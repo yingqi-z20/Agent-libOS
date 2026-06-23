@@ -106,6 +106,46 @@ capabilities.
 `ctx.add_startup_hook(fn)` runs a synchronous hook after all startup module
 registrations have been applied.
 
+## PTY Module
+
+`modules/pty/module.yaml` is the standard trusted module for interactive
+terminal sessions. When loaded and trusted, it registers the tools
+`pty_create`, `pty_read`, `pty_write`, `pty_resize`, `pty_close`, and
+`pty_list`, plus the `pty-agent:v0` image. The adapter, local PTY provider,
+reader thread, buffer limits, and timeout/window defaults live inside this
+module, not in the core Runtime or default Resource Provider Substrate.
+
+`pty_create(argv, cwd=None, cols=80, rows=24, startup_timeout_s=0.2,
+max_output_chars=4000, name=None)` launches a local PTY through the shell
+primitive's argv validation, workspace cwd checks, shell policy, human approval,
+resource budget, provider classification, events, and audit path. It returns a
+mutable Object Memory `EXTERNAL_REF` object id as `session_oid`; the payload is
+descriptive metadata only and is not an authority source.
+
+Follow-on tools use that `session_oid` as the public handle:
+
+- `pty_read(session_oid, timeout_s=0, max_chars=32000)` requires object `read`.
+- `pty_write(session_oid, text)` requires object `write`.
+- `pty_resize(session_oid, cols, rows)` requires object `write`.
+- `pty_close(session_oid, force=True, timeout_s=2)` requires object `delete`,
+  closes the host PTY, releases the object, and revokes its object
+  capabilities.
+- `pty_list()` returns active sessions whose PTY object is readable by the
+  caller.
+
+PTY sessions are memory-resident host resources. They are closed by explicit
+`pty_close`, object release, process-owned memory release on process exit,
+runtime shutdown, or PTY child process exit. Reopening a runtime does not
+reconnect old PTY objects; stale PTY `EXTERNAL_REF` rows are released during
+startup.
+
+Tests and hosts can override module defaults by setting `substrate.pty_settings`
+to a mapping before loading the module, and can inject a fake provider by
+setting `substrate.pty`. Without that injection, the module constructs its own
+local provider from the runtime workspace root. On Windows, the real backend
+uses `pywinpty`; install it through the optional `pty` extra when real ConPTY
+support is needed.
+
 ## CLI
 
 Verify a manifest without loading it:

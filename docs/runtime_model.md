@@ -106,6 +106,27 @@ uv run agent-libos --db .agent_libos.sqlite cd <pid> src
 
 updates one process working directory and leaves other processes unchanged.
 
+## Object-Bound PTY Sessions
+
+The trusted `modules/pty` runtime module can add an interactive PTY surface.
+`pty_create` starts the host PTY through the shell primitive's authorization
+path and returns a mutable Object Memory `EXTERNAL_REF` object id. The object
+payload records descriptive metadata such as argv, cwd, backend, dimensions,
+and creation time, but authorization for later interaction comes only from the
+current Object capability graph and the in-memory PTY registry.
+
+`pty_read` requires object `read`; `pty_write` and `pty_resize` require object
+`write`; `pty_close` requires object `delete`. Closing the session releases the
+object and revokes related object capabilities. If the object is released by a
+lifetime scope, process-owned memory cleanup, direct trusted delete, or runtime
+shutdown, the module-bound Object release or shutdown finalizer closes the
+underlying PTY as the object's RAII resource.
+
+PTY sessions are not checkpointed or persisted as reconnectable host handles.
+A checkpoint or committed image may contain an `EXTERNAL_REF` row only as stale
+metadata; reopening the runtime releases stale PTY objects rather than trying
+to reconnect a host terminal process.
+
 ## Scheduler
 
 The scheduler is thread-backed. It starts one worker task per runnable process

@@ -42,6 +42,10 @@ The implementation currently includes:
   async host wrapper `Runtime.arun_until_idle()`, so blocked quanta do not
   monopolize scheduler progress.
 - Process-local working directories for filesystem and shell operations.
+- Optional Object-bound PTY sessions through the trusted `modules/pty` runtime
+  module; when that module is loaded, `pty_create` returns an Object Memory
+  `EXTERNAL_REF` handle, and read, write, resize, and close rights follow
+  object capabilities.
 - Durable process message queues for IPC, including interrupt delivery.
 - Object-bound background tool tasks that can notify processes through the
   same durable message queues, including optional owner-change watches, without
@@ -307,6 +311,10 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   checks, permission policy, human approval, or audit.
 - Human approval is part of a primitive/syscall. Callers see a final success or
   final failure, not a pending/retry protocol.
+- When the optional PTY module is loaded, PTY sessions are host runtime
+  resources bound to mutable Object Memory `EXTERNAL_REF` handles. Shell policy
+  authorizes creation, object read/write/delete rights authorize interaction
+  and close, and runtime shutdown or object release closes the host PTY.
 - `process.exit` and `process.exec` are ordinary syscalls from TypeScript. The
   runtime applies lifecycle changes after the JIT tool returns its normal tool
   result.
@@ -349,8 +357,10 @@ scheduler quantum, worker, drain, and shutdown limits; process budgets; image
 ids; workspace namespace; tool limits; filesystem/Object Memory size limits;
 Deno sandbox limits; ObjectTask notification and shutdown limits; JSR import
 allowlists; shell policy lists; launcher presets; Skill defaults; and
-checkpoint defaults. `AgentLibOSConfig` is validated at construction time, so
-invalid or inverted bounds fail before a Runtime starts.
+checkpoint defaults. Optional modules such as `modules/pty` keep their own
+module-local settings outside `AgentLibOSConfig`.
+`AgentLibOSConfig` is validated at construction time, so invalid or inverted
+bounds fail before a Runtime starts.
 
 Add runtime dependencies with `uv add <package>` and development dependencies
 with `uv add --dev <package>`. Commit both `pyproject.toml` and `uv.lock` after

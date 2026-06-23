@@ -21,6 +21,10 @@
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_directory_primitive_enforces_limit_without_tool_schema",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_concurrent_one_time_file_write_crosses_provider_once",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_primitive_enforces_timeout_limit_without_tool_schema",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_create_requires_shell_policy_before_provider_spawn",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_input_limit_fails_closed_before_provider_write",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_session_limit_fails_closed_before_provider_spawn",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_concurrent_pty_create_reserves_capacity_before_provider_spawn",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_write_preconditions_fail_before_per_use_prompt",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_broad_shell_execute_before_human_prompt",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_root_filesystem_write_before_human_prompt"
@@ -130,6 +134,9 @@
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_lifetime_scope_commit_keeps_objects_with_explicit_owner",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_process_exit_releases_owned_memory_except_result_object",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_parent_exit_releases_waited_child_result_memory",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_process_exit_releases_pty_session_object_and_closes_provider",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_direct_object_release_closes_pty_session",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_close_failure_keeps_session_registered_for_retry",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runs_visible_tool_links_result_and_notifies_creator"
       ],
       "benchmark_attack_classes": []
@@ -146,6 +153,7 @@
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_async_runtime_resumes_human_question_with_answer",
         "tests/security/test_external_boundaries.py::TestExternalBoundary::test_one_time_human_output_capability_is_consumed_after_delivery",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_human_shell_approval_is_bound_to_exact_argv",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_high_risk_pty_spawn_requests_human_with_continuous_session_context",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_human_jsonrpc_approval_is_bound_to_params_hash",
         "tests/providers/test_gui_server.py::TestGuiServer::test_human_request_respond_rejects_non_pending_request",
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_runtime_human_primitive_uses_injected_provider"
@@ -161,6 +169,7 @@
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_exact_whitelist_rule_does_not_prefix_match_extra_args",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_allow_rule_with_shell_syntax_payload_requires_approval",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_local_shell_provider_uses_argv_without_shell_interpreter",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_other_process_without_object_capability_cannot_operate_pty",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_tool_cannot_shadow_existing_tool_name",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_fails_closed_without_budget_limit_support",
@@ -470,6 +479,9 @@
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_enforces_subprocess_wall_limit_with_metrics",
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_timeout_returns_metrics",
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_drains_large_stdout_while_monitoring",
+        "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_pty_provider_smoke",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_reader_drops_old_output_when_buffer_limit_is_reached",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_wall_time_budget_uses_monotonic_session_elapsed_time",
         "tests/security/test_resource_constraints.py::TestResourceConstraints::test_always_allow_shell_policy_does_not_bypass_subprocess_wall_budget",
         "tests/security/test_resource_constraints.py::TestResourceConstraints::test_shell_provider_without_limits_support_fails_closed_when_budgeted",
         "tests/security/test_resource_constraints.py::TestResourceConstraints::test_shell_timeout_charges_metrics_without_killing_when_budget_remains"

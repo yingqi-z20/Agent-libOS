@@ -85,6 +85,7 @@ class Runtime:
         self.resources = ResourceManager(store, self.audit, self.events)
         self.syscalls = SyscallRouter(self.audit, reserved_names=BUILTIN_SYSCALL_NAMES)
         self.provider_hooks: dict[str, list[Any]] = {}
+        self._shutdown_finalizers: list[Any] = []
         self.capability = CapabilityManager(store, self.audit, self.events, config=self.config)
         self.memory = ObjectMemoryManager(
             store,
@@ -352,6 +353,29 @@ class Runtime:
             }
         for name, component in [
             ("object_tasks", getattr(self, "object_tasks", None)),
+        ]:
+            try:
+                if not self._shutdown_component(component):
+                    return {
+                        "ok": False,
+                        "already_shutdown": False,
+                        "reason": reason,
+                        f"{name}_stopped": False,
+                    }
+            except Exception as exc:
+                errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
+        for index, finalizer in enumerate(list(self._shutdown_finalizers)):
+            try:
+                if finalizer() is False:
+                    return {
+                        "ok": False,
+                        "already_shutdown": False,
+                        "reason": reason,
+                        f"shutdown_finalizer_{index}_stopped": False,
+                    }
+            except Exception as exc:
+                errors.append({"component": f"shutdown_finalizer:{index}", "error": str(exc), "error_type": type(exc).__name__})
+        for name, component in [
             ("llms", getattr(self, "llms", None)),
             ("substrate", self.substrate),
         ]:
@@ -399,6 +423,32 @@ class Runtime:
             }
         for name, component in [
             ("object_tasks", getattr(self, "object_tasks", None)),
+        ]:
+            try:
+                if not await self._ashutdown_component(component):
+                    return {
+                        "ok": False,
+                        "already_shutdown": False,
+                        "reason": reason,
+                        f"{name}_stopped": False,
+                    }
+            except Exception as exc:
+                errors.append({"component": name, "error": str(exc), "error_type": type(exc).__name__})
+        for index, finalizer in enumerate(list(self._shutdown_finalizers)):
+            try:
+                result = finalizer()
+                if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
+                    result = await result
+                if result is False:
+                    return {
+                        "ok": False,
+                        "already_shutdown": False,
+                        "reason": reason,
+                        f"shutdown_finalizer_{index}_stopped": False,
+                    }
+            except Exception as exc:
+                errors.append({"component": f"shutdown_finalizer:{index}", "error": str(exc), "error_type": type(exc).__name__})
+        for name, component in [
             ("llms", getattr(self, "llms", None)),
             ("substrate", self.substrate),
         ]:
@@ -432,6 +482,9 @@ class Runtime:
         if callable(close):
             close()
         return True
+
+    def bind_shutdown_finalizer(self, finalizer: Any) -> None:
+        self._shutdown_finalizers.append(finalizer)
 
     async def _ashutdown_component(self, component: Any) -> bool:
         if component is None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 import pytest
 import sys
 import tempfile
+import time
 from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from agent_libos.primitives.shell import ShellAdapter
 from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate, LocalShellProvider, ResolvedPath, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
+from modules.pty.pty_module import LocalPtyProvider
 
 class TestResourceProviderSubstrate:
 
@@ -112,6 +114,26 @@ class TestResourceProviderSubstrate:
             assert result.returncode == 0
             assert len(result.stdout) == 200000
             assert result.metrics is not None
+
+    def test_local_pty_provider_smoke(self) -> None:
+        if sys.platform == "win32":
+            pytest.importorskip("winpty")
+            argv = ["cmd.exe", "/c", "echo", "PTY_PROVIDER_SMOKE"]
+        else:
+            argv = [sys.executable, "-c", "print('PTY_PROVIDER_SMOKE')"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalPtyProvider(temp_dir)
+            session = provider.spawn(argv, cols=80, rows=24)
+            try:
+                output = ""
+                deadline = time.monotonic() + 5.0
+                while "PTY_PROVIDER_SMOKE" not in output and time.monotonic() < deadline:
+                    output += session.read(timeout_s=0.1)
+                    if not session.is_alive() and "PTY_PROVIDER_SMOKE" not in output:
+                        time.sleep(0.05)
+                assert "PTY_PROVIDER_SMOKE" in output
+            finally:
+                session.close(force=True, timeout_s=1.0)
 
     def test_effectful_provider_without_classification_fails_closed(self) -> None:
         runtime = Runtime.open('local')

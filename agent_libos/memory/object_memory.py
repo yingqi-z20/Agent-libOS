@@ -138,12 +138,16 @@ class ObjectMemoryManager:
         self.resources = resources
         self._object_pin_checker: Callable[[str], bool] | None = None
         self._object_change_notifier: Callable[[str, dict[str, Any], str], None] | None = None
+        self._object_release_finalizers: list[Callable[[AgentObject, str, str], None]] = []
 
     def bind_object_pin_checker(self, checker: Callable[[str], bool] | None) -> None:
         self._object_pin_checker = checker
 
     def bind_object_change_notifier(self, notifier: Callable[[str, dict[str, Any], str], None] | None) -> None:
         self._object_change_notifier = notifier
+
+    def bind_object_release_finalizer(self, finalizer: Callable[[AgentObject, str, str], None]) -> None:
+        self._object_release_finalizers.append(finalizer)
 
     def create_object(
         self,
@@ -1010,6 +1014,10 @@ class ObjectMemoryManager:
         obj = self.store.get_object(oid)
         if obj is None:
             return False
+        # Release finalizers bind host resources to Object Memory lifetimes.
+        # They run before capability revocation so a failed cleanup cannot leave
+        # an unreachable host handle alive.
+        self._run_object_release_finalizers(obj, actor, reason)
         revoked = self.capabilities.revoke_resource_trusted(
             f"object:{oid}",
             revoked_by=actor,
@@ -1035,6 +1043,20 @@ class ObjectMemoryManager:
         if self._object_pin_checker is None:
             return False
         return bool(self._object_pin_checker(oid))
+
+    def _run_object_release_finalizers(self, obj: AgentObject, actor: str, reason: str) -> None:
+        for finalizer in list(self._object_release_finalizers):
+            try:
+                finalizer(obj, actor, reason)
+            except Exception as exc:
+                self.audit.record(
+                    actor=actor,
+                    action="memory.object_release_finalizer_failed",
+                    target=f"object:{obj.oid}",
+                    input_refs=[obj.oid],
+                    decision={"reason": reason, "error_type": type(exc).__name__, "error": str(exc)},
+                )
+                raise
 
     def _notify_object_changed(self, oid: str, change: dict[str, Any], actor_pid: str) -> None:
         if self._object_change_notifier is None:

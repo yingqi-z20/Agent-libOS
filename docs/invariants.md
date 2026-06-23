@@ -21,7 +21,8 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `tool-visibility-is-not-authority`: visible tools and endpoints do not grant
   protected resource authority.
 - `primitive-checks-before-effects`: primitives enforce capability, policy,
-  approval, and validation before side effects.
+  approval, and validation before side effects, including PTY spawn and write
+  limits.
 - `capability-matching-and-delegation`: typed matching, deny dominance,
   one-shot grants, revocation, grant-as-transfer, parent-linked delegation
   attenuation, and ISO-normalized leases.
@@ -34,12 +35,14 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `child-memory-merge-lifecycle-is-explicit`: terminal child process memory
   remains mergeable, then is adopted or released by the parent lifecycle.
 - `object-memory-lifecycle-is-explicit`: Object Memory ownership, release, and
-  RAII cleanup are explicit and revoke stale authority.
+  RAII cleanup are explicit and revoke stale authority, including Object-bound
+  PTY handles.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
   resume, consume one-shot grants, are decided exactly once from pending state,
   and route through primitives.
 - `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
-  sandboxed, process-local, and syscall-mediated.
+  sandboxed, process-local, and syscall-mediated; PTY creation reuses shell
+  authorization and follow-on PTY access uses Object capabilities.
 - `command-risk-rules-are-deterministic`: command risk rules separate
   harmless, risky, and destructive shell operations without model judgment.
 - `sandbox-profile-derived-from-capability-decision`: primitive sandbox
@@ -82,7 +85,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `llm-token-usage-is-charged-before-tool-dispatch`: provider-reported LLM token
   usage is settled before any model-selected tool call is dispatched.
 - `subprocess-resource-profiles-are-enforced`: shell and Deno subprocess wall,
-  CPU, and RSS limits are enforced by providers and audited on exceedance.
+  CPU, and RSS limits are enforced by providers and audited on exceedance; PTY
+  providers also have deterministic fake-provider coverage and real backend
+  smoke coverage where available.
 - `skill-activation-does-not-grant-authority`: Skills change visibility and
   prompt context without granting resources; API actor mode must still honor
   skill capability or human-approval gates.
