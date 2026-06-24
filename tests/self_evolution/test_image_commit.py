@@ -56,9 +56,33 @@ class TestImageCommit:
             runtime.image_registry.grant_register(source, 'exec-state:v0', issued_by='test')
             runtime.image_registry.commit_from_checkpoint(actor=source, checkpoint_id=checkpoint_id, image_id='exec-state:v0', name='exec-state')
             target = runtime.process.spawn(image='base-agent:v0', goal='target')
+            runtime.capability.grant(target, runtime.image_registry.resource_for('exec-state:v0'), [CapabilityRight.READ], issued_by='test')
             runtime.exec_process(target, 'exec-state:v0', goal='new goal', preserve_capabilities=False)
             assert runtime.memory.get_object_by_name(target, 'role').payload == {'role': 'committed'}
             assert not runtime.capability.check(target, 'shell:python', CapabilityRight.EXECUTE)
+
+    def test_committed_image_boot_requires_image_read_authority(self) -> None:
+        with _runtime() as runtime:
+            source = runtime.process.spawn(image='base-agent:v0', goal='source')
+            runtime.memory.create_object(pid=source, object_type=ObjectType.ARTIFACT, payload={'secret': 'baked'}, metadata=ObjectMetadata(title='Secret'), name='baked-secret', immutable=True)
+            checkpoint_id = runtime.checkpoint.create(source, 'before commit', actor=source)
+            runtime.image_registry.grant_register(source, 'secret-state:v0', issued_by='test')
+            runtime.image_registry.commit_from_checkpoint(actor=source, checkpoint_id=checkpoint_id, image_id='secret-state:v0', name='secret-state')
+
+            attacker = runtime.process.spawn(image='base-agent:v0', goal='attacker')
+            runtime.capability.grant(attacker, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+            with pytest.raises(CapabilityDenied, match='image:secret-state:v0'):
+                runtime.spawn_child_process(attacker, 'steal baked state', image='secret-state:v0')
+            assert runtime.process.list_children(attacker) == []
+
+            exec_target = runtime.process.spawn(image='base-agent:v0', goal='exec target')
+            with pytest.raises(CapabilityDenied, match='image:secret-state:v0'):
+                runtime.exec_process(exec_target, 'secret-state:v0', goal='steal via exec', preserve_capabilities=False)
+            assert runtime.process.get(exec_target).image_id == 'base-agent:v0'
+
+            runtime.capability.grant(attacker, runtime.image_registry.resource_for('secret-state:v0'), [CapabilityRight.READ], issued_by='test')
+            child = runtime.spawn_child_process(attacker, 'authorized boot', image='secret-state:v0')
+            assert runtime.memory.get_object_by_name(child, 'baked-secret').payload == {'secret': 'baked'}
 
     def test_committed_image_does_not_save_or_restore_resource_state(self) -> None:
         with _runtime() as runtime:

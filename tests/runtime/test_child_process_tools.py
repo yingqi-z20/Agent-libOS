@@ -6,8 +6,18 @@ from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, EventType, ObjectOwnerKind, ObjectType, ProcessStatus, ResourceBudget
-from agent_libos.models.exceptions import NotFound, ProcessError, ProcessWaitRequired
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired
+from agent_libos.runtime.syscalls import LibOSSyscallSession
 from scripts.llm_context_probe import last_tool_result, static_prefix
+
+
+def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
+    runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+
+
+def _grant_image_read(runtime: Runtime, pid: str, image_id: str) -> None:
+    runtime.capability.grant(pid, runtime.image_registry.resource_for(image_id), [CapabilityRight.READ], issued_by='test')
+
 
 class TestChildProcessTool:
 
@@ -18,6 +28,7 @@ class TestChildProcessTool:
             client = ParentChildClient()
             runtime.llm.client = client
             parent = runtime.process.spawn(image='base-agent:v0', goal='fork child and wait')
+            _grant_process_spawn(runtime, parent)
             results = asyncio.run(runtime.arun_until_idle(max_quanta=8))
             assert runtime.process.get(parent).status == ProcessStatus.EXITED
             assert client.child_pid is not None
@@ -69,6 +80,7 @@ class TestChildProcessTool:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='manage one child', resource_budget=ResourceBudget(max_child_processes=1))
+            _grant_process_spawn(runtime, parent)
             other = runtime.process.spawn(image='base-agent:v0', goal='not a child')
             forked = runtime.tools.call(parent, 'fork_child_process', {'goal': 'child', 'include_parent_roots': False})
             assert forked.ok, forked.error
@@ -96,6 +108,7 @@ class TestChildProcessTool:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='poll child')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'still running')
 
             waited = runtime.tools.call(parent, 'wait_child_process', {'child_pid': child, 'block': False})
@@ -111,6 +124,7 @@ class TestChildProcessTool:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='wait race parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'wait race child')
             original_update_process = runtime.store.update_process
             triggered = {'value': False}
@@ -155,6 +169,7 @@ class TestChildProcessTool:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='wait parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'wait child')
             with pytest.raises(ProcessWaitRequired):
                 runtime.process.wait(parent, child)
@@ -186,6 +201,7 @@ class TestChildProcessTool:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='wait for killed child')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'will be killed')
             with pytest.raises(ProcessWaitRequired):
                 runtime.process.wait(parent, child)
@@ -231,6 +247,7 @@ class TestChildProcessTool:
                 goal='parent',
                 resource_budget=ResourceBudget(max_child_processes=1),
             )
+            _grant_process_spawn(runtime, parent)
             failed_pid = {'value': None}
 
             def fail_child_launch(pid: str, image_id: str) -> None:
@@ -257,6 +274,8 @@ class TestChildProcessTool:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='review-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            _grant_image_read(runtime, parent, 'coding-agent:v0')
             parent_note = runtime.memory.create_object(pid=parent, object_type='observation', name='parent.note', payload={'visible_to_parent': True})
             spawned = runtime.tools.call(parent, 'spawn_child_process', {'goal': 'fresh child', 'image': 'coding-agent:v0'})
             assert spawned.ok, spawned.error
@@ -271,10 +290,70 @@ class TestChildProcessTool:
         finally:
             runtime.close()
 
+    def test_spawn_child_process_requires_process_spawn_authority(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            before = len(runtime.process.list())
+
+            with pytest.raises(CapabilityDenied, match='process:spawn'):
+                runtime.spawn_child_process(parent, 'denied child')
+
+            assert len(runtime.process.list()) == before
+            assert runtime.process.list_children(parent) == []
+        finally:
+            runtime.close()
+
+    def test_fork_syscall_requires_process_spawn_authority(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            session = LibOSSyscallSession(runtime, parent)
+            before = len(runtime.process.list())
+
+            with pytest.raises(CapabilityDenied, match='process:spawn'):
+                asyncio.run(session.handle('process.fork', {'goal': 'denied child'}))
+
+            assert len(runtime.process.list()) == before
+            assert runtime.process.list_children(parent) == []
+        finally:
+            runtime.close()
+
+    def test_cross_image_spawn_and_exec_require_image_read_authority(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            before = len(runtime.process.list())
+
+            with pytest.raises(CapabilityDenied, match='image:coding-agent:v0'):
+                runtime.spawn_child_process(parent, 'denied child', image='coding-agent:v0')
+
+            assert len(runtime.process.list()) == before
+            assert runtime.process.list_children(parent) == []
+            _grant_image_read(runtime, parent, 'coding-agent:v0')
+            child = runtime.spawn_child_process(parent, 'allowed child', image='coding-agent:v0')
+            assert runtime.process.get(child).image_id == 'coding-agent:v0'
+
+            target = runtime.process.spawn(image='base-agent:v0', goal='exec target')
+            original = runtime.process.get(target)
+            with pytest.raises(CapabilityDenied, match='image:coding-agent:v0'):
+                runtime.exec_process(target, 'coding-agent:v0', goal='denied exec')
+
+            unchanged = runtime.process.get(target)
+            assert unchanged.image_id == 'base-agent:v0'
+            assert unchanged.goal_oid == original.goal_oid
+            _grant_image_read(runtime, target, 'coding-agent:v0')
+            runtime.exec_process(target, 'coding-agent:v0', goal='allowed exec', preserve_capabilities=False, preserve_memory=False)
+            assert runtime.process.get(target).image_id == 'coding-agent:v0'
+        finally:
+            runtime.close()
+
     def test_spawn_child_process_inherits_only_explicit_capabilities(self) -> None:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='review-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             runtime.filesystem.grant_path(parent, 'README.md', [CapabilityRight.READ], issued_by='test')
             spawned = runtime.tools.call(parent, 'spawn_child_process', {'goal': 'read one file', 'inherit_read_files': ['README.md']})
             assert spawned.ok, spawned.error
@@ -291,6 +370,7 @@ class TestChildProcessTool:
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='become coding agent')
             runtime.filesystem.grant_workspace(pid, [CapabilityRight.READ], issued_by='test')
+            _grant_image_read(runtime, pid, 'coding-agent:v0')
             executed = runtime.tools.call(pid, 'exec_process', {'image': 'coding-agent:v0', 'goal': 'inspect without automatic capability lift', 'preserve_capabilities': False, 'preserve_memory': False})
             assert executed.ok, executed.error
             process = runtime.process.get(pid)
@@ -315,6 +395,7 @@ class TestChildProcessTool:
                 actor='cli',
             )
             pid = runtime.process.spawn(image='base-agent:v0', goal='stay on base')
+            _grant_image_read(runtime, pid, 'failing-exec:v0')
             other = runtime.process.spawn(image='base-agent:v0', goal='unrelated')
             before = runtime.process.get(pid)
             before_tools = dict(before.tool_table)
@@ -431,6 +512,7 @@ class TestChildProcessTool:
                 name='read.only.secret',
             )
             runtime.capability.grant(parent, f'object:{secret.oid}', [CapabilityRight.READ], issued_by='test')
+            _grant_process_spawn(runtime, parent)
 
             forked = runtime.tools.call(
                 parent,
@@ -472,6 +554,7 @@ class TestChildProcessTool:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='coding-agent:v0', goal='fork after revoke')
+            _grant_process_spawn(runtime, parent)
             path = 'README.md'
             for cap in list(runtime.capability.capabilities_for(parent)):
                 if cap.resource == 'filesystem:workspace:*' and CapabilityRight.READ.value in cap.rights:

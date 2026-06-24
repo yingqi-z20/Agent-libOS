@@ -420,7 +420,7 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             if args.working_directory is not None
             else parent.working_directory
         )
-        child_pid = runtime.process.fork(
+        child_pid = runtime.fork_child_process(
             parent=ctx.pid,
             goal=args.goal,
             memory_view=view_spec,

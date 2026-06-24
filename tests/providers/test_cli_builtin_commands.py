@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
-from agent_libos.models import ObjectMetadata, ObjectType, ProcessMessageKind, ProcessStatus
+from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ProcessMessageKind, ProcessStatus
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 class TestCLIBuiltinCommand:
@@ -174,6 +174,7 @@ class TestCLIBuiltinCommand:
     def test_cli_object_task_start_outputs_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runtime = Runtime.open('local')
         pid = runtime.process.spawn(image='base-agent:v0', goal='object task cli')
+        runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
         owner = runtime.memory.create_object(
             pid,
             ObjectType.ARTIFACT,
@@ -236,6 +237,7 @@ class TestCLIBuiltinCommand:
     def test_cli_object_task_watch_owner_updates_existing_task(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runtime = Runtime.open('local')
         pid = runtime.process.spawn(image='base-agent:v0', goal='object task watch cli')
+        runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
         owner = runtime.memory.create_object(
             pid,
             ObjectType.ARTIFACT,

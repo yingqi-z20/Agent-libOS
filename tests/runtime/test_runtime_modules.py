@@ -192,6 +192,29 @@ sha256: {source_sha}
             with pytest.raises(ValidationError):
                 Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
 
+    def test_module_source_swap_after_trust_does_not_execute_swapped_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, source_sha = _write_module(root)
+            source = root / 'test_module.py'
+            sentinel = root / 'swapped_executed.txt'
+            original_resolve = ModuleLoader.resolve
+
+            def swapping_resolve(loader: ModuleLoader, manifest_path: str | Path):
+                resolved = original_resolve(loader, manifest_path)
+                source.write_text(
+                    f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+                    "def register_module(ctx):\n    pass\n",
+                    encoding='utf-8',
+                )
+                return resolved
+
+            monkeypatch.setattr(ModuleLoader, 'resolve', swapping_resolve)
+            with pytest.raises(ValidationError, match='source changed after verification'):
+                Runtime.open(module_manifests=(str(manifest),), trusted_modules=(f'test-module:v0:{source_sha}',))
+
+            assert not sentinel.exists()
+
     def test_module_source_size_limit_fails_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

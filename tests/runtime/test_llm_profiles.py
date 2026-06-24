@@ -5,7 +5,7 @@ import tempfile
 
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, LLMDefaults, LLMProfile
-from agent_libos.models import AgentImage, ProcessStatus
+from agent_libos.models import AgentImage, CapabilityRight, ProcessStatus
 from agent_libos.storage import SQLiteStore
 from tests.support.fakes import RecordingActionClient
 
@@ -73,6 +73,9 @@ class TestLLMProfiles:
 
             from_image = runtime.process.spawn(image="profile-image:v0", goal="image default")
             explicit = runtime.process.spawn(image="profile-image:v0", goal="explicit", llm_profile_id="fast")
+            runtime.capability.grant(explicit, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
+            runtime.capability.grant(explicit, "image:next-profile-image:v0", [CapabilityRight.READ], issued_by="test")
+            runtime.capability.grant(explicit, "image:base-agent:v0", [CapabilityRight.READ], issued_by="test")
             forked = runtime.process.fork(parent=explicit, goal="fork inherits")
             spawned = runtime.spawn_child_process(explicit, "fresh child inherits")
 
@@ -84,6 +87,7 @@ class TestLLMProfiles:
             runtime.exec_process(explicit, "next-profile-image:v0", goal="exec keeps profile")
             assert runtime.process.get(explicit).llm_profile_id == "fast"
 
+            runtime.capability.grant(explicit, "image:base-agent:v0", [CapabilityRight.READ], issued_by="test")
             runtime.exec_process(explicit, "base-agent:v0", goal="exec override", llm_profile_id="override")
             assert runtime.process.get(explicit).llm_profile_id == "override"
         finally:

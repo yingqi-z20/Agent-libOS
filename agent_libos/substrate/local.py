@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.client
 import heapq
 import os
+import signal
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import tempfile
 import time
@@ -175,14 +178,23 @@ class LocalFilesystemProvider:
         return bool(is_junction()) if callable(is_junction) else False
 
     def _directory_entry(self, target: Path) -> DirectoryEntrySnapshot:
-        stat = target.stat()
-        kind = "file" if target.is_file() else "directory" if target.is_dir() else "other"
+        stat_result = target.lstat()
+        mode = stat_result.st_mode
+        kind = (
+            "symlink"
+            if stat.S_ISLNK(mode)
+            else "file"
+            if stat.S_ISREG(mode)
+            else "directory"
+            if stat.S_ISDIR(mode)
+            else "other"
+        )
         return DirectoryEntrySnapshot(
             name=target.name,
             path=target.relative_to(self.root).as_posix(),
             kind=kind,
-            size_bytes=stat.st_size if target.is_file() else None,
-            modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            size_bytes=stat_result.st_size if kind == "file" else None,
+            modified_at=datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).isoformat(),
         )
 
 
@@ -249,15 +261,17 @@ class LocalShellProvider:
         selected_cwd = self._resolve_cwd(cwd)
         stdout_limit = _SHELL_DEFAULTS.stdout_hard_limit_chars if stdout_limit_chars is None else max(0, int(stdout_limit_chars))
         stderr_limit = _SHELL_DEFAULTS.stderr_hard_limit_chars if stderr_limit_chars is None else max(0, int(stderr_limit_chars))
+        checked_argv = self._resolve_argv0(argv, selected_cwd)
         started_at = time.monotonic()
         with tempfile.TemporaryFile("w+b") as stdout_file, tempfile.TemporaryFile("w+b") as stderr_file:
             proc = subprocess.Popen(
-                argv,
+                checked_argv,
                 cwd=selected_cwd,
                 env=self._safe_env(),
                 shell=False,
                 stdout=stdout_file,
                 stderr=stderr_file,
+                **self._process_group_kwargs(),
             )
             ps_proc = psutil.Process(proc.pid)
             peak_memory = 0
@@ -292,6 +306,7 @@ class LocalShellProvider:
                             pass
                         break
                     if proc.poll() is not None:
+                        self._terminate_process_group(proc)
                         break
                     time.sleep(0.02)
             finally:
@@ -362,7 +377,37 @@ class LocalShellProvider:
         return target
 
     def _safe_env(self) -> dict[str, str]:
-        return {key: value for key, value in os.environ.items() if key.upper() in _SAFE_SHELL_ENV_KEYS}
+        env = {key: value for key, value in os.environ.items() if key.upper() in _SAFE_SHELL_ENV_KEYS}
+        env["PATH"] = self._safe_path()
+        return env
+
+    def _resolve_argv0(self, argv: list[str], selected_cwd: Path) -> list[str]:
+        if not argv or self._argv0_has_path(argv[0]):
+            return argv
+        resolved = shutil.which(argv[0], path=self._safe_path())
+        if resolved is None:
+            raise FileNotFoundError(f"shell executable not found on safe PATH: {argv[0]}")
+        target = Path(resolved).resolve()
+        if self.cwd in target.parents or target == self.cwd or selected_cwd in target.parents or target == selected_cwd:
+            raise CapabilityDenied(f"bare shell executable resolves inside workspace: {argv[0]}")
+        return [str(target), *argv[1:]]
+
+    def _safe_path(self) -> str:
+        entries: list[str] = []
+        for item in os.environ.get("PATH", "").split(os.pathsep):
+            if not item:
+                continue
+            raw = Path(item).expanduser()
+            if not raw.is_absolute():
+                continue
+            resolved = raw.resolve(strict=False)
+            if self.cwd in resolved.parents or resolved == self.cwd:
+                continue
+            entries.append(str(resolved))
+        return os.pathsep.join(entries)
+
+    def _argv0_has_path(self, value: str) -> bool:
+        return "/" in value or "\\" in value or Path(value).is_absolute()
 
     def _output_limit_kind(
         self,
@@ -421,7 +466,16 @@ class LocalShellProvider:
                 continue
         return cpu_seconds, max(peak_memory, memory_bytes)
 
+    def _process_group_kwargs(self) -> dict[str, Any]:
+        if os.name == "nt":
+            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"start_new_session": True}
+
     def _kill_process_tree(self, ps_proc: psutil.Process, proc: subprocess.Popen[str]) -> None:
+        # The direct child may exit after spawning background work, at which
+        # point psutil no longer sees those processes as descendants. A process
+        # group gives the provider one cleanup handle for the whole shell run.
+        self._terminate_process_group(proc)
         processes: list[psutil.Process] = []
         try:
             processes.extend(ps_proc.children(recursive=True))
@@ -444,6 +498,17 @@ class LocalShellProvider:
                 proc.kill()
             except ProcessLookupError:
                 pass
+
+    def _terminate_process_group(self, proc: subprocess.Popen[str]) -> None:
+        if os.name == "nt":
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.05)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
 
 
 class LocalHumanProvider:

@@ -57,6 +57,7 @@ class TestProcessWorkingDirectory:
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
             try:
                 parent = runtime.process.spawn(image='review-agent:v0', goal='spawn child')
+                runtime.capability.grant(parent, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
                 assert runtime.tools.call(parent, 'set_working_directory', {'path': 'child-cwd'}).ok
                 spawned = runtime.tools.call(parent, 'spawn_child_process', {'goal': 'inherit cwd'})
                 forked = runtime.tools.call(parent, 'fork_child_process', {'goal': 'inherit cwd'})

@@ -249,6 +249,7 @@ class TestJitSecurity:
 
     def test_deno_jit_process_exec_is_applied_after_tool_result(self) -> None:
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='exec after deno result')
+        self.runtime.capability.grant(pid, 'image:base-agent:v0', [CapabilityRight.READ], issued_by='test')
         candidate = self.runtime.tools.propose(pid, {'name': 'exec_after_result', 'description': 'Exec.', 'input_schema': {'type': 'object'}}, source_code='export async function run(args, libos) { /* fake:exec_after_result */ return {}; }')
         assert self.runtime.tools.validate(candidate).ok
         self.runtime.tools.register(pid, candidate)
@@ -350,8 +351,15 @@ class TestJitSecurity:
             'return d.readTextFileSync("x"); }'
         )
         denied_import = checker.static_check('import x from "npm:left-pad";\nexport async function run(args, libos) { return {}; }')
+        ordinary_export = checker.static_check(
+            'export function run(args, libos) { '
+            'const obj = { from: "npm:left-pad", import() { return "local"; } }; '
+            'const label = `hello ${args.name ?? "world"}`; '
+            'return { value: obj.import(), label }; }'
+        )
 
         assert computed_deno.ok, computed_deno.errors
+        assert ordinary_export.ok, ordinary_export.errors
         assert not denied_import.ok
         assert any(('import is not allowed: npm:left-pad' in error for error in denied_import.errors))
 
@@ -366,6 +374,66 @@ class TestJitSecurity:
         assert any(('import is not allowed: file:///tmp/tool.ts' in error for error in denied.errors))
         assert any(('JSR package is not in allowlist: @bad/pkg' in error for error in denied.errors))
         assert any(('JSR import must pin a package version: jsr:@std/path' in error for error in denied.errors))
+
+    def test_deno_static_check_rejects_mutable_jsr_versions(self) -> None:
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+        allowed = checker.static_check('import { join } from "jsr:@std/path@1.0.0";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
+        denied = checker.static_check('import { join } from "jsr:@std/path@1";\nimport { normalize } from "jsr:@std/path@latest";\nimport { dirname } from "jsr:@std/path@^1.0.0";\nexport function run(args, libos) { return {}; }')
+
+        assert allowed.ok, allowed.errors
+        assert not denied.ok
+        assert any('JSR import must use an exact semantic version: jsr:@std/path@1' in error for error in denied.errors)
+        assert any('JSR import must use an exact semantic version: jsr:@std/path@latest' in error for error in denied.errors)
+        assert any('JSR import must use an exact semantic version: jsr:@std/path@^1.0.0' in error for error in denied.errors)
+
+    def test_deno_static_check_rejects_comment_split_imports(self) -> None:
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+        dynamic_import = checker.static_check('export async function run(args, libos) { return await import/*comment*/("https://example.com/tool.ts"); }')
+        template_import = checker.static_check('export async function run(args, libos) { return `${await import("npm:left-pad")}`; }')
+        npm_import = checker.static_check('import x from /*comment*/ "npm:left-pad";\nexport function run(args, libos) { return {}; }')
+        exported_import = checker.static_check('export { join } from /*comment*/ "npm:left-pad";\nexport function run(args, libos) { return {}; }')
+        allowed = checker.static_check('import { join } from /*comment*/ "jsr:@std/path@1.0.0";\nexport function run(args, libos) { return { path: join("a", "b") }; }')
+
+        assert not dynamic_import.ok
+        assert any('dynamic import() is not allowed' in error for error in dynamic_import.errors)
+        assert not template_import.ok
+        assert any('dynamic import() is not allowed' in error for error in template_import.errors)
+        assert not npm_import.ok
+        assert any('import is not allowed: npm:left-pad' in error for error in npm_import.errors)
+        assert not exported_import.ok
+        assert any('import is not allowed: npm:left-pad' in error for error in exported_import.errors)
+        assert allowed.ok, allowed.errors
+
+    def test_deno_static_check_rejects_runtime_code_generation_import_bypasses(self) -> None:
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+        eval_import = checker.static_check('export async function run(args, libos) { return await eval("import(args.spec)"); }')
+        new_function_import = checker.static_check('export async function run(args, libos) { const loader = new Function("s", "return import(s)"); return await loader(args.spec); }')
+        global_function_import = checker.static_check('export async function run(args, libos) { const loader = globalThis.Function("s", "return import(s)"); return await loader(args.spec); }')
+        global_function_call_import = checker.static_check('export async function run(args, libos) { return globalThis.Function.call(null, "return import(args.spec)")(); }')
+        bracket_function_import = checker.static_check('export async function run(args, libos) { const loader = globalThis["Function"]("s", "return import(s)"); return await loader(args.spec); }')
+        bracket_function_call_import = checker.static_check('export async function run(args, libos) { return globalThis["Function"].call(null, "return import(args.spec)")(); }')
+        bracket_eval_import = checker.static_check('export async function run(args, libos) { return await window["eval"]("import(args.spec)"); }')
+        local_methods = checker.static_check(
+            'export function run(args, libos) { '
+            'const obj = { eval() { return 1; }, Function() { return 2; } }; '
+            'return { value: obj.eval() + obj.Function() + obj["eval"]() + obj["Function"]() + obj.Function.call(obj) }; }'
+        )
+
+        assert not eval_import.ok
+        assert any('runtime code generation is not allowed' in error for error in eval_import.errors)
+        assert not new_function_import.ok
+        assert any('runtime code generation is not allowed' in error for error in new_function_import.errors)
+        assert not global_function_import.ok
+        assert any('runtime code generation is not allowed' in error for error in global_function_import.errors)
+        assert not global_function_call_import.ok
+        assert any('runtime code generation is not allowed' in error for error in global_function_call_import.errors)
+        assert not bracket_function_import.ok
+        assert any('runtime code generation is not allowed' in error for error in bracket_function_import.errors)
+        assert not bracket_function_call_import.ok
+        assert any('runtime code generation is not allowed' in error for error in bracket_function_call_import.errors)
+        assert not bracket_eval_import.ok
+        assert any('runtime code generation is not allowed' in error for error in bracket_eval_import.errors)
+        assert local_methods.ok, local_methods.errors
 
     def test_deno_candidate_tests_fail_when_expected_syscall_is_not_performed(self) -> None:
         sandbox = NoSyscallDenoSandbox(deno_executable='deno')

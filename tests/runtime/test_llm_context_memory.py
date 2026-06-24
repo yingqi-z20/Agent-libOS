@@ -27,6 +27,16 @@ from agent_libos.models import (
 from tests.support.fakes import FakeDenoSandbox, RecordingActionClient
 from tests.support.skills import write_skill_package
 
+
+def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
+    runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+
+
+def _grant_context_compressor_authority(runtime: Runtime, pid: str) -> None:
+    _grant_process_spawn(runtime, pid)
+    runtime.capability.grant(pid, 'image:context-compressor:v0', [CapabilityRight.READ], issued_by='test')
+
+
 class TestLLMContextMemory:
 
     def test_llm_context_is_process_readable_writable_memory_object(self) -> None:
@@ -433,6 +443,7 @@ class TestLLMContextMemory:
                 {'action': 'process_exit', 'payload': _compact_summary('compressed state')},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='compact current context')
+            _grant_context_compressor_authority(runtime, pid)
 
             results = runtime.run_until_idle(max_quanta=3)
 
@@ -501,6 +512,7 @@ class TestLLMContextMemory:
                 {'action': 'process_exit', 'payload': {'goal': 'missing required fields'}},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='invalid compressor output')
+            _grant_context_compressor_authority(runtime, pid)
 
             waiting = runtime.run_next_process_once()
             assert waiting['waiting_event']
@@ -572,6 +584,7 @@ class TestLLMContextMemory:
                 ],
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='fail exhausted compaction')
+            _grant_context_compressor_authority(runtime, pid)
             _seed_context_entries(runtime, pid, count=40)
 
             failed = None
@@ -611,6 +624,7 @@ class TestLLMContextMemory:
                 {'action': 'process_exit', 'payload': _compact_summary('stale summary')},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='race context')
+            _grant_context_compressor_authority(runtime, pid)
 
             waiting = runtime.run_next_process_once()
             assert waiting['waiting_event']
@@ -652,6 +666,7 @@ class TestLLMContextMemory:
                 {'action': 'process_exit', 'payload': _compact_summary('stage two')},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='multi chunk context')
+            _grant_context_compressor_authority(runtime, pid)
 
             results = runtime.run_until_idle(max_quanta=5)
 
@@ -682,6 +697,7 @@ class TestLLMContextMemory:
                     }
                 ])
                 pid = runtime.process.spawn(image='base-agent:v0', goal='reopen compaction')
+                _grant_context_compressor_authority(runtime, pid)
                 waiting = runtime.run_next_process_once()
                 assert waiting['waiting_event']
                 assert runtime.store.get_llm_pending_action(pid)['wait_type'] == 'child'
@@ -718,6 +734,7 @@ class TestLLMContextMemory:
                     {'action': 'process_exit', 'payload': _compact_summary('lost result')},
                 ])
                 pid = runtime.process.spawn(image='base-agent:v0', goal='rerun missing child result')
+                _grant_context_compressor_authority(runtime, pid)
                 waiting = runtime.run_next_process_once()
                 child_pid = waiting['child_pid']
                 child_exit = runtime.run_process_once(child_pid)

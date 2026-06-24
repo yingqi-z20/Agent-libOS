@@ -4,6 +4,8 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { databaseTargetFromRenderer } from "./database.js";
+import { readImagePackageFiles } from "./imagePackage.js";
 
 type ServerConnection = {
   url: string;
@@ -22,8 +24,6 @@ const repoRoot = path.resolve(__dirname, "..", "..");
 const smokeMode = process.env.AGENT_LIBOS_GUI_SMOKE === "1";
 const smokeLogPath = process.env.AGENT_LIBOS_GUI_SMOKE_LOG;
 const imageManifestMaxBytes = 1_048_576;
-const imagePackageMaxBytes = 16_777_216;
-const imagePackageMaxFiles = 512;
 const allowedExternalProtocols = new Set(["http:", "https:", "mailto:"]);
 
 if (smokeMode) {
@@ -383,39 +383,8 @@ ipcMain.handle("libos:chooseImagePackage", async () => {
   };
 });
 
-function readImagePackageFiles(root: string) {
-  const files: Record<string, { base64: string }> = {};
-  let totalBytes = 0;
-  function visit(directory: string) {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      const fullPath = path.join(directory, entry.name);
-      const relative = path.relative(root, fullPath).split(path.sep).join("/");
-      if (relative.split("/").includes(".git")) {
-        throw new Error("Image packages must not include .git directories.");
-      }
-      if (entry.isSymbolicLink()) throw new Error(`Image package symlinks are not supported: ${relative}`);
-      if (entry.isDirectory()) {
-        visit(fullPath);
-        continue;
-      }
-      if (!entry.isFile()) throw new Error(`Image package path is not a regular file: ${relative}`);
-      const content = fs.readFileSync(fullPath);
-      totalBytes += content.byteLength;
-      if (Object.keys(files).length + 1 > imagePackageMaxFiles) {
-        throw new Error(`Image package exceeds ${imagePackageMaxFiles} files.`);
-      }
-      if (totalBytes > imagePackageMaxBytes) {
-        throw new Error(`Image package exceeds ${imagePackageMaxBytes} bytes.`);
-      }
-      files[relative] = { base64: content.toString("base64") };
-    }
-  }
-  visit(root);
-  return files;
-}
-
 ipcMain.handle("libos:useDatabase", async (_event, db: string) => {
-  return startRuntimeServer(db && db.trim() ? db.trim() : "local");
+  return startRuntimeServer(databaseTargetFromRenderer(db));
 });
 
 ipcMain.handle("libos:openExternal", async (_event, url: string) => {

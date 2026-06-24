@@ -9,6 +9,10 @@
         "command": {
           "type": "string",
           "description": "Bash command to run for this step."
+        },
+        "submit": {
+          "type": "boolean",
+          "description": "Set to true only when this command output is the final answer to submit."
         }
       },
       "required": ["command"],

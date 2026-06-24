@@ -33,6 +33,7 @@ class ModuleSource:
     source_path: str
     source_sha256: str
     entrypoint_object: str
+    source_bytes: bytes = b""
 
 
 @dataclass(frozen=True)

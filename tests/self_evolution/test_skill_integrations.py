@@ -142,10 +142,13 @@ class TestSkillIntegration:
                 runtime.skills.register_skill_from_path(extra_skill, actor='cli', require_capability=False)
                 runtime.register_image(AgentImage(image_id='skill-image:v0', name='skill-image', default_tools=['human_output'], default_skills=['image-skill']), actor='cli')
                 root = runtime.process.spawn(image='skill-image:v0', goal='root')
+                runtime.capability.grant(root, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+                runtime.capability.grant(root, 'image:base-agent:v0', [CapabilityRight.READ], issued_by='test')
                 runtime.capability.grant(root, 'skill:parent-extra', [CapabilityRight.EXECUTE], issued_by='test')
                 runtime.skills.activate_skill(root, 'parent-extra', actor=root)
                 forked = runtime.process.fork(root, 'forked')
                 spawned = runtime.spawn_child_process(root, 'spawned', image='base-agent:v0')
+                runtime.capability.grant(spawned, 'image:skill-image:v0', [CapabilityRight.READ], issued_by='test')
                 runtime.exec_process(spawned, 'skill-image:v0', goal='exec')
                 assert 'echo' in runtime.process.get(root).tool_table
                 assert 'read_text_file' in runtime.process.get(forked).tool_table

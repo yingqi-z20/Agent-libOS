@@ -18,6 +18,20 @@ from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequire
 from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
 from tests.support.fakes import FakeDenoSandbox
 
+
+class RejectingDenoSandbox(FakeDenoSandbox):
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        return ValidationResult(ok=False, errors=['package validation failed'])
+
+
 class TestImageRegistration:
 
     def test_register_image_primitive_validates_tools_and_emits_audit(self) -> None:
@@ -252,6 +266,26 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    def test_image_package_boot_failure_cleans_materialized_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = RejectingDenoSandbox()
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                with pytest.raises(ValidationError, match='package validation failed'):
+                    runtime.process.spawn(image='package-agent:v0', goal='failed boot')
+
+                materialized = Path(temp_dir) / runtime.config.image.materialized_workspace_root
+                seed_files = list(materialized.rglob('seed.txt')) if materialized.exists() else []
+                assert seed_files == []
+                assert not [
+                    row for row in runtime.store.list_tools()
+                    if row['name'] == 'package_count' and row['ephemeral']
+                ]
+            finally:
+                runtime.close()
+
     def test_image_package_multiplexed_jit_exposure_round_trips(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(
@@ -379,6 +413,7 @@ class TestImageRegistration:
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 pid = runtime.process.spawn(image='base-agent:v0', goal='before exec')
+                runtime.capability.grant(pid, runtime.image_registry.resource_for('package-agent:v0'), [CapabilityRight.READ], issued_by='test')
                 runtime.exec_process(pid, 'package-agent:v0', goal='after exec', preserve_capabilities=False)
                 process = runtime.process.get(pid)
 
@@ -387,6 +422,30 @@ class TestImageRegistration:
                 assert process.working_directory != '.'
                 assert 'package_count' in process.tool_table
                 assert runtime.filesystem.read_text(pid, 'seed.txt', cwd=process.working_directory).content.replace('\r\n', '\n') == 'seed\n'
+            finally:
+                runtime.close()
+
+    def test_exec_process_image_package_failure_restores_state_and_cleans_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            runtime.tools.sandbox = RejectingDenoSandbox()
+            try:
+                runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
+                pid = runtime.process.spawn(image='base-agent:v0', goal='before exec')
+                runtime.capability.grant(pid, runtime.image_registry.resource_for('package-agent:v0'), [CapabilityRight.READ], issued_by='test')
+                before = runtime.process.get(pid)
+
+                with pytest.raises(ValidationError, match='package validation failed'):
+                    runtime.exec_process(pid, 'package-agent:v0', goal='after failed exec', preserve_capabilities=False)
+
+                after = runtime.process.get(pid)
+                materialized = Path(temp_dir) / runtime.config.image.materialized_workspace_root
+                seed_files = list(materialized.rglob('seed.txt')) if materialized.exists() else []
+                assert after.image_id == before.image_id
+                assert after.working_directory == before.working_directory
+                assert 'package_count' not in after.tool_table
+                assert seed_files == []
             finally:
                 runtime.close()
 

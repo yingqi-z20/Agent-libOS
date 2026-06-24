@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
@@ -8,6 +9,16 @@ from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.serde import dumps, to_jsonable
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_SCALAR_SECRET_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(
+        r"(?i)['\"]?\b(api[_-]?key|authorization|auth[_-]?token|password|passwd|secret|session[_-]?token|token)\b['\"]?"
+        r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;\"'}]+)"
+    ),
+    re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9_=-]+"),
+    re.compile(r"\bSECRET_[A-Za-z0-9_]+\b"),
+    re.compile(r"(?i)\b(?:secret|token)[_-][A-Za-z0-9._-]+\b"),
+)
 
 SENSITIVE_OBSERVABILITY_KEYS = frozenset(
     {
@@ -105,8 +116,7 @@ def sanitize_for_observability(
     sensitive_keys: frozenset[str] = SENSITIVE_OBSERVABILITY_KEYS,
 ) -> dict[str, Any]:
     redacted = _redact_value(value, sensitive_keys=sensitive_keys)
-    envelope = observation_envelope(value, preview_chars=preview_chars)
-    envelope["preview"] = observation_envelope(redacted, preview_chars=preview_chars)["preview"]
+    envelope = observation_envelope(redacted, preview_chars=preview_chars)
     envelope["redacted"] = redacted != to_jsonable(value)
     return envelope
 
@@ -118,15 +128,22 @@ def _redact_value(value: Any, *, sensitive_keys: frozenset[str]) -> Any:
         for key, item in jsonable.items():
             key_text = str(key)
             if _is_sensitive_observability_key(key_text, sensitive_keys=sensitive_keys):
-                envelope = observation_envelope(item)
-                envelope["preview"] = "[redacted]"
-                redacted[key_text] = {"redacted": True, **envelope}
+                redacted[key_text] = {"redacted": True, "preview": "[redacted]"}
             else:
                 redacted[key_text] = _redact_value(item, sensitive_keys=sensitive_keys)
         return redacted
     if isinstance(jsonable, list):
         return [_redact_value(item, sensitive_keys=sensitive_keys) for item in jsonable]
+    if isinstance(jsonable, str):
+        return _redact_scalar_string(jsonable)
     return jsonable
+
+
+def _redact_scalar_string(value: str) -> str:
+    redacted = value
+    for pattern in _SCALAR_SECRET_PATTERNS:
+        redacted = pattern.sub("[redacted]", redacted)
+    return redacted
 
 
 def _is_sensitive_observability_key(key: str, *, sensitive_keys: frozenset[str]) -> bool:

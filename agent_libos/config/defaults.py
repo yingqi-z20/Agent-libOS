@@ -62,6 +62,15 @@ class GuiDefaults:
     http_shutdown_delay_s: float = 0.2
     object_task_wait_default_timeout_s: float = 30.0
     object_task_wait_max_timeout_s: float = 300.0
+    snapshot_event_limit: int = 200
+    snapshot_audit_limit: int = 200
+    snapshot_llm_call_limit: int = 100
+    snapshot_process_message_limit: int = 100
+    snapshot_process_llm_call_limit: int = 20
+    snapshot_object_task_limit: int = 100
+    snapshot_collection_max_items: int = 200
+    snapshot_string_max_chars: int = 8_192
+    sse_payload_max_bytes: int = 262_144
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -180,9 +189,12 @@ class ToolDefaults:
     message_subject_max_chars: int = 512
     message_body_max_chars: int = 32_000
     message_payload_max_bytes: int = 131_072
+    message_id_max_chars: int = 128
     message_read_limit: int = 100
     message_read_hard_limit: int = 1_000
     message_filter_ids_hard_limit: int = 1_000
+    message_filter_json_max_bytes: int = 16_384
+    message_wait_status_max_chars: int = 32_768
     human_request_payload_max_bytes: int = 131_072
     human_output_max_chars: int = 32_000
     human_request_list_limit: int = 1_000
@@ -520,8 +532,20 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _positive("runtime.launcher_max_quanta", runtime.launcher_max_quanta)
 
     gui = config.gui
-    _positive("gui.event_buffer_limit", gui.event_buffer_limit)
-    _positive("gui.request_body_max_bytes", gui.request_body_max_bytes)
+    for name in (
+        "event_buffer_limit",
+        "request_body_max_bytes",
+        "snapshot_event_limit",
+        "snapshot_audit_limit",
+        "snapshot_llm_call_limit",
+        "snapshot_process_message_limit",
+        "snapshot_process_llm_call_limit",
+        "snapshot_object_task_limit",
+        "snapshot_collection_max_items",
+        "snapshot_string_max_chars",
+        "sse_payload_max_bytes",
+    ):
+        _positive(f"gui.{name}", getattr(gui, name))
     _nonnegative("gui.scheduler_shutdown_join_timeout_s", gui.scheduler_shutdown_join_timeout_s)
     _nonnegative("gui.http_shutdown_delay_s", gui.http_shutdown_delay_s)
     _nonnegative("gui.object_task_wait_default_timeout_s", gui.object_task_wait_default_timeout_s)
@@ -645,9 +669,12 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "message_subject_max_chars",
         "message_body_max_chars",
         "message_payload_max_bytes",
+        "message_id_max_chars",
         "message_read_limit",
         "message_read_hard_limit",
         "message_filter_ids_hard_limit",
+        "message_filter_json_max_bytes",
+        "message_wait_status_max_chars",
         "human_request_payload_max_bytes",
         "human_output_max_chars",
         "human_request_list_limit",

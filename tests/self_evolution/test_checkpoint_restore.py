@@ -7,8 +7,8 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, CheckpointDefaults
-from agent_libos.models import CapabilityRight, HumanRequestStatus, ObjectMetadata, ObjectPatch, ObjectType, ProcessMessageStatus, ProcessStatus
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models import CapabilityEffect, CapabilityRight, EventType, HumanRequestStatus, ObjectMetadata, ObjectPatch, ObjectType, ProcessMessageStatus, ProcessStatus
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.substrate import LocalHumanProvider, LocalResourceProviderSubstrate
 from tests.support.checkpoints import ClassifiedShellProvider
 
@@ -29,6 +29,7 @@ class TestCheckpointRestore:
         runtime = Runtime.open('local')
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='root')
+            runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
             child = runtime.spawn_child_process(pid, 'child')
             unrelated = runtime.process.spawn(image='base-agent:v0', goal='other')
             handle = runtime.memory.create_object(pid, ObjectType.SUMMARY, {'version': 1}, ObjectMetadata(title='state'), immutable=False, name='state')
@@ -49,6 +50,50 @@ class TestCheckpointRestore:
             assert not runtime.capability.check(pid, 'test:temporary', CapabilityRight.READ)
             assert runtime.memory.get_object(unrelated, other_handle).payload == {'keep': True}
             assert result['restored_pids'] == [pid, child]
+        finally:
+            runtime.close()
+
+    def test_restore_does_not_resurrect_revoked_or_currently_denied_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='restore authority')
+                (Path(temp_dir) / 'secret.txt').write_text('secret', encoding='utf-8')
+                secret = runtime.filesystem.resource_for_path('secret.txt')
+                cap = runtime.filesystem.grant_path(pid, 'secret.txt', [CapabilityRight.READ], issued_by='test')
+                checkpoint_id = runtime.checkpoint.create(pid, 'before revoke', actor=pid)
+                runtime.capability.revoke(cap.cap_id, revoked_by=pid, reason='revoked before restore')
+                runtime.capability.issue_trusted(pid, secret, [CapabilityRight.READ], issued_by='test', effect=CapabilityEffect.DENY)
+
+                runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+                assert not runtime.capability.check(pid, secret, CapabilityRight.READ)
+                with pytest.raises(CapabilityDenied):
+                    runtime.filesystem.read_text(pid, 'secret.txt')
+            finally:
+                runtime.close()
+
+    def test_replay_to_event_is_scoped_to_checkpoint_process_subtree(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='replay scoped')
+            unrelated = runtime.process.spawn(image='base-agent:v0', goal='unrelated')
+            checkpoint_id = runtime.checkpoint.create(pid, 'before events', actor=pid)
+            unrelated_event = runtime.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source=unrelated,
+                target=unrelated,
+                payload={'secret': 'unrelated'},
+            )
+            related_event = runtime.events.emit(EventType.PROCESS_SIGNAL, source=pid, target=pid, payload={'ok': True})
+
+            with pytest.raises(NotFound):
+                runtime.checkpoint.replay_to_event(checkpoint_id, unrelated_event.event_id, actor=pid)
+            replayed = runtime.checkpoint.replay_to_event(checkpoint_id, related_event.event_id, actor=pid)
+
+            replayed_ids = [event['event_id'] for event in replayed['events']]
+            assert unrelated_event.event_id not in replayed_ids
+            assert replayed_ids[-1] == related_event.event_id
         finally:
             runtime.close()
 
@@ -107,6 +152,7 @@ class TestCheckpointRestore:
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
             try:
                 owner = runtime.process.spawn(image='base-agent:v0', goal='owner')
+                runtime.capability.grant(owner, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
                 child = runtime.spawn_child_process(owner, 'child')
                 unrelated = runtime.process.spawn(image='base-agent:v0', goal='other')
                 runtime.filesystem.grant_path(owner, 'owner.txt', [CapabilityRight.WRITE], issued_by='test')

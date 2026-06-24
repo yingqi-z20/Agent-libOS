@@ -458,6 +458,13 @@ async def _run_exec_command(runtime: Runtime, args: argparse.Namespace) -> dict[
     target_image = loaded_image["image_id"] if loaded_image is not None else args.image
     exec_args = _parse_json_mapping(args.args_json, "--args-json")
     old_process = runtime.process.get(args.pid)
+    if loaded_image is not None:
+        runtime.capability.grant(
+            args.pid,
+            runtime.image_registry.resource_for(target_image),
+            [CapabilityRight.READ],
+            issued_by="cli",
+        )
     old_image = old_process.image_id
     old_llm_profile = old_process.llm_profile_id
     process = runtime.exec_process(

@@ -271,7 +271,6 @@ export function App() {
             selectedPid={selectedPid}
             onMaxQuantaChange={setMaxQuanta}
             onOpenDb={() => void window.libosApi?.chooseDatabase().then(reconnect)}
-            onUseDb={(db) => void window.libosApi?.useDatabase(db).then(reconnect)}
             onSpawn={() => void spawnProcess()}
             onRun={() => selectedPid && client && void safe(() => client.run(selectedPid, maxQuanta).then(() => undefined))}
             onStep={() => selectedPid && client && void safe(() => client.step(selectedPid).then(() => undefined))}

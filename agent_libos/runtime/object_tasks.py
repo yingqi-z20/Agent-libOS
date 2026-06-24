@@ -10,6 +10,7 @@ from typing import Any, TYPE_CHECKING, Iterable
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
+    CapabilityRight,
     CapabilitySpec,
     EventPriority,
     EventType,
@@ -138,6 +139,7 @@ class ObjectTaskManager:
         if not self.runtime.tools.process_has_tool(pid, handle):
             raise ValidationError(f"tool is not in process tool table: {tool_name}")
         self._require_concurrency_capacity(owner.oid)
+        self.runtime.capability.require(pid, "process:spawn", CapabilityRight.WRITE)
 
         task_id = new_id("otask")
         runner_pid = self.runtime.process.spawn_child(

@@ -19,9 +19,14 @@
       "node_ids": [
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_filesystem_primitive_enforces_read_limits_without_tool_schema",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_directory_primitive_enforces_limit_without_tool_schema",
+        "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_filesystem_resource_keeps_os_distinct_path_names_separate",
+        "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_directory_listing_does_not_follow_child_symlink_metadata",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_concurrent_one_time_file_write_crosses_provider_once",
+        "tests/runtime/test_process_messages.py::TestProcessMessage::test_process_message_payload_limits_and_read_limit_are_enforced",
+        "tests/runtime/test_process_messages.py::TestProcessMessage::test_blocking_receive_rejects_oversized_wait_filters_before_status_write",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_primitive_enforces_timeout_limit_without_tool_schema",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_create_requires_shell_policy_before_provider_spawn",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_spawn_does_not_reuse_shell_run_timeout_scoped_capability",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_input_limit_fails_closed_before_provider_write",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_session_limit_fails_closed_before_provider_spawn",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_concurrent_pty_create_reserves_capacity_before_provider_spawn",
@@ -43,12 +48,14 @@
         "tests/security/test_capability.py::TestCapabilityManager::test_scoped_deny_rule_only_denies_matching_operation_context",
         "tests/security/test_capability.py::TestCapabilityManager::test_one_shot_grant_authority_is_consumed_after_successful_issue",
         "tests/security/test_capability.py::TestCapabilityManager::test_grant_authority_can_only_transfer_existing_allow_rights",
+        "tests/security/test_capability.py::TestCapabilityManager::test_grant_transfer_inherits_parent_expiration",
         "tests/security/test_capability.py::TestCapabilityManager::test_one_time_capability_claim_is_conditional",
         "tests/security/test_capability.py::TestCapabilityManager::test_delegate_can_only_attenuate_delegable_parent_capability",
         "tests/security/test_capability.py::TestCapabilityManager::test_delegated_capability_stops_authorizing_when_parent_is_revoked",
         "tests/security/test_capability.py::TestCapabilityManager::test_finite_use_capability_cannot_be_delegated_or_granted_onward",
         "tests/security/test_capability.py::TestCapabilityManager::test_capability_expiry_must_be_valid_iso_timestamp",
         "tests/security/test_capability.py::TestCapabilityManager::test_delegation_cannot_increase_parent_max_depth",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_capability_actor_mode_enforces_process_authority",
         "tests/security/test_capability.py::TestCapabilityRuntimeInterface::test_capability_syscalls_do_not_bypass_authority"
       ],
       "benchmark_attack_classes": []
@@ -59,6 +66,10 @@
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_creates_fresh_child_without_parent_memory_or_default_caps",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_requires_process_spawn_authority",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_fork_syscall_requires_process_spawn_authority",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_cross_image_spawn_and_exec_require_image_read_authority",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_start_requires_process_spawn_authority",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_inherits_only_explicit_capabilities",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_exec_process_swaps_image_without_granting_target_image_capabilities",
         "tests/runtime/test_process_working_directory.py::TestProcessWorkingDirectory::test_shell_tool_runs_from_process_working_directory"
@@ -137,6 +148,7 @@
         "tests/runtime/test_pty_module.py::TestPtyModule::test_process_exit_releases_pty_session_object_and_closes_provider",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_direct_object_release_closes_pty_session",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_close_failure_keeps_session_registered_for_retry",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_exited_pty_session_does_not_consume_process_session_capacity",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_runs_visible_tool_links_result_and_notifies_creator"
       ],
       "benchmark_attack_classes": []
@@ -169,8 +181,11 @@
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_exact_whitelist_rule_does_not_prefix_match_extra_args",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_allow_rule_with_shell_syntax_payload_requires_approval",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_local_shell_provider_uses_argv_without_shell_interpreter",
+        "tests/security/test_shell_primitive.py::TestShellMatcher::test_local_shell_provider_does_not_execute_workspace_path_hijack",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_shell_once_approval_does_not_authorize_pty_spawn",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_other_process_without_object_capability_cannot_operate_pty",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_comment_split_imports",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_tool_cannot_shadow_existing_tool_name",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_fails_closed_without_budget_limit_support",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_charges_returned_subprocess_metrics",
@@ -215,6 +230,7 @@
         "tests/unit/test_audit_manager.py::TestAuditManager::test_trace_limit_returns_latest_records_in_chronological_order",
         "tests/unit/test_audit_manager.py::TestAuditManager::test_trace_filters_before_applying_limit",
         "tests/providers/test_gui_server.py::TestGuiServer::test_snapshot_audit_window_contains_latest_records",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_snapshot_truncates_model_amplified_event_payloads",
         "tests/providers/test_gui_server.py::TestGuiServer::test_process_audit_filters_before_limit"
       ],
       "benchmark_attack_classes": []
@@ -224,8 +240,9 @@
       "title": "Tool observability records bounded preview, size, and hash instead of raw sensitive args or results.",
       "lane": "security",
       "node_ids": [
-        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_sanitizes_sensitive_fields_with_stable_hash",
+        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_sanitizes_sensitive_fields_without_hashing_secret_values",
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_redacts_common_credential_keys",
+        "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_redacts_scalar_credential_patterns",
         "tests/security/test_jit_security.py::TestJitSecurity::test_tool_events_and_audit_do_not_store_raw_sensitive_tool_args"
       ],
       "benchmark_attack_classes": []
@@ -236,6 +253,9 @@
       "lane": "security",
       "node_ids": [
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_is_format_and_dependency_lint_not_security_blacklist",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_comment_split_imports",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_mutable_jsr_versions",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_runtime_code_generation_import_bypasses",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_denies_missing_capability",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_candidate_specs_are_conservative_side_effects",
@@ -370,6 +390,7 @@
       "node_ids": [
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_untrusted_module_is_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_source_hash_mismatch_is_rejected",
+        "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_module_source_swap_after_trust_does_not_execute_swapped_bytes",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_json_manifest_duplicate_keys_are_rejected",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_manifest_schema_version_must_be_integer",
         "tests/runtime/test_runtime_modules.py::TestRuntimeModule::test_import_string_resolve_does_not_execute_package_init_before_trust",
@@ -389,6 +410,8 @@
       "lane": "self-evolution",
       "node_ids": [
         "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_preserves_append_only_history_and_reports_external_effects",
+        "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_restore_does_not_resurrect_revoked_or_currently_denied_capabilities",
+        "tests/self_evolution/test_checkpoint_restore.py::TestCheckpointRestore::test_replay_to_event_is_scoped_to_checkpoint_process_subtree",
         "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_resurrect_revoked_capability",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_normalizes_waiting_process_state",
@@ -412,11 +435,21 @@
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_rejects_undeclared_root_files",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_spawns_baked_memory_without_external_authority",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_exec_into_committed_image_restores_baked_memory_without_granting_required_caps",
+        "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_boot_requires_image_read_authority",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_jit_tool_remains_process_local",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_jit_tool_source_survives_runtime_reopen",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_does_not_package_external_registry_or_skill_trust"
       ],
       "benchmark_attack_classes": ["self_evolution_image"]
+    },
+    {
+      "id": "agent-output-is-not-control-channel",
+      "title": "Untrusted command output cannot trigger agent lifecycle control actions.",
+      "lane": "self-evolution",
+      "node_ids": [
+        "tests/self_evolution/test_mini_swe_agent_image.py::TestMiniSWEAgentImage::test_bash_source_contract_uses_explicit_submit_flag"
+      ],
+      "benchmark_attack_classes": []
     },
     {
       "id": "jsonrpc-provider-effects-are-registered-and-classified",
@@ -479,7 +512,9 @@
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_enforces_subprocess_wall_limit_with_metrics",
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_timeout_returns_metrics",
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_drains_large_stdout_while_monitoring",
+        "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_shell_provider_terminates_background_child_process_tree",
         "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_pty_provider_smoke",
+        "tests/providers/test_resource_substrate.py::TestResourceProviderSubstrate::test_local_pty_provider_close_terminates_child_process_tree",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_reader_drops_old_output_when_buffer_limit_is_reached",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_wall_time_budget_uses_monotonic_session_elapsed_time",
         "tests/security/test_resource_constraints.py::TestResourceConstraints::test_always_allow_shell_policy_does_not_bypass_subprocess_wall_budget",
@@ -494,6 +529,8 @@
       "lane": "benchmark",
       "node_ids": [
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_loads_m1_task_suite",
+        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_workspace_fixture_copy_rejects_symlinks",
+        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_runtime_setup_paths_must_stay_under_prepared_workspace",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_deterministic_smoke_run_across_baselines_and_libos",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_self_evolution_smoke_run_across_wrapper_and_libos"
       ],

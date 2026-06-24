@@ -2,6 +2,7 @@ from __future__ import annotations
 import pytest
 from uuid import uuid4
 from agent_libos import Runtime
+from agent_libos.models import CapabilityRight
 
 class TestGranularPermission:
 
@@ -44,6 +45,7 @@ class TestGranularPermission:
         denied_file = self._write_fixture('denied child read')
         parent_write = f'agent_outputs/inherit_parent_write_{uuid4().hex}.txt'
         parent = self.runtime.process.spawn(image='review-agent:v0', goal='parent')
+        self.runtime.capability.grant(parent, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
         self.runtime.filesystem.grant_path_list(parent, read_dirs=[allowed_dir], write_files=[parent_write], issued_by='test')
         forked = self.runtime.tools.call(parent, 'fork_child_process', {'goal': 'child', 'inherit_read_dirs': [allowed_dir]})
         child = forked.payload['child_pid']
@@ -62,6 +64,7 @@ class TestGranularPermission:
     def test_child_cannot_inherit_broader_permission_than_parent_has(self) -> None:
         allowed_file = self._write_fixture('one file')
         parent = self.runtime.process.spawn(image='review-agent:v0', goal='parent')
+        self.runtime.capability.grant(parent, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
         self.runtime.filesystem.grant_path_list(parent, read_files=[allowed_file], issued_by='test')
         requested_dir = '/'.join(allowed_file.split('/')[:-1])
         forked = self.runtime.tools.call(parent, 'fork_child_process', {'goal': 'child', 'inherit_read_dirs': [requested_dir]})

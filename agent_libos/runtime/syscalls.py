@@ -737,7 +737,7 @@ class LibOSSyscallSession:
 
     def _process_fork(self, args: dict[str, Any]) -> Any:
         mode = ForkMode(str(args.get("mode", ForkMode.WORKER.value)))
-        child_pid = self.runtime.process.fork(
+        child_pid = self.runtime.fork_child_process(
             parent=self.pid,
             goal=args.get("goal", ""),
             memory_view=MemoryViewSpec(

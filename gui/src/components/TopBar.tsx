@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import { Database, Pause, Play, RefreshCw, Square, StepForward } from "lucide-react";
 import type { SchedulerStatus } from "../api/types";
 import { useI18n } from "../i18n";
@@ -11,7 +10,6 @@ export function TopBar({
   selectedPid,
   onMaxQuantaChange,
   onOpenDb,
-  onUseDb,
   onSpawn,
   onRun,
   onStep,
@@ -26,7 +24,6 @@ export function TopBar({
   selectedPid: string | null;
   onMaxQuantaChange(value: number | null): void;
   onOpenDb(): void;
-  onUseDb(value: string): void;
   onSpawn(): void;
   onRun(): void;
   onStep(): void;
@@ -36,8 +33,6 @@ export function TopBar({
   onShowUser?: () => void;
 }) {
   const { t } = useI18n();
-  const [dbValue, setDbValue] = useState(db);
-  useEffect(() => setDbValue(db), [db]);
 
   return (
     <header className="topBar">
@@ -45,11 +40,8 @@ export function TopBar({
         <Database size={17} />
         <input
           aria-label={t("top.runtimeDatabase")}
-          value={dbValue}
-          onChange={(event) => setDbValue(event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") onUseDb(dbValue);
-          }}
+          value={db}
+          readOnly
         />
         <button title={t("top.openSqlite")} onClick={onOpenDb}>{t("top.open")}</button>
       </div>

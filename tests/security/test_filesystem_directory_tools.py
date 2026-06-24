@@ -57,6 +57,23 @@ class TestFilesystemDirectoryTool:
         assert 'lacks delete' in (denied.error or '')
         assert (self.runtime.workspace_root / path).exists()
 
+    def test_filesystem_resource_keeps_os_distinct_path_names_separate(self) -> None:
+        if os.name == 'nt':
+            pytest.skip('backslash is a path separator on Windows')
+        base = f'agent_outputs/path_alias_{uuid4().hex}'
+        normal = self._write_fixture(f'{base}/dir/file.txt', 'normal')
+        backslash = self._write_fixture(f'{base}/dir\\file.txt', 'backslash')
+        trailing_space = self._write_fixture(f'{base}/space.txt ', 'space')
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='path alias')
+        self.runtime.filesystem.grant_path(pid, normal, [CapabilityRight.READ], issued_by='test')
+        self.runtime.filesystem.grant_path(pid, f'{base}/space.txt', [CapabilityRight.READ], issued_by='test')
+
+        assert self.runtime.filesystem.read_text(pid, normal).content == 'normal'
+        with pytest.raises(CapabilityDenied):
+            self.runtime.filesystem.read_text(pid, backslash)
+        with pytest.raises(CapabilityDenied):
+            self.runtime.filesystem.read_text(pid, trailing_space)
+
     def test_delete_ask_each_time_uses_filesystem_primitive_context(self) -> None:
         path = self._write_fixture(f'agent_outputs/delete_prompt_{uuid4().hex}.txt', 'delete me')
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='delete with prompt')
@@ -144,6 +161,29 @@ class TestFilesystemDirectoryTool:
                 with pytest.raises(CapabilityDenied):
                     runtime.filesystem.write_text(pid, 'dir/payload.txt', 'escaped')
                 assert not (Path(outside) / 'payload.txt').exists()
+            finally:
+                runtime.close()
+
+    def test_directory_listing_does_not_follow_child_symlink_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            (root / 'list').mkdir()
+            outside_file = Path(outside) / 'outside.txt'
+            outside_file.write_text('outside secret metadata', encoding='utf-8')
+            try:
+                os.symlink(outside_file, root / 'list' / 'outside-link')
+            except OSError:
+                pytest.skip('symlink creation is not available in this environment')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='list symlink')
+                runtime.filesystem.grant_directory(pid, 'list', [CapabilityRight.READ], issued_by='test')
+
+                result = runtime.filesystem.read_directory(pid, 'list')
+
+                assert result.entries[0].name == 'outside-link'
+                assert result.entries[0].kind == 'symlink'
+                assert result.entries[0].size_bytes is None
             finally:
                 runtime.close()
 

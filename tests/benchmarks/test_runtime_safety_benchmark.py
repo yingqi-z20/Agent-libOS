@@ -3,11 +3,13 @@ import pytest
 import os
 import tempfile
 from pathlib import Path
+from agent_libos import Runtime
+from benchmarks.runtime_safety.fixtures import prepare_workspace
 from benchmarks.runtime_safety.loader import load_task_file, load_tasks
 from benchmarks.runtime_safety.metrics import METRIC_COLUMNS, collect_metrics, write_metrics
-from benchmarks.runtime_safety.models import BenchmarkValidationError, EffectRecord
+from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationError, EffectRecord
 from benchmarks.runtime_safety.oracle import classify_effects, safety_summary
-from benchmarks.runtime_safety.runners import run_suite, run_task, write_run_outputs
+from benchmarks.runtime_safety.runners import _setup_runtime_benchmark_resources, run_suite, run_task, write_run_outputs
 SUITE_ROOT = Path('benchmarks/runtime_safety')
 
 class TestRuntimeSafetyBenchmark:
@@ -25,6 +27,44 @@ class TestRuntimeSafetyBenchmark:
             path.write_text('\nschema_version: 0\nid: bad_task\ntitle: Bad\ngoal: Bad\nworkspace: fixtures/basic_repo\nattack_class: malformed\nallowed_effects:\n  - type: filesystem.read\n    path: "../secret"\nforbidden_effects: []\nsuccess_oracle: []\nsafety_oracle: []\n'.strip(), encoding='utf-8')
             with pytest.raises(BenchmarkValidationError):
                 load_task_file(path)
+
+    def test_workspace_fixture_copy_rejects_symlinks(self) -> None:
+        if os.name == 'nt':
+            pytest.skip('symlink setup is platform-sensitive on Windows')
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            suite = root / 'suite'
+            workspace = suite / 'fixtures' / 'repo'
+            workspace.mkdir(parents=True)
+            outside = root / 'outside.txt'
+            outside.write_text('outside', encoding='utf-8')
+            try:
+                os.symlink(outside, workspace / 'outside-link')
+            except OSError:
+                pytest.skip('symlink creation is not available in this environment')
+            task = _minimal_task(workspace='fixtures/repo')
+
+            with pytest.raises(BenchmarkValidationError, match='symlink'):
+                prepare_workspace(task, suite, root / 'run', 'agent_libos_full')
+
+    def test_runtime_setup_paths_must_stay_under_prepared_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / 'workspace'
+            workspace.mkdir()
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='benchmark setup path')
+                setups: list[dict[str, object]] = [
+                    {'skills': [{'path': '../host-skill'}]},
+                    {'images': [{'path': '../host-image'}]},
+                    {'jsonrpc_endpoints': [{'path': '../host-endpoint.yaml'}]},
+                ]
+                for setup in setups:
+                    task = _minimal_task(setup=setup)
+                    with pytest.raises(BenchmarkValidationError, match='escape workspace'):
+                        _setup_runtime_benchmark_resources(task, runtime, workspace, pid)
+            finally:
+                runtime.close()
 
     def test_oracle_classifies_allowed_forbidden_and_unknown(self) -> None:
         task = next((task for task in load_tasks(SUITE_ROOT) if task.id == 'fs_write_forbidden_001'))
@@ -111,3 +151,19 @@ class TestRuntimeSafetyBenchmark:
         with tempfile.TemporaryDirectory() as temp_dir:
             run = run_task(task, SUITE_ROOT, temp_dir, runner='agent_libos_full', llm_mode='real', max_quanta=1)
             assert run.result.metadata.get('llm_calls', 0) >= 1
+
+
+def _minimal_task(*, workspace: str = 'fixtures/basic_repo', setup: dict[str, object] | None = None) -> BenchmarkTask:
+    return BenchmarkTask(
+        id='path_boundary',
+        title='Path boundary',
+        goal='check path boundary',
+        workspace=workspace,
+        attack_class='test',
+        allowed_effects=[],
+        forbidden_effects=[],
+        success_oracle=[],
+        safety_oracle=[],
+        setup=setup or {},
+        mock_actions=[{'action': 'process_exit'}],
+    )

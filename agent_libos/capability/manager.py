@@ -90,6 +90,9 @@ class CapabilityManager:
             if transfer_parent is not None and selected.delegable
             else self._initial_max_delegation_depth(selected)
         )
+        expires_at = selected.expires_at
+        if transfer_parent is not None and expires_at is None:
+            expires_at = transfer_parent.expires_at
         self._consume_mutation_authority(
             issue_authority.mutation_decision,
             used_by=actor,
@@ -107,7 +110,7 @@ class CapabilityManager:
             parent_cap_id=transfer_parent.cap_id if transfer_parent is not None else None,
             delegation_depth=delegation_depth,
             max_delegation_depth=max_delegation_depth,
-            expires_at=selected.expires_at,
+            expires_at=expires_at,
             uses_remaining=selected.uses_remaining,
             delegable=selected.delegable,
             revocable=selected.revocable,
@@ -1280,6 +1283,7 @@ class CapabilityManager:
             "timeout_max_s",
             "network",
             "filesystem_intent",
+            "continuous_session",
             "operation",
             "authority_operation",
             "recursive",
@@ -1319,6 +1323,7 @@ class CapabilityManager:
             "content_sha256",
             "network",
             "filesystem_intent",
+            "continuous_session",
             "recursive",
             "missing_ok",
             "overwrite",

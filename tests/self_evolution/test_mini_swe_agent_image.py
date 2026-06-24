@@ -24,11 +24,12 @@ class TestMiniSWEAgentImage:
             "Implement the general solution",
             "Operating loop:",
             "Run focused tests first",
-            "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+            "`submit: true`",
         ]
 
         for phrase in required_phrases:
             assert phrase in prompt
+        assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" not in prompt
 
     def test_package_validates_and_registers_as_image_only_single_bash_tool(self) -> None:
         runtime = Runtime.open("local")
@@ -84,17 +85,20 @@ class TestMiniSWEAgentImage:
 
         assert [item["name"] for item in specs] == ["bash"]
         assert spec["input_schema"]["required"] == ["command"]
-        assert set(spec["input_schema"]["properties"]) == {"command"}
+        assert set(spec["input_schema"]["properties"]) == {"command", "submit"}
+        assert spec["input_schema"]["properties"]["submit"]["type"] == "boolean"
         assert spec["input_schema"]["additionalProperties"] is False
 
-    def test_bash_source_contract_matches_package_only_mini_compatibility(self) -> None:
+    def test_bash_source_contract_uses_explicit_submit_flag(self) -> None:
         source = PACKAGE_ROOT.joinpath("tools/scripts/bash.ts").read_text(encoding="utf-8")
 
-        assert 'const SUBMIT_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT";' in source
+        assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" not in source
+        assert "firstLogicalLine" not in source
         assert "const TIMEOUT_SECONDS = 30;" in source
         assert "const OUTPUT_LIMIT = 10000;" in source
         assert "const OUTPUT_EDGE = 5000;" in source
         assert 'argv: ["bash", "-lc", `exec 2>&1; ${command}`]' in source
         assert 'libos.syscall("shell.run"' in source
         assert 'libos.syscall("process.exit"' in source
+        assert "args.submit === true" in source
         assert "return observation(-1" in source

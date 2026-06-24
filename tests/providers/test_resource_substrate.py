@@ -1,5 +1,8 @@
 from __future__ import annotations
+import contextlib
+import os
 import pytest
+import psutil
 import sys
 import tempfile
 import time
@@ -115,6 +118,31 @@ class TestResourceProviderSubstrate:
             assert len(result.stdout) == 200000
             assert result.metrics is not None
 
+    def test_local_shell_provider_terminates_background_child_process_tree(self) -> None:
+        if sys.platform == "win32":
+            pytest.skip("POSIX process-group cleanup does not apply to Windows shell provider")
+        marker = f"SHELL_PROVIDER_TREE_{time.monotonic_ns()}"
+        child_script = "import time; time.sleep(60)"
+        parent_script = (
+            "import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {child_script!r}, {marker!r}]); "
+            "time.sleep(0.2)"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalShellProvider(temp_dir)
+            try:
+                result = provider.run([sys.executable, "-c", parent_script, marker], timeout=5.0)
+                assert result.returncode == 0
+
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and _processes_with_marker(marker):
+                    time.sleep(0.05)
+                assert _processes_with_marker(marker) == []
+            finally:
+                for proc in _processes_with_marker(marker):
+                    with contextlib.suppress(psutil.Error):
+                        proc.kill()
+
     def test_local_pty_provider_smoke(self) -> None:
         if sys.platform == "win32":
             pytest.importorskip("winpty")
@@ -134,6 +162,37 @@ class TestResourceProviderSubstrate:
                 assert "PTY_PROVIDER_SMOKE" in output
             finally:
                 session.close(force=True, timeout_s=1.0)
+
+    def test_local_pty_provider_close_terminates_child_process_tree(self) -> None:
+        if sys.platform == "win32":
+            pytest.skip("POSIX process-group cleanup does not apply to pywinpty")
+        marker = f"PTY_PROVIDER_TREE_{time.monotonic_ns()}"
+        child_script = "import time; time.sleep(60)"
+        parent_script = (
+            "import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {child_script!r}, {marker!r}]); "
+            "time.sleep(60)"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalPtyProvider(temp_dir)
+            session = provider.spawn([sys.executable, "-c", parent_script, marker], cols=80, rows=24)
+            try:
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and len(_processes_with_marker(marker)) < 2:
+                    time.sleep(0.05)
+                assert len(_processes_with_marker(marker)) >= 2
+
+                session.close(force=True, timeout_s=0.5)
+
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and _processes_with_marker(marker):
+                    time.sleep(0.05)
+                assert _processes_with_marker(marker) == []
+            finally:
+                session.close(force=True, timeout_s=0.5)
+                for proc in _processes_with_marker(marker):
+                    with contextlib.suppress(psutil.Error):
+                        proc.kill()
 
     def test_effectful_provider_without_classification_fails_closed(self) -> None:
         runtime = Runtime.open('local')
@@ -206,6 +265,21 @@ class RecordingFilesystemProvider:
 
     def __getattr__(self, name: str):
         return getattr(self.inner, name)
+
+
+def _processes_with_marker(marker: str) -> list[psutil.Process]:
+    matches: list[psutil.Process] = []
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        if proc.pid == current_pid:
+            continue
+        try:
+            cmdline = proc.info.get("cmdline") or []
+        except psutil.Error:
+            continue
+        if marker in " ".join(str(part) for part in cmdline):
+            matches.append(proc)
+    return matches
 
 class FakeClockProvider:
 

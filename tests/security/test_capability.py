@@ -11,6 +11,11 @@ from agent_libos.models import CapabilityEffect, CapabilityRight, CapabilitySpec
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 
+
+def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
+    runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+
+
 class TestCapabilityManager:
 
     def test_typed_resource_matching_rejects_prefix_collision(self) -> None:
@@ -274,6 +279,42 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_grant_transfer_inherits_parent_expiration(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            issuer = runtime.process.spawn(image='base-agent:v0', goal='issuer')
+            subject = runtime.process.spawn(image='base-agent:v0', goal='subject')
+            source = runtime.capability.issue_trusted(
+                issuer,
+                'object:leased',
+                [CapabilityRight.READ],
+                issued_by='test',
+                expires_at='2999-01-01T00:00:00Z',
+            )
+            runtime.capability.issue_trusted(issuer, 'object:leased', [CapabilityRight.GRANT], issued_by='test')
+
+            issued = runtime.capability.issue(
+                issuer,
+                subject,
+                CapabilitySpec(resource='object:leased', rights={CapabilityRight.READ.value}),
+            )
+
+            assert issued.parent_cap_id == source.cap_id
+            assert issued.expires_at == source.expires_at
+            assert runtime.capability.inspect(issued.cap_id)['expires_at'] == source.expires_at
+            with pytest.raises(CapabilityDenied):
+                runtime.capability.issue(
+                    issuer,
+                    subject,
+                    CapabilitySpec(
+                        resource='object:leased',
+                        rights={CapabilityRight.READ.value},
+                        expires_at='3000-01-01T00:00:00Z',
+                    ),
+                )
+        finally:
+            runtime.close()
+
     def test_one_time_capability_claim_is_conditional(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -318,6 +359,7 @@ class TestCapabilityManager:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'child')
             runtime.capability.grant(parent, 'filesystem:workspace:src/*', [CapabilityRight.READ, CapabilityRight.WRITE], issued_by='test', delegable=True)
             delegated = runtime.capability.delegate(parent, child, CapabilitySpec(resource='filesystem:workspace:src/main.py', rights={CapabilityRight.READ.value}))
@@ -333,6 +375,7 @@ class TestCapabilityManager:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'child')
             parent_cap = runtime.capability.grant(parent, 'object:shared', [CapabilityRight.READ], issued_by='test', delegable=True)
             delegated = runtime.capability.delegate(parent, child, CapabilitySpec(resource='object:shared', rights={CapabilityRight.READ.value}))
@@ -347,6 +390,7 @@ class TestCapabilityManager:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'child')
             subject = runtime.process.spawn(image='base-agent:v0', goal='subject')
             runtime.capability.issue_trusted(
@@ -369,6 +413,7 @@ class TestCapabilityManager:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'child')
             policy_cap = runtime.capability.grant(parent, 'shell:*', [CapabilityRight.EXECUTE], issued_by='test', constraints={runtime.config.shell.policy_capability_key: runtime.config.shell.always_allow_level}, delegable=True)
             with pytest.raises(CapabilityDenied):
@@ -382,6 +427,7 @@ class TestCapabilityManager:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'child')
             runtime.capability.issue(
                 'test',
@@ -468,6 +514,7 @@ class TestCapabilityRuntimeInterface:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'child')
             other = runtime.process.spawn(image='base-agent:v0', goal='other')
             runtime.capability.grant(parent, 'object:shared', [CapabilityRight.READ], issued_by='test', delegable=True)
@@ -492,6 +539,7 @@ class TestCapabilityRuntimeInterface:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
             runtime.capability.grant(parent, 'shell:*', [CapabilityRight.EXECUTE], issued_by='test', constraints={runtime.config.shell.policy_capability_key: runtime.config.shell.always_allow_level}, delegable=True)
             before = len(runtime.process.list())
             with pytest.raises(CapabilityDenied):

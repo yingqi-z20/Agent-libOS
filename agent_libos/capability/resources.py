@@ -13,7 +13,7 @@ class ResourceAuthority:
     """
 
     def canonical(self, resource: str) -> str:
-        raw = str(resource).strip().replace("\\", "/")
+        raw = str(resource).strip()
         while "//" in raw:
             raw = raw.replace("//", "/")
         return raw.rstrip("/") if raw.endswith("/") and not raw.endswith(":/") else raw

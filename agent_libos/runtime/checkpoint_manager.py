@@ -7,8 +7,10 @@ from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
     AgentImage,
+    Capability,
     CapabilityEffect,
     CapabilityRight,
+    CapabilityStatus,
     Checkpoint,
     EventType,
     HumanRequestStatus,
@@ -360,10 +362,13 @@ class CheckpointManager:
         if require_capability and actor is not None:
             self._require_checkpoint_or_process_read(actor, checkpoint)
         events = self.store.list_events()
+        scoped_pids = set(self._subtree_pids(checkpoint.pid))
         selected = []
         reached = False
         for event in events:
             if event.created_at < checkpoint.created_at:
+                continue
+            if event.source not in scoped_pids and event.target not in scoped_pids:
                 continue
             selected.append(
                 {
@@ -469,6 +474,7 @@ class CheckpointManager:
         rows = snapshot["rows"]
         object_oids = set(snapshot.get("object_oids", [])) | set(self._current_scoped_object_oids(current_pids))
         namespace_names = set(snapshot.get("namespaces", [])) | set(self._current_scoped_namespaces(current_pids))
+        restored_capability_rows = self._filtered_restored_capability_rows(rows.get("capabilities", []))
         with self.store.transaction(include_object_payloads=True) as cur:
             # Pending human/message state belongs to the same reconstructable
             # restore boundary as process rows. If a later insert fails, these
@@ -498,9 +504,7 @@ class CheckpointManager:
                     self.store.set_object_payload(oid, deepcopy(snapshot["object_payloads"][oid]))
             for row in rows.get("object_links", []):
                 self._insert_row(cur, "object_links", row)
-            for row in rows.get("capabilities", []):
-                if str(row.get("resource", "")).startswith(self.CHECKPOINT_RESOURCE_PREFIX):
-                    continue
+            for row in restored_capability_rows:
                 self._insert_row(cur, "capabilities", row)
             for row in rows.get("process_resource_reservations", []):
                 self._insert_row(cur, "process_resource_reservations", row)
@@ -642,6 +646,64 @@ class CheckpointManager:
             if decision.allowed and decision.selected_capability_id == capability.cap_id:
                 allowed.append(right)
         return allowed
+
+    def _filter_restored_capability_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        if str(row.get("resource", "")).startswith(self.CHECKPOINT_RESOURCE_PREFIX):
+            return None
+        current = self.store.get_capability(str(row.get("cap_id")))
+        if current is not None:
+            if not current.active or self._capability_is_expired(current):
+                return None
+            capability = current
+        else:
+            capability = self._capability_from_row(row)
+            if self._capability_is_expired(capability):
+                return None
+        item = dict(row)
+        item["uses_remaining"] = capability.uses_remaining
+        item["status"] = CapabilityStatus.ACTIVE.value
+        item["effect"] = capability.effect.value
+        item["rights_json"] = dumps(sorted(capability.rights))
+        if capability.effect == CapabilityEffect.ALLOW:
+            allowed_rights = self._currently_allowed_fork_rights(capability)
+            if not allowed_rights:
+                return None
+            item["rights_json"] = dumps(allowed_rights)
+        return item
+
+    def _filtered_restored_capability_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        kept: list[dict[str, Any]] = []
+        for row in rows:
+            filtered = self._filter_restored_capability_row(row)
+            if filtered is not None:
+                kept.append(filtered)
+        return kept
+
+    def _capability_from_row(self, row: dict[str, Any]) -> Capability:
+        return Capability(
+            cap_id=str(row["cap_id"]),
+            subject=str(row["subject"]),
+            resource=str(row["resource"]),
+            rights=set(loads(row.get("rights_json"), [])),
+            constraints=loads(row.get("constraints_json"), {}),
+            issued_by=str(row.get("issued_by") or "checkpoint.restore"),
+            issued_at=str(row.get("issued_at") or utc_now()),
+            expires_at=row.get("expires_at"),
+            delegable=bool(row.get("delegable")),
+            revocable=bool(row.get("revocable", True)),
+            effect=CapabilityEffect(str(row.get("effect") or CapabilityEffect.ALLOW.value)),
+            issuer_cap_id=row.get("issuer_cap_id"),
+            parent_cap_id=row.get("parent_cap_id"),
+            delegation_depth=int(row.get("delegation_depth") or 0),
+            max_delegation_depth=(
+                int(row["max_delegation_depth"])
+                if row.get("max_delegation_depth") is not None
+                else None
+            ),
+            uses_remaining=row.get("uses_remaining"),
+            status=CapabilityStatus(str(row.get("status") or CapabilityStatus.ACTIVE.value)),
+            metadata=loads(row.get("metadata_json"), {}),
+        )
 
     def _current_restrictive_capabilities(self, subject: str) -> list[Any]:
         if self.capabilities is None:

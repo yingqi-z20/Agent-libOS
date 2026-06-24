@@ -1,4 +1,3 @@
-const SUBMIT_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT";
 const TIMEOUT_SECONDS = 30;
 const OUTPUT_LIMIT = 10000;
 const OUTPUT_EDGE = 5000;
@@ -12,10 +11,6 @@ function commandText(value: unknown): string {
     throw new Error("command must be a non-empty string");
   }
   return value;
-}
-
-function firstLogicalLine(text: string): string {
-  return text.replace(/^\s+/, "").split(/\r?\n/, 1)[0] ?? "";
 }
 
 function observation(returncode: number, output: string, exceptionInfo = ""): Record<string, unknown> {
@@ -38,6 +33,7 @@ function observation(returncode: number, output: string, exceptionInfo = ""): Re
 
 export async function run(args: Record<string, unknown>, libos: LibOS): Promise<Record<string, unknown>> {
   const command = commandText(args.command);
+  const submit = args.submit === true;
   try {
     const result = await libos.syscall("shell.run", {
       argv: ["bash", "-lc", `exec 2>&1; ${command}`],
@@ -47,7 +43,7 @@ export async function run(args: Record<string, unknown>, libos: LibOS): Promise<
     const stdout = String(result.stdout ?? "");
     const stderr = String(result.stderr ?? "");
     const output = stdout + stderr;
-    if (returncode === 0 && firstLogicalLine(output) === SUBMIT_SENTINEL) {
+    if (returncode === 0 && submit) {
       await libos.syscall("process.exit", {
         payload: {
           status: "submitted",

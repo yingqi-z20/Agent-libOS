@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from pydantic import BaseModel
@@ -11,7 +12,7 @@ from agent_libos.tools.builtin.process import ProcessExitTool
 from agent_libos.tools.builtin.memory import CreateMemoryObjectTool
 from agent_libos.tools.builtin.object_tasks import StartObjectTaskTool, WatchObjectTaskOwnerTool
 from agent_libos.tools.builtin.permission import RequestPermissionTool
-from agent_libos.tools.observability import sanitize_for_observability
+from agent_libos.tools.observability import json_bytes, sanitize_for_observability
 
 
 class EmptyArgs(BaseModel):
@@ -83,7 +84,7 @@ class TestToolPolicyAndObservability:
         assert "capability.write" in delegate.side_effects
         assert "checkpoint.restore" in restore.side_effects
 
-    def test_observability_sanitizes_sensitive_fields_with_stable_hash(self) -> None:
+    def test_observability_sanitizes_sensitive_fields_without_hashing_secret_values(self) -> None:
         secret = "SECRET_TOKEN_SHOULD_NOT_APPEAR"
         value = {
             "path": "notes.txt",
@@ -97,9 +98,10 @@ class TestToolPolicyAndObservability:
 
         assert first["sha256"] == second["sha256"]
         assert first["bytes"] == second["bytes"]
+        assert first["sha256"] != hashlib.sha256(json_bytes(value)).hexdigest()
         assert secret not in first["preview"]
         assert first["redacted"] is True
-        assert "sha256" in first["preview"]
+        assert "sha256" not in first["preview"]
 
     def test_observability_redacts_common_credential_keys(self) -> None:
         secret = "sk_live_very_secret"
@@ -114,3 +116,22 @@ class TestToolPolicyAndObservability:
 
         assert secret not in sanitized["preview"]
         assert sanitized["redacted"] is True
+
+    def test_observability_redacts_scalar_credential_patterns(self) -> None:
+        secret = "sk_live_scalar_secret"
+        quoted_password = "hunter2"
+        quoted_token = "plainquotedtoken"
+        sentinel = "SECRET_TOKEN_SHOULD_NOT_APPEAR"
+        sanitized = sanitize_for_observability(
+            f"provider failed Authorization: Bearer {secret}; token={secret}; password='{quoted_password}'; api_key=\"{quoted_token}\"; {sentinel}",
+            preview_chars=10_000,
+        )
+        plain = sanitize_for_observability("ordinary failure message", preview_chars=10_000)
+
+        assert secret not in sanitized["preview"]
+        assert quoted_password not in sanitized["preview"]
+        assert quoted_token not in sanitized["preview"]
+        assert sentinel not in sanitized["preview"]
+        assert sanitized["redacted"] is True
+        assert plain["redacted"] is False
+        assert "ordinary failure message" in plain["preview"]

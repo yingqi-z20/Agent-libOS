@@ -66,6 +66,7 @@ class TestCheckpointFork:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='waiting parent')
+            runtime.capability.grant(parent, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
             child = runtime.spawn_child_process(parent, 'unfinished child')
             with pytest.raises(ProcessWaitRequired):
                 runtime.process.wait(parent, child)

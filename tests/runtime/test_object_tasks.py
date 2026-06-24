@@ -31,6 +31,10 @@ from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
 
 
+def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
+    runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
+
+
 class EmptyArgs(BaseModel):
     pass
 
@@ -68,6 +72,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="object task")
+            _grant_process_spawn(runtime, pid)
             owner = runtime.memory.create_object(
                 pid,
                 ObjectType.ARTIFACT,
@@ -113,6 +118,7 @@ class TestObjectTasks:
         runtime.messages.post = delayed_post  # type: ignore[method-assign]
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="object task wait notification")
+            _grant_process_spawn(runtime, pid)
             owner = runtime.memory.create_object(
                 pid,
                 ObjectType.ARTIFACT,
@@ -165,11 +171,27 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_object_task_start_requires_process_spawn_authority(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="object task without spawn")
+            owner = _owner(runtime, pid)
+            before = len(runtime.process.list())
+
+            with pytest.raises(CapabilityDenied, match="process:spawn"):
+                runtime.object_tasks.start(pid, owner, "get_working_directory", {})
+
+            assert len(runtime.process.list()) == before
+            assert runtime.store.list_object_tasks(include_terminal=True) == []
+        finally:
+            runtime.close()
+
     def test_object_task_runner_does_not_inherit_external_capability_unless_explicit(self, tmp_path: Path) -> None:
         runtime = Runtime.open("local", substrate=LocalResourceProviderSubstrate(tmp_path))
         try:
             path = f"agent_outputs/object_task_{uuid4().hex}.txt"
             pid = runtime.process.spawn(image="review-agent:v0", goal="write from object task")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             runtime.filesystem.grant_path(pid, path, [CapabilityRight.WRITE], issued_by="test", delegable=True)
 
@@ -197,6 +219,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="scheduler isolation")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(pid, owner, "receive_process_messages", {"channel": "never"})
             waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
@@ -220,7 +243,9 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             parent = runtime.process.spawn(image="base-agent:v0", goal="one time owner")
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, "object task creator")
+            _grant_process_spawn(runtime, child)
             owner = _owner(runtime, parent)
             cap = runtime.capability.issue_trusted(
                 subject=child,
@@ -250,6 +275,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             parent = runtime.process.spawn(image="base-agent:v0", goal="parent")
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, "wait for task")
             owner = _owner(runtime, parent)
             with pytest.raises(ProcessMessageWaitRequired):
@@ -279,6 +305,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             parent = runtime.process.spawn(image="base-agent:v0", goal="parent")
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, "notify me")
             owner = _owner(runtime, parent)
             task = runtime.object_tasks.start(parent, owner, "sleep", {"seconds": 0.05}, notify_pid=child)
@@ -296,6 +323,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             parent = runtime.process.spawn(image="base-agent:v0", goal="parent")
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, "notify me")
             owner = _owner(runtime, parent)
             task = runtime.object_tasks.start(parent, owner, "get_working_directory", {}, notify_pid=child)
@@ -314,6 +342,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="wait task")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(
                 pid,
@@ -334,6 +363,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="permission task")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             runtime.capability.grant(pid, "human:owner", [CapabilityRight.WRITE], issued_by="test", delegable=True)
             resource = "filesystem:workspace:agent_outputs/object_task_permission.txt"
@@ -365,6 +395,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="watch owner")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(
                 pid,
@@ -400,6 +431,7 @@ class TestObjectTasks:
             counter: dict[str, int] = {}
             handle = runtime.tools.register_tool(SideEffectThenWaitTool(counter), registered_by="test", ephemeral=True)
             pid = runtime.process.spawn(image="base-agent:v0", goal="unsafe replay")
+            _grant_process_spawn(runtime, pid)
             runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(pid, owner, "side_effect_then_wait", {}, owner_watch=True)
@@ -424,7 +456,9 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             parent = runtime.process.spawn(image="base-agent:v0", goal="watch link")
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, "watcher")
+            _grant_process_spawn(runtime, child)
             owner = _owner(runtime, parent)
             dst = runtime.memory.create_object(
                 parent,
@@ -472,6 +506,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="watch disabled")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(
                 pid,
@@ -494,6 +529,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="watch terminal")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(
                 pid,
@@ -517,6 +553,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="owner exits")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(pid, owner, "sleep", {"seconds": 0.05})
             runtime.process.exit(pid, message="creator exited")
@@ -534,6 +571,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="cancel task")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(pid, owner, "sleep", {"seconds": 1.0})
 
@@ -549,6 +587,7 @@ class TestObjectTasks:
         try:
             handle = runtime.tools.register_tool(SlowSyncSideEffectTool(), registered_by="test", ephemeral=True)
             pid = runtime.process.spawn(image="base-agent:v0", goal="sync cancel")
+            _grant_process_spawn(runtime, pid)
             runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(pid, owner, "slow_sync_side_effect_for_object_task", {})
@@ -570,6 +609,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="external kill")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(pid, owner, "receive_process_messages", {"channel": "never"})
             waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
@@ -587,7 +627,9 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             parent = runtime.process.spawn(image="base-agent:v0", goal="parent")
+            _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, "child")
+            _grant_process_spawn(runtime, child)
             child_owner = _owner(runtime, child)
             child_task = runtime.object_tasks.start(child, child_owner, "get_working_directory", {})
             child_task = runtime.object_tasks.wait(child_task.task_id, actor_pid=child, timeout=2)
@@ -605,6 +647,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="invalid object task bounds")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(pid, owner, "receive_process_messages", {"channel": "never"})
 
@@ -621,6 +664,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="shutdown object task wait")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             runtime.object_tasks.start(pid, owner, "receive_process_messages", {"channel": "never"})
 
@@ -639,6 +683,7 @@ class TestObjectTasks:
         try:
             handle = runtime.tools.register_tool(SlowSyncSideEffectTool(), registered_by="test", ephemeral=True)
             pid = runtime.process.spawn(image="base-agent:v0", goal="shutdown slow object task")
+            _grant_process_spawn(runtime, pid)
             runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(pid, owner, "slow_sync_side_effect_for_object_task", {})
@@ -668,6 +713,7 @@ class TestObjectTasks:
         runtime = Runtime.open("local", config=config)
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="concurrency")
+            _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             first = runtime.object_tasks.start(
                 pid,

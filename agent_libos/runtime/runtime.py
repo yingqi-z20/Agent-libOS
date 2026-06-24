@@ -5,6 +5,7 @@ import base64
 import hashlib
 import os
 import re
+import shutil
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,9 @@ from agent_libos.models import (
     AgentImage,
     CapabilityRight,
     EventType,
+    ForkMode,
+    MemoryView,
+    MemoryViewSpec,
     ObjectHandle,
     ObjectOwnerKind,
     ProcessStatus,
@@ -684,6 +688,7 @@ class Runtime:
             goal=goal if goal is not None else f"workflow:{tool_name}",
             working_directory=working_directory,
         )
+        self._grant_workflow_tool_authority(pid, selected_image, tool_name, tool_args)
         initial = self.process.get(pid)
         initial_image = initial.image_id
         initial_goal_oid = initial.goal_oid
@@ -774,6 +779,21 @@ class Runtime:
             child_pid=child_pid,
             waiting_message=waiting_message,
             filters=dict(filters or {}) if filters is not None else None,
+        )
+
+    def _grant_workflow_tool_authority(self, pid: str, selected_image: str, tool_name: str, tool_args: dict[str, Any]) -> None:
+        if tool_name != "exec_process":
+            return
+        target_image = tool_args.get("image")
+        if not isinstance(target_image, str) or target_image == selected_image:
+            return
+        if target_image not in self.images:
+            return
+        self.capability.grant(
+            pid,
+            self.image_registry.resource_for(target_image),
+            [CapabilityRight.READ],
+            issued_by="workflow",
         )
 
     def _workflow_result_from_tool_call(
@@ -922,7 +942,10 @@ class Runtime:
         preserve_capabilities: bool = False,
         llm_profile_id: str | None = None,
     ) -> Any:
+        process = self.process.get(pid)
         selected_image = self._require_image(image)
+        if image != process.image_id:
+            self._require_process_image_boot_authority(pid, image)
         self._preflight_process_image_boot(selected_image)
         previous_state = self._snapshot_process_exec_state(pid)
         self.process.exec(
@@ -972,6 +995,9 @@ class Runtime:
         parent_process = self.process.get(parent)
         selected_image = image or parent_process.image_id
         self._require_image(selected_image)
+        self._require_process_spawn_authority(parent)
+        if selected_image != parent_process.image_id:
+            self._require_process_image_boot_authority(parent, selected_image)
         selected_cwd = (
             self.resolve_process_working_directory(parent, working_directory)
             if working_directory is not None
@@ -987,9 +1013,48 @@ class Runtime:
             llm_profile_id=llm_profile_id,
         )
 
+    def fork_child_process(
+        self,
+        parent: str,
+        goal: dict[str, Any] | str | ObjectHandle,
+        *,
+        memory_view: MemoryView | MemoryViewSpec | None = None,
+        capabilities: list[dict[str, Any]] | None = None,
+        inherit_capabilities: list[dict[str, Any]] | None = None,
+        resource_budget: Any | None = None,
+        image: str | None = None,
+        mode: ForkMode | str = ForkMode.RESTRICTED,
+        working_directory: str | None = None,
+        llm_profile_id: str | None = None,
+    ) -> str:
+        parent_process = self.process.get(parent)
+        selected_image = image or parent_process.image_id
+        self._require_image(selected_image)
+        self._require_process_spawn_authority(parent)
+        if selected_image != parent_process.image_id:
+            self._require_process_image_boot_authority(parent, selected_image)
+        return self.process.fork(
+            parent=parent,
+            goal=goal,
+            memory_view=memory_view,
+            capabilities=capabilities,
+            inherit_capabilities=inherit_capabilities,
+            resource_budget=resource_budget,
+            image=selected_image,
+            mode=mode,
+            working_directory=working_directory,
+            llm_profile_id=llm_profile_id,
+        )
+
     def set_process_working_directory(self, pid: str, path: str) -> Any:
         relative = self.resolve_process_working_directory(pid, path)
         return self.process.set_working_directory(pid, relative)
+
+    def _require_process_spawn_authority(self, pid: str) -> None:
+        self.capability.require(pid, "process:spawn", CapabilityRight.WRITE)
+
+    def _require_process_image_boot_authority(self, pid: str, image_id: str) -> None:
+        self.capability.require(pid, self.image_registry.resource_for(image_id), CapabilityRight.READ)
 
     def _resolve_launch_llm_profile_id(self, image_id: str, explicit_profile_id: str | None) -> str:
         if explicit_profile_id is not None:
@@ -1218,8 +1283,13 @@ class Runtime:
                     self.checkpoint._insert_row(cur, table, row)
         for tool_id in stale_tool_ids:
             if not self._tool_id_used_by_other_process(tool_id, pid):
+                # Exec boot rollback restores the process table, but package JIT
+                # registration may also have inserted ephemeral tool rows. Drop
+                # unreferenced rows so a failed boot cannot leave inert tools in
+                # persistent discovery output.
                 getattr(self.tools, "_handles", {}).pop(tool_id, None)
                 getattr(self.tools, "_jit_sources", {}).pop(tool_id, None)
+                self.store.delete_tool(tool_id)
         for tool_id, handle in state["tool_handles"].items():
             self.tools._handles[tool_id] = deepcopy(handle)
         for tool_id, source in state["jit_sources"].items():
@@ -1303,17 +1373,28 @@ class Runtime:
 
     def _instantiate_image_package(self, pid: str, image: AgentImage) -> None:
         artifact = self._load_image_artifact(image, expected_kind="image_package")
-        workspace_paths = self._materialize_image_package_workspace(pid, image, artifact)
-        registered_jit = self._register_image_package_jit_tools(pid, image, artifact)
-        process = self.process.get(pid)
         workspace_root = None
         working_directory = None
-        if workspace_paths is not None:
-            workspace_root, working_directory = workspace_paths
-            process.working_directory = working_directory
-            process.updated_at = utc_now()
-            self.store.update_process(process)
-            self._grant_image_package_workspace(pid, image, artifact, workspace_root)
+        registered_jit: list[str] = []
+        try:
+            workspace_paths = self._materialize_image_package_workspace(pid, image, artifact)
+            if workspace_paths is not None:
+                workspace_root, working_directory = workspace_paths
+            registered_jit = self._register_image_package_jit_tools(pid, image, artifact)
+            process = self.process.get(pid)
+            if workspace_paths is not None:
+                process.working_directory = working_directory
+                process.updated_at = utc_now()
+                self.store.update_process(process)
+                self._grant_image_package_workspace(pid, image, artifact, workspace_root)
+        except Exception:
+            self._remove_registered_image_package_jit_tool_names(pid, registered_jit)
+            self._cleanup_materialized_image_workspace(
+                workspace_root,
+                actor=f"image:{image.image_id}",
+                reason="image_package_boot_failed",
+            )
+            raise
         self.audit.record(
             actor=f"image:{image.image_id}",
             action="image.boot.package",
@@ -1359,22 +1440,78 @@ class Runtime:
             "bytes": total_bytes,
         }
         self.resources.preflight(pid, usage, source="image.workspace.materialize", context=context)
-        root.mkdir(parents=True, exist_ok=True)
-        for record in files:
-            package_path = str(record["path"])
-            relative = self._relative_artifact_path(package_path, str(source))
-            target = (root / relative).resolve()
-            if root not in target.parents and target != root:
-                raise RuntimeError(f"image workspace file escaped materialized root: {package_path}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(self._artifact_file_bytes(record))
-        working_directory = str(workspace.get("working_directory") or ".")
-        cwd = (root / "" if working_directory == "." else root / working_directory).resolve()
-        if root not in cwd.parents and cwd != root:
-            raise RuntimeError("image workspace working_directory escaped materialized root")
-        cwd.mkdir(parents=True, exist_ok=True)
+        try:
+            # Workspace materialization is a runtime boot side effect, so keep
+            # it atomic with the rest of package boot and remove partial files
+            # if later validation fails.
+            root.mkdir(parents=True, exist_ok=True)
+            for record in files:
+                package_path = str(record["path"])
+                relative = self._relative_artifact_path(package_path, str(source))
+                target = (root / relative).resolve()
+                if root not in target.parents and target != root:
+                    raise RuntimeError(f"image workspace file escaped materialized root: {package_path}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(self._artifact_file_bytes(record))
+            working_directory = str(workspace.get("working_directory") or ".")
+            cwd = (root / "" if working_directory == "." else root / working_directory).resolve()
+            if root not in cwd.parents and cwd != root:
+                raise RuntimeError("image workspace working_directory escaped materialized root")
+            cwd.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            shutil.rmtree(root, ignore_errors=True)
+            self._prune_empty_materialized_workspace_parents(root.parent)
+            raise
         self.resources.charge(pid, usage, source="image.workspace.materialize", context=context)
         return root.relative_to(self.workspace_root).as_posix(), cwd.relative_to(self.workspace_root).as_posix()
+
+    def _cleanup_materialized_image_workspace(
+        self,
+        workspace_root: str | None,
+        *,
+        actor: str,
+        reason: str,
+    ) -> None:
+        if not workspace_root:
+            return
+        relative = Path(workspace_root)
+        materialized_root = Path(self.config.image.materialized_workspace_root)
+        if relative.is_absolute() or ".." in relative.parts:
+            return
+        if relative.parts[: len(materialized_root.parts)] != materialized_root.parts:
+            return
+        root = (self.workspace_root / relative).resolve()
+        if self.workspace_root not in root.parents and root != self.workspace_root:
+            return
+        try:
+            shutil.rmtree(root)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self.audit.record(
+                actor=actor,
+                action="image.workspace.cleanup_failed",
+                target=f"workspace:{workspace_root}",
+                decision={"reason": reason, "error": str(exc), "error_type": type(exc).__name__},
+            )
+            return
+        self._prune_empty_materialized_workspace_parents(root.parent)
+        self.audit.record(
+            actor=actor,
+            action="image.workspace.cleanup",
+            target=f"workspace:{workspace_root}",
+            decision={"reason": reason},
+        )
+
+    def _prune_empty_materialized_workspace_parents(self, start: Path) -> None:
+        boundary = (self.workspace_root / self.config.image.materialized_workspace_root).resolve()
+        current = start.resolve()
+        while current != boundary and boundary in current.parents:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
 
     def _grant_image_package_workspace(
         self,
@@ -1484,6 +1621,27 @@ class Runtime:
         for handle in handles.values():
             getattr(self.tools, "_jit_sources", {}).pop(handle.tool_id, None)
             getattr(self.tools, "_handles", {}).pop(handle.tool_id, None)
+            self.store.delete_tool(handle.tool_id)
+            with self.store.transaction() as cur:
+                cur.execute(
+                    "DELETE FROM tool_candidates WHERE pid = ? AND registered_tool_id = ?",
+                    (pid, handle.tool_id),
+                )
+
+    def _remove_registered_image_package_jit_tool_names(self, pid: str, names: list[str]) -> None:
+        if not names:
+            return
+        process = self.store.get_process(pid)
+        if process is None:
+            return
+        handles: dict[str, ToolHandle] = {}
+        for name in names:
+            tool_id = process.tool_table.get(name)
+            if tool_id is None or tool_id not in getattr(self.tools, "_jit_sources", {}):
+                continue
+            handle = getattr(self.tools, "_handles", {}).get(tool_id)
+            handles[name] = handle or ToolHandle(tool_id=tool_id, name=name, capability_id=None, scope="ephemeral_process")
+        self._remove_registered_image_package_jit_tools(pid, handles)
 
     def _load_image_artifact(self, image: AgentImage, *, expected_kind: str | None = None) -> dict[str, Any]:
         artifact_id = str(image.boot.get("artifact_id") or "")

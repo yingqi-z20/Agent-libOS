@@ -461,16 +461,18 @@ def _setup_runtime_benchmark_resources(
     setup = task.setup or {}
     for item in setup.get("skills", []) or []:
         if isinstance(item, dict):
+            path = safe_workspace_path(workspace, str(item["path"]))
             runtime.skills.register_skill_from_path(
-                workspace / str(item["path"]),
+                path,
                 actor="benchmark.setup",
                 replace=bool(item.get("replace", False)),
                 require_capability=False,
             )
     for item in setup.get("images", []) or []:
         if isinstance(item, dict):
+            path = safe_workspace_path(workspace, str(item["path"]))
             runtime.image_registry.register_from_package_path(
-                workspace / str(item["path"]),
+                path,
                 actor="benchmark.setup",
                 replace=bool(item.get("replace", False)),
                 require_capability=False,
@@ -478,7 +480,8 @@ def _setup_runtime_benchmark_resources(
             )
     for item in setup.get("jsonrpc_endpoints", []) or []:
         if isinstance(item, dict):
-            text = (workspace / str(item["path"])).read_text(encoding=str(item.get("encoding") or "utf-8"))
+            path = safe_workspace_path(workspace, str(item["path"]))
+            text = path.read_text(encoding=str(item.get("encoding") or "utf-8"))
             runtime.jsonrpc.register_endpoint_from_yaml_text(
                 text,
                 actor="benchmark.setup",

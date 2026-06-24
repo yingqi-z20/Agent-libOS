@@ -12,7 +12,8 @@ class TestCapabilityResources:
     def test_typed_resource_canonicalization_and_subsumption(self) -> None:
         resources = ResourceAuthority()
 
-        assert resources.canonical("filesystem:workspace\\src//main.py/") == "filesystem:workspace/src/main.py"
+        assert resources.canonical("filesystem:workspace:src//main.py/") == "filesystem:workspace:src/main.py"
+        assert resources.canonical("filesystem:workspace\\src//main.py/") == "filesystem:workspace\\src/main.py"
         assert resources.matches("filesystem:workspace:src/*", "filesystem:workspace:src/main.py")
         assert not resources.matches("filesystem:workspace:src/*", "filesystem:workspace:src2/main.py")
 

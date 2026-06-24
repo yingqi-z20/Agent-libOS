@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from agent_libos.api.gui.server import create_gui_http_server
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, GuiDefaults, RuntimeDefaults
-from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType
+from agent_libos.models import CapabilityRight, EventType, ObjectMetadata, ObjectType
 from agent_libos.runtime.runtime import Runtime
 from tests.support.skills import write_skill_package
 
@@ -158,6 +158,24 @@ class TestGuiServer:
         assert 'audit.window.204' in actions
         assert 'audit.window.0' not in actions
 
+    def test_snapshot_truncates_model_amplified_event_payloads(self) -> None:
+        huge = 'x' * (self.server.service.runtime.config.gui.snapshot_string_max_chars + 100)
+        self.server.service.runtime.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source='gui-test',
+            target='gui-test',
+            payload={'blob': huge},
+        )
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+
+        assert status == 200
+        serialized = json.dumps(snapshot)
+        assert huge not in serialized
+        event = snapshot['events'][-1]
+        assert event['payload']['blob']['truncated'] is True
+        assert len(event['payload']['blob']['preview']) == self.server.service.runtime.config.gui.snapshot_string_max_chars
+
     def test_process_audit_filters_before_limit(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'audit target', 'auto_run': False})
         pid = spawned['pid']
@@ -238,6 +256,104 @@ class TestGuiServer:
         assert status == 403
         assert 'checkpoint' in body['error']['message']
 
+    def test_capability_actor_mode_enforces_process_authority(self) -> None:
+        runtime = self.server.service.runtime
+        _status, actor = self.request('POST', '/api/processes', {'goal': 'capability actor', 'auto_run': False})
+        _status, subject = self.request('POST', '/api/processes', {'goal': 'capability subject', 'auto_run': False})
+
+        status, denied = self.request(
+            'POST',
+            '/api/capabilities/grant',
+            {
+                'subject': subject['pid'],
+                'resource': 'object:gui-actor-grant',
+                'rights': ['read'],
+                'actor': actor['pid'],
+                'confirmed': True,
+            },
+        )
+        assert status == 403
+        assert 'lacks grant/admin authority' in denied['error']['message']
+
+        status, admin_granted = self.request(
+            'POST',
+            '/api/capabilities/grant',
+            {
+                'subject': subject['pid'],
+                'resource': 'object:gui-admin-grant',
+                'rights': ['read'],
+                'confirmed': True,
+            },
+        )
+        assert status == 200
+        assert admin_granted['subject'] == subject['pid']
+
+        runtime.capability.grant(actor['pid'], 'object:gui-actor-grant', [CapabilityRight.READ], issued_by='test')
+        runtime.capability.grant(actor['pid'], 'object:gui-actor-grant', [CapabilityRight.GRANT], issued_by='test')
+        status, granted = self.request(
+            'POST',
+            '/api/capabilities/grant',
+            {
+                'subject': subject['pid'],
+                'resource': 'object:gui-actor-grant',
+                'rights': ['read'],
+                'actor': actor['pid'],
+                'confirmed': True,
+            },
+        )
+        assert status == 200
+        assert granted['subject'] == subject['pid']
+        assert granted['parent_cap_id']
+
+        runtime.capability.grant(actor['pid'], 'object:gui-delegate', [CapabilityRight.READ], issued_by='test', delegable=True)
+        status, mismatched_parent = self.request(
+            'POST',
+            '/api/capabilities/delegate',
+            {
+                'parent': subject['pid'],
+                'child': actor['pid'],
+                'resource': 'object:gui-delegate',
+                'rights': ['read'],
+                'actor': actor['pid'],
+                'confirmed': True,
+            },
+        )
+        assert status == 403
+        assert 'actor-mode delegation' in mismatched_parent['error']['message']
+
+        status, delegated = self.request(
+            'POST',
+            '/api/capabilities/delegate',
+            {
+                'parent': actor['pid'],
+                'child': subject['pid'],
+                'resource': 'object:gui-delegate',
+                'rights': ['read'],
+                'actor': actor['pid'],
+                'confirmed': True,
+            },
+        )
+        assert status == 200
+        assert delegated['subject'] == subject['pid']
+
+        cap = runtime.capability.grant(subject['pid'], 'object:gui-revoke', [CapabilityRight.READ], issued_by='test')
+        status, revoke_denied = self.request(
+            'POST',
+            f"/api/capabilities/{cap.cap_id}/revoke",
+            {'actor': actor['pid'], 'confirmed': True},
+        )
+        assert status == 403
+        assert 'lacks revoke/admin authority' in revoke_denied['error']['message']
+
+        runtime.capability.grant(actor['pid'], 'object:gui-revoke', [CapabilityRight.REVOKE], issued_by='test')
+        status, revoked = self.request(
+            'POST',
+            f"/api/capabilities/{cap.cap_id}/revoke",
+            {'actor': actor['pid'], 'confirmed': True},
+        )
+        assert status == 200
+        assert revoked['status'] == 'revoked'
+
     def test_image_register_accepts_package_files_and_rejects_host_file_path(self) -> None:
         files = _gui_image_package_files()
         status, denied = self.request('POST', '/api/images/register', {'files': files, 'source': 'gui-package-agent'})
@@ -305,6 +421,7 @@ class TestGuiServer:
         status, spawned = self.request('POST', '/api/processes', {'goal': 'object task', 'auto_run': False})
         assert status == 200
         pid = spawned['pid']
+        self.server.service.runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
         owner = self.server.service.runtime.memory.create_object(
             pid,
             ObjectType.ARTIFACT,
@@ -347,6 +464,7 @@ class TestGuiServer:
         status, spawned = self.request('POST', '/api/processes', {'goal': 'object task watch', 'auto_run': False})
         assert status == 200
         pid = spawned['pid']
+        self.server.service.runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
         owner = self.server.service.runtime.memory.create_object(
             pid,
             ObjectType.ARTIFACT,

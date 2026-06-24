@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import errno
+import contextlib
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -373,23 +375,39 @@ class _PosixPtySession:
     def close(self, *, force: bool = True, timeout_s: float = 2.0) -> int | None:
         if self._closed:
             return self.exit_code()
+        if force:
+            self._signal_process_group(signal.SIGTERM)
         if self.proc.poll() is None:
-            if force:
-                self.proc.terminate()
             try:
                 self.proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                self._signal_process_group(signal.SIGKILL)
                 try:
                     self.proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
-                    pass
+                    with contextlib.suppress(ProcessLookupError):
+                        self.proc.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        self.proc.wait(timeout=1.0)
         self._closed = True
         try:
             os.close(self.master_fd)
         except OSError:
             pass
         return self.exit_code()
+
+    def _signal_process_group(self, sig: int) -> None:
+        try:
+            os.killpg(self.proc.pid, sig)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            if sig == signal.SIGKILL:
+                with contextlib.suppress(ProcessLookupError):
+                    self.proc.kill()
+            else:
+                with contextlib.suppress(ProcessLookupError):
+                    self.proc.terminate()
 
 
 class _WinPtySession:
@@ -627,7 +645,20 @@ class PtyAdapter:
         self.shell._enforce_workspace_argv_scope(checked, cwd=cwd)
         # PTY creation launches an interactive host process. It must reuse the
         # same shell authority path as shell.run before any provider side effect.
-        decision = self.shell._authorize(pid, checked, resource, timeout=selected_startup_timeout, cwd=cwd)
+        decision = self.shell._authorize_operation(
+            pid,
+            checked,
+            resource,
+            timeout=selected_startup_timeout,
+            cwd=cwd,
+            adapter="pty",
+            primitive="runtime.pty.spawn",
+            operation="pty.spawn",
+            authority_operation="pty.spawn",
+            include_timeout_in_authority=False,
+            continuous_session=True,
+            extra_context={"startup_timeout_s": selected_startup_timeout},
+        )
         if decision.ask_human:
             self._request_human_approval(pid, checked, resource, decision, timeout=selected_startup_timeout, cwd=cwd)
         if not decision.allowed:
@@ -789,11 +820,11 @@ class PtyAdapter:
         session = self._require_session(session_oid)
         if selected_timeout > 0:
             deadline = time.monotonic() + selected_timeout
-            while time.monotonic() < deadline and self._buffer_is_empty(session) and session.handle.is_alive():
+            while time.monotonic() < deadline and self._buffer_is_empty(session) and self._session_alive(session):
                 time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         output, truncated = self._take_output(session, selected_max_chars)
-        alive = session.handle.is_alive()
-        exit_code = session.handle.exit_code()
+        alive = self._session_alive(session)
+        exit_code = self._session_exit_code(session)
         self.events.emit(
             EventType.EXTERNAL_READ,
             source=pid,
@@ -825,8 +856,9 @@ class PtyAdapter:
             raise ValidationError(f"pty input exceeds hard limit {self.config.pty.input_hard_limit_chars} chars")
         self._require_object_right(pid, session_oid, ObjectRight.WRITE.value)
         session = self._require_session(session_oid)
+        self._require_session_open(session)
         bytes_written = session.handle.write(text)
-        alive = session.handle.is_alive()
+        alive = self._session_alive(session)
         self.events.emit(
             EventType.EXTERNAL_WRITE,
             source=pid,
@@ -846,11 +878,12 @@ class PtyAdapter:
         selected_cols, selected_rows = self._validate_size(cols, rows)
         self._require_object_right(pid, session_oid, ObjectRight.WRITE.value)
         session = self._require_session(session_oid)
+        self._require_session_open(session)
         session.handle.resize(selected_cols, selected_rows)
         with session.lock:
             session.cols = selected_cols
             session.rows = selected_rows
-        alive = session.handle.is_alive()
+        alive = self._session_alive(session)
         self.audit.record(
             actor=pid,
             action="primitive.pty.resize",
@@ -896,8 +929,8 @@ class PtyAdapter:
                         argv=list(session.argv),
                         cwd=session.cwd,
                         backend=session.backend,
-                        alive=session.handle.is_alive(),
-                        exit_code=session.handle.exit_code(),
+                        alive=self._session_alive(session),
+                        exit_code=self._session_exit_code(session),
                         cols=session.cols,
                         rows=session.rows,
                         dropped_chars=session.dropped_chars,
@@ -999,6 +1032,7 @@ class PtyAdapter:
         thread.start()
 
     def _reader_loop(self, session: _PtyRuntimeSession, resource: str) -> None:
+        exited = False
         while not session.stop_event.is_set():
             try:
                 chunk = session.handle.read(timeout_s=0.05)
@@ -1006,6 +1040,7 @@ class PtyAdapter:
                     self._append_output(session, chunk)
                 self._sample_and_charge(session, resource)
                 if not session.handle.is_alive() and not chunk:
+                    exited = True
                     break
             except Exception as exc:
                 self.audit.record(
@@ -1014,8 +1049,12 @@ class PtyAdapter:
                     target=f"pty:{session.session_oid}",
                     decision={"error_type": type(exc).__name__, "error": str(exc)},
                 )
-                break
-        session.exit_code = session.handle.exit_code()
+                return
+        if session.stop_event.is_set():
+            session.exit_code = session.handle.exit_code()
+            return
+        if exited:
+            self._mark_session_exited(session, resource=resource)
 
     def _append_output(self, session: _PtyRuntimeSession, output: str) -> None:
         with session.lock:
@@ -1046,6 +1085,9 @@ class PtyAdapter:
     def _sample_and_charge(self, session: _PtyRuntimeSession, resource: str) -> None:
         if self.resources is None or session.handle.pid is None:
             return
+        with session.lock:
+            if session.closed:
+                return
         try:
             proc = psutil.Process(session.handle.pid)
             wall_seconds = max(0.0, time.monotonic() - session.started_monotonic)
@@ -1120,24 +1162,29 @@ class PtyAdapter:
             if session.closing:
                 raise ValidationError(f"PTY session close is already in progress: {session_oid}")
             if session.closed:
-                return session.exit_code
-            session.closing = True
-        try:
-            exit_code = session.handle.close(force=force, timeout_s=timeout_s)
-        except Exception:
+                exit_code = session.exit_code
+                remove_only = True
+            else:
+                session.closing = True
+                remove_only = False
+        if not remove_only:
+            try:
+                exit_code = session.handle.close(force=force, timeout_s=timeout_s)
+            except Exception:
+                with session.lock:
+                    session.closing = False
+                raise
+            session.stop_event.set()
+            if (
+                session.reader_thread is not None
+                and session.reader_thread.is_alive()
+                and session.reader_thread is not threading.current_thread()
+            ):
+                session.reader_thread.join(timeout=min(timeout_s, 1.0))
             with session.lock:
+                session.closed = True
                 session.closing = False
-            raise
-        session.stop_event.set()
-        if (
-            session.reader_thread is not None
-            and session.reader_thread.is_alive()
-            and session.reader_thread is not threading.current_thread()
-        ):
-            session.reader_thread.join(timeout=min(timeout_s, 1.0))
-        with session.lock:
-            session.closed = True
-            session.exit_code = exit_code
+                session.exit_code = exit_code
         with self._lock:
             self._sessions.pop(session_oid, None)
         self.events.emit(
@@ -1162,6 +1209,60 @@ class PtyAdapter:
             raise NotFound(f"PTY session is not active: {session_oid}")
         return session
 
+    def _require_session_open(self, session: _PtyRuntimeSession) -> None:
+        with session.lock:
+            if session.closed:
+                raise NotFound(f"PTY session is not active: {session.session_oid}")
+
+    def _session_alive(self, session: _PtyRuntimeSession) -> bool:
+        with session.lock:
+            if session.closed:
+                return False
+        return session.handle.is_alive()
+
+    def _session_exit_code(self, session: _PtyRuntimeSession) -> int | None:
+        with session.lock:
+            if session.closed:
+                return session.exit_code
+        return session.handle.exit_code()
+
+    def _mark_session_exited(self, session: _PtyRuntimeSession, *, resource: str) -> None:
+        with session.lock:
+            if session.closed or session.closing:
+                return
+            session.closing = True
+        exit_code = session.handle.exit_code()
+        try:
+            exit_code = session.handle.close(force=False, timeout_s=0.0)
+        except Exception as exc:
+            with session.lock:
+                session.closing = False
+            self.audit.record(
+                actor="runtime.pty",
+                action="primitive.pty.exit_cleanup_failed",
+                target=f"pty:{session.session_oid}",
+                decision={"error_type": type(exc).__name__, "error": str(exc)},
+            )
+            return
+        session.stop_event.set()
+        with session.lock:
+            session.closed = True
+            session.closing = False
+            session.exit_code = exit_code
+        self.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source="runtime.pty",
+            target=f"pty:{session.session_oid}",
+            payload={"operation": "exit", "reason": "process_exit", "exit_code": exit_code},
+        )
+        self.audit.record(
+            actor="runtime.pty",
+            action="primitive.pty.exit",
+            target=f"pty:{session.session_oid}",
+            input_refs=[session.session_oid],
+            decision={"resource": resource, "exit_code": exit_code},
+        )
+
     def _require_object_right(self, pid: str, oid: str, right: str) -> None:
         if self.runtime.store.get_object(oid) is None:
             raise NotFound(f"object not found: {oid}")
@@ -1175,9 +1276,10 @@ class PtyAdapter:
 
     def _reserve_session_capacity(self, pid: str) -> None:
         with self._lock:
-            global_count = len(self._sessions) + self._pending_session_creates
+            active_sessions = [session for session in self._sessions.values() if not session.closed]
+            global_count = len(active_sessions) + self._pending_session_creates
             process_count = (
-                sum(1 for session in self._sessions.values() if session.owner_pid == pid)
+                sum(1 for session in active_sessions if session.owner_pid == pid)
                 + self._pending_session_creates_by_process.get(pid, 0)
             )
             if global_count >= self.config.pty.max_sessions_global:
@@ -1279,7 +1381,16 @@ class PtyAdapter:
                     "subject": pid,
                     "resource": resource,
                     "rights": [CapabilityRight.EXECUTE.value],
-                    "constraints": self.shell._approval_constraints(argv, decision, timeout=timeout, cwd=cwd),
+                    "constraints": self.shell._approval_constraints(
+                        argv,
+                        decision,
+                        timeout=timeout,
+                        cwd=cwd,
+                        operation="pty.spawn",
+                        include_timeout=False,
+                        extra_conditions={"continuous_session": True},
+                        description="one-shot human approval for exact PTY spawn",
+                    ),
                 },
                 "context": {
                     "adapter": "pty",

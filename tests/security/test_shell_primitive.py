@@ -1,5 +1,6 @@
 from __future__ import annotations
 import agent_libos.substrate.local as local_substrate
+import os
 import pytest
 import tempfile
 from pathlib import Path
@@ -486,11 +487,70 @@ class TestShellMatcher:
         result = provider.run(['echo', 'safe$(printf${IFS}__INJECTED__)'])
 
         assert result.stdout == 'ok\n'
-        assert captured['argv'] == ['echo', 'safe$(printf${IFS}__INJECTED__)']
+        assert Path(captured['argv'][0]).name == 'echo'
+        assert captured['argv'][1:] == ['safe$(printf${IFS}__INJECTED__)']
         assert captured['kwargs']['stdout'] is not local_substrate.subprocess.PIPE
         assert captured['kwargs']['stderr'] is not local_substrate.subprocess.PIPE
         assert captured['kwargs']['shell'] is False
         assert 'OPENAI_API_KEY' not in captured['kwargs']['env']
+
+    def test_local_shell_provider_does_not_execute_workspace_path_hijack(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        captured: dict[str, Any] = {}
+        fake_git = tmp_path / 'git'
+        fake_git.write_text('#!/bin/sh\nprintf hijacked\n', encoding='utf-8')
+        fake_git.chmod(0o755)
+
+        class FakePopen:
+            pid = 12345
+            returncode = 0
+
+            def __init__(self, argv: list[str], **kwargs: Any) -> None:
+                captured['argv'] = argv
+                captured['kwargs'] = kwargs
+                kwargs['stdout'].write(b'ok\n')
+                kwargs['stdout'].flush()
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+        class FakePsutilProcess:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+            def children(self, recursive: bool = False) -> list[Any]:
+                return []
+
+            def cpu_times(self) -> Any:
+                return type('Times', (), {'user': 0.0, 'system': 0.0})()
+
+            def memory_info(self) -> Any:
+                return type('Mem', (), {'rss': 0})()
+
+        def fake_popen(argv: list[str], **kwargs: Any) -> FakePopen:
+            return FakePopen(argv, **kwargs)
+
+        searched_paths: list[str] = []
+
+        def fake_which(command: str, *, path: str | None = None) -> str | None:
+            searched_paths.append(path or '')
+            assert command == 'git'
+            return '/usr/bin/git'
+
+        monkeypatch.setenv('PATH', os.pathsep.join([str(tmp_path), '/usr/bin']))
+        monkeypatch.setattr(local_substrate.shutil, 'which', fake_which)
+        monkeypatch.setattr(local_substrate.subprocess, 'Popen', fake_popen)
+        monkeypatch.setattr(local_substrate.psutil, 'Process', FakePsutilProcess)
+        provider = local_substrate.LocalShellProvider(tmp_path)
+
+        result = provider.run(['git', 'status'])
+
+        assert result.stdout == 'ok\n'
+        assert captured['argv'][0] == '/usr/bin/git'
+        assert str(tmp_path) not in searched_paths[0].split(os.pathsep)
+        assert str(tmp_path) not in captured['kwargs']['env']['PATH'].split(os.pathsep)
 
     def _runtime_with_config(self, config: AgentLibOSConfig) -> tuple[Runtime, 'FakeShellProvider']:
         temp_dir = tempfile.TemporaryDirectory()

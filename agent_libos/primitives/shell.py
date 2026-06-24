@@ -303,6 +303,35 @@ class ShellAdapter:
         return f"shell:{command}"
 
     def _authorize(self, pid: str, argv: list[str], resource: str, *, timeout: float, cwd: str) -> ShellPolicyDecision:
+        return self._authorize_operation(
+            pid,
+            argv,
+            resource,
+            timeout=timeout,
+            cwd=cwd,
+            adapter="shell",
+            primitive="runtime.shell.run",
+            operation="shell.run",
+            authority_operation="shell.run",
+            include_timeout_in_authority=True,
+        )
+
+    def _authorize_operation(
+        self,
+        pid: str,
+        argv: list[str],
+        resource: str,
+        *,
+        timeout: float,
+        cwd: str,
+        adapter: str,
+        primitive: str,
+        operation: str,
+        authority_operation: str,
+        include_timeout_in_authority: bool,
+        continuous_session: bool = False,
+        extra_context: dict[str, Any] | None = None,
+    ) -> ShellPolicyDecision:
         rule_match = self.rule_engine.classify(argv)
         rule = rule_match.rule
         profile = self.capabilities.profiles.shell(
@@ -314,7 +343,36 @@ class ShellAdapter:
             timeout_s=timeout,
             cwd=cwd,
         )
-        operation_context = self._operation_context(pid, argv, resource, timeout=timeout, cwd=cwd, profile=profile)
+        if operation != "shell.run" or continuous_session or not include_timeout_in_authority:
+            restrictions = dict(profile.restrictions)
+            if not include_timeout_in_authority:
+                restrictions.pop("timeout_s", None)
+                restrictions["startup_timeout_s"] = timeout
+            if continuous_session:
+                restrictions["continuous_session"] = True
+            profile = SandboxProfile(
+                operation=operation,
+                resource=resource,
+                effect=rule.effect,
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                restrictions=restrictions,
+            )
+        operation_context = self._operation_context(
+            pid,
+            argv,
+            resource,
+            timeout=timeout,
+            cwd=cwd,
+            profile=profile,
+            adapter=adapter,
+            primitive=primitive,
+            operation=operation,
+            authority_operation=authority_operation,
+            include_timeout=include_timeout_in_authority,
+            continuous_session=continuous_session,
+            extra=extra_context,
+        )
         policy_caps = self._matching_shell_policy_caps(pid, resource, operation_context)
         if any(
             cap.effect == CapabilityEffect.DENY
@@ -611,14 +669,21 @@ class ShellAdapter:
         timeout: float,
         cwd: str,
         profile: SandboxProfile,
+        adapter: str = "shell",
+        primitive: str = "runtime.shell.run",
+        operation: str = "shell.run",
+        authority_operation: str = "shell.run",
+        include_timeout: bool = True,
+        continuous_session: bool = False,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         argv_json = "\0".join(argv)
         profile_json = self._profile_json(profile)
-        return {
-            "adapter": "shell",
-            "primitive": "runtime.shell.run",
-            "operation": "shell.run",
-            "authority_operation": "shell.run",
+        context = {
+            "adapter": adapter,
+            "primitive": primitive,
+            "operation": operation,
+            "authority_operation": authority_operation,
             "pid": pid,
             "argv": list(argv),
             "argv_sha256": hashlib.sha256(argv_json.encode("utf-8")).hexdigest(),
@@ -626,7 +691,6 @@ class ShellAdapter:
             "resource": resource,
             "right": CapabilityRight.EXECUTE.value,
             "cwd": cwd,
-            "timeout_s": timeout,
             "risk": profile.risk.value,
             "rule_id": profile.rule_id,
             "rule_effect": profile.effect.value,
@@ -634,6 +698,13 @@ class ShellAdapter:
             "network": bool(profile_json and profile_json["restrictions"].get("network")),
             "filesystem_intent": profile_json["restrictions"].get("filesystem_intent") if profile_json else None,
         }
+        if include_timeout:
+            context["timeout_s"] = timeout
+        if continuous_session:
+            context["continuous_session"] = True
+        if extra:
+            context.update(extra)
+        return context
 
     def _approval_constraints(
         self,
@@ -642,23 +713,31 @@ class ShellAdapter:
         *,
         timeout: float,
         cwd: str,
+        operation: str = "shell.run",
+        include_timeout: bool = True,
+        extra_conditions: dict[str, Any] | None = None,
+        description: str = "one-shot human approval for exact shell argv",
     ) -> dict[str, Any]:
         argv_json = "\0".join(argv)
+        conditions: dict[str, Any] = {
+            "argv": list(argv),
+            "match": "exact",
+            "argv_sha256": hashlib.sha256(argv_json.encode("utf-8")).hexdigest(),
+            "cwd": cwd,
+        }
+        if include_timeout:
+            conditions["timeout_s"] = timeout
+        if extra_conditions:
+            conditions.update(extra_conditions)
         return {
             AUTHORITY_RULES_KEY: [
                 {
                     "rule_id": f"shell.approval.{decision.rule_id or 'exact'}",
-                    "operation": "shell.run",
+                    "operation": operation,
                     "effect": CapabilityEffect.ALLOW.value,
                     "risk": decision.risk.value,
-                    "conditions": {
-                        "argv": list(argv),
-                        "match": "exact",
-                        "argv_sha256": hashlib.sha256(argv_json.encode("utf-8")).hexdigest(),
-                        "cwd": cwd,
-                        "timeout_s": timeout,
-                    },
-                    "description": "one-shot human approval for exact shell argv",
+                    "conditions": conditions,
+                    "description": description,
                 }
             ]
         }
@@ -722,6 +801,10 @@ class ShellAdapter:
         return self.capabilities.authorize_matching_capabilities(pid, resource, CapabilityRight.EXECUTE, caps, context)
 
     def _direct_shell_capability_applies_to_rule(self, cap: Capability, context: dict[str, Any]) -> bool:
+        if context.get("authority_operation", "shell.run") != "shell.run":
+            if cap.effect != CapabilityEffect.ALLOW:
+                return True
+            return AUTHORITY_RULES_KEY in cap.constraints
         if cap.effect != CapabilityEffect.ALLOW:
             return True
         if AUTHORITY_RULES_KEY in cap.constraints:
@@ -937,6 +1020,8 @@ class ShellAdapter:
         return value[:limit], True
 
     def _command_identity(self, argv0: str) -> str:
+        if self._argv0_has_path(argv0):
+            return argv0.strip().replace("\\", "/").casefold()
         return self._normalize_executable(argv0)
 
     def _normalize_executable(self, value: str) -> str:

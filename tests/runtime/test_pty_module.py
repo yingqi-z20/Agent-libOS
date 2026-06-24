@@ -11,7 +11,8 @@ from typing import Any
 import pytest
 
 from agent_libos import Runtime
-from agent_libos.models import AgentImage, ExternalEffectClassification
+from agent_libos.capability.rules import AUTHORITY_RULES_KEY
+from agent_libos.models import AgentImage, CapabilityRight, ExternalEffectClassification
 from agent_libos.models import ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectType, ResourceBudget
 from agent_libos.models.exceptions import HumanApprovalRequired
 from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
@@ -142,7 +143,109 @@ class TestPtyModule:
                 assert pending.payload["context"]["operation"] == "pty.spawn"
                 assert pending.payload["context"]["continuous_session"] is True
                 assert pending.payload["context"]["argv"] == ["python", "-c", "print(1)"]
+                rule = pending.payload["requested_once_capability"]["constraints"]["authority_rules"][0]
+                assert rule["operation"] == "pty.spawn"
+                assert rule["conditions"]["continuous_session"] is True
+                assert "timeout_s" not in rule["conditions"]
                 assert provider.spawned == []
+            finally:
+                runtime.close()
+
+    def test_pty_spawn_does_not_reuse_shell_run_timeout_scoped_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                runtime.register_image(
+                    AgentImage(
+                        image_id="pty-direct-shell-run-only:v0",
+                        name="pty-direct-shell-run-only",
+                        default_tools=["pty_create"],
+                    ),
+                    actor="cli",
+                )
+                pid = runtime.process.spawn(image="pty-direct-shell-run-only:v0", goal="timeout-scoped pty")
+                argv = ["sh", "-c", "sleep 3600"]
+                runtime.capability.issue_trusted(
+                    pid,
+                    "shell:sh",
+                    [CapabilityRight.EXECUTE],
+                    issued_by="test",
+                    constraints={
+                        "authority_rules": [
+                            {
+                                "rule_id": "test.shell.run.short.only",
+                                "operation": "shell.run",
+                                "effect": "allow",
+                                "risk": "high",
+                                "conditions": {"argv": argv, "match": "exact", "timeout_max_s": 0.001},
+                            }
+                        ]
+                    },
+                )
+
+                result = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": argv, "startup_timeout_s": 0, "max_output_chars": 1},
+                )
+
+                assert not result.ok
+                assert provider.spawned == []
+            finally:
+                runtime.close()
+
+    def test_pty_spawn_honors_bare_shell_deny_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="bare deny pty")
+                runtime.capability.issue_trusted(
+                    pid,
+                    "shell:git",
+                    [CapabilityRight.EXECUTE],
+                    issued_by="test",
+                    effect="deny",
+                )
+
+                result = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+
+                assert not result.ok
+                assert "explicit command capability denied" in (result.error or "")
+                assert provider.spawned == []
+            finally:
+                runtime.close()
+
+    def test_shell_once_approval_does_not_authorize_pty_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="shell approval is not pty approval")
+                argv = ["python", "-c", "print(1)"]
+
+                with pytest.raises(HumanApprovalRequired):
+                    runtime.shell.run(pid, argv)
+                runtime.human.drain_terminal_queue(auto_approve=True)
+                shell_approval_caps = [
+                    cap
+                    for cap in runtime.capability.capabilities_for(pid)
+                    if cap.resource == runtime.shell.resource_for(argv)
+                    and cap.uses_remaining == 1
+                    and any(rule.get("operation") == "shell.run" for rule in cap.constraints.get(AUTHORITY_RULES_KEY, []))
+                ]
+                assert shell_approval_caps
+
+                with pytest.raises(HumanApprovalRequired):
+                    runtime.tools.call(pid, "pty_create", {"argv": argv, "startup_timeout_s": 0})
+
+                assert provider.spawned == []
+                pending = runtime.human.pending()[0]
+                assert pending.payload["context"]["operation"] == "pty.spawn"
+                assert pending.payload["context"]["continuous_session"] is True
+                refreshed = {cap.cap_id: cap for cap in runtime.capability.capabilities_for(pid)}
+                assert refreshed[shell_approval_caps[0].cap_id].uses_remaining == 1
             finally:
                 runtime.close()
 
@@ -206,6 +309,31 @@ class TestPtyModule:
                 assert not second.ok
                 assert "per-process limit" in (second.error or "")
                 assert len(provider.spawned) == 1
+            finally:
+                runtime.close()
+
+    def test_exited_pty_session_does_not_consume_process_session_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[], session_alive=False)
+            runtime = _open_pty_runtime(temp_dir, provider, settings={"max_sessions_per_process": 1})
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="exited pty capacity")
+                first = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+                assert first.ok, first.error
+                first_oid = first.payload["session_oid"]
+
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    session = _pty_adapter(runtime)._sessions[first_oid]
+                    if session.closed:
+                        break
+                    time.sleep(0.01)
+
+                assert _pty_adapter(runtime)._sessions[first_oid].closed
+                second = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+
+                assert second.ok, second.error
+                assert len(provider.spawned) == 2
             finally:
                 runtime.close()
 
@@ -351,11 +479,13 @@ class FakePtyProvider:
         initial_outputs: list[str] | None = None,
         close_failures: int = 0,
         session_pid: int | None = None,
+        session_alive: bool = True,
         spawn_delay_s: float = 0.0,
     ) -> None:
         self.initial_outputs = list(["ready\n"] if initial_outputs is None else initial_outputs)
         self.close_failures = close_failures
         self.session_pid = session_pid
+        self.session_alive = session_alive
         self.spawn_delay_s = spawn_delay_s
         self.spawned: list[dict[str, Any]] = []
         self.sessions: list[FakePtySession] = []
@@ -378,6 +508,7 @@ class FakePtyProvider:
             outputs=list(self.initial_outputs),
             close_failures=self.close_failures,
             pid=self.session_pid,
+            alive=self.session_alive,
         )
         self.sessions.append(session)
         return session
@@ -400,10 +531,20 @@ class FakePtyProvider:
 class FakePtySession:
     backend = "fake-pty"
 
-    def __init__(self, *, cols: int, rows: int, outputs: list[str], close_failures: int = 0, pid: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        cols: int,
+        rows: int,
+        outputs: list[str],
+        close_failures: int = 0,
+        pid: int | None = None,
+        alive: bool = True,
+    ) -> None:
         self.outputs = outputs
         self.writes: list[str] = []
         self.closed = False
+        self.alive = alive
         self.size = (cols, rows)
         self.close_failures = close_failures
         self.pid = pid
@@ -424,14 +565,15 @@ class FakePtySession:
         self.size = (cols, rows)
 
     def is_alive(self) -> bool:
-        return not self.closed
+        return self.alive and not self.closed
 
     def exit_code(self) -> int | None:
-        return 0 if self.closed else None
+        return 0 if self.closed or not self.alive else None
 
     def close(self, *, force: bool = True, timeout_s: float = 2.0) -> int | None:
         if self.close_failures > 0:
             self.close_failures -= 1
             raise RuntimeError("simulated close failure")
         self.closed = True
+        self.alive = False
         return 0

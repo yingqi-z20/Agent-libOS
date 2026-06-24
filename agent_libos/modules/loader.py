@@ -93,7 +93,8 @@ class ModuleLoader:
         text = self._read_manifest(path)
         manifest = self.parse_manifest(text)
         source_path, entrypoint_object = self._resolve_entrypoint(path, manifest.entrypoint)
-        source_sha = self._sha256_file(source_path)
+        source_bytes = self._read_source_bytes(source_path)
+        source_sha = self._sha256_bytes(source_bytes)
         expected_sha = manifest.sha256.lower()
         if source_sha != expected_sha:
             raise ValidationError(
@@ -107,6 +108,7 @@ class ModuleLoader:
             source_path=str(source_path),
             source_sha256=source_sha,
             entrypoint_object=entrypoint_object,
+            source_bytes=source_bytes,
         )
 
     def parse_manifest(self, text: str) -> ModuleManifest:
@@ -146,7 +148,12 @@ class ModuleLoader:
     def import_entrypoint(self, source: ModuleSource) -> Any:
         module_ref, object_name = self._split_entrypoint(source.manifest.entrypoint)
         with _IMPORT_LOCK:
-            module = self._import_file(Path(source.source_path), source.manifest.module_id, source.source_sha256)
+            module = self._import_file(
+                Path(source.source_path),
+                source.manifest.module_id,
+                source.source_sha256,
+                source.source_bytes,
+            )
         self._verify_imported_module_source(module, source)
         entrypoint = getattr(module, object_name, None)
         if not callable(entrypoint):
@@ -296,22 +303,24 @@ class ModuleLoader:
         except ValueError as exc:
             raise ValidationError(f"module entrypoint path escapes manifest directory: {path}") from exc
 
-    def _import_file(self, path: Path, module_id: str, source_sha256: str) -> ModuleType:
+    def _import_file(self, path: Path, module_id: str, source_sha256: str, source_bytes: bytes) -> ModuleType:
         module_name = (
             "_agent_libos_module_"
             f"{hashlib.sha256((module_id + str(path) + source_sha256).encode('utf-8')).hexdigest()}"
         )
-        return self._exec_source_module(module_name, path)
+        return self._exec_source_module(module_name, path, source_bytes)
 
-    def _exec_source_module(self, module_name: str, path: Path) -> ModuleType:
-        loader = _FreshSourceLoader(module_name, str(path))
-        spec = importlib.util.spec_from_file_location(module_name, path, loader=loader)
-        if spec is None or spec.loader is None:
+    def _exec_source_module(self, module_name: str, path: Path, source_bytes: bytes) -> ModuleType:
+        spec = importlib.util.spec_from_loader(module_name, loader=None, origin=str(path))
+        if spec is None:
             raise ValidationError(f"cannot import module entrypoint source: {path}")
-        module = importlib.util.module_from_spec(spec)
+        module = ModuleType(module_name)
+        module.__file__ = str(path)
+        module.__spec__ = spec
+        module.__package__ = ""
         sys.modules[module_name] = module
         try:
-            spec.loader.exec_module(module)
+            exec(compile(source_bytes, str(path), "exec"), module.__dict__)
         except Exception:
             sys.modules.pop(module_name, None)
             raise
@@ -373,17 +382,16 @@ class ModuleLoader:
         return value.lower()
 
     def _sha256_file(self, path: Path) -> str:
+        return self._sha256_bytes(self._read_source_bytes(path))
+
+    def _read_source_bytes(self, path: Path) -> bytes:
         size = path.stat().st_size
         if size > self.config.modules.source_max_bytes:
             raise ValidationError(
                 "module source exceeded "
                 f"source_max_bytes={self.config.modules.source_max_bytes}"
             )
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
+        return path.read_bytes()
 
     def _sha256_bytes(self, value: bytes) -> str:
         return hashlib.sha256(value).hexdigest()

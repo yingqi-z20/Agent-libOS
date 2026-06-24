@@ -5,6 +5,7 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Any, Iterable
+from urllib.parse import quote
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
@@ -22,6 +23,7 @@ from agent_libos.substrate import FilesystemProvider, LocalFilesystemProvider, R
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_RESOURCE_SEGMENT_SAFE = "-._~"
 
 
 @dataclass(frozen=True)
@@ -597,6 +599,8 @@ class FilesystemAdapter:
         if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"file does not exist: {relative}")
+            # A no-op delete still consumes the exact one-shot approval: if the
+            # path appears later, this grant must not turn into a real delete.
             self._reserve_mutation_capability(consume_capability_id, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False)
         if target_state.kind != "file":
@@ -691,6 +695,8 @@ class FilesystemAdapter:
         if not target_state.exists:
             if not missing_ok:
                 raise NotFound(f"directory does not exist: {relative}")
+            # A no-op delete still consumes the exact one-shot approval: if the
+            # path appears later, this grant must not turn into a real delete.
             self._reserve_mutation_capability(consume_capability_id, right="delete")
             return DeleteResult(path=relative, kind="missing", deleted=False, recursive=recursive)
         if target_state.kind != "directory":
@@ -833,7 +839,7 @@ class FilesystemAdapter:
         return f"filesystem:{self.namespace}:*"
 
     def resource_for(self, path: str | os.PathLike[str]) -> str:
-        relative = self._logical_path(path)
+        relative = self._resource_path(path)
         if relative in {"", "."}:
             return f"filesystem:{self.namespace}:"
         return f"filesystem:{self.namespace}:{relative}"
@@ -843,7 +849,7 @@ class FilesystemAdapter:
         return self.resource_for(relative)
 
     def directory_resource_for(self, path: str | os.PathLike[str]) -> str:
-        relative = self._logical_path(path).rstrip("/")
+        relative = self._resource_path(path).rstrip("/")
         if relative in {"", "."}:
             return self.workspace_resource()
         return f"filesystem:{self.namespace}:{relative}/*"
@@ -1018,7 +1024,13 @@ class FilesystemAdapter:
         return target, target.relative
 
     def _logical_path(self, path: str | os.PathLike[str]) -> str:
-        return os.fspath(path).replace("\\", "/")
+        return os.fspath(path)
+
+    def _resource_path(self, path: str | os.PathLike[str]) -> str:
+        logical = self._logical_path(path)
+        if logical in {"", "."}:
+            return logical
+        return "/".join(quote(part, safe=_RESOURCE_SEGMENT_SAFE) for part in logical.split("/"))
 
     def _path_with_cwd(
         self,

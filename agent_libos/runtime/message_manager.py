@@ -55,6 +55,8 @@ class ProcessMessageManager:
         payload_dict = dict(payload or {})
         self._validate_text_limit(subject_text, self.config.tools.message_subject_max_chars, "process message subject")
         self._validate_text_limit(body_text, self.config.tools.message_body_max_chars, "process message body")
+        selected_correlation_id = self._normalize_optional_identifier(correlation_id, "process message correlation_id")
+        selected_reply_to = self._normalize_optional_identifier(reply_to, "process message reply_to")
         ensure_json_size(payload_dict, self.config.tools.message_payload_max_bytes, "process message payload")
         now = utc_now()
         message = ProcessMessage(
@@ -63,8 +65,8 @@ class ProcessMessageManager:
             recipient_pid=recipient_pid,
             kind=selected_kind,
             channel=self._normalize_channel(channel),
-            correlation_id=correlation_id,
-            reply_to=reply_to,
+            correlation_id=selected_correlation_id,
+            reply_to=selected_reply_to,
             subject=subject_text,
             body=body_text,
             payload=payload_dict,
@@ -142,16 +144,23 @@ class ProcessMessageManager:
         message_ids: list[str] | None = None,
     ) -> list[ProcessMessage]:
         self._require_process(pid)
-        self._validate_message_ids(message_ids)
-        return self.store.list_process_messages(
-            pid,
-            status=ProcessMessageStatus.UNREAD,
-            kind=ProcessMessageKind(kind) if kind is not None else None,
+        filters = self._filters(
+            kind=kind,
             sender=sender,
-            channel=self._normalize_channel(channel) if channel is not None else None,
+            channel=channel,
             correlation_id=correlation_id,
             reply_to=reply_to,
             message_ids=message_ids,
+        )
+        return self.store.list_process_messages(
+            pid,
+            status=ProcessMessageStatus.UNREAD,
+            kind=ProcessMessageKind(filters.get("kind")) if filters.get("kind") is not None else None,
+            sender=filters.get("sender"),
+            channel=filters.get("channel"),
+            correlation_id=filters.get("correlation_id"),
+            reply_to=filters.get("reply_to"),
+            message_ids=filters.get("message_ids"),
         )
 
     def list(
@@ -169,16 +178,23 @@ class ProcessMessageManager:
     ) -> list[ProcessMessage]:
         self._require_process(pid)
         selected_limit = self._normalize_limit(limit)
-        self._validate_message_ids(message_ids)
-        messages = self.store.list_process_messages(
-            pid,
-            status=None if include_acked else ProcessMessageStatus.UNREAD,
-            kind=ProcessMessageKind(kind) if kind is not None else None,
+        filters = self._filters(
+            kind=kind,
             sender=sender,
-            channel=self._normalize_channel(channel) if channel is not None else None,
+            channel=channel,
             correlation_id=correlation_id,
             reply_to=reply_to,
             message_ids=message_ids,
+        )
+        messages = self.store.list_process_messages(
+            pid,
+            status=None if include_acked else ProcessMessageStatus.UNREAD,
+            kind=ProcessMessageKind(filters.get("kind")) if filters.get("kind") is not None else None,
+            sender=filters.get("sender"),
+            channel=filters.get("channel"),
+            correlation_id=filters.get("correlation_id"),
+            reply_to=filters.get("reply_to"),
+            message_ids=filters.get("message_ids"),
             limit=selected_limit,
         )
         return messages
@@ -391,17 +407,27 @@ class ProcessMessageManager:
         reply_to: str | None = None,
         message_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        return {
+        filters = {
             "kind": ProcessMessageKind(kind).value if kind is not None else None,
             "sender": sender,
             "channel": self._normalize_channel(channel) if channel is not None else None,
-            "correlation_id": correlation_id,
-            "reply_to": reply_to,
-            "message_ids": list(message_ids) if message_ids is not None else None,
+            "correlation_id": self._normalize_optional_identifier(
+                correlation_id,
+                "process message correlation_id filter",
+            ),
+            "reply_to": self._normalize_optional_identifier(reply_to, "process message reply_to filter"),
+            "message_ids": self._validate_message_ids(message_ids),
         }
+        ensure_json_size(filters, self.config.tools.message_filter_json_max_bytes, "process message filters")
+        return filters
 
     def _wait_status_message(self, filters: dict[str, Any]) -> str:
-        return f"{self.WAIT_STATUS_PREFIX}{json.dumps(filters, sort_keys=True)}"
+        status = f"{self.WAIT_STATUS_PREFIX}{json.dumps(filters, sort_keys=True)}"
+        if len(status) > self.config.tools.message_wait_status_max_chars:
+            raise ValidationError(
+                f"process message wait status exceeds {self.config.tools.message_wait_status_max_chars} chars"
+            )
+        return status
 
     def _filters_from_wait_status(self, status_message: str | None) -> dict[str, Any] | None:
         if not status_message or not status_message.startswith(self.WAIT_STATUS_PREFIX):
@@ -430,14 +456,34 @@ class ProcessMessageManager:
             )
         return selected
 
-    def _validate_message_ids(self, message_ids: list[str] | None) -> None:
+    def _validate_message_ids(self, message_ids: list[str] | None) -> list[str] | None:
         if message_ids is None:
-            return
+            return None
         if len(message_ids) > self.config.tools.message_filter_ids_hard_limit:
             raise ValidationError(
                 f"process message id filter exceeds {self.config.tools.message_filter_ids_hard_limit}"
             )
+        checked: list[str] = []
+        for index, message_id in enumerate(message_ids):
+            checked.append(self._normalize_identifier(message_id, f"process message id filter[{index}]"))
+        return checked
 
     def _validate_text_limit(self, value: str, limit: int, label: str) -> None:
         if len(value) > limit:
             raise ValidationError(f"{label} exceeds {limit} chars")
+
+    def _normalize_optional_identifier(self, value: str | None, label: str) -> str | None:
+        if value is None:
+            return None
+        return self._normalize_identifier(value, label)
+
+    def _normalize_identifier(self, value: Any, label: str) -> str:
+        if not isinstance(value, str):
+            raise ValidationError(f"{label} must be a string")
+        if not value:
+            raise ValidationError(f"{label} must be non-empty")
+        if "\x00" in value:
+            raise ValidationError(f"{label} cannot contain NUL bytes")
+        if len(value) > self.config.tools.message_id_max_chars:
+            raise ValidationError(f"{label} exceeds {self.config.tools.message_id_max_chars} chars")
+        return value

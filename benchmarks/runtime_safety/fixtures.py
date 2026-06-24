@@ -13,6 +13,7 @@ def prepare_workspace(task: BenchmarkTask, suite_root: str | Path, run_root: str
     source = suite / task.workspace
     if not source.exists() or not source.is_dir():
         raise BenchmarkValidationError(f"{task.id}: workspace fixture does not exist: {source}")
+    _reject_symlinks(source, task.id)
     target = Path(run_root) / "workspaces" / runner / task.id
     if target.exists():
         shutil.rmtree(target)
@@ -50,3 +51,9 @@ def _apply_setup_files(task: BenchmarkTask, workspace: Path) -> None:
             shutil.rmtree(target)
         elif target.exists():
             target.unlink()
+
+
+def _reject_symlinks(source: Path, task_id: str) -> None:
+    for item in source.rglob("*"):
+        if item.is_symlink():
+            raise BenchmarkValidationError(f"{task_id}: workspace fixture contains symlink: {item}")
