@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -794,18 +796,23 @@ class SkillManager:
 
     def _read_host_resources(self, root: Path, raw_skill: bytes) -> list[SkillResource]:
         raw_resources: dict[str, bytes] = {"SKILL.md": raw_skill}
+        root_resolved = root.resolve()
         for directory in self.config.skills.resource_dirs:
             candidate = root / directory
             if not candidate.exists():
                 continue
+            if candidate.is_symlink():
+                raise ValidationError(f"skill resource path is a symlink: {directory}")
             if not candidate.is_dir():
                 raise ValidationError(f"skill resource path is not a directory: {directory}")
             for file in sorted(candidate.rglob("*")):
-                if not file.is_file():
+                stat_result = file.lstat()
+                if stat.S_ISLNK(stat_result.st_mode):
+                    raise ValidationError(f"skill package symlinks are not supported: {file}")
+                if not stat.S_ISREG(stat_result.st_mode):
                     continue
-                resolved = file.resolve()
                 try:
-                    relative = resolved.relative_to(root.resolve()).as_posix()
+                    relative = file.relative_to(root_resolved).as_posix()
                 except ValueError as exc:
                     raise ValidationError(f"skill resource escapes package root: {file}") from exc
                 self._validate_resource_path(relative)
@@ -1321,7 +1328,28 @@ class SkillManager:
     def _read_bytes_limited(self, path: Path, max_bytes: int) -> bytes:
         if not path.exists() or not path.is_file():
             raise NotFound(f"skill package file not found: {path}")
-        raw = path.read_bytes()
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ValidationError(f"skill package file is not a regular file: {path}")
+        if before.st_nlink > 1:
+            raise ValidationError(f"skill package hard links are not supported: {path}")
+        if before.st_size > max_bytes:
+            raise ValidationError(f"skill package file exceeds limit {max_bytes}: {path}")
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValidationError(f"skill package symlinks are not supported: {path}") from exc
+            raise
+        with os.fdopen(fd, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValidationError(f"skill package file is not a regular file: {path}")
+            if opened.st_nlink > 1:
+                raise ValidationError(f"skill package hard links are not supported: {path}")
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise ValidationError(f"skill package file changed during read: {path}")
+            raw = handle.read()
         if len(raw) > max_bytes:
             raise ValidationError(f"skill package file exceeds limit {max_bytes}: {path}")
         return raw

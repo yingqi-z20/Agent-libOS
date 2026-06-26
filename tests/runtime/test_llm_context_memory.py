@@ -24,7 +24,8 @@ from agent_libos.models import (
     ResourceBudget,
     ViewMode,
 )
-from tests.support.fakes import FakeDenoSandbox, RecordingActionClient
+from tests.support.deno import COUNT_CHARS_SOURCE
+from tests.support.fakes import RecordingActionClient
 from tests.support.skills import write_skill_package
 
 
@@ -116,10 +117,10 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    @pytest.mark.real_deno
     def test_multiplexed_jit_tool_call_dispatches_real_jit_tool(self) -> None:
         runtime = Runtime.open('local')
         try:
-            runtime.tools.sandbox = FakeDenoSandbox()
             _register_multiplexed_image(runtime)
             pid = runtime.process.spawn(image='multiplexed-jit:v0', goal='count with a JIT tool')
             _register_count_tool(runtime, pid, 'count_chars')
@@ -142,11 +143,11 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    @pytest.mark.real_deno
     def test_multiplexed_jit_direct_name_and_bad_args_are_repairable(self) -> None:
         config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, action_repair_attempts=3))
         runtime = Runtime.open('local', config=config)
         try:
-            runtime.tools.sandbox = FakeDenoSandbox()
             _register_multiplexed_image(runtime)
             pid = runtime.process.spawn(image='multiplexed-jit:v0', goal='repair bad JIT action')
             _register_count_tool(
@@ -184,10 +185,10 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    @pytest.mark.real_deno
     def test_multiplexed_prompt_context_hides_jit_catalog(self) -> None:
         runtime = Runtime.open('local')
         try:
-            runtime.tools.sandbox = FakeDenoSandbox()
             _register_multiplexed_image(runtime, prompt_mode=PROMPT_MODE_LIBOS_DEFAULT)
             pid = runtime.process.spawn(image='multiplexed-jit:v0', goal='hide catalog')
             _register_count_tool(runtime, pid, 'secret_count')
@@ -212,6 +213,7 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    @pytest.mark.real_deno
     def test_multiplexed_prompt_context_hides_skill_jit_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_dir = write_skill_package(
@@ -228,15 +230,12 @@ class TestLLMContextMemory:
                     }
                 ],
                 scripts={
-                    'scripts/skill_secret_count.ts': (
-                        'export function run(args, libos) { /* fake:count_chars */ return {}; }\n'
-                    )
+                    'scripts/skill_secret_count.ts': COUNT_CHARS_SOURCE
                 },
                 body='Use this skill without relying on an automatic JIT catalog.\n',
             )
             runtime = Runtime.open('local')
             try:
-                runtime.tools.sandbox = FakeDenoSandbox()
                 _register_multiplexed_image(runtime, prompt_mode=PROMPT_MODE_LIBOS_DEFAULT)
                 pid = runtime.process.spawn(image='multiplexed-jit:v0', goal='hide skill catalog')
                 runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
@@ -305,7 +304,8 @@ class TestLLMContextMemory:
     def test_llm_retries_malformed_empty_tool_name_once(self) -> None:
         runtime = Runtime.open('local')
         try:
-            runtime.llm.client = RecordingActionClient([{'action': '', 'path': '.'}, {'action': 'process_exit', 'payload': {'done': True}}])
+            secret = 'SECRET_REPAIR_ARGUMENT_SHOULD_NOT_APPEAR'
+            runtime.llm.client = RecordingActionClient([{'action': '', 'path': '.', 'token': secret}, {'action': 'process_exit', 'payload': {'done': True}}])
             pid = runtime.process.spawn(image='base-agent:v0', goal='recover malformed action')
             result = runtime.run_next_process_once()
             assert result['ok']
@@ -315,8 +315,13 @@ class TestLLMContextMemory:
             repairs = [record for record in runtime.audit.trace() if record.action == 'llm.action_repair_requested']
             assert len(repairs) == 1
             assert repairs[0].decision is not None
-            assert repairs[0].decision['tool_calls_preview'][0]['name'] == ''
-            assert '"path"' in repairs[0].decision['tool_calls_preview'][0]['arguments_preview']
+            preview = repairs[0].decision['tool_calls_preview'][0]
+            assert preview['name'] == ''
+            assert '"path"' in preview['arguments_preview']
+            assert secret not in preview['arguments_preview']
+            assert preview['arguments_redacted']
+            assert preview['arguments_sha256']
+            assert preview['arguments_bytes'] > 0
         finally:
             runtime.close()
 
@@ -794,7 +799,7 @@ def _register_count_tool(
             or {'type': 'object', 'properties': {'text': {'type': 'string'}}},
             'output_schema': {'type': 'object'},
         },
-        source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }',
+        source_code=COUNT_CHARS_SOURCE,
         tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}],
     )
     assert runtime.tools.validate(candidate).ok

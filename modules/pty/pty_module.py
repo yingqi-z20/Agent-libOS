@@ -5,6 +5,7 @@ import contextlib
 import math
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -55,7 +56,6 @@ if TYPE_CHECKING:
 _PTY_ADAPTER_ATTR = "_agent_libos_pty_adapter"
 _SAFE_PTY_ENV_KEYS = {
     "COMSPEC",
-    "HOME",
     "LANG",
     "LC_ALL",
     "PATH",
@@ -65,7 +65,6 @@ _SAFE_PTY_ENV_KEYS = {
     "SYSTEMROOT",
     "TEMP",
     "TMP",
-    "USERPROFILE",
     "WINDIR",
 }
 
@@ -249,9 +248,11 @@ class LocalPtyProvider:
         limits: SubprocessLimits | None = None,
     ) -> PtySession:
         selected_cwd = self._resolve_cwd(cwd)
+        safe_path = self._safe_path()
+        resolved_argv = self._resolve_argv0(argv, selected_cwd)
         if os.name == "nt":
-            return _WinPtySession.spawn(argv, cwd=selected_cwd, cols=cols, rows=rows)
-        return _PosixPtySession.spawn(argv, cwd=selected_cwd, cols=cols, rows=rows)
+            return _WinPtySession.spawn(resolved_argv, cwd=selected_cwd, home=self.cwd, path=safe_path, cols=cols, rows=rows)
+        return _PosixPtySession.spawn(resolved_argv, cwd=selected_cwd, home=self.cwd, path=safe_path, cols=cols, rows=rows)
 
     def classify_external_effect(
         self,
@@ -278,6 +279,34 @@ class LocalPtyProvider:
             raise CapabilityDenied(f"pty working directory escapes workspace root: {cwd}")
         return target
 
+    def _resolve_argv0(self, argv: list[str], selected_cwd: Path) -> list[str]:
+        if not argv or self._argv0_has_path(argv[0]):
+            return argv
+        resolved = shutil.which(argv[0], path=self._safe_path())
+        if resolved is None:
+            raise FileNotFoundError(f"pty executable not found on safe PATH: {argv[0]}")
+        target = Path(resolved).resolve()
+        if self.cwd in target.parents or target == self.cwd or selected_cwd in target.parents or target == selected_cwd:
+            raise CapabilityDenied(f"bare pty executable resolves inside workspace: {argv[0]}")
+        return [str(target), *argv[1:]]
+
+    def _safe_path(self) -> str:
+        entries: list[str] = []
+        for item in os.environ.get("PATH", "").split(os.pathsep):
+            if not item:
+                continue
+            raw = Path(item).expanduser()
+            if not raw.is_absolute():
+                continue
+            resolved = raw.resolve()
+            if self.cwd in resolved.parents or resolved == self.cwd:
+                continue
+            entries.append(str(resolved))
+        return os.pathsep.join(entries)
+
+    def _argv0_has_path(self, value: str) -> bool:
+        return "/" in value or "\\" in value or Path(value).is_absolute()
+
 
 class _PosixPtySession:
     backend = "posix-pty"
@@ -289,7 +318,7 @@ class _PosixPtySession:
         self._closed = False
 
     @classmethod
-    def spawn(cls, argv: list[str], *, cwd: Path, cols: int, rows: int) -> "_PosixPtySession":
+    def spawn(cls, argv: list[str], *, cwd: Path, home: Path, path: str, cols: int, rows: int) -> "_PosixPtySession":
         if sys.platform == "win32":
             raise RuntimeError("POSIX PTY backend is unavailable on Windows")
         import fcntl
@@ -303,7 +332,7 @@ class _PosixPtySession:
             proc = subprocess.Popen(
                 argv,
                 cwd=cwd,
-                env=_safe_subprocess_env(),
+                env=_safe_subprocess_env(path=path, home=home),
                 shell=False,
                 stdin=slave_fd,
                 stdout=slave_fd,
@@ -418,7 +447,7 @@ class _WinPtySession:
         self.pid = getattr(proc, "pid", None)
 
     @classmethod
-    def spawn(cls, argv: list[str], *, cwd: Path, cols: int, rows: int) -> "_WinPtySession":
+    def spawn(cls, argv: list[str], *, cwd: Path, home: Path, path: str, cols: int, rows: int) -> "_WinPtySession":
         try:
             from winpty import PtyProcess
         except ImportError as exc:
@@ -428,7 +457,7 @@ class _WinPtySession:
         spawn = PtyProcess.spawn
         kwargs = {
             "cwd": str(cwd),
-            "env": _safe_subprocess_env(),
+            "env": _safe_subprocess_env(path=path, home=home),
             "dimensions": (rows, cols),
         }
         try:
@@ -498,8 +527,12 @@ class _WinPtySession:
         return self.exit_code()
 
 
-def _safe_subprocess_env() -> dict[str, str]:
-    return {key: value for key, value in os.environ.items() if key.upper() in _SAFE_PTY_ENV_KEYS}
+def _safe_subprocess_env(*, path: str, home: Path) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if key.upper() in _SAFE_PTY_ENV_KEYS}
+    env["PATH"] = path
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    return env
 
 
 @dataclass
@@ -854,8 +887,10 @@ class PtyAdapter:
             raise ValidationError(f"pty input exceeds configured limit {self.config.pty.input_max_chars} chars")
         if len(text) > self.config.pty.input_hard_limit_chars:
             raise ValidationError(f"pty input exceeds hard limit {self.config.pty.input_hard_limit_chars} chars")
-        self._require_object_right(pid, session_oid, ObjectRight.WRITE.value)
         session = self._require_session(session_oid)
+        if session.owner_pid != pid:
+            raise CapabilityDenied(f"{pid} cannot write to PTY session owned by {session.owner_pid}")
+        self._require_object_right(pid, session_oid, ObjectRight.WRITE.value)
         self._require_session_open(session)
         bytes_written = session.handle.write(text)
         alive = self._session_alive(session)

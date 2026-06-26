@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_libos import Runtime
+from agent_libos import AgentImage, Runtime
 from agent_libos.models import CapabilityEffect, CapabilityRight, ObjectType, ProcessStatus
 from agent_libos.models.exceptions import CapabilityDenied, ProcessWaitRequired
 
@@ -101,6 +101,66 @@ class TestCheckpointFork:
 
             assert {process.pid for process in runtime.process.list()} == before_pids
             assert runtime.memory.get_object(pid, original).payload == {'value': 7}
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_does_not_replace_current_image_without_image_write(self) -> None:
+        runtime = Runtime.open('local')
+        image_id = 'checkpoint-fork-image:v0'
+        try:
+            runtime.register_image(
+                AgentImage(image_id=image_id, name='checkpoint-fork-image', system_prompt='snapshot prompt'),
+                actor='test',
+            )
+            source = runtime.process.spawn(image=image_id, goal='checkpoint image source')
+            checkpoint_id = runtime.checkpoint.create(source, 'image fork point', actor=source)
+            actor = runtime.process.spawn(image='base-agent:v0', goal='checkpoint executor')
+            runtime.capability.grant(actor, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
+            runtime.register_image(
+                AgentImage(image_id=image_id, name='checkpoint-fork-image', system_prompt='current prompt'),
+                actor='test',
+                replace=True,
+            )
+
+            forked = runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id)
+
+            assert runtime.process.get(forked['fork_root_pid']).image_id == image_id
+            assert not runtime.capability.check(actor, runtime.image_registry.resource_for(image_id), CapabilityRight.WRITE)
+            assert runtime.get_image(image_id).system_prompt == 'current prompt'
+            stored = runtime.store.get_image(image_id)
+            assert stored is not None
+            assert stored[0].system_prompt == 'current prompt'
+        finally:
+            runtime.close()
+
+    def test_fork_from_checkpoint_requires_image_write_to_restore_missing_image(self) -> None:
+        runtime = Runtime.open('local')
+        image_id = 'checkpoint-fork-missing-image:v0'
+        try:
+            runtime.register_image(
+                AgentImage(image_id=image_id, name='checkpoint-fork-missing-image', system_prompt='snapshot prompt'),
+                actor='test',
+            )
+            source = runtime.process.spawn(image=image_id, goal='checkpoint missing image source')
+            checkpoint_id = runtime.checkpoint.create(source, 'missing image fork point', actor=source)
+            actor = runtime.process.spawn(image='base-agent:v0', goal='checkpoint executor')
+            runtime.capability.grant(actor, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
+            runtime.images.pop(image_id)
+            runtime.store.delete_image(image_id)
+            before_pids = {process.pid for process in runtime.process.list()}
+
+            with pytest.raises(CapabilityDenied, match=f'image:{image_id}'):
+                runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id)
+
+            assert {process.pid for process in runtime.process.list()} == before_pids
+            runtime.image_registry.grant_register(actor, image_id, issued_by='test')
+            forked = runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id)
+
+            assert runtime.process.get(forked['fork_root_pid']).image_id == image_id
+            assert runtime.get_image(image_id).system_prompt == 'snapshot prompt'
+            stored = runtime.store.get_image(image_id)
+            assert stored is not None
+            assert stored[0].system_prompt == 'snapshot prompt'
         finally:
             runtime.close()
 

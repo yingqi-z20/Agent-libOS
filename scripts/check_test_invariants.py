@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = _load_manifest(Path(args.manifest))
     collected = _collect_pytest_nodeids()
-    deterministic_collected = _collect_pytest_nodeids("not real_deno and not real_llm")
+    deterministic_collected = _collect_pytest_nodeids("not real_llm")
     errors: list[str] = []
     invariant_ids, declared_attack_classes = _check_invariants(
         manifest,

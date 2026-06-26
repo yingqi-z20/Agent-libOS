@@ -11,7 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.14"]
-        lane: ["unit", "runtime", "security", "self-evolution", "providers", "benchmark"]
+        lane: ["unit", "runtime", "self-evolution", "providers", "benchmark"]
 
     steps:
       - name: Check out repository
@@ -27,6 +27,11 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2.0.4
+        with:
+          deno-version: lts
+
       - name: Install dependencies
         run: uv sync --frozen --all-groups
 
@@ -41,6 +46,56 @@ jobs:
 
       - name: Run pytest lane
         run: uv run python scripts/test_matrix.py --lane ${{ matrix.lane }}
+
+  security:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+        shard:
+          - name: capability-policy
+            paths: >-
+              tests/security/test_capability.py
+              tests/security/test_granular_permissions.py
+              tests/security/test_permission_policy.py
+              tests/security/test_human_question_tool.py
+          - name: filesystem-shell-jit
+            paths: >-
+              tests/security/test_filesystem_directory_tools.py
+              tests/security/test_shell_primitive.py
+              tests/security/test_jit_security.py
+          - name: external-resource
+            paths: >-
+              tests/security/test_external_boundaries.py
+              tests/security/test_resource_constraints.py
+
+    name: security (${{ matrix.python-version }}, ${{ matrix.shard.name }})
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2.0.4
+        with:
+          deno-version: lts
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Run security shard
+        run: uv run python -m pytest ${{ matrix.shard.paths }}
 
   gui:
     runs-on: ubuntu-latest

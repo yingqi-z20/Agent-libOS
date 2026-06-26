@@ -32,6 +32,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   namespaces do not bypass object capabilities.
 - `object-memory-materialization-budget-is-authoritative`: Object Memory
   context materialization uses current payload token estimates.
+- `context-compaction-preserves-authority-and-fails-closed`: context compaction
+  uses child-process summarizers without granting external authority, validates
+  summaries, preserves process authority, and fails closed on races or invalid
+  output.
 - `child-memory-merge-lifecycle-is-explicit`: terminal child process memory
   remains mergeable, then is adopted or released by the parent lifecycle.
 - `object-memory-lifecycle-is-explicit`: Object Memory ownership, release, and
@@ -101,6 +105,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `image-self-evolution-requires-image-authority`: image registration, package
   boot, exec, and checkpoint commit require image authority and do not bake
   external authority.
+- `agent-output-is-not-control-channel`: untrusted command output cannot trigger
+  lifecycle control actions; submission/exit must use explicit tool or syscall
+  arguments.
 - `jsonrpc-provider-effects-are-registered-and-classified`: JSON-RPC endpoint
   registration and calls use registered endpoint/method authority and
   classified provider effects.

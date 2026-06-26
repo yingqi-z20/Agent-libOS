@@ -122,10 +122,15 @@ resource budget, provider classification, events, and audit path. It returns a
 mutable Object Memory `EXTERNAL_REF` object id as `session_oid`; the payload is
 descriptive metadata only and is not an authority source.
 
+The local PTY backend resolves bare executables on a safe host PATH that
+excludes workspace entries, rejects workspace PATH hijacks, and gives child
+processes a workspace-scoped `HOME`/`USERPROFILE`.
+
 Follow-on tools use that `session_oid` as the public handle:
 
 - `pty_read(session_oid, timeout_s=0, max_chars=32000)` requires object `read`.
-- `pty_write(session_oid, text)` requires object `write`.
+- `pty_write(session_oid, text)` requires object `write` and the original
+  session owner pid.
 - `pty_resize(session_oid, cols, rows)` requires object `write`.
 - `pty_close(session_oid, force=True, timeout_s=2)` requires object `delete`,
   closes the host PTY, releases the object, and revokes its object
@@ -151,15 +156,15 @@ support is needed.
 Verify a manifest without loading it:
 
 ```bash
-uv run agent-libos modules verify modules/example/module.yaml
+uv run agent-libos modules verify modules/pty/module.yaml
 ```
 
 Load a trusted module before a command:
 
 ```bash
 uv run agent-libos \
-  --module-manifest modules/example/module.yaml \
-  --trusted-module example-module:v0:<source_sha256> \
+  --module-manifest modules/pty/module.yaml \
+  --trusted-module agent-libos-pty:v0:<source_sha256> \
   modules list
 ```
 

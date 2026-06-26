@@ -66,6 +66,6 @@ markers = [
     "providers: provider substrate, CLI, GUI server, JSON-RPC, clock, and script smoke tests",
     "benchmark: deterministic runtime-safety benchmark harness tests",
     "invariant(id): runtime safety invariant covered by the test",
-    "real_deno: requires --run-real-deno and a deno executable",
+    "real_deno: runs by default when deno is installed; use --skip-real-deno to skip",
     "real_llm: requires --run-real-llm and OpenAI-compatible credentials",
 ]

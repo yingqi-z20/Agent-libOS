@@ -10,17 +10,19 @@ from agent_libos import AgentImage, Runtime
 from agent_libos.models import CapabilityRight, ResourceBudget, ValidationResult
 from agent_libos.models.exceptions import NotFound, ValidationError
 from agent_libos.substrate import SubprocessLimits
-from tests.support.fakes import FakeDenoSandbox, RecordingActionClient
+from agent_libos.tools.sandbox import DenoTypescriptSandbox
+from tests.support.deno import COUNT_CHARS_SOURCE
+from tests.support.fakes import RecordingActionClient
 from tests.support.skills import write_skill_package
 
 
 class TestSkillIntegration:
 
+    @pytest.mark.real_deno
     def test_jit_skill_tool_is_process_local_and_uses_deno_validation_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            skill_dir = write_skill_package(Path(temp_dir), 'jit-skill', jit_tools=[{'name': 'skill_count', 'description': 'Count text characters.', 'source_path': 'scripts/skill_count.ts', 'input_schema': {'type': 'object'}, 'output_schema': {'type': 'object'}, 'tests': [{'args': {'text': 'abc'}, 'expected': {'count': 3}}]}], scripts={'scripts/skill_count.ts': 'export function run(args, libos) { /* fake:count_chars */ return {}; }\n'})
+            skill_dir = write_skill_package(Path(temp_dir), 'jit-skill', jit_tools=[{'name': 'skill_count', 'description': 'Count text characters.', 'source_path': 'scripts/skill_count.ts', 'input_schema': {'type': 'object'}, 'output_schema': {'type': 'object'}, 'tests': [{'args': {'text': 'abc'}, 'expected': {'count': 3}}]}], scripts={'scripts/skill_count.ts': COUNT_CHARS_SOURCE})
             runtime = Runtime.open('local')
-            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 owner = runtime.process.spawn(image='base-agent:v0', goal='load jit skill')
                 other = runtime.process.spawn(image='base-agent:v0', goal='other')
@@ -36,6 +38,7 @@ class TestSkillIntegration:
             finally:
                 runtime.close()
 
+    @pytest.mark.real_deno
     def test_jit_skill_validation_uses_broker_resource_limits_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_dir = write_skill_package(
@@ -51,10 +54,10 @@ class TestSkillIntegration:
                         'tests': [{'args': {'text': 'abc'}, 'expected': {'count': 3}}],
                     }
                 ],
-                scripts={'scripts/limited_count.ts': 'export function run(args, libos) { /* fake:count_chars */ return {}; }\n'},
+                scripts={'scripts/limited_count.ts': COUNT_CHARS_SOURCE},
             )
             runtime = Runtime.open('local')
-            sandbox = RecordingLimitFakeDenoSandbox()
+            sandbox = RecordingLimitDenoSandbox()
             runtime.tools.sandbox = sandbox
             try:
                 pid = runtime.process.spawn(
@@ -63,7 +66,7 @@ class TestSkillIntegration:
                     resource_budget=ResourceBudget(
                         max_subprocess_wall_seconds=5.0,
                         max_subprocess_cpu_seconds=5.0,
-                        max_subprocess_memory_bytes=1_000_000,
+                        max_subprocess_memory_bytes=512_000_000,
                     ),
                 )
                 runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
@@ -77,6 +80,7 @@ class TestSkillIntegration:
             finally:
                 runtime.close()
 
+    @pytest.mark.real_deno
     def test_skill_jit_activation_rolls_back_visible_jit_on_register_failure(self, monkeypatch) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_dir = write_skill_package(
@@ -101,12 +105,11 @@ class TestSkillIntegration:
                     },
                 ],
                 scripts={
-                    'scripts/first_count.ts': 'export function run(args, libos) { /* fake:count_chars */ return {}; }\n',
-                    'scripts/second_count.ts': 'export function run(args, libos) { /* fake:count_chars */ return {}; }\n',
+                    'scripts/first_count.ts': COUNT_CHARS_SOURCE,
+                    'scripts/second_count.ts': COUNT_CHARS_SOURCE,
                 },
             )
             runtime = Runtime.open('local')
-            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='load rollback skill')
                 runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
@@ -218,7 +221,7 @@ class TestSkillIntegration:
                 runtime.close()
 
 
-class RecordingLimitFakeDenoSandbox(FakeDenoSandbox):
+class RecordingLimitDenoSandbox(DenoTypescriptSandbox):
     def __init__(self) -> None:
         super().__init__()
         self.run_tests_calls = 0

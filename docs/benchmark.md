@@ -84,7 +84,7 @@ uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --r
 Select attack classes:
 
 ```bash
-uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner all --attack-class shell_bypass --output .benchmark_runs/shell
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner all --attack-class shell_policy_bypass --output .benchmark_runs/shell
 ```
 
 ## Real LLM Mode

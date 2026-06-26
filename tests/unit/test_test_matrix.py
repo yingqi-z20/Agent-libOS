@@ -11,6 +11,7 @@ def _args(**overrides: object) -> argparse.Namespace:
     defaults = {
         "lane": "runtime",
         "run_real_deno": False,
+        "skip_real_deno": False,
         "run_real_llm": False,
         "workers": "1",
         "dist": "loadfile",
@@ -27,6 +28,14 @@ class TestTestMatrix:
         assert command[:4] == [test_matrix.sys.executable, "-m", "pytest", "tests/runtime"]
         assert "-n" not in command
         assert "--dist" not in command
+        assert "not real_deno" not in command
+        assert "--skip-real-deno" not in command
+
+    def test_pytest_args_can_skip_real_deno_tests(self) -> None:
+        command = test_matrix._pytest_args(("tests/security",), _args(skip_real_deno=True))
+
+        assert "--skip-real-deno" in command
+        assert command[-2:] == ["-m", "not real_deno and not real_llm"]
 
     def test_pytest_args_include_xdist_workers_when_requested(self) -> None:
         command = test_matrix._pytest_args(("tests",), _args(workers="4", dist="load"))

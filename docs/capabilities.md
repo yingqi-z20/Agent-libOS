@@ -186,11 +186,12 @@ caller to hold `human:<name>` write authority, then creates a blocking human
 request. Before a request enters the human queue, the runtime canonicalizes the
 resource, normalizes rights, classifies risk, records resource scope, attaches
 any deterministic constraints, and shows the selected lease shape. Ordinary
-model requests cannot ask for broad high-risk authority such as `shell:*`
-execute or root/global filesystem write such as `filesystem:/:*` or
-`filesystem:*`. Workspace-level write (`filesystem:workspace:*`) can be approved
-by the human. Admin CLI and bootstrap paths can still issue broader policy
-explicitly, with audit.
+model requests cannot ask for broad high-risk authority such as
+`capability:*` with privileged rights (`admin`, `grant`, `revoke`, `write`,
+`execute`, or `delete`), `shell:*` execute, or root/global filesystem write such
+as `filesystem:/:*` or `filesystem:*`. Workspace-level write
+(`filesystem:workspace:*`) can be approved by the human. Admin CLI and
+bootstrap paths can still issue broader policy explicitly, with audit.
 
 When `ask_each_time` applies, the primitive creates a human approval request and
 waits inside the operation. The caller eventually receives either the final
@@ -293,6 +294,12 @@ model can produce them.
 Read, write, and delete are separate rights. Granting read over a directory does
 not grant write or delete.
 
+The default local filesystem provider performs no-follow traversal inside the
+workspace root for existing files. Existing file read, write, and delete reject
+symlink or junction traversal and reject regular files with multiple hard links
+(`st_nlink > 1`). Directory listings report child symlinks as symlink entries
+without following them.
+
 ## Shell Authority
 
 Shell execution is argv-only. The model-facing tool and syscall accept token
@@ -300,6 +307,12 @@ arrays, not shell command strings. Pipes, redirects, wildcard expansion, and
 command chaining must be requested explicitly through an interpreter executable
 such as `bash`, `sh`, `cmd`, or `powershell`, where policy matching can inspect
 the interpreter token.
+
+Arguments beginning with a `file:` URL are rejected before the provider runs.
+For bare executables, the local provider resolves argv[0] on a safe host PATH
+and refuses a resolution inside the workspace or selected process cwd. Shell
+subprocesses receive a constrained environment with `HOME` and `USERPROFILE`
+pointing at the workspace root instead of the host user's real home.
 
 Shell command risk is classified by argv-token rules before the provider runs:
 

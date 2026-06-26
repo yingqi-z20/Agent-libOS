@@ -325,9 +325,11 @@ class CheckpointManager:
         if require_capability:
             self._require_checkpoint_right(actor, checkpoint_id, CapabilityRight.EXECUTE)
         self._require_snapshot_modules(snapshot)
+        if require_capability:
+            self._require_snapshot_image_restore_rights(actor, snapshot, overwrite_existing=False)
         remapped = self._remap_snapshot(snapshot, parent_pid=parent_pid)
         self._insert_fork_rows(remapped)
-        self._restore_images(snapshot)
+        self._restore_images(snapshot, overwrite_existing=False)
         self._restore_jit_sources(snapshot)
         root_pid = remapped["pid_map"][checkpoint.pid]
         self.events.emit(
@@ -957,11 +959,40 @@ class CheckpointManager:
             artifacts[artifact_id] = {"artifact": artifact, **metadata}
         return artifacts
 
-    def _restore_images(self, snapshot: dict[str, Any]) -> None:
+    def _snapshot_image_ids_to_restore(self, snapshot: dict[str, Any], *, overwrite_existing: bool) -> list[str]:
+        runtime = self.runtime
+        if runtime is None:
+            return []
+        image_ids: list[str] = []
+        for image_id in snapshot.get("images", {}):
+            if not overwrite_existing and image_id in runtime.images:
+                continue
+            image_ids.append(str(image_id))
+        return image_ids
+
+    def _require_snapshot_image_restore_rights(
+        self,
+        actor: str,
+        snapshot: dict[str, Any],
+        *,
+        overwrite_existing: bool,
+    ) -> None:
+        runtime = self.runtime
+        if self.capabilities is None or runtime is None:
+            return
+        registry = getattr(runtime, "image_registry", None)
+        for image_id in self._snapshot_image_ids_to_restore(snapshot, overwrite_existing=overwrite_existing):
+            resource = registry.resource_for(image_id) if registry is not None else f"image:{image_id}"
+            self.capabilities.require(actor, resource, CapabilityRight.WRITE)
+
+    def _restore_images(self, snapshot: dict[str, Any], *, overwrite_existing: bool = True) -> None:
         runtime = self.runtime
         if runtime is None:
             return
+        restored_artifact_ids: set[str] | None = set() if not overwrite_existing else None
         for image_id, data in snapshot.get("images", {}).items():
+            if not overwrite_existing and image_id in runtime.images:
+                continue
             image = AgentImage(**data)
             runtime.images[image_id] = image
             runtime.store.upsert_image(
@@ -970,7 +1001,13 @@ class CheckpointManager:
                 source=f"checkpoint:{snapshot.get('checkpoint_id')}",
                 created_at=utc_now(),
             )
+            if restored_artifact_ids is not None:
+                artifact_id = str(image.boot.get("artifact_id") or "")
+                if artifact_id:
+                    restored_artifact_ids.add(artifact_id)
         for artifact_id, data in snapshot.get("image_artifacts", {}).items():
+            if restored_artifact_ids is not None and artifact_id not in restored_artifact_ids:
+                continue
             if runtime.store.get_image_artifact(artifact_id) is not None:
                 continue
             runtime.store.insert_image_artifact(

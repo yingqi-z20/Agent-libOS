@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import os
 import pytest
 import tempfile
 from pathlib import Path
@@ -16,10 +17,10 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
-from tests.support.fakes import FakeDenoSandbox
+from agent_libos.tools.sandbox import DenoTypescriptSandbox
 
 
-class RejectingDenoSandbox(FakeDenoSandbox):
+class RejectingValidationSandbox(DenoTypescriptSandbox):
     def run_tests(
         self,
         source_code: str,
@@ -225,11 +226,11 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    @pytest.mark.real_deno
     def test_image_package_jit_tools_are_process_local_and_not_workspace_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
-            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 result = runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 assert result.image.metadata['package_jit_tools'] == ['package_count']
@@ -242,11 +243,12 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    @pytest.mark.real_deno
     def test_image_package_jit_boot_validation_uses_broker_resource_limits_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
-            sandbox = RecordingLimitFakeDenoSandbox()
+            sandbox = RecordingLimitDenoSandbox()
             runtime.tools.sandbox = sandbox
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
@@ -256,7 +258,7 @@ class TestImageRegistration:
                     resource_budget=ResourceBudget(
                         max_subprocess_wall_seconds=5.0,
                         max_subprocess_cpu_seconds=5.0,
-                        max_subprocess_memory_bytes=1_000_000,
+                        max_subprocess_memory_bytes=512_000_000,
                     ),
                 )
 
@@ -270,7 +272,7 @@ class TestImageRegistration:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
-            runtime.tools.sandbox = RejectingDenoSandbox()
+            runtime.tools.sandbox = RejectingValidationSandbox()
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 with pytest.raises(ValidationError, match='package validation failed'):
@@ -286,6 +288,7 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    @pytest.mark.real_deno
     def test_image_package_multiplexed_jit_exposure_round_trips(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(
@@ -294,7 +297,6 @@ class TestImageRegistration:
                 jit_tool_exposure=JIT_TOOL_EXPOSURE_MULTIPLEXED,
             )
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
-            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 result = runtime.image_registry.register_from_package_path(
                     Path(temp_dir) / 'package-agent',
@@ -352,11 +354,11 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    @pytest.mark.real_deno
     def test_image_package_jit_tool_name_does_not_become_global_default_tool(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
-            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 owner = runtime.process.spawn(image='package-agent:v0', goal='owner')
@@ -405,11 +407,11 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    @pytest.mark.real_deno
     def test_exec_process_instantiates_image_package_workspace_and_jit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
-            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 pid = runtime.process.spawn(image='base-agent:v0', goal='before exec')
@@ -429,7 +431,7 @@ class TestImageRegistration:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
-            runtime.tools.sandbox = RejectingDenoSandbox()
+            runtime.tools.sandbox = RejectingValidationSandbox()
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 pid = runtime.process.spawn(image='base-agent:v0', goal='before exec')
@@ -513,6 +515,25 @@ workspace:
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
             try:
                 with pytest.raises(ValidationError, match='secret material'):
+                    runtime.image_registry.register_from_package_path(root, actor='cli')
+            finally:
+                runtime.close()
+
+    def test_image_package_rejects_host_hardlinked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside:
+            root = Path(temp_dir) / 'package-agent'
+            _write_image_package(root)
+            outside_file = Path(outside) / 'external-secret.txt'
+            outside_file.write_text('external secret\n', encoding='utf-8')
+            package_file = root / 'workspace' / 'seed.txt'
+            package_file.unlink()
+            try:
+                os.link(outside_file, package_file)
+            except OSError:
+                pytest.skip('hardlink creation is not available in this environment')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                with pytest.raises(ValidationError, match='hard links'):
                     runtime.image_registry.register_from_package_path(root, actor='cli')
             finally:
                 runtime.close()
@@ -605,7 +626,7 @@ workspace:
     return root
 
 
-class RecordingLimitFakeDenoSandbox(FakeDenoSandbox):
+class RecordingLimitDenoSandbox(DenoTypescriptSandbox):
     def __init__(self) -> None:
         super().__init__()
         self.run_tests_calls = 0

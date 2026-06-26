@@ -219,6 +219,19 @@ class HumanObjectManager:
         rights: list[str],
     ) -> None:
         rights_set = set(rights)
+        privileged_rights = {
+            CapabilityRight.ADMIN.value,
+            CapabilityRight.GRANT.value,
+            CapabilityRight.REVOKE.value,
+            CapabilityRight.WRITE.value,
+            CapabilityRight.EXECUTE.value,
+            CapabilityRight.DELETE.value,
+        }
+        if rights_set & privileged_rights:
+            if kind == "capability" or (scope == "prefix" and not body):
+                raise ValidationError(
+                    "model permission requests cannot ask for broad privileged capability authority; request a concrete non-meta resource instead"
+                )
         if kind == "shell" and CapabilityRight.EXECUTE.value in rights_set:
             if resource == self.config.shell.policy_resource or (scope == "prefix" and not body):
                 raise ValidationError(
@@ -244,6 +257,8 @@ class HumanObjectManager:
         rights_set = set(rights)
         if CapabilityRight.DELETE.value in rights_set:
             return AuthorityRisk.DESTRUCTIVE
+        if rights_set & {CapabilityRight.ADMIN.value, CapabilityRight.GRANT.value, CapabilityRight.REVOKE.value}:
+            return AuthorityRisk.HIGH
         if kind == "shell" and CapabilityRight.EXECUTE.value in rights_set:
             return AuthorityRisk.LOW if constraints else AuthorityRisk.HIGH
         if CapabilityRight.WRITE.value in rights_set or CapabilityRight.EXECUTE.value in rights_set:

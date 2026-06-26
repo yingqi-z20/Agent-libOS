@@ -10,7 +10,7 @@ from typing import Iterator
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ResourceBudget, ResourceUsage, ToolCandidateStatus
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
-from tests.support.fakes import FakeDenoSandbox
+from tests.support.deno import COUNT_CHARS_SOURCE
 from tests.support.skills import write_skill_package
 
 class TestImageCommit:
@@ -154,13 +154,14 @@ class TestImageCommit:
             assert not other_call.ok
             assert 'not in process tool table' in (other_call.error or '')
 
+    @pytest.mark.real_deno
     def test_committed_jit_tool_source_survives_runtime_reopen(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
             db_path = Path(temp_dir) / 'runtime.sqlite'
             runtime = Runtime.open(db_path)
             try:
                 source = runtime.process.spawn(image='toolmaker-agent:v0', goal='jit source')
-                tool_source = 'export function run(args, libos) { /* fake:count_chars */ return {}; }\n'
+                tool_source = COUNT_CHARS_SOURCE
                 candidate_id = runtime.tools.propose(
                     source,
                     {
@@ -192,7 +193,6 @@ class TestImageCommit:
 
             reopened = Runtime.open(db_path)
             try:
-                reopened.tools.sandbox = FakeDenoSandbox()
                 assert reopened.tools.resolve('committed_persistent_count', pid=booted).tool_id == tool_id
                 result = reopened.tools.call(booted, 'committed_persistent_count', {'text': 'hello'})
                 assert result.ok, result.error

@@ -61,8 +61,9 @@ uv sync --frozen --all-groups
 uv run python scripts/test_matrix.py --lane all
 ```
 
-The Deno executable is optional for the Python unit suite. Tests that require a
-real Deno installation should skip with a clear message when `deno` is missing.
+Deno-backed tests run by default when `deno` is installed. Tests that require a
+real Deno installation skip with a clear message when `deno` is missing; use
+`--skip-real-deno` only for runs that intentionally exclude them.
 
 ## Documentation Consistency
 
@@ -73,8 +74,9 @@ real Deno installation should skip with a clear message when `deno` is missing.
   and non-goals.
 - `docs/architecture.md`, `docs/runtime_model.md`, `docs/capabilities.md`,
   `docs/object_memory.md`, `docs/tools_and_jit.md`, `docs/skills.md`,
-  `docs/checkpoints.md`, `docs/cli.md`, `docs/development.md`, and
-  `docs/benchmark.md` are the core implementation guides.
+  `docs/checkpoints.md`, `docs/jsonrpc.md`, `docs/modules.md`, `docs/gui.md`,
+  `docs/cli.md`, `docs/development.md`, and `docs/benchmark.md` are the core
+  implementation guides.
 - `docs/mini_swe_agent_image.md` documents the package-only mini-swe-agent
   compatibility image.
 - `benchmarks/runtime_safety/schema.md` defines benchmark task shape for the M1

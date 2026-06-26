@@ -18,23 +18,31 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import CommandMetrics, LocalResourceProviderSubstrate, SubprocessLimits
-from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SandboxExecutionResult, SyscallHandler
+from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
 from agent_libos.utils.serde import dumps
-from tests.support.fakes import FakeDenoSandbox, NoSyscallDenoSandbox
+from tests.support.deno import (
+    BAD_OUTPUT_SOURCE,
+    COUNT_CHARS_SOURCE,
+    EXEC_AFTER_RESULT_SOURCE,
+    EXIT_AFTER_RESULT_SOURCE,
+    MISSING_EXEC_AFTER_RESULT_SOURCE,
+    READ_FILE_SOURCE,
+    WRITE_FILE_SOURCE,
+)
 
 class TestJitSecurity:
 
     def setup_method(self) -> None:
         self.runtime = Runtime.open('local')
-        self.runtime.tools.sandbox = FakeDenoSandbox()
 
     def teardown_method(self) -> None:
         self.runtime.close()
 
+    @pytest.mark.real_deno
     def test_deno_jit_tool_is_visible_only_to_registering_process(self) -> None:
         owner = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='make parser')
         other = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='unrelated process')
-        candidate = self.runtime.tools.propose(owner, {'name': 'count_chars', 'description': 'Count characters in text.', 'input_schema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}, 'output_schema': {'type': 'object'}}, source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }', tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}])
+        candidate = self.runtime.tools.propose(owner, {'name': 'count_chars', 'description': 'Count characters in text.', 'input_schema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}, 'output_schema': {'type': 'object'}}, source_code=COUNT_CHARS_SOURCE, tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}])
         validation = self.runtime.tools.validate(candidate)
         assert validation.ok, validation.errors
         self.runtime.tools.register(owner, candidate)
@@ -49,10 +57,11 @@ class TestJitSecurity:
         assert not other_call.ok
         assert 'not in process tool table' in (other_call.error or '')
 
+    @pytest.mark.real_deno
     def test_jit_candidate_tools_are_owned_by_proposing_process(self) -> None:
         owner = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='make private tool')
         other = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='try private candidate')
-        candidate = self.runtime.tools.propose(owner, {'name': 'owned_count_chars', 'description': 'Count characters in text.', 'input_schema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}, 'output_schema': {'type': 'object'}}, source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }', tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}])
+        candidate = self.runtime.tools.propose(owner, {'name': 'owned_count_chars', 'description': 'Count characters in text.', 'input_schema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}, 'output_schema': {'type': 'object'}}, source_code=COUNT_CHARS_SOURCE, tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}])
         denied_validation = self.runtime.tools.call(other, 'validate_jit_tool', {'candidate_id': candidate})
         denied_registration = self.runtime.tools.call(other, 'register_jit_tool', {'candidate_id': candidate})
         allowed_validation = self.runtime.tools.call(owner, 'validate_jit_tool', {'candidate_id': candidate})
@@ -89,6 +98,7 @@ class TestJitSecurity:
         assert 'filesystem.write' in candidate.spec.side_effects
         assert 'jsonrpc.call' in candidate.spec.side_effects
 
+    @pytest.mark.real_deno
     def test_jit_tool_names_are_process_local(self) -> None:
         first = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='local tool one')
         second = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='local tool two')
@@ -104,6 +114,7 @@ class TestJitSecurity:
         assert 'local_count_chars' in self._schema_names(first)
         assert 'local_count_chars' in self._schema_names(second)
 
+    @pytest.mark.real_deno
     def test_multiplexed_jit_schema_uses_single_protocol_tool(self) -> None:
         pid = self._spawn_multiplexed_process()
         self._register_count_tool(pid, 'count_chars')
@@ -124,6 +135,7 @@ class TestJitSecurity:
         assert JIT_MULTIPLEXER_TOOL_NAME not in self._schema_names(pid)
         assert JIT_MULTIPLEXER_TOOL_NAME not in {row['name'] for row in self.runtime.tools.model_visible_tools(pid)}
 
+    @pytest.mark.real_deno
     def test_multiplexer_cannot_dispatch_static_or_other_process_tool(self) -> None:
         owner = self._spawn_multiplexed_process()
         other = self._spawn_multiplexed_process()
@@ -181,19 +193,19 @@ class TestJitSecurity:
                 source_code='export function run(args, libos) { return {}; }',
             )
 
+    @pytest.mark.real_deno
     def test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / 'pkg').mkdir()
             (root / 'pkg' / 'data.txt').write_text('secret', encoding='utf-8')
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
-            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 pid = runtime.process.spawn(image='toolmaker-agent:v0', goal='read via syscall')
                 runtime.filesystem.grant_directory(pid, 'pkg', [CapabilityRight.READ], issued_by='test')
                 assert 'read_text_file' not in runtime.process.get(pid).tool_table
                 assert runtime.tools.call(pid, 'set_working_directory', {'path': 'pkg'}).ok is False
-                candidate = runtime.tools.propose(pid, {'name': 'read_via_syscall', 'description': 'Read file.', 'input_schema': {'type': 'object'}}, source_code='export async function run(args, libos) { /* fake:read_file */ return {}; }')
+                candidate = runtime.tools.propose(pid, {'name': 'read_via_syscall', 'description': 'Read file.', 'input_schema': {'type': 'object'}}, source_code=READ_FILE_SOURCE)
                 assert runtime.tools.validate(candidate).ok
                 runtime.tools.register(pid, candidate)
                 result = runtime.tools.call(pid, 'read_via_syscall', {'path': 'pkg/data.txt'})
@@ -202,9 +214,10 @@ class TestJitSecurity:
             finally:
                 runtime.close()
 
+    @pytest.mark.real_deno
     def test_deno_jit_syscall_denies_missing_capability(self) -> None:
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='read denied')
-        candidate = self.runtime.tools.propose(pid, {'name': 'read_denied', 'description': 'Read file.', 'input_schema': {'type': 'object'}}, source_code='export async function run(args, libos) { /* fake:read_file */ return {}; }')
+        candidate = self.runtime.tools.propose(pid, {'name': 'read_denied', 'description': 'Read file.', 'input_schema': {'type': 'object'}}, source_code=READ_FILE_SOURCE)
         assert self.runtime.tools.validate(candidate).ok
         self.runtime.tools.register(pid, candidate)
         result = self.runtime.tools.call(pid, 'read_denied', {'path': 'README.md'})
@@ -217,17 +230,17 @@ class TestJitSecurity:
         with pytest.raises(ValidationError):
             asyncio.run(session.handle('shell.run', {'argv': 'git status'}))
 
+    @pytest.mark.real_deno
     def test_deno_jit_human_approval_is_internal_to_syscall(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
-            runtime.tools.sandbox = FakeDenoSandbox()
             try:
                 pid = runtime.process.spawn(image='toolmaker-agent:v0', goal='write with approval')
                 resource = runtime.filesystem.resource_for_path('out.txt')
                 runtime.capability.set_permission_policy(pid, resource, [CapabilityRight.WRITE], CapabilityManager.ASK_EACH_TIME, issued_by='test')
                 runtime._current_human_auto_approve = True
-                candidate = runtime.tools.propose(pid, {'name': 'write_via_syscall', 'description': 'Write file.', 'input_schema': {'type': 'object'}}, source_code='export async function run(args, libos) { /* fake:write_file */ return {}; }')
+                candidate = runtime.tools.propose(pid, {'name': 'write_via_syscall', 'description': 'Write file.', 'input_schema': {'type': 'object'}}, source_code=WRITE_FILE_SOURCE)
                 assert runtime.tools.validate(candidate).ok
                 runtime.tools.register(pid, candidate)
                 result = runtime.tools.call(pid, 'write_via_syscall', {'path': 'out.txt', 'content': 'ok'})
@@ -237,9 +250,10 @@ class TestJitSecurity:
             finally:
                 runtime.close()
 
+    @pytest.mark.real_deno
     def test_deno_jit_process_exit_is_applied_after_tool_result(self) -> None:
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='exit after deno result')
-        candidate = self.runtime.tools.propose(pid, {'name': 'exit_after_result', 'description': 'Exit.', 'input_schema': {'type': 'object'}}, source_code='export async function run(args, libos) { /* fake:exit_after_result */ return {}; }')
+        candidate = self.runtime.tools.propose(pid, {'name': 'exit_after_result', 'description': 'Exit.', 'input_schema': {'type': 'object'}}, source_code=EXIT_AFTER_RESULT_SOURCE)
         assert self.runtime.tools.validate(candidate).ok
         self.runtime.tools.register(pid, candidate)
         result = self.runtime.tools.call(pid, 'exit_after_result', {})
@@ -247,10 +261,11 @@ class TestJitSecurity:
         assert result.payload == {'returned_after_exit_syscall': True}
         assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
 
+    @pytest.mark.real_deno
     def test_deno_jit_process_exec_is_applied_after_tool_result(self) -> None:
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='exec after deno result')
         self.runtime.capability.grant(pid, 'image:base-agent:v0', [CapabilityRight.READ], issued_by='test')
-        candidate = self.runtime.tools.propose(pid, {'name': 'exec_after_result', 'description': 'Exec.', 'input_schema': {'type': 'object'}}, source_code='export async function run(args, libos) { /* fake:exec_after_result */ return {}; }')
+        candidate = self.runtime.tools.propose(pid, {'name': 'exec_after_result', 'description': 'Exec.', 'input_schema': {'type': 'object'}}, source_code=EXEC_AFTER_RESULT_SOURCE)
         assert self.runtime.tools.validate(candidate).ok
         self.runtime.tools.register(pid, candidate)
         result = self.runtime.tools.call(pid, 'exec_after_result', {})
@@ -260,13 +275,13 @@ class TestJitSecurity:
         assert process.image_id == 'base-agent:v0'
         assert process.status == ProcessStatus.RUNNABLE
 
+    @pytest.mark.real_deno
     def test_deno_jit_deferred_exec_failure_does_not_persist_success_result(self) -> None:
-        self.runtime.tools.sandbox = DeferredBadExecSandbox()
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='bad deferred exec')
         candidate = self.runtime.tools.propose(
             pid,
             {'name': 'bad_deferred_exec', 'description': 'Bad deferred exec.', 'input_schema': {'type': 'object'}},
-            source_code='export async function run(args, libos) { return {}; }',
+            source_code=MISSING_EXEC_AFTER_RESULT_SOURCE,
         )
         assert self.runtime.tools.validate(candidate).ok
         self.runtime.tools.register(pid, candidate)
@@ -285,6 +300,7 @@ class TestJitSecurity:
         assert tool_audits[-1].decision['policy_decision'] == 'lifecycle_error'
         assert not any(record.decision.get('ok') is True for record in tool_audits)
 
+    @pytest.mark.real_deno
     def test_direct_deno_jit_call_validates_input_schema(self) -> None:
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='strict direct jit')
         candidate = self.runtime.tools.propose(
@@ -300,7 +316,7 @@ class TestJitSecurity:
                 },
                 'output_schema': {'type': 'object'},
             },
-            source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }',
+            source_code=COUNT_CHARS_SOURCE,
             tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}],
         )
         assert self.runtime.tools.validate(candidate).ok
@@ -316,8 +332,8 @@ class TestJitSecurity:
         with pytest.raises(ValueError, match='do not match input_schema'):
             self.runtime.tools.normalize_model_action(pid, {'action': 'strict_direct_count'})
 
+    @pytest.mark.real_deno
     def test_deno_jit_call_validates_output_schema(self) -> None:
-        self.runtime.tools.sandbox = BadOutputSandbox()
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='bad output jit')
         candidate = self.runtime.tools.propose(
             pid,
@@ -332,7 +348,7 @@ class TestJitSecurity:
                     'additionalProperties': False,
                 },
             },
-            source_code='export function run(args, libos) { return {}; }',
+            source_code=BAD_OUTPUT_SOURCE,
         )
         self.runtime.tools.register(pid, candidate)
 
@@ -413,6 +429,17 @@ class TestJitSecurity:
         bracket_function_import = checker.static_check('export async function run(args, libos) { const loader = globalThis["Function"]("s", "return import(s)"); return await loader(args.spec); }')
         bracket_function_call_import = checker.static_check('export async function run(args, libos) { return globalThis["Function"].call(null, "return import(args.spec)")(); }')
         bracket_eval_import = checker.static_check('export async function run(args, libos) { return await window["eval"]("import(args.spec)"); }')
+        optional_eval_import = checker.static_check('export async function run(args, libos) { return await eval?.("import(args.spec)"); }')
+        indirect_eval_import = checker.static_check('export async function run(args, libos) { return await (0, eval)("import(args.spec)"); }')
+        computed_eval_import = checker.static_check('export async function run(args, libos) { return await globalThis["ev" + "al"]("import(args.spec)"); }')
+        optional_function_import = checker.static_check('export async function run(args, libos) { const loader = Function?.("s", "return import(s)"); return await loader(args.spec); }')
+        function_call_import = checker.static_check('export async function run(args, libos) { const loader = Function.call(null, "s", "return import(s)"); return await loader(args.spec); }')
+        async_function_import = checker.static_check('export async function run(args, libos) { const AsyncFunction = (async function() {}).constructor; return await AsyncFunction("return import(args.spec)")(); }')
+        generator_function_import = checker.static_check('export function run(args, libos) { const GeneratorFunction = (function* () {}).constructor; return GeneratorFunction("yield 1")().next(); }')
+        direct_constructor_import = checker.static_check('export async function run(args, libos) { return await (async function() {}).constructor("return import(args.spec)")(); }')
+        bracket_constructor_import = checker.static_check('export async function run(args, libos) { return await (async function() {})["constructor"]("return import(args.spec)")(); }')
+        optional_constructor_import = checker.static_check('export async function run(args, libos) { return await (async function() {}).constructor?.("return import(args.spec)")(); }')
+        bracket_constructor_call_import = checker.static_check('export async function run(args, libos) { return await (async function() {})["constructor"].call(null, "return import(args.spec)")(); }')
         local_methods = checker.static_check(
             'export function run(args, libos) { '
             'const obj = { eval() { return 1; }, Function() { return 2; } }; '
@@ -433,10 +460,45 @@ class TestJitSecurity:
         assert any('runtime code generation is not allowed' in error for error in bracket_function_call_import.errors)
         assert not bracket_eval_import.ok
         assert any('runtime code generation is not allowed' in error for error in bracket_eval_import.errors)
+        assert not optional_eval_import.ok
+        assert any('runtime code generation is not allowed' in error for error in optional_eval_import.errors)
+        assert not indirect_eval_import.ok
+        assert any('runtime code generation is not allowed' in error for error in indirect_eval_import.errors)
+        assert not computed_eval_import.ok
+        assert any('runtime code generation is not allowed' in error for error in computed_eval_import.errors)
+        assert not optional_function_import.ok
+        assert any('runtime code generation is not allowed' in error for error in optional_function_import.errors)
+        assert not function_call_import.ok
+        assert any('runtime code generation is not allowed' in error for error in function_call_import.errors)
+        assert not async_function_import.ok
+        assert any('runtime code generation is not allowed' in error for error in async_function_import.errors)
+        assert not generator_function_import.ok
+        assert any('runtime code generation is not allowed' in error for error in generator_function_import.errors)
+        assert not direct_constructor_import.ok
+        assert any('runtime code generation is not allowed' in error for error in direct_constructor_import.errors)
+        assert not bracket_constructor_import.ok
+        assert any('runtime code generation is not allowed' in error for error in bracket_constructor_import.errors)
+        assert not optional_constructor_import.ok
+        assert any('runtime code generation is not allowed' in error for error in optional_constructor_import.errors)
+        assert not bracket_constructor_call_import.ok
+        assert any('runtime code generation is not allowed' in error for error in bracket_constructor_call_import.errors)
         assert local_methods.ok, local_methods.errors
 
+    def test_deno_executable_resolution_rejects_workspace_path_hijack(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        hijack_deno = tmp_path / 'deno'
+        hijack_deno.write_text('#!/bin/sh\necho hijack-deno\n', encoding='utf-8')
+        hijack_deno.chmod(0o755)
+        monkeypatch.setenv('PATH', str(tmp_path))
+        sandbox = DenoTypescriptSandbox(deno_executable='deno', forbidden_executable_roots=[tmp_path])
+
+        metadata = sandbox.metadata_for_source('export function run(args, libos) { return {}; }')
+
+        assert 'deno_version_error' in metadata
+        assert 'forbidden root' in metadata['deno_version_error']
+
+    @pytest.mark.real_deno
     def test_deno_candidate_tests_fail_when_expected_syscall_is_not_performed(self) -> None:
-        sandbox = NoSyscallDenoSandbox(deno_executable='deno')
+        sandbox = DenoTypescriptSandbox(deno_executable='deno')
         validation = sandbox.run_tests('export function run(args, libos) { return { ok: true }; }', [{'args': {}, 'syscalls': [{'name': 'filesystem.read_text', 'args': {'path': 'README.md'}}], 'expected': {'ok': True}}])
         assert not validation.ok
         assert any(('expected syscall(s) not performed' in error for error in validation.errors))
@@ -575,10 +637,11 @@ class TestJitSecurity:
         assert not validation.ok
         assert any(('Deno executable not found' in error for error in validation.errors))
 
+    @pytest.mark.real_deno
     def test_deno_validation_logs_are_bounded(self) -> None:
-        sandbox = HugeValidationLogSandbox(deno_executable='deno', max_validation_log_chars=64)
+        sandbox = DenoTypescriptSandbox(deno_executable='deno', max_validation_log_chars=64)
         validation = sandbox.run_tests(
-            'export function run(args, libos) { return {}; }',
+            'export function run(args, libos) { return { blob: "x".repeat(1000) }; }',
             [{'args': {}}],
         )
 
@@ -587,10 +650,11 @@ class TestJitSecurity:
         assert 'validation logs truncated' in validation.logs
         assert 'sha256=' in validation.logs
 
+    @pytest.mark.real_deno
     def test_deno_validation_mismatch_errors_are_bounded(self) -> None:
-        sandbox = HugeValidationLogSandbox(deno_executable='deno', max_validation_log_chars=64)
+        sandbox = DenoTypescriptSandbox(deno_executable='deno', max_validation_log_chars=64)
         validation = sandbox.run_tests(
-            'export function run(args, libos) { return {}; }',
+            'export function run(args, libos) { return { blob: "x".repeat(1000) }; }',
             [{'args': {}, 'expected': {'ok': True}}],
         )
 
@@ -600,9 +664,10 @@ class TestJitSecurity:
         assert 'sha256=' in validation.errors[0]
         assert 'x' * 128 not in validation.errors[0]
 
+    @pytest.mark.real_deno
     def test_jit_tool_cannot_shadow_existing_tool_name(self) -> None:
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='shadow builtin')
-        candidate = self.runtime.tools.propose(pid, {'name': 'process_exit', 'description': 'Try to shadow a builtin.', 'input_schema': {'type': 'object'}, 'output_schema': {'type': 'object'}}, source_code='export function run(args, libos) { return { shadowed: true }; }', tests=[{'args': {}, 'expected': {'ok': True}}])
+        candidate = self.runtime.tools.propose(pid, {'name': 'process_exit', 'description': 'Try to shadow a builtin.', 'input_schema': {'type': 'object'}, 'output_schema': {'type': 'object'}}, source_code='export function run(args, libos) { return { ok: true }; }', tests=[{'args': {}, 'expected': {'ok': True}}])
         validation = self.runtime.tools.validate(candidate)
         assert validation.ok, validation.errors
         with pytest.raises(ValidationError):
@@ -620,7 +685,7 @@ class TestJitSecurity:
         return {schema['function']['name'] for schema in self.runtime.tools.openai_tool_schemas(pid)}
 
     def _register_count_tool(self, pid: str, name: str) -> Any:
-        candidate = self.runtime.tools.propose(pid, {'name': name, 'description': 'Count characters in text.', 'input_schema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}, 'output_schema': {'type': 'object'}}, source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }', tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}])
+        candidate = self.runtime.tools.propose(pid, {'name': name, 'description': 'Count characters in text.', 'input_schema': {'type': 'object', 'properties': {'text': {'type': 'string'}}}, 'output_schema': {'type': 'object'}}, source_code=COUNT_CHARS_SOURCE, tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}])
         assert self.runtime.tools.validate(candidate).ok
         return self.runtime.tools.register(pid, candidate)
 
@@ -648,24 +713,6 @@ class NoLimitValidationSandbox(SandboxBackend):
 
     def run_tests(self, source_code: str, tests: list[dict[str, Any]], timeout: float | None = None) -> ValidationResult:
         return ValidationResult(ok=True)
-
-
-class HugeValidationLogSandbox(DenoTypescriptSandbox):
-    def deno_version(self) -> str:
-        return "fake-deno"
-
-    def run_source(
-        self,
-        source_code: str,
-        args: dict[str, Any],
-        *,
-        pid: str | None = None,
-        syscall_handler: SyscallHandler | None = None,
-        timeout: float | None = None,
-        limits: SubprocessLimits | None = None,
-        return_metrics: bool = False,
-    ) -> Any:
-        return {"blob": "x" * 1000}
 
 
 class RecordingValidationSandbox(SandboxBackend):
@@ -732,87 +779,3 @@ class PerCaseValidationSandbox(SandboxBackend):
                 "limit_kind": None,
             }
         return ValidationResult(ok=True, logs=f"case {self.calls}", metadata=metadata)
-
-
-class DeferredBadExecSandbox(SandboxBackend):
-    def static_check(self, source_code: str) -> ValidationResult:
-        return ValidationResult(ok=True)
-
-    async def arun_source(
-        self,
-        source_code: str,
-        args: dict[str, Any],
-        *,
-        pid: str | None = None,
-        syscall_handler: SyscallHandler | None = None,
-        timeout: float | None = None,
-        limits: SubprocessLimits | None = None,
-        return_metrics: bool = False,
-    ) -> Any:
-        assert syscall_handler is not None
-        await syscall_handler('process.exec', {'image': 'missing-image:v0', 'goal': 'bad exec'})
-        value = {'returned': True}
-        if return_metrics:
-            return SandboxExecutionResult(value=value, metrics=CommandMetrics(wall_seconds=0.001))
-        return value
-
-    def run_tests(
-        self,
-        source_code: str,
-        tests: list[dict[str, Any]],
-        timeout: float | None = None,
-        *,
-        limits: SubprocessLimits | None = None,
-        return_metrics: bool = False,
-    ) -> ValidationResult:
-        metadata = {}
-        if return_metrics:
-            metadata['metrics'] = {
-                'wall_seconds': 0.001,
-                'cpu_seconds': 0.0,
-                'peak_memory_bytes': 0,
-                'killed': False,
-                'limit_kind': None,
-            }
-        return ValidationResult(ok=True, metadata=metadata)
-
-
-class BadOutputSandbox(SandboxBackend):
-    def static_check(self, source_code: str) -> ValidationResult:
-        return ValidationResult(ok=True)
-
-    async def arun_source(
-        self,
-        source_code: str,
-        args: dict[str, Any],
-        *,
-        pid: str | None = None,
-        syscall_handler: SyscallHandler | None = None,
-        timeout: float | None = None,
-        limits: SubprocessLimits | None = None,
-        return_metrics: bool = False,
-    ) -> Any:
-        value = {'count': 'not-an-integer', 'extra': True}
-        if return_metrics:
-            return SandboxExecutionResult(value=value, metrics=CommandMetrics(wall_seconds=0.001))
-        return value
-
-    def run_tests(
-        self,
-        source_code: str,
-        tests: list[dict[str, Any]],
-        timeout: float | None = None,
-        *,
-        limits: SubprocessLimits | None = None,
-        return_metrics: bool = False,
-    ) -> ValidationResult:
-        metadata = {}
-        if return_metrics:
-            metadata['metrics'] = {
-                'wall_seconds': 0.001,
-                'cpu_seconds': 0.0,
-                'peak_memory_bytes': 0,
-                'killed': False,
-                'limit_kind': None,
-            }
-        return ValidationResult(ok=True, metadata=metadata)

@@ -17,7 +17,7 @@ provides:
   provider_hooks: []
   startup_hooks:
     - initialize_pty
-sha256: 075506d7b48f2db9f9557654cc25ca5b56443e99ab46d9f58a15445e8166e738
+sha256: 19a986a1e20a4f2b91abbcbf3056d7ceeecefbe5cc0db9e68b4d173efdaf4b63
 metadata:
   owner: local
   external_effects:

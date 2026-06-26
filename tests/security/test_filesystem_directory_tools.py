@@ -187,6 +187,38 @@ class TestFilesystemDirectoryTool:
             finally:
                 runtime.close()
 
+    def test_filesystem_rejects_workspace_hardlink_to_external_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            outside_file = Path(outside) / 'secret.txt'
+            outside_file.write_text('outside secret', encoding='utf-8')
+            link = root / 'linked-secret.txt'
+            try:
+                os.link(outside_file, link)
+            except OSError:
+                pytest.skip('hardlink creation is not available in this environment')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='hardlink escape')
+                runtime.filesystem.grant_path(
+                    pid,
+                    'linked-secret.txt',
+                    [CapabilityRight.READ, CapabilityRight.WRITE, CapabilityRight.DELETE],
+                    issued_by='test',
+                )
+
+                with pytest.raises(CapabilityDenied):
+                    runtime.filesystem.read_text(pid, 'linked-secret.txt')
+                with pytest.raises(CapabilityDenied):
+                    runtime.filesystem.write_text(pid, 'linked-secret.txt', 'changed')
+                with pytest.raises(CapabilityDenied):
+                    runtime.filesystem.delete_file(pid, 'linked-secret.txt')
+
+                assert outside_file.read_text(encoding='utf-8') == 'outside secret'
+                assert link.exists()
+            finally:
+                runtime.close()
+
     def test_one_time_mutation_capability_survives_provider_failure(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             root = Path(workspace)

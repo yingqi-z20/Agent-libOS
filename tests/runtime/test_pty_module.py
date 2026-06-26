@@ -16,6 +16,7 @@ from agent_libos.models import AgentImage, CapabilityRight, ExternalEffectClassi
 from agent_libos.models import ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectType, ResourceBudget
 from agent_libos.models.exceptions import HumanApprovalRequired
 from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
+from modules.pty.pty_module import LocalPtyProvider
 
 
 class TestPtyModule:
@@ -268,6 +269,50 @@ class TestPtyModule:
                 assert not write.ok
                 assert not closed.ok
                 assert provider.sessions[0].closed is False
+            finally:
+                runtime.close()
+
+    def test_delegated_object_write_cannot_drive_existing_pty_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                owner = runtime.process.spawn(image="pty-agent:v0", goal="owner")
+                other = runtime.process.spawn(image="pty-agent:v0", goal="delegated writer")
+                created = runtime.tools.call(owner, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+                assert created.ok, created.error
+                session_oid = created.payload["session_oid"]
+                runtime.capability.grant(other, f"object:{session_oid}", [CapabilityRight.WRITE], issued_by="test")
+
+                write = runtime.tools.call(other, "pty_write", {"session_oid": session_oid, "text": "whoami\n"})
+
+                assert not write.ok
+                assert "cannot write to PTY session owned by" in (write.error or "")
+                assert provider.sessions[0].writes == []
+            finally:
+                runtime.close()
+
+    def test_pty_spawn_rejects_workspace_path_hijack(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fake_tool = root / "git"
+            fake_tool.write_text("#!/bin/sh\necho hijacked\n", encoding="utf-8")
+            fake_tool.chmod(0o755)
+            monkeypatch.setenv("PATH", str(root))
+            runtime = _open_pty_runtime(temp_dir, LocalPtyProvider(root))
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="path hijack")
+                runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by="test")
+
+                with pytest.raises(FileNotFoundError, match="safe PATH"):
+                    _pty_adapter(runtime).create(
+                        pid,
+                        ["git", "status"],
+                        cwd=".",
+                        startup_timeout_s=0,
+                        max_output_chars=1,
+                    )
+
             finally:
                 runtime.close()
 

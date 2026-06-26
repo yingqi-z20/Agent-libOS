@@ -965,12 +965,28 @@ class ObjectTaskManager:
         decision = self.runtime.capability.authorize(task.creator_pid, f"object:{result_oid}", ObjectRight.GRANT)
         if not decision.allowed:
             raise CapabilityDenied(f"{task.creator_pid} cannot grant object task result: {result_oid}")
-        self.runtime.capability.handle_for_object(
-            recipient,
-            result_oid,
-            {ObjectRight.READ.value, ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value},
-            issued_by=f"object_task:{task.task_id}",
+        used_by = f"object_task:{task.task_id}"
+        consumed_capability_id = decision.consume_capability_id
+        self.runtime.capability.claim_decision_use(
+            decision,
+            used_by=used_by,
+            reason="one-time object task notify-result grant consumed",
         )
+        try:
+            self.runtime.capability.handle_for_object(
+                recipient,
+                result_oid,
+                {ObjectRight.READ.value, ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value},
+                issued_by=used_by,
+            )
+        except Exception:
+            if consumed_capability_id is not None:
+                self.runtime.capability._restore_reserved_use(
+                    consumed_capability_id,
+                    restored_by=used_by,
+                    reason="object task notify-result handle issuance failed",
+                )
+            raise
 
     def _set_runner_status(self, runner_pid: str, status: ProcessStatus, message: str | None = None) -> None:
         process = self.runtime.store.get_process(runner_pid)

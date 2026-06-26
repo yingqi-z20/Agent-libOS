@@ -19,8 +19,8 @@ trusted Runtime Modules before the runtime is used:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite \
-  --module-manifest modules/example/module.yaml \
-  --trusted-module example-module:v0:<source_sha256> \
+  --module-manifest modules/pty/module.yaml \
+  --trusted-module agent-libos-pty:v0:<source_sha256> \
   <command>
 ```
 
@@ -35,7 +35,7 @@ processes     print process table
 resources     print process resource budget, usage, and remaining budget
 tools         print registered tools
 workflow      run a user-facing workflow tool directly
-object-task   start, inspect, wait for, watch, or cancel Object tasks
+object-task   start, get, list, cancel, wait, or watch-owner Object tasks
 spawn         spawn a process
 cd            set a process working directory
 exec          replace a process image and goal
@@ -46,7 +46,8 @@ message       send a normal human process message
 interrupt     send a human interrupt process message
 checkpoint    checkpoint subcommands
 skills        Skill subcommands
-images        AgentImage list, inspect, and checkpoint commit subcommands
+capabilities  capability list, inspect, grant, delegate, revoke, and explain
+images        AgentImage list, inspect, validate, register, and commit
 jsonrpc       JSON-RPC endpoint and call subcommands
 modules       startup Runtime Module inspection and verification
 human         process pending human messages manually
@@ -417,9 +418,9 @@ Runtime Modules are trusted Python startup extensions. They are loaded with
 global arguments before the selected command runs:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite modules verify modules/example/module.yaml
-uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/example/module.yaml --trusted-module example-module:v0:<source_sha256> modules list
-uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/example/module.yaml --trusted-module example-module:v0:<source_sha256> modules inspect example-module:v0
+uv run agent-libos --db .agent_libos.sqlite modules verify modules/pty/module.yaml
+uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module.yaml --trusted-module agent-libos-pty:v0:<source_sha256> modules list
+uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module.yaml --trusted-module agent-libos-pty:v0:<source_sha256> modules inspect agent-libos-pty:v0
 ```
 
 `modules verify` resolves the entrypoint and computes the source hash without

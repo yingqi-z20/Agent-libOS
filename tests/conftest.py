@@ -24,7 +24,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--run-real-deno",
         action="store_true",
         default=False,
-        help="run tests that execute a real deno binary",
+        help="deprecated; real Deno tests run by default when deno is installed",
+    )
+    parser.addoption(
+        "--skip-real-deno",
+        action="store_true",
+        default=False,
+        help="skip tests that execute a real deno binary",
     )
     parser.addoption(
         "--run-real-llm",
@@ -59,7 +65,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     root = Path(config.rootpath)
-    run_real_deno = bool(config.getoption("--run-real-deno"))
+    skip_real_deno = bool(config.getoption("--skip-real-deno"))
     run_real_llm = bool(config.getoption("--run-real-llm"))
     invariant_marks = _load_invariant_marks(root)
 
@@ -68,8 +74,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for invariant_id in invariant_marks.get(item.nodeid.replace("\\", "/"), ()):
             item.add_marker(pytest.mark.invariant(invariant_id))
         if "real_deno" in item.keywords:
-            if not run_real_deno:
-                item.add_marker(pytest.mark.skip(reason="real Deno tests require --run-real-deno"))
+            if skip_real_deno:
+                item.add_marker(pytest.mark.skip(reason="real Deno tests skipped by --skip-real-deno"))
             elif shutil.which("deno") is None:
                 item.add_marker(pytest.mark.skip(reason="deno not installed"))
         if "real_llm" in item.keywords:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
+import os
 import re
+import stat
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -349,10 +352,11 @@ class ImageRegistryPrimitive:
         root_resolved = root.resolve()
         files: dict[str, bytes] = {}
         for file in sorted(root_resolved.rglob("*")):
-            if file.is_symlink():
+            stat_result = file.lstat()
+            if stat.S_ISLNK(stat_result.st_mode):
                 raise ValidationError(f"image package symlinks are not supported: {file}")
-            if not file.is_file():
-                if file.exists() and not file.is_dir():
+            if not stat.S_ISREG(stat_result.st_mode):
+                if file.exists() and not stat.S_ISDIR(stat_result.st_mode):
                     raise ValidationError(f"image package path is not a regular file or directory: {file}")
                 continue
             relative = file.relative_to(root_resolved).as_posix()
@@ -369,7 +373,8 @@ class ImageRegistryPrimitive:
         selected = Path(path).expanduser()
         if not selected.is_absolute():
             selected = Path.cwd() / selected
-        selected = selected.resolve()
+        if selected.is_symlink():
+            raise ValidationError(f"image package path is a symlink: {selected}")
         if selected.is_dir():
             selected = selected / self.config.image.package_manifest_name
         if selected.name != self.config.image.package_manifest_name:
@@ -381,10 +386,29 @@ class ImageRegistryPrimitive:
         return selected
 
     def _read_package_file_limited(self, path: Path) -> bytes:
-        size = path.stat().st_size
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ValidationError(f"image package path is not a regular file: {path}")
+        if before.st_nlink > 1:
+            raise ValidationError(f"image package hard links are not supported: {path}")
+        size = before.st_size
         if size > self.config.image.package_file_max_bytes:
             raise ValidationError(f"image package file exceeds package_file_max_bytes={self.config.image.package_file_max_bytes}: {path}")
-        return path.read_bytes()
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValidationError(f"image package symlinks are not supported: {path}") from exc
+            raise
+        with os.fdopen(fd, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValidationError(f"image package path is not a regular file: {path}")
+            if opened.st_nlink > 1:
+                raise ValidationError(f"image package hard links are not supported: {path}")
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise ValidationError(f"image package file changed during read: {path}")
+            return handle.read()
 
     def _read_workspace_package(self, pid: str, path: str) -> tuple[dict[str, bytes], str]:
         runtime = self._runtime()

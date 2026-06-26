@@ -117,6 +117,10 @@ Start here, then read the deeper references as needed:
   non-goals.
 - [benchmarks/runtime_safety/schema.md](benchmarks/runtime_safety/schema.md):
   benchmark task schema v0.
+- [plan.md](plan.md): dated paper-submission roadmap; not the implementation
+  reference for current behavior.
+- [AGENTS.md](AGENTS.md): repository structure, testing, security, and
+  contribution guidance for local agents and contributors.
 
 ## Quick Start
 
@@ -199,10 +203,12 @@ visible tool, persists the result object, and exits that process. Pass
 `--image <image_id>` to use another image's tool table. It does not bypass
 primitive capability checks, resource budgets, human approval, or audit.
 
-Every LLM action-selection call is persisted as an `llm_calls` row with prompt
-messages, visible tool schemas, model output, tool calls, token usage when
-available, reasoning metadata when exposed, raw provider response JSON, and
-errors.
+Every LLM action-selection call is persisted as an `llm_calls` row with
+provider ids, model/API mode, token usage when available, errors, and bounded
+observability envelopes for prompts, visible tool schemas, model output, tool
+calls, reasoning metadata, and raw provider responses. Raw prompts and provider
+payloads are not stored by default; set `config.llm.persist_full_io=True` only
+for explicit local debugging or forensic runs.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
@@ -313,14 +319,20 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   final failure, not a pending/retry protocol.
 - When the optional PTY module is loaded, PTY sessions are host runtime
   resources bound to mutable Object Memory `EXTERNAL_REF` handles. Shell policy
-  authorizes creation, object read/write/delete rights authorize interaction
-  and close, and runtime shutdown or object release closes the host PTY.
+  authorizes creation; object read, write, and delete rights authorize read,
+  resize, and close; and `pty_write` additionally requires the original session
+  owner so delegated object write rights cannot drive an existing shell.
+  Runtime shutdown or object release closes the host PTY.
 - `process.exit` and `process.exec` are ordinary syscalls from TypeScript. The
   runtime applies lifecycle changes after the JIT tool returns its normal tool
   result.
-- Checkpoint restore covers reconstructable process-subtree state only. It does
-  not delete append-only audit/events/LLM calls or roll back filesystem, shell,
-  image, network, or provider side effects.
+- Files under ignored `agent_outputs/` are generated workspace output, not a
+  control channel. Agent lifecycle actions such as mini-swe-agent submission must
+  come from explicit tool/syscall arguments, not parsed stdout or file content.
+- Checkpoint restore covers reconstructable process-subtree state and captured
+  image registry metadata needed by that state. It does not delete append-only
+  audit/events/LLM calls or roll back filesystem, shell, image-package source,
+  network, or provider side effects.
 - Checkpoint-derived images capture internal reconstructable runtime state, not
   external provider state. Their required capabilities are declarations and are
   not granted automatically at spawn or exec.
@@ -348,9 +360,11 @@ git diff --check
 Use `uv run python scripts/clean_agent_outputs.py` to dry-run cleanup of
 already accumulated local outputs, and add `--yes` to delete them.
 
-Deno is optional for the Python unit suite. Install `deno` or pass a runtime
-config built with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))` if
-you want to validate and run real Deno/TypeScript JIT tools from another binary.
+Deno-backed tests run by default when `deno` is installed and skip with a clear
+pytest reason when it is missing. Use `--skip-real-deno` only when you
+intentionally want to exclude tests marked `real_deno`. To validate and run
+real Deno/TypeScript JIT tools from another binary, pass a runtime config built
+with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))`.
 
 Runtime defaults live in `agent_libos.config.DEFAULT_CONFIG`, including
 scheduler quantum, worker, drain, and shutdown limits; process budgets; image

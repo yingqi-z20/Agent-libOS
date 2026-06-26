@@ -258,22 +258,30 @@ pid.
 Deno is launched with `--no-prompt` and without read, write, net, env, run, or
 ffi host permissions. External effects must go through syscalls.
 
+When `tools.deno_executable` is a bare name such as `deno`, the sandbox resolves
+it from absolute safe PATH entries and rejects executables under the runtime
+workspace/current root. Absolute executable paths are accepted only when they do
+not fall under configured forbidden roots.
+
 Static imports are limited to configured `jsr:` packages. The default allowlist
 is a small `@std/*` subset. `npm:`, `node:`, `http:`, `https:`, `file:`,
 and dynamic imports are rejected. Static checking is lint, not the security
 boundary: it checks that the source exports `run(args, libos)`, blocks dynamic
-imports, enforces source/test size limits, and restricts dependencies to the
-JSR allowlist. It intentionally does not try to blacklist every dangerous
-JavaScript spelling. Runtime safety comes from Deno no-permission execution,
-the libOS syscall protocol, primitive Capability checks, human approval, and
-resource budgets.
+imports, rejects common runtime code generation forms such as `eval`,
+`Function`, `AsyncFunction`, `GeneratorFunction`, `.constructor(...)`, and
+`["constructor"](...)`, enforces source/test size limits, and restricts
+dependencies to the JSR allowlist. It intentionally does not try to blacklist
+every dangerous JavaScript spelling. Runtime safety comes from Deno
+no-permission execution, the libOS syscall protocol, primitive Capability
+checks, human approval, and resource budgets.
 
 Validation and execution both use subprocess resource budgets when the process
 has them. A sandbox backend that cannot accept limits or return subprocess
 metrics fails closed for budgeted validation or execution.
 
-If Deno is missing, validation returns a clear error. Python unit tests skip or
-mock true Deno execution where appropriate.
+If Deno is missing, validation returns a clear error. Python tests marked
+`real_deno` run by default when `deno` is installed, skip with a clear reason
+when it is missing, and can be intentionally excluded with `--skip-real-deno`.
 
 ## Observability Limits
 

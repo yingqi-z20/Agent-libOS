@@ -1076,7 +1076,11 @@ class ShellAdapter:
         return tokens
 
     def _is_path_like_argument(self, value: str, *, argv0: bool) -> bool:
-        if not value or self._looks_like_url(value):
+        if not value:
+            return False
+        if self._is_file_url(value):
+            return True
+        if self._looks_like_url(value):
             return False
         if argv0:
             return self._argv0_has_path(value)
@@ -1091,10 +1095,15 @@ class ShellAdapter:
         parsed = urlsplit(value)
         return bool(parsed.scheme and parsed.netloc)
 
+    def _is_file_url(self, value: str) -> bool:
+        return urlsplit(value).scheme.casefold() == "file"
+
     def _is_absolute_path(self, value: str) -> bool:
         return Path(value).is_absolute() or PureWindowsPath(value).is_absolute() or PurePosixPath(value).is_absolute()
 
     def _resolve_argument_path(self, value: str, *, root: Path, cwd: Path) -> Path:
+        if self._is_file_url(value):
+            raise CapabilityDenied(f"shell argument path uses file URL syntax: {value}")
         if value.startswith("~"):
             raise CapabilityDenied(f"shell argument path uses host home expansion: {value}")
         raw = Path(value)

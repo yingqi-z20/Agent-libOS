@@ -366,19 +366,17 @@ ipcMain.handle("libos:chooseImagePackage", async () => {
   const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
   if (result.canceled || result.filePaths.length === 0) return null;
   const selected = result.filePaths[0];
-  const stats = fs.statSync(selected);
+  const stats = fs.lstatSync(selected);
   if (!stats.isDirectory()) throw new Error("Selected image package is not a directory.");
-  const manifestPath = path.join(selected, "IMAGE.yaml");
-  const manifestStats = fs.statSync(manifestPath);
-  if (!manifestStats.isFile()) throw new Error("Selected image package is missing IMAGE.yaml.");
-  if (manifestStats.size > imageManifestMaxBytes) {
+  const files = readImagePackageFiles(selected);
+  const manifest = Buffer.from(files["IMAGE.yaml"].base64, "base64");
+  if (manifest.length > imageManifestMaxBytes) {
     throw new Error(`Image manifest exceeds ${imageManifestMaxBytes} bytes.`);
   }
-  const files = readImagePackageFiles(selected);
   return {
     path: selected,
     name: path.basename(selected),
-    manifest: fs.readFileSync(manifestPath, "utf8"),
+    manifest: manifest.toString("utf8"),
     files
   };
 });

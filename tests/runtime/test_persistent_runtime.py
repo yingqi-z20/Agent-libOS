@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.models import ToolHandle, ToolSpec
-from tests.support.fakes import FakeDenoSandbox
+from tests.support.deno import COUNT_CHARS_SOURCE
 
 class TestPersistentRuntime:
 
@@ -28,12 +28,12 @@ class TestPersistentRuntime:
             finally:
                 reopened.close()
 
+    @pytest.mark.real_deno
     def test_registered_jit_tool_source_survives_runtime_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / 'runtime.sqlite'
             runtime = Runtime.open(db_path)
             try:
-                runtime.tools.sandbox = FakeDenoSandbox()
                 pid = runtime.process.spawn(image='toolmaker-agent:v0', goal='persistent jit tool')
                 candidate_id = runtime.tools.propose(
                     pid,
@@ -46,7 +46,7 @@ class TestPersistentRuntime:
                         },
                         'output_schema': {'type': 'object'},
                     },
-                    source_code='export function run(args, libos) { /* fake:count_chars */ return {}; }\n',
+                    source_code=COUNT_CHARS_SOURCE,
                     tests=[{'args': {'text': 'abc'}, 'expected': {'count': 3}}],
                 )
                 assert runtime.tools.validate(candidate_id, pid=pid).ok
@@ -60,7 +60,6 @@ class TestPersistentRuntime:
 
             reopened = Runtime.open(db_path)
             try:
-                reopened.tools.sandbox = FakeDenoSandbox()
                 assert reopened.tools.resolve('persistent_count_chars', pid=pid).tool_id == handle.tool_id
                 assert 'persistent_count_chars' in _schema_names(reopened, pid)
                 result = reopened.tools.call(pid, 'persistent_count_chars', {'text': 'hello'})

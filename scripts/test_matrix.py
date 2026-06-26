@@ -47,7 +47,12 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="test lane to run",
     )
-    parser.add_argument("--run-real-deno", action="store_true", help="include tests marked real_deno")
+    parser.add_argument(
+        "--run-real-deno",
+        action="store_true",
+        help="deprecated; real_deno tests run by default when deno is installed",
+    )
+    parser.add_argument("--skip-real-deno", action="store_true", help="exclude tests marked real_deno")
     parser.add_argument("--run-real-llm", action="store_true", help="include tests marked real_llm")
     parser.add_argument(
         "--max-lane-seconds",
@@ -114,9 +119,8 @@ def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
     if _workers_enabled(args):
         command.extend(["-n", args.workers, "--dist", args.dist])
     marker_filters: list[str] = []
-    if args.run_real_deno:
-        command.append("--run-real-deno")
-    else:
+    if args.skip_real_deno:
+        command.append("--skip-real-deno")
         marker_filters.append("not real_deno")
     if args.run_real_llm:
         command.append("--run-real-llm")

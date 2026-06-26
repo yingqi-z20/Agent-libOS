@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 from dataclasses import replace
 from typing import Any, TYPE_CHECKING
 
@@ -687,16 +689,30 @@ class LLMProcessExecutor:
         for tool_call in tool_calls:
             raw_args = tool_call.get("arguments")
             if isinstance(raw_args, str):
-                arguments_preview = raw_args[: self.config.llm.tool_arguments_preview_chars]
+                raw_bytes = raw_args.encode("utf-8", errors="replace")
+                try:
+                    observable_args: Any = json.loads(raw_args)
+                except ValueError:
+                    observable_args = raw_args
             else:
-                arguments_preview = repr(raw_args)[: self.config.llm.tool_arguments_preview_chars]
+                raw_text = repr(raw_args)
+                raw_bytes = raw_text.encode("utf-8", errors="replace")
+                observable_args = raw_args
+            observation = sanitize_for_observability(
+                observable_args,
+                preview_chars=self.config.llm.tool_arguments_preview_chars,
+            )
             previews.append(
                 {
                     "id": tool_call.get("id"),
                     "call_id": tool_call.get("call_id"),
                     "name": tool_call.get("name"),
                     "arguments_type": type(raw_args).__name__,
-                    "arguments_preview": arguments_preview,
+                    "arguments_preview": observation["preview"],
+                    "arguments_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                    "arguments_bytes": len(raw_bytes),
+                    "arguments_truncated": observation["truncated"],
+                    "arguments_redacted": observation["redacted"],
                 }
             )
         return previews

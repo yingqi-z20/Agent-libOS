@@ -338,6 +338,69 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_object_task_notify_result_consumes_one_time_grant_authority(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(image="base-agent:v0", goal="parent")
+            _grant_process_spawn(runtime, parent)
+            recipient = runtime.spawn_child_process(parent, "notify recipient")
+            owner = _owner(runtime, parent)
+            grant_cap = runtime.capability.issue_trusted(
+                subject=parent,
+                resource="object:*",
+                rights=[ObjectRight.GRANT.value],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            first = runtime.object_tasks.start(
+                parent,
+                owner,
+                "get_working_directory",
+                {},
+                notify_pid=recipient,
+                grant_result_to_notify=True,
+            )
+            first_completed = runtime.object_tasks.wait(first.task_id, actor_pid=parent, timeout=2)
+            assert first_completed.status == ObjectTaskStatus.SUCCEEDED
+            assert first_completed.result_oid is not None
+            recipient_handle = runtime.memory.handle_for_oid(
+                recipient,
+                first_completed.result_oid,
+                required_rights={ObjectRight.READ.value},
+            )
+            assert recipient_handle.oid == first_completed.result_oid
+            assert runtime.store.get_capability(grant_cap.cap_id).uses_remaining == 0
+
+            second = runtime.object_tasks.start(
+                parent,
+                owner,
+                "get_working_directory",
+                {},
+                notify_pid=recipient,
+                grant_result_to_notify=True,
+            )
+            second_completed = runtime.object_tasks.wait(second.task_id, actor_pid=parent, timeout=2)
+
+            assert second_completed.status == ObjectTaskStatus.FAILED
+            assert "cannot grant object task result" in (second_completed.error or "")
+            notify_object_grants = [
+                cap
+                for cap in runtime.capability.list_subject(recipient)
+                if cap.resource.startswith("object:")
+            ]
+            assert [
+                cap.resource
+                for cap in notify_object_grants
+                if cap.issued_by == f"object_task:{first.task_id}"
+            ] == [f"object:{first_completed.result_oid}"]
+            assert not any(cap.issued_by == f"object_task:{second.task_id}" for cap in notify_object_grants)
+            assert any(
+                record.action == "capability.consume" and grant_cap.cap_id in record.capability_refs
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
     def test_object_task_waiting_message_state_does_not_repeat_tool_call(self) -> None:
         runtime = Runtime.open("local")
         try:

@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, JIT_TOOL_EXPOSURE_DIRECT
-from tests.support.fakes import FakeDenoSandbox
 
 
 PACKAGE_ROOT = Path("images/mini-swe-agent")
@@ -48,9 +49,9 @@ class TestMiniSWEAgentImage:
         finally:
             runtime.close()
 
+    @pytest.mark.real_deno
     def test_spawn_exposes_only_package_bash_and_keeps_caller_workspace(self) -> None:
         runtime = Runtime.open("local")
-        runtime.tools.sandbox = FakeDenoSandbox()
         try:
             runtime.image_registry.register_from_package_path(PACKAGE_ROOT, actor="test")
             pid = runtime.process.spawn(image="mini-swe-agent:v0", goal="fix a bug")
@@ -63,9 +64,9 @@ class TestMiniSWEAgentImage:
         finally:
             runtime.close()
 
+    @pytest.mark.real_deno
     def test_declared_capabilities_are_advisory_not_bootstrap_grants(self) -> None:
         runtime = Runtime.open("local")
-        runtime.tools.sandbox = FakeDenoSandbox()
         try:
             runtime.image_registry.register_from_package_path(PACKAGE_ROOT, actor="test")
             pid = runtime.process.spawn(image="mini-swe-agent:v0", goal="fix a bug")

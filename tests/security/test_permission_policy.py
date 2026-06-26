@@ -193,6 +193,20 @@ class TestPermissionPolicy:
         assert not request.ok
         assert self.runtime.human.pending() == []
 
+    def test_request_permission_rejects_broad_capability_admin_before_human_prompt(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='request capability admin')
+        self._grant_human(pid)
+
+        request = self.runtime.tools.call(
+            pid,
+            'request_permission',
+            {'resource': 'capability:*', 'rights': ['admin'], 'reason': 'change permissions broadly'},
+        )
+
+        assert not request.ok
+        assert self.runtime.human.pending() == []
+        assert self.runtime.capability.permission_policy(pid, 'capability:anything', CapabilityRight.ADMIN) == CapabilityManager.MISSING
+
     def test_ask_each_time_prompts_from_filesystem_primitive_and_consumes_one_time_grant(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='ask every write')
         path = self._path()

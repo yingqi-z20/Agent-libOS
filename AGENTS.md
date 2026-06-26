@@ -5,12 +5,12 @@
 Agent libOS is a Python runtime with an optional Electron GUI. Core runtime code
 lives in `agent_libos/`, organized by subsystem: `runtime/`, `primitives/`,
 `capability/`, `memory/`, `skills/`, `modules/`, `tools/`, `substrate/`, and
-`api/` for CLI/GUI server entrypoints. Pytest tests live in `tests/` and are
-split by lane: `unit/`, `runtime/`, `security/`, `self_evolution/`,
-`providers/`, `benchmarks/`, and shared helpers in `support/`. Benchmark code
-and fixtures are under `benchmarks/runtime_safety/`, with runners in
-`experiments/`. Documentation is in `docs/`; the Electron/React frontend is in
-`gui/`; example skills live in `skills/`.
+`api/` for CLI/GUI server entrypoints. Pytest tests live in `tests/` and map to
+lanes: `unit`, `runtime`, `security`, `self-evolution`, `providers`, and
+`benchmark`; shared helpers live in `tests/support/`. Benchmark code and
+fixtures are under `benchmarks/runtime_safety/`, with runners in `experiments/`.
+Documentation is in `docs/`; the Electron/React frontend is in `gui/`; example
+skills live in `skills/`.
 
 ## Build, Test, and Development Commands
 
@@ -45,8 +45,9 @@ Add or update tests with each behavior change. Name Python tests
 `tests/<lane>/test_<feature>.py` and test methods `test_<expected_behavior>`.
 Security or authority changes need denial-path tests, audit/event assertions,
 and an entry in `tests/invariants.yaml` when they protect a runtime invariant.
-Real LLM and Deno paths must remain opt-in through pytest markers; default tests
-should be deterministic and token-free.
+Real LLM paths must remain opt-in through pytest markers and `--run-real-llm`.
+Real Deno tests run by default when `deno` is installed and can be excluded with
+`--skip-real-deno`; default tests should remain deterministic and token-free.
 
 ## Commit & Pull Request Guidelines
 

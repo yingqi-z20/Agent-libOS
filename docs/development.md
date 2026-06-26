@@ -1,7 +1,7 @@
 # Development Guide
 
-This guide covers local setup, regression checks, optional real LLM paths, and
-documentation rules for Agent libOS contributors.
+This guide covers local setup, regression checks, real Deno behavior, optional
+real LLM paths, and documentation rules for Agent libOS contributors.
 
 ## Setup
 
@@ -17,9 +17,11 @@ Use frozen dependency resolution for artifact and CI-style checks:
 uv sync --frozen --all-groups
 ```
 
-Deno is optional for the default Python test suite. Install `deno` or pass a
-runtime config built with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))`
-to validate and run real Deno/TypeScript JIT tools from another binary.
+Deno-backed tests run by default when `deno` is installed. If `deno` is absent,
+tests marked `real_deno` skip with a clear pytest reason; use
+`--skip-real-deno` only when a run intentionally excludes them. To validate and
+run real Deno/TypeScript JIT tools from another binary, pass a runtime config
+built with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))`.
 
 ## Standard Checks
 
@@ -211,6 +213,9 @@ Current behavior must not claim:
 - Skill activation as a capability grant.
 
 `agent_libos_design_doc.md` remains a historical archive and can be stale.
+`plan.md` is a dated paper roadmap; keep it useful for planning, but do not use
+it as the implementation reference for current command syntax or runtime
+behavior.
 
 ## Adding Runtime Code
 

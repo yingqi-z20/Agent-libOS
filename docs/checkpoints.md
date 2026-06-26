@@ -44,8 +44,15 @@ same startup Runtime Module ids and source hashes captured in the checkpoint.
 Checkpoint restore does not import Python modules, change module trust, restore
 global Skill trust rows, or roll back the host module environment.
 
-External filesystem, shell, image, JSON-RPC remote calls, and provider effects
-are not rolled back. Providers classify their own effects as:
+Host filesystem, shell, JSON-RPC remote calls, and provider effects are not
+rolled back. Image registry rows are internal runtime metadata: snapshots capture
+the image definitions needed by the checkpointed subtree and any referenced
+checkpoint-derived image artifacts. Destructive restore re-upserts those captured
+image rows so the restored subtree can run against its snapshotted image
+definitions; it does not copy image-package source directories or provider-side
+state.
+
+Providers classify their own effects as:
 
 - `irreversible`,
 - `rollbackable`,
@@ -183,6 +190,12 @@ uv run agent-libos --db .agent_libos.sqlite spawn --image stateful-agent:v0 --go
 
 Fork creates a new isolated process subtree from checkpoint state. It remaps
 pids, object ids, capability ids, namespace ids, and process-local tool records.
+Fork is non-destructive for the global image registry: it restores only image
+definitions or checkpoint-derived image artifacts that are missing from the
+current runtime, and never replaces an image id that already exists. When actor
+capability checks are enabled, fork therefore requires both `execute` on the
+checkpoint and `write` on each missing `image:<image_id>` resource it would
+reintroduce.
 
 The forked subtree must not gain authority wider than the checkpointed subtree
 held. It does not share the original process private namespace or result

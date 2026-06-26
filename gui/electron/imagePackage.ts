@@ -31,7 +31,8 @@ export function readImagePackageFiles(root: string) {
         continue;
       }
       if (!entry.isFile()) throw new Error(`Image package path is not a regular file: ${relative}`);
-      const stats = fs.statSync(fullPath);
+      const stats = fs.lstatSync(fullPath);
+      if (stats.nlink > 1) throw new Error(`Image package hard links are not supported: ${relative}`);
       totalBytes += stats.size;
       if (Object.keys(files).length + 1 > imagePackageMaxFiles) {
         throw new Error(`Image package exceeds ${imagePackageMaxFiles} files.`);
@@ -39,11 +40,30 @@ export function readImagePackageFiles(root: string) {
       if (totalBytes > imagePackageMaxBytes) {
         throw new Error(`Image package exceeds ${imagePackageMaxBytes} bytes.`);
       }
-      const content = fs.readFileSync(fullPath);
+      const content = readPackageFile(fullPath, relative, stats);
       files[relative] = { base64: content.toString("base64") };
     }
   }
 
   visit(root, 0);
+  if (!files["IMAGE.yaml"]) {
+    throw new Error("Image package is missing IMAGE.yaml.");
+  }
   return files;
+}
+
+function readPackageFile(fullPath: string, relative: string, before: fs.Stats) {
+  const noFollow = "O_NOFOLLOW" in fs.constants ? fs.constants.O_NOFOLLOW : 0;
+  const fd = fs.openSync(fullPath, fs.constants.O_RDONLY | noFollow);
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile()) throw new Error(`Image package path is not a regular file: ${relative}`);
+    if (opened.nlink > 1) throw new Error(`Image package hard links are not supported: ${relative}`);
+    if (opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error(`Image package file changed during read: ${relative}`);
+    }
+    return fs.readFileSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
 }

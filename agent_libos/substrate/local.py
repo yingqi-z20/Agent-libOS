@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import http.client
 import heapq
 import os
@@ -49,7 +50,6 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _SHELL_DEFAULTS = DEFAULT_CONFIG.shell
 _SAFE_SHELL_ENV_KEYS = {
     "COMSPEC",
-    "HOME",
     "LANG",
     "LC_ALL",
     "PATH",
@@ -59,7 +59,6 @@ _SAFE_SHELL_ENV_KEYS = {
     "SYSTEMROOT",
     "TEMP",
     "TMP",
-    "USERPROFILE",
     "WINDIR",
 }
 
@@ -94,16 +93,18 @@ class LocalFilesystemProvider:
         )
 
     def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
-        if max_bytes is None:
-            return self._target(path).read_bytes()
-        with self._target(path).open("rb") as handle:
+        target = self._target(path)
+        with self._open_existing_file(target, os.O_RDONLY) as handle:
+            if max_bytes is None:
+                return handle.read()
             return handle.read(max(0, max_bytes))
 
     def write_text(self, path: ResolvedPath, text: str, encoding: str, newline: str | None = "\n") -> None:
         target = self._target(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target = self._target(path)
-        target.write_text(text, encoding=encoding, newline=newline)
+        with self._open_write_file(target, encoding=encoding, newline=newline) as handle:
+            handle.write(text)
 
     def make_directory(self, path: ResolvedPath, *, parents: bool, exist_ok: bool) -> None:
         self._target(path).mkdir(parents=parents, exist_ok=exist_ok)
@@ -117,7 +118,9 @@ class LocalFilesystemProvider:
         return [self._directory_entry(child) for child in children]
 
     def delete_file(self, path: ResolvedPath) -> None:
-        self._target(path).unlink()
+        target = self._target(path)
+        self._require_existing_single_link_file(target)
+        target.unlink()
 
     def delete_directory(self, path: ResolvedPath, *, recursive: bool) -> None:
         target = self._target(path)
@@ -176,6 +179,98 @@ class LocalFilesystemProvider:
             return True
         is_junction = getattr(path, "is_junction", None)
         return bool(is_junction()) if callable(is_junction) else False
+
+    def _open_existing_file(self, target: Path, flags: int) -> Any:
+        fd = self._open_under_root(target, flags)
+        try:
+            self._validate_open_regular_file(fd, target)
+            return os.fdopen(fd, "rb")
+        except Exception:
+            os.close(fd)
+            raise
+
+    def _open_write_file(self, target: Path, *, encoding: str, newline: str | None) -> Any:
+        try:
+            fd = self._open_under_root(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            fd = self._open_under_root(target, os.O_WRONLY)
+        try:
+            self._validate_open_regular_file(fd, target)
+            os.ftruncate(fd, 0)
+            return os.fdopen(fd, "w", encoding=encoding, newline=newline)
+        except Exception:
+            os.close(fd)
+            raise
+
+    def _open_under_root(self, target: Path, flags: int, mode: int = 0o666) -> int:
+        if os.open not in os.supports_dir_fd:
+            return self._open_under_root_fallback(target, flags, mode)
+        parts = self._relative_parts(target)
+        if not parts:
+            raise CapabilityDenied("filesystem operation requires a file path below the adapter root")
+        dir_fd = self._open_root_dir_fd()
+        try:
+            for part in parts[:-1]:
+                next_fd = self._open_dir_component(dir_fd, part)
+                os.close(dir_fd)
+                dir_fd = next_fd
+            return self._open_file_component(dir_fd, parts[-1], flags, mode)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(dir_fd)
+
+    def _open_under_root_fallback(self, target: Path, flags: int, mode: int) -> int:
+        self._require_existing_single_link_file(target, allow_missing=bool(flags & os.O_CREAT))
+        return os.open(target, flags, mode)
+
+    def _relative_parts(self, target: Path) -> tuple[str, ...]:
+        try:
+            parts = target.relative_to(self.root).parts
+        except ValueError as exc:
+            raise CapabilityDenied(f"path escapes filesystem adapter root: {target}") from exc
+        if any(part in {"", ".", ".."} for part in parts):
+            raise CapabilityDenied(f"invalid filesystem path component: {target}")
+        return tuple(parts)
+
+    def _open_root_dir_fd(self) -> int:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        return os.open(self.root, flags)
+
+    def _open_dir_component(self, dir_fd: int, name: str) -> int:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            return os.open(name, flags, dir_fd=dir_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise CapabilityDenied(f"filesystem path contains a symlink or non-directory component: {name}") from exc
+            raise
+
+    def _open_file_component(self, dir_fd: int, name: str, flags: int, mode: int) -> int:
+        try:
+            return os.open(name, flags | getattr(os, "O_NOFOLLOW", 0), mode, dir_fd=dir_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise CapabilityDenied(f"filesystem path contains a symlink or non-file component: {name}") from exc
+            raise
+
+    def _validate_open_regular_file(self, fd: int, target: Path) -> None:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise CapabilityDenied(f"filesystem path is not a regular file: {target}")
+        if stat_result.st_nlink > 1:
+            raise CapabilityDenied(f"filesystem path is a hard link with multiple names: {target}")
+
+    def _require_existing_single_link_file(self, target: Path, *, allow_missing: bool = False) -> None:
+        try:
+            stat_result = target.lstat()
+        except FileNotFoundError:
+            if allow_missing:
+                return
+            raise
+        if stat.S_ISLNK(stat_result.st_mode):
+            raise CapabilityDenied(f"filesystem path contains a symlink or junction: {target}")
+        if stat.S_ISREG(stat_result.st_mode) and stat_result.st_nlink > 1:
+            raise CapabilityDenied(f"filesystem path is a hard link with multiple names: {target}")
 
     def _directory_entry(self, target: Path) -> DirectoryEntrySnapshot:
         stat_result = target.lstat()
@@ -379,6 +474,8 @@ class LocalShellProvider:
     def _safe_env(self) -> dict[str, str]:
         env = {key: value for key, value in os.environ.items() if key.upper() in _SAFE_SHELL_ENV_KEYS}
         env["PATH"] = self._safe_path()
+        env["HOME"] = str(self.cwd)
+        env["USERPROFILE"] = str(self.cwd)
         return env
 
     def _resolve_argv0(self, argv: list[str], selected_cwd: Path) -> list[str]:

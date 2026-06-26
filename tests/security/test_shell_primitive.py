@@ -65,6 +65,35 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
+    def test_shell_rejects_file_url_arguments_before_provider_run(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='file url shell')
+            runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
+
+            with pytest.raises(CapabilityDenied, match='file URL'):
+                runtime.shell.run(pid, ['git', 'status', f'file://{Path(tempfile.gettempdir())}/secret.txt'])
+
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
+    def test_shell_subprocess_home_points_to_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='workspace home shell')
+                runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
+
+                result = runtime.shell.run(
+                    pid,
+                    ['python', '-c', 'import os; print(os.environ.get("HOME")); print(os.environ.get("USERPROFILE"))'],
+                )
+
+                assert result.stdout.splitlines() == [str(Path(temp_dir).resolve()), str(Path(temp_dir).resolve())]
+            finally:
+                runtime.close()
+
     def test_unlisted_command_requires_approval_and_consumes_once(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:
@@ -569,6 +598,7 @@ class RecordingShellSubstrate(LocalResourceProviderSubstrate):
         self.workspace_display = str(self.workspace_root)
         self.filesystem = LocalFilesystemProvider(root)
         self.clock = LocalClockProvider()
+        shell.cwd = self.workspace_root
         self.shell = shell
         self.human = LocalHumanProvider()
 

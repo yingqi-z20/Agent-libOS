@@ -115,12 +115,13 @@ payload records descriptive metadata such as argv, cwd, backend, dimensions,
 and creation time, but authorization for later interaction comes only from the
 current Object capability graph and the in-memory PTY registry.
 
-`pty_read` requires object `read`; `pty_write` and `pty_resize` require object
-`write`; `pty_close` requires object `delete`. Closing the session releases the
-object and revokes related object capabilities. If the object is released by a
-lifetime scope, process-owned memory cleanup, direct trusted delete, or runtime
-shutdown, the module-bound Object release or shutdown finalizer closes the
-underlying PTY as the object's RAII resource.
+`pty_read` requires object `read`; `pty_write` requires object `write` and the
+original session owner pid; `pty_resize` requires object `write`; `pty_close`
+requires object `delete`. Closing the session releases the object and revokes
+related object capabilities. If the object is released by a lifetime scope,
+process-owned memory cleanup, direct trusted delete, or runtime shutdown, the
+module-bound Object release or shutdown finalizer closes the underlying PTY as
+the object's RAII resource.
 
 PTY sessions are not checkpointed or persisted as reconnectable host handles.
 A checkpoint or committed image may contain an `EXTERNAL_REF` row only as stale
@@ -240,9 +241,9 @@ Human interaction is modeled as runtime objects, not raw prompt text.
 - `request_permission` requires human write authority, creates a blocking scoped
   policy request with canonical resource, risk, resource scope, lease shape, and
   constraints shown to the human, then returns the final policy decision. Model
-  requests cannot ask for broad high-risk grants such as `shell:*` execute or
-  root/global filesystem write such as `filesystem:/:*`; workspace write remains
-  a human-approvable scope.
+  requests cannot ask for broad high-risk grants such as `capability:*`
+  privileged rights, `shell:*` execute, or root/global filesystem write such as
+  `filesystem:/:*`; workspace write remains a human-approvable scope.
 - `human_output` writes through the HumanObject primitive and provider.
 - Per-use approvals can create one-shot capabilities that are consumed after
   one successful primitive call.

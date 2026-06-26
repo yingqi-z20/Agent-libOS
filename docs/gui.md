@@ -98,9 +98,9 @@ machine has a working desktop/GPU stack and you specifically want to exercise
 the preload bridge.
 
 The Vite development server is bound to `127.0.0.1` and restricts file serving
-to the `gui/` directory. `npm audit --omit=dev` should remain clean; at the
-time of this implementation npm reports a dev-only Vite/esbuild advisory with
-no available upstream fix, so the development server must stay local-only.
+to the `gui/` directory. Production dependency audit should remain clean; any
+dev-server advisory must be handled with local-only exposure unless an upstream
+fix is available.
 
 ## Current Workspace
 

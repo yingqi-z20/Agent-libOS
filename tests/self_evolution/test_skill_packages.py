@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -71,6 +72,25 @@ class TestSkillPackageLoading:
                 assert not runtime.capability.check(pid, 'skill:workspace-skill', CapabilityRight.EXECUTE)
                 resource = runtime.skills.read_skill_resource(pid, 'workspace-skill', 'references/guide.md')
                 assert resource['content'] == 'Workspace resource guide.'
+            finally:
+                runtime.close()
+
+    def test_host_skill_package_rejects_hardlinked_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside:
+            root = Path(temp_dir)
+            skill_dir = write_skill_package(root, 'hardlink-skill', allowed_tools=['echo'], extra_resources={'references/guide.md': 'resource'})
+            outside_file = Path(outside) / 'external-secret.txt'
+            outside_file.write_text('external secret\n', encoding='utf-8')
+            resource = skill_dir / 'references' / 'guide.md'
+            resource.unlink()
+            try:
+                os.link(outside_file, resource)
+            except OSError:
+                pytest.skip('hardlink creation is not available in this environment')
+            runtime = Runtime.open('local')
+            try:
+                with pytest.raises(ValidationError, match='hard links'):
+                    runtime.skills.validate_package_path(skill_dir)
             finally:
                 runtime.close()
 

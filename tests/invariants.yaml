@@ -21,6 +21,7 @@
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_directory_primitive_enforces_limit_without_tool_schema",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_filesystem_resource_keeps_os_distinct_path_names_separate",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_directory_listing_does_not_follow_child_symlink_metadata",
+        "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_filesystem_rejects_workspace_hardlink_to_external_inode",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_concurrent_one_time_file_write_crosses_provider_once",
         "tests/runtime/test_process_messages.py::TestProcessMessage::test_process_message_payload_limits_and_read_limit_are_enforced",
         "tests/runtime/test_process_messages.py::TestProcessMessage::test_blocking_receive_rejects_oversized_wait_filters_before_status_write",
@@ -32,7 +33,8 @@
         "tests/runtime/test_pty_module.py::TestPtyModule::test_concurrent_pty_create_reserves_capacity_before_provider_spawn",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_write_preconditions_fail_before_per_use_prompt",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_broad_shell_execute_before_human_prompt",
-        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_root_filesystem_write_before_human_prompt"
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_root_filesystem_write_before_human_prompt",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_rejects_broad_capability_admin_before_human_prompt"
       ],
       "benchmark_attack_classes": ["forbidden_file_write", "forbidden_file_delete"]
     },
@@ -182,10 +184,15 @@
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_custom_allow_rule_with_shell_syntax_payload_requires_approval",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_local_shell_provider_uses_argv_without_shell_interpreter",
         "tests/security/test_shell_primitive.py::TestShellMatcher::test_local_shell_provider_does_not_execute_workspace_path_hijack",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_rejects_file_url_arguments_before_provider_run",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_subprocess_home_points_to_workspace",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_shell_once_approval_does_not_authorize_pty_spawn",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_other_process_without_object_capability_cannot_operate_pty",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_delegated_object_write_cannot_drive_existing_pty_session",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_spawn_rejects_workspace_path_hijack",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_comment_split_imports",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_executable_resolution_rejects_workspace_path_hijack",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_tool_cannot_shadow_existing_tool_name",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_fails_closed_without_budget_limit_support",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_validation_charges_returned_subprocess_metrics",
@@ -243,7 +250,8 @@
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_sanitizes_sensitive_fields_without_hashing_secret_values",
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_redacts_common_credential_keys",
         "tests/unit/test_tool_policy_and_observability.py::TestToolPolicyAndObservability::test_observability_redacts_scalar_credential_patterns",
-        "tests/security/test_jit_security.py::TestJitSecurity::test_tool_events_and_audit_do_not_store_raw_sensitive_tool_args"
+        "tests/security/test_jit_security.py::TestJitSecurity::test_tool_events_and_audit_do_not_store_raw_sensitive_tool_args",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_retries_malformed_empty_tool_name_once"
       ],
       "benchmark_attack_classes": []
     },
@@ -256,6 +264,7 @@
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_comment_split_imports",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_mutable_jsr_versions",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_static_check_rejects_runtime_code_generation_import_bypasses",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_executable_resolution_rejects_workspace_path_hijack",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_denies_missing_capability",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_candidate_specs_are_conservative_side_effects",
@@ -320,6 +329,7 @@
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_completion_survives_one_time_owner_handle",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_notification_can_interrupt_and_wake_message_waiter",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_result_oid_in_notification_does_not_grant_result_authority",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_notify_result_consumes_one_time_grant_authority",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_waiting_message_state_does_not_repeat_tool_call",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_request_permission_resumes_after_human_decision",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_update_resumes_waiting_runner",
@@ -375,6 +385,7 @@
       "node_ids": [
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_loaded_existing_tool_visibility_does_not_grant_resource_authority",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_host_skill_package_rejects_hardlinked_resources",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_skill_syscalls_use_primitive_capabilities_not_tool_table",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_loaded_skill_uses_activation_snapshot_after_registry_replace",
         "tests/self_evolution/test_skill_integrations.py::TestSkillIntegration::test_jit_skill_validation_uses_broker_resource_limits_once",
@@ -415,6 +426,8 @@
         "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_resurrect_revoked_capability",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_normalizes_waiting_process_state",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_replace_current_image_without_image_write",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_requires_image_write_to_restore_missing_image",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_checkpoint_restore_and_fork_do_not_resurrect_global_skill_trust"
       ],
       "benchmark_attack_classes": ["self_evolution_checkpoint"]
@@ -432,13 +445,16 @@
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_jit_boot_validation_uses_broker_resource_limits_once",
         "tests/self_evolution/test_skill_integrations.py::TestSkillIntegration::test_image_default_skill_spawn_fails_closed_when_skill_missing",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_rejects_secret_or_cache_files",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_rejects_host_hardlinked_files",
         "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_rejects_undeclared_root_files",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_spawns_baked_memory_without_external_authority",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_exec_into_committed_image_restores_baked_memory_without_granting_required_caps",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_boot_requires_image_read_authority",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_jit_tool_remains_process_local",
         "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_jit_tool_source_survives_runtime_reopen",
-        "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_does_not_package_external_registry_or_skill_trust"
+        "tests/self_evolution/test_image_commit.py::TestImageCommit::test_committed_image_does_not_package_external_registry_or_skill_trust",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_replace_current_image_without_image_write",
+        "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_requires_image_write_to_restore_missing_image"
       ],
       "benchmark_attack_classes": ["self_evolution_image"]
     },

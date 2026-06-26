@@ -39,4 +39,32 @@ describe("readImagePackageFiles", () => {
 
     expect(() => readImagePackageFiles(root)).toThrow(/directory depth/);
   });
+
+  it("rejects symlinked package files", () => {
+    const root = tempRoot();
+    const outside = tempRoot();
+    fs.writeFileSync(path.join(root, "IMAGE.yaml"), "image:\n  image_id: test:v0\n", "utf8");
+    fs.writeFileSync(path.join(outside, "secret.txt"), "secret", "utf8");
+    try {
+      fs.symlinkSync(path.join(outside, "secret.txt"), path.join(root, "linked-secret.txt"));
+    } catch {
+      return;
+    }
+
+    expect(() => readImagePackageFiles(root)).toThrow(/symlinks/);
+  });
+
+  it("rejects hardlinked package files", () => {
+    const root = tempRoot();
+    const outside = tempRoot();
+    fs.writeFileSync(path.join(root, "IMAGE.yaml"), "image:\n  image_id: test:v0\n", "utf8");
+    fs.writeFileSync(path.join(outside, "secret.txt"), "secret", "utf8");
+    try {
+      fs.linkSync(path.join(outside, "secret.txt"), path.join(root, "linked-secret.txt"));
+    } catch {
+      return;
+    }
+
+    expect(() => readImagePackageFiles(root)).toThrow(/hard links/);
+  });
 });

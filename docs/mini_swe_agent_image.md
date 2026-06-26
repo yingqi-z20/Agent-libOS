@@ -2,7 +2,7 @@
 
 `images/mini-swe-agent/` is a package-only AgentImage that follows the
 mini-swe-agent `mini.yaml` tool-call shape: the model sees a single `bash`
-tool with a required `command` string.
+tool with a required `command` string and an optional `submit` boolean.
 
 ```bash
 uv run agent-libos images validate images/mini-swe-agent
@@ -12,9 +12,9 @@ uv run agent-libos images register images/mini-swe-agent
 The package uses `prompt_mode: image_only`, `jit_tool_exposure: direct`, and
 `default_tools: []`. At boot, the image package registers one process-local JIT
 tool named `bash`; it does not expose `process_exit`, Object Memory, or other
-builtin tools to the model. If the command output begins with
-`COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`, the JIT wrapper calls the internal
-`process.exit` syscall after returning the tool result.
+builtin tools to the model. If `submit` is `true` and the shell command exits
+successfully, the JIT wrapper calls the internal `process.exit` syscall with
+the command output as the submitted payload after collecting the tool result.
 
 The wrapper runs:
 

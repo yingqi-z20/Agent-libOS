@@ -141,6 +141,7 @@ class ToolBroker:
             max_stderr_bytes=self.config.tools.deno_max_stderr_bytes,
             jsr_allowlist=self.config.tools.deno_jsr_allowlist,
             max_validation_log_chars=self.config.tools.jit_validation_log_max_chars,
+            forbidden_executable_roots=[Path(workspace_root or Path.cwd()).resolve()],
         )
         self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self._tools: dict[str, BaseAgentTool] = {}

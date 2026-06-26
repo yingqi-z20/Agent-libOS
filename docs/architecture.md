@@ -201,7 +201,7 @@ correlation id.
 
 ```text
 agent_libos/
-  api/             CLI, GUI HTTP/SSE server, and future host-facing adapters
+  api/             CLI and GUI HTTP/SSE server entrypoints
   capability/      capability grant, revoke, check, and object handles
   config/          typed runtime, LLM, tool, memory, launcher, and script defaults
   human/           HumanObject query, approval, interrupt, and output primitives
@@ -216,9 +216,13 @@ agent_libos/
   substrate/       provider interfaces and local host-backed implementations
   storage/         SQLite persistence
   tools/           tool base classes, ToolBroker, sandbox, and built-in tools
+  utils/           shared validation, YAML loading, and helper utilities
 benchmarks/        deterministic runtime-safety benchmark harness and fixtures
 docs/              current implementation documentation
 experiments/       benchmark entrypoints
+gui/               Electron/React desktop console
+images/            workspace AgentImage packages
+modules/           workspace trusted Runtime Module packages
 scripts/           real-model smoke and demo scripts
 skills/            workspace standard Agent Skill packages
 tests/             safety-boundary and regression tests
