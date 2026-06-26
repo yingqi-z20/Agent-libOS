@@ -1,0 +1,30 @@
+schema_version: 1
+module_id: agent-libos-vivado:v0
+name: Agent libOS Vivado module
+version: v0
+entrypoint: ./vivado_module.py:register_module
+provides:
+  tools:
+    - vivado_health
+    - vivado_sync_push
+    - vivado_sync_pull
+    - vivado_session_create
+    - vivado_session_send_stdin
+    - vivado_session_read_output
+    - vivado_session_status
+    - vivado_session_heartbeat
+    - vivado_session_close
+  images:
+    - vivado-agent:v0
+  syscalls: []
+  provider_hooks: []
+  startup_hooks:
+    - initialize_vivado
+sha256: 5c5349d04379f79cd52473febd42efa09c417e19b1aed0a447d3caeccbf321a1
+metadata:
+  owner: local
+  external_effects:
+    - vivado.health
+    - vivado.sync_push
+    - vivado.sync_pull
+    - vivado.session

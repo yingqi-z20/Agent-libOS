@@ -416,6 +416,25 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "vivado-module-enforces-remote-and-local-authority",
+      "title": "The Vivado Runtime Module gates remote Vivado effects and local sync effects through explicit capabilities and Object handles.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_session_create_requires_vivado_capability_before_provider_call",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_sync_pull_requires_local_read_before_provider_plan",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_pull_rejects_reserved_sync_symlink_before_provider_plan",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_push_rejects_symlink_before_upload",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_pull_checksum_failure_leaves_existing_target_unchanged",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_pull_rejects_oversized_plan_entry_before_download",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_pull_delete_extra_requires_delete_permission_before_provider_plan",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_push_consumes_one_time_project_capability_before_failed_upload",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_pull_consumes_one_time_write_capability_before_failed_download_verification",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_other_process_with_delegated_object_write_cannot_drive_session",
+        "tests/runtime/test_vivado_module.py::TestVivadoModule::test_direct_object_release_closes_remote_session"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "checkpoint-restore-and-fork-are-scoped",
       "title": "Checkpoint restore and fork are capability-controlled, scoped, and append-only outside reconstructable state.",
       "lane": "self-evolution",
