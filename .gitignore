@@ -24,3 +24,4 @@ gui/.smoke-user-data/
 gui/release/
 gui-memory
 !benchmarks/runtime_safety/fixtures/basic_repo/.env
+!benchmarks/practical_agent_workflows/fixtures/common_repo/.env

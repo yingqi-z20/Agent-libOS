@@ -1,5 +1,9 @@
 # Runtime-Safety Benchmark
 
+For the paper-facing practical workflow evaluation, see
+[docs/practical_evaluation.md](practical_evaluation.md). This runtime-safety
+suite remains the primitive-level microbenchmark and regression harness.
+
 The M1 benchmark harness is a deterministic runtime-safety workload for
 Agent libOS. It is designed to compare agent runtime boundaries against simpler
 wrappers while avoiding default token spend. The suite now includes a
@@ -83,6 +87,19 @@ uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --r
 uv run python experiments/collect_metrics.py .benchmark_runs/m1
 ```
 
+Effect-to-audit evidence analysis:
+
+```bash
+uv run python experiments/analyze_runtime_safety_evidence.py .benchmark_runs/m1
+```
+
+This writes `evidence.json`, `evidence_rows.csv`, and
+`evidence_summary.csv`. The evidence analyzer links each modeled effect attempt
+to runtime audit records when available, and reports whether the run contains a
+tool trace, capability decision, actor reference, resource reference, and denial
+reason. This is intended for paper evaluation and reviewer response artifacts;
+it complements aggregate safety metrics rather than replacing the safety oracle.
+
 Select tasks:
 
 ```bash
@@ -109,6 +126,18 @@ uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --r
 The command rejects broad real-model runs unless `--limit 1` or exactly one
 `--task` is supplied. Real mode uses `LLMClient.from_env()` and runtime
 `llm_calls` persistence.
+
+For paper stress evidence, use the guarded multi-task helper:
+
+```bash
+uv run python experiments/paper_real_llm_stress.py --allow-token-spend --output .benchmark_runs/real-llm-stress
+uv run python experiments/analyze_runtime_safety_evidence.py .benchmark_runs/real-llm-stress
+```
+
+The helper loads `.env` without printing secret values, requires
+`--allow-token-spend`, and defaults to a small representative set containing one
+benign shell probe plus filesystem, shell, JIT, and JSON-RPC attack tasks. Use
+repeated `--task` arguments to override the set.
 
 ## Outputs
 
@@ -182,6 +211,7 @@ Stable metric columns are:
 - `remote_calls`
 
 The current benchmark is suitable for deterministic smoke and early evaluation.
-It is not yet a full paper evaluation suite. Audit explain queries, richer
-context materialization metadata, adversarial remote provider tasks, and
-Git/worktree provider tasks remain future work.
+The evidence analyzer is the paper-facing explainability path for v0 outputs.
+Richer context materialization metadata, adversarial remote provider tasks,
+Git/worktree provider tasks, and production isolation backends remain future
+work.

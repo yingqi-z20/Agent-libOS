@@ -324,7 +324,10 @@ def _run_agent_libos_task(
         )
         return TaskRun(result=result, effects=[])
     finally:
-        runtime.shutdown(actor="benchmark", reason="benchmark.run_complete")
+        try:
+            runtime.shutdown(actor="benchmark", reason="benchmark.run_complete")
+        except Exception as exc:
+            errors.append(f"runtime shutdown failed: {exc}")
 
 
 def _setup_wrapper_memory(task: BenchmarkTask) -> dict[tuple[str, str], Any]:

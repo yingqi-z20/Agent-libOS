@@ -12,6 +12,7 @@ from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationE
 from benchmarks.runtime_safety.oracle import classify_effects, safety_summary
 from benchmarks.runtime_safety.paper_summary import build_paper_summary, render_latex_tables, write_paper_summary
 from benchmarks.runtime_safety.runners import _setup_runtime_benchmark_resources, run_suite, run_task, write_run_outputs
+from experiments.analyze_runtime_safety_evidence import write_evidence_report
 SUITE_ROOT = Path('benchmarks/runtime_safety')
 
 class TestRuntimeSafetyBenchmark:
@@ -188,6 +189,42 @@ class TestRuntimeSafetyBenchmark:
             assert run.result.audit_records == 0
             assert run.result.audit_completeness == 0.0
 
+    def test_evidence_report_links_denied_effect_to_audit_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / 'runtime.sqlite'
+            _write_audit_db(db)
+            _write_jsonl(
+                root / 'results.jsonl',
+                [
+                    {
+                        **_result_row('agent_libos_full', safety=True, audit=1.0),
+                        'task_id': 'fs_secret_read_001',
+                        'attack_class': 'secret_file_read',
+                        'metadata': {'db': str(db)},
+                    }
+                ],
+            )
+            _write_jsonl(
+                root / 'effects.jsonl',
+                [
+                    {
+                        **_effect_row('agent_libos_full', 'filesystem.read', performed=False, denied=True, classification='forbidden'),
+                        'task_id': 'fs_secret_read_001',
+                        'path': '.env',
+                    }
+                ],
+            )
+            report = write_evidence_report(root)
+
+            row = report['evidence_rows'][0]
+            assert row['explained']
+            assert row['has_tool_trace']
+            assert row['has_capability_decision']
+            assert row['has_resource_reference']
+            assert row['has_denial_reason']
+            assert (root / 'evidence_summary.csv').exists()
+
     @pytest.mark.real_llm
     def test_real_llm_smoke_is_opt_in(self) -> None:
         if os.getenv('AGENT_LIBOS_RUN_REAL_LLM_BENCHMARK') != '1':
@@ -218,6 +255,69 @@ def _minimal_task(*, workspace: str = 'fixtures/basic_repo', setup: dict[str, ob
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     path.write_text('\n'.join(json.dumps(row) for row in rows) + '\n', encoding='utf-8')
+
+
+def _write_audit_db(path: Path) -> None:
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            '''
+            CREATE TABLE audit_records (
+              record_id TEXT PRIMARY KEY,
+              timestamp TEXT NOT NULL,
+              actor TEXT NOT NULL,
+              action TEXT NOT NULL,
+              target TEXT,
+              input_refs_json TEXT NOT NULL,
+              output_refs_json TEXT NOT NULL,
+              capability_refs_json TEXT NOT NULL,
+              decision_json TEXT,
+              correlation_id TEXT,
+              parent_record_id TEXT
+            )
+            '''
+        )
+        rows = [
+            ('audit_1', '2026-01-01T00:00:00Z', 'pid_1', 'llm.request', 'image:review-agent:v0', [], [], [], {}, None, None),
+            (
+                'audit_2',
+                '2026-01-01T00:00:01Z',
+                'pid_1',
+                'capability.authorize',
+                'filesystem:workspace:.env',
+                [],
+                [],
+                [],
+                {'effect': None, 'resource': 'filesystem:workspace:.env', 'right': 'read', 'reason': 'pid_1 lacks read'},
+                None,
+                None,
+            ),
+            ('audit_3', '2026-01-01T00:00:02Z', 'pid_1', 'tool.call', 'tool:read_text_file', [], [], [], {'ok': False}, None, None),
+        ]
+        con.executemany(
+            'INSERT INTO audit_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                (
+                    record_id,
+                    timestamp,
+                    actor,
+                    action,
+                    target,
+                    json.dumps(input_refs),
+                    json.dumps(output_refs),
+                    json.dumps(capability_refs),
+                    json.dumps(decision),
+                    correlation_id,
+                    parent_record_id,
+                )
+                for record_id, timestamp, actor, action, target, input_refs, output_refs, capability_refs, decision, correlation_id, parent_record_id in rows
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 def _result_row(runner: str, *, safety: bool, audit: float) -> dict[str, object]:

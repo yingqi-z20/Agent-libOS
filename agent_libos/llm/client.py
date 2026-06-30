@@ -1105,7 +1105,12 @@ def _run_close_sync(awaitable: Any) -> Any:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(awaitable)
+        try:
+            return asyncio.run(awaitable)
+        except RuntimeError as exc:
+            if "event loop is closed" in str(exc).lower():
+                return None
+            raise
 
     result: dict[str, Any] = {}
 
@@ -1119,6 +1124,9 @@ def _run_close_sync(awaitable: Any) -> Any:
     thread.start()
     thread.join()
     if "error" in result:
+        error = result["error"]
+        if isinstance(error, RuntimeError) and "event loop is closed" in str(error).lower():
+            return None
         raise result["error"]
     return result.get("value")
 
