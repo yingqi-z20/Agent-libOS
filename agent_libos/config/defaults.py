@@ -105,7 +105,7 @@ class SchedulerDefaults:
     max_quanta: int | None = None
     poll_interval_s: float = 0.01
     max_workers: int = 8
-    drain_window_s: float = 0.5
+    drain_window_s: float = 600.0
     shutdown_join_timeout_s: float = 2.0
 
 
