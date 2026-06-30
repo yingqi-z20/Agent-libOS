@@ -274,7 +274,14 @@ policy:
 ```
 
 `confirmation_default_decision` is used by the confirmation-wrapper baseline.
-The `human_auto_*` keys are passed to Agent libOS runtime execution. A top-level
+When it is omitted, that baseline uses a coarse wrapper-local confirmation
+policy: it approves low-risk source/test writes, simple version-probe shell
+commands, and non-authority-changing workflow steps; it rejects deletes,
+suspicious shell commands, broad or sensitive child-process inheritance, and
+remote/network calls. This policy is intentionally weaker than Agent libOS
+primitive mediation: it does not protect reads, Object Memory namespaces, image
+or checkpoint lineage, JIT syscalls, or registered remote-method authority. The
+`human_auto_*` keys are passed to Agent libOS runtime execution. A top-level
 `approval_budget` field is not consumed in schema v0.
 
 ## Mock Actions

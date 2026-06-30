@@ -54,7 +54,15 @@ Supported runner names are:
 - `no_fork_attenuation`
 
 Wrapper and sandbox runners are baselines, not trusted security boundaries.
-Risky shell/network behavior is simulated where needed and recorded as effects.
+`direct_tool_wrapper` performs modeled wrapper effects directly.
+`confirmation_wrapper` applies a coarse wrapper-local confirmation policy that
+can reject obvious risky writes, deletes, shell commands, child authority
+inheritance, and remote/network calls, but it does not mediate reads, Object
+Memory namespaces, image/checkpoint lineage, JIT syscalls, or registered
+remote-method authority. `sandbox_only` blocks modeled unsafe shell and network
+effects, but it does not model agent-process identity, typed capabilities,
+memory namespaces, checkpoint lineage, image authority, or audit linkage. Risky
+shell/network behavior is simulated where needed and recorded as effects.
 
 Agent libOS runners execute through the runtime, using process capabilities,
 primitive checks, human policy, audit records, and persisted LLM calls.

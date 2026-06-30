@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import pytest
 import os
 import tempfile
@@ -9,6 +10,7 @@ from benchmarks.runtime_safety.loader import load_task_file, load_tasks
 from benchmarks.runtime_safety.metrics import METRIC_COLUMNS, collect_metrics, write_metrics
 from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationError, EffectRecord
 from benchmarks.runtime_safety.oracle import classify_effects, safety_summary
+from benchmarks.runtime_safety.paper_summary import build_paper_summary, render_latex_tables, write_paper_summary
 from benchmarks.runtime_safety.runners import _setup_runtime_benchmark_resources, run_suite, run_task, write_run_outputs
 SUITE_ROOT = Path('benchmarks/runtime_safety')
 
@@ -82,16 +84,25 @@ class TestRuntimeSafetyBenchmark:
         assert safety_summary(task, effects)['safety_passed']
 
     def test_deterministic_smoke_run_across_baselines_and_libos(self) -> None:
-        selected_ids = {'fs_secret_read_001', 'fs_write_forbidden_001', 'shell_allowed_version_001'}
+        selected_ids = {'fs_secret_read_001', 'fs_write_forbidden_001', 'shell_allowed_version_001', 'shell_curl_001'}
         tasks = [task for task in load_tasks(SUITE_ROOT) if task.id in selected_ids]
         with tempfile.TemporaryDirectory() as temp_dir:
             runs = run_suite(tasks, SUITE_ROOT, temp_dir, runners=['direct_tool_wrapper', 'confirmation_wrapper', 'sandbox_only', 'agent_libos_full'])
-            assert len(runs) == 12
+            assert len(runs) == 16
             full = [run for run in runs if run.result.runner == 'agent_libos_full']
             direct = [run for run in runs if run.result.runner == 'direct_tool_wrapper']
+            by_runner_task = {(run.result.runner, run.result.task_id): run for run in runs}
             assert all((run.result.task_success for run in full))
             assert any((run.result.forbidden_performed == 0 for run in full))
             assert any((run.result.forbidden_performed > 0 for run in direct))
+            confirmation_write = by_runner_task[('confirmation_wrapper', 'fs_write_forbidden_001')]
+            assert confirmation_write.result.safety_passed
+            assert any(effect.denied and effect.type == 'filesystem.write' and effect.path == '.env' for effect in confirmation_write.effects)
+            confirmation_read = by_runner_task[('confirmation_wrapper', 'fs_secret_read_001')]
+            assert not confirmation_read.result.safety_passed
+            sandbox_shell = by_runner_task[('sandbox_only', 'shell_curl_001')]
+            assert sandbox_shell.result.safety_passed
+            assert any(effect.denied and effect.type == 'shell.exec' for effect in sandbox_shell.effects)
 
     def test_self_evolution_smoke_run_across_wrapper_and_libos(self) -> None:
         selected_ids = {'skill_tool_visibility_001', 'skill_jit_secret_read_001', 'image_exec_required_capability_001', 'image_commit_required_capability_001', 'child_delegation_attenuation_001', 'checkpoint_fork_revoked_capability_001', 'jsonrpc_visibility_no_method_authority_001'}
@@ -117,6 +128,42 @@ class TestRuntimeSafetyBenchmark:
             assert collected['result_count'] == 4
             assert 'unauthorized_side_effect_rate' in collected['rows'][0]
             assert 'skill_activations' in collected['rows'][0]
+
+    def test_paper_summary_writes_latex_and_denial_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _write_jsonl(
+                root / 'results.jsonl',
+                [
+                    _result_row('agent_libos_full', safety=True, audit=1.0),
+                    _result_row('direct_tool_wrapper', safety=False, audit=0.0),
+                    _result_row('no_primitive_approval', safety=False, audit=1.0),
+                    _result_row('no_audit_linkage', safety=True, audit=0.0),
+                ],
+            )
+            _write_jsonl(
+                root / 'effects.jsonl',
+                [
+                    _effect_row('agent_libos_full', 'process.spawn', performed=False, denied=True, classification='allowed'),
+                    _effect_row('agent_libos_full', 'filesystem.read', performed=False, denied=True, classification='forbidden'),
+                    _effect_row('direct_tool_wrapper', 'filesystem.read', performed=True, classification='forbidden'),
+                    _effect_row('no_primitive_approval', 'filesystem.read', performed=True, classification='forbidden'),
+                    _effect_row('no_audit_linkage', 'filesystem.read', performed=False, denied=True, classification='forbidden'),
+                ],
+            )
+            summary = write_paper_summary(root)
+
+            assert (root / 'paper_summary.json').exists()
+            assert (root / 'paper_tables.tex').exists()
+            assert summary['full_allowed_denials'][0]['type'] == 'process.spawn'
+            latex = render_latex_tables(build_paper_summary(root))
+            assert 'Full Agent libOS' in latex
+            assert 'No primitive approval' in latex
+            assert '\\textbf{Effects}' in latex
+            assert '\\textbf{Allowed den.}' in latex
+            assert '\\textbf{Audit}' not in latex
+            assert '\\textbf{FD}' not in latex
+            assert 'allowed-effect denials: 1' in latex
 
     def test_agent_libos_runner_denies_missing_authority_and_records_llm(self) -> None:
         task = next((task for task in load_tasks(SUITE_ROOT) if task.id == 'fs_secret_read_001'))
@@ -167,3 +214,50 @@ def _minimal_task(*, workspace: str = 'fixtures/basic_repo', setup: dict[str, ob
         setup=setup or {},
         mock_actions=[{'action': 'process_exit'}],
     )
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    path.write_text('\n'.join(json.dumps(row) for row in rows) + '\n', encoding='utf-8')
+
+
+def _result_row(runner: str, *, safety: bool, audit: float) -> dict[str, object]:
+    return {
+        'task_id': f'{runner}_task',
+        'runner': runner,
+        'attack_class': 'synthetic',
+        'ok': True,
+        'task_success': True,
+        'safety_passed': safety,
+        'unknown_effects': 0,
+        'forbidden_performed': 0 if safety else 1,
+        'approval_count': 0,
+        'tool_calls': 1,
+        'primitive_calls': 1 if runner.startswith('no_') or runner == 'agent_libos_full' else 0,
+        'llm_tokens': 2,
+        'wall_time_s': 0.1,
+        'audit_records': 1 if audit else 0,
+        'audit_completeness': audit,
+        'errors': [],
+        'workspace': None,
+        'metadata': {},
+    }
+
+
+def _effect_row(
+    runner: str,
+    effect_type: str,
+    *,
+    performed: bool,
+    denied: bool = False,
+    classification: str,
+) -> dict[str, object]:
+    return {
+        'task_id': f'{runner}_task',
+        'runner': runner,
+        'type': effect_type,
+        'performed': performed,
+        'denied': denied,
+        'simulated': runner in {'direct_tool_wrapper', 'confirmation_wrapper', 'sandbox_only'},
+        'classification': classification,
+        'error': 'synthetic denial' if denied else None,
+    }
