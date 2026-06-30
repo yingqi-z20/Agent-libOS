@@ -23,6 +23,18 @@ Run guarded real-model action selection:
 .\.venv\Scripts\python.exe experiments\run_practical_workflows.py --mode real --allow-token-spend --runner agent_libos --limit 3 --output .benchmark_runs\practical-real-pilot
 ```
 
+Run the free-tool real LLM completion pilot:
+
+```powershell
+.\.venv\Scripts\python.exe experiments\run_practical_real_llm_completion.py --scenario-set real_completion_8 --output .benchmark_runs\practical_eval_v2_real_completion --allow-token-spend --max-quanta 8
+```
+
+Replay a captured completion pilot without another LLM call:
+
+```powershell
+.\.venv\Scripts\python.exe experiments\run_practical_real_llm_completion.py --mode replay --replay-trace .benchmark_runs\practical_eval_v2_real_completion\replay_trace.jsonl --output .benchmark_runs\practical_eval_v2_real_completion_replay
+```
+
 Generated reports:
 
 - `practical_eval_summary.md`
@@ -31,6 +43,10 @@ Generated reports:
 - `failure_taxonomy.md`
 - `metrics.json`
 - `replay_trace.jsonl`
+
+The free-tool completion pilot additionally writes
+`real_completion_summary.md`, `real_completion_cases.md`,
+`real_completion_failures.md`, and `tool_transcript.jsonl`.
 
 Reviewer-facing metrics include benign success, attack-setting task success,
 state-diff success, attack-success-blocked rate, forbidden committed effects,
@@ -83,6 +99,10 @@ The reports are intentionally separated:
 - Live runtime slice: at least 40 scenarios through `agent_libos_live`.
 - Real LLM pilot: guarded stress runs; unknown oracle cases are reported
   separately and replay traces are retained.
+- Real LLM completion pilot: 8 free-tool tasks across coding, research,
+  enterprise, devops, and self-evolution. These tasks use real runtime tool
+  selection rather than fixed action-id selection, and task completion is judged
+  by deterministic workspace/service-state oracles.
 
 Security claims should be based on committed effects. The reports also list
 model-requested harmful actions and runtime-denied harmful actions so reviewers
@@ -100,6 +120,10 @@ Generated on 2026-07-01:
 - Real LLM smoke pilot: `.benchmark_runs/practical_eval_v2_real_pilot_smoke`,
   covering 3 scenarios with 1,690 LLM tokens, plus deterministic replay at
   `.benchmark_runs/practical_eval_v2_real_pilot_replay`.
+- Real LLM completion pilot: `.benchmark_runs/practical_eval_v2_real_completion_qwen_prompt_v3_full`,
+  covering 8 free-tool completion scenarios with qwen3.7-max, 8/8 task
+  success, 0 forbidden committed effects, 100.0% trace coverage, and replay at
+  `.benchmark_runs/practical_eval_v2_real_completion_qwen_prompt_v3_full_replay`.
 
 Modeled primary results:
 

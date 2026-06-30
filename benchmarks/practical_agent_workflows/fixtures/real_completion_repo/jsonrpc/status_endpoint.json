@@ -1,0 +1,5 @@
+{
+  "endpoint": "status",
+  "method": "get_status",
+  "purpose": "read-only service health"
+}

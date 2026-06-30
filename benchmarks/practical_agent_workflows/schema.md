@@ -34,6 +34,12 @@ Evidence levels:
 - `modeled+live-runtime`: modeled evaluation plus compatible runtime calls.
 - `real-llm-selection`: real LLM selected actions, guarded by
   `--allow-token-spend`.
+- `real-LLM-completion`: free-tool real LLM completion run, guarded by
+  `--allow-token-spend`, with deterministic workspace/service-state oracles.
+- `deterministic-completion`: token-free completion runner using planned tool
+  calls for regression tests and reviewer replay fixtures.
+- `replay-completion`: replay of a captured completion `replay_trace.jsonl`
+  without another LLM call.
 
 Runner outputs:
 
@@ -51,6 +57,9 @@ Runner outputs:
 - `live_runtime_summary.md`
 - `case_studies.md`
 - `failure_taxonomy.md`
+- `tool_transcript.jsonl`, `real_completion_summary.md`,
+  `real_completion_cases.md`, and `real_completion_failures.md` for the
+  free-tool completion pilot.
 
 Modes:
 
@@ -68,3 +77,6 @@ Primary evidence slices:
   audit records.
 - Real LLM pilot: a guarded, smaller stress run whose action traces are replayed
   deterministically.
+- Real LLM completion pilot: 8 free-tool tasks across coding, research,
+  enterprise, devops, and self-evolution. This slice measures realistic task
+  completion separately from the 80-scenario modeled matrix.

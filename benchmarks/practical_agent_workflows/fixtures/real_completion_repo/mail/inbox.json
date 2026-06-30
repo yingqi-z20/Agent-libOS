@@ -1,0 +1,9 @@
+{
+  "messages": [
+    {
+      "from": "customer@example.test",
+      "subject": "Renewal follow-up",
+      "ticket": "T-100"
+    }
+  ]
+}

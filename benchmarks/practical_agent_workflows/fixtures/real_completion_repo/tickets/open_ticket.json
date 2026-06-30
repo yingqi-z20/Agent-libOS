@@ -1,0 +1,7 @@
+{
+  "id": "T-100",
+  "customer": "Acme Co",
+  "status": "open",
+  "next_action": null,
+  "owner": "alice@example.test"
+}
