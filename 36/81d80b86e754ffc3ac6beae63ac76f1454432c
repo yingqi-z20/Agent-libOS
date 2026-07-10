@@ -1,0 +1,99 @@
+README.md
+  s_6ae2769807ca0a::t_914288fea110f7 266-270
+agent_libos/capability/manager.py
+  s_6ae2769807ca0a::t_dd627bae9761d9 96-106,124,126-139
+agent_libos/human/manager.py
+  s_6ae2769807ca0a::t_1747aa077f9965 107-111,113,544-547,554-555,582-584,607-617,665,671-672,674-686,688-711,714,717-729,1476-1491
+agent_libos/llm/client.py
+  s_6ae2769807ca0a::t_74b9c3394a30fa 7,430-450,537-538,541-542
+agent_libos/primitives/shell.py
+  s_6ae2769807ca0a::t_7c0fad14f77250 9,54-61,125,128,173-174,350-364
+agent_libos/runtime/checkpoint_manager.py
+  s_6ae2769807ca0a::t_5f59cf4571f776 3,203-204,233-234,519-525,1394-1401,1403,1405-1444
+agent_libos/runtime/message_manager.py
+  s_6ae2769807ca0a::t_0677493a61799d 81-119
+agent_libos/runtime/object_tasks.py
+  s_6ae2769807ca0a::t_c742266f83049b 328-329,334,341-346,356-357,359,379,1345-1348,1350-1354,1356,1358,1362-1384
+agent_libos/runtime/process_manager.py
+  s_6ae2769807ca0a::t_1de0d1e7181db4 361-381,640-643,652-666
+agent_libos/runtime/runtime.py
+  s_6ae2769807ca0a::t_0dd79052bd6b1d 560-562,565-567,1031-1039
+agent_libos/runtime/scheduler.py
+  s_6ae2769807ca0a::t_b43651cb6724c0 24-27,120-136,336-342
+agent_libos/storage/sqlite.py
+  s_6ae2769807ca0a::t_c5bebffd21baa8 1777,1792-1793,4147,4198-4200,4235-4287
+benchmarks/runtime_safety/metrics.py
+  s_6ae2769807ca0a::t_b5f40daa1a8eeb 73,79,262-271,279,376-410
+benchmarks/runtime_safety/runners.py
+  s_6ae2769807ca0a::t_823e434e226ee8 1321-1336
+docs/architecture.md
+  s_6ae2769807ca0a::t_e3f6fac66b40d1 268-269
+docs/benchmark.md
+  s_6ae2769807ca0a::t_c57d7aab86009b 229-230,237-250
+docs/capabilities.md
+  s_6ae2769807ca0a::t_93f9730ab59da4 40-49,535-542
+docs/checkpoints.md
+  s_6ae2769807ca0a::t_0311e748e42a4c 174-181
+docs/cli.md
+  s_6ae2769807ca0a::t_f5ff94c080ab1e 71-72
+docs/development.md
+  s_6ae2769807ca0a::t_efddc18a4e0a91 143-150
+docs/gui.md
+  s_6ae2769807ca0a::t_8ad341979dc6cb 200-208
+docs/invariants.md
+  s_6ae2769807ca0a::t_874c8f7d373723 66-67,80-81,106-107,132-141,151-153,168-169,217-219
+docs/object_memory.md
+  s_6ae2769807ca0a::t_db3dc561caf67a 195-203
+docs/runtime_model.md
+  s_6ae2769807ca0a::t_1fbe59fc19cd21 426-431,474-476,520-527,531-533,543-546
+docs/storage.md
+  s_6ae2769807ca0a::t_53324f3271b50c 84-90
+tests/benchmarks/test_runtime_safety_benchmark.py
+  s_6ae2769807ca0a::t_0e747dba66b6f1 492-501,616-650
+tests/invariants.yaml
+  s_6ae2769807ca0a::t_d608a38588e3f6 245-246,301-302,314,347,512-535,564,611-619,743,984
+tests/providers/test_gui_server.py
+  s_6ae2769807ca0a::t_12cef679b7bfd4 21-31,150-187
+tests/providers/test_resource_substrate.py
+  s_6ae2769807ca0a::t_5a29638f5ad81f 83-86
+tests/runtime/test_child_process_tools.py
+  s_6ae2769807ca0a::t_54aefca033cd7f 476-543
+tests/runtime/test_object_tasks.py
+  s_6ae2769807ca0a::t_577c6b08361ffd 80-125
+tests/runtime/test_parallel_scheduler.py
+  s_6ae2769807ca0a::t_df0e7b64184777 24-70
+tests/runtime/test_process_messages.py
+  s_6ae2769807ca0a::t_ec54a634de0852 22-63
+tests/security/test_capability.py
+  s_6ae2769807ca0a::t_96a3777f7584cd 12,442-488
+tests/security/test_human_question_tool.py
+  s_6ae2769807ca0a::t_fefb091b715935 241-331
+tests/security/test_shell_primitive.py
+  s_6ae2769807ca0a::t_1bfa59cdfdbb2d 5,25-27,43,86,185-215,383,408,494-495,533,576,620
+tests/self_evolution/test_checkpoint_authority.py
+  s_6ae2769807ca0a::t_cfb3fac03c7a31 19-41
+tests/self_evolution/test_checkpoint_restore.py
+  s_6ae2769807ca0a::t_4c1035e4615684 630-633,635,659-677,683-686,688,703-704
+tests/unit/test_llm_client.py
+  s_6ae2769807ca0a::t_c42cf829d0158d 4-6,14-39,587-623
+tests/unit/test_storage_backend_boundaries.py
+  s_6ae2769807ca0a::t_5e04e0ae510b23 4-5,25-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3681d80b86e754ffc3ac6beae63ac76f1454432c",
+  "prompts": {},
+  "sessions": {
+    "s_6ae2769807ca0a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4bab-724e-7a72-a4e3-d44d0f102e86",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
