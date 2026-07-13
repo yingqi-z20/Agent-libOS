@@ -1,0 +1,217 @@
+AGENTS.md
+  s_d1724b93aec833::t_3517b2702361e4 13-16,35,71-75
+README.md
+  s_d1724b93aec833::t_87e17f9cf1e69d 115-117,123-124,126-127,138-139,159-160,163-165,172-173,245-264,424-426,431-435,472-475,533-536,572-573
+agent_libos/__init__.py
+  s_128ff0aa8e356c::t_a2aaab968a6dbb 94
+agent_libos/api/cli.py
+  s_128ff0aa8e356c::t_28957212538f5c 109-112,166-169,171-177,181,183-186,188-191
+agent_libos/capability/manager.py
+  s_43086bfa38be31::t_04c16774fdaf25 4,167-172,232-247,380,382-403,405-414,971-985,987,989-1003,1833-1834,1884-1886,1889-1891,1895-1906
+agent_libos/human/manager.py
+  s_128ff0aa8e356c::t_ff3c995e2050e8 19,470-474,651,655-668,671,675-676
+agent_libos/llm/executor.py
+  s_128ff0aa8e356c::t_120e531ae7f8cc 167-171,203-208
+agent_libos/memory/object_memory.py
+  s_128ff0aa8e356c::t_28ab2ff4505fc5 825-853
+agent_libos/models/object_tasks.py
+  s_63ca2c9148ce1b::t_cd1eb4541dfc80 19-20
+agent_libos/modules/registry.py
+  s_128ff0aa8e356c::t_022eb07250c89f 4,26,36-39,68-81,116-129,160-166,169-183,186-190,193-197,199-206,209-212,234-236,243-258
+agent_libos/runtime/event_bus.py
+  s_128ff0aa8e356c::t_78ac28f20a72aa 8,48-64
+agent_libos/runtime/image_registry.py
+  s_128ff0aa8e356c::t_9731b7746e5c93 12,15,25,147-153,155-162,166-171,184-189,199-203,209-213,308-313,358-365,408-412,1060-1062,1064-1067,1070,1138-1193,1242-1252,1257-1289,1312-1358
+agent_libos/runtime/object_tasks.py
+  s_20c39cc2a0f67f::t_026aa861a4c583 58-59,119-165
+agent_libos/runtime/process_manager.py
+  s_128ff0aa8e356c::t_73fca2356b3e63 583,591,628,630,639-687,689-691,694-726,768-774,784-786,793-795,799-802,836-846
+agent_libos/runtime/ratings.py
+  s_128ff0aa8e356c::t_84289ee48f8c23 3,24-39
+agent_libos/runtime/resource_manager.py
+  s_128ff0aa8e356c::t_32382fb202a070 3,313-320,322-324,326-384
+agent_libos/runtime/runtime.py
+  s_63ca2c9148ce1b::t_6e4b8a34388a28 10,124-128,827-841,2378
+agent_libos/skills/schema.py
+  s_128ff0aa8e356c::t_c8a61bbdb48402 80-84
+agent_libos/storage/base.py
+  s_128ff0aa8e356c::t_0132adf36c799e 135-138,165-171,199-205,378-386,408-416,429,489
+agent_libos/storage/sqlite.py
+  s_128ff0aa8e356c::t_4dee90c9abd9d9 348-353,565-567,1163-1204,1325,1328-1329,1335-1340,1462-1507,1509-1510,1512-1515,2626-2724,2799-2800,2849-2872,2951-2957,3246-3251,3254,3784-3789
+agent_libos/substrate/local.py
+  s_43086bfa38be31::t_483087017b13d7 64,1494-1498,1509-1517,1519-1547,1557-1561,1592-1596,1617-1623,1641-1644,1652-1656,1668-1674,1683-1700,1776,1778,1787-1790,1811-1832,1838-1911,2012,2027,2052-2087,2116-2121,2142-2150
+agent_libos/tools/broker.py
+  s_128ff0aa8e356c::t_5dcd4153c0f60c 7,204-208,216-230,243-274,278-281,288-312,489-505,523-546,548-574,1573-1576,1621-1624
+benchmarks/runtime_safety/runners.py
+  s_63ca2c9148ce1b::t_e1a549937e9b13 50-63,324,330,377-384
+docs/architecture.md
+  s_d1724b93aec833::t_7562662731ee2e 93-95,317-321,329-335
+docs/artifact_anonymity.md
+  s_d1724b93aec833::t_1d17b6a9e15677 71-72,80-81,83-85
+docs/benchmark.md
+  s_128ff0aa8e356c::t_3cc2db94345c1e 46-57,65-75,128-129,258-262,277-293,300,302-303,313-316
+docs/capabilities.md
+  s_43086bfa38be31::t_e292589ff10b67 78-82,194-197,203-204,217-225,228-234,463-469,523-533
+docs/configuration.md
+  s_128ff0aa8e356c::t_3727db5f7574b4 1-137
+docs/development.md
+  s_d1724b93aec833::t_f055caefafd566 57,60-65,106-109,308-310,334-335,351-356
+docs/gui_api_schema.json
+  s_d1724b93aec833::t_8faf927832e300 1-367
+docs/jsonrpc.md
+  s_43086bfa38be31::t_bddad840bf72ee 160-162
+docs/mcp.md
+  s_43086bfa38be31::t_53002d7f284e91 81-88,128-132,136-142,179-180,190-192,197-200
+docs/mini_swe_agent_image.md
+  s_d1724b93aec833::t_d2e1bc3fd5d24a 12-18
+docs/modules.md
+  s_43086bfa38be31::t_90e8dfdf6a5e1d 116-122
+docs/object_memory.md
+  s_63ca2c9148ce1b::t_4677204f8a0f1c 158-168,186-192
+docs/prelaunch_hardening_report.md
+  s_d1724b93aec833::t_290c60538fb67b 5-11
+docs/providers.md
+  s_128ff0aa8e356c::t_3b0b47a003a6f0 1-83
+docs/release_status.md
+  s_128ff0aa8e356c::t_d4bdb7faecca23 1-76
+docs/runtime_model.md
+  s_43086bfa38be31::t_a5e5b7f489f78d 375-381,408-413,435-445,587-598,608-613
+docs/skills.md
+  s_63ca2c9148ce1b::t_d98580e770e880 187-202
+docs/support_matrix.md
+  s_d1724b93aec833::t_96c0f450c30b37 1-61
+docs/tools_and_jit.md
+  s_63ca2c9148ce1b::t_8d18320b84117e 165-168
+experiments/collect_metrics.py
+  s_63ca2c9148ce1b::t_e8aa7186e57af7 10,16,20
+experiments/run_benchmark.py
+  s_d1724b93aec833::t_61363b37a5d251 4-5,8-10,14-21,26-34,77-83,160-335
+gui/electron/main.ts
+  s_128ff0aa8e356c::t_1722ba10e78309 1,6,10-16,33,49-60,79,106,108-113,118,121,123,127,362-364,366,402,405,407,411,413-428,431,433-438,440-442,501,511-523
+gui/electron/rendererProtocol.test.ts
+  s_128ff0aa8e356c::t_1e1573b0903191 1-28
+gui/electron/rendererProtocol.ts
+  s_128ff0aa8e356c::t_83be374b7156ab 1-46
+gui/electron/shutdown.test.ts
+  s_128ff0aa8e356c::t_673de16022dd47 1-21
+gui/electron/shutdown.ts
+  s_128ff0aa8e356c::t_e1395ff798c3da 1-20
+gui/package-lock.json
+  s_128ff0aa8e356c::t_1f3f330fc9f110 3,9
+gui/package.json
+  s_128ff0aa8e356c::t_5a70546c761516 3,9-11
+gui/scripts/clean-electron-build.mjs
+  s_128ff0aa8e356c::t_93eafe4338976e 1-5
+gui/src/components/ProcessTree.test.tsx
+  s_128ff0aa8e356c::t_e4d7bab070cd69 18-27
+gui/src/components/ProcessTree.tsx
+  s_128ff0aa8e356c::t_d113224a162f32 35,37-40
+gui/tsconfig.electron.json
+  s_d1724b93aec833::t_fb1f979902c242 13-14
+gui/vite.config.ts
+  s_d1724b93aec833::t_46d20c47cfe97e 1,22-24
+pyproject.toml
+  s_128ff0aa8e356c::t_f9c240cc096f22 7
+scripts/test_matrix.py
+  s_d1724b93aec833::t_b3dd24443d4b4c 6,27-28,42,63,65,214-219,221,224-318
+tests/benchmarks/test_runtime_safety_benchmark.py
+  s_d1724b93aec833::t_22b3cf795edd3f 15,17,792-811,872-875,877-884,889-895
+tests/providers/test_mcp_sdk_integration.py
+  s_43086bfa38be31::t_bf0126a07363eb 17-23,25,49-63,121-141,173-323,344-348,410-429,446-449,531-562
+tests/runtime/test_child_process_tools.py
+  s_128ff0aa8e356c::t_cf91142e79d26e 8-17,33-65
+tests/runtime/test_llm_context_memory.py
+  s_128ff0aa8e356c::t_b396e02fb16690 50-97
+tests/runtime/test_object_memory.py
+  s_128ff0aa8e356c::t_10bc784135a42d 1511-1569
+tests/runtime/test_object_tasks.py
+  s_63ca2c9148ce1b::t_019fcc153a6d2b 81-137
+tests/runtime/test_runtime_modules.py
+  s_128ff0aa8e356c::t_51f149be8dad61 11,26-34,816-897
+tests/runtime/test_store_contract.py
+  s_128ff0aa8e356c::t_4b325cec775e09 18,31-32,274-368
+tests/security/test_capability.py
+  s_43086bfa38be31::t_97e3bb47717285 427-557,742-866,1112-1165
+tests/security/test_human_question_tool.py
+  s_43086bfa38be31::t_f17a3d81497142 10,16,31-39,278-398
+tests/security/test_jit_security.py
+  s_63ca2c9148ce1b::t_02b814b9c5c647 10,120-242
+tests/self_evolution/test_checkpoint_authority.py
+  s_128ff0aa8e356c::t_14da0cca8291fb 12,19-27
+tests/self_evolution/test_image_commit.py
+  s_128ff0aa8e356c::t_6eddede2ff4b0d 9,18-71
+tests/self_evolution/test_image_registration.py
+  s_63ca2c9148ce1b::t_a70b121c828d7f 166-246
+tests/self_evolution/test_skill_registry_locking.py
+  s_522bb84ec19871::t_2cfc3d5813d147 1-132
+tests/unit/test_configuration_docs.py
+  s_d1724b93aec833::t_34997b4035ede4 1-28
+tests/unit/test_documentation_links.py
+  s_128ff0aa8e356c::t_5f3a7eee75f99e 1-110
+tests/unit/test_gui_api_schema.py
+  s_128ff0aa8e356c::t_82d6b50d3a4b43 1-273
+tests/unit/test_resource_manager.py
+  s_128ff0aa8e356c::t_5c67f4f1c8d43d 8-15,104-134,205-239
+tests/unit/test_test_matrix.py
+  s_43086bfa38be31::t_6c8c300579ad6c 4-5,7,76-80,129-214
+uv.lock
+  s_128ff0aa8e356c::t_66136b65b1ba3d 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2e8f41a9b0e9110d257c4153c7acd9b1aba182ad",
+  "prompts": {},
+  "sessions": {
+    "s_128ff0aa8e356c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5b19-6ef8-7420-bf8e-c92fa4d69314",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_20c39cc2a0f67f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5c45-a407-7383-a3fb-302c9aca92f5",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_43086bfa38be31": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5b19-ecc9-7a93-a6b2-6ce85b1279c0",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_522bb84ec19871": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5c45-8e4a-7972-be5f-66d4f988d37a",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_63ca2c9148ce1b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5b1a-05bb-7013-a8af-6e6e5845a2f7",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_d1724b93aec833": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5b1a-2105-7ea0-a986-35d1b9fd91c9",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
