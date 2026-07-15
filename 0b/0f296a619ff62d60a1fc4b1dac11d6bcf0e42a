@@ -1,0 +1,27 @@
+README.md
+  s_f13900d3eb7bde::t_e39018608a0e70 254-269
+docs/benchmark.md
+  s_f13900d3eb7bde::t_c056e950d16c2e 315-339,343-347
+docs/paper_thesis.md
+  s_f13900d3eb7bde::t_a9e2b9f373f9e0 18,21-22,30-35,56-59,63,87-100,122-127
+docs/release_status.md
+  s_f13900d3eb7bde::t_94c25b56a909bd 3,5-6,10-33,38-43,45-47,49,51-80,82-85,87-110,113-125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0b0f296a619ff62d60a1fc4b1dac11d6bcf0e42a",
+  "prompts": {},
+  "sessions": {
+    "s_f13900d3eb7bde": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6503-5c91-7303-87f4-777814cafd92",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
