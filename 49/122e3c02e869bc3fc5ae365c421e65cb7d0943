@@ -1,0 +1,47 @@
+agent_libos/__init__.py
+  s_fe347bbc77937a::t_daa2f63f9bb52c 94
+agent_libos/substrate/local.py
+  s_fe347bbc77937a::t_37ed4fd422d8c3 355-356
+benchmarks/runtime_safety/schema.md
+  s_fe347bbc77937a::t_3b71afb0e4fcec 173-174,180-182
+docs/capabilities.md
+  s_fe347bbc77937a::t_7307941884da58 498-507
+docs/checkpoints.md
+  s_fe347bbc77937a::t_6edd06d235031c 99-105
+docs/providers.md
+  s_fe347bbc77937a::t_3abca3b52affe9 20
+docs/release_status.md
+  s_fe347bbc77937a::t_5fad7d5dd78526 1,3
+gui/package-lock.json
+  s_fe347bbc77937a::t_0a97508029019b 3,9
+gui/package.json
+  s_fe347bbc77937a::t_fbacda137f72b2 3
+pyproject.toml
+  s_fe347bbc77937a::t_0b164536624e94 7
+tests/security/test_filesystem_directory_tools.py
+  s_fe347bbc77937a::t_002e7992656db3 64-80
+tests/self_evolution/test_checkpoint_restore.py
+  s_fe347bbc77937a::t_d5f15e6afac0f3 854-860,885-886,888-890
+tests/unit/test_release_contract.py
+  s_fe347bbc77937a::t_414cdef97f8be5 14,19
+uv.lock
+  s_fe347bbc77937a::t_ccc21319ad1b54 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "49122e3c02e869bc3fc5ae365c421e65cb7d0943",
+  "prompts": {},
+  "sessions": {
+    "s_fe347bbc77937a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6abf-fc8f-7531-85a2-ab25fdb45989",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
