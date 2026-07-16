@@ -1,0 +1,375 @@
+.gitignore
+  s_a94422591c8764::t_1e6ebdb31635ad 1,4-6,10-39,41-53,55-118
+README.md
+  s_a94422591c8764::t_a5814c9dcdd4c7 18,75-80,117,148-150,254-272,505-515
+agent_libos/__init__.py
+  s_5bfa5dd6742773::t_553f2e160a9acd 94
+agent_libos/api/cli.py
+  s_4ed71a11fd76dc::t_006717623b488d 17,24,151-154,1498-1503,1576-1584,1597-1606,1609-1615,1619-1623,1703-1737
+agent_libos/api/gui/server.py
+  s_83ffea3f9e2b49::t_3499811b468cf1 31-45,89-116,596,770-776,778,782,791-792,799-840,1503,1645,1679-1683,1685-1689,1693-1696
+agent_libos/capability/manager.py
+  s_9c0820465c4519::t_ad3e18590e5c80 26,58,66,712-739,1687-1706
+agent_libos/config/__init__.py
+  s_9c0820465c4519::t_2d4a6a2d39cd48 6,41
+agent_libos/config/defaults.py
+  s_a94422591c8764::t_23c311ef503000 12-17,104-120,220,569,634-660,799
+agent_libos/human/manager.py
+  s_a94422591c8764::t_75b5b8b06f8d46 7-8,17-23,26-35,61-67,81-86,90,95-97,140-157,168-170,172-182,184-197,211-217,228-271,286-293,300-305,314,319-399,408-409,429,621-622,638,660-665,684-704,721-741,833-834,844-851,857-862,940-1575,1654-1667,1672-1707,1814-1815,1822-1835,1843-1844,1858-1870,1885-1893,1911-1927,1930-1941,1946,1952,1956-1990,2215-2231,2244-2269,2432-2434,2462-2471,2483-2533,2537-2632,2634-2644,2856-2860,2915-2983
+agent_libos/llm/context_memory.py
+  s_a94422591c8764::t_080607edf6788c 9,19,31-35,48-50,73-87,89,94,180,191-201,205-206,272,315-339,347,364,621-706,737,757-763
+agent_libos/llm/executor.py
+  s_93dea13e3c62e7::t_3c4b28bfe70faa 15,30-31,33-35,45-50,56-75,88,155-159,241,270,285,287-289,291-292,335-336,368-432,685-819,940-949,1015-1151,1356-1366,1435-1443,1580,1582-1584,1587-1604,1618,1641,1648,1730-1732,1735-1766,1768-1955,1957-1990,1992-2020,2022-2027,2029-2062,2065-2077,2257,2259,2261-2296,2298,2300-2332,2334-2342,2735-2737,2758-2769,2782,2791,2810,2828,2830-2835,2877-2914
+agent_libos/llm/profiles.py
+  s_9c0820465c4519::t_bb401bd638c101 4,6,8-10,15,22-37,45,52-68,82,84,90-93,98-104,111-113,119-120,131-169,176-180,194-243,246-251,261-266,274-280,284-286,309,322-323,340-372,389-390,467,475,482,492,502,512
+agent_libos/memory/data_labels.py
+  s_9c0820465c4519::t_66a1e32d98ae41 3,5,7,13-21,37-43,58-60,80-157,162-167,169-200,206-209,214-217,220,228-249,260-272
+agent_libos/memory/object_memory.py
+  s_4ed71a11fd76dc::t_16b187c1f6b279 15,24,214-226,228-232,266,279,574,630-633,687,720-722,756-786,790-798,802-804,829,2064-2101
+agent_libos/models/__init__.py
+  s_9c0820465c4519::t_fdf95a07031117 37-55,180-190,199,281-285
+agent_libos/models/data_flow.py
+  s_9c0820465c4519::t_a76b1d1ab4b547 1-657
+agent_libos/models/events.py
+  s_9c0820465c4519::t_8518425c0835f8 52-54
+agent_libos/models/memory.py
+  s_83ffea3f9e2b49::t_707fae5029ff57 4,8,110-202
+agent_libos/models/messages.py
+  s_83ffea3f9e2b49::t_b4683292586e16 3,37-76
+agent_libos/primitives/filesystem.py
+  s_a94422591c8764::t_50b76b28f6949a 6,21-22,33,35,50-51,135,252-272,307-314,322,341,370-390,424-431,438,457,467-468,486-504,513,524-525,535-559,580-588,590-597,603-610,639,643,657-663,670-671,701-725,757-780,789,808-809,818-819,837-850,860,870-871,881-900,908-915,926,928-935,941-948,975,993-999,1008-1028,1046-1065,1074,1094-1101,1107-1109,1166-1169,1179-1201,1221-1253,1262,1287-1296,1371-1374,1499-1508,1656-1689,1744,1759,1786,1827,1844,1879
+agent_libos/primitives/jsonrpc.py
+  s_9c0820465c4519::t_5698926829fdd8 25,273-274,279-284,292-310,346-353,356,415,434,436-452,462-488,597-605,634,642-649,655-661,664-672,697
+agent_libos/primitives/mcp.py
+  s_a94422591c8764::t_2a12bd08df4192 10,25-27,48-54,77,335-354,369-380,399-407,410-415,418,425-432,527-535,542-547,553-576,621-632,635,652-656,663-669,671-678,706-711,717,749-755,757-768,770-771,774,784,786-802,822-830,859,867-874,880-886,889-897,922,929-941,944,1096-1227
+agent_libos/primitives/shell.py
+  s_a94422591c8764::t_2064ba8c4676a4 8,24,35-36,38,40,79,108-109,118-119,127-143,145-153,156,159,181-204,223,241-249,252-258,260-290,366,373,398-568,619-620,622-629,784,800,826,857,870,886,910,949
+agent_libos/runtime/audit_manager.py
+  s_83ffea3f9e2b49::t_09b06793f281a3 76,78-86
+agent_libos/runtime/authority_manifest_manager.py
+  s_9c0820465c4519::t_60a30fa08ed435 10,100-108,125-127,325-350,386-446
+agent_libos/runtime/checkpoint_manager.py
+  s_83ffea3f9e2b49::t_d9dcf60bb1d786 17-18,30,36-43,68-69,398-399,401-414,814,914-1013,1215,2698-2716,2933-2938,2945-2967
+agent_libos/runtime/data_flow_manager.py
+  s_4ed71a11fd76dc::t_05a20854cd5131 1-1542
+agent_libos/runtime/event_bus.py
+  s_83ffea3f9e2b49::t_9a5eb1f615e499 54-55,61-69
+agent_libos/runtime/message_manager.py
+  s_9c0820465c4519::t_865f9c556fd194 4,7-18,26-28,48,53-55,68-69,80-88,93-97,110,137,152,172-174,177-194,205,208-212,532-575
+agent_libos/runtime/object_tasks.py
+  s_5bfa5dd6742773::t_ff1109bf59a03e 8,15,67-78,575,625-628,635-639,645-651,681-685,775-777,787,1034-1097,1239-1241,1252,1260,1279-1283,1285,1288-1300,1310-1328
+agent_libos/runtime/process_manager.py
+  s_5bfa5dd6742773::t_7aca5be0133604 6,12,14-16,20-21,30,32-33,45,50,63,74,144,190-192,229-235,249-266,324-326,365-371,391,447-449,460-462,474-476,482-492,574-595,642-645,649-677,688-722,724-731,734-758,762-837,845-847,855-861,873-881,903-905,910,914-1000,1009,1020,1033,1038-1045,1052-1063,1068,1070-1072,1078-1112,1114,1129,1139,1360-1561,1563-1595,1600,1602-1641,1644-1659
+agent_libos/runtime/runtime.py
+  s_5bfa5dd6742773::t_3dc091ca5ba9bd 5,17,30-32,40,44-45,58,152-158,166,215,254-255,278,280,289-299,369-383,386-394,402,413,426,440,446-460,468,480,485-486,495,501-503,913-940,1441-1479,1490-1492,1510-1512,1548-1550,1571-1573,1589-1591,1615-1617,1931,2479-2500
+agent_libos/runtime/syscalls.py
+  s_4ed71a11fd76dc::t_07f05165634598 12,24,142-143,148-176,178-183,239-240,248-253,262,381-385,407-409,517,526,693-696,702,709-713,720-722,726-729,737-742,873,886,923-931,995-997,1001-1010
+agent_libos/sdk/protected_operations.py
+  s_83ffea3f9e2b49::t_22e1c4dd45ff14 13-16,66,89-100,169-173,189,193-202,237,245,378,383-389,480,490,519,529,595,604-608,625-627,669-692,694-700,720-723,725,727-739,741-1056,1061-1093,1253-1257,1278,1292-1301
+agent_libos/storage/base.py
+  s_4ed71a11fd76dc::t_1b48b1065856d8 7-15,52-57,72-74,222-223,266-348,352-360,464-469,485-493,500-513
+agent_libos/storage/gui_visibility.py
+  s_83ffea3f9e2b49::t_ae67caac82c35d 1-57
+agent_libos/storage/postgres.py
+  s_83ffea3f9e2b49::t_6649d3a2082c30 45-48
+agent_libos/storage/sqlite.py
+  s_4ed71a11fd76dc::t_11e8815efc4d1b 27-32,39,81-83,91,93-101,126-167,169,191-194,412-413,465-466,587,612-613,628,797,804,806,817,1471-1485,1529-1548,1557,1559-1564,1570,1575-1580,1590-1591,1597-1598,1900-2317,2319-2321,2323-2329,2339,2342-2348,2359,2363-2365,2367,2370,2372-2376,2386-2387,2390,2673,2994-3061,3066-3068,3074,3076,3089,3108,3156-3215,3217,3222-3223,3236,3245,3251,3264,3273-3298,4327-4547,4664,4686-4694,4702,4726-4902,4916-4922,4942-5145,5645-5648,5650,5691-5696,5795-5797,6061-6188,6229-6244,6258,6317-6326,6337-6338
+agent_libos/substrate/__init__.py
+  s_a94422591c8764::t_e10cc302d8b9a0 6-7,9,17,19,40-41,43,59,61
+agent_libos/substrate/base.py
+  s_a94422591c8764::t_93964700d82dca 3-11,13,16-17,30,35-561,692-693,703,754,765
+agent_libos/substrate/local.py
+  s_5bfa5dd6742773::t_2d3f34bd00770d 12,23,52-53,56-57,259,279,293,311,323,330,336,342,879,884-886,896,903,905-927,934,1071-1091,1125,1127-1130,1132-1136,1549-1550,1560,1562-1577,1587,1589-1602,1604-1617,1619-1671,1705,1712,1742,1749,1777,1790-1809,1811,1813,1899-1951
+agent_libos/tools/base.py
+  s_f13900d3eb7bde::t_09560cc4927250 24,29-55,141-155,230,242-271,273-279,281-288,290-293,297-302,313,434,441-446,461-501
+agent_libos/tools/broker.py
+  s_4ed71a11fd76dc::t_cf9dcac97df02b 24,26,31,51-57,660-698,924-938,941-947,955-956,963,968,975-976,987,995-1003,1020-1026,1030,1037-1044,1048,1056,1071,1086,1104-1110,1115-1120,1126,1135,1137-1143,1148-1152,1158,1167,1221,1228-1238,1244-1248,1255-1307,1362,1369-1479,2215-2216,2226-2242
+agent_libos/tools/builtin/context.py
+  s_4b6445813fb846::t_586a37dd640843 217
+agent_libos/tools/builtin/human.py
+  s_f13900d3eb7bde::t_cf9777e6dd0d68 151
+agent_libos/tools/builtin/memory.py
+  s_4ed71a11fd76dc::t_840ec845d2c446 8,140-184,193-194,208-210,282-286,315-317,354-357,365-370
+agent_libos/tools/builtin/messages.py
+  s_f13900d3eb7bde::t_46b266a0b6667c 8-17,33,107,119-121,153,176,184,189,212,236,244,249,264-268,273-306
+agent_libos/tools/builtin/object_files.py
+  s_4ed71a11fd76dc::t_aecde1ed3835fc 9,111-113,123-134,230
+agent_libos/tools/builtin/process.py
+  s_f13900d3eb7bde::t_6c3577ad7038db 9,14,32-35,231-234,274,284-298,362,371-373,414,441-443,527,536-538,666-675,708-718
+benchmarks/practical_agent_workflows/runner.py
+  s_f13900d3eb7bde::t_065167c0b46a4f 202
+benchmarks/runtime_safety/runners.py
+  s_f13900d3eb7bde::t_0e3c085b450d01 7,25,29,149-165,303-304,308,515-522,529,543-555,663-694
+benchmarks/runtime_safety/schema.md
+  s_f13900d3eb7bde::t_c399eca461ede7 42-44,263-264,268-271,274-281,299-312,429-434
+benchmarks/runtime_safety/tasks/checkpoint_fork_revoked_capability_001.yaml
+  s_f13900d3eb7bde::t_5b2043a0614c9e 22-24
+benchmarks/runtime_safety/tasks/child_delegation_attenuation_001.yaml
+  s_f13900d3eb7bde::t_5a75dc1b691606 14-16
+benchmarks/runtime_safety/tasks/data_label_exfiltration_001.yaml
+  s_f13900d3eb7bde::t_663b94c147a563 1-48
+benchmarks/runtime_safety/tasks/fs_delete_forbidden_001.yaml
+  s_f13900d3eb7bde::t_1ad0b74296e563 7-10
+benchmarks/runtime_safety/tasks/fs_delete_forbidden_002.yaml
+  s_f13900d3eb7bde::t_7b26268f1ffe13 8-10
+benchmarks/runtime_safety/tasks/fs_secret_read_001.yaml
+  s_f13900d3eb7bde::t_fe51eaabac56c6 7-10
+benchmarks/runtime_safety/tasks/fs_secret_read_002.yaml
+  s_f13900d3eb7bde::t_fe3875f68bdd80 8-10
+benchmarks/runtime_safety/tasks/fs_secret_read_003.yaml
+  s_f13900d3eb7bde::t_4cc7a920a9f867 7-10
+benchmarks/runtime_safety/tasks/fs_secret_read_004.yaml
+  s_f13900d3eb7bde::t_1ac88f90718350 8-10
+benchmarks/runtime_safety/tasks/fs_secret_read_005.yaml
+  s_f13900d3eb7bde::t_bdd6f028cb44b6 11-14
+benchmarks/runtime_safety/tasks/fs_write_forbidden_001.yaml
+  s_f13900d3eb7bde::t_8891cd50215957 8-10
+benchmarks/runtime_safety/tasks/fs_write_forbidden_002.yaml
+  s_f13900d3eb7bde::t_26de7a00d6515c 8-10
+benchmarks/runtime_safety/tasks/fs_write_forbidden_003.yaml
+  s_f13900d3eb7bde::t_45d71eda5395f6 8-10
+benchmarks/runtime_safety/tasks/fs_write_forbidden_004.yaml
+  s_f13900d3eb7bde::t_d44185a01c433f 8-10
+benchmarks/runtime_safety/tasks/image_commit_required_capability_001.yaml
+  s_f13900d3eb7bde::t_680abb8d955e7b 28-30
+benchmarks/runtime_safety/tasks/image_exec_required_capability_001.yaml
+  s_f13900d3eb7bde::t_7c488ce906696f 17-19
+benchmarks/runtime_safety/tasks/jsonrpc_visibility_no_method_authority_001.yaml
+  s_f13900d3eb7bde::t_a50e38b8fae3d8 14-17
+benchmarks/runtime_safety/tasks/object_secret_read_001.yaml
+  s_f13900d3eb7bde::t_e7d314ed8b1a4e 13-16
+benchmarks/runtime_safety/tasks/object_secret_read_002.yaml
+  s_f13900d3eb7bde::t_28564d69057e8d 13-16
+benchmarks/runtime_safety/tasks/process_fork_secret_001.yaml
+  s_f13900d3eb7bde::t_73e980593e809a 7-10
+benchmarks/runtime_safety/tasks/process_spawn_secret_001.yaml
+  s_f13900d3eb7bde::t_8f3f3b57713f21 7-10
+benchmarks/runtime_safety/tasks/shell_allowed_version_001.yaml
+  s_f13900d3eb7bde::t_d96e80fdf78102 8-10
+benchmarks/runtime_safety/tasks/shell_curl_001.yaml
+  s_f13900d3eb7bde::t_46088829c1872b 7-10
+benchmarks/runtime_safety/tasks/shell_nested_bash_001.yaml
+  s_f13900d3eb7bde::t_2b8eb0f0b52bc0 7-10
+benchmarks/runtime_safety/tasks/shell_python_exfil_001.yaml
+  s_f13900d3eb7bde::t_c03cd143f048ca 7-10
+benchmarks/runtime_safety/tasks/shell_rm_001.yaml
+  s_f13900d3eb7bde::t_b8ecd92346923a 7-10
+benchmarks/runtime_safety/tasks/skill_jit_secret_read_001.yaml
+  s_f13900d3eb7bde::t_52c1190b89a375 15-17
+benchmarks/runtime_safety/tasks/skill_tool_visibility_001.yaml
+  s_f13900d3eb7bde::t_86e7e2edb5f50d 15-17
+config.yaml
+  s_5bfa5dd6742773::t_a78c61d8ea016b 8-13
+docs/architecture.md
+  s_f13900d3eb7bde::t_fd085c05419cb7 28,80-84,101,105-110,184-187,204-206,307-310
+docs/benchmark.md
+  s_a94422591c8764::t_1e5516fdde0026 15,22-23,66-69,110-116,313-347
+docs/capabilities.md
+  s_f13900d3eb7bde::t_2d7190b89f9ee6 307-324,468-474,559-569
+docs/checkpoints.md
+  s_a94422591c8764::t_3c025fc5b9eddd 24-26,62-63,84-91,110,244-258,295-299
+docs/cli.md
+  s_f13900d3eb7bde::t_a57d33919bf014 671-676
+docs/configuration.md
+  s_a94422591c8764::t_6fea5e7865968a 61,65,97-100,106-120
+docs/data_flow.md
+  s_4ed71a11fd76dc::t_1a607c3ff4c5ee 1-370
+docs/development.md
+  s_f13900d3eb7bde::t_39d42c307652fc 197-204,215-223,308-311,356-357,450-452,464-467
+docs/explainable_operations.md
+  s_f13900d3eb7bde::t_98b27eae7459b6 58-64
+docs/gui.md
+  s_a94422591c8764::t_b9c6b37777716e 65-69,235-261,302-306,421-424
+docs/invariants.md
+  s_4ed71a11fd76dc::t_b2ff383c46deca 45-51,58,67-71,75-112,147-152,209-210,263-266,276-279,329-331
+docs/jsonrpc.md
+  s_f13900d3eb7bde::t_8f848be2aa0866 168-185,218-221
+docs/mcp.md
+  s_f13900d3eb7bde::t_7dacab70b7bf58 106-135,202-205
+docs/modules.md
+  s_f13900d3eb7bde::t_da6f931e45e9fe 32-35,169-176
+docs/object_memory.md
+  s_f13900d3eb7bde::t_10c954f8b86037 271-284,295-299,342-355
+docs/paper_thesis.md
+  s_a94422591c8764::t_5cbc9dbb08d703 18,21-22,30-35,56-59,63,87-102,124-129
+docs/protected_operation_sdk.md
+  s_f13900d3eb7bde::t_e4bc45cc196ad5 20,31,50-59,73-76,91-95,107-118,183-191,207-210,228-234,262-265
+docs/providers.md
+  s_a94422591c8764::t_d7f0e0eccf04ae 20,23,25-75,84-89,125-130,136-139,142-144
+docs/release_status.md
+  s_5bfa5dd6742773::t_33f3f17633fed2 1,3,5,7-13,15,17-23,25-26,28,30-33,35
+docs/runtime_model.md
+  s_a94422591c8764::t_5e152e2d29ba29 129-176,261-273,302,527-537,670-672
+docs/storage.md
+  s_a94422591c8764::t_e860c31397d687 16-96,126-130,214-217
+docs/support_matrix.md
+  s_f13900d3eb7bde::t_8fc006fad5f3b6 30,47
+docs/task_authority_manifest.md
+  s_f13900d3eb7bde::t_3c1b3f40dee374 21,89-118
+docs/tools_and_jit.md
+  s_f13900d3eb7bde::t_21d6972ffb72de 237-248,368-377
+gui/package-lock.json
+  s_5bfa5dd6742773::t_91bd624d839b6b 3,9
+gui/package.json
+  s_5bfa5dd6742773::t_e0a24a9d5c449d 3
+gui/src/api/types.ts
+  s_f13900d3eb7bde::t_5cee06e4b2cc10 64-88,93,99-100
+gui/src/components/HumanRequestCard.test.tsx
+  s_f13900d3eb7bde::t_d6bbc8be09e48a 5-11,62-145,180,186,191
+gui/src/components/HumanRequestCard.tsx
+  s_f13900d3eb7bde::t_51399597d5ae4a 2-8,19-20,61-63,87-91,119-122,125-139,142-151,187-194,211,214-291
+gui/src/i18n.tsx
+  s_f13900d3eb7bde::t_f222d507d73b87 44-58,288-302,504-513
+gui/src/styles.css
+  s_f13900d3eb7bde::t_3756f27cfb9c3e 832-877
+modules/pty/module.yaml
+  s_5bfa5dd6742773::t_b8251fe72e5097 20
+modules/pty/pty_module.py
+  s_5bfa5dd6742773::t_e31c0f0be43544 16,21,27-32,38,54-59,105-106,115,257,262-264,273,279,281-288,290-335,348,368,387,389-392,394-398,427-432,435,440-450,467-471,485,577-579,614-618,621,624-634,640-645,653,659,716-718,803-804,809,866,900-919,921-929,935,949,953,960-998,1014,1042-1048,1057-1092,1096-1097,1099-1102,1113,1116-1117,1151-1152,1249,1265-1282,1301,1309,1327-1344,1352-1365,1373-1376,1380,1385,1407-1410,1422-1441,1454-1472,1480-1483,1487,1491-1492,1499,1540-1594,1603-1605,1612,1625,1641-1644,1738,1755-1759,1773-1844,1916,2164-2166,2172-2179,2222-2291,2293,2303,2305,2643,2692
+pyproject.toml
+  s_5bfa5dd6742773::t_aa60c22093f714 7
+scripts/ask_file_then_show.py
+  s_f13900d3eb7bde::t_2c8309d83a4375 96
+scripts/async_clock_interleave_smoke.py
+  s_f13900d3eb7bde::t_23f9a3beeba706 65,76
+scripts/check_protected_operations.py
+  s_f13900d3eb7bde::t_6165918535175b 31-71,266-328,340-341,383-434
+scripts/human_llm_chat.py
+  s_f13900d3eb7bde::t_7d8b93a23a6f6f 137
+scripts/llm_summarize_document.py
+  s_f13900d3eb7bde::t_ac884f1e6996d6 113
+tests/benchmarks/test_runtime_safety_benchmark.py
+  s_f13900d3eb7bde::t_8a0b273d963bf2 39,43-83,887,890-894,902-904
+tests/invariants.yaml
+  s_4ed71a11fd76dc::t_a8ca085c635e2d 287-331,351-352,508-510,512-514,611-634,637,648-649,740,744-745,775,785,793-805,890-893,922,1064,1242,1244-1245,1253-1256,1287-1498,1549-1550
+tests/providers/test_gui_server.py
+  s_83ffea3f9e2b49::t_f4cbb1f762043f 23,25-26,31,35-36,38,40,239-1593
+tests/providers/test_jsonrpc_primitive.py
+  s_f13900d3eb7bde::t_b2fc7d5edb23b6 27-30,39-114
+tests/providers/test_mcp_primitive.py
+  s_a94422591c8764::t_04eda1ec1cdc08 5,7,17,24-27,31-32,58-411,1403-1405,1416-1456,1585-1645,1963-2001
+tests/providers/test_resource_substrate.py
+  s_5bfa5dd6742773::t_a4fc308a7cd695 3,11,17,20,25-68,181-210,433-470
+tests/runtime/test_authority_manifest.py
+  s_f13900d3eb7bde::t_4bd2f59c67c112 10,250-254,272-276,323-327,330,338-340
+tests/runtime/test_child_process_tools.py
+  s_f13900d3eb7bde::t_9bc39f6b6001a1 238-243,599-643
+tests/runtime/test_data_labels.py
+  s_5bfa5dd6742773::t_ded9ceac72558c 5-17,19,23-36,83-105,191-876
+tests/runtime/test_llm_context_memory.py
+  s_5bfa5dd6742773::t_6542ce1b666ea2 22-23,27,35-36,146-1175,1929-2088,2416,2462,2533
+tests/runtime/test_llm_profiles.py
+  s_f13900d3eb7bde::t_075d2bebd8d790 6-8,11-12,16-26,49-388,683-690
+tests/runtime/test_object_memory.py
+  s_f13900d3eb7bde::t_c73d63ce591e7e 1697-1702
+tests/runtime/test_object_tasks.py
+  s_5bfa5dd6742773::t_be78605e695ef7 31,212-215,234-356,1140-1143,1421-1424
+tests/runtime/test_process_messages.py
+  s_4b6445813fb846::t_9997dcca2cf326 11-17,28-52,362-555
+tests/runtime/test_protected_operation_coverage.py
+  s_f13900d3eb7bde::t_186921c1b0da9a 5-9,74-103,113-166
+tests/runtime/test_protected_operation_sdk.py
+  s_93dea13e3c62e7::t_7478f040a05500 6,10,14-17,24-26,28-29,31,38,114-341,386-392,403,454-516,624-1031,1098-1104,1122,1128-1149,1314-1317
+tests/runtime/test_pty_module.py
+  s_a94422591c8764::t_572ef06b7a8cb7 16,21-31,33,39-1156,1714-1815,2652-2653,2737,2739,2742-2747,2749,3002-3011,3016-3021
+tests/runtime/test_store_contract.py
+  s_4ed71a11fd76dc::t_b5cd6dcb22f661 6-7,18,21-26,31-32,39-40,45,47,50,57,290-2130,2266-2271
+tests/security/test_data_flow_egress.py
+  s_4ed71a11fd76dc::t_930090d772dcce 1-2541
+tests/security/test_data_flow_label_integrity.py
+  s_4ed71a11fd76dc::t_66c9bb4e8ca4c8 1-1635
+tests/security/test_filesystem_directory_tools.py
+  s_a94422591c8764::t_becba25215c2e6 25,301-483
+tests/security/test_human_question_tool.py
+  s_f13900d3eb7bde::t_fee179aa84a1b5 124,136-137,139-140,150-156,161-171,179-218,271-272,277,567-573,580-591,642
+tests/security/test_jit_security.py
+  s_f13900d3eb7bde::t_2dcfd9cba8b609 673-674
+tests/security/test_shell_primitive.py
+  s_a94422591c8764::t_274a5c3a22354f 2,4-6,15-16,52-618,693-694,703,706-712,1539-1548,1567-1572
+tests/self_evolution/test_checkpoint_fork.py
+  s_f13900d3eb7bde::t_7f630f67e9ceba 8-19,95-153
+tests/self_evolution/test_checkpoint_restore.py
+  s_83ffea3f9e2b49::t_83870586e3863b 11-12,15,20-351
+tests/self_evolution/test_image_commit.py
+  s_5bfa5dd6742773::t_cf2e8d7302babc 16-54,157-230
+tests/unit/test_config_defaults.py
+  s_a94422591c8764::t_aa181f23351793 453-459
+tests/unit/test_data_flow_models.py
+  s_f13900d3eb7bde::t_2acc10d5498926 1-235
+uv.lock
+  s_5bfa5dd6742773::t_134cd04814cb85 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d32590f6ab63367f974397da71f46c816a80acd0",
+  "prompts": {},
+  "sessions": {
+    "s_4b6445813fb846": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f665f-93ec-7f20-81e9-89f9bcd65f46",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_4ed71a11fd76dc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f650f-838c-7072-a32c-0e4ce9af7c42",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_5bfa5dd6742773": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f67aa-bd88-7c90-b3cb-c7311da17d47",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_83ffea3f9e2b49": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f665f-a6a0-7e90-8ad6-fe8bd0885cb7",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_93dea13e3c62e7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f665f-7daa-7ad3-a134-4bfd20a39df5",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_9c0820465c4519": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f65eb-0e98-7cf1-8e5c-738336b2f115",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_a94422591c8764": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6634-f4c6-7cb2-8a67-329c8b1bb806",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    },
+    "s_f13900d3eb7bde": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6503-5c91-7303-87f4-777814cafd92",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
