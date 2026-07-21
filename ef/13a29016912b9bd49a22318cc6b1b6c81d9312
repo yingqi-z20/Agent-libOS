@@ -1,0 +1,53 @@
+.github/workflows/test.yml
+  s_aeabc83064814a::t_f29cabf0568124 144-149,184,187
+README.md
+  s_aeabc83064814a::t_473013afedbf7d 243-252
+agent_libos/__init__.py
+  s_aeabc83064814a::t_52fe686ea53d79 116
+agent_libos/modules/context.py
+  s_aeabc83064814a::t_d75868f36ec5ae 108-110,113-114,123-124,134-144,148,151-153,220
+agent_libos/modules/registry.py
+  s_aeabc83064814a::t_a48f6c91865659 422
+docs/development.md
+  s_aeabc83064814a::t_a3e784710a4b03 57-62,65-71
+docs/release_status.md
+  s_aeabc83064814a::t_78466711b37790 1,3,159-162,189,210
+docs/support_matrix.md
+  s_aeabc83064814a::t_cebea750ba1ac1 57-62
+gui/package-lock.json
+  s_aeabc83064814a::t_e5e2e3dc532531 3,9
+gui/package.json
+  s_aeabc83064814a::t_6f8d1f73c5548f 3
+plan.md
+  s_aeabc83064814a::t_623c31272b7018 206
+pyproject.toml
+  s_aeabc83064814a::t_4f17ca4d392814 7
+scripts/test_matrix.py
+  s_aeabc83064814a::t_209b6b2db8378b 24-26,32-38,76-82,140-142,339-348
+tests/unit/test_module_context.py
+  s_aeabc83064814a::t_929ed9a6f601c1 1-96
+tests/unit/test_release_contract.py
+  s_aeabc83064814a::t_7dc7a6bd8331a3 16,21,73,84-86,88-89,194-206
+tests/unit/test_test_matrix.py
+  s_aeabc83064814a::t_70d93ecc11a6b8 23,40,48-51,57,65-69,95-100,102-113,165-171
+uv.lock
+  s_aeabc83064814a::t_8012eaabbf0dfe 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ef13a29016912b9bd49a22318cc6b1b6c81d9312",
+  "prompts": {},
+  "sessions": {
+    "s_aeabc83064814a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8090-0411-7ce1-be27-3e86b5027efd",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
