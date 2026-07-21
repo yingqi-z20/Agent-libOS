@@ -232,12 +232,22 @@ class HierarchicalPathLock:
 
 
 def _executable_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    change_identity = int(value.st_ctime_ns)
+    if os.name == "nt":
+        # Python 3.14 exposes Windows creation time as st_birthtime_ns while
+        # st_ctime_ns from a descriptor and from its path can disagree for the
+        # same file.  Birth time remains stable across both APIs and, together
+        # with the file ID, size, mtime, and content hash, identifies the file
+        # without treating every Windows executable as a replacement race.
+        change_identity = int(
+            getattr(value, "st_birthtime_ns", value.st_ctime_ns)
+        )
     return (
         int(value.st_dev),
         int(value.st_ino),
         int(value.st_size),
         int(value.st_mtime_ns),
-        int(value.st_ctime_ns),
+        change_identity,
     )
 
 

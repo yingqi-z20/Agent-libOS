@@ -74,6 +74,8 @@ class _PostgresCleanupConnection:
 
 class TestStorageBackendBoundaries:
     def test_sqlite_database_lease_and_wal_sidecars_are_owner_only(self, tmp_path: Path) -> None:
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "fchmod"):
+            pytest.skip("POSIX owner-only file modes are unavailable")
         db_path = tmp_path / "private-runtime.sqlite"
         previous_umask = os.umask(0o022)
         try:
@@ -1462,7 +1464,7 @@ class TestStorageBackendBoundaries:
         assert list(caught.value.exceptions) == [close_error, restore_error]
         assert store._admission_commit_guard is None
         assert store._admission_guard_close_claim is close_reservation
-        assert store._lease_handle is not None
+        assert store._runtime_ownership_released() is False
         with pytest.raises(
             RuntimeError,
             match="admission-guard close is pending",

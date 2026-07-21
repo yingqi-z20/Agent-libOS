@@ -5,11 +5,12 @@ import tempfile
 import time
 from dataclasses import replace
 
+import pytest
 from pydantic import BaseModel
 
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import ObjectType
+from agent_libos.models import EventType, ObjectType, ProcessStatus
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
 
 
@@ -122,6 +123,94 @@ class StaticToolV2(SyncAgentTool[EmptyArgs]):
 
 
 class TestToolResultLimits:
+    def test_terminalization_during_result_persistence_fails_closed_and_is_audited(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="terminal result persistence race",
+            )
+            runtime.tools.configure_process_tools(
+                pid,
+                ["get_working_directory"],
+                assigned_by="test",
+            )
+            before_result_oids = {
+                obj.oid
+                for obj in runtime.store.list_objects()
+                if obj.type == ObjectType.TOOL_RESULT
+            }
+            result_memory = runtime.tools.execution._memory
+            original_create_object = result_memory.create_object
+            terminalized = False
+            terminal_revision: int | None = None
+            terminal_capability_ids: tuple[str, ...] = ()
+
+            def terminalize_before_result_create(
+                *args: object,
+                **kwargs: object,
+            ):
+                nonlocal terminalized, terminal_revision, terminal_capability_ids
+                selected_type = kwargs.get("object_type")
+                if selected_type is None and len(args) > 1:
+                    selected_type = args[1]
+                if selected_type == ObjectType.TOOL_RESULT and not terminalized:
+                    terminalized = True
+                    runtime.process.cancel(
+                        pid,
+                        "injected tool-result persistence race",
+                    )
+                    terminal = runtime.process.get(pid)
+                    terminal_revision = terminal.revision
+                    terminal_capability_ids = tuple(terminal.capabilities)
+                return original_create_object(*args, **kwargs)
+
+            monkeypatch.setattr(
+                result_memory,
+                "create_object",
+                terminalize_before_result_create,
+            )
+
+            result = runtime.tools.call(pid, "get_working_directory", {})
+
+            assert terminalized
+            assert not result.ok
+            assert result.result_handle is None
+            assert "terminal process" in (result.error or "")
+            terminal = runtime.process.get(pid)
+            assert terminal.status == ProcessStatus.KILLED
+            assert terminal.revision == terminal_revision
+            assert tuple(terminal.capabilities) == terminal_capability_ids
+            after_result_oids = {
+                obj.oid
+                for obj in runtime.store.list_objects()
+                if obj.type == ObjectType.TOOL_RESULT
+            }
+            assert after_result_oids == before_result_oids
+            call_events = [
+                event
+                for event in runtime.events.list()
+                if event.payload.get("call_id") == result.call_id
+                and event.type in {EventType.TOOL_COMPLETED, EventType.TOOL_FAILED}
+            ]
+            assert [event.type for event in call_events] == [EventType.TOOL_FAILED]
+            assert call_events[0].payload["result_oid"] is None
+            tool_audits = [
+                record
+                for record in runtime.audit.trace()
+                if record.action == "tool.call"
+                and record.decision.get("tool") == "get_working_directory"
+            ]
+            assert len(tool_audits) == 1
+            assert tool_audits[0].decision["ok"] is False
+            assert tool_audits[0].decision["policy_decision"] == "allow"
+            assert tool_audits[0].output_refs == []
+        finally:
+            runtime.close()
+
     def test_tool_result_payload_limit_rejects_before_result_object_creation(self) -> None:
         runtime = Runtime.open("local")
         try:

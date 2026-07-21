@@ -290,7 +290,21 @@ class ToolExecutionService:
         bounded = self._bound_result(prepared, output, started_at)
         if isinstance(bounded, ToolCallResult):
             return bounded
-        return await self._persist_success(prepared, bounded, started_at)
+        try:
+            return await self._persist_success(prepared, bounded, started_at)
+        except ProcessRevisionConflict as exc:
+            # Resource enforcement can terminalize the process after the
+            # provider returns but before its ToolResult capability attaches.
+            # Preserve that terminal winner and surface one audited failure.
+            latest = self._processes.get_process(prepared.pid)
+            if latest is None or latest.status not in _TERMINAL_PROCESS_STATUSES:
+                raise
+            return self._invocation_error_result(
+                prepared,
+                exc,
+                started_at,
+                policy_decision="allow",
+            )
 
     def _prepare_invocation(
         self,

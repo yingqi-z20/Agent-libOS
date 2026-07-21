@@ -45,7 +45,7 @@ _SCP_REMOTE_RE = re.compile(
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _ATTRIBUTE_DRIVER_RE = re.compile(
-    rb"(?:^|[ \t])(?P<kind>filter|diff|merge)=(?P<name>[A-Za-z0-9._-]+)(?=$|[ \t])",
+    rb"(?:^|[ \t])(?P<kind>filter|diff|merge)=(?P<name>[A-Za-z0-9._-]+)(?=$|[ \t\r])",
     re.MULTILINE,
 )
 _DANGEROUS_HELPER_CHARS = frozenset(";&|`$<>(){}\n\r")
@@ -877,12 +877,18 @@ class LocalGitProvider:
             raise self._error(GitErrorCode.UNSAFE_CONFIG, "invalid credential helper")
         helper = words[0]
         candidates: list[Path] = []
+
+        def add_candidate(candidate: Path) -> None:
+            candidates.append(candidate)
+            if os.name == "nt" and candidate.suffix.casefold() != ".exe":
+                candidates.append(Path(f"{candidate}.exe"))
+
         if Path(helper).is_absolute():
-            candidates.append(Path(helper))
+            add_candidate(Path(helper))
         else:
             executable = shutil.which(f"git-credential-{helper}", path=self._safe_path())
             if executable:
-                candidates.append(Path(executable))
+                add_candidate(Path(executable))
             git_path, _identity, _digest = self._resolve_executable()
             exec_path = self._invoke(
                 ["--exec-path"],
@@ -893,8 +899,26 @@ class LocalGitProvider:
                 operation="credential_helper_inspection",
             )
             if exec_path.returncode == 0:
-                candidates.append(Path(os.fsdecode(exec_path.stdout.strip())) / f"git-credential-{helper}")
-            candidates.append(git_path.parent / f"git-credential-{helper}")
+                git_exec_dir = Path(os.fsdecode(exec_path.stdout.strip()))
+                add_candidate(git_exec_dir / f"git-credential-{helper}")
+                if os.name == "nt" and len(git_exec_dir.parents) >= 2:
+                    # Git for Windows keeps Git Credential Manager in
+                    # <install>/mingw64/bin while `git --exec-path` reports
+                    # <install>/mingw64/libexec/git-core.
+                    add_candidate(
+                        git_exec_dir.parent.parent
+                        / "bin"
+                        / f"git-credential-{helper}"
+                    )
+            add_candidate(git_path.parent / f"git-credential-{helper}")
+            if os.name == "nt":
+                for parent in tuple(git_path.parents)[:3]:
+                    add_candidate(
+                        parent
+                        / "mingw64"
+                        / "bin"
+                        / f"git-credential-{helper}"
+                    )
         for candidate in candidates:
             try:
                 resolved = candidate.resolve(strict=True)

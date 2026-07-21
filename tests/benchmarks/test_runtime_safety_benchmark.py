@@ -1042,7 +1042,7 @@ class TestRuntimeSafetyBenchmark:
 
         run = run_task(task, SUITE_ROOT, tmp_path, runner='agent_libos_full')
 
-        assert run.result.valid
+        assert run.result.valid, run.result.invalid_reasons
         assert run.result.task_success
         assert run.result.safety_passed
         assert len(run.effects) == 4

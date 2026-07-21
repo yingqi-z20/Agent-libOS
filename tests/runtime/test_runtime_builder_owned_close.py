@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from pathlib import Path
 from typing import Callable
@@ -195,6 +196,10 @@ def test_pre_lifecycle_failed_open_reserves_exact_close_before_retry(
     assert close_calls == [1, 2]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows uses the SQLite connection itself as the runtime lease",
+)
 def test_sync_failed_open_poisoned_store_closes_and_releases_file_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -211,11 +216,15 @@ def test_sync_failed_open_poisoned_store_closes_and_releases_file_lease(
         Runtime.open("ignored")
 
     assert RuntimeAssemblyCleanupRequired.extract(caught.value) == ()
-    assert store._lease_handle is None
+    assert store._runtime_ownership_released() is True
     reopened = SQLiteStore(database)
     reopened.close()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows uses the SQLite connection itself as the runtime lease",
+)
 def test_async_failed_open_poisoned_store_closes_and_releases_file_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -236,13 +245,17 @@ def test_async_failed_open_poisoned_store_closes_and_releases_file_lease(
             await Runtime.aopen("ignored")
 
         assert RuntimeAssemblyCleanupRequired.extract(caught.value) == ()
-        assert store._lease_handle is None
+        assert store._runtime_ownership_released() is True
 
     asyncio.run(exercise())
     reopened = SQLiteStore(database)
     reopened.close()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows releases its connection-backed lease when the store is poisoned",
+)
 def test_sync_failed_open_poisoned_store_retained_close_publishes_retry_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -271,7 +284,7 @@ def test_sync_failed_open_poisoned_store_retained_close_publishes_retry_handle(
     handle = _extract_one(caught.value)
 
     assert handle.owns_store is True
-    assert store._lease_handle is not None
+    assert store._runtime_ownership_released() is False
     with pytest.raises(ValidationError, match="already open"):
         SQLiteStore(database)
 
@@ -279,11 +292,15 @@ def test_sync_failed_open_poisoned_store_retained_close_publishes_retry_handle(
 
     assert close_calls == 2
     assert handle.released is True
-    assert store._lease_handle is None
+    assert store._runtime_ownership_released() is True
     reopened = SQLiteStore(database)
     reopened.close()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows releases its connection-backed lease when the store is poisoned",
+)
 def test_async_failed_open_poisoned_store_retained_close_publishes_retry_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -313,7 +330,7 @@ def test_async_failed_open_poisoned_store_retained_close_publishes_retry_handle(
         handle = _extract_one(caught.value)
 
         assert handle.owns_store is True
-        assert store._lease_handle is not None
+        assert store._runtime_ownership_released() is False
         with pytest.raises(ValidationError, match="already open"):
             SQLiteStore(database)
 
@@ -321,9 +338,36 @@ def test_async_failed_open_poisoned_store_retained_close_publishes_retry_handle(
 
         assert close_calls == 2
         assert handle.released is True
-        assert store._lease_handle is None
+        assert store._runtime_ownership_released() is True
 
     asyncio.run(exercise())
+    reopened = SQLiteStore(database)
+    reopened.close()
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows connection-backed SQLite lease regression",
+)
+def test_windows_poisoned_file_store_terminalizes_released_connection_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "windows-poisoned-connection-lease.sqlite"
+    store = SQLiteStore(database)
+    store._poison("injected Windows connection lease release")
+    assert store._runtime_ownership_released() is True
+    monkeypatch.setattr(
+        "agent_libos.runtime.builder.open_store",
+        lambda *_args, **_kwargs: store,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        Runtime.open("ignored")
+    handle = _extract_one(caught.value)
+
+    assert handle.owns_store is False
+    assert handle.released is True
     reopened = SQLiteStore(database)
     reopened.close()
 

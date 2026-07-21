@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -467,6 +468,8 @@ def test_publication_scale_rejects_direct_selects_substituted_for_helper_sql(
 def test_publication_scale_traces_handler_connections_opened_during_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if os.name == "nt":
+        pytest.skip("Windows SQLite runtime ownership uses an exclusive connection lease")
     original = publication_runner.ProcessManager.reconcile_terminal_publications
 
     def reconcile_with_second_connection(

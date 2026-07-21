@@ -70,6 +70,26 @@ def test_console_entrypoint_uses_the_domain_error_boundary() -> None:
     }
 
 
+def test_ci_checkout_does_not_persist_credentials_in_git_config() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(
+        encoding="utf-8"
+    )
+    parsed = yaml.safe_load(workflow)
+    checkout_jobs: list[str] = []
+    for job_name, job in parsed["jobs"].items():
+        checkout_steps = [
+            step
+            for step in job.get("steps", [])
+            if str(step.get("uses") or "").startswith("actions/checkout@")
+        ]
+        if not checkout_steps:
+            continue
+        checkout_jobs.append(job_name)
+        assert len(checkout_steps) == 1
+        assert checkout_steps[0].get("with", {}).get("persist-credentials") is False
+    assert checkout_jobs
+
+
 def test_release_workflow_runs_release_smokes_without_repeating_lane_matrix() -> None:
     workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(
         encoding="utf-8"

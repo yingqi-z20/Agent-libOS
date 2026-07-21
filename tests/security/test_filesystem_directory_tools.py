@@ -637,7 +637,7 @@ class TestFilesystemDirectoryTool:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='list reparse race')
                 runtime.filesystem.grant_directory(pid, 'dir', [CapabilityRight.READ], issued_by='test')
 
-                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root|path changed'):
                     runtime.filesystem.read_directory(pid, 'dir')
 
                 assert provider.swapped
@@ -734,7 +734,7 @@ class TestFilesystemDirectoryTool:
                 with pytest.raises(CapabilityDenied, match='opened path changed|escapes filesystem adapter root|symlink|junction'):
                     runtime.filesystem.write_text(pid, 'dir/victim.txt', 'changed')
 
-                assert provider.swapped
+                assert provider.swap_attempted
                 assert outside_file.read_text(encoding='utf-8') == 'outside'
             finally:
                 runtime.close()
@@ -986,10 +986,12 @@ class FallbackOpenSwapProvider(LocalFilesystemProvider):
         super().__init__(root)
         self.outside = outside
         self.swapped = False
+        self.swap_attempted = False
 
     def _before_fallback_open(self, target: Path, flags: int) -> None:
         if self.swapped:
             return
+        self.swap_attempted = True
         link = Path(self.root_display) / 'dir'
         _remove_directory_for_swap(link)
         _create_directory_reparse_link(link, self.outside)

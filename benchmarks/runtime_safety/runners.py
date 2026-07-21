@@ -160,7 +160,7 @@ class BenchmarkShellProvider(LocalShellProvider):
         interpreter_bin = str(Path(sys.executable).parent.resolve(strict=False))
         inherited = super()._safe_path().split(os.pathsep)
         return os.pathsep.join(
-            dict.fromkeys([interpreter_bin, *[item for item in inherited if item]])
+            dict.fromkeys([*[item for item in inherited if item], interpreter_bin])
         )
 
 

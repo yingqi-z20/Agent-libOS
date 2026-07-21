@@ -42,6 +42,16 @@ from agent_libos.substrate import (
 _T = TypeVar("_T")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_host_git_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_home = tmp_path / "git-home"
+    git_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(git_home))
+
+
 def _git(root: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
     environment = dict(os.environ)
     environment.update(
@@ -375,11 +385,12 @@ def test_provider_disables_host_git_trace_sinks(
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     trace_output = tmp_path / "git-trace-events.json"
+    trace_target = trace_output.as_posix()
     (fake_home / ".gitconfig").write_text(
         "[trace2]\n"
-        f"\teventTarget = {trace_output}\n"
-        f"\tnormalTarget = {trace_output}\n"
-        f"\tperfTarget = {trace_output}\n",
+        f"\teventTarget = {trace_target}\n"
+        f"\tnormalTarget = {trace_target}\n"
+        f"\tperfTarget = {trace_target}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(fake_home))
@@ -461,6 +472,8 @@ def test_git_path_token_preserves_non_utf8_bytes() -> None:
 
 
 def test_status_preserves_newline_paths_and_async_facade(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("Windows filenames cannot contain newline characters")
     root = tmp_path / "repo"
     _init_repository(root)
     raw_name = "line\nbreak.txt"
@@ -951,6 +964,7 @@ def test_worktree_git_write_preserves_unchanged_secret_file_label(
     _git(root, "switch", "-q", "main")
     secret_path = root / "secret.txt"
     secret_path.write_text("secret\n", encoding="utf-8")
+    secret_digest = hashlib.sha256(secret_path.read_bytes()).hexdigest()
     runtime = _open_runtime(root)
     try:
         writer = runtime.process.spawn(image="base-agent:v0", goal="bind secret file")
@@ -966,7 +980,7 @@ def test_worktree_git_write_preserves_unchanged_secret_file_label(
         runtime.data_flow.bind_written_file_digest(
             pid=writer,
             normalized_path="secret.txt",
-            content_sha256=hashlib.sha256(secret_path.read_bytes()).hexdigest(),
+            content_sha256=secret_digest,
             context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
         )
 
@@ -975,7 +989,7 @@ def test_worktree_git_write_preserves_unchanged_secret_file_label(
 
         binding = runtime.store.get_file_label_binding("secret.txt")
         assert binding is not None
-        assert binding.content_sha256 == hashlib.sha256(b"secret\n").hexdigest()
+        assert binding.content_sha256 == secret_digest
         assert binding.labels.sensitivity.value == "secret"
     finally:
         runtime.close()
@@ -1251,6 +1265,7 @@ def test_restore_source_tree_requires_subtree_filesystem_authority(
         runtime.close()
 
 
+@pytest.mark.timeout(240 if os.name == "nt" else 120)
 def test_local_branch_switch_stash_integrate_restore_reset_and_clean(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
@@ -1605,6 +1620,50 @@ def test_multiple_remote_urls_and_escaping_fetch_refspec_are_rejected(
     with pytest.raises(GitError) as refspec_error:
         LocalGitProvider(root).remote_fingerprint("origin")
     assert refspec_error.value.code == GitErrorCode.UNSAFE_CONFIG.value
+
+
+def test_windows_system_credential_helper_resolves_from_git_install_bin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Git for Windows installation layout regression")
+    root = tmp_path / "repo"
+    _init_repository(root)
+    install_root = tmp_path / "host-git"
+    git_path = install_root / "cmd" / "git.exe"
+    helper = install_root / "mingw64" / "bin" / "git-credential-manager.exe"
+    git_path.parent.mkdir(parents=True)
+    helper.parent.mkdir(parents=True)
+    git_path.write_bytes(b"git executable")
+    helper.write_bytes(b"credential helper executable")
+    provider = LocalGitProvider(root)
+    monkeypatch.setattr(
+        "agent_libos.substrate.git.shutil.which",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_resolve_executable",
+        lambda: (git_path, (1, 2, 3, 4, 5), "0" * 64),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_invoke",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=str(
+                install_root / "mingw64" / "libexec" / "git-core"
+            ).encode(),
+            stderr=b"",
+        ),
+    )
+
+    resolved, digest = provider._resolve_helper("manager")
+
+    assert Path(resolved) == helper.resolve()
+    assert digest == hashlib.sha256(helper.read_bytes()).hexdigest()
 
 
 def test_shell_credential_helper_is_rejected_without_execution(tmp_path: Path) -> None:

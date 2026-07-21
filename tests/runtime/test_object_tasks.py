@@ -2399,7 +2399,7 @@ class TestObjectTasks:
     def test_runtime_shutdown_keeps_store_open_when_object_task_executor_is_still_running(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
-            object_tasks=replace(DEFAULT_CONFIG.object_tasks, shutdown_join_timeout_s=0.01),
+            object_tasks=replace(DEFAULT_CONFIG.object_tasks, shutdown_join_timeout_s=0.5),
         )
         runtime = Runtime.open("local", config=config)
         release = threading.Event()
@@ -2427,6 +2427,11 @@ class TestObjectTasks:
 
             release.set()
             assert slow_tool.finished.wait(timeout=2.0)
+            deadline = time.monotonic() + 2.0
+            while runtime.object_tasks._has_active_future(task.task_id):
+                if time.monotonic() >= deadline:
+                    pytest.fail("object task runner did not finish cleanup")
+                time.sleep(0.01)
             retry = runtime.shutdown(actor="test", reason="object-task-slow-drain-retry")
             assert retry["ok"] is True
         finally:

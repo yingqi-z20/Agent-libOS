@@ -2566,10 +2566,19 @@ class TestPtyModule:
                 pid = runtime.process.spawn(
                     image="pty-agent:v0",
                     goal="pty wall budget",
-                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=0.001),
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=10.0),
                 )
-                created = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
+                argv = ["pty-test-command"]
+                _grant_exact_pty_once(runtime, pid, argv)
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": argv, "startup_timeout_s": 0},
+                )
                 assert created.ok, created.error
+                adapter = _pty_adapter(runtime)
+                session = adapter._sessions[created.payload["session_oid"]]
+                session.started_monotonic = time.monotonic() - 11.0
 
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and (
@@ -2596,7 +2605,7 @@ class TestPtyModule:
                 pid = runtime.process.spawn(
                     image="pty-agent:v0",
                     goal="pty wall budget before sampler failure",
-                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=0.001),
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=10.0),
                 )
                 created = runtime.tools.call(
                     pid,
@@ -2607,7 +2616,7 @@ class TestPtyModule:
                 adapter = _pty_adapter(runtime)
                 session = adapter._sessions[created.payload["session_oid"]]
                 session.handle.pid = os.getpid()
-                session.started_monotonic = time.monotonic() - 1.0
+                session.started_monotonic = time.monotonic() - 11.0
 
                 def deny_process_access(process_pid: int) -> Any:
                     raise psutil.AccessDenied(pid=process_pid)
@@ -2634,7 +2643,7 @@ class TestPtyModule:
                 pid = runtime.process.spawn(
                     image="pty-agent:v0",
                     goal="pty blocked reader budget",
-                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=0.001),
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=10.0),
                 )
                 created = runtime.tools.call(
                     pid,
@@ -2643,6 +2652,10 @@ class TestPtyModule:
                 )
                 assert created.ok, created.error
                 assert provider.sessions[0].read_started.wait(timeout=1.0)
+                session = _pty_adapter(runtime)._sessions[
+                    created.payload["session_oid"]
+                ]
+                session.started_monotonic = time.monotonic() - 11.0
 
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and (
@@ -2815,10 +2828,14 @@ class TestPtyModule:
                 pid = runtime.process.spawn(
                     image="pty-agent:v0",
                     goal="pty shutdown waits for reader",
-                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=0.001),
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=10.0),
                 )
                 created = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
                 assert created.ok, created.error
+                session = _pty_adapter(runtime)._sessions[
+                    created.payload["session_oid"]
+                ]
+                session.started_monotonic = time.monotonic() - 11.0
                 assert audit_blocked.wait(timeout=2.0)
                 assert provider.sessions[0].closed
                 assert not _pty_adapter(runtime)._sessions

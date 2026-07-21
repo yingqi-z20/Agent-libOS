@@ -1994,11 +1994,7 @@ class TestRuntimeShutdown:
                 )
             )
             try:
-                for _ in range(1000):
-                    if cleanup_entered.is_set():
-                        break
-                    await asyncio.sleep(0)
-                assert cleanup_entered.is_set()
+                assert await asyncio.to_thread(cleanup_entered.wait, 2.0)
                 assert cleanup_threads == [cleanup_threads[0]]
                 assert cleanup_threads[0] != caller_thread
 
@@ -2067,11 +2063,7 @@ class TestRuntimeShutdown:
                 )
             )
             try:
-                for _ in range(1000):
-                    if cleanup_entered.is_set():
-                        break
-                    await asyncio.sleep(0)
-                assert cleanup_entered.is_set()
+                assert await asyncio.to_thread(cleanup_entered.wait, 2.0)
                 task.cancel()
                 release_cleanup.set()
                 with pytest.raises(BaseExceptionGroup) as caught:
@@ -2142,11 +2134,7 @@ class TestRuntimeShutdown:
                 )
             )
             try:
-                for _ in range(1000):
-                    if entered.is_set():
-                        break
-                    await asyncio.sleep(0)
-                assert entered.is_set()
+                assert await asyncio.to_thread(entered.wait, 2.0)
                 task.cancel()
                 await asyncio.sleep(0)
                 assert not task.done()
@@ -2515,11 +2503,7 @@ class TestRuntimeShutdown:
                 lifecycle.ashutdown(reason="cancel-during-store-close")
             )
             try:
-                for _ in range(1000):
-                    if store.ownership_released.is_set():
-                        break
-                    await asyncio.sleep(0)
-                assert store.ownership_released.is_set()
+                assert await asyncio.to_thread(store.ownership_released.wait, 2.0)
                 assert store.close_threads[0] != caller_thread
                 task.cancel()
                 await asyncio.sleep(0)
@@ -2592,20 +2576,12 @@ class TestRuntimeShutdown:
             )
             follower: asyncio.Task[dict[str, object]] | None = None
             try:
-                for _ in range(1000):
-                    if store.ownership_released.is_set():
-                        break
-                    await asyncio.sleep(0)
-                assert store.ownership_released.is_set()
+                assert await asyncio.to_thread(store.ownership_released.wait, 2.0)
 
                 follower = asyncio.create_task(
                     lifecycle.ashutdown(reason="warning-follower")
                 )
-                for _ in range(1000):
-                    if follower_joined.is_set():
-                        break
-                    await asyncio.sleep(0)
-                assert follower_joined.is_set()
+                assert await asyncio.to_thread(follower_joined.wait, 2.0)
 
                 leader.cancel()
                 await asyncio.sleep(0)
@@ -2948,11 +2924,7 @@ class TestRuntimeShutdown:
                 )
             )
             try:
-                for _ in range(1000):
-                    if store.ownership_released.is_set():
-                        break
-                    await asyncio.sleep(0)
-                assert store.ownership_released.is_set()
+                assert await asyncio.to_thread(store.ownership_released.wait, 2.0)
                 task.cancel()
                 await asyncio.sleep(0)
                 assert not task.done()

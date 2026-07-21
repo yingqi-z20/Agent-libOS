@@ -653,18 +653,37 @@ class LocalFilesystemProvider:
     def _fallback_create_parent_dirs(self, target: Path) -> None:
         if target.parent == self.root:
             return
-        guard = self._windows_parent_directory_guard(target)
-        if guard is not None:
+        if os.name != "nt":
+            raise CapabilityDenied(
+                "filesystem parent creation requires descriptor-bound directory operations"
+            )
+        parts = self._relative_parts(target)
+        current = self.root
+        guard = self._windows_directory_guard(current)
+        try:
+            for part in parts[:-1]:
+                child = current / part
+                try:
+                    child.mkdir()
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise CapabilityDenied(
+                        f"filesystem parent path could not be created safely: {child}"
+                    ) from exc
+                child_guard = self._windows_directory_guard(child)
+                guard.close()
+                guard = child_guard
+                current = child
+        finally:
             guard.close()
-            return
-        raise CapabilityDenied("filesystem parent creation requires descriptor-bound directory operations")
 
     def _fallback_make_directory(self, target: Path, *, parents: bool, exist_ok: bool) -> None:
+        if parents:
+            self._fallback_create_parent_dirs(target)
         guard = self._windows_parent_directory_guard(target)
         try:
             self._target(ResolvedPath(display=os.fspath(target), relative=target.relative_to(self.root).as_posix()))
-            if parents:
-                raise CapabilityDenied("recursive directory creation requires descriptor-bound directory operations")
             target.mkdir(parents=False, exist_ok=exist_ok)
         finally:
             if guard is not None:
@@ -693,30 +712,56 @@ class LocalFilesystemProvider:
     def _windows_parent_directory_guard(self, target: Path) -> _WindowsDirectoryGuard | None:
         if os.name != "nt":
             return None
+        return self._windows_directory_guard(target.parent)
+
+    def _windows_directory_guard(self, directory: Path) -> _WindowsDirectoryGuard:
         try:
-            guard = _WindowsDirectoryGuard.open(target.parent)
+            if self._is_reparse_path(directory) or not directory.is_dir():
+                raise CapabilityDenied(
+                    f"filesystem path contains a symlink, junction, or non-directory: {directory}"
+                )
+            guard = _WindowsDirectoryGuard.open(directory)
             opened = self._windows_final_path_from_handle(guard.handle)
-            requested = Path(os.path.abspath(os.fspath(target.parent)))
+            requested = Path(os.path.abspath(os.fspath(directory)))
             if os.path.normcase(os.fspath(opened)) != os.path.normcase(os.fspath(requested)):
                 guard.close()
-                raise CapabilityDenied(f"filesystem parent path changed during validation: {target.parent}")
+                raise CapabilityDenied(
+                    f"filesystem directory path changed during validation: {directory}"
+                )
             if self.root not in opened.parents and opened != self.root:
                 guard.close()
-                raise CapabilityDenied(f"filesystem parent path escapes adapter root: {target.parent}")
+                raise CapabilityDenied(
+                    f"filesystem directory path escapes adapter root: {directory}"
+                )
             return guard
         except OSError as exc:
-            raise CapabilityDenied(f"filesystem parent path could not be guarded: {target.parent}") from exc
+            raise CapabilityDenied(
+                f"filesystem directory path could not be guarded: {directory}"
+            ) from exc
 
     def _open_under_root_fallback(self, target: Path, flags: int, mode: int) -> int:
-        self._require_existing_single_link_file(target, allow_missing=bool(flags & os.O_CREAT))
-        self._before_fallback_open(target, flags)
-        fd = os.open(target, flags, mode)
+        guard = self._windows_parent_directory_guard(target)
         try:
-            self._validate_open_target_matches_request(fd, target)
-        except Exception:
-            os.close(fd)
-            raise
-        return fd
+            self._require_existing_single_link_file(
+                target,
+                allow_missing=bool(flags & os.O_CREAT),
+            )
+            try:
+                self._before_fallback_open(target, flags)
+            except OSError as exc:
+                raise CapabilityDenied(
+                    f"filesystem opened path changed while its parent was guarded: {target}"
+                ) from exc
+            fd = os.open(target, flags, mode)
+            try:
+                self._validate_open_target_matches_request(fd, target)
+            except Exception:
+                os.close(fd)
+                raise
+            return fd
+        finally:
+            if guard is not None:
+                guard.close()
 
     def _before_fallback_open(self, target: Path, flags: int) -> None:
         return None

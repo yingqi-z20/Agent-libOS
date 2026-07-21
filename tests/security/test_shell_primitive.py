@@ -222,6 +222,8 @@ class TestShellPrimitive:
             runtime.close()
 
     def test_secret_egress_uses_the_provider_resolved_executable_identity(self, tmp_path: Path) -> None:
+        if os.name == 'nt':
+            pytest.skip('executable shell-script snapshots require POSIX exec semantics')
         root = tmp_path / 'workspace'
         commands = root / 'commands'
         commands.mkdir(parents=True)
@@ -316,6 +318,8 @@ class TestShellPrimitive:
         self,
         tmp_path: Path,
     ) -> None:
+        if os.name == 'nt':
+            pytest.skip('executable shell-script snapshots require POSIX exec semantics')
         root = tmp_path / 'workspace'
         commands = root / 'commands'
         commands.mkdir(parents=True)
@@ -523,6 +527,8 @@ class TestShellPrimitive:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        if os.name == 'nt':
+            pytest.skip('executable shell-script snapshots require POSIX exec semantics')
         root = tmp_path / 'workspace'
         commands = root / 'commands'
         commands.mkdir(parents=True)

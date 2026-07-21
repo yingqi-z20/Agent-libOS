@@ -339,6 +339,8 @@ def test_scale_benchmark_rejects_extra_reviewed_effect_reads(
 def test_scale_benchmark_traces_handler_connections_opened_during_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if os.name == "nt":
+        pytest.skip("Windows SQLite runtime ownership uses an exclusive connection lease")
     original = RuntimeBuilder._recover_runtime_state
 
     def recover_with_second_connection(host: Runtime) -> None:

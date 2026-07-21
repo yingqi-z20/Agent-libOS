@@ -973,13 +973,13 @@ class TestLLMContextMemory:
 
                 assert waiting['waiting_human']
                 assert client.user_prompts == []
-                with sqlite3.connect(db) as conn:
-                    row = conn.execute(
-                        'SELECT action_json FROM llm_pending_actions WHERE pid = ?',
-                        (pid,),
-                    ).fetchone()
-                assert row is not None
-                assert sentinel not in row[0]
+                rows = runtime.store.select_table_rows(
+                    'llm_pending_actions',
+                    'pid = ?',
+                    (pid,),
+                )
+                assert len(rows) == 1
+                assert sentinel not in rows[0]['action_json']
                 durable = runtime.store.get_llm_pending_action(pid)
                 assert durable is not None
                 assert durable['action']['kind'] == 'llm_release_request_redacted'

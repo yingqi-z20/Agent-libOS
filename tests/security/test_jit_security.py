@@ -422,6 +422,13 @@ class TestJitSecurity:
             killed = asyncio.Event()
             proc = SimpleNamespace(pid=4242, returncode=None)
 
+            class FakeJob:
+                def assign_pid(self, process_pid: int) -> None:
+                    assert process_pid == proc.pid
+
+                def close(self) -> None:
+                    return None
+
             async def fake_create_subprocess_exec(*_command: str, **_kwargs: Any) -> Any:
                 return proc
 
@@ -439,6 +446,8 @@ class TestJitSecurity:
             monkeypatch.setattr(sandbox, '_serve_process', block_worker)
             monkeypatch.setattr(sandbox, '_monitor_process', block_worker)
             monkeypatch.setattr(sandbox, '_kill_process', kill_process)
+            if os.name == 'nt':
+                monkeypatch.setattr(WindowsJobObject, 'create', FakeJob)
 
             task = asyncio.create_task(
                 sandbox.arun_source('export function run(args, libos) { return {}; }', {}),

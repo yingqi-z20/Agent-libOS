@@ -1,5 +1,6 @@
 from __future__ import annotations
 import contextlib
+import hashlib
 import json
 import os
 import pytest
@@ -21,6 +22,16 @@ from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesy
 from modules.pty.pty_module import LocalPtyProvider, _PosixPtySession
 
 class TestResourceProviderSubstrate:
+
+    def test_windows_executable_hash_uses_consistent_path_and_descriptor_identity(
+        self,
+    ) -> None:
+        if os.name != "nt":
+            pytest.skip("Windows stat identity regression")
+        executable = Path(sys.executable)
+        expected = hashlib.sha256(executable.read_bytes()).hexdigest()
+
+        assert substrate_base.executable_content_sha256(executable) == expected
 
     def test_runtime_python_alias_requires_an_external_host_interpreter(
         self,
@@ -272,6 +283,8 @@ class TestResourceProviderSubstrate:
 
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = LocalShellProvider(temp_dir)
+            if mode == "wall" and not provider.supports_subprocess_limits:
+                pytest.skip("wall-time SubprocessLimits are unavailable on Windows")
             if mode == "success":
                 result = provider.run([sys.executable, "-c", "print('ok')"], timeout=2.0)
                 assert result.returncode == 0
@@ -329,7 +342,12 @@ class TestResourceProviderSubstrate:
 
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = LocalShellProvider(temp_dir)
-            with pytest.raises(ValidationError, match="complete process metrics are unavailable"):
+            expected = (
+                "complete process metrics are unavailable"
+                if provider.supports_subprocess_limits
+                else "cannot enforce SubprocessLimits"
+            )
+            with pytest.raises(ValidationError, match=expected):
                 provider.run(
                     [sys.executable, "-c", "import time; time.sleep(0.2)"],
                     timeout=2.0,
@@ -340,6 +358,8 @@ class TestResourceProviderSubstrate:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        if not hasattr(os, "killpg"):
+            pytest.skip("POSIX process-group fallback is unavailable")
         class TreeAccessDenied:
             def children(self, *, recursive: bool) -> list[Any]:
                 assert recursive

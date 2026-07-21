@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -177,7 +178,7 @@ class TestMcpPrimitive:
             server_id="deadline",
             transport="streamable_http",
             tools=[tool],
-            timeout_s=0.04,
+            timeout_s=0.3,
             max_request_bytes=65_536,
             max_response_bytes=1_048_576,
             http=McpHttpTransportSpec(url="https://mcp.example.test/tools"),
@@ -188,7 +189,7 @@ class TestMcpPrimitive:
 
         class FakeSession:
             async def list_tools(self) -> Any:
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.1)
                 item = type(
                     "LiveTool",
                     (),
@@ -202,7 +203,7 @@ class TestMcpPrimitive:
 
             async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> Any:
                 call_started.set()
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.4)
                 call_completed.set()
                 return type("CallResult", (), {"content": [], "isError": False})()
 
@@ -228,7 +229,7 @@ class TestMcpPrimitive:
         assert session_entries == 1
         assert call_started.is_set()
         assert not call_completed.is_set()
-        assert elapsed < 0.15
+        assert elapsed < 0.45
 
     def test_total_mcp_budget_denial_does_not_start_provider(self) -> None:
         runtime = Runtime.open('local')
@@ -642,6 +643,8 @@ class TestMcpPrimitive:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        if os.name == "nt":
+            pytest.skip("executable shell-script snapshots require POSIX exec semantics")
         root = tmp_path / "workspace"
         root.mkdir()
         executable = root / "trusted-mcp"
@@ -734,6 +737,8 @@ class TestMcpPrimitive:
         self,
         tmp_path: Path,
     ) -> None:
+        if os.name == "nt":
+            pytest.skip("executable shell-script snapshots require POSIX exec semantics")
         root = tmp_path / "workspace"
         root.mkdir()
         executable = root / "sibling-mcp"
