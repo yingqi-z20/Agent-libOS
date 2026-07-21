@@ -1,0 +1,49 @@
+agent_libos/config/defaults.py
+  s_aeabc83064814a::t_3cd0d45f005837 527
+agent_libos/primitives/git.py
+  s_aeabc83064814a::t_848fa5a2cf7a33 650-662,4096-4101,4112,4300,4422
+agent_libos/primitives/git_command_policy.py
+  s_aeabc83064814a::t_d785d7f7eee67a 22-34,51-56,61-110,115-118
+config.yaml
+  s_aeabc83064814a::t_f2806a0fefef40 7
+docs/capabilities.md
+  s_aeabc83064814a::t_7ec2ebfeee6bda 709-711
+docs/configuration.md
+  s_aeabc83064814a::t_dcd5cffb0598d8 148
+docs/git.md
+  s_aeabc83064814a::t_a900b0aad5b9f3 24-26,196-198
+docs/providers.md
+  s_aeabc83064814a::t_f9be49d8a22355 23
+docs/release_status.md
+  s_aeabc83064814a::t_973a0fc5ca238c 206
+docs/support_matrix.md
+  s_aeabc83064814a::t_b73c751a32e6af 28
+tests/invariants.yaml
+  s_aeabc83064814a::t_b10815e3e7aed3 2716-2717,2738-2739,2761
+tests/providers/test_git_primitive.py
+  s_aeabc83064814a::t_7ca5c6341602ea 35-39,1536-1569,1853-1910,1965-2022,2112-2127
+tests/runtime/test_pty_module.py
+  s_aeabc83064814a::t_40dfcfa01b8192 1366-1389
+tests/security/test_shell_primitive.py
+  s_aeabc83064814a::t_84f3e6c4507b2b 747-770
+tests/unit/test_git_models.py
+  s_aeabc83064814a::t_fef820bc6dd72a 9,11,37,243-289
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "61c93a16243ca15b97a17ca1b2306fb92c5aef90",
+  "prompts": {},
+  "sessions": {
+    "s_aeabc83064814a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8090-0411-7ce1-be27-3e86b5027efd",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
