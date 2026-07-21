@@ -1,0 +1,45 @@
+.github/workflows/test.yml
+  s_aeabc83064814a::t_0a7d128442ddbe 226,229
+agent_libos/evidence/external_effects.py
+  s_aeabc83064814a::t_c90e64e16580d9 12,447,463-467
+agent_libos/primitives/git.py
+  s_aeabc83064814a::t_b548f436fcfc97 11,74,122-143,1558-1738,1750,1752-1753,1755-1767,1769,1773,1783,1795,1858-1910,1946-1951,2011-2019,2021-2022,2069-2070,2073-2078,2087-2103,2119-2407,2409-2484,2489,2494-2495,2497-2498,2502-2506,2516-2519,2534-2571,2615-2616,2629-2630,2634-2638,2649,2671-2685,2689,2697,2706-2707,2709-2711,2715-2725,2754-2757,2839-2844,2871-2874,2892,2973,2980,2986-2987,3105,3154,3156-3167,3172-3177,3187-3201,3243,3263-3336,3349-3370,3372-3383,3385-3388,3394-3398,3407,3410-3417,3461,3492-3494,4106,4163,4165,4168-4171,4175-4178,4185-4188,4191-4244,4260-4268,4328,4341,4856
+agent_libos/runtime/builder.py
+  s_aeabc83064814a::t_f48197b0b3f600 3009
+agent_libos/storage/sql.py
+  s_aeabc83064814a::t_229c9de83ba5d3 8748-8753
+agent_libos/substrate/base.py
+  s_aeabc83064814a::t_b2fb09138ff5bc 839-852
+agent_libos/substrate/git.py
+  s_aeabc83064814a::t_98e9fc987391f9 287-290,698-703,1526-1570
+benchmarks/runtime_safety/fixtures.py
+  s_aeabc83064814a::t_c748572bed23a7 3,6,10,21,28,35-36,74-91,93-101,103-146,149-154,161-168
+scripts/check_protected_operations.py
+  s_aeabc83064814a::t_d6e2ce64677077 33-36
+tests/benchmarks/test_runtime_safety_benchmark.py
+  s_aeabc83064814a::t_0679e4eb6409ed 208-264
+tests/invariants.yaml
+  s_aeabc83064814a::t_61e8323eeb2a3c 2709,2727-2730,2748-2755,2783-2784
+tests/providers/test_git_primitive.py
+  s_aeabc83064814a::t_3b5470f2efdcb7 20,42-50,54,103-117,225-258,365-392,691-1249
+tests/unit/test_release_contract.py
+  s_aeabc83064814a::t_f385ac053707ef 95-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f7e405f95c3d7d70d902cec6f14fa6bd1cb1b8e6",
+  "prompts": {},
+  "sessions": {
+    "s_aeabc83064814a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8090-0411-7ce1-be27-3e86b5027efd",
+        "model": "unknown"
+      },
+      "human_author": "zhangyingqi.150 <zhangyingqi.150@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
