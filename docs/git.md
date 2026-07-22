@@ -160,8 +160,11 @@ configuration or attributes select an external clean/smudge/process filter,
 LFS filter, diff command, merge driver, alternate-refs command, custom SSH
 command, upload/receive pack, remote helper, promisor/partial clone, shell
 credential helper, repository credential helper, or workspace-controlled
-include. Hooks are redirected to an empty Host-owned directory and commands
-also use `--no-verify` where applicable.
+include. Commands that materialize a target tree inspect its `.gitattributes`
+blobs as well as the current worktree, so a checkout cannot activate a
+previously dormant driver during materialization. Hooks are redirected to an
+empty Host-owned directory and commands also use `--no-verify` where
+applicable.
 
 Commit author/committer identity is read from effective repository or Host Git
 configuration. The model can supply only the commit message; author overrides,
@@ -169,16 +172,25 @@ environment identity, signing, and editor invocation are unavailable.
 
 Filesystem reads/writes/deletes reject `.git` path components, the worktree
 `.git` file, and Git metadata aliases when `git.protect_git_metadata` is true.
-Only the Git provider may mutate repository metadata.
+The typed Git provider is the only Runtime primitive that mutates repository
+metadata; filesystem capability does not authorize metadata access.
 
 For compatibility, Shell, the optional PTY module, and benchmark provenance
-share the provider's repository validation for exactly six raw inspection
-commands: `git status`, `git status --short`, `git branch --show-current`,
-`git rev-parse --show-toplevel`, `git diff`, and `git diff --stat`. Executable
-matching is case-insensitive and accepts the platform `git.exe` spelling. The
-commands receive the same no-pager/no-lock/no-fsmonitor/no-external-diff and
-no-lazy-fetch hardening. Every other raw Git command is rejected before shell
-policy or Human approval, including when Shell policy is `always_allow`.
+share the provider's repository validation for exactly six directly invoked
+inspection commands: `git status`, `git status --short`,
+`git branch --show-current`, `git rev-parse --show-toplevel`, `git diff`, and
+`git diff --stat`. Executable matching is case-insensitive and accepts the
+platform `git.exe` spelling. The commands receive the same
+no-pager/no-lock/no-fsmonitor/no-external-diff and no-lazy-fetch hardening. Every
+other direct Git command, including supported transparent launcher wrappers, is
+rejected before shell policy or Human approval even when Shell policy is
+`always_allow`.
+
+That check is argv mediation, not an OS sandbox. An authorized interpreter,
+script, or native executable can invoke Git later or modify `.git` directly as
+the host user. Such authority is outside the typed Git boundary and must be
+isolated by a container/WASM/service provider when those downstream effects are
+not acceptable.
 
 ## Remote operations
 

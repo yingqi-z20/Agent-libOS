@@ -28,7 +28,6 @@
     "agent_libos/runtime/object_tasks.py::ObjectTaskManager._execute_task": 24,
     "agent_libos/runtime/resource_manager.py::ResourceManager.remaining_budgets": 28,
     "agent_libos/runtime/scheduler.py::AsyncProcessScheduler._run_until_idle_locked": 26,
-    "agent_libos/substrate/git.py::LocalGitProvider._active_attribute_drivers": 21,
     "agent_libos/substrate/git.py::LocalGitProvider._ensure_managed_worktree_excluded": 24,
     "agent_libos/substrate/git.py::LocalGitProvider._invoke": 33,
     "agent_libos/substrate/git.py::LocalGitProvider._validate_remote_url": 25,

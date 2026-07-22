@@ -698,17 +698,26 @@ whole-shell authority must be represented as a policy capability carrying
 policy semantics. Broad `deny` and `ask` records remain conservative
 constraints.
 
-For the exact built-in inspection argv `git status`, `git status --short`,
-`git branch --show-current`, `git rev-parse --show-toplevel`, `git diff`, and
-`git diff --stat`, Shell and PTY apply the shared Git-provider validation and
-inject no-pager/no-optional-lock/no-fsmonitor/no-external-diff/no-textconv and
+For the exact directly invoked inspection argv `git status`,
+`git status --short`, `git branch --show-current`,
+`git rev-parse --show-toplevel`, `git diff`, and `git diff --stat`, Shell and PTY
+apply the shared Git-provider validation and inject
+no-pager/no-optional-lock/no-fsmonitor/no-external-diff/no-textconv and
 no-lazy-fetch hardening. Matching is case-insensitive and accepts `git.exe`.
-Authorization and returned results retain the original argv. Every other raw
+Authorization and returned results retain the original argv. Every other direct
 Git argv—including mutation and remote commands—is deterministically rejected
-before Shell policy or Human approval, even under `always_allow`; callers must
-use the typed `Runtime.git` boundary. The shared Shell/PTY check also unwraps
-`env` and `nohup` executable launchers. `env --split-string`/`env -S` dispatch is
-rejected because its eventual executable cannot be validated as an argv token.
+before Shell policy or Human approval, even under `always_allow`; callers should
+use the typed `Runtime.git` boundary for capability-, state-, and evidence-aware
+Git operations. The shared Shell/PTY check also unwraps supported transparent
+executable launchers. `env --split-string`/`env -S` dispatch is rejected because
+its eventual executable cannot be validated as an argv token.
+
+This is an argv compatibility policy, not an operating-system process boundary.
+An authorized interpreter, script, or native program can invoke Git later or
+modify repository metadata directly with the host user's permissions. Granting
+that Shell/PTY authority therefore authorizes those downstream effects; use a
+container/WASM/service provider when child-process filesystem or network I/O
+must be isolated.
 
 Scoped denies are supported with `AuthorityRule` constraints. An unconstrained
 deny still dominates all matching grants; a constrained deny dominates only when

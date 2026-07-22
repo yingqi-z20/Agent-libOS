@@ -250,10 +250,12 @@ longer defines.
   call, and automatic child-exit cleanup records a close intent before exit-code
   observation/close. Object release finalizers run outside the SQL transaction so PTY
   close can durably record its intent; `swe_edit` refuses truncated source.
-  Auto-allowed Git inspection disables optional locks, repository fsmonitor,
-  and external diff helpers before the provider boundary. Raw Git is limited to
-  six exact inspection commands; all mutation and remote argv must use the typed
-  Git primitive even under an always-allow shell policy.
+  Auto-allowed direct Git inspection disables optional locks, repository
+  fsmonitor, and external diff helpers before the provider boundary. Direct Git
+  argv and supported transparent launcher wrappers are limited to six exact
+  inspection commands even under an always-allow shell policy. Authorized
+  interpreters and native programs retain the documented host-user I/O boundary
+  of Local Shell and are not claimed to be mediated as nested Git operations.
 - `git-provider-is-pinned-and-non-executable`: the typed Git provider operates
   only on the configured workspace repository or an explicitly trusted managed
   worktree. It rejects parent discovery, untrusted gitfiles, symlinked metadata,

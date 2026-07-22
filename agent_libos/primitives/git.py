@@ -4071,7 +4071,12 @@ class GitPrimitive:
         if strategy not in {"ff_only", "merge", "rebase"}:
             raise ValidationError("Git pull strategy must be ff_only, merge, or rebase")
         selected_remote = self._validate_remote(remote)
-        selected_branch = self._validate_branch(branch) if branch is not None else None
+        selected_branch = self._pull_branch_for_authorization(
+            pid,
+            branch,
+            expected_state_token=expected_state_token,
+            worktree_id=worktree_id,
+        )
         fingerprint = self._remote_preflight(
             pid,
             selected_remote,
@@ -4083,7 +4088,7 @@ class GitPrimitive:
             fingerprint,
             remote=selected_remote,
             use_push_url=False,
-            remote_ref=(f"refs/heads/{selected_branch}" if selected_branch else None),
+            remote_ref=f"refs/heads/{selected_branch}",
         )
 
         def dispatch(before: GitRepositoryState) -> tuple[str | None, dict[str, Any], Sequence[bytes]]:
@@ -4094,10 +4099,6 @@ class GitPrimitive:
             if current_fingerprint["fingerprint"] != fingerprint["fingerprint"]:
                 raise GitError(GitErrorCode.STALE_STATE.value, "Git remote configuration or refs changed before pull", retryable=True)
             branch_name = selected_branch
-            if branch_name is None:
-                if not before.head_ref or not before.head_ref.startswith("refs/heads/"):
-                    raise GitError(GitErrorCode.INVALID_REF.value, "detached or unborn HEAD requires an explicit pull branch")
-                branch_name = before.head_ref[len("refs/heads/") :]
             tracking_ref = f"refs/remotes/{selected_remote}/{branch_name}"
             self._mutation_command(
                 before,
@@ -4165,6 +4166,32 @@ class GitPrimitive:
             additional_authorities=((self.remote_resource(selected_remote), CapabilityRight.READ, False),),
             remote=selected_remote,
         )
+
+    def _pull_branch_for_authorization(
+        self,
+        pid: str,
+        branch: str | None,
+        *,
+        expected_state_token: str,
+        worktree_id: str,
+    ) -> str:
+        if branch is not None:
+            return self._validate_branch(branch)
+        expected = self._validate_expected_token(expected_state_token)
+        current = self.status(pid, worktree_id=worktree_id)
+        if current.state.token != expected:
+            raise GitError(
+                GitErrorCode.STALE_STATE.value,
+                "Git repository state changed after the preceding read",
+                retryable=True,
+                details={"actual_state_token": current.state.token},
+            )
+        if current.branch is None:
+            raise GitError(
+                GitErrorCode.INVALID_REF.value,
+                "detached HEAD requires an explicit pull branch",
+            )
+        return self._validate_branch(current.branch)
 
     def _canonical_local_ref(self, value: str) -> str:
         if value.startswith("refs/"):

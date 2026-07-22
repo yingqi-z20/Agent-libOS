@@ -763,8 +763,16 @@ class TestShellPrimitive:
             events_before = runtime.events.list()
             effects_before = runtime.store.list_external_effects(pid=pid)
 
-            with pytest.raises(ValidationError, match='typed git_'):
-                runtime.shell.run(pid, ['env', 'git', 'branch', 'wrapper-created'])
+            wrapped_commands = (
+                ['env', 'git', 'branch', 'wrapper-created'],
+                ['timeout', '30', 'git', 'push'],
+                ['nice', '-n', '5', 'git', 'reset', '--hard'],
+                ['setsid', 'git', 'branch', 'wrapper-created'],
+                ['stdbuf', '-o0', 'git', 'push'],
+            )
+            for requested in wrapped_commands:
+                with pytest.raises(ValidationError, match='typed git_'):
+                    runtime.shell.run(pid, requested)
 
             assert provider.calls == []
             assert runtime.human.pending() == []
@@ -1245,13 +1253,16 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
-    def test_blacklist_policy_asks_for_nested_shell_interpreter(self) -> None:
+    def test_interpreter_wrapped_git_is_governed_by_interpreter_policy(self) -> None:
         runtime, _provider = self._runtime_with_fake_shell()
         try:
             pid = runtime.process.spawn(image='review-agent:v0', goal='blacklist shell')
             runtime.shell.grant_policy(pid, runtime.config.shell.blocklist_ask_else_auto_level, issued_by='test')
             with pytest.raises(HumanApprovalRequired):
-                runtime.shell.run(pid, ['env', 'bash', '-c', 'echo unsafe'])
+                runtime.shell.run(
+                    pid,
+                    ['env', 'bash', '-c', 'git branch wrapper-created'],
+                )
             request = runtime.human.pending()[0]
             assert request.payload['context']['matched_rule'] == ['bash']
         finally:

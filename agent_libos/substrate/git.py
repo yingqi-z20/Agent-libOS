@@ -44,9 +44,11 @@ _SCP_REMOTE_RE = re.compile(
     r"(?:(?P<user>[A-Za-z0-9._-]+)@)?(?P<host>[A-Za-z0-9.-]+):(?P<path>[^\x00\r\n]+)\Z"
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_ATTRIBUTE_LINE_RE = re.compile(
+    rb'(?P<pattern>"(?:[^"\\]|\\.)*"|[^ \t\r\n]+)(?:[ \t]+(?P<attributes>.*))?\Z'
+)
 _ATTRIBUTE_DRIVER_RE = re.compile(
-    rb"(?:^|[ \t])(?P<kind>filter|diff|merge)=(?P<name>[A-Za-z0-9._-]+)(?=$|[ \t\r])",
-    re.MULTILINE,
+    rb"(?:^|[ \t])(?P<kind>filter|diff|merge)=(?P<name>[^ \t\r\n]+)(?=$|[ \t\r\n])"
 )
 _DANGEROUS_HELPER_CHARS = frozenset(";&|`$<>(){}\n\r")
 _REMOTE_OPERATIONS = frozenset({"fetch", "pull", "push", "ls-remote"})
@@ -1027,6 +1029,7 @@ class LocalGitProvider:
         *,
         remote: str | None,
         operation: str,
+        treeish_targets: Sequence[str] = (),
     ) -> tuple[str, tuple[tuple[str, str], ...]]:
         entries = self._config_entries(layout)
         normalized: list[str] = []
@@ -1059,9 +1062,20 @@ class LocalGitProvider:
         def driver_is_active(kind: str, key: str) -> bool:
             nonlocal active_drivers
             if active_drivers is None:
-                active_drivers = self._active_attribute_drivers(layout, entries)
-            parts = key.split(".")
-            return len(parts) >= 3 and parts[1] in active_drivers[kind]
+                active_drivers = self._active_attribute_drivers(
+                    layout,
+                    entries,
+                    treeish_targets=treeish_targets,
+                )
+            key_without_suffix, separator, _suffix = key.rpartition(".")
+            prefix = f"{kind}."
+            configured_name = key_without_suffix[len(prefix) :]
+            return (
+                bool(separator)
+                and key_without_suffix.startswith(prefix)
+                and bool(configured_name)
+                and configured_name in active_drivers[kind]
+            )
         for scope, origin, key, value in entries:
             if scope == "command":
                 continue
@@ -1173,6 +1187,8 @@ class LocalGitProvider:
         self,
         layout: GitRepositoryLayout,
         entries: Sequence[tuple[str, str, str, str]],
+        *,
+        treeish_targets: Sequence[str] = (),
     ) -> dict[str, set[str]]:
         """Inspect attribute declarations as data, without invoking Git drivers."""
 
@@ -1188,15 +1204,11 @@ class LocalGitProvider:
         include(layout.common_dir / "info" / "attributes")
         for scope, _origin, key, value in entries:
             if scope != "command" and key == "core.attributesfile" and value:
-                selected = Path(value)
+                selected = Path(value).expanduser()
                 if not selected.is_absolute():
-                    home = os.environ.get("HOME")
-                    if not home:
-                        raise self._error(
-                            GitErrorCode.UNSAFE_CONFIG,
-                            "relative Host attributes file cannot be resolved safely",
-                        )
-                    selected = Path(home) / selected
+                    # Git resolves relative core.attributesFile values from
+                    # the command cwd, which is pinned to workspace_root.
+                    selected = self.workspace_root / selected
                 include(selected)
         visited = 0
         for directory, directory_names, file_names in os.walk(layout.root, followlinks=False):
@@ -1217,6 +1229,37 @@ class LocalGitProvider:
                 include(current / ".gitattributes")
         drivers = {"filter": set(), "diff": set(), "merge": set()}
         total = 0
+
+        def inspect(raw: bytes) -> None:
+            nonlocal total
+            total += len(raw)
+            if total > 1_048_576:
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "Git attributes exceed their aggregate safety bound",
+                )
+            for raw_line in raw.splitlines():
+                # Git ignores horizontal whitespace around an attributes line.
+                # Strip it before separating the pattern from its attributes so
+                # an indented driver declaration cannot evade inspection.
+                line = raw_line.rstrip(b"\r").strip(b" \t")
+                if not line or line.startswith(b"#"):
+                    continue
+                line_match = _ATTRIBUTE_LINE_RE.fullmatch(line)
+                if line_match is None:
+                    continue
+                attributes = line_match.group("attributes") or b""
+                for match in _ATTRIBUTE_DRIVER_RE.finditer(attributes):
+                    kind = match.group("kind").decode("ascii")
+                    try:
+                        name = match.group("name").decode("utf-8", errors="strict")
+                    except UnicodeDecodeError as exc:
+                        raise self._error(
+                            GitErrorCode.UNSAFE_CONFIG,
+                            "Git attribute driver name is not UTF-8",
+                        ) from exc
+                    drivers[kind].add(name.casefold())
+
         for selected in files:
             try:
                 metadata = selected.lstat()
@@ -1230,14 +1273,115 @@ class LocalGitProvider:
                 raw = self._read_small_file(selected, limit=1_048_576)
             except (OSError, ValueError) as exc:
                 raise self._error(GitErrorCode.UNSAFE_CONFIG, "Git attributes exceed their safety bound") from exc
-            total += len(raw)
-            if total > 1_048_576:
-                raise self._error(GitErrorCode.UNSAFE_CONFIG, "Git attributes exceed their aggregate safety bound")
-            for match in _ATTRIBUTE_DRIVER_RE.finditer(raw):
-                kind = match.group("kind").decode("ascii")
-                name = match.group("name").decode("ascii")
-                drivers[kind].add(name.casefold())
+            inspect(raw)
+        for raw in self._tree_attribute_sources(layout, treeish_targets):
+            inspect(raw)
         return drivers
+
+    def _tree_attribute_sources(
+        self,
+        layout: GitRepositoryLayout,
+        treeish_targets: Sequence[str],
+    ) -> Iterator[bytes]:
+        seen_blobs: set[bytes] = set()
+        for target in dict.fromkeys(treeish_targets):
+            result = self._invoke(
+                [
+                    *self._repo_prefix(layout),
+                    "ls-tree",
+                    "-r",
+                    "-z",
+                    "--full-tree",
+                    target,
+                    "--",
+                    ".gitattributes",
+                    ":(glob)**/.gitattributes",
+                ],
+                timeout=self.config.local_timeout_s,
+                stdin=None,
+                max_output_bytes=min(
+                    self.config.output_hard_limit_bytes,
+                    1_048_576,
+                ),
+                read_only=True,
+                operation="attribute_inspection",
+            )
+            if result.returncode != 0:
+                raise self._error(
+                    GitErrorCode.STALE_STATE,
+                    "Git attribute target could not be inspected",
+                    operation="attribute_inspection",
+                    retryable=True,
+                )
+            for record in result.stdout.split(b"\0"):
+                if not record:
+                    continue
+                header, separator, _path = record.partition(b"\t")
+                fields = header.split(b" ")
+                if not separator or len(fields) != 3:
+                    raise self._error(
+                        GitErrorCode.UNSAFE_CONFIG,
+                        "Git attribute tree has an unsupported format",
+                    )
+                mode, object_type, oid = fields
+                # Git deliberately does not follow a symlinked attributes
+                # file in a worktree, so its blob content is not active.
+                if mode == b"120000":
+                    continue
+                if object_type != b"blob" or not re.fullmatch(rb"[0-9a-f]+", oid):
+                    raise self._error(
+                        GitErrorCode.UNSAFE_CONFIG,
+                        "Git attribute tree has an unsupported entry",
+                    )
+                if oid in seen_blobs:
+                    continue
+                seen_blobs.add(oid)
+                if len(seen_blobs) > 10_000:
+                    raise self._error(
+                        GitErrorCode.UNSAFE_CONFIG,
+                        "Git attribute discovery exceeded its safety bound",
+                    )
+                blob = self._invoke(
+                    [*self._repo_prefix(layout), "cat-file", "blob", os.fsdecode(oid)],
+                    timeout=self.config.local_timeout_s,
+                    stdin=None,
+                    max_output_bytes=min(
+                        self.config.output_hard_limit_bytes,
+                        1_048_576,
+                    ),
+                    read_only=True,
+                    operation="attribute_inspection",
+                )
+                if blob.returncode != 0:
+                    raise self._error(
+                        GitErrorCode.UNSAFE_CONFIG,
+                        "Git attribute blob could not be inspected",
+                    )
+                yield blob.stdout
+
+    @staticmethod
+    def _attribute_treeish_targets(args: Sequence[str]) -> tuple[str, ...]:
+        checked = list(args)
+        if not checked:
+            return ()
+        operation = checked[0]
+        boundary = checked.index("--") if "--" in checked else len(checked)
+        prefix = checked[1:boundary]
+        if operation in {"checkout", "switch"}:
+            for option in ("--detach", "-b", "-B", "-c", "-C"):
+                if option in prefix:
+                    index = prefix.index(option)
+                    offset = 1 if option == "--detach" else 2
+                    return tuple(prefix[index + offset : index + offset + 1])
+            positional = [token for token in prefix if not token.startswith("-")]
+            return tuple(positional[-1:])
+        if operation in {"merge", "rebase", "cherry-pick", "revert", "reset"}:
+            positional = [token for token in prefix if not token.startswith("-")]
+            return tuple(positional[-1:])
+        if operation == "worktree" and prefix[:1] == ["add"]:
+            positional = [token for token in prefix[1:] if not token.startswith("-")]
+            return tuple(positional[-1:])
+        return ()
 
     def _remote_urls(self, layout: GitRepositoryLayout, remote: str) -> tuple[str, str]:
         if not _REMOTE_NAME_RE.fullmatch(remote) or remote.startswith("-"):
@@ -2023,7 +2167,13 @@ class LocalGitProvider:
         if any(not isinstance(item, str) or "\x00" in item for item in args):
             raise self._error(GitErrorCode.COMMAND_FAILED, "invalid Git argument", operation=operation)
         before = self.repository_layout(worktree=worktree)
-        self._validate_repository_config(before, remote=remote, operation=operation)
+        treeish_targets = self._attribute_treeish_targets(args)
+        self._validate_repository_config(
+            before,
+            remote=remote,
+            operation=operation,
+            treeish_targets=treeish_targets,
+        )
         remote_env: dict[str, str] = {}
         if remote is not None:
             current_fingerprint = self.remote_fingerprint(remote, worktree=before.root)
@@ -2042,6 +2192,7 @@ class LocalGitProvider:
                 before,
                 remote=remote,
                 operation=operation,
+                treeish_targets=treeish_targets,
             )
             if (
                 hashlib.sha256(fetch_url.encode("utf-8")).hexdigest()

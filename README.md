@@ -541,9 +541,11 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - Git calls operate only on the fixed workspace repository or a trusted
   managed worktree. Mutations require a prior state token plus Git and affected
   filesystem authority; destructive and remote-ref-rewriting operations bind
-  one-use Human approval to exact state/OIDs. Raw Shell/PTY Git is limited to
-  six hardened inspection commands and cannot bypass `Runtime.git` even under
-  an always-allow shell policy.
+  one-use Human approval to exact state/OIDs. Direct Shell/PTY Git argv and
+  transparent executable-launcher wrappers are limited to six hardened
+  inspection commands even under an always-allow shell policy. As with other
+  direct I/O, an authorized general interpreter or native program remains a
+  host-user process and is outside that argv-only compatibility boundary.
 - Human approval is part of a primitive/syscall. Callers see a final success or
   final failure, not a pending/retry protocol. Run-local automatic decisions
   are isolated across concurrent scheduler workers, and terminal process states

@@ -426,6 +426,119 @@ def test_active_external_filter_is_rejected_before_status_can_execute_it(tmp_pat
         runtime.close()
 
 
+@pytest.mark.parametrize("driver_name", ["hostile/name", "hostile.name"])
+def test_active_external_filter_with_structured_name_is_rejected_before_execution(
+    tmp_path: Path,
+    driver_name: str,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    sentinel = tmp_path / "filter-ran"
+    (root / ".gitattributes").write_text(
+        f"  *.txt filter={driver_name}  \n",
+        encoding="utf-8",
+    )
+    _git(root, "config", f"filter.{driver_name}.clean", f"touch {sentinel}")
+    _git(root, "config", f"filter.{driver_name}.smudge", "cat")
+
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="reject structured filter name")
+        _grant_git_authority(runtime, pid)
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.status(pid)
+
+        assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+        assert not sentinel.exists()
+        assert runtime.store.list_external_effects(pid=pid) == []
+    finally:
+        runtime.close()
+
+
+def test_attribute_pattern_named_like_driver_is_not_treated_as_active_driver(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    sentinel = tmp_path / "filter-ran"
+    (root / ".gitattributes").write_text(
+        "filter=hostile/name binary\n",
+        encoding="utf-8",
+    )
+    _git(root, "config", "filter.hostile/name.clean", f"touch {sentinel}")
+    _git(root, "config", "filter.hostile/name.smudge", "cat")
+
+    provider = LocalGitProvider(root)
+    result = provider.run(["status", "--porcelain=v2", "-z"])
+
+    assert result.returncode == 0
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize(
+    ("configured_path", "location"),
+    [("attributes", "workspace"), ("~/attributes", "home")],
+)
+def test_configured_attributes_file_uses_git_path_resolution(
+    tmp_path: Path,
+    configured_path: str,
+    location: str,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    sentinel = tmp_path / "filter-ran"
+    attributes = (
+        root / "attributes"
+        if location == "workspace"
+        else Path(os.environ["HOME"]) / "attributes"
+    )
+    attributes.write_text("*.txt filter=hostile\n", encoding="utf-8")
+    _git(root, "config", "core.attributesFile", configured_path)
+    _git(root, "config", "filter.hostile.clean", f"touch {sentinel}")
+    _git(root, "config", "filter.hostile.smudge", "cat")
+    (root / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+    provider = LocalGitProvider(root)
+    with pytest.raises(GitError) as exc_info:
+        provider.run(["status", "--porcelain=v2", "-z"])
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+    assert not sentinel.exists()
+
+
+def test_checkout_rejects_filter_activated_only_by_target_tree(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "hostile")
+    (root / ".gitattributes").write_text(
+        "tracked.txt filter=hostile\n",
+        encoding="utf-8",
+    )
+    (root / "tracked.txt").write_text("target\n", encoding="utf-8")
+    _git(root, "add", "--", ".gitattributes", "tracked.txt")
+    _git(root, "commit", "-q", "-m", "target attributes")
+    _git(root, "switch", "-q", "main")
+    sentinel = tmp_path / "filter-ran"
+    _git(root, "config", "filter.hostile.clean", "cat")
+    _git(root, "config", "filter.hostile.smudge", f"touch {sentinel}")
+
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="reject target filter")
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.switch(pid, "hostile", state)
+
+        assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+        assert not sentinel.exists()
+        assert _git(root, "branch", "--show-current").strip() == b"main"
+    finally:
+        runtime.close()
+
+
 def test_repository_hook_is_disabled_for_typed_commit(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
@@ -1909,7 +2022,7 @@ def test_fast_forward_pull_from_configured_bare_remote(tmp_path: Path) -> None:
         runtime.close()
 
 
-def test_pull_fetches_only_the_capability_scoped_branch(tmp_path: Path) -> None:
+def test_pull_defaults_to_the_capability_scoped_current_branch(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     remote = tmp_path / "remote.git"
     other = tmp_path / "other"
@@ -1952,7 +2065,7 @@ def test_pull_fetches_only_the_capability_scoped_branch(tmp_path: Path) -> None:
         )
         state = runtime.git.status(pid).state.token
 
-        runtime.git.pull(pid, "origin", state, branch="main", strategy="ff_only")
+        runtime.git.pull(pid, "origin", state, strategy="ff_only")
 
         assert (root / "remote.txt").read_text(encoding="utf-8") == "from remote\n"
         secret_ref = subprocess.run(
@@ -2134,7 +2247,7 @@ def test_simulated_pull_request_merge_strategies(
         runtime.close()
 
 
-def test_filesystem_and_raw_shell_cannot_bypass_typed_git_boundary(tmp_path: Path) -> None:
+def test_filesystem_and_direct_raw_shell_git_respect_typed_git_controls(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
     shell_config = replace(DEFAULT_CONFIG.shell, default_policy_level="always_allow")

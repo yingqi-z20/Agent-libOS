@@ -249,6 +249,10 @@ def test_legacy_git_reads_share_case_insensitive_exact_hardening(
         ["nohup", "GiT.ExE", "push"],
         ["env", "FOO=bar", "nohup", "git", "reset", "--hard"],
         ["env", "-a", "masked", "git", "branch", "wrapper-created"],
+        ["timeout", "30", "git", "push"],
+        ["nice", "-n", "5", "git", "reset", "--hard"],
+        ["setsid", "git", "branch", "wrapper-created"],
+        ["stdbuf", "-o0", "git", "push"],
     ],
 )
 def test_raw_git_policy_rejects_launcher_wrapped_git(requested: list[str]) -> None:
@@ -261,6 +265,10 @@ def test_raw_git_policy_rejects_launcher_wrapped_git(requested: list[str]) -> No
     [
         ["env", "printf", "git"],
         ["nohup", "printf", "git"],
+        ["timeout", "30", "printf", "git"],
+        ["nice", "printf", "git"],
+        ["setsid", "printf", "git"],
+        ["stdbuf", "-o0", "printf", "git"],
     ],
 )
 def test_raw_git_policy_preserves_non_git_launcher_arguments(

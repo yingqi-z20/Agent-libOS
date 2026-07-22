@@ -1393,8 +1393,9 @@ class ShellAdapter:
             if index == 0 and not value.strip():
                 raise ValidationError("shell argv[0] must be non-empty")
             checked.append(value)
-        # This check deliberately precedes policy evaluation. An always_allow
-        # shell grant cannot become an alternate Git mutation/remote boundary.
+        # This direct-argv check deliberately precedes policy evaluation.
+        # General interpreters remain governed by Shell authority because the
+        # local provider is not an operating-system subprocess sandbox.
         return validate_and_normalize_raw_git(checked)
 
     def _validate_timeout(self, timeout: float) -> float:

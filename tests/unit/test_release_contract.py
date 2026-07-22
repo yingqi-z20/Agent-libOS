@@ -13,12 +13,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_release_version_identifiers_are_aligned() -> None:
-    assert validate_version_alignment(ROOT) == "0.3.3"
+    assert validate_version_alignment(ROOT) == "0.3.4"
 
 
 def test_release_status_contains_current_version_state_only() -> None:
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
-    assert text.startswith("# Agent libOS 0.3.3 Status\n")
+    assert text.startswith("# Agent libOS 0.3.4 Status\n")
     forbidden = {
         "commit id": r"\bcommit\b",
         "dirty state": r"\bdirty\b",

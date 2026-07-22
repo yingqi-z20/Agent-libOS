@@ -1,6 +1,6 @@
-# Agent libOS 0.3.3 Status
+# Agent libOS 0.3.4 Status
 
-Agent libOS 0.3.3 is release-ready for the core Python runtime scope exercised
+Agent libOS 0.3.4 is release-ready for the core Python runtime scope exercised
 by the checked-in CI workflow and defined in `docs/support_matrix.md`. This is
 not a claim that every platform, desktop package, or real external-provider
 configuration has been release-validated.
@@ -186,7 +186,7 @@ configuration has been release-validated.
   The profile validates exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The 0.3.3 wheel and source distribution pass content, metadata, entrypoint,
+- The 0.3.4 wheel and source distribution pass content, metadata, entrypoint,
   isolated-install, dependency-consistency, CLI, GUI-server, and deterministic
   demo checks on Python 3.11. CI preserves the same validated distributions for
   release use.
@@ -207,7 +207,7 @@ configuration has been release-validated.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 0.3.3.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 0.3.4.
 
 ## Remaining environment gates and non-blocking debt
 
