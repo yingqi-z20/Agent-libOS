@@ -206,8 +206,9 @@ server, while direct `agent-libos-gui-server` runs default to `%APPDATA%/Agent
 libOS/llm-profiles.json` on Windows, `~/Library/Application Support/Agent
 libOS/llm-profiles.json` on macOS, and the `agent-libos/llm-profiles.json`
 file under `${XDG_CONFIG_HOME:-~/.config}` on Linux. The file stores model routing fields such
-as profile id, model, base URL, API mode, tuning options, and the `api_key_env`
-name. It never stores the API key value. When a profile has a base URL,
+as profile id, model, base URL, API mode, tuning options, optional
+`context_window_tokens`, and the `api_key_env` name. It never stores the API
+key value. When a profile has a base URL,
 `allow_custom_base_url: false` is preserved explicitly rather than inferred
 away, so disabling custom-base-url use remains stable across GUI restarts.
 

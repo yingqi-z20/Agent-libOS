@@ -20,12 +20,21 @@ from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.llm.client import LLMClient
 from agent_libos.llm.context_memory import LLMContextMemory
+from agent_libos.llm.context_management import (
+    ContextManagementPolicy,
+    ContextPressureAssessment,
+    assess_context_pressure,
+    context_management_policy,
+    context_pressure_prompt,
+    provider_usage_lower_bound,
+)
 from agent_libos.llm.prompt import build_system_prompt, build_user_prompt
 from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.llm.pending import (
     LLMPendingActionService,
     pending_data_flow_metadata,
+    pending_metadata,
     pending_resume_token,
 )
 from agent_libos.llm.actions import LLMActionService, auto_wait_message_action
@@ -94,6 +103,14 @@ class _LLMReleaseApprovalRequired(HumanApprovalRequired):
 
 class _LLMReleasePayloadUnavailable(RuntimeError):
     """An opt-out release cannot be resumed after its in-memory payload is lost."""
+
+
+class _ContextManagementHandled(Exception):
+    """End this quantum after a host-selected context-management action."""
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        super().__init__("context management handled this quantum")
+        self.result = result
 
 
 @dataclass(slots=True)
@@ -408,6 +425,8 @@ class LLMProcessExecutor:
                 actions=actions,
                 parallel_tool_calls=parallel_tool_calls,
             )
+        except _ContextManagementHandled as handled:
+            return handled.result
         except _LLMReleaseApprovalRequired as exc:
             return self._wait_for_llm_release(pid, exc)
         except HumanApprovalRequired as exc:
@@ -444,16 +463,19 @@ class LLMProcessExecutor:
             )
             return {"ok": False, "resource_limit_exceeded": True, "error": str(exc)}
         except Exception as exc:
-            self._process.exit(pid, failed=True, message=f"LLM quantum failed: {exc}")
-            self._audit.record(
-                actor=pid,
-                action="llm.action_failed",
-                target=f"process:{pid}",
-                decision={"error": str(exc)},
-            )
-            return {"ok": False, "error": str(exc)}
+            return self._fail_llm_quantum(pid, exc)
         finally:
             self._data_flow.reset(flow_token)
+
+    def _fail_llm_quantum(self, pid: str, error: Exception) -> dict[str, Any]:
+        self._process.exit(pid, failed=True, message=f"LLM quantum failed: {error}")
+        self._audit.record(
+            actor=pid,
+            action="llm.action_failed",
+            target=f"process:{pid}",
+            decision={"error": str(error)},
+        )
+        return {"ok": False, "error": str(error)}
 
     def _advance_event_cursor(self, pid: str, event_id: str) -> None:
         """Advance one worker's cursor without racing cross-process accounting.
@@ -784,6 +806,7 @@ class LLMProcessExecutor:
         response_id: str | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
+        pending_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         resume_token = self._persist_pending_action(
             pid,
@@ -795,6 +818,7 @@ class LLMProcessExecutor:
             response_id=response_id,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
+            pending_metadata=pending_metadata,
         )
         operation_context = self.pending.get(pid) or {}
         self.pending.remember(pid, "human", {
@@ -808,6 +832,7 @@ class LLMProcessExecutor:
             "response_id": response_id,
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
+            "pending_metadata": dict(pending_metadata or {}),
         })
         self._audit.record(
             actor=pid,
@@ -877,6 +902,7 @@ class LLMProcessExecutor:
         prepared: dict[str, Any],
     ) -> dict[str, Any]:
         canonical_args = dict(prepared.get("canonical_args") or {})
+        request_options = dict(prepared.get("request_options") or {})
         return {
             "kind": "llm_release_request_redacted",
             "schema_version": 1,
@@ -887,6 +913,9 @@ class LLMProcessExecutor:
             "prepared_request_sha256": cls._prepared_llm_release_sha256(prepared),
             "attempt": prepared.get("attempt"),
             "payload_retained": False,
+            "context_pressure": dict(
+                request_options.get("context_pressure") or {}
+            ),
         }
 
     @staticmethod
@@ -968,6 +997,7 @@ class LLMProcessExecutor:
         response_id: str | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
+        pending_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         resume_token = self._persist_pending_action(
             pid,
@@ -979,6 +1009,7 @@ class LLMProcessExecutor:
             response_id=response_id,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
+            pending_metadata=pending_metadata,
         )
         operation_context = self.pending.get(pid) or {}
         self.pending.remember(pid, "child", {
@@ -992,6 +1023,7 @@ class LLMProcessExecutor:
             "response_id": response_id,
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
+            "pending_metadata": dict(pending_metadata or {}),
         })
         self._audit.record(
             actor=pid,
@@ -1017,6 +1049,7 @@ class LLMProcessExecutor:
         response_id: str | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
+        pending_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         resume_token = self._persist_pending_action(
             pid,
@@ -1028,6 +1061,7 @@ class LLMProcessExecutor:
             response_id=response_id,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
+            pending_metadata=pending_metadata,
         )
         operation_context = self.pending.get(pid) or {}
         self.pending.remember(pid, "message", {
@@ -1041,6 +1075,7 @@ class LLMProcessExecutor:
             "response_id": response_id,
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
+            "pending_metadata": dict(pending_metadata or {}),
         })
         self._audit.record(
             actor=pid,
@@ -1069,6 +1104,7 @@ class LLMProcessExecutor:
             return self._pending_action_resuming_result(pid)
         pending = claimed
         action = dict(pending["action"])
+        context_management_metadata = self._context_management_pending_metadata(pending)
         self.pending.forget_generation(pid, "human", resume_token)
         if request.status == HumanRequestStatus.APPROVED or (
             self._action_name(action) == "request_permission" and request.status == HumanRequestStatus.REJECTED
@@ -1085,6 +1121,7 @@ class LLMProcessExecutor:
                             **self._pending_data_flow_metadata(pending),
                             "human_resume_request_id": request_id,
                             "operation_id": pending.get("tool_operation_id"),
+                            **self._context_management_dispatch_metadata(pending),
                         },
                     )
             except HumanApprovalRequired as exc:
@@ -1095,6 +1132,7 @@ class LLMProcessExecutor:
                     message=str(exc),
                     content_preview=str(pending.get("content_preview", "")),
                     tool_call_count=int(pending.get("tool_call_count", 0)),
+                    pending_metadata=context_management_metadata or None,
                     **self._pending_tool_call_context(pending),
                 )
             except ProcessMessageWaitRequired as exc:
@@ -1105,6 +1143,7 @@ class LLMProcessExecutor:
                     message=str(exc),
                     content_preview=str(pending.get("content_preview", "")),
                     tool_call_count=int(pending.get("tool_call_count", 0)),
+                    pending_metadata=context_management_metadata or None,
                     **self._pending_tool_call_context(pending),
                 )
             except ProcessWaitRequired as exc:
@@ -1115,7 +1154,14 @@ class LLMProcessExecutor:
                     message=str(exc),
                     content_preview=str(pending.get("content_preview", "")),
                     tool_call_count=int(pending.get("tool_call_count", 0)),
+                    pending_metadata=context_management_metadata or None,
                     **self._pending_tool_call_context(pending),
+                )
+            except Exception as exc:
+                if not context_management_metadata:
+                    raise
+                return await self._recover_context_management_error(
+                    pid, pending, context_management_metadata, exc
                 )
             self._persist_response_tool_output(
                 pid=pid,
@@ -1123,6 +1169,12 @@ class LLMProcessExecutor:
                 **self._pending_tool_call_context(pending),
             )
             self._clear_pending_action(pid, self._pending_resume_token(pending))
+            if context_management_metadata:
+                return await self._finish_resumed_context_management(
+                    pid,
+                    result=result,
+                    metadata=context_management_metadata,
+                )
             return self._completed_action_result(
                 pid=pid,
                 action=action,
@@ -1143,6 +1195,12 @@ class LLMProcessExecutor:
             **self._pending_tool_call_context(pending),
         )
         self._clear_pending_action(pid, self._pending_resume_token(pending))
+        if context_management_metadata:
+            return await self._finish_resumed_context_management(
+                pid,
+                result=result,
+                metadata=context_management_metadata,
+            )
         return self._completed_action_result(
             pid=pid,
             action=action,
@@ -1399,6 +1457,115 @@ class LLMProcessExecutor:
         }
 
     @staticmethod
+    def _context_management_pending_metadata(
+        pending: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata = pending_metadata(pending)
+        if (
+            metadata.get("kind") != "context_management_auto"
+            or metadata.get("schema_version") != 1
+            or metadata.get("source") != "runtime_context_management"
+        ):
+            return {}
+        return metadata
+
+    @classmethod
+    def _context_management_dispatch_metadata(
+        cls,
+        pending: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata = cls._context_management_pending_metadata(pending)
+        if not metadata:
+            return {}
+        return {
+            "context_management_auto": True,
+            "context_pressure_episode_id": metadata.get("episode_id"),
+            "context_pressure_policy_fingerprint": metadata.get(
+                "policy_fingerprint"
+            ),
+        }
+
+    async def _finish_resumed_context_management(
+        self,
+        pid: str,
+        *,
+        result: dict[str, Any],
+        metadata: dict[str, Any],
+        failure_reason: str | None = None,
+    ) -> dict[str, Any]:
+        generation_before = str(metadata.get("context_generation") or "")
+        generation_after = self._processes.get_llm_context_generation(pid)
+        common = {
+            **dict(metadata.get("assessment") or {}),
+            "source": "runtime_context_management",
+            "episode_id": metadata.get("episode_id"),
+            "policy_fingerprint": metadata.get("policy_fingerprint"),
+            "mode": metadata.get("mode"),
+            "tool_name": metadata.get("tool_name"),
+            "context_generation_after": generation_after,
+        }
+        if self._context_compaction_succeeded(
+            result,
+            generation_before=generation_before,
+            generation_after=generation_after,
+        ):
+            self._audit.record(
+                actor=pid,
+                action="llm.context_pressure_compacted",
+                target=f"process:{pid}",
+                decision=common,
+            )
+            return {
+                "ok": True,
+                "context_compacted": True,
+                "context_pressure_episode_id": metadata.get("episode_id"),
+                "context_generation": generation_after,
+                "resumed_context_management": True,
+            }
+
+        reason = failure_reason or self._context_management_failure_reason(
+            result,
+            generation_before=generation_before,
+            generation_after=generation_after,
+        )
+        self._audit.record(
+            actor=pid,
+            action="llm.context_pressure_failed",
+            target=f"process:{pid}",
+            decision={
+                **common,
+                "reason": reason,
+                "result": sanitize_for_observability(result),
+            },
+        )
+        # The failed maintenance action is deliberately not represented as a
+        # model tool result. Continue by rebuilding the ordinary Provider
+        # request; the completed pending marker deduplicates this episode.
+        return await self._arun_once_impl(pid)
+
+    async def _recover_context_management_error(
+        self,
+        pid: str,
+        pending: dict[str, Any],
+        metadata: dict[str, Any],
+        error: Exception,
+    ) -> dict[str, Any]:
+        self._clear_pending_action(pid, self._pending_resume_token(pending))
+        return await self._finish_resumed_context_management(
+            pid,
+            result={
+                "ok": False,
+                "tool_id": None,
+                "result_oid": None,
+                "payload": None,
+                "error": str(error),
+                "error_type": type(error).__name__,
+            },
+            metadata=metadata,
+            failure_reason=type(error).__name__,
+        )
+
+    @staticmethod
     def _completion_tool_call_context(completion: Any, *, index: int) -> dict[str, str | None]:
         response_id = str(getattr(completion, "response_id", "") or "") or None
         tool_calls = list(getattr(completion, "tool_calls", []) or [])
@@ -1484,6 +1651,9 @@ class LLMProcessExecutor:
             return self._pending_action_resuming_result(pid)
         pending = claimed
         action = dict(pending["action"])
+        context_management_metadata = self._context_management_pending_metadata(
+            pending
+        )
         self.pending.forget_generation(pid, "child", resume_token)
         try:
             with self._data_flow.recovered_source_snapshot_access():
@@ -1495,6 +1665,7 @@ class LLMProcessExecutor:
                         "pending_child_resume": True,
                         "pending_child_pid": child_pid,
                         "operation_id": pending.get("tool_operation_id"),
+                        **self._context_management_dispatch_metadata(pending),
                     },
                 )
         except ProcessWaitRequired as exc:
@@ -1505,6 +1676,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
+                pending_metadata=context_management_metadata or None,
                 **self._pending_tool_call_context(pending),
             )
         except HumanApprovalRequired as exc:
@@ -1515,6 +1687,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
+                pending_metadata=context_management_metadata or None,
                 **self._pending_tool_call_context(pending),
             )
         except ProcessMessageWaitRequired as exc:
@@ -1525,7 +1698,14 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
+                pending_metadata=context_management_metadata or None,
                 **self._pending_tool_call_context(pending),
+            )
+        except Exception as exc:
+            if not context_management_metadata:
+                raise
+            return await self._recover_context_management_error(
+                pid, pending, context_management_metadata, exc
             )
         self._persist_response_tool_output(
             pid=pid,
@@ -1533,6 +1713,12 @@ class LLMProcessExecutor:
             **self._pending_tool_call_context(pending),
         )
         self._clear_pending_action(pid, self._pending_resume_token(pending))
+        if context_management_metadata:
+            return await self._finish_resumed_context_management(
+                pid,
+                result=result,
+                metadata=context_management_metadata,
+            )
         return self._completed_action_result(
             pid=pid,
             action=action,
@@ -1563,6 +1749,9 @@ class LLMProcessExecutor:
             return self._pending_action_resuming_result(pid)
         pending = claimed
         action = dict(pending["action"])
+        context_management_metadata = self._context_management_pending_metadata(
+            pending
+        )
         self.pending.forget_generation(pid, "message", resume_token)
         try:
             with self._data_flow.recovered_source_snapshot_access():
@@ -1572,6 +1761,7 @@ class LLMProcessExecutor:
                     context_metadata={
                         **self._pending_data_flow_metadata(pending),
                         "operation_id": pending.get("tool_operation_id"),
+                        **self._context_management_dispatch_metadata(pending),
                     },
                 )
         except ProcessMessageWaitRequired as exc:
@@ -1582,6 +1772,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
+                pending_metadata=context_management_metadata or None,
                 **self._pending_tool_call_context(pending),
             )
         except ProcessWaitRequired as exc:
@@ -1592,6 +1783,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
+                pending_metadata=context_management_metadata or None,
                 **self._pending_tool_call_context(pending),
             )
         except HumanApprovalRequired as exc:
@@ -1602,7 +1794,14 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
+                pending_metadata=context_management_metadata or None,
                 **self._pending_tool_call_context(pending),
+            )
+        except Exception as exc:
+            if not context_management_metadata:
+                raise
+            return await self._recover_context_management_error(
+                pid, pending, context_management_metadata, exc
             )
         self._persist_response_tool_output(
             pid=pid,
@@ -1610,6 +1809,12 @@ class LLMProcessExecutor:
             **self._pending_tool_call_context(pending),
         )
         self._clear_pending_action(pid, self._pending_resume_token(pending))
+        if context_management_metadata:
+            return await self._finish_resumed_context_management(
+                pid,
+                result=result,
+                metadata=context_management_metadata,
+            )
         completed = self._completed_action_result(
             pid=pid,
             action=action,
@@ -1830,7 +2035,7 @@ class LLMProcessExecutor:
         )
         try:
             if _prepared_request is None:
-                self._prepare_fresh_llm_request(
+                await self._prepare_fresh_llm_request(
                     state,
                     response_scope_fingerprint=response_scope_fingerprint,
                     force_stateless=_force_stateless,
@@ -1838,6 +2043,10 @@ class LLMProcessExecutor:
             else:
                 self._prepare_resumed_llm_request(state, _prepared_request)
             completion = await self._invoke_prepared_llm_request(state)
+        except _ContextManagementHandled:
+            # No Provider request was attempted, so do not charge or persist a
+            # synthetic failed LLM call for host-side maintenance/waiting.
+            raise
         except HumanApprovalRequired as exc:
             if not state.prepared:
                 raise
@@ -1921,7 +2130,7 @@ class LLMProcessExecutor:
             resumed_release=True,
         )
 
-    def _prepare_fresh_llm_request(
+    async def _prepare_fresh_llm_request(
         self,
         state: _LLMCallState,
         *,
@@ -1933,17 +2142,6 @@ class LLMProcessExecutor:
             f"llm:{state.profile_id}",
             profile_snapshot.identity_sha256,
         )
-        self._data_flow.precheck_egress_clearance(
-            pid=state.pid,
-            sink=precheck_sink,
-            context=state.flow_context,
-            payload={
-                "messages": state.request_messages,
-                "tools": state.tools,
-                "profile_id": state.profile_id,
-            },
-        )
-        self._preflight_llm_call(state.pid)
         resolved = self._llms.resolve(
             state.profile_id,
             snapshot=profile_snapshot,
@@ -1956,7 +2154,7 @@ class LLMProcessExecutor:
         )
         if state.sink != precheck_sink:
             raise _LLMProviderChainScopeChanged(
-                "LLM profile Sink changed after egress precheck"
+                "LLM profile Sink changed while assembling the request"
             )
         self._set_llm_provider_scope(state)
         previous_outputs: list[dict[str, Any]]
@@ -1987,6 +2185,12 @@ class LLMProcessExecutor:
             response_scope_fingerprint=response_scope_fingerprint,
             previous_output_count=len(previous_outputs),
         )
+        image = self._images.get(state.process.image_id)
+        if image is None:
+            raise RuntimeError(
+                f"agent image disappeared while assembling the LLM request: {state.process.image_id}"
+            )
+        await self._apply_context_management(state, image=image)
         state.egress_payload = {
             "messages": state.request_messages,
             "tools": state.tools,
@@ -1994,6 +2198,17 @@ class LLMProcessExecutor:
             "previous_response_id": state.previous_response_id,
             "parallel_tool_calls": state.parallel_tool_calls,
         }
+        # Context pressure is evaluated only after the complete request has
+        # been assembled, but before either LLM resource preflight or external
+        # data-flow clearance. Prompt-mode notices therefore participate in
+        # the exact egress payload that is checked and persisted.
+        self._data_flow.precheck_egress_clearance(
+            pid=state.pid,
+            sink=precheck_sink,
+            context=state.flow_context,
+            payload=state.egress_payload,
+        )
+        self._preflight_llm_call(state.pid)
         state.canonical_args = {
             "profile_id": resolved.profile_id,
             "sink_identity_sha256": state.sink.identity_sha256,
@@ -2041,6 +2256,9 @@ class LLMProcessExecutor:
         state.request_options.update(
             {
                 "llm_profile_id": resolved.profile_id,
+                "llm_context_generation": self._processes.get_llm_context_generation(
+                    state.pid
+                ),
                 "client_class": type(client).__name__,
                 "real_llm_client": isinstance(client, LLMClient),
                 "openai_tool_schema": self._tool_schema_observation(state.tools),
@@ -2071,6 +2289,452 @@ class LLMProcessExecutor:
                     state.auto_wait_on_empty_tool_calls
                 ),
             }
+        )
+
+    async def _apply_context_management(self, state: _LLMCallState, *, image: Any) -> None:
+        resolved = state.resolved
+        assert resolved is not None
+        policy = context_management_policy(image.planner)
+        generation = str(state.request_options["llm_context_generation"])
+        latest_call = self._processes.get_latest_llm_call(
+            pid=state.pid,
+            purpose="action_selection",
+        )
+        lower_bound = provider_usage_lower_bound(
+            latest_call,
+            profile_id=resolved.profile_id,
+            context_generation=generation,
+            previous_response_id=state.previous_response_id,
+        )
+        assessment = assess_context_pressure(
+            messages=state.request_messages,
+            tools=state.tools,
+            context_window_tokens=resolved.context_window_tokens,
+            reserved_output_tokens=resolved.max_tokens,
+            threshold_ratio=policy.threshold_ratio,
+            profile_id=resolved.profile_id,
+            context_generation=generation,
+            provider_lower_bound_tokens=lower_bound,
+        )
+        prior = self._prior_context_pressure_state(
+            state.pid,
+            latest_call=latest_call,
+            policy_fingerprint=policy.fingerprint,
+        )
+        episode_id = (
+            str(prior.get("episode_id") or "")
+            if prior.get("active") is True
+            else ""
+        ) or new_id("ctxpressure")
+        attempted = bool(prior.get("auto_attempted")) if prior.get("active") is True else False
+        observation = {
+            **assessment.to_dict(),
+            "source": "runtime_context_management",
+            "active": assessment.triggered,
+            "episode_id": episode_id,
+            "policy_fingerprint": policy.fingerprint,
+            "mode": policy.mode,
+            "auto_attempted": attempted,
+            "action": "none",
+        }
+        state.request_options["context_pressure"] = observation
+
+        if not assessment.triggered:
+            if prior.get("active") is True:
+                observation["action"] = "recovered"
+                self._audit_context_pressure(
+                    state.pid,
+                    "llm.context_pressure_recovered",
+                    assessment,
+                    policy,
+                    episode_id=episode_id,
+                )
+            return
+
+        self._audit_context_pressure(
+            state.pid,
+            "llm.context_pressure_detected",
+            assessment,
+            policy,
+            episode_id=episode_id,
+        )
+        if policy.mode == "disabled":
+            observation["action"] = "disabled"
+            return
+        if policy.mode == "prompt":
+            notice = context_pressure_prompt(policy, assessment)
+            self._append_context_pressure_notice(state.request_messages, notice)
+            observation["action"] = "prompted"
+            self._audit_context_pressure(
+                state.pid,
+                "llm.context_pressure_prompted",
+                assessment,
+                policy,
+                episode_id=episode_id,
+            )
+            return
+        if attempted:
+            observation["action"] = "deduplicated"
+            return
+        await self._attempt_auto_context_management(
+            state,
+            policy=policy,
+            assessment=assessment,
+            episode_id=episode_id,
+            observation=observation,
+        )
+
+    async def _attempt_auto_context_management(
+        self,
+        state: _LLMCallState,
+        *,
+        policy: ContextManagementPolicy,
+        assessment: ContextPressureAssessment,
+        episode_id: str,
+        observation: dict[str, Any],
+    ) -> None:
+        observation.update({"auto_attempted": True, "action": "auto_attempted"})
+        action = policy.tool_action()
+        pending_context = self._auto_context_pending_metadata(
+            policy,
+            assessment,
+            episode_id=episode_id,
+        )
+        try:
+            self._persist_completed_context_management_marker(
+                state.pid,
+                action=action,
+                metadata={**pending_context, "outcome": "attempted"},
+            )
+        except Exception as exc:
+            observation.update(
+                {"action": "failed", "failure_reason": type(exc).__name__}
+            )
+            self._audit_context_pressure(
+                state.pid,
+                "llm.context_pressure_failed",
+                assessment,
+                policy,
+                episode_id=episode_id,
+                extra={
+                    "reason": "attempt_marker_persistence_failed",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return
+        self._audit_context_pressure(
+            state.pid,
+            "llm.context_pressure_auto_attempted",
+            assessment,
+            policy,
+            episode_id=episode_id,
+            extra={"tool_name": policy.tool_name},
+        )
+        try:
+            result = await self._dispatch_auto_context_action(
+                state.pid,
+                action=action,
+                pending_context=pending_context,
+            )
+        except _ContextManagementHandled:
+            raise
+        except Exception as exc:
+            observation.update(
+                {"action": "failed", "failure_reason": type(exc).__name__}
+            )
+            self._audit_context_pressure(
+                state.pid,
+                "llm.context_pressure_failed",
+                assessment,
+                policy,
+                episode_id=episode_id,
+                extra={"reason": type(exc).__name__, "error": str(exc)},
+            )
+            return
+        self._finish_auto_context_action(
+            state.pid,
+            action=action,
+            result=result,
+            policy=policy,
+            assessment=assessment,
+            episode_id=episode_id,
+            pending_context=pending_context,
+            observation=observation,
+        )
+
+    @staticmethod
+    def _auto_context_pending_metadata(
+        policy: ContextManagementPolicy,
+        assessment: ContextPressureAssessment,
+        *,
+        episode_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "kind": "context_management_auto",
+            "schema_version": 1,
+            "source": "runtime_context_management",
+            "episode_id": episode_id,
+            "policy_fingerprint": policy.fingerprint,
+            "mode": policy.mode,
+            "tool_name": policy.tool_name,
+            "context_generation": assessment.context_generation,
+            "assessment": assessment.to_dict(),
+        }
+
+    async def _dispatch_auto_context_action(
+        self,
+        pid: str,
+        *,
+        action: dict[str, Any],
+        pending_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return await self.adispatch(
+                pid,
+                action,
+                context_metadata={
+                    "context_management_auto": True,
+                    "context_pressure_episode_id": pending_context["episode_id"],
+                    "context_pressure_policy_fingerprint": pending_context[
+                        "policy_fingerprint"
+                    ],
+                },
+            )
+        except HumanApprovalRequired as exc:
+            payload = self._wait_for_human_action(
+                pid=pid,
+                action=action,
+                request_id=exc.request_id,
+                message=str(exc),
+                content_preview="",
+                tool_call_count=0,
+                pending_metadata=pending_context,
+            )
+            raise _ContextManagementHandled(payload) from exc
+        except ProcessWaitRequired as exc:
+            payload = self._wait_for_child_action(
+                pid=pid,
+                action=exc.resume_action or action,
+                child_pid=exc.child_pid,
+                message=str(exc),
+                content_preview="",
+                tool_call_count=0,
+                pending_metadata=pending_context,
+            )
+            raise _ContextManagementHandled(payload) from exc
+        except ProcessMessageWaitRequired as exc:
+            payload = self._wait_for_message_action(
+                pid=pid,
+                action=action,
+                filters=exc.filters,
+                message=str(exc),
+                content_preview="",
+                tool_call_count=0,
+                pending_metadata=pending_context,
+            )
+            raise _ContextManagementHandled(payload) from exc
+
+    def _finish_auto_context_action(
+        self,
+        pid: str,
+        *,
+        action: dict[str, Any],
+        result: dict[str, Any],
+        policy: ContextManagementPolicy,
+        assessment: ContextPressureAssessment,
+        episode_id: str,
+        pending_context: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> None:
+        generation_after = self._processes.get_llm_context_generation(pid)
+        if self._context_compaction_succeeded(
+            result,
+            generation_before=assessment.context_generation,
+            generation_after=generation_after,
+        ):
+            self._persist_completed_context_management_marker(
+                pid,
+                action=action,
+                metadata={
+                    **pending_context,
+                    "context_generation_after": generation_after,
+                    "outcome": "compacted",
+                },
+            )
+            self._audit_context_pressure(
+                pid,
+                "llm.context_pressure_compacted",
+                assessment,
+                policy,
+                episode_id=episode_id,
+                extra={
+                    "tool_name": policy.tool_name,
+                    "context_generation_after": generation_after,
+                },
+            )
+            raise _ContextManagementHandled(
+                {
+                    "ok": True,
+                    "context_compacted": True,
+                    "context_pressure_episode_id": episode_id,
+                    "context_generation": generation_after,
+                }
+            )
+        reason = self._context_management_failure_reason(
+            result,
+            generation_before=assessment.context_generation,
+            generation_after=generation_after,
+        )
+        observation.update({"action": "failed", "failure_reason": reason})
+        self._audit_context_pressure(
+            pid,
+            "llm.context_pressure_failed",
+            assessment,
+            policy,
+            episode_id=episode_id,
+            extra={"reason": reason, "result": sanitize_for_observability(result)},
+        )
+
+    def _prior_context_pressure_state(
+        self,
+        pid: str,
+        *,
+        latest_call: Any | None,
+        policy_fingerprint: str,
+    ) -> dict[str, Any]:
+        durable = self.pending.get(pid) or {}
+        metadata = pending_metadata(durable)
+        durable_action = dict(durable.get("action") or {})
+        durable_pressure: Any = durable_action.get("context_pressure")
+        if durable_action.get("kind") == "llm_release_request":
+            durable_pressure = dict(
+                durable_action.get("request_options") or {}
+            ).get("context_pressure")
+        durable_is_newer = str(durable.get("updated_at") or "") >= str(
+            getattr(latest_call, "completed_at", "") or ""
+        )
+        if (
+            durable_is_newer
+            and isinstance(durable_pressure, dict)
+            and durable_pressure.get("policy_fingerprint") == policy_fingerprint
+        ):
+            return dict(durable_pressure)
+        if (
+            durable_is_newer
+            and metadata.get("kind") == "context_management_auto"
+            and metadata.get("policy_fingerprint") == policy_fingerprint
+        ):
+            return {
+                "active": True,
+                "episode_id": metadata.get("episode_id"),
+                "auto_attempted": True,
+                "policy_fingerprint": policy_fingerprint,
+            }
+        if latest_call is not None:
+            options = getattr(latest_call, "request_options", {})
+            if isinstance(options, dict) and "context_pressure" in options:
+                pressure = options.get("context_pressure")
+                if (
+                    isinstance(pressure, dict)
+                    and pressure.get("policy_fingerprint") == policy_fingerprint
+                ):
+                    return dict(pressure)
+                return {}
+        if (
+            metadata.get("kind") == "context_management_auto"
+            and metadata.get("policy_fingerprint") == policy_fingerprint
+        ):
+            return {
+                "active": True,
+                "episode_id": metadata.get("episode_id"),
+                "auto_attempted": True,
+                "policy_fingerprint": policy_fingerprint,
+            }
+        return {}
+
+    @staticmethod
+    def _append_context_pressure_notice(
+        messages: list[dict[str, Any]],
+        notice: str,
+    ) -> None:
+        for message in reversed(messages):
+            if str(message.get("role") or "") != "user":
+                continue
+            content = str(message.get("content") or "")
+            message["content"] = "\n\n".join(part for part in (content, notice) if part)
+            return
+        messages.append({"role": "user", "content": notice})
+
+    @staticmethod
+    def _context_compaction_succeeded(
+        result: dict[str, Any],
+        *,
+        generation_before: str,
+        generation_after: str,
+    ) -> bool:
+        payload = result.get("payload")
+        return bool(
+            result.get("ok") is True
+            and isinstance(payload, dict)
+            and payload.get("compacted") is True
+            and generation_after != generation_before
+        )
+
+    @staticmethod
+    def _context_management_failure_reason(
+        result: dict[str, Any],
+        *,
+        generation_before: str,
+        generation_after: str,
+    ) -> str:
+        if result.get("ok") is not True:
+            return "tool_failed"
+        payload = result.get("payload")
+        if not isinstance(payload, dict) or payload.get("compacted") is not True:
+            return "invalid_compaction_result"
+        if generation_after == generation_before:
+            return "context_generation_unchanged"
+        return "unknown"
+
+    def _persist_completed_context_management_marker(
+        self,
+        pid: str,
+        *,
+        action: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> None:
+        self._persist_pending_action(
+            pid,
+            wait_type="context_management",
+            action=action,
+            content_preview="",
+            tool_call_count=0,
+            pending_metadata=metadata,
+            status="completed",
+        )
+
+    def _audit_context_pressure(
+        self,
+        pid: str,
+        action: str,
+        assessment: ContextPressureAssessment,
+        policy: ContextManagementPolicy,
+        *,
+        episode_id: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        self._audit.record(
+            actor=pid,
+            action=action,
+            target=f"process:{pid}",
+            decision={
+                **assessment.to_dict(),
+                "episode_id": episode_id,
+                "policy_fingerprint": policy.fingerprint,
+                "mode": policy.mode,
+                **dict(extra or {}),
+            },
         )
 
     def _prepare_resumed_llm_request(
@@ -2909,6 +3573,8 @@ class LLMProcessExecutor:
         tool_call_id: str | None = None,
         tool_name: str | None = None,
         resume_token: str | None = None,
+        pending_metadata: dict[str, Any] | None = None,
+        status: str = "pending",
     ) -> str:
         return self.pending.persist(
             pid,
@@ -2919,10 +3585,12 @@ class LLMProcessExecutor:
             request_id=request_id,
             child_pid=child_pid,
             filters=filters,
+            metadata=pending_metadata,
             response_id=response_id,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             resume_token=resume_token,
+            status=status,
         )
 
     @staticmethod

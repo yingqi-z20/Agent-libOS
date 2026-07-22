@@ -540,6 +540,13 @@ prompt: prompt.md
 prompt_mode: image_only
 jit_tool_exposure: direct
 llm_profile: review-fast
+planner:
+  context_management:
+    mode: auto_compact
+    threshold_ratio: 0.8
+    tool:
+      name: compact_process_context
+      arguments: {}
 default_tools:
   - read_memory_object
   - human_output
@@ -573,6 +580,13 @@ names or schemas into prompt context.
 `llm_profile` is optional and names a host-configured LLM profile used when a
 root process is spawned from the image. It is only an id; provider API keys stay
 in the host environment and are not packaged into the image.
+
+`planner.context_management` is optional. It accepts only `auto_compact`,
+`prompt`, or `disabled`, a ratio in `(0, 1]`, an OpenAI-compatible tool name,
+object arguments, and a literal prompt. Other planner keys remain
+image-defined and compatible. Automatic mode does not grant the named tool;
+include it in `default_tools` (or otherwise in the process's complete tool
+table) when the image intends it to run.
 
 `required_modules` is optional. Each entry must contain a `module_id` and the
 64-character lowercase `source_sha256` reported by

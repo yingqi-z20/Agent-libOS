@@ -1963,11 +1963,13 @@ class TestGuiServer:
                 'api_key_env': 'KIMI_API_KEY',
                 'api_mode': 'chat',
                 'max_tokens': 4096,
+                'context_window_tokens': 200000,
                 'allow_custom_base_url': True,
             },
         )
         assert status == 200
         assert updated['max_tokens'] == 4096
+        assert updated['context_window_tokens'] == 200000
         assert updated['allow_custom_base_url'] is True
         assert 'secret' not in self.llm_profiles_file.read_text(encoding='utf-8')
 
@@ -1996,7 +1998,12 @@ class TestGuiServer:
         self.host, self.port = self.server.server_address
         status, profiles = self.request('GET', '/api/llm-profiles')
         assert status == 200
-        assert any(profile['profile_id'] == 'kimi-k2.7-code' and profile['max_tokens'] == 4096 for profile in profiles)
+        assert any(
+            profile['profile_id'] == 'kimi-k2.7-code'
+            and profile['max_tokens'] == 4096
+            and profile['context_window_tokens'] == 200000
+            for profile in profiles
+        )
 
     def test_llm_profile_spawn_exec_validation_and_delete_in_use(self) -> None:
         status, body = self.request('POST', '/api/processes', {'goal': 'bad profile', 'auto_run': False, 'llm_profile': 'missing'})

@@ -366,6 +366,36 @@ class TestImageRegistration:
         finally:
             runtime.close()
 
+    def test_image_context_management_is_strict_without_restricting_other_planner_keys(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id='context-policy:v0',
+                    name='context-policy',
+                    planner={
+                        'custom_planner_extension': {'enabled': True},
+                        'context_management': {
+                            'mode': 'prompt',
+                            'threshold_ratio': 0.75,
+                            'prompt': 'Reduce context.',
+                        },
+                    },
+                ),
+                actor='cli',
+            )
+            with pytest.raises(ValidationError, match='unknown planner.context_management'):
+                runtime.register_image(
+                    AgentImage(
+                        image_id='bad-context-policy:v0',
+                        name='bad-context-policy',
+                        planner={'context_management': {'ambient_tool_grant': True}},
+                    ),
+                    actor='cli',
+                )
+        finally:
+            runtime.close()
+
     def test_register_image_rejects_invalid_required_capability_right(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -760,6 +790,37 @@ class TestImageRegistration:
                 assert inspected['image']['prompt_mode'] == 'minimal_runtime'
                 listed = {image['image_id']: image for image in runtime.image_registry.list_images()}
                 assert listed['package-agent:v0']['prompt_mode'] == 'minimal_runtime'
+            finally:
+                runtime.close()
+
+    def test_image_package_context_management_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = _write_image_package(Path(temp_dir) / 'package-agent')
+            manifest = root / 'IMAGE.yaml'
+            manifest.write_text(
+                manifest.read_text(encoding='utf-8').replace(
+                    'metadata:\n',
+                    'planner:\n'
+                    '  context_management:\n'
+                    '    mode: prompt\n'
+                    '    threshold_ratio: 0.7\n'
+                    '    prompt: Preserve package state.\n'
+                    'metadata:\n',
+                ),
+                encoding='utf-8',
+            )
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                result = runtime.image_registry.register_from_package_path(root, actor='cli')
+                inspected = runtime.image_registry.inspect('package-agent:v0')
+
+                expected = {
+                    'mode': 'prompt',
+                    'threshold_ratio': 0.7,
+                    'prompt': 'Preserve package state.',
+                }
+                assert result.image.planner['context_management'] == expected
+                assert inspected['image']['planner']['context_management'] == expected
             finally:
                 runtime.close()
 

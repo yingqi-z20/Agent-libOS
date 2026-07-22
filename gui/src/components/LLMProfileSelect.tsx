@@ -23,6 +23,7 @@ type ProfileFormState = {
   api_mode: "" | "auto" | "responses" | "chat";
   temperature: string;
   max_tokens: string;
+  context_window_tokens: string;
   timeout_s: string;
   max_retries: string;
   store: "" | "true" | "false";
@@ -39,6 +40,7 @@ const emptyForm: ProfileFormState = {
   api_mode: "",
   temperature: "",
   max_tokens: "",
+  context_window_tokens: "",
   timeout_s: "",
   max_retries: "",
   store: "",
@@ -221,6 +223,10 @@ function LLMProfileManagerDialog({
                 <input type="number" min={1} step={1} value={form.max_tokens} onChange={(event) => setForm({ ...form, max_tokens: event.currentTarget.value })} />
               </label>
               <label>
+                {t("llmProfile.contextWindowTokens")}
+                <input type="number" min={1} step={1} value={form.context_window_tokens} onChange={(event) => setForm({ ...form, context_window_tokens: event.currentTarget.value })} />
+              </label>
+              <label>
                 {t("llmProfile.timeout")}
                 <input type="number" min={0.1} step="0.1" value={form.timeout_s} onChange={(event) => setForm({ ...form, timeout_s: event.currentTarget.value })} />
               </label>
@@ -281,6 +287,7 @@ function formFromProfile(profile: LLMProfileSummary): ProfileFormState {
     api_mode: profile.api_mode ?? "",
     temperature: stringifyNumber(profile.temperature),
     max_tokens: stringifyNumber(profile.max_tokens),
+    context_window_tokens: stringifyNumber(profile.context_window_tokens),
     timeout_s: stringifyNumber(profile.timeout_s),
     max_retries: stringifyNumber(profile.max_retries),
     store: boolToForm(profile.store),
@@ -299,6 +306,7 @@ function formToInput(form: ProfileFormState): LLMProfileInput {
     api_mode: form.api_mode || null,
     temperature: numberOrNull(form.temperature),
     max_tokens: integerOrNull(form.max_tokens),
+    context_window_tokens: integerOrNull(form.context_window_tokens),
     timeout_s: numberOrNull(form.timeout_s),
     max_retries: integerOrNull(form.max_retries),
     store: formBoolToValue(form.store),

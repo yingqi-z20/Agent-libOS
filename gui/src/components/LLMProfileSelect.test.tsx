@@ -41,6 +41,7 @@ describe("LLMProfileSelect", () => {
 
     expect(html).toMatch(/Model profiles|模型 Profiles/);
     expect(html).toMatch(/Config profiles are read-only|配置文件中的 profile 只读/);
+    expect(html).toMatch(/Context window tokens|上下文窗口 tokens/);
     expect(html).toContain("kimi-k2.7-code");
     expect(html).toContain("disabled=\"\"");
   });
@@ -68,6 +69,7 @@ function profile(
     auto_wait_on_empty_tool_calls: null,
     temperature: null,
     max_tokens: null,
+    context_window_tokens: null,
     allow_custom_base_url: source === "user",
     source,
     editable,

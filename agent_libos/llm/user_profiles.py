@@ -48,6 +48,7 @@ _USER_PROFILE_FIELDS = (
     "auto_wait_on_empty_tool_calls",
     "temperature",
     "max_tokens",
+    "context_window_tokens",
     "allow_custom_base_url",
 )
 
@@ -96,12 +97,20 @@ class UserLLMProfileStore:
         profiles: dict[str, LLMProfile] = {}
         for profile_id, payload in profiles_raw.items():
             selected_id = normalize_user_llm_profile_id(profile_id)
-            profiles[selected_id] = validate_user_llm_profile_payload(selected_id, payload)
+            profiles[selected_id] = validate_user_llm_profile_payload(
+                selected_id,
+                payload,
+                config=self.config,
+            )
         return profiles
 
     def upsert(self, profile_id: str, payload: Mapping[str, Any]) -> LLMProfile:
         selected_id = normalize_user_llm_profile_id(profile_id)
-        profile = validate_user_llm_profile_payload(selected_id, payload)
+        profile = validate_user_llm_profile_payload(
+            selected_id,
+            payload,
+            config=self.config,
+        )
         profiles = self.load()
         profiles[selected_id] = profile
         self.save(profiles)
@@ -147,7 +156,12 @@ def normalize_user_llm_profile_id(value: Any) -> str:
     return selected
 
 
-def validate_user_llm_profile_payload(profile_id: str, payload: Any) -> LLMProfile:
+def validate_user_llm_profile_payload(
+    profile_id: str,
+    payload: Any,
+    *,
+    config: AgentLibOSConfig | None = None,
+) -> LLMProfile:
     if not isinstance(payload, Mapping):
         raise ValidationError(f"LLM profile payload must be an object: {profile_id}")
     if "api_key" in payload:
@@ -173,10 +187,24 @@ def validate_user_llm_profile_payload(profile_id: str, payload: Any) -> LLMProfi
     raw["timeout_s"] = _optional_positive_float(raw.get("timeout_s"), "timeout_s")
     raw["max_retries"] = _optional_nonnegative_int(raw.get("max_retries"), "max_retries")
     raw["max_tokens"] = _optional_positive_int(raw.get("max_tokens"), "max_tokens")
+    raw["context_window_tokens"] = _optional_positive_int(
+        raw.get("context_window_tokens"),
+        "context_window_tokens",
+    )
     raw["temperature"] = _optional_float(raw.get("temperature"), "temperature")
     for key in ("store", "responses_previous_response_id", "parallel_tool_calls", "auto_wait_on_empty_tool_calls", "allow_custom_base_url"):
         raw[key] = _optional_bool(raw.get(key), key)
     cleaned = {key: value for key, value in raw.items() if value is not None}
+    selected_config = config or DEFAULT_CONFIG
+    effective_max_tokens = raw["max_tokens"] or selected_config.llm.max_tokens
+    effective_context_window = (
+        raw["context_window_tokens"]
+        or selected_config.llm.context_window_tokens
+    )
+    if effective_max_tokens >= effective_context_window:
+        raise ValidationError(
+            "LLM profile max_tokens must be less than context_window_tokens"
+        )
     try:
         return LLMProfile(**cleaned)
     except (TypeError, ValueError, PydanticValidationError) as exc:
@@ -223,6 +251,7 @@ def summarize_llm_profile(
         "auto_wait_on_empty_tool_calls": profile.auto_wait_on_empty_tool_calls,
         "temperature": profile.temperature,
         "max_tokens": profile.max_tokens,
+        "context_window_tokens": profile.context_window_tokens,
         "allow_custom_base_url": profile.allow_custom_base_url,
         "source": source,
         "editable": editable,

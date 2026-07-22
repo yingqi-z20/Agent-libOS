@@ -141,6 +141,10 @@ and unregister from changing the registry.
 | PTY input/control | `pty:session:<session-id>` | aliases the immutable content-bound spawn trust identity |
 | Internal process handoff | `process:<pid>` | identity-domain propagation, not external trust |
 
+`context_window_tokens` is a local LLM scheduling bound, not a Provider/Sink
+identity component. Changing only that value therefore does not invalidate an
+otherwise identical trusted LLM Sink rule.
+
 MCP metadata-only cached discovery is public. A process-initiated live refresh
 is a bidirectional provider operation: its current flow context is checked as
 outbound request data, and returned metadata or an after-dispatch provider

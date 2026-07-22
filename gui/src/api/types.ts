@@ -218,6 +218,7 @@ export type LLMProfileSummary = {
   auto_wait_on_empty_tool_calls: boolean | null;
   temperature: number | null;
   max_tokens: number | null;
+  context_window_tokens: number | null;
   allow_custom_base_url: boolean;
   source: "config" | "user";
   editable: boolean;
@@ -239,6 +240,7 @@ export type LLMProfileInput = {
   auto_wait_on_empty_tool_calls?: boolean | null;
   temperature?: number | null;
   max_tokens?: number | null;
+  context_window_tokens?: number | null;
   allow_custom_base_url?: boolean | null;
 };
 

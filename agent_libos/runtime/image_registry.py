@@ -38,6 +38,7 @@ from agent_libos.models import (
     is_openai_tool_name,
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.llm.context_management import context_management_policy
 from agent_libos.ports import (
     ImageCheckpointPort,
     ImageFilesystemPort,
@@ -1377,6 +1378,7 @@ class ImageRegistryPrimitive:
         if len(image.system_prompt) > self.config.image.prompt_max_chars:
             raise ValidationError(f"system_prompt exceeds prompt_max_chars={self.config.image.prompt_max_chars}")
         self._validate_mapping_size(image.planner, "planner")
+        context_management_policy(image.planner)
         self._validate_mapping_size(image.action_schema, "action_schema")
         self._validate_mapping_size(image.metadata, "metadata")
         self._validate_mapping_size(image.boot, "boot")

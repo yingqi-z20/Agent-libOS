@@ -162,6 +162,41 @@ class TestConfigDefaults:
     def test_default_llm_config_persists_full_io(self) -> None:
         assert DEFAULT_CONFIG.llm.persist_full_io is True
         assert DEFAULT_CONFIG.llm.auto_wait_on_empty_tool_calls is False
+        assert DEFAULT_CONFIG.llm.context_window_tokens == 131_072
+        assert DEFAULT_CONFIG.llm.max_tokens < DEFAULT_CONFIG.llm.context_window_tokens
+
+    def test_llm_context_window_requires_effective_output_reservation_to_fit(self) -> None:
+        config = AgentLibOSConfig(
+            llm=LLMDefaults(
+                context_window_tokens=200_000,
+                profiles={
+                    "default": LLMProfile(),
+                    "coding": LLMProfile(
+                        max_tokens=8_192,
+                        context_window_tokens=32_768,
+                    ),
+                },
+            )
+        )
+
+        assert config.llm.context_window_tokens == 200_000
+        assert config.llm.profiles["coding"].context_window_tokens == 32_768
+
+        with pytest.raises(ValueError, match="max_tokens must be less"):
+            AgentLibOSConfig(
+                llm=LLMDefaults(
+                    max_tokens=1_000,
+                    context_window_tokens=1_000,
+                )
+            )
+        with pytest.raises(ValueError, match="effective max_tokens"):
+            AgentLibOSConfig(
+                llm=LLMDefaults(
+                    profiles={
+                        "default": LLMProfile(context_window_tokens=32_768),
+                    }
+                )
+            )
 
     def test_payload_retention_is_explicit_disabled_and_bounded(self) -> None:
         defaults = DEFAULT_CONFIG.runtime

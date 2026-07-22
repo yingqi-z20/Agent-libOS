@@ -9,6 +9,8 @@ from agent_libos.ports.operations import OperationPort
 from agent_libos.storage.repositories import EvidenceRepository, ProcessRepository
 from agent_libos.utils.ids import new_id
 
+PENDING_METADATA_FILTER_KEY = "__agent_libos_pending_metadata__"
+
 
 class LLMPendingActionService:
     """Own durable and in-memory state for resumable LLM actions."""
@@ -90,11 +92,15 @@ class LLMPendingActionService:
         request_id: str | None = None,
         child_pid: str | None = None,
         filters: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
         response_id: str | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
         resume_token: str | None = None,
+        status: str = "pending",
     ) -> str:
+        if status not in {"pending", "completed"}:
+            raise ValueError(f"unsupported pending LLM action status: {status}")
         selected_token = resume_token or new_id("llmwait")
         llm_operation = self._operations.current()
         tool_operation_id = self._waiting_tool_operation(
@@ -102,6 +108,10 @@ class LLMPendingActionService:
             request_id=request_id,
             child_pid=child_pid,
         )
+        stored_filters = dict(filters or {})
+        stored_filters.pop(PENDING_METADATA_FILTER_KEY, None)
+        if metadata:
+            stored_filters[PENDING_METADATA_FILTER_KEY] = dict(metadata)
         self._processes.upsert_llm_pending_action(
             pid,
             {
@@ -114,12 +124,12 @@ class LLMPendingActionService:
                 "response_id": response_id,
                 "tool_call_id": tool_call_id,
                 "tool_name": tool_name,
-                "filters": dict(filters or {}),
+                "filters": stored_filters,
                 "action": dict(action),
                 "data_flow_context": serialize_data_flow_context(self._data_flow.current_context()),
                 "content_preview": content_preview,
                 "tool_call_count": tool_call_count,
-                "status": "pending",
+                "status": status,
             },
         )
         return selected_token
@@ -201,7 +211,10 @@ class LLMPendingActionService:
                 self._restore_child_goal({**pending, **restored})
             return
         if wait_type == "message":
-            self._message_actions[pid] = {**common, "filters": dict(pending.get("filters") or {})}
+            self._message_actions[pid] = {
+                **common,
+                "filters": pending_message_filters(pending),
+            }
             return
         raise RuntimeError(f"invalid durable pending LLM action for {pid}: wait_type={wait_type!r}")
 
@@ -254,6 +267,23 @@ def pending_data_flow_metadata(pending: dict[str, Any]) -> dict[str, Any]:
     return {"data_flow_context": dict(pending.get("data_flow_context") or {})}
 
 
+def pending_metadata(pending: dict[str, Any]) -> dict[str, Any]:
+    direct = pending.get("pending_metadata")
+    if isinstance(direct, dict):
+        return dict(direct)
+    filters = pending.get("filters")
+    if not isinstance(filters, dict):
+        return {}
+    value = filters.get(PENDING_METADATA_FILTER_KEY)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def pending_message_filters(pending: dict[str, Any]) -> dict[str, Any]:
+    filters = dict(pending.get("filters") or {})
+    filters.pop(PENDING_METADATA_FILTER_KEY, None)
+    return filters
+
+
 def _hydrated_common(pending: dict[str, Any]) -> dict[str, Any]:
     return {
         "resume_token": pending_resume_token(pending),
@@ -266,4 +296,5 @@ def _hydrated_common(pending: dict[str, Any]) -> dict[str, Any]:
         "tool_call_id": str(pending["tool_call_id"]) if pending.get("tool_call_id") else None,
         "tool_name": str(pending["tool_name"]) if pending.get("tool_name") else None,
         "data_flow_context": dict(pending.get("data_flow_context") or {}),
+        "pending_metadata": pending_metadata(pending),
     }

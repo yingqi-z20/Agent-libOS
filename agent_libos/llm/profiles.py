@@ -44,6 +44,7 @@ class ResolvedLLMProfile:
     identity_sha256: str
     temperature: float
     max_tokens: int
+    context_window_tokens: int
     parallel_tool_calls: bool
     auto_wait_on_empty_tool_calls: bool
 
@@ -170,6 +171,11 @@ class LLMProfileRegistry:
                 identity_sha256=snapshot.identity_sha256,
                 temperature=self.config.llm.temperature if profile.temperature is None else profile.temperature,
                 max_tokens=self.config.llm.max_tokens if profile.max_tokens is None else profile.max_tokens,
+                context_window_tokens=(
+                    self.config.llm.context_window_tokens
+                    if profile.context_window_tokens is None
+                    else profile.context_window_tokens
+                ),
                 parallel_tool_calls=self._resolved_parallel_tool_calls(profile, client),
                 auto_wait_on_empty_tool_calls=self._resolved_auto_wait_on_empty_tool_calls(profile),
             )
@@ -223,10 +229,15 @@ class LLMProfileRegistry:
             else MappingProxyType({})
         )
         policy = self._resolved_policy(profile, legacy_env)
+        identity_profile = asdict(profile)
+        # Model-window sizing controls only local request scheduling. It does
+        # not identify the external Provider/Sink and must not invalidate
+        # existing trust rules when hosts adopt this field.
+        identity_profile.pop("context_window_tokens", None)
         identity = {
             "schema_version": 1,
             "profile_id": profile_id,
-            "profile": asdict(profile),
+            "profile": identity_profile,
             "effective": {
                 "base_url": profile.base_url or _optional_env(legacy_env, "OPENAI_BASE_URL"),
                 "model": profile.model
@@ -429,6 +440,16 @@ class LLMProfileRegistry:
             raise ValidationError(f"unsupported LLM profile kind for {profile_id}: {profile.kind}")
         if not profile.api_key_env.strip():
             raise ValidationError(f"LLM profile api_key_env must be non-empty: {profile_id}")
+        max_tokens = self.config.llm.max_tokens if profile.max_tokens is None else profile.max_tokens
+        context_window = (
+            self.config.llm.context_window_tokens
+            if profile.context_window_tokens is None
+            else profile.context_window_tokens
+        )
+        if max_tokens >= context_window:
+            raise ValidationError(
+                f"LLM profile max_tokens must be less than context_window_tokens: {profile_id}"
+            )
 
     def _normalize_profile_id(self, profile_id: str | None) -> str:
         selected = str(profile_id or "").strip()

@@ -89,6 +89,16 @@ short factual runtime note and state sections. `libos_default` preserves the
 native Agent libOS planner envelope and fallback JSON instructions used by the
 built-in images.
 
+`planner.context_management` controls model-window pressure handling. With no
+entry, the image uses `auto_compact` at 80% projected occupancy and calls
+`compact_process_context`. `prompt` appends the image-owned literal reminder
+and numeric pressure facts in every prompt mode, including `image_only`;
+`disabled` records pressure but takes no action. Projected occupancy is the
+conservative complete-input estimate plus the profile's `max_tokens` output
+reservation. A configured automatic tool is never added to the process tool
+table: it must already be present and remains subject to its argument schema,
+Capability, resource, approval, event, and audit checks.
+
 Root process spawn never grants image `required_capabilities`.
 Requirements are copied into the Host-authored
 Task Authority Manifest and reported as satisfied or unmet. Only the

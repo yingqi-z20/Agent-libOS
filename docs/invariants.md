@@ -557,6 +557,11 @@ longer defines.
   stored as process-local ids, resolved at LLM-call time, inherited by child
   processes, preserved by image-package defaults, isolated from non-default
   ambient provider environment, and fail closed when the id is unknown.
+- `automatic-context-management-does-not-grant-authority`: context pressure
+  may select an Image-configured tool, but never inserts it into the process
+  tool table or bypasses argument validation, Capability, resource, approval,
+  event, audit, and durable-wait enforcement. Failed automatic maintenance is
+  audited and remains invisible to the model request.
 - `resource-budgets-are-hierarchical`: resource usage is charged to the acting
   process and its parent chain, and visibility/capability mechanisms cannot
   mint additional budget. The complete hierarchy, reservations, event, and

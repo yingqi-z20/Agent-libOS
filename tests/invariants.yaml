@@ -2779,6 +2779,18 @@
       "benchmark_attack_classes": ["git_patch_lineage"]
     },
     {
+      "id": "automatic-context-management-does-not-grant-authority",
+      "title": "Automatic context management cannot expand the process tool table or bypass ToolBroker authority.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_context_management_authority.py::test_automatic_context_management_does_not_expand_process_tool_authority",
+        "tests/security/test_context_management_authority.py::test_automatic_context_management_cannot_bypass_tool_argument_schema",
+        "tests/security/test_context_management_authority.py::test_automatic_context_management_cannot_bypass_capability_checks",
+        "tests/security/test_context_management_authority.py::test_automatic_context_management_cannot_bypass_resource_budget"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "model-tool-projection-does-not-change-authority",
       "title": "Lazy tool groups reduce model schemas through a durable projection without changing callable tools or capabilities.",
       "lane": "runtime",

@@ -334,6 +334,7 @@ class LLMProfile:
     auto_wait_on_empty_tool_calls: bool | None = None
     temperature: float | None = None
     max_tokens: int | None = None
+    context_window_tokens: int | None = None
     allow_custom_base_url: bool = False
 
 
@@ -343,6 +344,7 @@ class LLMDefaults:
     profiles: dict[str, LLMProfile] = field(default_factory=lambda: {"default": LLMProfile()})
     temperature: float = 0.2
     max_tokens: int = 65_536
+    context_window_tokens: int = 131_072
     timeout_s: float = 60.0
     max_retries: int = 2
     api_mode: Literal["auto", "responses", "chat"] = "auto"
@@ -981,46 +983,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _nonnegative("process.fork_min_tool_calls", process.fork_min_tool_calls)
     _nonnegative("process.fork_min_child_processes", process.fork_min_child_processes)
 
-    llm = config.llm
-    _require_non_empty("llm.default_profile_id", llm.default_profile_id)
-    if llm.default_profile_id not in llm.profiles:
-        raise ValueError(f"llm.default_profile_id does not reference a configured profile: {llm.default_profile_id}")
-    for profile_id, profile in llm.profiles.items():
-        _require_non_empty("llm.profiles key", profile_id)
-        if profile.kind != "openai_compatible":
-            raise ValueError(f"llm.profiles[{profile_id!r}].kind is not supported: {profile.kind}")
-        if profile.base_url is not None:
-            _require_non_empty(f"llm.profiles[{profile_id!r}].base_url", profile.base_url)
-        if profile.model is not None:
-            _require_non_empty(f"llm.profiles[{profile_id!r}].model", profile.model)
-        _require_non_empty(f"llm.profiles[{profile_id!r}].api_key_env", profile.api_key_env)
-        if profile.api_mode is not None and profile.api_mode not in {"auto", "responses", "chat"}:
-            raise ValueError(f"llm.profiles[{profile_id!r}].api_mode is not supported: {profile.api_mode}")
-        _optional_non_empty(f"llm.profiles[{profile_id!r}].safety_identifier", profile.safety_identifier)
-        _optional_max_chars(f"llm.profiles[{profile_id!r}].safety_identifier", profile.safety_identifier, 64)
-        _optional_non_empty(f"llm.profiles[{profile_id!r}].safety_identifier_env", profile.safety_identifier_env)
-        _optional_non_empty(f"llm.profiles[{profile_id!r}].prompt_cache_key", profile.prompt_cache_key)
-        _positive_optional(f"llm.profiles[{profile_id!r}].timeout_s", profile.timeout_s)
-        _nonnegative_optional(f"llm.profiles[{profile_id!r}].max_retries", profile.max_retries)
-        _nonnegative_optional(f"llm.profiles[{profile_id!r}].temperature", profile.temperature)
-        _positive_optional(f"llm.profiles[{profile_id!r}].max_tokens", profile.max_tokens)
-    _optional_non_empty("llm.safety_identifier", llm.safety_identifier)
-    _optional_max_chars("llm.safety_identifier", llm.safety_identifier, 64)
-    _optional_non_empty("llm.prompt_cache_key", llm.prompt_cache_key)
-    _nonnegative("llm.temperature", llm.temperature)
-    _positive("llm.max_tokens", llm.max_tokens)
-    _positive("llm.timeout_s", llm.timeout_s)
-    _nonnegative("llm.max_retries", llm.max_retries)
-    _positive("llm.compatibility_retry_attempts", llm.compatibility_retry_attempts)
-    _positive("llm.action_repair_attempts", llm.action_repair_attempts)
-    _nonnegative("llm.content_preview_chars", llm.content_preview_chars)
-    _nonnegative("llm.tool_arguments_preview_chars", llm.tool_arguments_preview_chars)
-    _nonnegative("llm.call_record_preview_chars", llm.call_record_preview_chars)
-    _positive("llm.call_record_list_limit", llm.call_record_list_limit)
-    _positive("llm.call_record_hard_limit", llm.call_record_hard_limit)
-    _require_at_least("llm.call_record_hard_limit", llm.call_record_hard_limit, "llm.call_record_list_limit", llm.call_record_list_limit)
-    _require_non_empty("llm.json_instruction", llm.json_instruction)
-    _require_status_codes("llm.fallback_status_codes", llm.fallback_status_codes)
+    _validate_llm_config(config.llm)
 
     tools = config.tools
     _require_non_empty("tools.version", tools.version)
@@ -1288,6 +1251,84 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _require_non_empty("scripts.clock_demo_timezone", scripts.clock_demo_timezone)
     _require_at_least("scripts.document_summary_max_read_bytes", scripts.document_summary_max_read_bytes, "scripts.document_summary_max_bytes", scripts.document_summary_max_bytes)
     _require_at_least("scripts.document_context_max_tokens", scripts.document_context_max_tokens, "scripts.document_context_min_tokens", scripts.document_context_min_tokens)
+
+
+def _validate_llm_config(llm: LLMDefaults) -> None:
+    _require_non_empty("llm.default_profile_id", llm.default_profile_id)
+    if llm.default_profile_id not in llm.profiles:
+        raise ValueError(
+            "llm.default_profile_id does not reference a configured profile: "
+            f"{llm.default_profile_id}"
+        )
+    for profile_id, profile in llm.profiles.items():
+        prefix = f"llm.profiles[{profile_id!r}]"
+        _require_non_empty("llm.profiles key", profile_id)
+        if profile.kind != "openai_compatible":
+            raise ValueError(f"{prefix}.kind is not supported: {profile.kind}")
+        if profile.base_url is not None:
+            _require_non_empty(f"{prefix}.base_url", profile.base_url)
+        if profile.model is not None:
+            _require_non_empty(f"{prefix}.model", profile.model)
+        _require_non_empty(f"{prefix}.api_key_env", profile.api_key_env)
+        if profile.api_mode is not None and profile.api_mode not in {
+            "auto",
+            "responses",
+            "chat",
+        }:
+            raise ValueError(f"{prefix}.api_mode is not supported: {profile.api_mode}")
+        _optional_non_empty(f"{prefix}.safety_identifier", profile.safety_identifier)
+        _optional_max_chars(f"{prefix}.safety_identifier", profile.safety_identifier, 64)
+        _optional_non_empty(
+            f"{prefix}.safety_identifier_env",
+            profile.safety_identifier_env,
+        )
+        _optional_non_empty(f"{prefix}.prompt_cache_key", profile.prompt_cache_key)
+        _positive_optional(f"{prefix}.timeout_s", profile.timeout_s)
+        _nonnegative_optional(f"{prefix}.max_retries", profile.max_retries)
+        _nonnegative_optional(f"{prefix}.temperature", profile.temperature)
+        _positive_optional(f"{prefix}.max_tokens", profile.max_tokens)
+        _positive_optional(
+            f"{prefix}.context_window_tokens",
+            profile.context_window_tokens,
+        )
+        effective_max_tokens = (
+            llm.max_tokens if profile.max_tokens is None else profile.max_tokens
+        )
+        effective_context_window = (
+            llm.context_window_tokens
+            if profile.context_window_tokens is None
+            else profile.context_window_tokens
+        )
+        if effective_max_tokens >= effective_context_window:
+            raise ValueError(
+                f"{prefix} effective max_tokens must be less than "
+                "effective context_window_tokens"
+            )
+    _optional_non_empty("llm.safety_identifier", llm.safety_identifier)
+    _optional_max_chars("llm.safety_identifier", llm.safety_identifier, 64)
+    _optional_non_empty("llm.prompt_cache_key", llm.prompt_cache_key)
+    _nonnegative("llm.temperature", llm.temperature)
+    _positive("llm.max_tokens", llm.max_tokens)
+    _positive("llm.context_window_tokens", llm.context_window_tokens)
+    if llm.max_tokens >= llm.context_window_tokens:
+        raise ValueError("llm.max_tokens must be less than llm.context_window_tokens")
+    _positive("llm.timeout_s", llm.timeout_s)
+    _nonnegative("llm.max_retries", llm.max_retries)
+    _positive("llm.compatibility_retry_attempts", llm.compatibility_retry_attempts)
+    _positive("llm.action_repair_attempts", llm.action_repair_attempts)
+    _nonnegative("llm.content_preview_chars", llm.content_preview_chars)
+    _nonnegative("llm.tool_arguments_preview_chars", llm.tool_arguments_preview_chars)
+    _nonnegative("llm.call_record_preview_chars", llm.call_record_preview_chars)
+    _positive("llm.call_record_list_limit", llm.call_record_list_limit)
+    _positive("llm.call_record_hard_limit", llm.call_record_hard_limit)
+    _require_at_least(
+        "llm.call_record_hard_limit",
+        llm.call_record_hard_limit,
+        "llm.call_record_list_limit",
+        llm.call_record_list_limit,
+    )
+    _require_non_empty("llm.json_instruction", llm.json_instruction)
+    _require_status_codes("llm.fallback_status_codes", llm.fallback_status_codes)
 
 
 def _positive_or_non_empty(name: str, value: object) -> None:

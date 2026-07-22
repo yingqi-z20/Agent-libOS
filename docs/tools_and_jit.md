@@ -92,6 +92,16 @@ projection convenience, not an authority declaration.
 
 ## Context Compaction
 
+Images may invoke compaction automatically before an LLM request by setting
+`planner.context_management.mode: auto_compact` (the default). The attempt is
+made only once per pressure episode and policy fingerprint. It counts as
+successful only when the tool reports `compacted: true` and advances the
+durable LLM-context generation; the current quantum then ends so the next one
+re-materializes context. Unavailable, denied, invalid, resource-exhausted, or
+failed automatic tools are audited and the original model request continues
+without an injected fallback prompt. Human, child, and message waits remain
+durable and retain the automatic episode metadata across reopen.
+
 `compact_process_context` is a model-visible wrapper for bounded long-running
 sessions. It reads the caller process' `llm_context:<pid>` object, spawns a
 `context-compressor:v0` child image with only `process_exit` visible, and

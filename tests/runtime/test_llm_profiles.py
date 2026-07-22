@@ -173,6 +173,38 @@ class TestLLMProfiles:
         finally:
             runtime.close()
 
+    def test_profile_context_window_override_does_not_change_provider_identity(self) -> None:
+        first = Runtime(
+            SQLiteStore(":memory:"),
+            config=AgentLibOSConfig(
+                llm=LLMDefaults(
+                    profiles={
+                        "default": LLMProfile(context_window_tokens=100_000),
+                    }
+                )
+            ),
+        )
+        second = Runtime(
+            SQLiteStore(":memory:"),
+            config=AgentLibOSConfig(
+                llm=LLMDefaults(
+                    profiles={
+                        "default": LLMProfile(context_window_tokens=200_000),
+                    }
+                )
+            ),
+        )
+        try:
+            assert (
+                first.llms.profile_identity_sha256("default")
+                == second.llms.profile_identity_sha256("default")
+            )
+            assert first.llms.resolve("default").context_window_tokens == 100_000
+            assert second.llms.resolve("default").context_window_tokens == 200_000
+        finally:
+            first.close()
+            second.close()
+
     def test_cached_default_client_is_rebuilt_for_new_effective_release_policy(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -617,6 +649,7 @@ class TestUserLLMProfileStore:
                     "api_mode": "chat",
                     "temperature": 0.1,
                     "max_tokens": 8192,
+                    "context_window_tokens": 200000,
                     "auto_wait_on_empty_tool_calls": True,
                     "allow_custom_base_url": False,
                 },
@@ -638,6 +671,7 @@ class TestUserLLMProfileStore:
             assert loaded["qwen3.7-max"].allow_custom_base_url is False
             assert loaded["compat-without-opt-in"].allow_custom_base_url is False
             assert loaded["qwen3.7-max"].auto_wait_on_empty_tool_calls is True
+            assert loaded["qwen3.7-max"].context_window_tokens == 200000
             persisted = json.loads(path.read_text(encoding="utf-8"))["profiles"]["qwen3.7-max"]
             assert persisted["allow_custom_base_url"] is False
             assert "secret" not in path.read_text(encoding="utf-8")
@@ -663,6 +697,16 @@ class TestUserLLMProfileStore:
                 assert "API keys are not accepted" in str(exc)
             else:
                 raise AssertionError("raw API keys should be rejected")
+
+            with pytest.raises(ValidationError, match="max_tokens must be less"):
+                store.upsert(
+                    "window-too-small",
+                    {
+                        "model": "window-too-small",
+                        "api_key_env": "SMALL_API_KEY",
+                        "context_window_tokens": 32_768,
+                    },
+                )
 
     def test_runtime_ashutdown_closes_async_llm_clients(self) -> None:
         async def run() -> bool:
