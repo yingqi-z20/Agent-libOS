@@ -243,16 +243,19 @@ def provider_usage_lower_bound(
         return 0
     if options.get("llm_context_generation") != context_generation:
         return 0
+    if (
+        not previous_response_id
+        or getattr(call, "api", None) != "responses"
+        or str(getattr(call, "response_id", "") or "") != previous_response_id
+    ):
+        # A previous stateless/chat request is not retained by the Provider,
+        # so its input usage says nothing about the current request size.
+        return 0
     usage = getattr(call, "usage", {})
     if not isinstance(usage, dict):
         return 0
     lower_bound = _usage_int(usage, "prompt_tokens", "input_tokens")
-    if (
-        previous_response_id
-        and getattr(call, "api", None) == "responses"
-        and str(getattr(call, "response_id", "") or "") == previous_response_id
-    ):
-        lower_bound = max(lower_bound, _usage_int(usage, "total_tokens"))
+    lower_bound = max(lower_bound, _usage_int(usage, "total_tokens"))
     return lower_bound
 
 
@@ -268,7 +271,9 @@ def assess_context_pressure(
     provider_lower_bound_tokens: int = 0,
 ) -> ContextPressureAssessment:
     local = estimate_request_input_tokens(messages, tools)
-    estimated_input = max(local, max(0, provider_lower_bound_tokens))
+    # In a Responses chain the Provider lower bound is retained history;
+    # `local` is the new request that will be appended to that history.
+    estimated_input = local + max(0, provider_lower_bound_tokens)
     projected = estimated_input + reserved_output_tokens
     ratio = projected / context_window_tokens
     return ContextPressureAssessment(

@@ -89,9 +89,32 @@ _CONTENT_FILTER_OPERATIONS = frozenset(
 _DIFF_OPERATIONS = frozenset({"blame", "diff", "log", "show"})
 _MERGE_OPERATIONS = frozenset({"cherry-pick", "merge", "pull", "rebase", "revert"})
 _FILTER_DRIVER_SUFFIXES = frozenset({"clean", "smudge", "process"})
-_DIFF_DRIVER_SUFFIXES = frozenset({"command"})
+_DIFF_DRIVER_SUFFIXES = frozenset({"command", "textconv"})
 _MERGE_DRIVER_SUFFIXES = frozenset({"driver"})
 _SAFE_REF_SUFFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,500}\Z")
+_REPOSITORY_HTTP_SECURITY_SUFFIXES = frozenset(
+    {
+        "cookiefile",
+        "curloptresolve",
+        "delegation",
+        "emptyauth",
+        "extraheader",
+        "followredirects",
+        "pinnedpubkey",
+        "proxy",
+        "proxyauthmethod",
+        "savecookies",
+        "schannelcheckrevoke",
+        "schannelusesslcainfo",
+        "sslbackend",
+        "sslcapath",
+        "sslcainfo",
+        "sslcert",
+        "sslcertpasswordprotected",
+        "sslkey",
+        "sslverify",
+    }
+)
 
 
 def _configured_driver_is_active(
@@ -677,15 +700,19 @@ class LocalGitProvider:
         except (OSError, ValueError) as exc:
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "invalid Git common directory") from exc
 
-    def _repo_prefix(self, layout: GitRepositoryLayout | tuple[Path, Path, Path]) -> list[str]:
+    def _repo_prefix(
+        self,
+        layout: GitRepositoryLayout | tuple[Path, Path, Path],
+        *,
+        literal_pathspecs: bool = True,
+    ) -> list[str]:
         if isinstance(layout, GitRepositoryLayout):
             worktree, git_dir = layout.root, layout.git_dir
         else:
             worktree, git_dir, _common = layout
         protocol_file = "always" if self.config.allow_file_remotes else "never"
-        return [
+        prefix = [
             "--no-pager",
-            "--literal-pathspecs",
             "-c",
             "core.fsmonitor=false",
             "-c",
@@ -725,6 +752,9 @@ class LocalGitProvider:
             f"--git-dir={git_dir}",
             f"--work-tree={worktree}",
         ]
+        if literal_pathspecs:
+            prefix.insert(1, "--literal-pathspecs")
+        return prefix
 
     def _raw_repo(
         self,
@@ -975,6 +1005,7 @@ class LocalGitProvider:
     def _validate_remote_config_entry(
         self,
         *,
+        scope: str,
         key: str,
         value: str,
         remote: str | None,
@@ -982,6 +1013,24 @@ class LocalGitProvider:
         if remote is None:
             return
         remote_key = f"remote.{remote.casefold()}."
+        if scope in {"local", "worktree"}:
+            suffix = key.rsplit(".", 1)[-1]
+            repository_http_override = (
+                key.startswith("http.")
+                and (
+                    suffix in _REPOSITORY_HTTP_SECURITY_SUFFIXES
+                    or suffix.startswith(("proxyssl", "schannel", "ssl"))
+                )
+            )
+            remote_proxy_override = (
+                key.startswith(remote_key)
+                and suffix in {"proxy", "proxyauthmethod"}
+            )
+            if repository_http_override or remote_proxy_override:
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "repository config cannot override Git HTTP transport security",
+                )
         if key == f"{remote_key}fetch" and not _is_safe_fetch_refspec(value, remote):
             raise self._error(
                 GitErrorCode.UNSAFE_CONFIG,
@@ -1099,6 +1148,7 @@ class LocalGitProvider:
             ):
                 raise self._error(GitErrorCode.UNSAFE_CONFIG, "repository config contains an executable Git extension")
             self._validate_remote_config_entry(
+                scope=scope,
                 key=key,
                 value=value,
                 remote=remote,
@@ -1274,28 +1324,105 @@ class LocalGitProvider:
             except (OSError, ValueError) as exc:
                 raise self._error(GitErrorCode.UNSAFE_CONFIG, "Git attributes exceed their safety bound") from exc
             inspect(raw)
-        for raw in self._tree_attribute_sources(layout, treeish_targets):
+        seen_blobs: set[bytes] = set()
+        for raw in self._index_attribute_sources(layout, seen_blobs=seen_blobs):
+            inspect(raw)
+        for raw in self._tree_attribute_sources(
+            layout,
+            treeish_targets,
+            seen_blobs=seen_blobs,
+        ):
             inspect(raw)
         return drivers
+
+    def _index_attribute_sources(
+        self,
+        layout: GitRepositoryLayout,
+        *,
+        seen_blobs: set[bytes],
+    ) -> Iterator[bytes]:
+        result = self._invoke(
+            [
+                *self._repo_prefix(layout, literal_pathspecs=False),
+                "ls-files",
+                "--stage",
+                "-z",
+                "--",
+                ":(top,glob)**/.gitattributes",
+            ],
+            timeout=self.config.local_timeout_s,
+            stdin=None,
+            max_output_bytes=min(
+                self.config.output_hard_limit_bytes,
+                1_048_576,
+            ),
+            read_only=True,
+            operation="attribute_inspection",
+        )
+        if result.returncode != 0:
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "Git index attributes could not be inspected",
+            )
+        for record in result.stdout.split(b"\0"):
+            if not record:
+                continue
+            header, separator, path = record.partition(b"\t")
+            fields = header.split(b" ")
+            if (
+                not separator
+                or len(fields) != 3
+                or fields[2] not in {b"0", b"1", b"2", b"3"}
+                or not (
+                    path == b".gitattributes"
+                    or path.endswith(b"/.gitattributes")
+                )
+            ):
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "Git index attributes have an unsupported format",
+                )
+            mode, oid, _stage = fields
+            # Git does not follow a symlinked attributes file. Intent-to-add
+            # entries have a null object id and are represented by the
+            # worktree file, which was inspected above.
+            if mode == b"120000" or not oid.strip(b"0"):
+                continue
+            if not re.fullmatch(rb"[0-9a-f]+", oid):
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "Git index attributes have an unsupported entry",
+                )
+            yield from self._attribute_blob_source(
+                layout,
+                oid,
+                seen_blobs=seen_blobs,
+            )
 
     def _tree_attribute_sources(
         self,
         layout: GitRepositoryLayout,
         treeish_targets: Sequence[str],
+        *,
+        seen_blobs: set[bytes],
     ) -> Iterator[bytes]:
-        seen_blobs: set[bytes] = set()
         for target in dict.fromkeys(treeish_targets):
-            result = self._invoke(
+            # ``ls-tree`` does not support glob-magic pathspecs. Grepping for
+            # the empty pattern lists only non-empty attributes blobs, which
+            # are the only blobs capable of declaring a driver, without
+            # enumerating every ordinary file in a large target tree.
+            matched = self._invoke(
                 [
-                    *self._repo_prefix(layout),
-                    "ls-tree",
-                    "-r",
+                    *self._repo_prefix(layout, literal_pathspecs=False),
+                    "grep",
                     "-z",
-                    "--full-tree",
+                    "-l",
+                    "--full-name",
+                    "-e",
+                    "",
                     target,
                     "--",
-                    ".gitattributes",
-                    ":(glob)**/.gitattributes",
+                    ":(top,glob)**/.gitattributes",
                 ],
                 timeout=self.config.local_timeout_s,
                 stdin=None,
@@ -1306,43 +1433,52 @@ class LocalGitProvider:
                 read_only=True,
                 operation="attribute_inspection",
             )
-            if result.returncode != 0:
+            if matched.returncode == 1:
+                continue
+            if matched.returncode != 0:
                 raise self._error(
                     GitErrorCode.STALE_STATE,
                     "Git attribute target could not be inspected",
                     operation="attribute_inspection",
                     retryable=True,
                 )
-            for record in result.stdout.split(b"\0"):
+            target_prefix = os.fsencode(target) + b":"
+            paths: list[bytes] = []
+            for record in matched.stdout.split(b"\0"):
                 if not record:
                     continue
-                header, separator, _path = record.partition(b"\t")
-                fields = header.split(b" ")
-                if not separator or len(fields) != 3:
+                if not record.startswith(target_prefix):
                     raise self._error(
                         GitErrorCode.UNSAFE_CONFIG,
                         "Git attribute tree has an unsupported format",
                     )
-                mode, object_type, oid = fields
-                # Git deliberately does not follow a symlinked attributes
-                # file in a worktree, so its blob content is not active.
-                if mode == b"120000":
-                    continue
-                if object_type != b"blob" or not re.fullmatch(rb"[0-9a-f]+", oid):
+                path = record[len(target_prefix) :]
+                if not (
+                    path == b".gitattributes"
+                    or path.endswith(b"/.gitattributes")
+                ):
                     raise self._error(
                         GitErrorCode.UNSAFE_CONFIG,
-                        "Git attribute tree has an unsupported entry",
+                        "Git attribute tree has an unsupported format",
                     )
-                if oid in seen_blobs:
-                    continue
-                seen_blobs.add(oid)
-                if len(seen_blobs) > 10_000:
+                paths.append(path)
+                if len(paths) > 10_000:
                     raise self._error(
                         GitErrorCode.UNSAFE_CONFIG,
                         "Git attribute discovery exceeded its safety bound",
                     )
-                blob = self._invoke(
-                    [*self._repo_prefix(layout), "cat-file", "blob", os.fsdecode(oid)],
+            for offset in range(0, len(paths), 128):
+                selected = paths[offset : offset + 128]
+                result = self._invoke(
+                    [
+                        *self._repo_prefix(layout),
+                        "ls-tree",
+                        "-z",
+                        "--full-tree",
+                        target,
+                        "--",
+                        *(os.fsdecode(path) for path in selected),
+                    ],
                     timeout=self.config.local_timeout_s,
                     stdin=None,
                     max_output_bytes=min(
@@ -1352,15 +1488,135 @@ class LocalGitProvider:
                     read_only=True,
                     operation="attribute_inspection",
                 )
-                if blob.returncode != 0:
+                if result.returncode != 0:
                     raise self._error(
-                        GitErrorCode.UNSAFE_CONFIG,
-                        "Git attribute blob could not be inspected",
+                        GitErrorCode.STALE_STATE,
+                        "Git attribute target could not be inspected",
+                        operation="attribute_inspection",
+                        retryable=True,
                     )
-                yield blob.stdout
+                remaining = set(selected)
+                for record in result.stdout.split(b"\0"):
+                    if not record:
+                        continue
+                    header, separator, path = record.partition(b"\t")
+                    fields = header.split(b" ")
+                    if (
+                        not separator
+                        or len(fields) != 3
+                        or path not in remaining
+                    ):
+                        raise self._error(
+                            GitErrorCode.UNSAFE_CONFIG,
+                            "Git attribute tree has an unsupported format",
+                        )
+                    remaining.remove(path)
+                    mode, object_type, oid = fields
+                    # Git deliberately does not follow a symlinked attributes
+                    # file in a worktree, so its blob content is not active.
+                    if mode == b"120000":
+                        continue
+                    if object_type != b"blob" or not re.fullmatch(
+                        rb"[0-9a-f]+", oid
+                    ):
+                        raise self._error(
+                            GitErrorCode.UNSAFE_CONFIG,
+                            "Git attribute tree has an unsupported entry",
+                        )
+                    yield from self._attribute_blob_source(
+                        layout,
+                        oid,
+                        seen_blobs=seen_blobs,
+                    )
+                if remaining:
+                    raise self._error(
+                        GitErrorCode.STALE_STATE,
+                        "Git attribute target changed during inspection",
+                        operation="attribute_inspection",
+                        retryable=True,
+                    )
 
-    @staticmethod
-    def _attribute_treeish_targets(args: Sequence[str]) -> tuple[str, ...]:
+    def _attribute_blob_source(
+        self,
+        layout: GitRepositoryLayout,
+        oid: bytes,
+        *,
+        seen_blobs: set[bytes],
+    ) -> Iterator[bytes]:
+        if oid in seen_blobs:
+            return
+        seen_blobs.add(oid)
+        if len(seen_blobs) > 10_000:
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "Git attribute discovery exceeded its safety bound",
+            )
+        blob = self._invoke(
+            [*self._repo_prefix(layout), "cat-file", "blob", os.fsdecode(oid)],
+            timeout=self.config.local_timeout_s,
+            stdin=None,
+            max_output_bytes=min(
+                self.config.output_hard_limit_bytes,
+                1_048_576,
+            ),
+            read_only=True,
+            operation="attribute_inspection",
+        )
+        if blob.returncode != 0:
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "Git attribute blob could not be inspected",
+            )
+        yield blob.stdout
+
+    def _rebase_attribute_targets(
+        self,
+        layout: GitRepositoryLayout,
+        upstream: str,
+    ) -> tuple[str, ...]:
+        result = self._invoke(
+            [
+                *self._repo_prefix(layout),
+                "rev-list",
+                "--reverse",
+                f"{upstream}..HEAD",
+            ],
+            timeout=self.config.local_timeout_s,
+            stdin=None,
+            max_output_bytes=min(
+                self.config.output_hard_limit_bytes,
+                1_048_576,
+            ),
+            read_only=True,
+            operation="attribute_inspection",
+        )
+        if result.returncode != 0:
+            raise self._error(
+                GitErrorCode.STALE_STATE,
+                "Git rebase attribute targets could not be inspected",
+                operation="attribute_inspection",
+                retryable=True,
+            )
+        replayed: list[str] = []
+        for raw_oid in result.stdout.splitlines():
+            if not re.fullmatch(rb"[0-9a-f]+", raw_oid):
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "Git rebase attribute targets have an unsupported format",
+                )
+            replayed.append(raw_oid.decode("ascii"))
+            if len(replayed) > 10_000:
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "Git rebase attribute discovery exceeded its safety bound",
+                )
+        return tuple(dict.fromkeys((upstream, *replayed)))
+
+    def _attribute_treeish_targets(
+        self,
+        layout: GitRepositoryLayout,
+        args: Sequence[str],
+    ) -> tuple[str, ...]:
         checked = list(args)
         if not checked:
             return ()
@@ -1375,7 +1631,25 @@ class LocalGitProvider:
                     return tuple(prefix[index + offset : index + offset + 1])
             positional = [token for token in prefix if not token.startswith("-")]
             return tuple(positional[-1:])
-        if operation in {"merge", "rebase", "cherry-pick", "revert", "reset"}:
+        if operation == "rebase":
+            if prefix == ["--abort"]:
+                return ("ORIG_HEAD",)
+            if any(
+                option in prefix
+                for option in ("--continue", "--skip", "--quit")
+            ):
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "incremental Git rebase modes are not supported",
+                )
+            positional = [token for token in prefix if not token.startswith("-")]
+            if len(positional) != 1:
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "Git rebase target form is not supported",
+                )
+            return self._rebase_attribute_targets(layout, positional[0])
+        if operation in {"merge", "cherry-pick", "revert", "reset"}:
             positional = [token for token in prefix if not token.startswith("-")]
             return tuple(positional[-1:])
         if operation == "worktree" and prefix[:1] == ["add"]:
@@ -1450,7 +1724,9 @@ class LocalGitProvider:
             if parsed.username is not None or parsed.password is not None or parsed.hostname not in {None, "", "localhost"}:
                 raise self._error(GitErrorCode.UNSAFE_CONFIG, "file Git remotes must be local and contain no user information")
             return
-        if scheme not in set(self.config.allowed_remote_schemes):
+        if scheme not in {
+            allowed.casefold() for allowed in self.config.allowed_remote_schemes
+        }:
             raise self._error(GitErrorCode.UNSAFE_CONFIG, "Git remote protocol is not allowed")
         if not parsed.hostname or parsed.password is not None:
             raise self._error(GitErrorCode.UNSAFE_CONFIG, "Git remote URL contains invalid user information")
@@ -2167,7 +2443,7 @@ class LocalGitProvider:
         if any(not isinstance(item, str) or "\x00" in item for item in args):
             raise self._error(GitErrorCode.COMMAND_FAILED, "invalid Git argument", operation=operation)
         before = self.repository_layout(worktree=worktree)
-        treeish_targets = self._attribute_treeish_targets(args)
+        treeish_targets = self._attribute_treeish_targets(before, args)
         self._validate_repository_config(
             before,
             remote=remote,
@@ -2252,14 +2528,24 @@ class LocalGitProvider:
         selected_timeout = self.config.lock_timeout_s if timeout is None else timeout
         if selected_timeout <= 0 or selected_timeout > self.config.timeout_hard_limit_s:
             raise self._error(GitErrorCode.REPOSITORY_BUSY, "invalid repository lock timeout")
-        with self._thread_lock:
+        deadline = time.monotonic() + selected_timeout
+        thread_lock_acquired = self._thread_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        )
+        if not thread_lock_acquired:
+            raise self._error(
+                GitErrorCode.REPOSITORY_BUSY,
+                "Git repository is busy",
+                retryable=True,
+            )
+        try:
             depth = int(getattr(self._lock_state, "depth", 0))
             if depth:
                 self._lock_state.depth = depth + 1
                 try:
                     yield self.repository_layout(worktree=worktree)
                 finally:
-                    self._lock_state.depth -= 1
+                    self._lock_state.depth = depth
                 return
             layout = self.repository_layout(worktree=worktree)
             lock_directory = layout.common_dir / "agent-libos"
@@ -2274,9 +2560,14 @@ class LocalGitProvider:
             except OSError as exc:
                 raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "repository lock could not be opened") from exc
             acquired = False
-            deadline = time.monotonic() + selected_timeout
             try:
                 while not acquired:
+                    if time.monotonic() >= deadline:
+                        raise self._error(
+                            GitErrorCode.REPOSITORY_BUSY,
+                            "Git repository is busy",
+                            retryable=True,
+                        )
                     try:
                         if os.name == "nt":
                             import msvcrt
@@ -2298,7 +2589,7 @@ class LocalGitProvider:
                                 "Git repository is busy",
                                 retryable=True,
                             )
-                        time.sleep(0.02)
+                        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
                 self._lock_state.depth = 1
                 current = self.repository_layout(worktree=worktree)
                 if not self._same_layout(layout, current):
@@ -2320,6 +2611,8 @@ class LocalGitProvider:
                     except OSError:
                         pass
                 os.close(descriptor)
+        finally:
+            self._thread_lock.release()
 
     def classify_external_effect(
         self,

@@ -30,7 +30,7 @@ from urllib.parse import urlsplit
 
 import psutil
 
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import DEFAULT_CONFIG, GitDefaults
 from agent_libos.models import (
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
@@ -54,6 +54,7 @@ from agent_libos.substrate.base import (
     ExecutableSnapshot,
     HierarchicalPathLock,
     PathState,
+    ProviderEffectNotStarted,
     ResolvedPath,
     resolve_runtime_python_alias,
     snapshot_executable,
@@ -84,6 +85,16 @@ _SAFE_SHELL_ENV_KEYS = {
     "TMP",
     "WINDIR",
 }
+
+
+class _ProtectedMetadataDeleteDenied(CapabilityDenied, ProviderEffectNotStarted):
+    """A recursive delete rejected before the provider mutated the tree."""
+
+
+class _ProtectedDeleteState:
+    def __init__(self) -> None:
+        self.mutation_started = False
+
 
 if os.name == "nt":
     import msvcrt
@@ -342,10 +353,42 @@ class LocalFilesystemProvider:
             self._delete_file_under_root(path, target)
             self._target(path)
 
+    def contains_descendant_name(
+        self,
+        path: ResolvedPath,
+        *,
+        names: tuple[str, ...],
+    ) -> bool:
+        with self._path_lock.hold(path.relative):
+            target = self._target(path)
+            return self._contains_descendant_name(target, names)
+
     def delete_directory(self, path: ResolvedPath, *, recursive: bool) -> None:
         with self._path_lock.hold(path.relative):
             target = self._target(path)
-            self._delete_directory_under_root(path, target, recursive=recursive)
+            self._delete_directory_under_root(
+                path,
+                target,
+                recursive=recursive,
+                protected_descendant_names=(),
+            )
+            self._target(path)
+
+    def delete_directory_protected(
+        self,
+        path: ResolvedPath,
+        *,
+        recursive: bool,
+        protected_descendant_names: tuple[str, ...],
+    ) -> None:
+        with self._path_lock.hold(path.relative):
+            target = self._target(path)
+            self._delete_directory_under_root(
+                path,
+                target,
+                recursive=recursive,
+                protected_descendant_names=protected_descendant_names,
+            )
             self._target(path)
 
     def classify_external_effect(
@@ -466,16 +509,37 @@ class LocalFilesystemProvider:
         finally:
             guard.close()
 
-    def _delete_directory_under_root(self, path: ResolvedPath, target: Path, *, recursive: bool) -> None:
+    def _delete_directory_under_root(
+        self,
+        path: ResolvedPath,
+        target: Path,
+        *,
+        recursive: bool,
+        protected_descendant_names: tuple[str, ...],
+    ) -> None:
         if self._supports_dir_fd_deletes():
             dir_fd, name = self._open_parent_dir_fd(target)
             try:
                 self._before_path_sink_checked("delete_directory", target)
                 self._require_directory_component_for_delete(dir_fd, name, target)
                 if recursive:
-                    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
-                        raise CapabilityDenied("recursive directory delete requires symlink-safe rmtree support")
-                    shutil.rmtree(name, dir_fd=dir_fd)
+                    self._reject_protected_descendants(
+                        target,
+                        protected_descendant_names,
+                    )
+                    if protected_descendant_names:
+                        delete_state = _ProtectedDeleteState()
+                        self._delete_protected_directory_at(
+                            dir_fd,
+                            name,
+                            target,
+                            protected_descendant_names,
+                            delete_state,
+                        )
+                    else:
+                        if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+                            raise CapabilityDenied("recursive directory delete requires symlink-safe rmtree support")
+                        shutil.rmtree(name, dir_fd=dir_fd)
                 else:
                     os.rmdir(name, dir_fd=dir_fd)
             finally:
@@ -487,12 +551,229 @@ class LocalFilesystemProvider:
             self._before_path_sink_checked("delete_directory", target)
             self._target(path)
             if recursive:
-                shutil.rmtree(target)
+                self._reject_protected_descendants(
+                    target,
+                    protected_descendant_names,
+                )
+                if protected_descendant_names:
+                    if os.name != "nt":
+                        raise CapabilityDenied(
+                            "protected recursive delete requires descriptor-bound "
+                            "directory operations on this platform"
+                        )
+                    self._delete_protected_directory_path(
+                        target,
+                        protected_descendant_names,
+                        _ProtectedDeleteState(),
+                    )
+                else:
+                    shutil.rmtree(target)
             else:
                 target.rmdir()
         finally:
             if guard is not None:
                 guard.close()
+
+    def _delete_protected_directory_at(
+        self,
+        parent_fd: int,
+        name: str,
+        target: Path,
+        protected_descendant_names: tuple[str, ...],
+        delete_state: _ProtectedDeleteState,
+    ) -> None:
+        try:
+            expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise CapabilityDenied(
+                f"filesystem path changed during recursive delete: {target}"
+            ) from exc
+        directory_fd = self._open_dir_component(parent_fd, name)
+        try:
+            opened = os.fstat(directory_fd)
+            self._require_same_directory_identity(expected, opened, target)
+            self._delete_protected_directory_contents_at(
+                directory_fd,
+                target,
+                protected_descendant_names,
+                delete_state,
+            )
+            try:
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise CapabilityDenied(
+                    f"filesystem path changed during recursive delete: {target}"
+                ) from exc
+            self._require_same_directory_identity(opened, current, target)
+            os.rmdir(name, dir_fd=parent_fd)
+            delete_state.mutation_started = True
+            self._after_protected_delete_entry(target)
+        finally:
+            os.close(directory_fd)
+
+    def _delete_protected_directory_contents_at(
+        self,
+        directory_fd: int,
+        target: Path,
+        protected_descendant_names: tuple[str, ...],
+        delete_state: _ProtectedDeleteState,
+    ) -> None:
+        protected = {name.casefold() for name in protected_descendant_names}
+        names = sorted(os.listdir(directory_fd))
+        if any(name.casefold() in protected for name in names):
+            self._raise_protected_metadata_delete_denied(delete_state)
+        for name in names:
+            child_target = target / name
+            try:
+                child_state = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(child_state.st_mode):
+                try:
+                    self._delete_protected_directory_at(
+                        directory_fd,
+                        name,
+                        child_target,
+                        protected_descendant_names,
+                        delete_state,
+                    )
+                except FileNotFoundError:
+                    continue
+                continue
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+            delete_state.mutation_started = True
+            self._after_protected_delete_entry(child_target)
+
+    def _raise_protected_metadata_delete_denied(
+        self,
+        delete_state: _ProtectedDeleteState,
+    ) -> None:
+        message = "recursive directory delete contains protected metadata"
+        if delete_state.mutation_started:
+            raise CapabilityDenied(message)
+        raise _ProtectedMetadataDeleteDenied(message)
+
+    def _after_protected_delete_entry(self, _target: Path) -> None:
+        return None
+
+    def _require_same_directory_identity(
+        self,
+        expected: os.stat_result,
+        observed: os.stat_result,
+        target: Path,
+    ) -> None:
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or expected.st_dev != observed.st_dev
+            or expected.st_ino != observed.st_ino
+        ):
+            raise CapabilityDenied(
+                f"filesystem directory changed during recursive delete: {target}"
+            )
+
+    def _delete_protected_directory_path(
+        self,
+        target: Path,
+        protected_descendant_names: tuple[str, ...],
+        delete_state: _ProtectedDeleteState,
+    ) -> None:
+        guard = self._windows_directory_guard(target)
+        try:
+            with os.scandir(target) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+            protected = {name.casefold() for name in protected_descendant_names}
+            if any(entry.name.casefold() in protected for entry in entries):
+                self._raise_protected_metadata_delete_denied(delete_state)
+            for entry in entries:
+                child = target / entry.name
+                try:
+                    if child.is_symlink():
+                        child.unlink()
+                        delete_state.mutation_started = True
+                        self._after_protected_delete_entry(child)
+                    elif self._is_reparse_path(child):
+                        child.rmdir()
+                        delete_state.mutation_started = True
+                        self._after_protected_delete_entry(child)
+                    elif entry.is_dir(follow_symlinks=False):
+                        self._delete_protected_directory_path(
+                            child,
+                            protected_descendant_names,
+                            delete_state,
+                        )
+                    else:
+                        child.unlink()
+                        delete_state.mutation_started = True
+                        self._after_protected_delete_entry(child)
+                except FileNotFoundError:
+                    continue
+        finally:
+            guard.close()
+        # Do not rescan after processing the captured entry set. If another
+        # actor inserted metadata in the meantime, rmdir fails non-empty and
+        # leaves that new entry untouched.
+        target.rmdir()
+        delete_state.mutation_started = True
+        self._after_protected_delete_entry(target)
+
+    def _reject_protected_descendants(
+        self,
+        target: Path,
+        protected_descendant_names: tuple[str, ...],
+    ) -> None:
+        if self._contains_descendant_name(target, protected_descendant_names):
+            raise _ProtectedMetadataDeleteDenied(
+                "recursive directory delete contains protected metadata"
+            )
+
+    def _contains_descendant_name(
+        self,
+        target: Path,
+        names: tuple[str, ...],
+    ) -> bool:
+        protected = {name.casefold() for name in names}
+        if not protected:
+            return False
+
+        scan_failed = False
+
+        def record_walk_error(_error: OSError) -> None:
+            nonlocal scan_failed
+            scan_failed = True
+
+        for current, directory_names, file_names in os.walk(
+            target,
+            topdown=True,
+            onerror=record_walk_error,
+            followlinks=False,
+        ):
+            if any(
+                name.casefold() in protected
+                for name in (*directory_names, *file_names)
+            ):
+                return True
+            current_path = Path(current)
+            retained_directories: list[str] = []
+            for name in directory_names:
+                try:
+                    if self._is_reparse_path(current_path / name):
+                        continue
+                except OSError:
+                    scan_failed = True
+                    continue
+                retained_directories.append(name)
+            directory_names[:] = retained_directories
+        # A recursive delete must fail closed if any subtree could not be
+        # inspected. The caller deliberately receives only a boolean so path
+        # names discovered during this policy scan are never exposed.
+        return scan_failed
 
     def _supports_dir_fd_deletes(self) -> bool:
         return (
@@ -500,6 +781,7 @@ class LocalFilesystemProvider:
             and os.stat in os.supports_dir_fd
             and os.unlink in os.supports_dir_fd
             and os.rmdir in os.supports_dir_fd
+            and os.listdir in os.supports_fd
         )
 
     def _open_parent_dir_fd(self, target: Path) -> tuple[int, str]:
@@ -927,10 +1209,34 @@ class LocalShellProvider:
     supports_subprocess_limits = os.name != "nt"
     supports_executable_snapshots = True
 
-    def __init__(self, cwd: str | Path, *, git_config: Any | None = None):
+    def __init__(
+        self,
+        cwd: str | Path,
+        *,
+        git_config: GitDefaults | None = None,
+    ):
         self.cwd = Path(cwd).resolve()
         self._git_config = git_config
         self._git_read_guard: LocalGitProvider | None = None
+
+    @property
+    def git_config(self) -> GitDefaults:
+        """Return the effective Git policy used by raw Git read guards."""
+
+        return self._git_config or DEFAULT_CONFIG.git
+
+    def bind_runtime_git_config(self, git_config: GitDefaults) -> None:
+        """Bind the Runtime-owned Git policy used by legacy raw read guards."""
+
+        if (
+            self._git_read_guard is not None
+            and self._git_read_guard.config != git_config
+        ):
+            raise ValidationError(
+                "local shell provider already initialized a Git guard with "
+                "a different configuration"
+            )
+        self._git_config = git_config
 
     def resolve_argv(self, argv: list[str], *, cwd: str | None = None) -> list[str]:
         return self._resolve_argv0(argv, self._resolve_cwd(cwd))
@@ -2741,10 +3047,13 @@ class LocalResourceProviderSubstrate:
         workspace_root: str | Path,
         namespace: str = _RUNTIME_DEFAULTS.workspace_namespace,
         *,
-        git_config: Any | None = None,
+        git_config: GitDefaults | None = None,
     ):
         self.workspace_root = Path(workspace_root).resolve()
         self.workspace_display = str(self.workspace_root)
+        self._declared_git_config = git_config
+        self._bound_runtime_git_config: GitDefaults | None = None
+        self._git_config_binding_lock = threading.RLock()
         self.filesystem = LocalFilesystemProvider(self.workspace_root, namespace=namespace)
         self.clock = LocalClockProvider()
         self.shell = LocalShellProvider(self.workspace_root, git_config=git_config)
@@ -2752,3 +3061,57 @@ class LocalResourceProviderSubstrate:
         self.human = LocalHumanProvider()
         self.jsonrpc = HttpJsonRpcProvider()
         self.mcp = SdkMcpProvider(self.workspace_root)
+
+    def bind_runtime_git_config(self, git_config: GitDefaults) -> None:
+        """Bind built-in Git boundaries to one authoritative Runtime policy.
+
+        An explicit constructor policy is a caller-owned compatibility
+        contract, so a conflicting Runtime policy is rejected instead of
+        silently choosing one. Substrates created without a policy inherit the
+        Runtime policy at assembly time.
+        """
+
+        with self._git_config_binding_lock:
+            declared = self._declared_git_config
+            if declared is not None and declared != git_config:
+                raise ValidationError(
+                    "local substrate Git configuration does not match the "
+                    "Runtime Git configuration"
+                )
+            bound = self._bound_runtime_git_config
+            if bound is not None and bound != git_config:
+                raise ValidationError(
+                    "local substrate is already bound to a different Runtime "
+                    "Git configuration"
+                )
+
+            current_git = getattr(self, "git", None)
+            replacement_git = current_git
+            if isinstance(current_git, LocalGitProvider):
+                if type(current_git) is LocalGitProvider:
+                    if current_git.config != git_config:
+                        replacement_git = LocalGitProvider(
+                            self.workspace_root,
+                            config=git_config,
+                        )
+                elif current_git.config != git_config:
+                    raise ValidationError(
+                        "local Git provider subclass configuration does not "
+                        "match the Runtime Git configuration"
+                    )
+
+            current_shell = self.shell
+            if (
+                isinstance(current_shell, LocalShellProvider)
+                and type(current_shell) is not LocalShellProvider
+                and current_shell.git_config != git_config
+            ):
+                raise ValidationError(
+                    "local shell provider subclass Git configuration does not "
+                    "match the Runtime Git configuration"
+                )
+            if type(current_shell) is LocalShellProvider:
+                current_shell.bind_runtime_git_config(git_config)
+            if replacement_git is not current_git:
+                self.git = replacement_git
+            self._bound_runtime_git_config = git_config

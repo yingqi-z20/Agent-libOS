@@ -34,6 +34,14 @@ SAFE_PROVIDER_CALLS = frozenset(
         # This narrow, non-dispatching observation follows repository authority
         # and is repeated in the protected phase before a Git mutation runs.
         (Path("agent_libos/primitives/git.py"), "preflight_path_kind"),
+        # Repository locking is a payload-free local synchronization fence.
+        # Git acquires it only after protected-operation preparation and holds
+        # it across final dispatch revalidation, provider I/O, and completion.
+        (Path("agent_libos/primitives/git.py"), "repository_lock"),
+        # This payload-free Git safety preflight validates repository identity,
+        # configuration, and active drivers before a read intent is created;
+        # the protected phase repeats the full state observation before use.
+        (Path("agent_libos/primitives/git.py"), "validate_read_only_operation"),
         (Path("agent_libos/human/delivery.py"), "read"),
         (Path("agent_libos/human/delivery.py"), "write"),
     }

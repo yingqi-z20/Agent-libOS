@@ -249,6 +249,7 @@ class ProtectedOperationInvocation:
     data_flow_target_state_version: str | int | None = None
     data_flow_target_state_version_resolver: TargetStateVersionResolver | None = None
     data_flow_allow_recovered_source_snapshots: bool = False
+    additional_data_sinks: tuple[DataSink, ...] = ()
 
 
 class ProtectedOperationProtocolError(ValidationError):
@@ -483,6 +484,13 @@ class ProtectedOperation:
         self._data_flow_decision: DataFlowDecision | None = None
         self._data_flow_release_decision: CapabilityDecision | None = None
         self._data_flow_release_reservation_id: str | None = None
+        self._additional_data_flow_decisions: tuple[DataFlowDecision, ...] = ()
+        self._additional_data_flow_release_decisions: tuple[
+            CapabilityDecision | None, ...
+        ] = ()
+        self._additional_data_flow_release_reservation_ids: tuple[
+            str | None, ...
+        ] = ()
         self._data_flow_registry_generation: int | None = None
         self._data_flow_ingress_observed = False
         self._operation_cm: Any | None = None
@@ -569,7 +577,7 @@ class ProtectedOperation:
     def call(self, phase: ProviderPhase, function: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
         self._require_active()
         with self._provider_registry_phase_scope():
-            self._dispatch(phase)
+            self._dispatch_or_abort_not_started(phase)
             token = self._activate_boundary(phase)
             try:
                 result = function(*args, **kwargs)
@@ -612,7 +620,7 @@ class ProtectedOperation:
             raise ValidationError(
                 "registry-guarded provider phases must use synchronous call()"
             )
-        self._dispatch(phase)
+        self._dispatch_or_abort_not_started(phase)
         token = self._activate_boundary(phase)
         try:
             result = await function(*args, **kwargs)
@@ -845,8 +853,13 @@ class ProtectedOperation:
 
     def _reserve_decisions(self) -> None:
         decisions = [*self._authority_decisions]
-        if self._data_flow_release_decision is not None:
-            decisions.append(self._data_flow_release_decision)
+        release_decisions = (
+            self._data_flow_release_decision,
+            *self._additional_data_flow_release_decisions,
+        )
+        decisions.extend(
+            decision for decision in release_decisions if decision is not None
+        )
         for decision in decisions:
             cap_id = decision.consume_capability_id
             if cap_id is None:
@@ -865,8 +878,18 @@ class ProtectedOperation:
             ):
                 self._reservation_ids_by_capability[capability_id] = reservation_id
                 self._reservation_ids.append(reservation_id)
-            if decision is self._data_flow_release_decision:
-                self._data_flow_release_reservation_id = reservation_id
+        release_reservation_ids = tuple(
+            None
+            if decision is None or decision.consume_capability_id is None
+            else self._reservation_ids_by_capability.get(
+                str(decision.consume_capability_id)
+            )
+            for decision in release_decisions
+        )
+        self._data_flow_release_reservation_id = release_reservation_ids[0]
+        self._additional_data_flow_release_reservation_ids = (
+            release_reservation_ids[1:]
+        )
 
     def _revalidate_authority(self) -> None:
         if self.contract.authority_mode == AuthorityMode.RUNTIME_INTERNAL:
@@ -1041,6 +1064,7 @@ class ProtectedOperation:
         if not has_egress:
             if (
                 self.invocation.data_sink is not None
+                or self.invocation.additional_data_sinks
                 or self.invocation.data_sink_revalidator is not None
                 or self.invocation.data_flow_context is not None
                 or self.invocation.data_flow_payload is not _DATA_FLOW_PAYLOAD_UNSET
@@ -1062,6 +1086,16 @@ class ProtectedOperation:
             raise ValidationError(
                 f"egress protected operation requires a concrete DataSink: {self.contract.name}"
             )
+        additional_sinks = self.invocation.additional_data_sinks
+        if not isinstance(additional_sinks, tuple) or any(
+            not isinstance(item, DataSink) for item in additional_sinks
+        ):
+            raise ValidationError(
+                "additional egress data Sinks must be a tuple of concrete DataSink values"
+            )
+        sinks = (sink, *additional_sinks)
+        if len({item.identity for item in sinks}) != len(sinks):
+            raise ValidationError("egress data Sink identities must be unique")
         context = self.invocation.data_flow_context
         if not isinstance(context, DataFlowContext):
             raise ValidationError(
@@ -1077,21 +1111,34 @@ class ProtectedOperation:
                 f"egress protected operation requires an operation descriptor: {self.contract.name}"
             )
         payload = self.invocation.data_flow_payload
-        decision, release = manager.authorize_egress(
-            pid=self.invocation.pid,
-            sink=sink,
-            context=context,
-            payload=payload,
-            operation=operation,
-            target_state_version=self.invocation.data_flow_target_state_version,
-            request_release=True,
-            allow_recovered_source_snapshots=(
-                self.invocation.data_flow_allow_recovered_source_snapshots
-            ),
-        )
-        self._data_flow_decision = decision
-        self._data_flow_release_decision = release
-        self._data_flow_registry_generation = decision.registry_generation
+        decisions: list[DataFlowDecision] = []
+        releases: list[CapabilityDecision | None] = []
+        registry_generation: int | None = None
+        for selected_sink in sinks:
+            authorization: dict[str, Any] = {
+                "pid": self.invocation.pid,
+                "sink": selected_sink,
+                "context": context,
+                "payload": payload,
+                "operation": operation,
+                "target_state_version": self.invocation.data_flow_target_state_version,
+                "request_release": True,
+                "allow_recovered_source_snapshots": (
+                    self.invocation.data_flow_allow_recovered_source_snapshots
+                ),
+            }
+            if registry_generation is not None:
+                authorization["expected_registry_generation"] = registry_generation
+            decision, release = manager.authorize_egress(**authorization)
+            if registry_generation is None:
+                registry_generation = decision.registry_generation
+            decisions.append(decision)
+            releases.append(release)
+        self._data_flow_decision = decisions[0]
+        self._data_flow_release_decision = releases[0]
+        self._additional_data_flow_decisions = tuple(decisions[1:])
+        self._additional_data_flow_release_decisions = tuple(releases[1:])
+        self._data_flow_registry_generation = registry_generation
 
     def _observe_data_flow_ingress(self, phase: ProviderPhase) -> None:
         if self._data_flow_ingress_observed or not phase.information_flow:
@@ -1153,7 +1200,8 @@ class ProtectedOperation:
             return
         manager = self.sdk.data_flow
         sink = self.invocation.data_sink
-        assert manager is not None and sink is not None
+        assert manager is not None and isinstance(sink, DataSink)
+        sinks = (sink, *self.invocation.additional_data_sinks)
         context = self.invocation.data_flow_context
         assert isinstance(context, DataFlowContext)
         payload = self.invocation.data_flow_payload
@@ -1162,7 +1210,6 @@ class ProtectedOperation:
         assert operation
         authorization: dict[str, Any] = {
             "pid": self.invocation.pid,
-            "sink": sink,
             "context": context,
             "payload": payload,
             "operation": operation,
@@ -1176,40 +1223,83 @@ class ProtectedOperation:
         resolver = self.invocation.data_flow_target_state_version_resolver
         if resolver is not None:
             authorization["current_target_state_version"] = resolver()
-        if use_reserved_release and self._data_flow_release_decision is not None:
-            reservation_id = self._data_flow_release_reservation_id
-            if reservation_id is None:
-                raise CapabilityDenied(
-                    "data release reservation disappeared before protected dispatch"
-                )
-            authorization.update(
-                reserved_release_decision=self._data_flow_release_decision,
-                reserved_release_id=reservation_id,
-            )
-        decision, release = manager.authorize_egress(
-            **authorization,
+        prepared_releases = (
+            self._data_flow_release_decision,
+            *self._additional_data_flow_release_decisions,
         )
-        if (self._data_flow_release_decision is None) != (release is None):
-            raise CapabilityDenied("data release authority changed before protected dispatch")
-        if release is not None and self._data_flow_release_decision is not None:
-            if release.selected_capability_id != self._data_flow_release_decision.selected_capability_id:
-                raise CapabilityDenied("data release capability changed before protected dispatch")
-        self._data_flow_decision = decision
-        self._data_flow_release_decision = release
+        reservation_ids = (
+            self._data_flow_release_reservation_id,
+            *self._additional_data_flow_release_reservation_ids,
+        )
+        if len(prepared_releases) != len(sinks):
+            raise ProtectedOperationProtocolError(
+                "prepared data-flow release set does not match egress Sinks"
+            )
+        if use_reserved_release and len(reservation_ids) != len(sinks):
+            raise ProtectedOperationProtocolError(
+                "reserved data-flow release set does not match egress Sinks"
+            )
+        decisions: list[DataFlowDecision] = []
+        releases: list[CapabilityDecision | None] = []
+        for index, selected_sink in enumerate(sinks):
+            selected_authorization = {**authorization, "sink": selected_sink}
+            prepared_release = prepared_releases[index]
+            if use_reserved_release and prepared_release is not None:
+                reservation_id = reservation_ids[index]
+                if reservation_id is None:
+                    raise CapabilityDenied(
+                        "data release reservation disappeared before protected dispatch"
+                    )
+                selected_authorization.update(
+                    reserved_release_decision=prepared_release,
+                    reserved_release_id=reservation_id,
+                )
+            decision, release = manager.authorize_egress(**selected_authorization)
+            if (prepared_release is None) != (release is None):
+                raise CapabilityDenied(
+                    "data release authority changed before protected dispatch"
+                )
+            if release is not None and prepared_release is not None:
+                if release.selected_capability_id != prepared_release.selected_capability_id:
+                    raise CapabilityDenied(
+                        "data release capability changed before protected dispatch"
+                    )
+            decisions.append(decision)
+            releases.append(release)
+        self._data_flow_decision = decisions[0]
+        self._data_flow_release_decision = releases[0]
+        self._additional_data_flow_decisions = tuple(decisions[1:])
+        self._additional_data_flow_release_decisions = tuple(releases[1:])
 
     def _data_flow_evidence(self) -> dict[str, Any] | None:
         decision = self._data_flow_decision
         if decision is None:
             return None
         sink = self.invocation.data_sink
+        assert isinstance(sink, DataSink)
+        evidence = self._data_flow_decision_evidence(decision, sink)
+        if self._additional_data_flow_decisions:
+            evidence["additional_egresses"] = [
+                self._data_flow_decision_evidence(selected_decision, selected_sink)
+                for selected_decision, selected_sink in zip(
+                    self._additional_data_flow_decisions,
+                    self.invocation.additional_data_sinks,
+                    strict=True,
+                )
+            ]
+        return evidence
+
+    @staticmethod
+    def _data_flow_decision_evidence(
+        decision: DataFlowDecision,
+        sink: DataSink,
+    ) -> dict[str, Any]:
         return {
             "decision_id": decision.decision_id,
             "sink": decision.sink,
-            "sink_identity_sha256": sink.identity_sha256 if sink is not None else None,
-            "sink_trust_identity": sink.registry_identity if sink is not None else None,
-            "sink_trust_identity_sha256": (
-                sink.registry_identity_sha256 if sink is not None else None
-            ),
+            "sink_identity_sha256": sink.identity_sha256,
+            "sink_trust_identity": sink.registry_identity,
+            "sink_trust_identity_sha256": sink.registry_identity_sha256,
             "direction": decision.direction.value,
             "outcome": decision.outcome.value,
             "reason": decision.reason,
@@ -1265,6 +1355,21 @@ class ProtectedOperation:
             self._persist_rolled_back_data_flow_denial(error)
             raise
         self._dispatched = True
+
+    def _dispatch_or_abort_not_started(self, phase: ProviderPhase) -> None:
+        try:
+            self._dispatch(phase)
+        except BaseException:
+            if not any(
+                item.state_mutation
+                or item.information_flow
+                or item.commits_authority
+                for item in self._completed_phases
+            ):
+                self._abort_not_started(
+                    "provider_dispatch_rejected_after_non_effectful_phases"
+                )
+            raise
 
     def _record_completed_phase(self, phase: ProviderPhase) -> None:
         if self.effect_id is None:

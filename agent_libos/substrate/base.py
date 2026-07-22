@@ -55,7 +55,15 @@ class HierarchicalPathLock:
         self._root_tokens = threading.local()
 
     @staticmethod
-    def _parts(path: str) -> tuple[str, ...]:
+    def order_key(path: str) -> tuple[str, ...]:
+        """Return the canonical key used to order and compare path scopes.
+
+        Callers that need to acquire several scopes can sort by this key to
+        preserve the lock's canonical acquisition order.  The key is also
+        suitable for coalescing aliases that this lock deliberately treats as
+        the same path.
+        """
+
         normalized = str(path).replace("\\", "/").strip("/")
         if normalized in {"", "."}:
             return ()
@@ -64,6 +72,10 @@ class HierarchicalPathLock:
             for part in normalized.split("/")
             if part not in {"", "."}
         )
+
+    @classmethod
+    def _parts(cls, path: str) -> tuple[str, ...]:
+        return cls.order_key(path)
 
     @staticmethod
     def creation_scope(path: str) -> str:
@@ -715,7 +727,22 @@ class FilesystemProvider(Protocol):
 
     def delete_file(self, path: ResolvedPath) -> None: ...
 
+    def contains_descendant_name(
+        self,
+        path: ResolvedPath,
+        *,
+        names: tuple[str, ...],
+    ) -> bool: ...
+
     def delete_directory(self, path: ResolvedPath, *, recursive: bool) -> None: ...
+
+    def delete_directory_protected(
+        self,
+        path: ResolvedPath,
+        *,
+        recursive: bool,
+        protected_descendant_names: tuple[str, ...],
+    ) -> None: ...
 
     def classify_external_effect(
         self,

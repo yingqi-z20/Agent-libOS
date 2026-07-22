@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import GitErrorCode
@@ -111,7 +111,10 @@ class GitRestoreArgs(GitPathsMutationArgs):
 
 
 class GitBranchArgs(_StrictArgs):
-    action: Literal["create", "delete", "rename"]
+    operation: Literal["create", "delete", "rename"] = Field(
+        validation_alias=AliasChoices("operation", "action"),
+        serialization_alias="action",
+    )
     name: str
     expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
     start: str | None = None
@@ -131,7 +134,10 @@ class GitSwitchArgs(_StrictArgs):
 
 
 class GitTagArgs(_StrictArgs):
-    action: Literal["create", "delete"]
+    operation: Literal["create", "delete"] = Field(
+        validation_alias=AliasChoices("operation", "action"),
+        serialization_alias="action",
+    )
     name: str
     expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
     target: str | None = None
@@ -149,7 +155,10 @@ class GitIntegrateArgs(_StrictArgs):
 
 
 class GitStashArgs(_StrictArgs):
-    action: Literal["push", "apply", "pop", "drop", "clear"]
+    operation: Literal["push", "apply", "pop", "drop", "clear"] = Field(
+        validation_alias=AliasChoices("operation", "action"),
+        serialization_alias="action",
+    )
     expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
     index: int = Field(default=0, ge=0, le=100_000)
     include_untracked: bool = False
@@ -173,7 +182,10 @@ class GitCleanArgs(_StrictArgs):
 
 
 class GitWorktreeArgs(_StrictArgs):
-    action: Literal["create", "remove"]
+    operation: Literal["create", "remove"] = Field(
+        validation_alias=AliasChoices("operation", "action"),
+        serialization_alias="action",
+    )
     expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
     ref: str | None = None
     new_branch: str | None = None
@@ -312,7 +324,7 @@ class _GitTool(SyncAgentTool[_StrictArgs]):
         try:
             result = getattr(ctx.runtime.git, self.method_name)(
                 pid=ctx.pid,
-                **args.model_dump(exclude_none=True),
+                **args.model_dump(exclude_none=True, by_alias=True),
             )
         except GitError as exc:
             raise _git_tool_error(exc) from exc

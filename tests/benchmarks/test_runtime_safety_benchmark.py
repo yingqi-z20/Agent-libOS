@@ -230,6 +230,92 @@ class TestRuntimeSafetyBenchmark:
             prepare_workspace(task, suite, tmp_path / 'run', 'agent_libos_full')
         assert not sentinel.exists()
 
+    def test_workspace_git_setup_uses_trusted_host_git_and_safe_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        suite = tmp_path / 'suite'
+        source = suite / 'fixtures' / 'repo'
+        source.mkdir(parents=True)
+        (source / 'payload.txt').write_text('payload\n', encoding='utf-8')
+        fake_git_name = 'git.cmd' if os.name == 'nt' else 'git'
+        fake_git = source / fake_git_name
+        fake_git.write_text(
+            '@exit /b 97\r\n' if os.name == 'nt' else '#!/bin/sh\nexit 97\n',
+            encoding='utf-8',
+        )
+        if os.name != 'nt':
+            fake_git.chmod(0o700)
+
+        run_root = tmp_path / 'run'
+        target = run_root / 'workspaces' / 'agent_libos_full' / 'path_boundary'
+        inherited_path = os.environ.get('PATH', os.defpath)
+        monkeypatch.setenv('PATH', os.pathsep.join((str(target), inherited_path)))
+        original_run = subprocess.run
+        fixture_dispatches = 0
+
+        def guarded_run(argv, *args, **kwargs):
+            nonlocal fixture_dispatches
+            cwd = Path(kwargs['cwd']).resolve(strict=False)
+            if cwd == target.resolve(strict=False):
+                fixture_dispatches += 1
+                assert Path(argv[0]).is_absolute()
+                child_path = str(kwargs['env']['PATH']).split(os.pathsep)
+                assert target.resolve(strict=False) not in {
+                    Path(item).resolve(strict=False) for item in child_path if item
+                }
+            return original_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, 'run', guarded_run)
+        task = _minimal_task(
+            workspace='fixtures/repo',
+            setup={'git': {'initialize': True}},
+        )
+
+        prepared = prepare_workspace(task, suite, run_root, 'agent_libos_full')
+
+        assert fixture_dispatches == 6
+        assert (prepared / '.git').is_dir()
+
+    def test_workspace_git_setup_creates_commit_and_post_commit_files(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        suite = tmp_path / 'suite'
+        source = suite / 'fixtures' / 'repo'
+        source.mkdir(parents=True)
+        (source / 'payload.txt').write_text('committed\n', encoding='utf-8')
+        task = _minimal_task(
+            workspace='fixtures/repo',
+            setup={
+                'git': {
+                    'initialize': True,
+                    'post_commit_files': [
+                        {'path': 'working.txt', 'content': 'uncommitted\n'},
+                    ],
+                },
+            },
+        )
+
+        prepared = prepare_workspace(
+            task,
+            suite,
+            tmp_path / 'run',
+            'agent_libos_full',
+        )
+
+        assert (prepared / '.git' / 'HEAD').read_text(encoding='utf-8').strip() == (
+            'ref: refs/heads/main'
+        )
+        commit_oid = (
+            prepared / '.git' / 'refs' / 'heads' / 'main'
+        ).read_text(encoding='utf-8').strip()
+        assert len(commit_oid) == 40
+        assert all(character in '0123456789abcdef' for character in commit_oid)
+        assert (prepared / '.git' / 'index').is_file()
+        assert (prepared / 'working.txt').read_text(encoding='utf-8') == 'uncommitted\n'
+
     def test_workspace_setup_files_cannot_inject_git_filter_config(
         self,
         tmp_path: Path,

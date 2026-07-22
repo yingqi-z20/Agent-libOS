@@ -1400,7 +1400,7 @@ class PtyAdapter:
             self.shell_policy.snapshot_executable_for_dispatch(
                 pid=plan.pid,
                 provider=self.provider,
-                requested_argv0=guards.provider_argv[0],
+                requested_argv0=plan.argv[0],
                 provider_argv0=guards.provider_argv[0],
                 cwd=plan.cwd,
                 expected_sink=plan.spawn_sink,

@@ -146,10 +146,16 @@ class FilesystemAdapter:
         It intentionally exposes no underlying lock implementation.
         """
 
-        normalized = sorted(dict.fromkeys(str(path) for path in paths))
+        paths_by_order_key: dict[tuple[str, ...], str] = {}
+        for path in paths:
+            display_path = str(path)
+            order_key = self._file_label_io_lock.order_key(display_path)
+            paths_by_order_key.setdefault(order_key, display_path)
         with ExitStack() as stack:
-            for path in normalized:
-                stack.enter_context(self._file_label_io_lock.hold(path))
+            for order_key in sorted(paths_by_order_key):
+                stack.enter_context(
+                    self._file_label_io_lock.hold(paths_by_order_key[order_key])
+                )
             yield
 
     def validate_directory(
@@ -1367,12 +1373,72 @@ class FilesystemAdapter:
                     intent_record=intent.get("record"),
                 )
                 raise error
-            protected.call(
-                ProviderPhase("delete", state_mutation=True, information_flow=True),
-                self.provider.delete_directory,
-                target,
-                recursive=recursive,
+            protected_descendant_names = (
+                (".git",)
+                if recursive and self.config.git.protect_git_metadata
+                else ()
             )
+            if protected_descendant_names:
+                protected_metadata_scan = getattr(
+                    self.provider,
+                    "contains_descendant_name",
+                    None,
+                )
+                protected_directory_delete = getattr(
+                    self.provider,
+                    "delete_directory_protected",
+                    None,
+                )
+                if not callable(protected_metadata_scan) or not callable(
+                    protected_directory_delete
+                ):
+                    error = ValidationError(
+                        "filesystem provider must support protected recursive deletion"
+                    )
+                    self._complete_state_rejection(
+                        protected,
+                        pid=pid,
+                        target=resource,
+                        audit_action="primitive.filesystem.delete_directory.rejected",
+                        context=effect_context,
+                        error=error,
+                        intent_record=intent.get("record"),
+                    )
+                    raise error
+                contains_protected_metadata = protected.call(
+                    ProviderPhase("protected_metadata_scan", information_flow=True),
+                    protected_metadata_scan,
+                    target,
+                    names=protected_descendant_names,
+                )
+                if contains_protected_metadata:
+                    error = CapabilityDenied(
+                        "Git metadata is only accessible through the Runtime Git primitive"
+                    )
+                    self._complete_state_rejection(
+                        protected,
+                        pid=pid,
+                        target=resource,
+                        audit_action="primitive.filesystem.delete_directory.rejected",
+                        context=effect_context,
+                        error=error,
+                        intent_record=intent.get("record"),
+                    )
+                    raise error
+                protected.call(
+                    ProviderPhase("delete", state_mutation=True, information_flow=True),
+                    protected_directory_delete,
+                    target,
+                    recursive=True,
+                    protected_descendant_names=protected_descendant_names,
+                )
+            else:
+                protected.call(
+                    ProviderPhase("delete", state_mutation=True, information_flow=True),
+                    self.provider.delete_directory,
+                    target,
+                    recursive=recursive,
+                )
             result = DeleteResult(
                 path=relative, kind="directory", deleted=True, recursive=recursive
             )

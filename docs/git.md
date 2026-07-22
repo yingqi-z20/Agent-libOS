@@ -40,7 +40,9 @@ a proper subdirectory of the workspace and outside `.git`. The Runtime creates
 the path and opaque id; the model cannot supply an arbitrary destination. The
 provider adds that root to the repository-local `info/exclude` without editing
 the tracked `.gitignore`. Removal is explicit, and unknown or dirty worktrees
-are never automatically deleted.
+are never automatically deleted. Listing uses the configured managed-root
+identity rather than following a later symlink replacement, so an external
+checkout cannot become visible by redirecting that root.
 
 ## Public Runtime and tool surface
 
@@ -159,12 +161,14 @@ operation fails `unsafe_repository_config` before dispatch when its active
 configuration or attributes select an external clean/smudge/process filter,
 LFS filter, diff command, merge driver, alternate-refs command, custom SSH
 command, upload/receive pack, remote helper, promisor/partial clone, shell
-credential helper, repository credential helper, or workspace-controlled
-include. Commands that materialize a target tree inspect its `.gitattributes`
-blobs as well as the current worktree, so a checkout cannot activate a
-previously dormant driver during materialization. Hooks are redirected to an
-empty Host-owned directory and commands also use `--no-verify` where
-applicable.
+credential helper, repository credential helper, repository-scoped HTTP
+proxy/TLS/header/cookie/redirect override, or workspace-controlled include.
+Commands that materialize a target tree inspect its `.gitattributes` blobs as
+well as the current worktree and index, including nested and binary attribute
+files. Rebase inspects every bounded replay candidate. A checkout, blame, or
+rebase therefore cannot activate a previously dormant filter, diff command, or
+`textconv` driver. Hooks are redirected to an empty Host-owned directory and
+commands also use `--no-verify` where applicable.
 
 Commit author/committer identity is read from effective repository or Host Git
 configuration. The model can supply only the commit message; author overrides,
@@ -172,6 +176,10 @@ environment identity, signing, and editor invocation are unavailable.
 
 Filesystem reads/writes/deletes reject `.git` path components, the worktree
 `.git` file, and Git metadata aliases when `git.protect_git_metadata` is true.
+Recursive deletion preflights and then removes entries without following
+symlinks or reparse points; it fails closed if any descendant is Git metadata,
+including metadata inserted during traversal. A partial deletion is recorded
+as an unknown mutation rather than certified as not started.
 The typed Git provider is the only Runtime primitive that mutates repository
 metadata; filesystem capability does not authorize metadata access.
 
@@ -214,10 +222,12 @@ Host configuration option for controlled deployments and deterministic tests.
 HTTPS may use standard Host credential helpers only when the helper was loaded
 from system/global config, resolves to an executable outside the workspace,
 and its executable identity can be hashed. `!shell` helpers and repository
-helpers are forbidden. SSH uses a Host-resolved OpenSSH executable, batch mode,
-the inherited SSH agent when enabled, no user config, no forwarding, and no
-proxy/local commands. Authentication material is never placed in model-visible
-argv, tool results, audit, events, or provider error text.
+helpers are forbidden. Host system/global HTTP proxy and TLS policy remains
+available, while repository-local transport overrides are forbidden. SSH uses
+a Host-resolved OpenSSH executable, batch mode, the inherited SSH agent when
+enabled, no user config, no forwarding, and no proxy/local commands.
+Authentication material is never placed in model-visible argv, tool results,
+audit, events, or provider error text.
 
 Before approval the primitive captures hashes of the fetch/push URLs, effective
 configuration, credential/SSH executable identities, remote-tracking refs, and
@@ -236,9 +246,15 @@ requests.
 `git_create_patch` creates an immutable `ObjectType.CODE_PATCH`. Its payload
 contains the complete patch bytes, base/head/index OIDs, source state token,
 changed byte-safe paths, byte count, and SHA-256. Object provenance and data
-labels include the files that contributed to the patch. If the complete patch
-exceeds `git.patch_max_bytes` or the Object hard limit, the call fails without
-creating an Object.
+labels include the files, index, and every returned commit that contributed to
+the patch. Git diff, show, log, and blame reads recover the same lineage and
+revalidate repository and label generations before returning. A monotonic,
+repository-scoped content carrier also preserves the highest classification of
+every Runtime-mediated mutation. It is bound after final policy revalidation
+and before the first Host effect, so renamed or deleted content, ref-only
+outputs, long histories, and post-effect settlement failures cannot lose their
+lineage. If the complete patch exceeds `git.patch_max_bytes` or the Object hard
+limit, the call fails without creating an Object.
 
 `git_apply_patch` accepts only an existing patch Object created by this
 primitive. It validates the artifact hash and schema, checks the expected state,
@@ -253,7 +269,11 @@ directory. Creation captures base/head OIDs and patch hash. Review supports
 comment, approve, and request-changes. Close retains evidence. Merge supports
 fast-forward, merge commit, and squash, always compares the live base/head and
 metadata hashes with the recorded values, requires a clean selected worktree,
-and uses mandatory approval. These records do not contact a hosting platform.
+and uses mandatory approval. PR metadata has persistent per-record and
+collection lineage, prebound before provider writes so an unknown settlement
+cannot downgrade later inspection. Creation and merge must pass both the PR
+sink and repository sink clearances in one protected operation. These records
+do not contact a hosting platform.
 
 ## Stable errors and recovery
 

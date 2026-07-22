@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import GitError
+from agent_libos.substrate import LocalGitProvider
 from benchmarks.runtime_safety.loader import _safe_relative_path
 from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationError
 
@@ -71,6 +73,14 @@ def _apply_setup_git(task: BenchmarkTask, workspace: Path) -> None:
             f"{task.id}: setup.git must enable deterministic initialize"
         )
 
+    provider = LocalGitProvider(workspace, config=DEFAULT_CONFIG.git)
+    try:
+        executable, _identity, _digest = provider._resolve_executable()
+    except GitError as exc:
+        raise BenchmarkValidationError(
+            f"{task.id}: deterministic Git fixture setup could not resolve trusted Host Git"
+        ) from exc
+
     with tempfile.TemporaryDirectory(prefix="agent-libos-benchmark-git-") as isolated:
         isolated_root = Path(isolated)
         global_config = isolated_root / "global-config"
@@ -83,7 +93,6 @@ def _apply_setup_git(task: BenchmarkTask, workspace: Path) -> None:
                 "COMSPEC",
                 "LANG",
                 "LC_ALL",
-                "PATH",
                 "PATHEXT",
                 "SYSTEMROOT",
                 "TEMP",
@@ -97,6 +106,7 @@ def _apply_setup_git(task: BenchmarkTask, workspace: Path) -> None:
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": str(global_config),
                 "GIT_TERMINAL_PROMPT": "0",
+                "PATH": provider._safe_path(),
             }
         )
 
@@ -104,7 +114,7 @@ def _apply_setup_git(task: BenchmarkTask, workspace: Path) -> None:
             try:
                 result = subprocess.run(
                     [
-                        DEFAULT_CONFIG.git.executable,
+                        str(executable),
                         "-c",
                         f"core.hooksPath={hooks}",
                         *args,

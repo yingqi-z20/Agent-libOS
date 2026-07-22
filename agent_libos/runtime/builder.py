@@ -2349,11 +2349,16 @@ class RuntimeBuilder(Generic[RuntimeT]):
         config: AgentLibOSConfig | None,
     ) -> None:
         host.config = config or DEFAULT_CONFIG
-        host.substrate = substrate or LocalResourceProviderSubstrate(
-            Path.cwd().resolve(),
-            namespace=host.config.runtime.workspace_namespace,
-            git_config=host.config.git,
-        )
+        if substrate is None:
+            host.substrate = LocalResourceProviderSubstrate(
+                Path.cwd().resolve(),
+                namespace=host.config.runtime.workspace_namespace,
+                git_config=host.config.git,
+            )
+        else:
+            host.substrate = substrate
+            if isinstance(substrate, LocalResourceProviderSubstrate):
+                substrate.bind_runtime_git_config(host.config.git)
         host.workspace_root = Path(
             getattr(
                 host.substrate,

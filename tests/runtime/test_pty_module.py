@@ -942,6 +942,156 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
+    def test_workspace_launcher_identity_pins_resolved_host_executable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if os.name == "nt":
+            pytest.skip("executable PTY snapshots require POSIX exec semantics")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "workspace"
+            commands = root / "commands"
+            host_commands = base / "host-commands"
+            commands.mkdir(parents=True)
+            host_commands.mkdir()
+            launcher = commands / "late-tool"
+            executable = host_commands / "trusted-tool"
+            trusted = commands / "trusted.txt"
+            stolen = commands / "stolen.txt"
+            executable.write_text(
+                "#!/bin/sh\nprintf trusted > trusted.txt\nprintf 'ready\\n'\nsleep 2\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            provider = LocalPtyProvider(root)
+            runtime = _open_pty_runtime(str(root), provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="pin a late-resolved PTY workspace launcher",
+                )
+                runtime.shell.grant_policy(
+                    pid,
+                    runtime.config.shell.always_allow_level,
+                    issued_by="test",
+                )
+                adapter = _pty_adapter(runtime)
+                adapter.resources = None
+                original_sink = adapter.shell_policy.executable_data_sink
+
+                def link_after_workspace_scope_check(
+                    namespace: str,
+                    argv0: str,
+                    *,
+                    cwd: str | os.PathLike[str] | None = None,
+                ) -> DataSink:
+                    if not launcher.is_symlink():
+                        launcher.symlink_to(executable)
+                    return original_sink(namespace, argv0, cwd=cwd)
+
+                monkeypatch.setattr(
+                    adapter.shell_policy,
+                    "executable_data_sink",
+                    link_after_workspace_scope_check,
+                )
+                original_mark_dispatched = (
+                    protected_operations.mark_external_effect_dispatched
+                )
+                dispatch_count = 0
+
+                def replace_after_final_validation(store: Any, effect_id: str) -> Any:
+                    nonlocal dispatch_count
+                    result = original_mark_dispatched(store, effect_id)
+                    dispatch_count += 1
+                    if dispatch_count == 2:
+                        executable.write_text(
+                            "#!/bin/sh\nprintf stolen > stolen.txt\nprintf 'replacement\\n'\nsleep 2\n",
+                            encoding="utf-8",
+                        )
+                        executable.chmod(0o755)
+                    return result
+
+                monkeypatch.setattr(
+                    protected_operations,
+                    "mark_external_effect_dispatched",
+                    replace_after_final_validation,
+                )
+
+                created = adapter.create(
+                    pid,
+                    ["./late-tool"],
+                    cwd="commands",
+                    startup_timeout_s=0.2,
+                )
+
+                assert dispatch_count >= 2
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and not trusted.exists():
+                    time.sleep(0.01)
+                assert trusted.read_text(encoding="utf-8") == "trusted"
+                assert not stolen.exists()
+                adapter.close(pid, created.session_oid)
+            finally:
+                runtime.close()
+
+    def test_host_path_pty_executable_does_not_require_snapshot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if os.name == "nt":
+            pytest.skip("host PATH control uses POSIX sh")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            provider = LocalPtyProvider(root)
+            snapshot_required: list[bool] = []
+            original_snapshot_required = provider.executable_snapshot_required
+
+            def record_snapshot_requirement(
+                executable: str,
+                *,
+                requested_argv0: str | None = None,
+                cwd: str | None = None,
+            ) -> bool:
+                required = original_snapshot_required(
+                    executable,
+                    requested_argv0=requested_argv0,
+                    cwd=cwd,
+                )
+                snapshot_required.append(required)
+                return required
+
+            monkeypatch.setattr(
+                provider,
+                "executable_snapshot_required",
+                record_snapshot_requirement,
+            )
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="run an immutable Host PATH executable",
+                )
+                runtime.shell.grant_policy(
+                    pid,
+                    runtime.config.shell.always_allow_level,
+                    issued_by="test",
+                )
+                adapter = _pty_adapter(runtime)
+                adapter.resources = None
+
+                created = adapter.create(
+                    pid,
+                    ["sh", "-c", "printf 'ready\\n'; sleep 2"],
+                    cwd=".",
+                    startup_timeout_s=0.2,
+                )
+
+                assert snapshot_required == [False]
+                adapter.close(pid, created.session_oid)
+            finally:
+                runtime.close()
+
     def test_replaced_pty_executable_loses_secret_sink_trust_before_spawn(
         self,
         monkeypatch: pytest.MonkeyPatch,

@@ -28,7 +28,11 @@ from agent_libos.models import (
     SinkTrustLevel,
     SinkTrustRule,
 )
-from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    HumanApprovalRequired,
+    ValidationError,
+)
 from agent_libos.sdk import (
     PostProviderFailureMode,
     ProviderRegistryBinding,
@@ -133,6 +137,78 @@ def _ingress_setup(runtime):
         data_flow_ingress_context=context,
     )
     return pid, capability, contract, invocation, context
+
+
+def _multi_sink_egress_setup(
+    runtime,
+    *,
+    trust_level: SinkTrustLevel = SinkTrustLevel.CONDITIONAL,
+    mutable_source: bool = False,
+):
+    pid, capability, base_contract, base_invocation = _setup(runtime)
+    source = runtime.memory.create_object(
+        pid,
+        ObjectType.EVIDENCE,
+        {"value": "MULTI_SINK_SECRET_SENTINEL"},
+        metadata=ObjectMetadata(sensitivity="secret"),
+        immutable=not mutable_source,
+    )
+    primary_sink = DataSink("test:multi-sink-primary")
+    additional_sink = DataSink("test:multi-sink-additional")
+    for sink in (primary_sink, additional_sink):
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=sink.identity,
+                trust_level=trust_level,
+                max_sensitivity="secret",
+            ),
+            actor="test.host",
+            require_capability=False,
+        )
+    contract = replace(
+        base_contract,
+        name="primitive.test.multi_sink_egress",
+        operation="send",
+        data_flow_direction=DataFlowDirection.EGRESS,
+    )
+    runtime.protected_operations.register_contract(contract)
+    invocation = replace(
+        base_invocation,
+        target=primary_sink.identity,
+        data_sink=primary_sink,
+        additional_data_sinks=(additional_sink,),
+        data_flow_context=runtime.data_flow.context_from_source_oids(
+            pid,
+            [source.oid],
+        ),
+        data_flow_payload={"value": "MULTI_SINK_SECRET_SENTINEL"},
+        data_flow_operation="test.multi_sink_egress",
+        data_flow_target_state_version="state-v1",
+        data_flow_target_state_version_resolver=lambda: "state-v1",
+    )
+    return (
+        pid,
+        capability,
+        contract,
+        invocation,
+        primary_sink,
+        additional_sink,
+        source,
+    )
+
+
+def _approve_multi_sink_releases(runtime, contract, invocation) -> None:
+    for _index in range(2):
+        with pytest.raises(HumanApprovalRequired):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ):
+                raise AssertionError("provider body must not run before all releases")
+        processed = runtime.human.drain_terminal_queue(auto_approve=True)
+        assert len(processed) == 1
+        assert processed[0].payload["type"] == "data_release_approval"
 
 
 def test_sdk_revalidates_provider_registry_binding_before_every_phase() -> None:
@@ -568,7 +644,595 @@ def test_sdk_unknown_effect_preserves_payload_free_data_flow_evidence() -> None:
         assert evidence["trust_sha256"] == trust.spec_hash
         assert evidence["registry_generation"] == trust.generation
         assert evidence["payload_sha256"]
+        assert "additional_egresses" not in evidence
         assert sentinel not in str(effect.provider_metadata)
+
+
+def test_sdk_multi_sink_releases_restore_and_commit_atomically() -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            primary_sink,
+            additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(runtime)
+        _approve_multi_sink_releases(runtime, contract, invocation)
+        release_caps = {
+            cap.resource.removeprefix("data_release:"): cap
+            for cap in runtime.capability.capabilities_for(pid)
+            if cap.resource.startswith("data_release:")
+        }
+        assert set(release_caps) == {
+            primary_sink.identity,
+            additional_sink.identity,
+        }
+        assert all(cap.uses_remaining == 1 for cap in release_caps.values())
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        effect_ids_before = {
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+        }
+
+        reservation_ids: tuple[str, ...] = ()
+        with pytest.raises(
+            ProtectedOperationProtocolError,
+            match="without provider phase",
+        ):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                reservation_ids = tuple(operation._reservation_ids)
+                assert len(reservation_ids) == 3
+                assert operation._data_flow_release_reservation_id is not None
+                assert operation._additional_data_flow_release_reservation_ids == (
+                    reservation_ids[-1],
+                )
+
+        assert {
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+        } == effect_ids_before
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert all(
+            runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            for cap in release_caps.values()
+        )
+        assert all(
+            runtime.store.get_capability_use_reservation(reservation_id)["status"]
+            == "restored"
+            for reservation_id in reservation_ids
+        )
+
+        provider_calls = 0
+
+        def send() -> str:
+            nonlocal provider_calls
+            provider_calls += 1
+            return "sent"
+
+        with runtime.protected_operations.start(
+            contract,
+            invocation,
+            provider=_Provider(),
+        ) as operation:
+            result = operation.call(
+                ProviderPhase("send", information_flow=True),
+                send,
+            )
+            operation.complete(result, _evidence(pid))
+
+        assert provider_calls == 1
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
+        assert all(
+            runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+            for cap in release_caps.values()
+        )
+        effects = [
+            effect
+            for effect in runtime.store.list_external_effects(pid=pid)
+            if effect.effect_id not in effect_ids_before
+        ]
+        assert len(effects) == 1
+        effect = effects[0]
+        data_flow = effect.provider_metadata["data_flow"]
+        assert data_flow["sink"] == primary_sink.identity
+        assert data_flow["release_capability_id"] == release_caps[
+            primary_sink.identity
+        ].cap_id
+        assert [item["sink"] for item in data_flow["additional_egresses"]] == [
+            additional_sink.identity
+        ]
+        assert data_flow["additional_egresses"][0][
+            "release_capability_id"
+        ] == release_caps[additional_sink.identity].cap_id
+        assert "MULTI_SINK_SECRET_SENTINEL" not in str(effect.provider_metadata)
+
+
+def test_sdk_multi_sink_missing_additional_reservation_blocks_provider() -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            primary_sink,
+            additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(runtime)
+        _approve_multi_sink_releases(runtime, contract, invocation)
+        release_caps = {
+            cap.resource.removeprefix("data_release:"): cap
+            for cap in runtime.capability.capabilities_for(pid)
+            if cap.resource.startswith("data_release:")
+        }
+        effect_ids_before = {
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+        }
+        provider_calls = 0
+
+        with pytest.raises(
+            CapabilityDenied,
+            match="data release reservation disappeared",
+        ):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                assert operation._data_flow_release_reservation_id is not None
+                assert operation._additional_data_flow_release_reservation_ids[0]
+                operation._additional_data_flow_release_reservation_ids = (None,)
+
+                def send() -> str:
+                    nonlocal provider_calls
+                    provider_calls += 1
+                    return "sent"
+
+                operation.call(
+                    ProviderPhase("send", information_flow=True),
+                    send,
+                )
+
+        assert provider_calls == 0
+        assert {
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+        } == effect_ids_before
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert set(release_caps) == {
+            primary_sink.identity,
+            additional_sink.identity,
+        }
+        assert all(
+            runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            for cap in release_caps.values()
+        )
+
+
+def test_sdk_multi_sink_registry_change_between_preflights_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            _primary_sink,
+            additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(
+            runtime,
+            trust_level=SinkTrustLevel.TRUSTED,
+        )
+        original = runtime.data_flow.authorize_egress
+        authorization_calls = 0
+
+        def authorize_and_change_registry(**kwargs):
+            nonlocal authorization_calls
+            result = original(**kwargs)
+            authorization_calls += 1
+            if authorization_calls == 1:
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern=additional_sink.identity,
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                    ),
+                    actor="test.host",
+                    replace=True,
+                    require_capability=False,
+                )
+            return result
+
+        monkeypatch.setattr(
+            runtime.data_flow,
+            "authorize_egress",
+            authorize_and_change_registry,
+        )
+        provider_calls = 0
+        with pytest.raises(CapabilityDenied, match="registry generation changed"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ):
+                provider_calls += 1
+
+        assert authorization_calls == 1
+        assert provider_calls == 0
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+
+
+def test_sdk_multi_sink_registry_change_before_dispatch_blocks_provider() -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            _primary_sink,
+            additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(
+            runtime,
+            trust_level=SinkTrustLevel.TRUSTED,
+        )
+        provider_calls = 0
+
+        with pytest.raises(CapabilityDenied, match="registry generation changed"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern=additional_sink.identity,
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity="secret",
+                    ),
+                    actor="test.host",
+                    replace=True,
+                    require_capability=False,
+                )
+
+                def send() -> str:
+                    nonlocal provider_calls
+                    provider_calls += 1
+                    return "sent"
+
+                operation.call(
+                    ProviderPhase("send", information_flow=True),
+                    send,
+                )
+
+        assert provider_calls == 0
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+
+
+def test_sdk_multi_sink_source_change_before_dispatch_blocks_provider() -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            _primary_sink,
+            _additional_sink,
+            source,
+        ) = _multi_sink_egress_setup(
+            runtime,
+            trust_level=SinkTrustLevel.TRUSTED,
+            mutable_source=True,
+        )
+        provider_calls = 0
+
+        with pytest.raises(CapabilityDenied, match="source Object changed"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                runtime.memory.update_object(
+                    pid,
+                    source,
+                    ObjectPatch(payload={"value": "changed-after-prepare"}),
+                )
+
+                def send() -> str:
+                    nonlocal provider_calls
+                    provider_calls += 1
+                    return "sent"
+
+                operation.call(
+                    ProviderPhase("send", information_flow=True),
+                    send,
+                )
+
+        assert provider_calls == 0
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+
+
+def test_sdk_multi_sink_additional_denial_blocks_provider() -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            _primary_sink,
+            additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(
+            runtime,
+            trust_level=SinkTrustLevel.TRUSTED,
+        )
+        runtime.data_flow.unregister_sink_trust(
+            additional_sink.identity,
+            actor="test.host",
+            require_capability=False,
+        )
+        provider_calls = 0
+
+        with pytest.raises(CapabilityDenied, match="exceeds Sink maximum"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ):
+                provider_calls += 1
+
+        assert provider_calls == 0
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+        denied = runtime.store.list_data_flow_decisions(pid=pid, outcome="deny")
+        assert denied[-1].sink == additional_sink.identity
+
+
+def test_sdk_rejects_duplicate_multi_sink_identity_before_effect_intent() -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            primary_sink,
+            _additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(
+            runtime,
+            trust_level=SinkTrustLevel.TRUSTED,
+        )
+        duplicate = replace(
+            invocation,
+            additional_data_sinks=(primary_sink,),
+        )
+
+        with pytest.raises(ValidationError, match="identities must be unique"):
+            with runtime.protected_operations.start(
+                contract,
+                duplicate,
+                provider=_Provider(),
+            ):
+                pass
+
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+
+
+def test_sdk_rejects_additional_sink_for_non_egress_contract() -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, contract, invocation = _setup(runtime)
+        invalid = replace(
+            invocation,
+            additional_data_sinks=(DataSink("test:unexpected-additional"),),
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match="non-egress protected operation",
+        ):
+            with runtime.protected_operations.start(
+                contract,
+                invalid,
+                provider=_Provider(),
+            ):
+                pass
+
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+
+
+def test_sdk_multi_sink_unknown_provider_effect_consumes_all_releases() -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            primary_sink,
+            additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(runtime)
+        _approve_multi_sink_releases(runtime, contract, invocation)
+        release_caps = {
+            cap.resource.removeprefix("data_release:"): cap
+            for cap in runtime.capability.capabilities_for(pid)
+            if cap.resource.startswith("data_release:")
+        }
+        effect_ids_before = {
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+        }
+
+        with pytest.raises(RuntimeError, match="ambiguous multi-sink failure"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                operation.call(
+                    ProviderPhase("send", information_flow=True),
+                    lambda: (_ for _ in ()).throw(
+                        RuntimeError("ambiguous multi-sink failure")
+                    ),
+                )
+
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
+        assert set(release_caps) == {
+            primary_sink.identity,
+            additional_sink.identity,
+        }
+        assert all(
+            runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+            for cap in release_caps.values()
+        )
+        effects = [
+            effect
+            for effect in runtime.store.list_external_effects(pid=pid)
+            if effect.effect_id not in effect_ids_before
+        ]
+        assert len(effects) == 1
+        assert effects[0].transaction_state == "unknown"
+        assert len(
+            effects[0].provider_metadata["data_flow"]["additional_egresses"]
+        ) == 1
+
+
+def test_sdk_multi_sink_certified_not_started_restores_all_releases() -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            primary_sink,
+            additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(runtime)
+        _approve_multi_sink_releases(runtime, contract, invocation)
+        release_caps = {
+            cap.resource.removeprefix("data_release:"): cap
+            for cap in runtime.capability.capabilities_for(pid)
+            if cap.resource.startswith("data_release:")
+        }
+        effect_ids_before = {
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+        }
+
+        with pytest.raises(ProviderEffectNotStarted, match="not started"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                operation.call(
+                    ProviderPhase("send", information_flow=True),
+                    lambda: (_ for _ in ()).throw(
+                        ProviderEffectNotStarted("multi-sink not started")
+                    ),
+                )
+
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert set(release_caps) == {
+            primary_sink.identity,
+            additional_sink.identity,
+        }
+        assert all(
+            runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            for cap in release_caps.values()
+        )
+        assert {
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+        } == effect_ids_before
+
+
+def test_sdk_dispatch_rejection_after_non_effectful_phase_restores_all_releases() -> None:
+    with temporary_runtime() as runtime:
+        (
+            pid,
+            capability,
+            contract,
+            invocation,
+            primary_sink,
+            additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(runtime)
+        _approve_multi_sink_releases(runtime, contract, invocation)
+        release_caps = {
+            cap.resource.removeprefix("data_release:"): cap
+            for cap in runtime.capability.capabilities_for(pid)
+            if cap.resource.startswith("data_release:")
+        }
+        effect_ids_before = {
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+        }
+        current_target_state = ["state-v1"]
+        raced_invocation = replace(
+            invocation,
+            data_flow_target_state_version_resolver=lambda: current_target_state[0],
+        )
+        mutation_calls = 0
+
+        with pytest.raises(
+            CapabilityDenied,
+            match="target state version changed",
+        ):
+            with runtime.protected_operations.start(
+                contract,
+                raced_invocation,
+                provider=_Provider(),
+            ) as operation:
+                assert operation.call(
+                    ProviderPhase(
+                        "repository_lock",
+                        commits_authority=False,
+                    ),
+                    lambda: "locked",
+                ) == "locked"
+                current_target_state[0] = "state-v2"
+
+                def mutate() -> str:
+                    nonlocal mutation_calls
+                    mutation_calls += 1
+                    return "mutated"
+
+                operation.call(
+                    ProviderPhase(
+                        "mutate",
+                        state_mutation=True,
+                        information_flow=True,
+                    ),
+                    mutate,
+                )
+
+        assert mutation_calls == 0
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert set(release_caps) == {
+            primary_sink.identity,
+            additional_sink.identity,
+        }
+        assert all(
+            runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            for cap in release_caps.values()
+        )
+        assert {
+            effect.effect_id
+            for effect in runtime.store.list_external_effects(pid=pid)
+        } == effect_ids_before
 
 
 def test_sdk_required_resource_policy_charges_preflight_on_provider_failure() -> None:

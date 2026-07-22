@@ -1504,7 +1504,7 @@ def test_delete_serializes_pre_unlink_against_secret_label_publication(
                 [CapabilityRight.DELETE],
                 issued_by="test.host",
             )
-            original_delete = runtime.filesystem.provider.delete_directory
+            original_delete = runtime.filesystem.provider.delete_directory_protected
 
             def delete_target() -> None:
                 runtime.filesystem.delete_directory(
@@ -1513,7 +1513,7 @@ def test_delete_serializes_pre_unlink_against_secret_label_publication(
                     recursive=True,
                 )
 
-            provider_method = "delete_directory"
+            provider_method = "delete_directory_protected"
 
         with pytest.raises(HumanApprovalRequired):
             runtime.filesystem.write_text(
@@ -1894,7 +1894,7 @@ def test_recursive_directory_delete_uses_atomic_label_snapshot(
 
         provider_calls = {"state": 0, "delete": 0}
         original_state = runtime.filesystem.provider.state
-        original_delete = runtime.filesystem.provider.delete_directory
+        original_delete = runtime.filesystem.provider.delete_directory_protected
 
         def track_state(*args: Any, **kwargs: Any):
             provider_calls["state"] += 1
@@ -1912,7 +1912,7 @@ def test_recursive_directory_delete_uses_atomic_label_snapshot(
         monkeypatch.setattr(runtime.filesystem.provider, "state", track_state)
         monkeypatch.setattr(
             runtime.filesystem.provider,
-            "delete_directory",
+            "delete_directory_protected",
             track_delete,
         )
 
@@ -1966,7 +1966,7 @@ def test_recursive_directory_delete_preserves_post_dispatch_replacement_binding(
         release_delete = threading.Event()
         writer_started = threading.Event()
         writer_complete = threading.Event()
-        original_delete = runtime.filesystem.provider.delete_directory
+        original_delete = runtime.filesystem.provider.delete_directory_protected
         delete_error: list[BaseException] = []
         writer_error: list[BaseException] = []
 
@@ -2002,7 +2002,7 @@ def test_recursive_directory_delete_preserves_post_dispatch_replacement_binding(
 
         monkeypatch.setattr(
             runtime.filesystem.provider,
-            "delete_directory",
+            "delete_directory_protected",
             blocking_delete,
         )
         delete_thread = threading.Thread(target=run_delete, daemon=True)

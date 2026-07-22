@@ -204,6 +204,143 @@ def test_auto_compaction_failure_is_silent_and_model_call_continues(
         runtime.close()
 
 
+@pytest.mark.parametrize("failure_kind", ["result", "exception"])
+def test_auto_compaction_generation_change_rebuilds_before_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    image = AgentImage(
+        image_id=f"generation-change-{failure_kind}:v0",
+        name=f"generation-change-{failure_kind}",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime, client, pid = _runtime_with_image(image)
+    original_dispatch = runtime.llm.adispatch
+
+    async def dispatch(
+        selected_pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if action.get("action") != "compact_process_context":
+            return await original_dispatch(
+                selected_pid,
+                action,
+                context_metadata=context_metadata,
+            )
+        runtime.store.set_llm_context_generation(
+            selected_pid,
+            "generation-after-failed-maintenance",
+        )
+        if failure_kind == "exception":
+            raise RuntimeError("failure after changing context generation")
+        return {
+            "ok": False,
+            "tool_id": "tool_context",
+            "result_oid": None,
+            "payload": None,
+            "error": "failure after changing context generation",
+        }
+
+    monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        changed = runtime.run_next_process_once()
+
+        assert changed["context_generation_changed"] is True
+        assert changed["context_management_failed"] is True
+        assert client.user_prompts == []
+        assert runtime.store.list_llm_calls(pid=pid) == []
+
+        rebuilt = runtime.run_next_process_once()
+
+        assert rebuilt["ok"] is True
+        assert len(client.user_prompts) == 1
+        call = runtime.store.get_latest_llm_call(
+            pid=pid,
+            purpose="action_selection",
+        )
+        assert call is not None
+        assert (
+            call.request_options["llm_context_generation"]
+            == "generation-after-failed-maintenance"
+        )
+    finally:
+        runtime.close()
+
+
+def test_completed_context_marker_does_not_reuse_terminal_llm_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="completed-marker-operation:v0",
+        name="completed-marker-operation",
+        default_tools=[
+            "compact_process_context",
+            "create_memory_object",
+            "process_exit",
+        ],
+    )
+    runtime, _client, pid = _runtime_with_image(
+        image,
+        actions=[
+            {
+                "action": "create_memory_object",
+                "type": "observation",
+                "payload": {"step": 1},
+            },
+            {"action": "process_exit", "payload": {"done": True}},
+        ],
+    )
+    original_dispatch = runtime.llm.adispatch
+
+    async def dispatch(
+        selected_pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if action.get("action") == "compact_process_context":
+            return {
+                "ok": False,
+                "tool_id": "tool_context",
+                "result_oid": None,
+                "payload": None,
+                "error": "test failure",
+            }
+        return await original_dispatch(
+            selected_pid,
+            action,
+            context_metadata=context_metadata,
+        )
+
+    monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        first = runtime.run_next_process_once()
+        assert first["ok"] is True
+        marker = runtime.store.get_llm_pending_action(pid)
+        assert marker is not None and marker["status"] == "completed"
+        marker_operation_id = marker["llm_operation_id"]
+
+        second = runtime.run_next_process_once()
+
+        assert second["ok"] is True
+        llm_operations = [
+            operation
+            for operation in runtime.store.list_operations(pid=pid)
+            if operation.name == "llm.action_selection"
+        ]
+        assert len(llm_operations) == 2
+        assert len({operation.operation_id for operation in llm_operations}) == 2
+        assert marker_operation_id in {
+            operation.operation_id for operation in llm_operations
+        }
+    finally:
+        runtime.close()
+
+
 def test_auto_attempt_marker_prevents_replay_after_interrupted_reopen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

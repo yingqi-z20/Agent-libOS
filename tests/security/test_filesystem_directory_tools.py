@@ -1,5 +1,6 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import os
 import pytest
 import shutil
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any, Iterator
 from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
@@ -78,6 +80,257 @@ class TestFilesystemDirectoryTool:
             and effect.rollback_status == ExternalEffectRollbackStatus.NOT_SUPPORTED
             for effect in mutation_effects
         )
+
+    @pytest.mark.parametrize(
+        ('metadata_path', 'metadata_kind'),
+        [
+            ('repository/.git', 'directory'),
+            ('managed-worktree/.git', 'file'),
+        ],
+    )
+    def test_recursive_delete_rejects_descendant_git_metadata(
+        self,
+        metadata_path: str,
+        metadata_kind: str,
+    ) -> None:
+        base = f'agent_outputs/protected_git_metadata_{uuid4().hex}'
+        target = self.runtime.workspace_root / base
+        metadata = target / metadata_path
+        if metadata_kind == 'directory':
+            metadata.mkdir(parents=True)
+            (metadata / 'config').write_text('[core]\n', encoding='utf-8')
+        else:
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text('gitdir: /trusted/metadata\n', encoding='utf-8')
+        payload = target / 'payload.txt'
+        payload.write_text('preserve me', encoding='utf-8')
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='protect nested git metadata')
+        self.runtime.filesystem.grant_directory(
+            pid,
+            base,
+            [CapabilityRight.DELETE],
+            issued_by='test',
+        )
+
+        with pytest.raises(CapabilityDenied, match='Git metadata'):
+            self.runtime.filesystem.delete_directory(pid, base, recursive=True)
+
+        assert metadata.exists()
+        assert payload.read_text(encoding='utf-8') == 'preserve me'
+        resource = self.runtime.filesystem.directory_resource_for_path(base)
+        rejection = next(
+            record
+            for record in self.runtime.audit.trace(actor=pid, target=resource)
+            if record.action == 'primitive.filesystem.delete_directory.rejected'
+        )
+        assert rejection.decision['outcome'] == 'rejected_after_state_observation'
+        rejection_event = next(
+            event
+            for event in self.runtime.events.list(target=resource)
+            if event.type == EventType.EXTERNAL_READ
+            and event.payload.get('outcome') == 'rejected_after_state_observation'
+        )
+        assert rejection_event.payload['error_type'] == 'CapabilityDenied'
+        effects = self.runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].state_mutation is False
+        assert effects[0].information_flow is True
+
+    def test_recursive_delete_allows_similarly_named_non_metadata_entries(self) -> None:
+        base = f'agent_outputs/non_git_metadata_{uuid4().hex}'
+        target = self.runtime.workspace_root / base
+        (target / '.github').mkdir(parents=True)
+        (target / '.gitignore').write_text('*.tmp\n', encoding='utf-8')
+        (target / '.github' / 'workflow.yml').write_text('name: test\n', encoding='utf-8')
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='delete ordinary directory')
+        self.runtime.filesystem.grant_directory(
+            pid,
+            base,
+            [CapabilityRight.DELETE],
+            issued_by='test',
+        )
+
+        result = self.runtime.filesystem.delete_directory(pid, base, recursive=True)
+
+        assert result.deleted
+        assert not target.exists()
+
+    def test_recursive_delete_does_not_follow_descendant_reparse_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            outside_root = Path(outside)
+            target = root / 'parent'
+            target.mkdir()
+            external_metadata = outside_root / '.git'
+            external_metadata.mkdir()
+            external_config = external_metadata / 'config'
+            external_config.write_text('[core]\n', encoding='utf-8')
+            _create_directory_reparse_link(target / 'external-link', outside_root)
+            runtime = self._runtime_with_filesystem_provider(
+                root,
+                LocalFilesystemProvider(root),
+            )
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='delete reparse link safely')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    'parent',
+                    [CapabilityRight.DELETE],
+                    issued_by='test',
+                )
+
+                result = runtime.filesystem.delete_directory(
+                    pid,
+                    'parent',
+                    recursive=True,
+                )
+
+                assert result.deleted
+                assert not target.exists()
+                assert external_config.read_text(encoding='utf-8') == '[core]\n'
+            finally:
+                runtime.close()
+
+    def test_recursive_delete_preserves_git_metadata_inserted_after_sink_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            target = root / 'parent'
+            target.mkdir()
+            payload = target / 'payload.txt'
+            payload.write_text('preserve me', encoding='utf-8')
+            provider = PostScanGitMetadataInjectionProvider(root)
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='protect post-scan git metadata')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    'parent',
+                    [CapabilityRight.DELETE],
+                    issued_by='test',
+                )
+
+                with pytest.raises(CapabilityDenied, match='protected metadata'):
+                    runtime.filesystem.delete_directory(pid, 'parent', recursive=True)
+
+                assert provider.injected
+                assert (target / '.git' / 'config').exists()
+                assert payload.read_text(encoding='utf-8') == 'preserve me'
+                effects = runtime.store.list_external_effects(pid=pid)
+                assert len(effects) == 1
+                assert effects[0].state_mutation is False
+                assert effects[0].information_flow is True
+                assert (
+                    effects[0].provider_metadata['outcome']
+                    == 'partial_not_started_after_prior_provider_effect'
+                )
+            finally:
+                runtime.close()
+
+    def test_recursive_delete_preserves_git_metadata_inserted_after_entry_enumeration(self) -> None:
+        if os.listdir not in os.supports_fd:
+            pytest.skip('descriptor-bound recursive delete is not used on this platform')
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            target = root / 'parent'
+            target.mkdir()
+            (target / 'payload.txt').write_text('ordinary payload', encoding='utf-8')
+            provider = PostEnumerationGitMetadataInjectionProvider(root)
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='protect late git metadata')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    'parent',
+                    [CapabilityRight.DELETE],
+                    issued_by='test',
+                )
+
+                with pytest.raises(OSError):
+                    runtime.filesystem.delete_directory(pid, 'parent', recursive=True)
+
+                assert provider.injected
+                assert (target / '.git' / 'config').exists()
+            finally:
+                runtime.close()
+
+    def test_recursive_delete_records_partial_mutation_before_late_child_metadata(self) -> None:
+        if os.listdir not in os.supports_fd:
+            pytest.skip('descriptor-bound recursive delete is not used on this platform')
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            target = root / 'parent'
+            target.mkdir()
+            ordinary = target / '00-ordinary.txt'
+            ordinary.write_text('delete first', encoding='utf-8')
+            (target / '99-child').mkdir()
+            provider = LateChildGitMetadataInjectionProvider(root)
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='track partial protected delete')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    'parent',
+                    [CapabilityRight.DELETE],
+                    issued_by='test',
+                )
+
+                with pytest.raises(CapabilityDenied, match='protected metadata'):
+                    runtime.filesystem.delete_directory(pid, 'parent', recursive=True)
+
+                assert provider.injected
+                assert not ordinary.exists()
+                assert (target / '99-child' / '.git' / 'config').exists()
+                effects = runtime.store.list_external_effects(pid=pid)
+                assert len(effects) == 1
+                assert effects[0].state_mutation is True
+                assert (
+                    effects[0].provider_metadata['outcome']
+                    == 'unknown_after_provider_exception'
+                )
+                assert effects[0].provider_metadata['error_type'] == 'CapabilityDenied'
+            finally:
+                runtime.close()
+
+    def test_recursive_delete_fails_closed_for_legacy_provider_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            recursive_target = root / 'recursive'
+            recursive_target.mkdir()
+            payload = recursive_target / 'payload.txt'
+            payload.write_text('preserve me', encoding='utf-8')
+            empty_target = root / 'empty'
+            empty_target.mkdir()
+            provider = LegacyDeleteDirectoryProvider(root)
+            runtime = self._runtime_with_filesystem_provider(root, provider)
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='legacy filesystem provider')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    '.',
+                    [CapabilityRight.DELETE],
+                    issued_by='test',
+                )
+
+                with pytest.raises(
+                    ValidationError,
+                    match='provider must support protected recursive deletion',
+                ):
+                    runtime.filesystem.delete_directory(
+                        pid,
+                        'recursive',
+                        recursive=True,
+                    )
+
+                assert payload.read_text(encoding='utf-8') == 'preserve me'
+                deleted = runtime.filesystem.delete_directory(
+                    pid,
+                    'empty',
+                    recursive=False,
+                )
+                assert deleted.deleted
+                assert not empty_target.exists()
+            finally:
+                runtime.close()
 
     def test_filesystem_post_provider_event_failure_leaves_durable_unknown_effect_intent(
         self,
@@ -384,6 +637,95 @@ class TestFilesystemDirectoryTool:
         assert not first.is_alive()
         assert not second.is_alive()
         assert errors == []
+
+    def test_file_label_path_batch_uses_canonical_lock_order(self) -> None:
+        class BarrierPathLock(HierarchicalPathLock):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first_attempts = threading.Barrier(2)
+                self.distinct_acquisitions = threading.Barrier(2)
+                self.first_keys: dict[int, tuple[str, ...]] = {}
+                self.first_keys_lock = threading.Lock()
+
+            @contextmanager
+            def hold(self, path: str) -> Iterator[None]:
+                owner = threading.get_ident()
+                with self.first_keys_lock:
+                    first = owner not in self.first_keys
+                    if first:
+                        self.first_keys[owner] = self.order_key(path)
+                if first:
+                    self.first_attempts.wait(timeout=5)
+                with super().hold(path):
+                    if first and len(set(self.first_keys.values())) > 1:
+                        self.distinct_acquisitions.wait(timeout=5)
+                    yield
+
+        path_lock = BarrierPathLock()
+        self.runtime.filesystem._file_label_io_lock = path_lock
+        entered: list[tuple[str, ...]] = []
+        errors: list[BaseException] = []
+
+        def hold_paths(paths: list[str]) -> None:
+            try:
+                with self.runtime.filesystem.hold_file_label_io_paths(paths):
+                    entered.append(tuple(paths))
+            except BaseException as exc:
+                errors.append(exc)
+
+        first_paths = ['A/x', 'b/y']
+        second_paths = ['B/y', 'a/x']
+        first = threading.Thread(
+            target=hold_paths,
+            args=(first_paths,),
+            daemon=True,
+        )
+        second = threading.Thread(
+            target=hold_paths,
+            args=(second_paths,),
+            daemon=True,
+        )
+        first.start()
+        second.start()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert set(entered) == {tuple(first_paths), tuple(second_paths)}
+        assert set(path_lock.first_keys.values()) == {('a', 'x')}
+
+    def test_file_label_path_batch_coalesces_canonical_aliases(self) -> None:
+        class RecordingPathLock(HierarchicalPathLock):
+            def __init__(self) -> None:
+                super().__init__()
+                self.acquired: list[tuple[str, ...]] = []
+
+            @contextmanager
+            def hold(self, path: str) -> Iterator[None]:
+                self.acquired.append(self.order_key(path))
+                with super().hold(path):
+                    yield
+
+        path_lock = RecordingPathLock()
+        self.runtime.filesystem._file_label_io_lock = path_lock
+
+        with self.runtime.filesystem.hold_file_label_io_paths(
+            ['Tree/é.TXT', 'tree/é.txt', 'other/file.txt']
+        ):
+            assert path_lock.acquired == [
+                ('other', 'file.txt'),
+                ('tree', 'é.txt'),
+            ]
+
+        assert path_lock.acquired == [
+            ('other', 'file.txt'),
+            ('tree', 'é.txt'),
+        ]
+        with self.runtime.filesystem.hold_file_label_io_paths(['ordinary.txt']):
+            pass
+        assert path_lock.acquired[-1] == ('ordinary.txt',)
 
     def test_hierarchical_path_lock_does_not_starve_queued_ancestor(self) -> None:
         path_lock = HierarchicalPathLock()
@@ -979,6 +1321,68 @@ class SinkSwapProvider(LocalFilesystemProvider):
         _remove_directory_for_swap(link)
         _create_directory_reparse_link(link, self.outside)
         self.swapped = True
+
+
+class PostScanGitMetadataInjectionProvider(LocalFilesystemProvider):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.injected = False
+
+    def _reject_protected_descendants(
+        self,
+        target: Path,
+        protected_descendant_names: tuple[str, ...],
+    ) -> None:
+        super()._reject_protected_descendants(target, protected_descendant_names)
+        metadata = target / '.git'
+        metadata.mkdir()
+        (metadata / 'config').write_text('[core]\n', encoding='utf-8')
+        self.injected = True
+
+
+class PostEnumerationGitMetadataInjectionProvider(LocalFilesystemProvider):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.injected = False
+
+    def _delete_protected_directory_contents_at(
+        self,
+        directory_fd: int,
+        target: Path,
+        protected_descendant_names: tuple[str, ...],
+        delete_state: Any,
+    ) -> None:
+        super()._delete_protected_directory_contents_at(
+            directory_fd,
+            target,
+            protected_descendant_names,
+            delete_state,
+        )
+        if self.injected:
+            return
+        metadata = target / '.git'
+        metadata.mkdir()
+        (metadata / 'config').write_text('[core]\n', encoding='utf-8')
+        self.injected = True
+
+
+class LateChildGitMetadataInjectionProvider(LocalFilesystemProvider):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.injected = False
+
+    def _after_protected_delete_entry(self, target: Path) -> None:
+        if self.injected or target.name != '00-ordinary.txt':
+            return
+        metadata = target.parent / '99-child' / '.git'
+        metadata.mkdir()
+        (metadata / 'config').write_text('[core]\n', encoding='utf-8')
+        self.injected = True
+
+
+class LegacyDeleteDirectoryProvider(LocalFilesystemProvider):
+    contains_descendant_name = None
+    delete_directory_protected = None
 
 
 class FallbackOpenSwapProvider(LocalFilesystemProvider):

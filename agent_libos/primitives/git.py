@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+import unicodedata
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -135,10 +136,19 @@ class _GitFlowSnapshot:
     state_version_resolver: Callable[[], str]
 
 
+@dataclass(frozen=True, slots=True)
+class _GitReadFlowSnapshot:
+    flow: _GitFlowSnapshot
+    repository_state_token: str
+    refresh: Callable[[], _GitFlowSnapshot]
+
+
 _GitFlowSnapshotResolver = Callable[
     [Sequence[tuple[bytes | None, bool]]],
     _GitFlowSnapshot,
 ]
+
+_GitReadFlowSnapshotResolver = Callable[[], _GitReadFlowSnapshot]
 
 
 def _sha256(value: bytes) -> str:
@@ -234,6 +244,15 @@ class GitPrimitive:
         if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
             raise GitError(GitErrorCode.STALE_STATE.value, "expected_state_token is invalid")
         return value
+
+    @staticmethod
+    def _stable_generated_id(prefix: str, *parts: str | None) -> str:
+        material = json.dumps(
+            [prefix, *parts],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"{prefix}_{_sha256(material)[:32]}"
 
     @staticmethod
     def _decode_path(value: str | GitPath | dict[str, Any]) -> bytes:
@@ -492,6 +511,8 @@ class GitPrimitive:
         extra: dict[str, Any] | None = None,
         resource: str | None = None,
         source_oids: Iterable[str] | None = None,
+        flow_snapshot_resolver: _GitReadFlowSnapshotResolver | None = None,
+        flow_lock_paths: Sequence[str] = (),
     ) -> _T:
         target = resource or self.repository_resource
         context = self._operation_context(
@@ -510,22 +531,44 @@ class GitPrimitive:
             question=f"Allow this process to inspect Git {operation.replace('_', ' ')}?",
             source_oids=source_oids,
         )
+        self.provider.validate_read_only_operation(
+            "status",
+            worktree=self._worktree_path(worktree_id),
+        )
         observation = {"read_only": True, "worktree_id": worktree_id, **dict(extra or {})}
         if self.data_flow is None:
             raise ValidationError("Git data-flow manager is not attached")
-        request_context = self.data_flow.context_from_source_oids(pid, source_oids)
-        invocation = ProtectedOperationInvocation(
-            pid=pid,
-            actor=pid,
-            target=target,
-            decisions=(decision,),
-            canonical_args=context,
-            observation=observation,
-            data_flow_ingress_context=self.data_flow.unclassified_ingress_context(
-                request_context,
-                origin="external:git",
-            ),
-        )
+
+        def guarded_flow_snapshot() -> _GitReadFlowSnapshot:
+            try:
+                stable_flow = self._repository_content_flow_snapshot()
+                if flow_snapshot_resolver is not None:
+                    operation_flow = flow_snapshot_resolver()
+                    read_flow_snapshot = _GitReadFlowSnapshot(
+                        flow=self._aggregate_flow_snapshots(
+                            (stable_flow, operation_flow.flow)
+                        ),
+                        repository_state_token=operation_flow.repository_state_token,
+                        refresh=lambda: self._aggregate_flow_snapshots(
+                            (
+                                self._repository_content_flow_snapshot(),
+                                operation_flow.refresh(),
+                            )
+                        ),
+                    )
+                else:
+                    state = self.provider.repository_state(
+                        worktree=self._worktree_path(worktree_id)
+                    )
+                    read_flow_snapshot = _GitReadFlowSnapshot(
+                        flow=stable_flow,
+                        repository_state_token=self._state_token(state).token,
+                        refresh=self._repository_content_flow_snapshot,
+                    )
+                return read_flow_snapshot
+            except GitProviderEffectNotStarted:
+                raise
+
         def guarded_callback() -> tuple[_T, dict[str, Any]]:
             try:
                 return callback()
@@ -541,28 +584,79 @@ class GitPrimitive:
                 }:
                     raise self._provider_not_started(exc) from exc
                 raise
-
+        request_context = self.data_flow.context_from_source_oids(
+            pid,
+            source_oids,
+        )
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
+            actor=pid,
+            target=target,
+            decisions=(decision,),
+            canonical_args=context,
+            observation=observation,
+            data_flow_ingress_context=self.data_flow.unclassified_ingress_context(
+                request_context,
+                origin="external:git",
+            ),
+        )
         with self.protected_operations.start(
             "primitive.git.read",
             invocation,
             provider=self.provider,
         ) as protected:
-            result, summary = protected.call(
-                ProviderPhase(operation, information_flow=True),
-                guarded_callback,
-            )
-            return protected.complete(
-                result,
-                self._evidence(
-                    pid=pid,
-                    operation=operation,
-                    resource=target,
-                    summary=summary,
-                    mutation=False,
-                ),
-                classification_context=observation,
-                classification_result=summary,
-            )
+            with self.provider.repository_lock(
+                worktree=self._worktree_path(worktree_id)
+            ):
+                with self.filesystem.hold_file_label_io_paths(flow_lock_paths):
+                    read_flow_snapshot = protected.call(
+                        ProviderPhase(
+                            f"{operation}_flow_snapshot",
+                            information_flow=True,
+                        ),
+                        guarded_flow_snapshot,
+                    )
+                    self.data_flow.observe_ingress(
+                        read_flow_snapshot.flow.context
+                    )
+                    result, summary = protected.call(
+                        ProviderPhase(operation, information_flow=True),
+                        guarded_callback,
+                    )
+                    current_flow = read_flow_snapshot.refresh()
+                    reported_state_token = summary.get("state_token")
+                    if (
+                        (
+                            reported_state_token is not None
+                            and reported_state_token
+                            != read_flow_snapshot.repository_state_token
+                        )
+                        or current_flow.state_version
+                        != read_flow_snapshot.flow.state_version
+                    ):
+                        self.data_flow.observe_ingress(
+                            DataFlowContext.aggregate(
+                                (
+                                    read_flow_snapshot.flow.context,
+                                    current_flow.context,
+                                )
+                            )
+                        )
+                        raise CapabilityDenied(
+                            "Git data-flow carrier changed during read"
+                        )
+                    return protected.complete(
+                        result,
+                        self._evidence(
+                            pid=pid,
+                            operation=operation,
+                            resource=target,
+                            summary=summary,
+                            mutation=False,
+                        ),
+                        classification_context=observation,
+                        classification_result=summary,
+                    )
 
     def _run(
         self,
@@ -864,6 +958,14 @@ class GitPrimitive:
             read,
             worktree_id=worktree_id,
             extra={"limit": selected_limit},
+            flow_snapshot_resolver=lambda: self._git_read_lineage_snapshot(
+                worktree_id=worktree_id,
+                include_head=True,
+                include_index=True,
+                include_repository_content=True,
+                include_worktree_tree=True,
+            ),
+            flow_lock_paths=(self._normalized_worktree_root(worktree_id) or ".",),
         )
 
     def _bounded_output_limit(self, value: int | None, *, patch: bool = False) -> int:
@@ -951,6 +1053,22 @@ class GitPrimitive:
                 "paths_sha256": _sha256(b"\0".join(selected_paths)),
                 "max_bytes": selected_limit,
             },
+            flow_snapshot_resolver=lambda: self._diff_read_flow_snapshot(
+                scope=scope,
+                base=base,
+                head=head,
+                paths=selected_paths,
+                worktree_id=worktree_id,
+            ),
+            flow_lock_paths=(
+                tuple(
+                    self._normalized_file_path(path, worktree_id=worktree_id)
+                    for path in selected_paths
+                )
+                or (self._normalized_worktree_root(worktree_id) or ".",)
+                if scope == "worktree"
+                else ()
+            ),
         )
 
     def _diff_result(
@@ -1152,6 +1270,11 @@ class GitPrimitive:
             read,
             worktree_id=worktree_id,
             extra={"ref": ref, "limit": selected_limit},
+            flow_snapshot_resolver=lambda: self._log_read_flow_snapshot(
+                ref=ref,
+                limit=selected_limit,
+                worktree_id=worktree_id,
+            ),
         )
 
     def _commit(self, oid: str, *, worktree_id: str) -> GitCommit:
@@ -1248,6 +1371,10 @@ class GitPrimitive:
             read,
             worktree_id=worktree_id,
             extra={"ref": ref, "max_bytes": selected_limit},
+            flow_snapshot_resolver=lambda: self._show_read_flow_snapshot(
+                worktree_id=worktree_id,
+                ref=ref,
+            ),
         )
 
     def blame(
@@ -1310,6 +1437,17 @@ class GitPrimitive:
                 "ref": ref,
                 "max_bytes": selected_limit,
             },
+            flow_snapshot_resolver=lambda: self._blame_read_flow_snapshot(
+                path=selected_path,
+                ref=ref,
+                worktree_id=worktree_id,
+            ),
+            flow_lock_paths=(
+                self._normalized_file_path(
+                    selected_path,
+                    worktree_id=worktree_id,
+                ),
+            ),
         )
 
     def list_refs(
@@ -1403,6 +1541,14 @@ class GitPrimitive:
             read,
             worktree_id=worktree_id,
             extra={"kind": kind, "limit": limit},
+            flow_snapshot_resolver=lambda: self._git_read_lineage_snapshot(
+                worktree_id=worktree_id,
+                fixed_carriers=(
+                    (("pull_request_collection", "workspace"),)
+                    if kind in {"all", "pull_requests"}
+                    else ()
+                ),
+            ),
         )
 
     def list_remotes(self, pid: str, *, worktree_id: str = "main") -> dict[str, Any]:
@@ -1477,7 +1623,13 @@ class GitPrimitive:
                     "Git worktree count exceeds the configured hard limit",
                 )
             worktrees: list[GitWorktreeInfo] = []
-            managed_root = Path(getattr(self.provider, "managed_worktree_root", Path("/__unmanaged__"))).resolve(strict=False)
+            managed_root = Path(
+                getattr(
+                    self.provider,
+                    "managed_worktree_root",
+                    Path("/__unmanaged__"),
+                )
+            )
             main_root = before.layout.root
             for record in records:
                 values: dict[str, bytes] = {}
@@ -1502,7 +1654,7 @@ class GitPrimitive:
                 elif managed and _WORKTREE_ID_RE.fullmatch(path.name):
                     item_id = path.name
                 else:
-                    item_id = f"external_{_sha256(os.fsencode(str(path)))[:20]}"
+                    continue
                 branch_value = values.get("branch")
                 worktrees.append(
                     GitWorktreeInfo(
@@ -1602,11 +1754,14 @@ class GitPrimitive:
         selectors: list[tuple[str, str]] = []
         for raw_path, subtree in scopes:
             if raw_path is None:
-                continue
-            normalized = self._normalized_file_path(
-                raw_path,
-                worktree_id=worktree_id,
-            )
+                if not subtree:
+                    continue
+                normalized = self._normalized_worktree_root(worktree_id) or "."
+            else:
+                normalized = self._normalized_file_path(
+                    raw_path,
+                    worktree_id=worktree_id,
+                )
             if subtree:
                 context, version = self.data_flow.file_tree_snapshot(normalized)
                 kind = "tree"
@@ -1634,6 +1789,72 @@ class GitPrimitive:
             context=DataFlowContext.aggregate(contexts),
             state_version=self._flow_state_version(captures),
             state_version_resolver=resolve,
+        )
+
+    def _aggregate_flow_snapshots(
+        self,
+        snapshots: Sequence[_GitFlowSnapshot],
+    ) -> _GitFlowSnapshot:
+        selected = tuple(snapshots)
+        captures = [
+            ("snapshot", str(index), snapshot.state_version)
+            for index, snapshot in enumerate(selected)
+        ]
+
+        def resolve() -> str:
+            return self._flow_state_version(
+                [
+                    ("snapshot", str(index), snapshot.state_version_resolver())
+                    for index, snapshot in enumerate(selected)
+                ]
+            )
+
+        return _GitFlowSnapshot(
+            context=DataFlowContext.aggregate(
+                snapshot.context for snapshot in selected
+            ),
+            state_version=self._flow_state_version(captures),
+            state_version_resolver=resolve,
+        )
+
+    @staticmethod
+    def _canonical_workspace_identity(value: str | os.PathLike[str]) -> bytes:
+        resolved = os.fspath(Path(value).resolve(strict=False)).replace("\\", "/")
+        canonical = unicodedata.normalize("NFC", resolved).casefold()
+        return os.fsencode(canonical)
+
+    def _repository_content_lineage_path(self) -> str:
+        workspace = getattr(self.provider, "workspace_root", self.filesystem.root)
+        repository = _sha256(self._canonical_workspace_identity(workspace))
+        return f".git/agent-libos-flow/{repository}/repository_content/workspace"
+
+    def _repository_content_flow_snapshot(self) -> _GitFlowSnapshot:
+        if self.data_flow is None:
+            raise ValidationError("Git data-flow manager is not attached")
+        path = self._repository_content_lineage_path()
+        context, version = self.data_flow.file_snapshot(path)
+        return _GitFlowSnapshot(
+            context=context,
+            state_version=version,
+            state_version_resolver=lambda: self.data_flow.file_state_version(path),
+        )
+
+    def _bind_repository_content_lineage(
+        self,
+        *,
+        pid: str,
+        context: DataFlowContext,
+    ) -> None:
+        if self.data_flow is None:
+            raise ValidationError("Git data-flow manager is not attached")
+        self.data_flow.bind_written_file_digest(
+            pid=pid,
+            normalized_path=self._repository_content_lineage_path(),
+            content_sha256=_sha256(
+                b"repository_content\0"
+                + self._repository_content_lineage_path().encode("utf-8")
+            ),
+            context=context,
         )
 
     @staticmethod
@@ -1722,6 +1943,325 @@ class GitPrimitive:
         elif include_head and state.head_oid is not None:
             carriers.append(("commit", state.head_oid))
         return self._git_lineage_snapshot(state, carriers)
+
+    def _git_read_lineage_snapshot(
+        self,
+        *,
+        worktree_id: str,
+        refs: Sequence[str] = (),
+        include_head: bool = False,
+        include_index: bool = False,
+        include_pull_requests: bool = False,
+        include_repository_content: bool = False,
+        worktree_paths: Sequence[bytes] = (),
+        include_worktree_tree: bool = False,
+        fixed_carriers: Sequence[tuple[str, str]] = (),
+    ) -> _GitReadFlowSnapshot:
+        before = self.provider.repository_state(
+            worktree=self._worktree_path(worktree_id)
+        )
+        before_token = self._state_token(before)
+        resolved_oids = tuple(
+            self._resolve_commit(ref, worktree_id=worktree_id)
+            for ref in refs
+        )
+        state = self.provider.repository_state(
+            worktree=self._worktree_path(worktree_id)
+        )
+        self._require_same_state(before_token.token, state)
+        carriers: list[tuple[str, str]] = [*fixed_carriers]
+        carriers.extend(("commit", oid) for oid in resolved_oids)
+        if include_head and state.head_oid is not None:
+            carriers.append(("commit", state.head_oid))
+        if include_index:
+            carriers.append(("index", state.index_sha256))
+        if include_pull_requests:
+            carriers.append(("pull_requests", state.pull_requests_sha256))
+        selected_carriers = tuple(dict.fromkeys(carriers))
+        filesystem_scopes = tuple(
+            (path, True) for path in dict.fromkeys(worktree_paths)
+        )
+        if include_worktree_tree:
+            filesystem_scopes = (*filesystem_scopes, (None, True))
+
+        def capture() -> _GitFlowSnapshot:
+            snapshots = [self._git_lineage_snapshot(state, selected_carriers)]
+            if include_repository_content:
+                snapshots.append(self._repository_content_flow_snapshot())
+            if filesystem_scopes:
+                snapshots.append(
+                    self._filesystem_flow_snapshot(
+                        filesystem_scopes,
+                        worktree_id=worktree_id,
+                    )
+                )
+            return self._aggregate_flow_snapshots(snapshots)
+
+        return _GitReadFlowSnapshot(
+            flow=capture(),
+            repository_state_token=before_token.token,
+            refresh=capture,
+        )
+
+    def _diff_read_flow_snapshot(
+        self,
+        *,
+        scope: str,
+        base: str | None,
+        head: str | None,
+        paths: Sequence[bytes],
+        worktree_id: str,
+        include_patch_index: bool = False,
+    ) -> _GitReadFlowSnapshot:
+        if scope == "worktree":
+            return self._git_read_lineage_snapshot(
+                worktree_id=worktree_id,
+                include_head=True,
+                include_index=True,
+                include_repository_content=True,
+                worktree_paths=paths,
+                include_worktree_tree=not paths,
+            )
+        if scope == "staged":
+            return self._git_read_lineage_snapshot(
+                worktree_id=worktree_id,
+                include_head=True,
+                include_index=True,
+                include_repository_content=True,
+            )
+        if scope == "range" and base is not None and head is not None:
+            return self._git_read_lineage_snapshot(
+                worktree_id=worktree_id,
+                refs=(base, head),
+                include_index=include_patch_index,
+                include_repository_content=True,
+            )
+        raise ValidationError("Git diff scope must be worktree, staged, or range")
+
+    def _range_read_flow_snapshot(
+        self,
+        *,
+        base: str,
+        head: str,
+        worktree_id: str,
+        include_index: bool = False,
+    ) -> _GitReadFlowSnapshot:
+        return self._diff_read_flow_snapshot(
+            scope="range",
+            base=base,
+            head=head,
+            paths=(),
+            worktree_id=worktree_id,
+            include_patch_index=include_index,
+        )
+
+    def _log_read_flow_snapshot(
+        self,
+        *,
+        ref: str | None,
+        limit: int,
+        worktree_id: str,
+    ) -> _GitReadFlowSnapshot:
+        before = self.provider.repository_state(
+            worktree=self._worktree_path(worktree_id)
+        )
+        before_token = self._state_token(before)
+        oid = (
+            before.head_oid
+            if ref is None
+            else self._resolve_commit(ref, worktree_id=worktree_id)
+        )
+        commit_oids: list[str] = []
+        if oid is not None:
+            result = self._require_success(
+                self._run(
+                    [
+                        "rev-list",
+                        "--parents",
+                        f"--max-count={limit + 1}",
+                        oid,
+                        "--",
+                    ],
+                    worktree_id=worktree_id,
+                    max_output_bytes=self.config.git.output_hard_limit_bytes,
+                ),
+                "log_flow_snapshot",
+            )
+            for row in result.stdout.splitlines():
+                raw_oids = row.split()
+                if not raw_oids:
+                    raise GitError(
+                        GitErrorCode.COMMAND_FAILED.value,
+                        "Git rev-list returned an empty commit record",
+                    )
+                for raw_oid in raw_oids:
+                    selected = raw_oid.decode("ascii", errors="strict")
+                    if not _OID_RE.fullmatch(selected):
+                        raise GitError(
+                            GitErrorCode.COMMAND_FAILED.value,
+                            "Git rev-list returned an invalid commit OID",
+                        )
+                    commit_oids.append(selected)
+        current = self.provider.repository_state(
+            worktree=self._worktree_path(worktree_id)
+        )
+        self._require_same_state(before_token.token, current)
+        snapshot = self._git_read_lineage_snapshot(
+            worktree_id=worktree_id,
+            include_repository_content=True,
+            fixed_carriers=tuple(
+                ("commit", commit_oid) for commit_oid in commit_oids
+            ),
+        )
+        if snapshot.repository_state_token != before_token.token:
+            raise GitError(
+                GitErrorCode.STALE_STATE.value,
+                "Git state changed while log lineage was captured",
+                retryable=True,
+            )
+        return snapshot
+
+    def _show_read_flow_snapshot(
+        self,
+        *,
+        ref: str,
+        worktree_id: str,
+    ) -> _GitReadFlowSnapshot:
+        before = self.provider.repository_state(
+            worktree=self._worktree_path(worktree_id)
+        )
+        before_token = self._state_token(before)
+        oid = self._resolve_commit(ref, worktree_id=worktree_id)
+        commit = self._commit(oid, worktree_id=worktree_id)
+        current = self.provider.repository_state(
+            worktree=self._worktree_path(worktree_id)
+        )
+        self._require_same_state(before_token.token, current)
+        snapshot = self._git_read_lineage_snapshot(
+            worktree_id=worktree_id,
+            include_repository_content=True,
+            fixed_carriers=tuple(
+                ("commit", commit_oid)
+                for commit_oid in dict.fromkeys((oid, *commit.parents))
+            ),
+        )
+        if snapshot.repository_state_token != before_token.token:
+            raise GitError(
+                GitErrorCode.STALE_STATE.value,
+                "Git state changed while show lineage was captured",
+                retryable=True,
+            )
+        return snapshot
+
+    def _blame_read_flow_snapshot(
+        self,
+        *,
+        path: bytes,
+        ref: str | None,
+        worktree_id: str,
+    ) -> _GitReadFlowSnapshot:
+        before = self.provider.repository_state(
+            worktree=self._worktree_path(worktree_id)
+        )
+        before_token = self._state_token(before)
+        oid = (
+            before.head_oid
+            if ref is None
+            else self._resolve_commit(ref, worktree_id=worktree_id)
+        )
+        args = ["blame", "--porcelain", "--no-progress"]
+        if oid is not None:
+            args.append(oid)
+        args.extend(["--", os.fsdecode(path)])
+        result = self._require_success(
+            self._run(
+                args,
+                worktree_id=worktree_id,
+                max_output_bytes=self.config.git.output_hard_limit_bytes,
+            ),
+            "blame_flow_snapshot",
+        )
+        commit_oids: list[str] = []
+        for line in result.stdout.splitlines():
+            if line.startswith(b"previous "):
+                fields = line.split(b" ", 2)
+                if len(fields) != 3:
+                    raise GitError(
+                        GitErrorCode.COMMAND_FAILED.value,
+                        "Git blame returned an invalid previous record",
+                    )
+                selected = fields[1].decode("ascii", errors="strict")
+                if not _OID_RE.fullmatch(selected):
+                    raise GitError(
+                        GitErrorCode.COMMAND_FAILED.value,
+                        "Git blame returned an invalid previous commit OID",
+                    )
+                commit_oids.append(selected)
+                continue
+            fields = line.split(b" ")
+            if len(fields) < 3 or not fields[1].isdigit() or not fields[2].isdigit():
+                continue
+            raw_oid = fields[0].removeprefix(b"^")
+            selected = raw_oid.decode("ascii", errors="ignore")
+            if _OID_RE.fullmatch(selected) and any(
+                character != "0" for character in selected
+            ):
+                commit_oids.append(selected)
+        current = self.provider.repository_state(
+            worktree=self._worktree_path(worktree_id)
+        )
+        self._require_same_state(before_token.token, current)
+        snapshot = self._git_read_lineage_snapshot(
+            worktree_id=worktree_id,
+            include_repository_content=True,
+            fixed_carriers=tuple(
+                ("commit", commit_oid)
+                for commit_oid in dict.fromkeys(commit_oids)
+            ),
+            worktree_paths=(path,) if oid is None else (),
+        )
+        if snapshot.repository_state_token != before_token.token:
+            raise GitError(
+                GitErrorCode.STALE_STATE.value,
+                "Git state changed while blame lineage was captured",
+                retryable=True,
+            )
+        return snapshot
+
+    def _current_git_read_flow_snapshot(
+        self,
+        expected_state_token: str,
+        **kwargs: Any,
+    ) -> _GitFlowSnapshot:
+        snapshot = self._git_read_lineage_snapshot(**kwargs)
+        if snapshot.repository_state_token != expected_state_token:
+            raise GitError(
+                GitErrorCode.STALE_STATE.value,
+                "Git state changed before data-flow snapshot",
+                retryable=True,
+            )
+        return snapshot.flow
+
+    def _current_range_flow_snapshot(
+        self,
+        expected_state_token: str,
+        *,
+        base: str,
+        head: str,
+        worktree_id: str,
+    ) -> _GitFlowSnapshot:
+        snapshot = self._range_read_flow_snapshot(
+            base=base,
+            head=head,
+            worktree_id=worktree_id,
+        )
+        if snapshot.repository_state_token != expected_state_token:
+            raise GitError(
+                GitErrorCode.STALE_STATE.value,
+                "Git state changed before range data-flow snapshot",
+                retryable=True,
+            )
+        return snapshot.flow
 
     def _bind_git_lineage(
         self,
@@ -1866,13 +2406,24 @@ class GitPrimitive:
     def _mark_git_effect_started(self) -> None:
         state = getattr(self._dispatch_state, "current", None)
         if isinstance(state, dict):
+            if not state.get("started"):
+                self._prebind_repository_content_lineage()
             state["started"] = True
+
+    def _mark_git_materialized_worktree(self, worktree_id: str) -> None:
+        if not _WORKTREE_ID_RE.fullmatch(worktree_id) or worktree_id == "main":
+            raise ValidationError("invalid materialized Git worktree id")
+        state = getattr(self._dispatch_state, "current", None)
+        if isinstance(state, dict):
+            state["materialized_worktree_id"] = worktree_id
 
     def _mark_git_source_carrier(self, carrier_kind: str, carrier_id: str) -> None:
         if carrier_kind == "commit":
             valid = bool(_OID_RE.fullmatch(carrier_id))
-        elif carrier_kind == "index":
+        elif carrier_kind in {"index", "pull_requests"}:
             valid = bool(_SHA256_RE.fullmatch(carrier_id))
+        elif carrier_kind == "pull_request":
+            valid = bool(_PR_ID_RE.fullmatch(carrier_id))
         else:
             valid = False
         if not valid:
@@ -1882,6 +2433,93 @@ class GitPrimitive:
             carriers = state.setdefault("source_carriers", [])
             if isinstance(carriers, list):
                 carriers.append((carrier_kind, carrier_id))
+                if state.get("started"):
+                    self._prebind_repository_content_lineage()
+
+    def _mark_git_output_carrier(self, carrier_kind: str, carrier_id: str) -> None:
+        if carrier_kind != "pull_request" or not _PR_ID_RE.fullmatch(carrier_id):
+            raise ValidationError("invalid Git data-flow output carrier")
+        state = getattr(self._dispatch_state, "current", None)
+        if isinstance(state, dict):
+            carriers = state.setdefault("output_carriers", [])
+            if isinstance(carriers, list):
+                carriers.append((carrier_kind, carrier_id))
+
+    def _prebind_pull_request_lineage(self, pr_id: str) -> None:
+        state = getattr(self._dispatch_state, "current", None)
+        if not isinstance(state, dict):
+            raise ValidationError(
+                "pull request lineage must be bound inside Git mutation dispatch"
+            )
+        pid = state.get("pid")
+        repository_state = state.get("repository_state")
+        mutation_context = state.get("mutation_context")
+        if (
+            not isinstance(pid, str)
+            or not isinstance(repository_state, GitRepositoryState)
+            or not isinstance(mutation_context, DataFlowContext)
+        ):
+            raise ValidationError("Git mutation data-flow state is incomplete")
+        contexts = [
+            mutation_context,
+            *tuple(state.get("source_contexts") or ()),
+        ]
+        source_carriers = tuple(
+            dict.fromkeys(tuple(state.get("source_carriers") or ()))
+        )
+        if source_carriers:
+            contexts.append(
+                self._git_lineage_snapshot(
+                    repository_state,
+                    source_carriers,
+                ).context
+            )
+        selected_context = DataFlowContext.aggregate(contexts)
+        if self.data_flow is None:
+            raise ValidationError("Git data-flow manager is not attached")
+        with self.data_flow.store.transaction():
+            for carrier_kind, carrier_id in (
+                ("pull_request", pr_id),
+                ("pull_request_collection", "workspace"),
+            ):
+                self._bind_git_lineage(
+                    pid=pid,
+                    state=repository_state,
+                    carrier_kind=carrier_kind,
+                    carrier_id=carrier_id,
+                    context=selected_context,
+                )
+
+    def _prebind_repository_content_lineage(self) -> None:
+        state = getattr(self._dispatch_state, "current", None)
+        if not isinstance(state, dict):
+            raise ValidationError(
+                "repository content lineage must be bound inside Git mutation dispatch"
+            )
+        pid = state.get("pid")
+        repository_state = state.get("repository_state")
+        mutation_context = state.get("mutation_context")
+        if (
+            not isinstance(pid, str)
+            or not isinstance(repository_state, GitRepositoryState)
+            or not isinstance(mutation_context, DataFlowContext)
+        ):
+            raise ValidationError("Git mutation data-flow state is incomplete")
+        contexts = [mutation_context, *tuple(state.get("source_contexts") or ())]
+        source_carriers = tuple(
+            dict.fromkeys(tuple(state.get("source_carriers") or ()))
+        )
+        if source_carriers:
+            contexts.append(
+                self._git_lineage_snapshot(
+                    repository_state,
+                    source_carriers,
+                ).context
+            )
+        self._bind_repository_content_lineage(
+            pid=pid,
+            context=DataFlowContext.aggregate(contexts),
+        )
 
     def _mark_git_source_context(self, context: DataFlowContext) -> None:
         state = getattr(self._dispatch_state, "current", None)
@@ -1889,6 +2527,8 @@ class GitPrimitive:
             contexts = state.setdefault("source_contexts", [])
             if isinstance(contexts, list):
                 contexts.append(context)
+                if state.get("started"):
+                    self._prebind_repository_content_lineage()
 
     def _resolve_stash_commit(
         self,
@@ -2080,6 +2720,7 @@ class GitPrimitive:
         observation: dict[str, Any],
         source_oids: Iterable[str] | None,
         flow_snapshot: _GitFlowSnapshot | None,
+        additional_data_sinks: Sequence[DataSink],
     ) -> tuple[ProtectedOperationInvocation, DataFlowContext, DataFlowContext | None]:
         if self.data_flow is None:
             raise ValidationError("Git data-flow manager is not attached")
@@ -2125,6 +2766,7 @@ class GitPrimitive:
                 mandatory_indexes,
             ),
             data_sink=DataSink(target),
+            additional_data_sinks=tuple(additional_data_sinks),
             data_flow_context=flow_context,
             data_flow_ingress_context=ingress_context,
             data_flow_payload=context,
@@ -2168,6 +2810,8 @@ class GitPrimitive:
         invocation: ProtectedOperationInvocation,
         observation: dict[str, Any],
         input_refs: Iterable[str],
+        worktree_id: str,
+        flow_lock_paths: Sequence[str],
         dispatch: Callable[[], tuple[GitOperationResult, dict[str, Any]]],
     ) -> GitOperationResult:
         def provider_phase() -> tuple[GitOperationResult, dict[str, Any]]:
@@ -2178,27 +2822,31 @@ class GitPrimitive:
             invocation,
             provider=self.provider,
         ) as protected:
-            result, summary = protected.call(
-                ProviderPhase(
-                    operation,
-                    state_mutation=True,
-                    information_flow=remote is not None,
-                ),
-                provider_phase,
-            )
-            return protected.complete(
-                result,
-                self._evidence(
-                    pid=pid,
-                    operation=operation,
-                    resource=target,
-                    summary=summary,
-                    mutation=True,
-                    input_refs=input_refs,
-                ),
-                classification_context=observation,
-                classification_result=summary,
-            )
+            with self.provider.repository_lock(
+                worktree=self._worktree_path(worktree_id)
+            ):
+                with self.filesystem.hold_file_label_io_paths(flow_lock_paths):
+                    result, summary = protected.call(
+                        ProviderPhase(
+                            operation,
+                            state_mutation=True,
+                            information_flow=remote is not None,
+                        ),
+                        provider_phase,
+                    )
+                    return protected.complete(
+                        result,
+                        self._evidence(
+                            pid=pid,
+                            operation=operation,
+                            resource=target,
+                            summary=summary,
+                            mutation=True,
+                            input_refs=input_refs,
+                        ),
+                        classification_context=observation,
+                        classification_result=summary,
+                    )
 
     def _status_worktree_paths(self, state: GitRepositoryState) -> tuple[bytes, ...]:
         parsed = self._parse_status(
@@ -2342,6 +2990,10 @@ class GitPrimitive:
         if self.data_flow is None:
             raise ValidationError("Git data-flow manager is not attached")
         with self.data_flow.store.transaction():
+            self._bind_repository_content_lineage(
+                pid=pid,
+                context=context,
+            )
             if before.index_sha256 != after.index_sha256:
                 previous_index = self._git_lineage_snapshot(
                     before,
@@ -2354,6 +3006,20 @@ class GitPrimitive:
                     carrier_id=after.index_sha256,
                     context=DataFlowContext.aggregate(
                         (previous_index.context, context)
+                    ),
+                )
+            if before.pull_requests_sha256 != after.pull_requests_sha256:
+                previous_pull_requests = self._git_lineage_snapshot(
+                    before,
+                    (("pull_requests", before.pull_requests_sha256),),
+                )
+                self._bind_git_lineage(
+                    pid=pid,
+                    state=after,
+                    carrier_kind="pull_requests",
+                    carrier_id=after.pull_requests_sha256,
+                    context=DataFlowContext.aggregate(
+                        (previous_pull_requests.context, context)
                     ),
                 )
             if created_oid is None or not _OID_RE.fullmatch(created_oid):
@@ -2387,6 +3053,7 @@ class GitPrimitive:
         context: DataFlowContext,
         source_carriers: Sequence[tuple[str, str]],
         source_contexts: Sequence[DataFlowContext],
+        output_carriers: Sequence[tuple[str, str]],
         materialized_worktree_id: str | None,
     ) -> tuple[bytes, ...]:
         selected_carriers = tuple(dict.fromkeys(source_carriers))
@@ -2419,6 +3086,14 @@ class GitPrimitive:
             created_oid=created_oid,
             context=settled_context,
         )
+        for carrier_kind, carrier_id in tuple(dict.fromkeys(output_carriers)):
+            self._bind_git_lineage(
+                pid=pid,
+                state=after,
+                carrier_kind=carrier_kind,
+                carrier_id=carrier_id,
+                context=settled_context,
+            )
         if writes_worktree:
             self._reconcile_worktree_labels(
                 pid=pid,
@@ -2488,7 +3163,13 @@ class GitPrimitive:
                 context=mutation_context,
                 source_carriers=tuple(current_state["source_carriers"]),
                 source_contexts=tuple(current_state["source_contexts"]),
-                materialized_worktree_id=materialized_worktree_id,
+                output_carriers=tuple(current_state["output_carriers"]),
+                materialized_worktree_id=(
+                    materialized_worktree_id
+                    if current_state.get("materialized_worktree_id")
+                    == materialized_worktree_id
+                    else None
+                ),
             )
         except BaseException as settlement_error:
             raise BaseExceptionGroup(
@@ -2516,93 +3197,91 @@ class GitPrimitive:
             "started": False,
             "source_carriers": [],
             "source_contexts": [],
+            "output_carriers": [],
+            "materialized_worktree_id": None,
         }
         self._dispatch_state.current = current_state
         try:
-            with self.provider.repository_lock(
+            # _complete_mutation holds the repository and filesystem label
+            # locks through provider dispatch, settlement, and completion.
+            before_state = self.provider.repository_state(
                 worktree=self._worktree_path(worktree_id)
-            ):
-                before_state = self.provider.repository_state(
-                    worktree=self._worktree_path(worktree_id)
-                )
-                before_token = self._require_same_state(expected, before_state)
-                self._revalidate_exact_path_scopes(
-                    filesystem_path_scopes,
+            )
+            current_state.update(
+                pid=pid,
+                repository_state=before_state,
+                mutation_context=mutation_context,
+            )
+            before_token = self._require_same_state(expected, before_state)
+            self._revalidate_exact_path_scopes(
+                filesystem_path_scopes,
+                worktree_id=worktree_id,
+            )
+            writes_worktree = any(
+                right in {CapabilityRight.WRITE, CapabilityRight.DELETE}
+                for right in filesystem_rights
+            )
+            try:
+                created_oid, details, changed_raw = callback(before_state)
+            except BaseException as operation_error:
+                if not current_state["started"]:
+                    raise
+                self._settle_failed_mutation(
+                    pid=pid,
+                    before=before_state,
                     worktree_id=worktree_id,
+                    reconciliation_paths=reconciliation_paths,
+                    writes_worktree=writes_worktree,
+                    mutation_context=mutation_context,
+                    current_state=current_state,
+                    materialized_worktree_id=materialized_worktree_id,
+                    operation_error=operation_error,
                 )
-                lock_paths = tuple(paths) if paths else (None,)
-                worktree_root = self._normalized_worktree_root(worktree_id)
-                normalized_locks = [
-                    worktree_root or "."
-                    if raw_path is None
-                    else self._normalized_file_path(
-                        raw_path,
-                        worktree_id=worktree_id,
-                    )
-                    for raw_path in lock_paths
-                ]
-                with self.filesystem.hold_file_label_io_paths(
-                    normalized_locks if filesystem_rights else ()
-                ):
-                    writes_worktree = any(
-                        right in {CapabilityRight.WRITE, CapabilityRight.DELETE}
-                        for right in filesystem_rights
-                    )
-                    try:
-                        created_oid, details, changed_raw = callback(before_state)
-                    except BaseException as operation_error:
-                        if not current_state["started"]:
-                            raise
-                        self._settle_failed_mutation(
-                            pid=pid,
-                            before=before_state,
-                            worktree_id=worktree_id,
-                            reconciliation_paths=reconciliation_paths,
-                            writes_worktree=writes_worktree,
-                            mutation_context=mutation_context,
-                            current_state=current_state,
-                            materialized_worktree_id=materialized_worktree_id,
-                            operation_error=operation_error,
-                        )
-                        raise
-                    after_state = self.provider.repository_state(
-                        worktree=self._worktree_path(worktree_id)
-                    )
-                    changed = self._settle_mutation_state(
-                        pid=pid,
-                        before=before_state,
-                        after=after_state,
-                        created_oid=created_oid,
-                        changed_raw=changed_raw,
-                        reconciliation_paths=reconciliation_paths,
-                        writes_worktree=writes_worktree,
-                        worktree_id=worktree_id,
-                        context=mutation_context,
-                        source_carriers=tuple(current_state["source_carriers"]),
-                        source_contexts=tuple(current_state["source_contexts"]),
-                        materialized_worktree_id=materialized_worktree_id,
-                    )
-                after_token = self._state_token(after_state)
-                result = GitOperationResult(
-                    operation=operation,
-                    repository_id=before_state.layout.repository_id,
-                    worktree_id=before_state.layout.worktree_id,
-                    before=before_token,
-                    after=after_token,
-                    changed_paths=[self._git_path(path) for path in changed],
-                    created_oid=created_oid,
-                    details=dict(details),
-                )
-                return result, {
-                    "repository_id": result.repository_id,
-                    "worktree_id": result.worktree_id,
-                    "before_state_token": before_token.token,
-                    "after_state_token": after_token.token,
-                    "changed_paths": len(result.changed_paths),
-                    "changed_paths_sha256": _sha256(b"\0".join(changed)),
-                    "created_oid": created_oid,
-                    **dict(details),
-                }
+                raise
+            after_state = self.provider.repository_state(
+                worktree=self._worktree_path(worktree_id)
+            )
+            changed = self._settle_mutation_state(
+                pid=pid,
+                before=before_state,
+                after=after_state,
+                created_oid=created_oid,
+                changed_raw=changed_raw,
+                reconciliation_paths=reconciliation_paths,
+                writes_worktree=writes_worktree,
+                worktree_id=worktree_id,
+                context=mutation_context,
+                source_carriers=tuple(current_state["source_carriers"]),
+                source_contexts=tuple(current_state["source_contexts"]),
+                output_carriers=tuple(current_state["output_carriers"]),
+                materialized_worktree_id=(
+                    materialized_worktree_id
+                    if current_state.get("materialized_worktree_id")
+                    == materialized_worktree_id
+                    else None
+                ),
+            )
+            after_token = self._state_token(after_state)
+            result = GitOperationResult(
+                operation=operation,
+                repository_id=before_state.layout.repository_id,
+                worktree_id=before_state.layout.worktree_id,
+                before=before_token,
+                after=after_token,
+                changed_paths=[self._git_path(path) for path in changed],
+                created_oid=created_oid,
+                details=dict(details),
+            )
+            return result, {
+                "repository_id": result.repository_id,
+                "worktree_id": result.worktree_id,
+                "before_state_token": before_token.token,
+                "after_state_token": after_token.token,
+                "changed_paths": len(result.changed_paths),
+                "changed_paths_sha256": _sha256(b"\0".join(changed)),
+                "created_oid": created_oid,
+                **dict(details),
+            }
         except GitProviderEffectNotStarted:
             raise
         except GitError as exc:
@@ -2641,6 +3320,7 @@ class GitPrimitive:
         mandatory_primary_approval: bool = False,
         flow_snapshot_resolver: _GitFlowSnapshotResolver | None = None,
         protected_flow_snapshot_resolver: _GitFlowSnapshotResolver | None = None,
+        additional_data_sinks: Sequence[DataSink] = (),
     ) -> GitOperationResult:
         if descriptor not in _GIT_MUTATION_DESCRIPTORS:
             raise ValidationError("unsupported protected Git operation descriptor")
@@ -2695,6 +3375,12 @@ class GitPrimitive:
                 scope_count=len(filesystem_path_scopes),
                 resolver=resolve_protected_snapshot,
             )
+        flow_snapshot = self._aggregate_flow_snapshots(
+            (
+                self._repository_content_flow_snapshot(),
+                *(() if flow_snapshot is None else (flow_snapshot,)),
+            )
+        )
         invocation, flow_context, ingress_context = self._mutation_invocation(
             pid=pid,
             operation=operation,
@@ -2708,6 +3394,7 @@ class GitPrimitive:
             observation=observation,
             source_oids=source_oids,
             flow_snapshot=flow_snapshot,
+            additional_data_sinks=additional_data_sinks,
         )
 
         def dispatch() -> tuple[GitOperationResult, dict[str, Any]]:
@@ -2725,6 +3412,26 @@ class GitPrimitive:
                 callback=lambda before: callback(before),
             )
 
+        writes_worktree = any(
+            right in {CapabilityRight.WRITE, CapabilityRight.DELETE}
+            for right in filesystem_rights
+        )
+        if writes_worktree:
+            flow_lock_paths = (self._normalized_worktree_root(worktree_id) or ".",)
+        elif filesystem_rights:
+            lock_paths = tuple(paths) if paths else (None,)
+            flow_lock_paths = tuple(
+                self._normalized_worktree_root(worktree_id) or "."
+                if raw_path is None
+                else self._normalized_file_path(
+                    raw_path,
+                    worktree_id=worktree_id,
+                )
+                for raw_path in lock_paths
+            )
+        else:
+            flow_lock_paths = ()
+
         return self._complete_mutation(
             pid=pid,
             operation=operation,
@@ -2734,6 +3441,8 @@ class GitPrimitive:
             invocation=invocation,
             observation=observation,
             input_refs=input_refs,
+            worktree_id=worktree_id,
+            flow_lock_paths=flow_lock_paths,
             dispatch=dispatch,
         )
 
@@ -2901,7 +3610,11 @@ class GitPrimitive:
             dispatch,
             worktree_id=worktree_id,
             paths=selected,
-            filesystem_rights=(CapabilityRight.WRITE, CapabilityRight.DELETE),
+            filesystem_rights=(
+                (CapabilityRight.WRITE, CapabilityRight.DELETE)
+                if worktree
+                else ()
+            ),
             filesystem_path_subtree=True,
             destructive=True,
             extra={"staged": staged, "worktree": worktree, "source": source},
@@ -3445,10 +4158,19 @@ class GitPrimitive:
         if action == "create":
             if managed_worktree_id is not None:
                 raise GitError(GitErrorCode.INVALID_PATH.value, "Runtime generates managed worktree ids")
-            selected_id = new_id("wt")
+            selected_branch = self._validate_branch(new_branch) if new_branch is not None else None
+            selected_expected_state = self._validate_expected_token(
+                expected_state_token
+            )
+            selected_id = self._stable_generated_id(
+                "wt",
+                pid,
+                selected_expected_state,
+                ref,
+                selected_branch,
+            )
             if not _WORKTREE_ID_RE.fullmatch(selected_id):
                 raise RuntimeError("generated worktree id is invalid")
-            selected_branch = self._validate_branch(new_branch) if new_branch is not None else None
         else:
             if ref is not None or new_branch is not None:
                 raise ValidationError("Git worktree remove accepts only managed_worktree_id")
@@ -3456,6 +4178,9 @@ class GitPrimitive:
                 raise GitError(GitErrorCode.INVALID_PATH.value, "invalid managed worktree id")
             selected_id = managed_worktree_id
             selected_branch = None
+            selected_expected_state = self._validate_expected_token(
+                expected_state_token
+            )
         workspace_root = Path(getattr(self.provider, "workspace_root", self.filesystem.root))
         managed_path = Path(getattr(self.provider, "managed_worktree_root", workspace_root)) / selected_id
         try:
@@ -3476,7 +4201,14 @@ class GitPrimitive:
                     args = ["worktree", "add", "--detach", str(target), oid]
                 else:
                     args = ["worktree", "add", "-b", selected_branch, str(target), oid]
-                self._mutation_command(before, "worktree", args, worktree_id="main")
+                try:
+                    self._mutation_command(before, "worktree", args, worktree_id="main")
+                except BaseException:
+                    with contextlib.suppress(GitError):
+                        self.provider.repository_layout(worktree=target)
+                        self._mark_git_materialized_worktree(selected_id)
+                    raise
+                self._mark_git_materialized_worktree(selected_id)
                 self.provider.repository_layout(worktree=target)
                 created_oid = oid
             else:
@@ -3498,7 +4230,7 @@ class GitPrimitive:
         return self._mutate(
             pid,
             "worktree",
-            expected_state_token,
+            selected_expected_state,
             dispatch,
             worktree_id="main",
             paths=(fs_path,),
@@ -3634,6 +4366,23 @@ class GitPrimitive:
                 "path_count": len(selected_paths),
                 "paths_sha256": _sha256(b"\0".join(selected_paths)),
             },
+            flow_snapshot_resolver=lambda: self._diff_read_flow_snapshot(
+                scope=scope,
+                base=base,
+                head=head,
+                paths=selected_paths,
+                worktree_id=worktree_id,
+                include_patch_index=scope == "range",
+            ),
+            flow_lock_paths=(
+                tuple(
+                    self._normalized_file_path(path, worktree_id=worktree_id)
+                    for path in selected_paths
+                )
+                or (self._normalized_worktree_root(worktree_id) or ".",)
+                if scope == "worktree"
+                else ()
+            ),
         )
         return self._store_patch_artifact(
             pid=pid,
@@ -4440,12 +5189,16 @@ class GitPrimitive:
         review_bodies: dict[str, str] | None = None,
         expected_sha256: str | None,
         create: bool = False,
+        lineage_prebound: bool = False,
     ) -> GitPullRequest:
         data = self._pull_request_payload(
             pull_request,
             review_bodies=review_bodies,
         )
         content_sha256 = _sha256(data)
+        if not lineage_prebound:
+            self._mark_git_output_carrier("pull_request", pull_request.pr_id)
+            self._prebind_pull_request_lineage(pull_request.pr_id)
         self._mark_git_effect_started()
         persisted_sha256 = self.provider.write_pull_request_metadata(
             pull_request.pr_id,
@@ -4540,6 +5293,7 @@ class GitPrimitive:
             raise GitError(GitErrorCode.NOT_FOUND.value, "pull request was not found")
         data, metadata_sha256 = item
         pull_request, bodies = self._parse_pull_request_metadata(data, expected_pr_id=pr_id)
+        self._mark_git_source_carrier("pull_request", pr_id)
         return pull_request, bodies, metadata_sha256
 
     def _verify_pull_request_snapshot(self, pull_request: GitPullRequest) -> None:
@@ -4564,7 +5318,16 @@ class GitPrimitive:
             raise ValidationError("pull request body is invalid")
         selected_base = self._canonical_pull_request_ref(base_ref)
         selected_head = self._canonical_pull_request_ref(head_ref)
-        pr_id = new_id("pr")
+        selected_expected_state = self._validate_expected_token(expected_state_token)
+        pr_id = self._stable_generated_id(
+            "pr",
+            pid,
+            selected_expected_state,
+            selected_base,
+            selected_head,
+            _sha256(title.encode("utf-8")),
+            _sha256(body.encode("utf-8")),
+        )
         if not _PR_ID_RE.fullmatch(pr_id):
             raise RuntimeError("generated pull request id is invalid")
         pr_resource = self.pull_request_resource(pr_id)
@@ -4611,6 +5374,8 @@ class GitPrimitive:
                 f"create {base_snapshot} {base_oid}\n"
                 f"create {head_snapshot} {head_oid}\n"
             ).encode("ascii")
+            self._mark_git_output_carrier("pull_request", pr_id)
+            self._prebind_pull_request_lineage(pr_id)
             self._mutation_command(
                 before,
                 "create_pull_request",
@@ -4622,6 +5387,7 @@ class GitPrimitive:
                 pull_request,
                 expected_sha256=None,
                 create=True,
+                lineage_prebound=True,
             )
             created.append(pull_request)
             return head_oid, {
@@ -4637,12 +5403,13 @@ class GitPrimitive:
         operation_result = self._mutate(
             pid,
             "create_pull_request",
-            expected_state_token,
+            selected_expected_state,
             dispatch,
             descriptor="primitive.git.pull_request",
             resource=pr_resource,
             primary_right=CapabilityRight.WRITE,
             additional_authorities=((self.repository_resource, CapabilityRight.WRITE, False),),
+            additional_data_sinks=(DataSink(self.repository_resource),),
             extra={
                 "pr_id": pr_id,
                 "base_ref": selected_base,
@@ -4650,6 +5417,12 @@ class GitPrimitive:
                 "title_sha256": _sha256(title.encode("utf-8")),
                 "body_sha256": _sha256(body.encode("utf-8")),
             },
+            protected_flow_snapshot_resolver=lambda _scopes: self._current_range_flow_snapshot(
+                selected_expected_state,
+                base=selected_base,
+                head=selected_head,
+                worktree_id="main",
+            ),
         )
         if len(created) != 1:
             raise GitError(GitErrorCode.UNKNOWN_EFFECT.value, "pull request creation outcome is unknown")
@@ -4719,6 +5492,10 @@ class GitPrimitive:
             read,
             resource="git_pr:workspace:*",
             extra={"status": selected_status.value if selected_status is not None else None, "limit": limit},
+            flow_snapshot_resolver=lambda: self._git_read_lineage_snapshot(
+                worktree_id="main",
+                fixed_carriers=(("pull_request_collection", "workspace"),),
+            ),
         )
 
     def inspect_pull_request(self, pid: str, pr_id: str) -> GitPullRequest:
@@ -4751,6 +5528,10 @@ class GitPrimitive:
             read,
             resource=self.pull_request_resource(pr_id),
             extra={"pr_id": pr_id},
+            flow_snapshot_resolver=lambda: self._git_read_lineage_snapshot(
+                worktree_id="main",
+                fixed_carriers=(("pull_request", pr_id),),
+            ),
         )
 
     def review_pull_request(
@@ -4823,6 +5604,11 @@ class GitPrimitive:
                 "body_sha256": _sha256(encoded_body),
                 "body_bytes": len(encoded_body),
             },
+            protected_flow_snapshot_resolver=lambda _scopes: self._current_git_read_flow_snapshot(
+                expected_state_token,
+                worktree_id="main",
+                fixed_carriers=(("pull_request", pr_id),),
+            ),
         )
         if len(updated) != 1:
             raise GitError(GitErrorCode.UNKNOWN_EFFECT.value, "pull request review outcome is unknown")
@@ -4861,6 +5647,11 @@ class GitPrimitive:
             resource=self.pull_request_resource(pr_id),
             primary_right=CapabilityRight.DELETE,
             extra={"pr_id": pr_id},
+            protected_flow_snapshot_resolver=lambda _scopes: self._current_git_read_flow_snapshot(
+                expected_state_token,
+                worktree_id="main",
+                fixed_carriers=(("pull_request", pr_id),),
+            ),
         )
         if len(updated) != 1:
             raise GitError(GitErrorCode.UNKNOWN_EFFECT.value, "pull request close outcome is unknown")
@@ -4965,7 +5756,13 @@ class GitPrimitive:
                 (self.repository_resource, CapabilityRight.DELETE, False),
                 (self.repository_resource, CapabilityRight.ADMIN, False),
             ),
+            additional_data_sinks=(DataSink(self.repository_resource),),
             extra={"pr_id": pr_id, "strategy": strategy},
+            protected_flow_snapshot_resolver=lambda _scopes: self._current_git_read_flow_snapshot(
+                expected_state_token,
+                worktree_id=worktree_id,
+                fixed_carriers=(("pull_request", pr_id),),
+            ),
         )
         if len(updated) != 1:
             raise GitError(GitErrorCode.UNKNOWN_EFFECT.value, "pull request merge outcome is unknown")

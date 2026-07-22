@@ -81,7 +81,7 @@ def test_request_estimator_includes_tool_outputs_and_openai_schemas() -> None:
     assert with_schema > base
 
 
-def test_provider_usage_is_a_same_profile_and_generation_lower_bound() -> None:
+def test_provider_usage_is_ignored_without_an_active_responses_chain() -> None:
     call = SimpleNamespace(
         api="chat",
         response_id="response-1",
@@ -97,7 +97,14 @@ def test_provider_usage_is_a_same_profile_and_generation_lower_bound() -> None:
         profile_id="coding",
         context_generation="generation-1",
         previous_response_id=None,
-    ) == 900
+    ) == 0
+    call.api = "responses"
+    assert provider_usage_lower_bound(
+        call,
+        profile_id="coding",
+        context_generation="generation-1",
+        previous_response_id=None,
+    ) == 0
     assert provider_usage_lower_bound(
         call,
         profile_id="coding",
@@ -129,6 +136,27 @@ def test_responses_chain_uses_previous_total_usage_as_lower_bound() -> None:
         context_generation="generation-1",
         previous_response_id="response-1",
     ) == 950
+
+
+def test_responses_chain_adds_retained_history_to_new_request() -> None:
+    messages = [{"role": "user", "content": "new chained input"}]
+    local = estimate_request_input_tokens(messages, [])
+
+    assessment = assess_context_pressure(
+        messages=messages,
+        tools=[],
+        context_window_tokens=2_000,
+        reserved_output_tokens=100,
+        threshold_ratio=0.8,
+        profile_id="coding",
+        context_generation="generation-1",
+        provider_lower_bound_tokens=950,
+    )
+
+    assert assessment.local_input_estimate_tokens == local
+    assert assessment.provider_usage_lower_bound_tokens == 950
+    assert assessment.estimated_input_tokens == local + 950
+    assert assessment.projected_tokens == local + 1_050
 
 
 def test_context_management_defaults_to_builtin_auto_compaction() -> None:

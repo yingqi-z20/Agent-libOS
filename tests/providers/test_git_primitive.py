@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import os
 import subprocess
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -17,6 +18,7 @@ from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, GitDefaults
 from agent_libos.models import (
     CapabilityRight,
+    DataFlowContext,
     EventType,
     GitErrorCode,
     GitPullRequestStatus,
@@ -36,6 +38,7 @@ from agent_libos.substrate import (
     GitProviderEffectNotStarted,
     LocalGitProvider,
     LocalResourceProviderSubstrate,
+    LocalShellProvider,
 )
 
 
@@ -214,6 +217,77 @@ def test_provider_defers_hook_isolation_until_a_git_call(
     assert exc_info.value.code == GitErrorCode.COMMAND_FAILED.value
 
 
+def test_provider_repository_lock_thread_waiter_honors_timeout(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    holder_entered = threading.Event()
+    holder_release = threading.Event()
+    holder_done = threading.Event()
+    waiter_done = threading.Event()
+    holder_failures: list[BaseException] = []
+    waiter_results: list[str] = []
+
+    def hold_repository_lock() -> None:
+        try:
+            with provider.repository_lock(timeout=2.0):
+                holder_entered.set()
+                if not holder_release.wait(timeout=5.0):
+                    raise AssertionError("repository lock holder was not released")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            holder_failures.append(exc)
+        finally:
+            holder_done.set()
+
+    def wait_for_repository_lock() -> None:
+        try:
+            with provider.repository_lock(timeout=0.05):
+                waiter_results.append("acquired")
+        except GitError as exc:
+            waiter_results.append(exc.code)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            waiter_results.append(f"unexpected:{exc!r}")
+        finally:
+            waiter_done.set()
+
+    holder = threading.Thread(target=hold_repository_lock)
+    waiter = threading.Thread(target=wait_for_repository_lock)
+    holder.start()
+    assert holder_entered.wait(timeout=2.0)
+    waiter.start()
+
+    waiter_completed_while_held = waiter_done.wait(timeout=1.0)
+    holder_was_still_holding = not holder_done.is_set()
+    holder_release.set()
+    holder.join(timeout=2.0)
+    waiter.join(timeout=2.0)
+
+    assert not holder.is_alive()
+    assert not waiter.is_alive()
+    assert holder_failures == []
+    assert waiter_completed_while_held
+    assert holder_was_still_holding
+    assert waiter_results == [GitErrorCode.REPOSITORY_BUSY.value]
+
+    with provider.repository_lock(timeout=0.5):
+        pass
+
+
+def test_provider_repository_lock_remains_reentrant_in_same_thread(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+
+    with provider.repository_lock(timeout=0.5) as outer:
+        with provider.repository_lock(timeout=0.05) as inner:
+            assert outer.repository_id == inner.repository_id
+            assert outer.worktree_id == inner.worktree_id
+
+
 def test_builder_does_not_eagerly_construct_a_fallback_git_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -234,6 +308,147 @@ def test_builder_does_not_eagerly_construct_a_fallback_git_provider(
         module_manifests=(),
     )
     runtime.close()
+
+
+def test_builder_binds_runtime_git_config_to_supplied_local_substrate(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    selected_git = replace(
+        DEFAULT_CONFIG.git,
+        enabled=False,
+        executable="runtime-selected-git",
+        inherit_credential_helpers=False,
+        inherit_ssh_agent=False,
+    )
+    config = replace(
+        _runtime_config(git=selected_git),
+        shell=replace(DEFAULT_CONFIG.shell, default_policy_level="always_allow"),
+    )
+    substrate = LocalResourceProviderSubstrate(root)
+    runtime = Runtime.open(
+        ":memory:",
+        config=config,
+        substrate=substrate,
+        module_manifests=(),
+    )
+    try:
+        assert runtime.git.provider is substrate.git
+        assert runtime.git.provider.config is selected_git
+        assert runtime.shell.provider is substrate.shell
+        assert substrate.shell._git_config is selected_git
+
+        pid = runtime.process.spawn(image="base-agent:v0", goal="verify disabled Git")
+        _grant_git_authority(runtime, pid)
+        runtime.capability.issue_trusted(
+            pid,
+            "shell:git",
+            [CapabilityRight.EXECUTE],
+            issued_by="git-provider-test",
+        )
+        with pytest.raises(GitError) as typed_error:
+            runtime.git.repository_info(pid)
+        assert typed_error.value.code == GitErrorCode.GIT_UNAVAILABLE.value
+        with pytest.raises(GitError) as shell_error:
+            runtime.shell.run(pid, ["git", "status"])
+        assert shell_error.value.code == GitErrorCode.GIT_UNAVAILABLE.value
+    finally:
+        runtime.close()
+
+
+def test_builder_rejects_conflicting_explicit_local_substrate_git_config(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    substrate = LocalResourceProviderSubstrate(
+        root,
+        git_config=DEFAULT_CONFIG.git,
+    )
+    config = _runtime_config(
+        git=replace(DEFAULT_CONFIG.git, inherit_credential_helpers=False),
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="substrate Git configuration does not match",
+    ):
+        Runtime.open(
+            ":memory:",
+            config=config,
+            substrate=substrate,
+            module_manifests=(),
+        )
+
+
+@pytest.mark.parametrize("provider_kind", ("git", "shell"))
+def test_builder_rejects_local_provider_subclass_with_mismatched_git_config(
+    tmp_path: Path,
+    provider_kind: str,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    substrate = LocalResourceProviderSubstrate(root)
+
+    if provider_kind == "git":
+        class DerivedLocalGitProvider(LocalGitProvider):
+            pass
+
+        original_provider: Any = DerivedLocalGitProvider(root)
+        substrate.git = original_provider
+    else:
+        class DerivedLocalShellProvider(LocalShellProvider):
+            pass
+
+        original_provider = DerivedLocalShellProvider(root)
+        substrate.shell = original_provider
+
+    config = _runtime_config(git=replace(DEFAULT_CONFIG.git, enabled=False))
+    with pytest.raises(
+        ValidationError,
+        match="provider subclass.*does not match",
+    ):
+        Runtime.open(
+            ":memory:",
+            config=config,
+            substrate=substrate,
+            module_manifests=(),
+        )
+
+    assert getattr(substrate, provider_kind) is original_provider
+    if provider_kind == "git":
+        assert original_provider.config == DEFAULT_CONFIG.git
+    else:
+        assert original_provider._git_config is None
+
+
+def test_local_substrate_runtime_git_binding_is_idempotent_and_atomic(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    substrate = LocalResourceProviderSubstrate(root)
+    selected_git = replace(DEFAULT_CONFIG.git, inherit_credential_helpers=False)
+    conflicting_git = replace(selected_git, enabled=False)
+
+    substrate.bind_runtime_git_config(selected_git)
+    bound_git_provider = substrate.git
+    bound_shell_provider = substrate.shell
+    substrate.bind_runtime_git_config(selected_git)
+
+    assert substrate.git is bound_git_provider
+    assert substrate.shell is bound_shell_provider
+    assert bound_git_provider.config is selected_git
+    assert bound_shell_provider._git_config is selected_git
+
+    with pytest.raises(ValidationError, match="already bound"):
+        substrate.bind_runtime_git_config(conflicting_git)
+
+    assert substrate.git is bound_git_provider
+    assert substrate.shell is bound_shell_provider
+    assert bound_git_provider.config is selected_git
+    assert bound_shell_provider._git_config is selected_git
 
 
 def test_builder_registers_fallback_git_provider_for_effect_recovery(
@@ -426,6 +641,48 @@ def test_active_external_filter_is_rejected_before_status_can_execute_it(tmp_pat
         runtime.close()
 
 
+def test_index_only_filter_is_rejected_before_status_can_execute_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    sentinel = tmp_path / "index-filter-ran"
+    attributes = root / ".gitattributes"
+    attributes.write_text("*.txt filter=hostile\n", encoding="utf-8")
+    _git(root, "add", "--", ".gitattributes")
+    attributes.unlink()
+    _git(root, "config", "filter.hostile.clean", f"touch {sentinel}")
+    _git(root, "config", "filter.hostile.smudge", "cat")
+    (root / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+    provider = LocalGitProvider(root)
+    with pytest.raises(GitError) as exc_info:
+        provider.run(["status", "--porcelain=v2", "-z"])
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+    assert not sentinel.exists()
+
+
+def test_active_textconv_driver_is_rejected_before_blame_can_execute_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    sentinel = tmp_path / "textconv-ran"
+    (root / ".gitattributes").write_text(
+        "tracked.txt diff=hostile\n",
+        encoding="utf-8",
+    )
+    _git(root, "config", "diff.hostile.textconv", f"touch {sentinel}")
+
+    provider = LocalGitProvider(root)
+    with pytest.raises(GitError) as exc_info:
+        provider.run(["blame", "HEAD", "--", "tracked.txt"])
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+    assert not sentinel.exists()
+
+
 @pytest.mark.parametrize("driver_name", ["hostile/name", "hostile.name"])
 def test_active_external_filter_with_structured_name_is_rejected_before_execution(
     tmp_path: Path,
@@ -537,6 +794,121 @@ def test_checkout_rejects_filter_activated_only_by_target_tree(tmp_path: Path) -
         assert _git(root, "branch", "--show-current").strip() == b"main"
     finally:
         runtime.close()
+
+
+def test_binary_target_attributes_are_discovered_before_checkout(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "binary-attributes")
+    (root / ".gitattributes").write_bytes(
+        b"\0ignored binary line\ntracked.txt filter=hostile\n"
+    )
+    (root / "tracked.txt").write_text("target\n", encoding="utf-8")
+    _git(
+        root,
+        "-c",
+        "filter.hostile.clean=cat",
+        "add",
+        "--",
+        ".gitattributes",
+        "tracked.txt",
+    )
+    _git(root, "commit", "-q", "-m", "binary target attributes")
+    _git(root, "switch", "-q", "main")
+    sentinel = tmp_path / "binary-attribute-filter-ran"
+    _git(root, "config", "filter.hostile.clean", "cat")
+    _git(root, "config", "filter.hostile.smudge", f"touch {sentinel}")
+
+    provider = LocalGitProvider(root)
+    with pytest.raises(GitError) as exc_info:
+        provider.run(
+            ["switch", "binary-attributes"],
+            read_only=False,
+        )
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+    assert not sentinel.exists()
+    assert _git(root, "branch", "--show-current").strip() == b"main"
+
+
+def test_target_attribute_discovery_does_not_enumerate_the_entire_tree(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "large")
+    for index in range(800):
+        (root / f"ordinary-file-{index:03d}-with-a-long-name.txt").write_text(
+            f"{index}\n",
+            encoding="utf-8",
+        )
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "large tree without attributes")
+    _git(root, "switch", "-q", "main")
+    _git(root, "config", "filter.inactive.smudge", "cat")
+    limited = replace(
+        DEFAULT_CONFIG.git,
+        output_max_bytes=65_536,
+        output_hard_limit_bytes=65_536,
+    )
+
+    result = LocalGitProvider(root, config=limited).run(
+        ["switch", "large"],
+        read_only=False,
+    )
+
+    assert result.returncode == 0
+    assert _git(root, "branch", "--show-current").strip() == b"large"
+
+
+def test_rebase_rejects_filter_activated_by_an_intermediate_replayed_commit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "topic")
+    nested = root / "nested"
+    nested.mkdir()
+    (nested / ".gitattributes").write_text(
+        "tracked.txt filter=hostile\n",
+        encoding="utf-8",
+    )
+    (nested / "tracked.txt").write_text("topic one\n", encoding="utf-8")
+    _git(
+        root,
+        "-c",
+        "filter.hostile.clean=cat",
+        "add",
+        "--",
+        "nested/.gitattributes",
+        "nested/tracked.txt",
+    )
+    _git(root, "commit", "-q", "-m", "activate filter")
+    (nested / ".gitattributes").unlink()
+    (nested / "tracked.txt").write_text("topic two\n", encoding="utf-8")
+    _git(root, "-c", "filter.hostile.clean=cat", "add", "-A")
+    _git(root, "commit", "-q", "-m", "remove filter")
+    _git(root, "switch", "-q", "main")
+    (root / "base.txt").write_text("base\n", encoding="utf-8")
+    _git(root, "add", "--", "base.txt")
+    _git(root, "commit", "-q", "-m", "advance base")
+    _git(root, "switch", "-q", "topic")
+    sentinel = tmp_path / "rebase-filter-ran"
+    _git(root, "config", "filter.hostile.clean", "cat")
+    _git(root, "config", "filter.hostile.smudge", f"touch {sentinel}")
+
+    provider = LocalGitProvider(root)
+    with pytest.raises(GitError) as exc_info:
+        provider.run(
+            ["rebase", "--no-autostash", "main"],
+            read_only=False,
+        )
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+    assert not sentinel.exists()
+    assert _git(root, "branch", "--show-current").strip() == b"topic"
 
 
 def test_repository_hook_is_disabled_for_typed_commit(tmp_path: Path) -> None:
@@ -974,6 +1346,484 @@ def test_git_commit_lineage_blocks_cross_process_secret_push(tmp_path: Path) -> 
         runtime.close()
 
 
+def test_git_reads_and_patch_artifacts_recover_commit_and_index_lineage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    base_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    secret_path = root / "secret.txt"
+    secret_path.write_text("classified from Git\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="label secret bytes")
+        stager = runtime.process.spawn(image="base-agent:v0", goal="stage secret bytes")
+        committer = runtime.process.spawn(image="base-agent:v0", goal="commit secret bytes")
+        reader = runtime.process.spawn(image="base-agent:v0", goal="read secret commit")
+        for pid in (writer, stager, committer, reader):
+            _grant_git_authority(runtime, pid)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-read-lineage-test",
+            ),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="secret.txt",
+            content_sha256=hashlib.sha256(secret_path.read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
+        )
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            runtime.git.show(reader, base_oid)
+            normal_context = runtime.data_flow.current_context()
+        assert normal_context.labels.sensitivity.value == "normal"
+        assert normal_context.labels.trust_level == "untrusted"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(stager).state.token
+            staged = runtime.git.stage(stager, ["secret.txt"], state)
+        binding = runtime.store.get_file_label_binding("secret.txt")
+        assert binding is not None
+        runtime.data_flow.tombstone_file(
+            pid=writer,
+            normalized_path="secret.txt",
+            expected_binding_id=binding.binding_id,
+            expected_generation=binding.generation,
+        )
+        assert runtime.data_flow.file_context("secret.txt").labels.sensitivity.value == "normal"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            staged_diff = runtime.git.diff(reader, scope="staged")
+            staged_context = runtime.data_flow.current_context()
+        assert "classified from Git" in staged_diff.patch
+        assert staged_context.labels.sensitivity.value == "secret"
+        staged_parents, _staged_refs = runtime.data_flow.provenance_sources(
+            staged_context
+        )
+        assert source.oid in staged_parents
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            committed = runtime.git.commit(
+                committer,
+                "commit classified bytes",
+                staged.after.token,
+            )
+        assert committed.created_oid is not None
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            shown = runtime.git.show(reader, committed.created_oid)
+            shown_context = runtime.data_flow.current_context()
+        assert "classified from Git" in shown["patch"]
+        assert shown_context.labels.sensitivity.value == "secret"
+        shown_parents, _shown_refs = runtime.data_flow.provenance_sources(
+            shown_context
+        )
+        assert source.oid in shown_parents
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            artifact = runtime.git.create_patch(
+                reader,
+                scope="range",
+                base=base_oid,
+                head=committed.created_oid,
+            )
+        stored = runtime.store.get_object(artifact.oid)
+        assert stored is not None
+        assert stored.metadata.sensitivity == "secret"
+        assert source.oid in stored.provenance.parent_oids
+    finally:
+        runtime.close()
+
+
+def test_git_read_rejects_carrier_label_generation_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    tracked = root / "tracked.txt"
+    tracked.write_text("classified race\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="label secret bytes")
+        reader = runtime.process.spawn(image="base-agent:v0", goal="read racing diff")
+        _grant_git_authority(runtime, writer)
+        _grant_git_authority(runtime, reader)
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-read-race-test",
+            ),
+        )
+        source_context = runtime.data_flow.context_from_source_oids(
+            writer,
+            [source.oid],
+        )
+        digest = hashlib.sha256(tracked.read_bytes()).hexdigest()
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="tracked.txt",
+            content_sha256=digest,
+            context=source_context,
+        )
+        original = runtime.git._diff_result
+
+        def racing_diff(**kwargs: Any) -> tuple[Any, dict[str, Any]]:
+            runtime.data_flow.bind_written_file_digest(
+                pid=writer,
+                normalized_path="tracked.txt",
+                content_sha256=digest,
+                context=source_context,
+            )
+            return original(**kwargs)
+
+        monkeypatch.setattr(runtime.git, "_diff_result", racing_diff)
+        with runtime.data_flow.activate(DataFlowContext()):
+            with pytest.raises(CapabilityDenied, match="carrier changed"):
+                runtime.git.diff(reader, paths=["tracked.txt"])
+            raced_context = runtime.data_flow.current_context()
+        assert raced_context.labels.sensitivity.value == "secret"
+    finally:
+        runtime.close()
+
+
+def test_repository_content_prebind_survives_post_effect_settlement_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    tracked = root / "tracked.txt"
+    tracked.write_text("classified staged bytes\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="stage secret bytes")
+        reader = runtime.process.spawn(image="base-agent:v0", goal="read unknown stage")
+        for pid in (writer, reader):
+            _grant_git_authority(runtime, pid)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret stage"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-repository-prebind-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(writer, [source.oid])
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="tracked.txt",
+            content_sha256=hashlib.sha256(tracked.read_bytes()).hexdigest(),
+            context=secret_context,
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(writer).state.token
+
+        original = runtime.git._settle_git_lineage
+
+        def fail_settlement(**_kwargs: Any) -> None:
+            raise RuntimeError("repository lineage settlement failed")
+
+        monkeypatch.setattr(runtime.git, "_settle_git_lineage", fail_settlement)
+        with pytest.raises(RuntimeError, match="repository lineage settlement failed"):
+            runtime.git.stage(writer, ["tracked.txt"], state)
+        monkeypatch.setattr(runtime.git, "_settle_git_lineage", original)
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            staged = runtime.git.diff(reader, scope="staged")
+            context = runtime.data_flow.current_context()
+        assert "classified staged bytes" in staged.patch
+        assert context.labels.sensitivity.value == "secret"
+        parents, _source_refs = runtime.data_flow.provenance_sources(context)
+        assert source.oid in parents
+    finally:
+        runtime.close()
+
+
+def test_range_patch_artifact_inherits_unrelated_current_index_lineage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    base_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    (root / "normal.txt").write_text("normal range change\n", encoding="utf-8")
+    _git(root, "add", "--", "normal.txt")
+    _git(root, "commit", "-q", "-m", "normal range change")
+    head_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    (root / "secret-index.txt").write_text("unrelated staged secret\n", encoding="utf-8")
+    _git(root, "add", "--", "secret-index.txt")
+    runtime = _open_runtime(root)
+    try:
+        labeler = runtime.process.spawn(image="base-agent:v0", goal="label index")
+        reader = runtime.process.spawn(image="base-agent:v0", goal="create range patch")
+        for pid in (labeler, reader):
+            _grant_git_authority(runtime, pid)
+        source = runtime.memory.create_object(
+            labeler,
+            ObjectType.EVIDENCE,
+            {"classification": "secret current index"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-range-patch-index-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(labeler, [source.oid])
+        state = runtime.git.provider.repository_state()
+        runtime.git._bind_git_lineage(
+            pid=labeler,
+            state=state,
+            carrier_kind="index",
+            carrier_id=state.index_sha256,
+            context=secret_context,
+        )
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            ranged = runtime.git.diff(
+                reader,
+                scope="range",
+                base=base_oid,
+                head=head_oid,
+            )
+            range_context = runtime.data_flow.current_context()
+        assert "normal range change" in ranged.patch
+        assert range_context.labels.sensitivity.value == "normal"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            artifact = runtime.git.create_patch(
+                reader,
+                scope="range",
+                base=base_oid,
+                head=head_oid,
+            )
+        stored = runtime.store.get_object(artifact.oid)
+        assert stored is not None
+        assert stored.metadata.sensitivity == "secret"
+        assert source.oid in stored.provenance.parent_oids
+    finally:
+        runtime.close()
+
+
+def test_worktree_read_holds_file_label_lock_through_final_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    tracked = root / "tracked.txt"
+    tracked.write_text("before concurrent write\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    writer_thread: threading.Thread | None = None
+    try:
+        reader = runtime.process.spawn(image="base-agent:v0", goal="read stable diff")
+        writer = runtime.process.spawn(image="base-agent:v0", goal="write after refresh")
+        _grant_git_authority(runtime, reader)
+        _grant_git_authority(runtime, writer)
+        refresh_count = 0
+        writer_started = threading.Event()
+        writer_finished = threading.Event()
+        original = runtime.git._aggregate_flow_snapshots
+
+        def write_after_refresh() -> None:
+            writer_started.set()
+            runtime.filesystem.write_text(
+                writer,
+                "tracked.txt",
+                "after concurrent write\n",
+            )
+            writer_finished.set()
+
+        def aggregate_with_barrier(
+            snapshots: Any,
+        ) -> Any:
+            nonlocal refresh_count, writer_thread
+            refresh_count += 1
+            if refresh_count == 2:
+                writer_thread = threading.Thread(target=write_after_refresh)
+                writer_thread.start()
+                assert writer_started.wait(timeout=2)
+                assert not writer_finished.wait(timeout=0.1)
+            return original(snapshots)
+
+        monkeypatch.setattr(
+            runtime.git,
+            "_aggregate_flow_snapshots",
+            aggregate_with_barrier,
+        )
+        result = runtime.git.diff(reader, paths=["tracked.txt"])
+        assert "before concurrent write" in result.patch
+        assert writer_thread is not None
+        writer_thread.join(timeout=5)
+        assert writer_finished.is_set()
+        assert tracked.read_text(encoding="utf-8") == "after concurrent write\n"
+    finally:
+        if writer_thread is not None:
+            writer_thread.join(timeout=5)
+        runtime.close()
+
+
+def test_log_and_blame_aggregate_every_returned_commit_carrier(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    base_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    history = root / "history.txt"
+    history.write_text("ancestor classified line\n", encoding="utf-8")
+    _git(root, "add", "--", "history.txt")
+    _git(root, "commit", "-q", "-m", "ancestor secret marker")
+    ancestor_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    history.write_text(
+        "ancestor classified line\ndescendant normal line\n",
+        encoding="utf-8",
+    )
+    _git(root, "commit", "-q", "-am", "descendant marker")
+    descendant_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    runtime = _open_runtime(root)
+    try:
+        labeler = runtime.process.spawn(image="base-agent:v0", goal="label commit carriers")
+        reader = runtime.process.spawn(image="base-agent:v0", goal="read commit history")
+        _grant_git_authority(runtime, labeler)
+        _grant_git_authority(runtime, reader)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(labeler).state.token
+            normal_tag = runtime.git.tag(
+                labeler,
+                "create",
+                "descendant-normal",
+                state,
+                target=descendant_oid,
+            )
+        source = runtime.memory.create_object(
+            labeler,
+            ObjectType.EVIDENCE,
+            {"classification": "secret ancestor"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-history-lineage-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(
+            labeler,
+            [source.oid],
+        )
+        with runtime.data_flow.activate(secret_context):
+            runtime.git.tag(
+                labeler,
+                "create",
+                "ancestor-secret",
+                normal_tag.after.token,
+                target=ancestor_oid,
+            )
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            logged = runtime.git.log(reader, ref=descendant_oid)
+            log_context = runtime.data_flow.current_context()
+        assert [item.subject for item in logged["commits"]][:2] == [
+            "descendant marker",
+            "ancestor secret marker",
+        ]
+        assert log_context.labels.sensitivity.value == "secret"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            ranged = runtime.git.diff(
+                reader,
+                scope="range",
+                base=base_oid,
+                head=descendant_oid,
+            )
+            range_context = runtime.data_flow.current_context()
+        assert "ancestor classified line" in ranged.patch
+        assert range_context.labels.sensitivity.value == "secret"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            blamed = runtime.git.blame(
+                reader,
+                "history.txt",
+                ref=descendant_oid,
+            )
+            blame_context = runtime.data_flow.current_context()
+        assert "ancestor classified line" in blamed["content"]
+        assert blame_context.labels.sensitivity.value == "secret"
+    finally:
+        runtime.close()
+
+
+def test_default_blame_does_not_inherit_unread_dirty_worktree_lineage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    tracked = root / "tracked.txt"
+    tracked.write_text("dirty secret line\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="label dirty file")
+        reader = runtime.process.spawn(image="base-agent:v0", goal="blame committed file")
+        _grant_git_authority(runtime, writer)
+        _grant_git_authority(runtime, reader)
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret dirty bytes"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-blame-control-test",
+            ),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="tracked.txt",
+            content_sha256=hashlib.sha256(tracked.read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
+        )
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            blamed = runtime.git.blame(reader, "tracked.txt")
+            context = runtime.data_flow.current_context()
+        assert "initial" in blamed["content"]
+        assert "dirty secret line" not in blamed["content"]
+        assert context.labels.sensitivity.value == "normal"
+        assert context.labels.trust_level == "untrusted"
+    finally:
+        runtime.close()
+
+
 def test_worktree_git_write_rebinds_stale_trusted_file_label(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
@@ -1084,6 +1934,15 @@ def test_worktree_git_write_preserves_unchanged_secret_file_label(
         switcher = runtime.process.spawn(image="base-agent:v0", goal="switch worktree")
         _grant_git_authority(runtime, writer)
         _grant_git_authority(runtime, switcher)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
         source = runtime.memory.create_object(
             writer,
             ObjectType.EVIDENCE,
@@ -1205,6 +2064,15 @@ def test_stash_round_trip_preserves_secret_worktree_lineage(
         stasher = runtime.process.spawn(image="base-agent:v0", goal="round-trip stash")
         _grant_git_authority(runtime, writer)
         _grant_git_authority(runtime, stasher)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
         source = runtime.memory.create_object(
             writer,
             ObjectType.EVIDENCE,
@@ -1374,6 +2242,82 @@ def test_restore_source_tree_requires_subtree_filesystem_authority(
         child_binding = runtime.store.get_file_label_binding("node/child.txt")
         assert child_binding is not None
         assert child_binding.labels.trust_level == "untrusted"
+    finally:
+        runtime.close()
+
+
+def test_worktree_restore_holds_root_label_lock_for_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    for name in ("a.txt", "b.txt"):
+        (root / name).write_text(f"{name} original\n", encoding="utf-8")
+    _git(root, "add", "--", "a.txt", "b.txt")
+    _git(root, "commit", "-q", "-m", "add restore files")
+    for name in ("a.txt", "b.txt"):
+        (root / name).write_text(f"{name} dirty\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="restore one dirty file")
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+        observed: list[tuple[str, ...]] = []
+        original = runtime.filesystem.hold_file_label_io_paths
+
+        @contextlib.contextmanager
+        def capture(paths: Any):
+            selected = tuple(paths)
+            observed.append(selected)
+            with original(selected):
+                yield
+
+        monkeypatch.setattr(runtime.filesystem, "hold_file_label_io_paths", capture)
+        _with_auto_approvals(
+            runtime,
+            lambda: runtime.git.restore(pid, ["a.txt"], state),
+        )
+        assert observed[0] == (".",)
+    finally:
+        runtime.close()
+
+
+def test_staged_only_restore_needs_no_filesystem_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    for name in ("a.txt", "b.txt"):
+        (root / name).write_text(f"{name} original\n", encoding="utf-8")
+    _git(root, "add", "--", "a.txt", "b.txt")
+    _git(root, "commit", "-q", "-m", "add staged restore files")
+    for name in ("a.txt", "b.txt"):
+        (root / name).write_text(f"{name} staged\n", encoding="utf-8")
+    _git(root, "add", "--", "a.txt", "b.txt")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="restore index only")
+        _grant_git_repository_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+        result = _with_auto_approvals(
+            runtime,
+            lambda: runtime.git.restore(
+                pid,
+                ["a.txt"],
+                state,
+                staged=True,
+                worktree=False,
+            ),
+        )
+        assert [path.display for path in result.changed_paths] == ["a.txt"]
+        assert (root / "a.txt").read_text(encoding="utf-8") == "a.txt staged\n"
+        assert (root / "b.txt").read_text(encoding="utf-8") == "b.txt staged\n"
+        staged_paths = set(
+            _git(root, "diff", "--cached", "--name-only").decode("utf-8").splitlines()
+        )
+        assert "a.txt" not in staged_paths
+        assert "b.txt" in staged_paths
     finally:
         runtime.close()
 
@@ -1609,6 +2553,162 @@ def test_managed_worktree_is_generated_inside_ignored_runtime_directory(
         runtime.close()
 
 
+def test_managed_worktree_create_reuses_generated_id_after_human_approval(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="approve managed worktree")
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+        )
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.WRITE],
+            effect="ask",
+            issued_by="git-provider-test",
+        )
+        runtime.filesystem.grant_directory(
+            pid,
+            ".",
+            [CapabilityRight.READ, CapabilityRight.WRITE],
+            issued_by="git-provider-test",
+        )
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.worktree(pid, "create", state)
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+
+        created = runtime.git.worktree(pid, "create", state)
+        worktree_id = created.details["managed_worktree_id"]
+        assert worktree_id.startswith("wt_")
+        assert (root / DEFAULT_CONFIG.git.worktree_root / worktree_id).is_dir()
+        assert any(
+            record.action == "primitive.git.worktree"
+            and record.target == "git:workspace"
+            for record in runtime.audit.trace(actor=pid)
+        )
+        assert any(
+            event.type == EventType.EXTERNAL_WRITE
+            and event.source == pid
+            and event.payload.get("operation") == "worktree"
+            for event in runtime.events.list(target="git:workspace")
+        )
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("ref", "new_branch"),
+    (
+        ("missing-worktree-ref", None),
+        (None, "main"),
+    ),
+    ids=("missing-ref", "duplicate-branch"),
+)
+def test_managed_worktree_create_failure_does_not_reconcile_absent_target(
+    tmp_path: Path,
+    ref: str | None,
+    new_branch: str | None,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="reject worktree create")
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(GitError):
+            runtime.git.worktree(
+                pid,
+                "create",
+                state,
+                ref=ref,
+                new_branch=new_branch,
+            )
+
+        managed_root = Path(runtime.git.provider.managed_worktree_root)
+        assert not managed_root.exists() or not any(managed_root.iterdir())
+    finally:
+        runtime.close()
+
+
+def test_list_worktrees_omits_unmanaged_external_paths(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    external = tmp_path / "outside-runtime-worktree"
+    _init_repository(root)
+    _git(root, "worktree", "add", "--detach", str(external), "HEAD")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="list managed worktrees")
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+        )
+
+        listed = runtime.git.list_worktrees(pid)
+
+        assert [(item.worktree_id, item.path) for item in listed["worktrees"]] == [
+            ("main", str(root.resolve()))
+        ]
+        assert str(external.resolve()) not in repr(listed)
+        assert str(external.resolve()) not in repr(runtime.audit.trace(actor=pid))
+        assert str(external.resolve()) not in repr(
+            runtime.events.list(target="git:workspace")
+        )
+    finally:
+        runtime.close()
+
+
+def test_list_worktrees_rejects_managed_root_symlink_drift(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    external_root = tmp_path / "outside-managed-root"
+    external_worktree = external_root / "wt_external"
+    _init_repository(root)
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="list managed worktrees")
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+        )
+        external_root.mkdir()
+        _git(root, "worktree", "add", "--detach", str(external_worktree), "HEAD")
+        managed_root = Path(runtime.git.provider.managed_worktree_root)
+        managed_root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            managed_root.symlink_to(external_root, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are unavailable on this platform")
+
+        listed = runtime.git.list_worktrees(pid)
+
+        assert [(item.worktree_id, item.path) for item in listed["worktrees"]] == [
+            ("main", str(root.resolve()))
+        ]
+        assert str(external_worktree.resolve()) not in repr(listed)
+        assert str(external_worktree.resolve()) not in repr(
+            runtime.audit.trace(actor=pid)
+        )
+        assert str(external_worktree.resolve()) not in repr(
+            runtime.events.list(target="git:workspace")
+        )
+    finally:
+        runtime.close()
+
+
 def test_file_remote_push_and_fetch_use_only_configured_remote(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     remote = tmp_path / "remote.git"
@@ -1714,6 +2814,24 @@ def test_remote_url_userinfo_query_and_custom_protocol_are_rejected(tmp_path: Pa
         assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
 
 
+def test_remote_scheme_comparison_uses_normalized_config_values(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "remote", "add", "origin", "https://example.test/repository.git")
+    git_config = replace(
+        DEFAULT_CONFIG.git,
+        allowed_remote_schemes=("HTTPS", "SSH"),
+    )
+
+    fingerprint = LocalGitProvider(root, config=git_config).remote_fingerprint(
+        "origin"
+    )
+
+    assert fingerprint["remote"] == "origin"
+
+
 def test_multiple_remote_urls_and_escaping_fetch_refspec_are_rejected(
     tmp_path: Path,
 ) -> None:
@@ -1733,6 +2851,89 @@ def test_multiple_remote_urls_and_escaping_fetch_refspec_are_rejected(
     with pytest.raises(GitError) as refspec_error:
         LocalGitProvider(root).remote_fingerprint("origin")
     assert refspec_error.value.code == GitErrorCode.UNSAFE_CONFIG.value
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("http.proxy", "http://attacker.example.test:8080"),
+        (
+            "http.https://example.test/.proxy",
+            "http://attacker.example.test:8080",
+        ),
+        ("http.sslVerify", "false"),
+        ("http.sslVersion", "tlsv1"),
+        ("remote.origin.proxy", "http://attacker.example.test:8080"),
+    ),
+    ids=("proxy", "url-proxy", "tls-verify", "tls-version", "remote-proxy"),
+)
+def test_repository_http_transport_overrides_are_rejected(
+    tmp_path: Path,
+    key: str,
+    value: str,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "remote", "add", "origin", "https://example.test/repository.git")
+    _git(root, "config", key, value)
+
+    with pytest.raises(GitError) as exc_info:
+        LocalGitProvider(root).remote_fingerprint("origin")
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+
+
+def test_repository_http_transport_override_fails_before_remote_effect(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "remote", "add", "origin", "https://example.test/repository.git")
+    _git(root, "config", "http.sslVerify", "false")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="reject unsafe HTTP config")
+        _grant_git_authority(runtime, pid, remote="origin")
+        state = runtime.git.status(pid).state.token
+        effects_before = runtime.store.list_external_effects(pid=pid)
+        remote_resource = runtime.git.remote_resource("origin")
+        events_before = runtime.events.list(target=remote_resource)
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.fetch(pid, "origin", state)
+
+        assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+        assert runtime.store.list_external_effects(pid=pid) == effects_before
+        assert runtime.events.list(target=remote_resource) == events_before
+        assert not any(
+            record.action == "primitive.git.fetch"
+            for record in runtime.audit.trace(actor=pid)
+        )
+        assert any(
+            operation.name == "runtime.git.fetch"
+            and operation.outcome is not None
+            and operation.outcome.value == "failed"
+            for operation in runtime.store.list_operations(pid=pid)
+        )
+    finally:
+        runtime.close()
+
+
+def test_host_global_http_transport_config_remains_supported(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "remote", "add", "origin", "https://example.test/repository.git")
+    _git(
+        root,
+        "config",
+        "--global",
+        "http.proxy",
+        "http://host-proxy.example.test:8080",
+    )
+
+    fingerprint = LocalGitProvider(root).remote_fingerprint("origin")
+
+    assert fingerprint["remote"] == "origin"
 
 
 def test_windows_system_credential_helper_resolves_from_git_install_bin(
@@ -2080,6 +3281,302 @@ def test_pull_defaults_to_the_capability_scoped_current_branch(tmp_path: Path) -
         runtime.close()
 
 
+def test_repository_content_high_water_covers_all_patch_scopes_and_renames(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    origin_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "mv", "tracked.txt", "renamed.txt")
+    _git(root, "commit", "-q", "-m", "rename tracked file")
+    (root / "noise.txt").write_text("noise\n", encoding="utf-8")
+    _git(root, "add", "--", "noise.txt")
+    _git(root, "commit", "-q", "-m", "unrelated base")
+    base_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    (root / "renamed.txt").write_text("replacement\n", encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "replace renamed content")
+    head_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    runtime = _open_runtime(root)
+    try:
+        labeler = runtime.process.spawn(image="base-agent:v0", goal="label origin")
+        reader = runtime.process.spawn(image="base-agent:v0", goal="read patches")
+        for pid in (labeler, reader):
+            _grant_git_authority(runtime, pid)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            labeler,
+            ObjectType.EVIDENCE,
+            {"classification": "secret byte origin"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-repository-high-water-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(
+            labeler,
+            [source.oid],
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(labeler).state.token
+        with runtime.data_flow.activate(secret_context):
+            runtime.git.tag(
+                labeler,
+                "create",
+                "secret-origin",
+                state,
+                target=origin_oid,
+            )
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            ranged = runtime.git.diff(
+                reader,
+                scope="range",
+                base=base_oid,
+                head=head_oid,
+            )
+            range_context = runtime.data_flow.current_context()
+        assert "-initial" in ranged.patch
+        assert range_context.labels.sensitivity.value == "secret"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            same = runtime.git.diff(
+                reader,
+                scope="range",
+                base=head_oid,
+                head=head_oid,
+            )
+            same_context = runtime.data_flow.current_context()
+        assert same.patch == ""
+        assert same_context.labels.sensitivity.value == "secret"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            shown = runtime.git.show(reader, head_oid)
+            show_context = runtime.data_flow.current_context()
+        assert "-initial" in shown["patch"]
+        assert show_context.labels.sensitivity.value == "secret"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            artifact = runtime.git.create_patch(
+                reader,
+                scope="range",
+                base=base_oid,
+                head=head_oid,
+            )
+        stored = runtime.store.get_object(artifact.oid)
+        assert stored is not None
+        assert stored.metadata.sensitivity == "secret"
+        assert source.oid in stored.provenance.parent_oids
+
+        (root / "renamed.txt").write_text("worktree replacement\n", encoding="utf-8")
+        with runtime.data_flow.activate(DataFlowContext()):
+            worktree = runtime.git.diff(reader, paths=["renamed.txt"])
+            worktree_context = runtime.data_flow.current_context()
+        assert worktree_context.labels.sensitivity.value == "secret"
+        with runtime.data_flow.activate(DataFlowContext()):
+            staged = runtime.git.stage(
+                reader,
+                ["renamed.txt"],
+                worktree.state.token,
+            )
+        with runtime.data_flow.activate(DataFlowContext()):
+            staged_diff = runtime.git.diff(reader, scope="staged")
+            staged_context = runtime.data_flow.current_context()
+        assert staged.after.token == staged_diff.state.token
+        assert staged_context.labels.sensitivity.value == "secret"
+    finally:
+        runtime.close()
+
+
+def test_range_reads_ignore_unrelated_long_history(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    commit_oids: list[str] = []
+    for index in range(8):
+        (root / f"noise-{index}.txt").write_text(f"{index}\n", encoding="utf-8")
+        _git(root, "add", "--", f"noise-{index}.txt")
+        _git(root, "commit", "-q", "-m", f"noise {index}")
+        commit_oids.append(_git(root, "rev-parse", "HEAD").strip().decode("ascii"))
+    git_config = replace(
+        DEFAULT_CONFIG.git,
+        log_entry_limit=2,
+        log_entry_hard_limit=2,
+    )
+    runtime = _open_runtime(root, git=git_config)
+    try:
+        reader = runtime.process.spawn(image="base-agent:v0", goal="read short range")
+        _grant_git_authority(runtime, reader)
+        adjacent = runtime.git.diff(
+            reader,
+            scope="range",
+            base=commit_oids[-2],
+            head=commit_oids[-1],
+        )
+        same = runtime.git.diff(
+            reader,
+            scope="range",
+            base=commit_oids[-1],
+            head=commit_oids[-1],
+        )
+        assert "noise-7.txt" in adjacent.patch
+        assert same.patch == ""
+    finally:
+        runtime.close()
+
+
+def test_repository_content_lineage_survives_resource_alias_and_path_spelling(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    database = tmp_path / "runtime.db"
+    first_config = _runtime_config()
+    first = Runtime.open(
+        database,
+        config=first_config,
+        substrate=LocalResourceProviderSubstrate(root),
+        module_manifests=(),
+    )
+    try:
+        labeler = first.process.spawn(image="base-agent:v0", goal="label repository")
+        _grant_git_authority(first, labeler)
+        first.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        source = first.memory.create_object(
+            labeler,
+            ObjectType.EVIDENCE,
+            {"classification": "secret repository alias"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-repository-alias-test",
+            ),
+        )
+        secret_context = first.data_flow.context_from_source_oids(labeler, [source.oid])
+        with first.data_flow.activate(DataFlowContext()):
+            state = first.git.status(labeler).state.token
+        with first.data_flow.activate(secret_context):
+            first.git.tag(labeler, "create", "secret-alias", state)
+    finally:
+        first.close()
+
+    aliased_git = replace(
+        DEFAULT_CONFIG.git,
+        repository_resource="git:alternate",
+    )
+    second = Runtime.open(
+        database,
+        config=_runtime_config(git=aliased_git),
+        substrate=LocalResourceProviderSubstrate(root, git_config=aliased_git),
+        module_manifests=(),
+    )
+    try:
+        reader = second.process.spawn(image="base-agent:v0", goal="read aliased repository")
+        _grant_git_authority(second, reader)
+        second.capability.issue_trusted(
+            reader,
+            "git:alternate",
+            [CapabilityRight.READ, CapabilityRight.DIFF],
+            issued_by="git-provider-test",
+        )
+        with second.data_flow.activate(DataFlowContext()):
+            refs = second.git.list_refs(reader, kind="tags")
+            context = second.data_flow.current_context()
+        assert "secret-alias" in {ref.short_name for ref in refs["refs"]}
+        assert context.labels.sensitivity.value == "secret"
+        parents, _source_refs = second.data_flow.provenance_sources(context)
+        assert source.oid in parents
+
+        composed = tmp_path / "Caf\N{LATIN SMALL LETTER E WITH ACUTE}" / "Repo"
+        decomposed = tmp_path / "CAFE\N{COMBINING ACUTE ACCENT}" / "repo"
+        assert GitPrimitive._canonical_workspace_identity(
+            composed
+        ) == GitPrimitive._canonical_workspace_identity(decomposed)
+    finally:
+        second.close()
+
+
+def test_show_log_and_blame_include_emitted_parent_carriers(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    (root / "tracked.txt").write_text("parent classified line\n", encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "classified parent")
+    parent_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "switch", "-q", "-c", "side")
+    (root / "side.txt").write_text("side\n", encoding="utf-8")
+    _git(root, "add", "--", "side.txt")
+    _git(root, "commit", "-q", "-m", "side parent")
+    side_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "switch", "-q", "main")
+    (root / "tracked.txt").write_text("child line\n", encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "child")
+    child_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "merge", "-q", "--no-ff", "side", "-m", "merge side")
+    merge_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    runtime = _open_runtime(root)
+    try:
+        labeler = runtime.process.spawn(image="base-agent:v0", goal="late label parents")
+        reader = runtime.process.spawn(image="base-agent:v0", goal="read emitted parents")
+        for pid in (labeler, reader):
+            _grant_git_authority(runtime, pid)
+        source = runtime.memory.create_object(
+            labeler,
+            ObjectType.EVIDENCE,
+            {"classification": "secret parent carrier"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-parent-carrier-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(labeler, [source.oid])
+        state = runtime.git.provider.repository_state()
+        for oid in (parent_oid, side_oid):
+            runtime.git._bind_git_lineage(
+                pid=labeler,
+                state=state,
+                carrier_kind="commit",
+                carrier_id=oid,
+                context=secret_context,
+            )
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            shown = runtime.git.show(reader, child_oid)
+            shown_context = runtime.data_flow.current_context()
+        assert "parent classified line" in shown["patch"]
+        assert shown_context.labels.sensitivity.value == "secret"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            blamed = runtime.git.blame(reader, "tracked.txt", ref=child_oid)
+            blame_context = runtime.data_flow.current_context()
+        assert f"previous {parent_oid}" in blamed["content"]
+        assert blame_context.labels.sensitivity.value == "secret"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            logged = runtime.git.log(reader, ref=merge_oid, limit=1)
+            log_context = runtime.data_flow.current_context()
+        assert side_oid in logged["commits"][0].parents
+        assert log_context.labels.sensitivity.value == "secret"
+    finally:
+        runtime.close()
+
+
 def test_simulated_pull_request_create_review_close_and_merge_requires_approval(
     tmp_path: Path,
 ) -> None:
@@ -2130,6 +3627,616 @@ def test_simulated_pull_request_create_review_close_and_merge_requires_approval(
             reviewed["operation"].after.token,
         )
         assert closed["pull_request"].status is GitPullRequestStatus.CLOSED
+    finally:
+        runtime.close()
+
+
+def test_pull_request_metadata_persists_and_restores_data_flow_lineage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+    runtime = _open_runtime(root)
+    try:
+        creator = runtime.process.spawn(image="base-agent:v0", goal="create secret PR")
+        reviewer = runtime.process.spawn(image="base-agent:v0", goal="review secret PR")
+        inspector = runtime.process.spawn(image="base-agent:v0", goal="inspect secret PR")
+        for pid in (creator, reviewer, inspector):
+            _grant_git_authority(runtime, pid)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git_pr:workspace:*",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            creator,
+            ObjectType.EVIDENCE,
+            {"classification": "secret pull request"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-pr-lineage-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(
+            creator,
+            [source.oid],
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(creator).state.token
+        with runtime.data_flow.activate(secret_context):
+            created = runtime.git.create_pull_request(
+                creator,
+                "Classified feature",
+                "Contains secret review context",
+                "main",
+                "feature",
+                state,
+            )
+        pull_request = created["pull_request"]
+
+        for kind in ("pull_requests", "all"):
+            with runtime.data_flow.activate(DataFlowContext()):
+                listed_refs = runtime.git.list_refs(inspector, kind=kind)
+                refs_context = runtime.data_flow.current_context()
+            assert {
+                ref.name for ref in listed_refs["refs"]
+            }.issuperset(set(runtime.git._pull_request_snapshot_refs(pull_request.pr_id)))
+            assert refs_context.labels.sensitivity.value == "secret"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            branch_refs = runtime.git.list_refs(inspector, kind="branches")
+        assert {ref.short_name for ref in branch_refs["refs"]}.issuperset(
+            {"main", "feature"}
+        )
+
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git_pr:workspace:*",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="normal",
+            ),
+            actor="git-provider-test",
+            replace=True,
+            require_capability=False,
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            with pytest.raises(CapabilityDenied, match="data-flow denied"):
+                runtime.git.review_pull_request(
+                    reviewer,
+                    pull_request.pr_id,
+                    "comment",
+                    "normal review",
+                    created["operation"].after.token,
+                )
+
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git_pr:workspace:*",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            replace=True,
+            require_capability=False,
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            reviewed = runtime.git.review_pull_request(
+                reviewer,
+                pull_request.pr_id,
+                "comment",
+                "normal review",
+                created["operation"].after.token,
+            )
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            inspected = runtime.git.inspect_pull_request(
+                inspector,
+                pull_request.pr_id,
+            )
+            inspect_context = runtime.data_flow.current_context()
+        assert inspected.body == "Contains secret review context"
+        assert inspected.reviews == reviewed["pull_request"].reviews
+        assert inspect_context.labels.sensitivity.value == "secret"
+        inspect_parents, _inspect_refs = runtime.data_flow.provenance_sources(
+            inspect_context
+        )
+        assert source.oid in inspect_parents
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            listed = runtime.git.list_pull_requests(inspector)
+            list_context = runtime.data_flow.current_context()
+        assert [item.pr_id for item in listed["pull_requests"]] == [
+            pull_request.pr_id
+        ]
+        assert list_context.labels.sensitivity.value == "secret"
+    finally:
+        runtime.close()
+
+
+def test_pull_request_prebind_survives_post_write_lineage_settlement_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+    runtime = _open_runtime(root)
+    try:
+        creator = runtime.process.spawn(image="base-agent:v0", goal="create PR")
+        reviewer = runtime.process.spawn(image="base-agent:v0", goal="review secret PR")
+        inspector = runtime.process.spawn(image="base-agent:v0", goal="inspect unknown PR")
+        for pid in (creator, reviewer, inspector):
+            _grant_git_authority(runtime, pid)
+        for pattern in ("git:workspace", "git_pr:workspace:*"):
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=pattern,
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity="secret",
+                ),
+                actor="git-provider-test",
+                require_capability=False,
+            )
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(creator).state.token
+            created = runtime.git.create_pull_request(
+                creator,
+                "Feature",
+                "Normal body",
+                "main",
+                "feature",
+                state,
+            )
+        source = runtime.memory.create_object(
+            reviewer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret review"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-pr-prebind-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(
+            reviewer,
+            [source.oid],
+        )
+        original = runtime.git._bind_git_lineage
+        individual_bind_count = 0
+
+        def fail_second_individual_bind(**kwargs: Any) -> None:
+            nonlocal individual_bind_count
+            if kwargs.get("carrier_kind") == "pull_request":
+                individual_bind_count += 1
+                if individual_bind_count == 2:
+                    raise RuntimeError("post-write lineage settlement failed")
+            original(**kwargs)
+
+        monkeypatch.setattr(
+            runtime.git,
+            "_bind_git_lineage",
+            fail_second_individual_bind,
+        )
+        with runtime.data_flow.activate(secret_context):
+            with pytest.raises(
+                RuntimeError,
+                match="post-write lineage settlement failed",
+            ):
+                runtime.git.review_pull_request(
+                    reviewer,
+                    created["pull_request"].pr_id,
+                    "comment",
+                    "classified review",
+                    created["operation"].after.token,
+                )
+        monkeypatch.setattr(runtime.git, "_bind_git_lineage", original)
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            inspected = runtime.git.inspect_pull_request(
+                inspector,
+                created["pull_request"].pr_id,
+            )
+            inspect_context = runtime.data_flow.current_context()
+        assert len(inspected.reviews) == 1
+        assert inspect_context.labels.sensitivity.value == "secret"
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            listed = runtime.git.list_pull_requests(inspector)
+            list_context = runtime.data_flow.current_context()
+        assert len(listed["pull_requests"][0].reviews) == 1
+        assert list_context.labels.sensitivity.value == "secret"
+    finally:
+        runtime.close()
+
+
+def test_pull_request_create_requires_repository_sink_clearance(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    base_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+    runtime = _open_runtime(root)
+    try:
+        creator = runtime.process.spawn(image="base-agent:v0", goal="create secret PR")
+        _grant_git_authority(runtime, creator)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git_pr:workspace:*",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="normal",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            creator,
+            ObjectType.EVIDENCE,
+            {"classification": "secret pull request"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-pr-multi-sink-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(
+            creator,
+            [source.oid],
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(creator).state.token
+        with runtime.data_flow.activate(secret_context):
+            with pytest.raises(CapabilityDenied, match="data-flow denied"):
+                runtime.git.create_pull_request(
+                    creator,
+                    "Classified feature",
+                    "Secret body",
+                    "main",
+                    "feature",
+                    state,
+                )
+        assert _git(
+            root,
+            "for-each-ref",
+            "refs/agent-libos/pull-requests",
+        ).strip() == b""
+        assert not runtime.git.provider.list_pull_request_metadata(limit=10)
+        assert runtime.git.provider.repository_state().head_oid == base_oid
+    finally:
+        runtime.close()
+
+
+def test_pull_request_prebind_failure_leaves_no_snapshot_refs_or_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+    runtime = _open_runtime(root)
+    try:
+        creator = runtime.process.spawn(image="base-agent:v0", goal="create secret PR")
+        _grant_git_authority(runtime, creator)
+        for pattern in ("git:workspace", "git_pr:workspace:*"):
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=pattern,
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity="secret",
+                ),
+                actor="git-provider-test",
+                require_capability=False,
+            )
+        source = runtime.memory.create_object(
+            creator,
+            ObjectType.EVIDENCE,
+            {"classification": "secret pull request"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-pr-prebind-failure-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(
+            creator,
+            [source.oid],
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(creator).state.token
+
+        def fail_prebind(_pr_id: str) -> None:
+            raise RuntimeError("pull request lineage prebind failed")
+
+        monkeypatch.setattr(
+            runtime.git,
+            "_prebind_pull_request_lineage",
+            fail_prebind,
+        )
+        with runtime.data_flow.activate(secret_context):
+            with pytest.raises(
+                RuntimeError,
+                match="pull request lineage prebind failed",
+            ):
+                runtime.git.create_pull_request(
+                    creator,
+                    "Classified feature",
+                    "Secret body",
+                    "main",
+                    "feature",
+                    state,
+                )
+        assert _git(
+            root,
+            "for-each-ref",
+            "refs/agent-libos/pull-requests",
+        ).strip() == b""
+        assert not runtime.git.provider.list_pull_request_metadata(limit=10)
+    finally:
+        runtime.close()
+
+
+def test_pull_request_collection_prebind_never_downgrades_prior_lineage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "secret-feature")
+    (root / "secret-feature.txt").write_text("secret feature\n", encoding="utf-8")
+    _git(root, "add", "--", "secret-feature.txt")
+    _git(root, "commit", "-q", "-m", "secret feature")
+    _git(root, "switch", "-q", "main")
+    _git(root, "switch", "-q", "-c", "normal-feature")
+    (root / "normal-feature.txt").write_text("normal feature\n", encoding="utf-8")
+    _git(root, "add", "--", "normal-feature.txt")
+    _git(root, "commit", "-q", "-m", "normal feature")
+    _git(root, "switch", "-q", "main")
+    runtime = _open_runtime(root)
+    try:
+        creator = runtime.process.spawn(image="base-agent:v0", goal="create two PRs")
+        inspector = runtime.process.spawn(image="base-agent:v0", goal="list two PRs")
+        _grant_git_authority(runtime, creator)
+        _grant_git_authority(runtime, inspector)
+        for pattern in ("git:workspace", "git_pr:workspace:*"):
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=pattern,
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity="secret",
+                ),
+                actor="git-provider-test",
+                require_capability=False,
+            )
+        source = runtime.memory.create_object(
+            creator,
+            ObjectType.EVIDENCE,
+            {"classification": "secret pull request"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-pr-collection-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(
+            creator,
+            [source.oid],
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(creator).state.token
+        with runtime.data_flow.activate(secret_context):
+            secret_pr = runtime.git.create_pull_request(
+                creator,
+                "Secret feature",
+                "Secret body",
+                "main",
+                "secret-feature",
+                state,
+            )
+        with runtime.data_flow.activate(DataFlowContext()):
+            normal_pr = runtime.git.create_pull_request(
+                creator,
+                "Normal feature",
+                "Normal body",
+                "main",
+                "normal-feature",
+                secret_pr["operation"].after.token,
+            )
+        assert normal_pr["pull_request"].pr_id != secret_pr["pull_request"].pr_id
+
+        with runtime.data_flow.activate(DataFlowContext()):
+            listed = runtime.git.list_pull_requests(inspector)
+            list_context = runtime.data_flow.current_context()
+        assert len(listed["pull_requests"]) == 2
+        assert list_context.labels.sensitivity.value == "secret"
+    finally:
+        runtime.close()
+
+
+def test_pull_request_merge_requires_repository_sink_clearance(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    base_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+    runtime = _open_runtime(root)
+    try:
+        creator = runtime.process.spawn(image="base-agent:v0", goal="create secret PR")
+        merger = runtime.process.spawn(image="base-agent:v0", goal="merge secret PR")
+        _grant_git_authority(runtime, creator)
+        _grant_git_authority(runtime, merger)
+        for pattern in ("git:workspace", "git_pr:workspace:*"):
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern=pattern,
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity="secret",
+                ),
+                actor="git-provider-test",
+                require_capability=False,
+            )
+        source = runtime.memory.create_object(
+            creator,
+            ObjectType.EVIDENCE,
+            {"classification": "secret pull request"},
+            metadata=ObjectMetadata(
+                sensitivity="secret",
+                origin="git-pr-merge-sink-test",
+            ),
+        )
+        secret_context = runtime.data_flow.context_from_source_oids(
+            creator,
+            [source.oid],
+        )
+        with runtime.data_flow.activate(DataFlowContext()):
+            state = runtime.git.status(creator).state.token
+        with runtime.data_flow.activate(secret_context):
+            created = runtime.git.create_pull_request(
+                creator,
+                "Classified feature",
+                "Secret body",
+                "main",
+                "feature",
+                state,
+            )
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="normal",
+            ),
+            actor="git-provider-test",
+            replace=True,
+            require_capability=False,
+        )
+        pr_id = created["pull_request"].pr_id
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.merge_pull_request(
+                merger,
+                pr_id,
+                created["operation"].after.token,
+            )
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+        with runtime.data_flow.activate(DataFlowContext()):
+            with pytest.raises(CapabilityDenied, match="data-flow denied"):
+                runtime.git.merge_pull_request(
+                    merger,
+                    pr_id,
+                    created["operation"].after.token,
+                )
+        assert _git(root, "rev-parse", "HEAD").strip().decode("ascii") == base_oid
+        assert not (root / "feature.txt").exists()
+        metadata = runtime.git.provider.read_pull_request_metadata(pr_id)
+        assert metadata is not None
+        pull_request, _bodies = runtime.git._parse_pull_request_metadata(
+            metadata[0],
+            expected_pr_id=pr_id,
+        )
+        assert pull_request.status is GitPullRequestStatus.OPEN
+    finally:
+        runtime.close()
+
+
+def test_pull_request_create_reuses_generated_id_after_human_approval(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="approve pull request creation")
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.READ, CapabilityRight.WRITE],
+            issued_by="git-provider-test",
+        )
+        runtime.capability.issue_trusted(
+            pid,
+            "git_pr:workspace:*",
+            [CapabilityRight.WRITE],
+            effect="ask",
+            issued_by="git-provider-test",
+        )
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.create_pull_request(
+                pid,
+                "Feature",
+                "Adds feature.txt",
+                "main",
+                "feature",
+                state,
+            )
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+
+        created = runtime.git.create_pull_request(
+            pid,
+            "Feature",
+            "Adds feature.txt",
+            "main",
+            "feature",
+            state,
+        )
+        pr_id = created["pull_request"].pr_id
+        assert pr_id.startswith("pr_")
+        assert any(
+            record.action == "primitive.git.create_pull_request"
+            and record.target == runtime.git.pull_request_resource(pr_id)
+            for record in runtime.audit.trace(actor=pid)
+        )
+        assert any(
+            event.type == EventType.EXTERNAL_WRITE
+            and event.source == pid
+            and event.payload.get("operation") == "create_pull_request"
+            for event in runtime.events.list(
+                target=runtime.git.pull_request_resource(pr_id)
+            )
+        )
     finally:
         runtime.close()
 

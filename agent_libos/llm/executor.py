@@ -249,7 +249,12 @@ class LLMProcessExecutor:
         if process.status not in {ProcessStatus.RUNNING, ProcessStatus.RUNNABLE}:
             return await self._arun_once_impl(pid)
         pending = self.pending.get(pid)
-        operation_id = str(pending.get("llm_operation_id") or "") if pending is not None else ""
+        operation_id = (
+            str(pending.get("llm_operation_id") or "")
+            if pending is not None
+            and pending.get("status") in {"pending", "resuming"}
+            else ""
+        )
         with self._operations.scope(
             kind="llm_request",
             name="llm.action_selection",
@@ -2440,6 +2445,9 @@ class LLMProcessExecutor:
         except _ContextManagementHandled:
             raise
         except Exception as exc:
+            generation_after = self._processes.get_llm_context_generation(
+                state.pid
+            )
             observation.update(
                 {"action": "failed", "failure_reason": type(exc).__name__}
             )
@@ -2449,8 +2457,19 @@ class LLMProcessExecutor:
                 assessment,
                 policy,
                 episode_id=episode_id,
-                extra={"reason": type(exc).__name__, "error": str(exc)},
+                extra={
+                    "reason": type(exc).__name__,
+                    "error": str(exc),
+                    "context_generation_after": generation_after,
+                },
             )
+            if generation_after != assessment.context_generation:
+                raise _ContextManagementHandled(
+                    self._context_generation_changed_result(
+                        episode_id=episode_id,
+                        generation_after=generation_after,
+                    )
+                ) from exc
             return
         self._finish_auto_context_action(
             state.pid,
@@ -2593,8 +2612,35 @@ class LLMProcessExecutor:
             assessment,
             policy,
             episode_id=episode_id,
-            extra={"reason": reason, "result": sanitize_for_observability(result)},
+            extra={
+                "reason": reason,
+                "result": sanitize_for_observability(result),
+                "context_generation_after": generation_after,
+            },
         )
+        if generation_after != assessment.context_generation:
+            raise _ContextManagementHandled(
+                self._context_generation_changed_result(
+                    episode_id=episode_id,
+                    generation_after=generation_after,
+                )
+            )
+
+    @staticmethod
+    def _context_generation_changed_result(
+        *,
+        episode_id: str,
+        generation_after: str,
+    ) -> dict[str, Any]:
+        """End the quantum so the next request rematerializes fresh context."""
+
+        return {
+            "ok": True,
+            "context_generation_changed": True,
+            "context_management_failed": True,
+            "context_pressure_episode_id": episode_id,
+            "context_generation": generation_after,
+        }
 
     def _prior_context_pressure_state(
         self,

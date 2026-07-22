@@ -17,7 +17,7 @@ modules:
   manifest_paths:
     - modules/pty/module.yaml
   trusted_modules:
-    - agent-libos-pty:v0:81c53ccabc769a947842c12160377de9201c6d11ca2bfed88ff06292485bbc19:8eab5b8f0ee10ef0826f999b4162dae3a5257aabbcaa794a5a50fa296ba2a36c
+    - agent-libos-pty:v0:4e48faa3811270c6c5102b8ce948b7ec82eb1003e6ec5564f081d30b2c42c1bf:94dd1576534ab9dec99d628f3596cab53448ad806857cdbe19d0d724034925d8
 
 data_flow:
   default_trust_level: untrusted
