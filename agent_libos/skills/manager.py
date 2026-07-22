@@ -5,6 +5,7 @@ import binascii
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -34,7 +35,7 @@ from agent_libos.ports import AuditPort, EventPort, RuntimePublicationReceiptRec
 from agent_libos.skills.schema import ActionSchema, JitToolSpec, LoadedSkill, SkillPackage, SkillResource
 from agent_libos.storage import UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
-from agent_libos.utils.serde import dumps, to_jsonable
+from agent_libos.utils.serde import bounded_json_loads, dumps, to_jsonable
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -893,34 +894,53 @@ class SkillManager:
     def _load_package_from_workspace(self, pid: str, path: str) -> tuple[SkillPackage, str]:
         cwd = self._process.working_directory(pid)
         package_root, skill_md_path = self._workspace_package_paths(path)
-        read = self._filesystem.read_text(
+        read = self._filesystem.read_bytes(
             pid,
             skill_md_path,
             max_bytes=self.config.skills.skill_md_max_bytes,
             cwd=cwd,
         )
-        frontmatter, body = self._parse_skill_markdown(read.content, expected_dir_name=Path(package_root).name)
+        if read.truncated:
+            raise ValidationError(
+                "SKILL.md exceeds "
+                f"skill_md_max_bytes={self.config.skills.skill_md_max_bytes}: {skill_md_path}"
+            )
+        frontmatter, body = self._parse_skill_markdown(
+            read.content.decode("utf-8"),
+            expected_dir_name=Path(package_root).name,
+        )
         _target, workspace_package_root = self._filesystem.resolve_path(package_root, cwd=cwd)
         references = self._frontmatter_reference_paths(frontmatter)
-        raw_resources: dict[str, bytes] = {"SKILL.md": read.content.encode("utf-8")}
+        raw_resources: dict[str, bytes] = {"SKILL.md": read.content}
         for ref in references:
-            ref_read = self._filesystem.read_text(
+            ref_read = self._filesystem.read_bytes(
                 pid,
                 self._join_relative(package_root, ref),
                 max_bytes=self.config.skills.resource_read_max_bytes,
                 cwd=cwd,
             )
-            raw_resources[ref] = ref_read.content.encode("utf-8")
+            if ref_read.truncated:
+                raise ValidationError(
+                    "skill metadata resource exceeds "
+                    f"resource_read_max_bytes={self.config.skills.resource_read_max_bytes}: {ref}"
+                )
+            raw_resources[ref] = ref_read.content
         jit_tools = self._load_jit_specs_from_resources(frontmatter, raw_resources)
         for tool in jit_tools:
             if tool.source_path not in raw_resources:
-                script_read = self._filesystem.read_text(
+                script_read = self._filesystem.read_bytes(
                     pid,
                     self._join_relative(package_root, tool.source_path),
-                    max_bytes=self.config.skills.max_jit_source_chars,
+                    max_bytes=self.config.skills.resource_read_max_bytes,
                     cwd=cwd,
                 )
-                raw_resources[tool.source_path] = script_read.content.encode("utf-8")
+                if script_read.truncated:
+                    raise ValidationError(
+                        "Skill JIT source exceeds "
+                        f"resource_read_max_bytes={self.config.skills.resource_read_max_bytes}: "
+                        f"{tool.source_path}"
+                    )
+                raw_resources[tool.source_path] = script_read.content
         self._read_workspace_resource_dirs(pid, workspace_package_root, raw_resources)
         resources = [self._resource_from_bytes(path, content) for path, content in sorted(raw_resources.items())]
         package = self._package_from_parts(frontmatter, body, resources)
@@ -1097,6 +1117,7 @@ class SkillManager:
                     source=script.content,
                     tests=tool.tests,
                     metadata=tool.metadata,
+                    timeout_s=tool.timeout_s,
                 )
             )
         return result
@@ -1109,7 +1130,10 @@ class SkillManager:
         raw = raw_resources.get(normalized)
         if raw is None:
             return []
-        data = json.loads(raw.decode("utf-8"))
+        try:
+            data = bounded_json_loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+            raise ValidationError(f"invalid JSON skill metadata resource {normalized}: {exc}") from exc
         if not isinstance(data, list):
             raise ValidationError("agent-libos.jit-tools JSON must be a list")
         return [self._coerce_jit_tool(item) for item in data]
@@ -1164,8 +1188,7 @@ class SkillManager:
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         seen = set(exclude_skill_ids or ())
-        roots = [Path("skills"), Path(".agents") / "skills", Path(".claude") / "skills"]
-        roots.extend(Path(root).expanduser() for root in self.config.skills.global_dirs)
+        roots = self._skill_catalog_roots()
         needle = text.lower() if text else None
         for root in roots:
             if not root.exists() or not root.is_dir():
@@ -1207,6 +1230,23 @@ class SkillManager:
                     return result
         return result
 
+    def _skill_catalog_roots(self) -> list[Path]:
+        """Return configured workspace/global catalog roots without aliases."""
+
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for configured in (*self.config.skills.workspace_dirs, *self.config.skills.global_dirs):
+            root = Path(configured).expanduser()
+            # ``strict=False`` also normalizes relative spellings and symlinked
+            # aliases for roots that do not exist yet.  Keep the configured
+            # spelling for diagnostics and source summaries.
+            key = os.path.normcase(os.fspath(root.resolve(strict=False)))
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(root)
+        return roots
+
     def _validate_package(self, skill: SkillPackage) -> None:
         defaults = self.config.skills
         if skill.schema_version != defaults.schema_version:
@@ -1232,6 +1272,20 @@ class SkillManager:
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
             raise ValidationError(f"duplicate Skill tool names: {duplicates}")
+        self._validate_package_resources(skill)
+        for tool in skill.jit_tools:
+            self._validate_jit_tool_name(tool.name, "jit_tools[].name")
+            self._validate_jit_script_path(tool.source_path)
+            self._coerce_jit_timeout(tool.timeout_s)
+            if len(tool.source) > defaults.max_jit_source_chars:
+                raise ValidationError(f"JIT source for {tool.name} exceeds max_jit_source_chars={defaults.max_jit_source_chars}")
+        for spec in skill.required_capabilities:
+            self._validate_capability_spec(spec)
+
+    def _validate_package_resources(self, skill: SkillPackage) -> None:
+        defaults = self.config.skills
+        if len(skill.resources) > defaults.max_package_files:
+            raise ValidationError(f"skill package exceeds max_package_files={defaults.max_package_files}")
         seen_paths: set[str] = set()
         total_bytes = 0
         for resource in skill.resources:
@@ -1240,16 +1294,14 @@ class SkillManager:
                 raise ValidationError(f"duplicate skill resource path: {resource.path}")
             seen_paths.add(resource.path)
             self._validate_resource_content(resource)
+            if resource.path != "SKILL.md" and resource.size_bytes > defaults.resource_read_max_bytes:
+                raise ValidationError(
+                    "skill resource exceeds "
+                    f"resource_read_max_bytes={defaults.resource_read_max_bytes}: {resource.path}"
+                )
             total_bytes += resource.size_bytes
         if total_bytes > defaults.package_max_bytes:
             raise ValidationError(f"skill package exceeds package_max_bytes={defaults.package_max_bytes}")
-        for tool in skill.jit_tools:
-            self._validate_jit_tool_name(tool.name, "jit_tools[].name")
-            self._validate_jit_script_path(tool.source_path)
-            if len(tool.source) > defaults.max_jit_source_chars:
-                raise ValidationError(f"JIT source for {tool.name} exceeds max_jit_source_chars={defaults.max_jit_source_chars}")
-        for spec in skill.required_capabilities:
-            self._validate_capability_spec(spec)
 
     def _validate_loadable(
         self,
@@ -1295,6 +1347,11 @@ class SkillManager:
                     "description": jit.description,
                     "input_schema": jit.input_schema,
                     "output_schema": jit.output_schema,
+                    "policy": (
+                        {"sandbox_timeout_s": jit.timeout_s}
+                        if jit.timeout_s is not None
+                        else {}
+                    ),
                     "metadata": {"skill_id": skill.skill_id, "source_path": jit.source_path, **jit.metadata},
                 },
                 source_code=jit.source,
@@ -1775,7 +1832,7 @@ class SkillManager:
         }
 
     def _jit_summary(self, tool: JitToolSpec) -> dict[str, Any]:
-        return {
+        summary = {
             "name": tool.name,
             "description": tool.description,
             "source_path": tool.source_path,
@@ -1784,6 +1841,9 @@ class SkillManager:
             "tests": tool.tests,
             "source_sha256": self._hash_text(tool.source),
         }
+        if tool.timeout_s is not None:
+            summary["timeout_s"] = tool.timeout_s
+        return summary
 
     def _resource_summary(self, resource: SkillResource) -> dict[str, Any]:
         return {
@@ -1847,7 +1907,16 @@ class SkillManager:
     def _coerce_jit_tool(self, value: Any) -> JitToolSpec:
         if not isinstance(value, dict):
             raise ValidationError("jit_tools entries must be mappings")
-        allowed = {"name", "description", "input_schema", "output_schema", "source_path", "tests", "metadata"}
+        allowed = {
+            "name",
+            "description",
+            "input_schema",
+            "output_schema",
+            "source_path",
+            "tests",
+            "metadata",
+            "timeout_s",
+        }
         unknown = sorted(set(value) - allowed)
         if unknown:
             raise ValidationError(f"unknown Skill JIT tool fields: {unknown}")
@@ -1872,7 +1941,31 @@ class SkillManager:
             output_schema=output_schema,
             tests=tests,
             metadata=self._mapping(value.get("metadata"), "jit_tools[].metadata"),
+            timeout_s=self._coerce_jit_timeout(value.get("timeout_s")),
         )
+
+    def _coerce_jit_timeout(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValidationError("jit_tools[].timeout_s must be a number")
+        if isinstance(value, int):
+            if value <= 0:
+                raise ValidationError("jit_tools[].timeout_s must be finite and > 0")
+            if value > self.config.tools.deno_timeout_hard_limit_s:
+                raise ValidationError(
+                    "jit_tools[].timeout_s exceeds tools.deno_timeout_hard_limit_s="
+                    f"{self.config.tools.deno_timeout_hard_limit_s}"
+                )
+        timeout = float(value)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValidationError("jit_tools[].timeout_s must be finite and > 0")
+        if timeout > self.config.tools.deno_timeout_hard_limit_s:
+            raise ValidationError(
+                "jit_tools[].timeout_s exceeds tools.deno_timeout_hard_limit_s="
+                f"{self.config.tools.deno_timeout_hard_limit_s}"
+            )
+        return timeout
 
     def _json_resource(self, resources: dict[str, SkillResource], path: str) -> Any:
         resource = resources.get(path)
@@ -1881,8 +1974,8 @@ class SkillManager:
         if resource.content is None:
             raise ValidationError(f"referenced skill metadata resource must be text: {path}")
         try:
-            return json.loads(resource.content)
-        except json.JSONDecodeError as exc:
+            return bounded_json_loads(resource.content)
+        except (ValueError, RecursionError) as exc:
             raise ValidationError(f"invalid JSON skill metadata resource {path}: {exc}") from exc
 
     def _frontmatter_reference_paths(self, frontmatter: dict[str, Any]) -> list[str]:
@@ -2024,6 +2117,11 @@ class SkillManager:
                     "source_sha256": self._hash_text(tool.source),
                     "tests": tool.tests,
                     "metadata": tool.metadata,
+                    **(
+                        {"timeout_s": tool.timeout_s}
+                        if tool.timeout_s is not None
+                        else {}
+                    ),
                 }
                 for tool in package.jit_tools
             ],

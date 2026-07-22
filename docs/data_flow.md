@@ -133,7 +133,7 @@ and unregister from changing the registry.
 | MCP | `mcp:<server-id>:<tool-id>` | server, transport, and tool manifest hash; stdio also binds the resolved executable path/content |
 | MCP live discovery | `mcp:<server-id>:list_tools` | server and transport manifest hash; stdio also binds the resolved executable path/content |
 | File | `filesystem:workspace:<normalized-path>` | canonical workspace path |
-| Git local mutation/fetch | `git:workspace` | repository/worktree identity plus expected state token; fetch also binds the existing remote fingerprint |
+| Git local mutation/fetch | configured `git.repository_resource` (default `git:workspace`) | repository/worktree identity plus expected state token; fetch also binds the existing remote fingerprint |
 | Git push | `git_remote:workspace:<remote>` | fetch/push URL hashes, effective config/helper identities, selected refs, and expected old remote OID |
 | Simulated Git PR | `git_pr:workspace:<pr-id>` | repository-local metadata hash plus immutable base/head snapshot OIDs |
 | Shell | `shell:<resolved-executable>` | resolved path plus executable content hash; mutable workspace executables dispatch from a Host-owned content snapshot |
@@ -160,9 +160,12 @@ transitions are bidirectional. The ordinary Git/remote/PR capability and Task
 Authority effect ceiling remain independent of Sink clearance. Mutation target
 state is the opaque repository token; remote operations additionally revalidate
 URL/config/ref fingerprints after approval and before dispatch. Patch creation
-derives the immutable `CODE_PATCH` Object from the exact contributing file
-bindings, and patch application propagates those source labels to the operation
-result and affected filesystem bindings. Audit and event payloads retain only
+derives the immutable `CODE_PATCH` Object from a conservative lineage: observed
+file bindings plus repository/index carriers and returned commits. Range patches
+include the current index carrier even when unrelated staged content did not
+contribute patch bytes, so labels may safely overtaint. Patch application
+propagates those source labels to the operation result and affected filesystem
+bindings. Audit and event payloads retain only
 hashes, OIDs, counts, and bounded metadata—not patch bytes, commit messages,
 credentials, or raw provider errors. See [Git Provider and Primitive](git.md).
 
@@ -177,24 +180,29 @@ For egress, the runtime performs this sequence:
 
 1. Check identifier visibility and non-consuming capability policy needed to
    avoid registry or endpoint enumeration.
-2. Construct the canonical Sink and resolve its Host trust record and identity
-   hash.
+2. Construct the canonical primary Sink and every additional real recipient as
+   one ordered tuple, and require unique identities.
 3. Resolve trusted Object sources into `DataFlowContext` and perform an early
    clearance/source-version check.
-4. For conditional high-sensitivity flow, create only a metadata-only Human
-   release request.
+4. Authorize Sinks in tuple order. The primary captures the Sink-registry
+   generation and every later authorization must use that same generation. A
+   conditional Sink creates only a metadata-only Human release request and
+   suspends that attempt, so later Sinks may be checked on a resumed attempt and
+   multiple conditional recipients may require sequential approvals.
 5. Complete ordinary capability, Task Authority, policy, approval, and budget
    checks.
 6. In the protected-operation transaction, revalidate registry generation,
    Object versions/content hashes, exact payload hash, and release binding.
-7. Atomically reserve ordinary and release capabilities and create the pending
-   external-effect intent.
+7. Atomically reserve ordinary authority and every required per-Sink release
+   capability and create the pending external-effect intent.
 8. Immediately before each provider phase, revalidate the registry generation,
    exact source versions/content hashes, target state, payload, and release
-   binding, then recompute any mutable Host Sink identity (including executable
-   content). A mismatch appends a payload-free denial. A release already
-   reserved or committed by an earlier phase remains valid only through that
-   same protected-operation reservation. For Shell, PTY, and MCP stdio
+   binding. The optional `data_sink_revalidator` recomputes a mutable primary
+   Sink identity (including executable content); additional Sink identities
+   must remain stable for the invocation, although their trust and authorization
+   are still rechecked. A mismatch appends a payload-free denial. A release
+   already reserved or committed by an earlier phase remains valid only through
+   that same protected-operation reservation. For Shell, PTY, and MCP stdio
    executables in the mutable workspace, create and verify a private Host-owned
    content snapshot before final dispatch. A bounded, all-or-nothing set of
    direct sibling resources is linked beside that copy for ordinary relative
@@ -211,12 +219,18 @@ and does not create an external-effect intent. It does append a payload-free
 Sink, label/source hashes, trusted source refs, trust record/generation, and
 reason.
 
-Successful effect metadata binds the decision, trust id/hash, registry
-generation, source Object id/version/content hashes, label hash, and release
-capability where applicable. Mutable sources are checked again immediately
-before every provider dispatch. A mutation before the first phase rejects and
-restores both reservations; a mutation between phases prevents the later
-provider call and conservatively finalizes the already-started effect.
+Successful effect metadata binds the primary and additional Sink decisions,
+trust ids/hashes, shared registry generation, source Object
+id/version/content hashes, label hash, and every release capability where
+applicable. Additional recipients appear in `additional_egresses`. Mutable
+sources and all Sink authorizations are checked again immediately before every
+provider dispatch. A mutation before the first authority-committing phase
+rejects and restores the complete reservation set; a mutation after a phase
+that observed/mutated provider state or used the default
+`commits_authority=True` prevents the later provider call and conservatively
+finalizes the already-started effect. Pure coordination phases must explicitly
+set `commits_authority=False` to retain the certified-not-started restoration
+floor.
 
 Direct Host primitive calls may pass `source_oids`. Those are Object references
 resolved by the runtime; callers cannot submit a `DataLabels` value as payload
@@ -229,12 +243,17 @@ context, so omitting an explicit source cannot wash a label.
 Steps 6–7 are the atomic authority boundary: current ordinary and release
 authority is revalidated, finite uses are reserved, and the prepared
 external-effect intent is written in one RuntimeStore transaction. This is not
-a distributed transaction with the provider. A first-phase
-`ProviderEffectNotStarted` can restore the exact still-live reservations; once
-a provider phase may have observed or changed state, authority stays committed
-and an ambiguous outcome remains durable as `unknown` or pending
-reconciliation. Prepared-intent recovery runs before general provider-effect
-reconciliation on reopen. The complete contract is documented in the
+a distributed transaction with the provider. Dispatch rejection or
+`ProviderEffectNotStarted` can restore the exact still-live reservations only
+when every previously completed phase has
+`state_mutation=False`, `information_flow=False`, and
+`commits_authority=False`. The first phase is one instance of that rule; the
+default `commits_authority=True` closes the restoration floor even for a
+successful phase that otherwise appears non-effectful. Once the floor closes,
+authority stays committed and an ambiguous outcome remains durable as
+`unknown` or pending reconciliation. Prepared-intent recovery runs before
+general provider-effect reconciliation on reopen. The complete contract is
+documented in the
 [Protected Operation SDK](protected_operation_sdk.md), with its durable state
 and ordering in [Storage](storage.md).
 
@@ -247,9 +266,9 @@ fail-closed. See [Explainable Operations](explainable_operations.md) and
 
 ## Exact conditional release
 
-A conditional send above `normal` creates a requested
-`data_release:<sink>` `approve` capability with `uses_remaining=1`. Its binding
-includes:
+A conditional send above `normal` creates a separate requested
+`data_release:<sink>` `approve` capability with `uses_remaining=1` for every
+Sink that needs a release. Each binding includes:
 
 - pid, Sink identity and identity hash;
 - trust id/hash and current registry generation;
@@ -268,6 +287,13 @@ cannot be elevated by Human approval; `trusted` Sinks need no release.
 When the binding includes mutable target state, the SDK resolves its current
 version again inside the prepare transaction; a change from the approved
 version denies before capability reservation or provider dispatch.
+
+All per-Sink releases share the source, payload, operation, manifest, and target
+state binding, while each retains its own Sink identity and trust binding. As
+described above, Human requests can be surfaced sequentially across retries.
+Once the full set is authorized, prepare, success commit, certified-not-started
+restoration, and unknown settlement reserve or settle the complete set in one
+RuntimeStore transaction.
 
 For Human Sinks, the metadata-only release and protected request are linked in
 durable state. Rejecting/cancelling the release (or an ambiguous release-prompt
@@ -328,10 +354,12 @@ model to recreate the call. A changed profile/Sink identity also fails closed,
 and the same release cannot produce a second provider request.
 
 The protected-operation lifecycle restores an unconsumed ordinary/release use
-when protected preparation aborts before its durable dispatch boundary. After
-dispatch begins, it restores only when the first provider phase certifies
-`ProviderEffectNotStarted` and no earlier information flow occurred. Crossing
-DNS, stdio, provider, or spawn commits the uses even if a later phase fails.
+when protected preparation aborts before its durable dispatch boundary. Once
+phase dispatch is attempted, it restores only when the current phase certifies
+`ProviderEffectNotStarted` and every completed earlier phase has
+`state_mutation=False`, `information_flow=False`, and
+`commits_authority=False`. Crossing DNS, stdio, provider, or spawn closes that
+restoration floor even if a later phase fails.
 
 ## Process domains and persistence
 

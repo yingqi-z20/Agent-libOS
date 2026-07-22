@@ -10,6 +10,7 @@ from agent_libos import AgentImage, Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.llm.prompt import build_system_prompt
 from agent_libos.models import (
+    CapabilityRight,
     JIT_TOOL_EXPOSURE_DIRECT,
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
     JIT_TOOL_EXPOSURES,
@@ -18,6 +19,7 @@ from agent_libos.models import (
     PROMPT_MODE_MINIMAL_RUNTIME,
 )
 from agent_libos.models.exceptions import ValidationError
+from tests.support.skills import write_skill_package
 
 
 class TestLLMPromptModes:
@@ -99,6 +101,58 @@ class TestLLMPromptModes:
             assert "Available tools:" not in user_prompt
             assert "Capabilities:" not in user_prompt
             assert "Choose the next single runtime action" not in user_prompt
+        finally:
+            runtime.close()
+
+    def test_image_only_runtime_quantum_preserves_loaded_skill_instructions(
+        self,
+        tmp_path: Any,
+    ) -> None:
+        skill_dir = write_skill_package(
+            tmp_path,
+            "image-only-reviewer",
+            body="Always preserve the IMAGE_ONLY_SKILL_MARKER constraint.\n",
+        )
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="image-only-with-skill:v0",
+                    name="image-only-with-skill",
+                    system_prompt="Use only model-supplied tool schemas.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            pid = runtime.process.spawn(
+                image="image-only-with-skill:v0",
+                goal="review the repository",
+            )
+            runtime.skills.register_skill_from_path(
+                skill_dir,
+                actor="test",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "skill:image-only-reviewer",
+                [CapabilityRight.EXECUTE],
+                issued_by="test",
+            )
+            runtime.skills.activate_skill(pid, "image-only-reviewer", actor=pid)
+            client = PromptRecordingClient()
+            runtime.llm.client = client
+
+            result = runtime.run_next_process_once()
+
+            assert result["ok"], result
+            assert "IMAGE_ONLY_SKILL_MARKER" in client.user_prompts[0]
+            assert "Loaded skills:" in client.user_prompts[0]
+            assert "Available tools:" not in client.user_prompts[0]
+            assert "Capabilities:" not in client.user_prompts[0]
+            assert "Choose the next single runtime action" not in client.user_prompts[0]
         finally:
             runtime.close()
 

@@ -29,8 +29,9 @@ longer defines.
   limits. Filesystem/clock/shell/PTY provider calls persist a pending `unknown`
   effect intent before the boundary, CAS the same id on final classification,
   and after attempting the call remove it without a final record only when the
-  provider certifies `ProviderEffectNotStarted` and no earlier information flow
-  occurred. Clock sleep/asleep inserts the intent before its first monotonic
+  provider certifies `ProviderEffectNotStarted` and every completed earlier
+  phase has no mutation or information flow and explicitly does not commit
+  authority. Clock sleep/asleep inserts the intent before its first monotonic
   observation, treats elapsed-time measurement as information flow, and permits
   restore/abandon only when that first observation is certified not-started.
 - `capability-matching-and-delegation`: typed matching, deny dominance,
@@ -75,9 +76,9 @@ longer defines.
 - `external-effect-recovery-is-keyset-bounded`: startup recovery scans only
   nonterminal external effects through bounded indexed keyset pages and
   converges the full backlog without materializing the full effect history.
-- `protected-provider-operations-use-sdk`: LLM, filesystem, clock, shell, JSON-RPC,
-  MCP, Human, and PTY provider effects share one contract registry and one
-  prepare/dispatch/finalize state machine. Static coverage rejects direct
+- `protected-provider-operations-use-sdk`: LLM, filesystem, Git, clock, shell,
+  JSON-RPC, MCP, Human, and PTY provider effects share one contract registry and
+  one prepare/dispatch/finalize state machine. Static coverage rejects direct
   low-level lifecycle and out-of-phase provider calls, while generic tests
   cover sync/async phases, restart recovery of prepared local state and finite
   authority, not-started restoration, partial effects, unknown outcomes,
@@ -489,7 +490,12 @@ longer defines.
 - `runtime-shutdown-is-drained-and-retry-safe`: scheduler work, ObjectTask
   executors, Human/provider blocking jobs, PTY reader/monitor workers, active
   admission leases, and GUI runtime users drain before shared state closes; a
-  timed-out shutdown leaves storage open and can be retried. A checked public
+  timed-out shutdown leaves storage open and can be retried. After admission
+  drains, ordinary shutdown records attempt evidence before stopping components
+  while it still owns the store; that record does not claim later teardown
+  succeeded. A stage failure names the dynamic `<stage>_stopped: false` result
+  field, and only completed component teardown plus terminal store-ownership
+  release yields the shared first-attempt `ok: true` result. A checked public
   mutation inventory is installed under admission. Every public Human control
   method is classified as mutation or read-only; approvals, presentation,
   terminal draining, cancellation, and recovery are rejected at `STOPPING`
@@ -560,8 +566,14 @@ longer defines.
 - `automatic-context-management-does-not-grant-authority`: context pressure
   may select an Image-configured tool, but never inserts it into the process
   tool table or bypasses argument validation, Capability, resource, approval,
-  event, audit, and durable-wait enforcement. Failed automatic maintenance is
-  audited and remains invisible to the model request.
+  event, audit, and durable-wait enforcement. An initial failure with unchanged
+  context generation is audited and remains invisible while the original model
+  request continues; a changed generation ends that quantum so the next one
+  rebuilds context. Human/child/message waits remain durable, and a failed
+  resumed attempt terminally completes its pending generation before rebuilding
+  the ordinary request from the current generation. Prompt-mode pressure
+  accounts for its final numeric notice and fails before provider dispatch if
+  that exact request exceeds the configured context window.
 - `resource-budgets-are-hierarchical`: resource usage is charged to the acting
   process and its parent chain, and visibility/capability mechanisms cannot
   mint additional budget. The complete hierarchy, reservations, event, and
@@ -587,6 +599,14 @@ longer defines.
   Loaded-Skill provenance preserves a base/shared alias until its last actual
   source is unloaded; noncanonical persisted provenance is rejected before
   unload. Discovery rejects non-positive, boolean, and above-config limits.
+- `workspace-skill-snapshots-reject-truncated-inputs`: workspace Skill
+  registration rejects truncated `SKILL.md`, extension metadata, and JIT source
+  reads before parsing or hashing them, so a snapshot never authenticates only
+  a bounded prefix of a larger file.
+- `package-json-manifests-fail-closed-at-parser-limits`: host and workspace
+  Skill metadata plus image-package JIT manifests reject oversized JSON
+  integers and excessive nesting as typed validation failures instead of
+  leaking interpreter parser exceptions.
 - `runtime-modules-load-trusted-code-atomically`: startup Runtime Modules bind
   trust to the current source hash, reject ambiguous manifests and duplicate
   module ids, resolve import strings without executing untrusted package code,
@@ -649,6 +669,9 @@ longer defines.
   The implementation uses one reservation scope for diagnostic
   inspect/diff/replay; the mapped one-shot regression directly proves inspect
   consumes the selected finite checkpoint/process read exactly once.
+  `checkpoint:*` control capabilities are excluded from new snapshot artifacts
+  and are also filtered during restore and fork, so snapshot transitions cannot
+  duplicate or resurrect authority over checkpoint artifacts.
 - `image-self-evolution-requires-image-authority`: image registration, package
   boot, exec, and checkpoint commit require image authority and do not bake
   external authority. Failed registration/commit removes new artifacts and

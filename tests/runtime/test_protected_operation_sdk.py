@@ -498,7 +498,12 @@ def test_sdk_success_consumes_authority_and_persists_safe_evidence() -> None:
         assert "provider-secret" not in serialized
         assert effect.canonical_args_hash
         assert effect.provider_metadata["provider_phases"] == [
-            {"name": "read", "state_mutation": False, "information_flow": True}
+            {
+                "name": "read",
+                "state_mutation": False,
+                "information_flow": True,
+                "commits_authority": True,
+            }
         ]
 
 
@@ -564,6 +569,89 @@ def test_sdk_later_not_started_keeps_prior_information_flow() -> None:
         assert effect.information_flow is True
         assert effect.provider_metadata["outcome"] == "partial_not_started_after_prior_provider_effect"
         assert effect.provider_metadata["provider_phases"][0]["name"] == "metadata"
+
+
+def test_sdk_later_not_started_after_noncommitting_phase_restores_authority() -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, contract, invocation = _setup(runtime)
+
+        def coordinate() -> str:
+            effect = runtime.store.list_external_effects(pid=pid)[0]
+            assert effect.provider_metadata["active_provider_phase"] == {
+                "name": "coordination",
+                "state_mutation": False,
+                "information_flow": False,
+                "commits_authority": False,
+            }
+            return "ready"
+
+        with pytest.raises(ProviderEffectNotStarted, match="body not started"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                assert operation.call(
+                    ProviderPhase("coordination", commits_authority=False),
+                    coordinate,
+                ) == "ready"
+                effect = runtime.store.list_external_effects(pid=pid)[0]
+                assert effect.provider_metadata["completed_provider_phases"] == [
+                    {
+                        "name": "coordination",
+                        "state_mutation": False,
+                        "information_flow": False,
+                        "commits_authority": False,
+                    }
+                ]
+                operation.call(
+                    ProviderPhase("body", information_flow=True),
+                    lambda: (_ for _ in ()).throw(
+                        ProviderEffectNotStarted("body not started")
+                    ),
+                )
+
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+
+
+def test_sdk_later_not_started_after_default_phase_keeps_committed_authority() -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, contract, invocation = _setup(runtime)
+
+        with pytest.raises(ProviderEffectNotStarted, match="body not started"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                assert operation.call(
+                    ProviderPhase("coordination"),
+                    lambda: "ready",
+                ) == "ready"
+                assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
+                operation.call(
+                    ProviderPhase("body", information_flow=True),
+                    lambda: (_ for _ in ()).throw(
+                        ProviderEffectNotStarted("body not started")
+                    ),
+                )
+
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
+        effect = runtime.store.list_external_effects(pid=pid)[0]
+        assert effect.effect_state == "finalized"
+        assert effect.transaction_state == "committed"
+        assert effect.provider_metadata["outcome"] == (
+            "partial_not_started_after_prior_provider_effect"
+        )
+        assert effect.provider_metadata["provider_phases"] == [
+            {
+                "name": "coordination",
+                "state_mutation": False,
+                "information_flow": False,
+                "commits_authority": True,
+            }
+        ]
 
 
 def test_sdk_ordinary_provider_failure_is_unknown() -> None:

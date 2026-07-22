@@ -68,10 +68,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-real-llm", action="store_true", help="include tests marked real_llm")
     parser.add_argument("--run-mcp", action="store_true", help="include tests marked mcp")
     parser.add_argument(
+        "--keep-agent-outputs",
+        action="store_true",
+        help="preserve files created under agent_outputs during pytest cleanup",
+    )
+    parser.add_argument(
         "--max-lane-seconds",
         type=_positive_seconds,
         default=DEFAULT_MAX_LANE_SECONDS,
-        help="hard process-tree timeout for the selected lane command",
+        help="hard process-tree timeout applied independently to each selected command",
     )
     parser.add_argument(
         "--durations",
@@ -161,6 +166,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--workers only applies to pytest lanes; run the gui lane separately")
     if _workers_enabled(args) and importlib.util.find_spec("xdist") is None:
         parser.error("pytest-xdist is required for --workers; run `uv sync --all-groups` first")
+    if args.lane == "gui" and args.keep_agent_outputs:
+        parser.error("--keep-agent-outputs only applies to pytest lanes")
 
 
 def _resolve_defaults(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -218,9 +225,12 @@ def _worker_suffix(args: argparse.Namespace) -> str:
 
 
 def _pytest_env(args: argparse.Namespace) -> dict[str, str] | None:
+    env: dict[str, str] = {}
     if args.run_real_llm:
-        return {"AGENT_LIBOS_RUN_REAL_LLM_BENCHMARK": "1"}
-    return None
+        env["AGENT_LIBOS_RUN_REAL_LLM_BENCHMARK"] = "1"
+    if args.keep_agent_outputs:
+        env["AGENT_LIBOS_KEEP_AGENT_OUTPUTS"] = "1"
+    return env or None
 
 
 def _run(command: Command, *, max_seconds: float) -> int:

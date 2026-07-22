@@ -149,13 +149,15 @@ leave the transaction `unknown`.
 
 A provider may raise `ProviderEffectNotStarted` only when it can certify that
 its selected call did not begin. The primitive abandons the pending intent only
-when no earlier provider observation in the composite operation produced
-information flow. In that case it restores an exact reservation when one was
-reserved; filesystem/clock/shell and PTY spawn perform restoration and
-abandonment in one store transaction. If an earlier filesystem `state()` or MCP
-live-tool validation already returned information, the main mutation/call being
-not-started still finalizes an information-flow effect instead of erasing the
-intent.
+when every completed earlier provider phase has `state_mutation=False`,
+`information_flow=False`, and `commits_authority=False`. In that case it
+restores an exact reservation when one was reserved; filesystem/clock/shell and
+PTY spawn perform restoration and abandonment in one store transaction. The
+default `commits_authority=True` therefore closes the restoration floor even
+for a successful phase whose other two flags are false. If an earlier
+filesystem `state()` or MCP live-tool validation already returned information,
+the main mutation/call being not-started still finalizes the observed partial
+effect instead of erasing the intent.
 
 Human terminal reads and automatic writes persist only request/purpose and
 length/hash observations; raw prompts, answers, and provider exception text do
@@ -240,6 +242,7 @@ teardown. The caller retains explicit ownership and can extract and retry it
 without relying on garbage collection:
 
 ```python
+from agent_libos import Runtime
 from agent_libos.runtime import RuntimeAssemblyCleanupRequired
 
 try:
@@ -265,6 +268,7 @@ a stale handle therefore cannot close a successor Runtime. Async handle and
 failed-open close paths run blocking backend release off-loop, shield it through
 caller cancellation, and report cancellation only after the irreversible close
 outcome is known.
+
 `agent_libos.runtime.runtime.Runtime` is the stable host facade over that
 assembled graph. Its component fields are declared explicitly for static
 tooling, and the architecture check rejects composition-root assignments that
@@ -366,13 +370,20 @@ keeps rollback ownership explicit.
 Host-facing control surfaces live under `agent_libos.api`. The CLI entrypoint
 and the local GUI HTTP/SSE server are different presentations over the same
 runtime managers and primitives; neither is an authority boundary by itself.
-Both must call `Runtime.shutdown()` when they own a runtime instance. Shutdown
-first stops scheduler work and ObjectTask runner work, then releases host
-resources and emits runtime lifecycle audit/event records. If a synchronous
-quantum or ObjectTask tool thread cannot be joined safely, shutdown reports the
-component that did not stop and leaves owned storage open so a live worker is
-not racing a closed runtime store connection. Host shutdown never marks AgentProcess
-records as exited.
+Both must close a Runtime they own: synchronous hosts call
+`Runtime.shutdown()`, while event-loop hosts call and await
+`Runtime.ashutdown()`. Ordinary shutdown first closes mutation admission and
+drains admitted work. While store ownership remains, it then attempts to write
+`runtime.shutdown` audit/event evidence; an evidence failure returns before any
+component callback. After successful evidence it stops scheduler work and
+ObjectTask runner work, runs registered finalizers, stops modules, LLM clients,
+supervised blocking work, and the substrate, and only then claims and closes the
+store. The durable record therefore evidences a shutdown attempt that reached
+this phase, not successful completion of every later teardown step. If a
+synchronous quantum, ObjectTask tool thread, or later component cannot be
+stopped safely, shutdown reports the exact failed stage and leaves owned storage
+open so live work is not racing a closed store connection. Host shutdown never
+marks AgentProcess records as exited.
 
 The final ordinary store close uses an exact nonblocking ownership claim. Async
 shutdown performs the blocking backend release off-loop and drains that

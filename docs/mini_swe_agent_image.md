@@ -14,8 +14,10 @@ checkout that configuration selects `.agent_libos.sqlite`, so omitting `--db`
 persists the registration there. A checkout without project configuration
 falls back to `DEFAULT_CONFIG`, whose `local` store is in memory and therefore
 does not survive a later CLI invocation. Use an explicit `--db` when the
-artifact must be reproducible independent of the caller's current directory or
-local configuration.
+artifact must survive later invocations. Relative database paths are still
+resolved from the CLI process's current working directory; use an absolute
+`--db` path when invocations from different directories must select the same
+store independently of local configuration.
 
 The package uses `prompt_mode: image_only`, `jit_tool_exposure: direct`, and
 `default_tools: []`. At boot, the image package registers one process-local JIT
@@ -30,7 +32,11 @@ The wrapper runs:
 bash -lc "exec 2>&1; <command>"
 ```
 
-with a 30 second timeout and a 10000 character observation window.
+with a 30 second shell timeout and a 10000 character observation window. The
+package declares a 35 second outer JIT sandbox timeout so the shell timeout has
+time to return its structured observation. This per-tool timeout is capped by
+the Host's `tools.deno_timeout_hard_limit_s` (60 seconds by default); it does
+not raise the 5 second default used by other JIT tools.
 
 The package declares required capabilities for workspace filesystem read/write
 and shell execute authority. Those declarations are metadata checked by normal

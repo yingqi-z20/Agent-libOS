@@ -2367,15 +2367,13 @@ class LLMProcessExecutor:
             observation["action"] = "disabled"
             return
         if policy.mode == "prompt":
-            notice = context_pressure_prompt(policy, assessment)
-            self._append_context_pressure_notice(state.request_messages, notice)
-            observation["action"] = "prompted"
-            self._audit_context_pressure(
-                state.pid,
-                "llm.context_pressure_prompted",
-                assessment,
-                policy,
+            self._apply_context_pressure_prompt(
+                state,
+                policy=policy,
+                base_assessment=assessment,
+                provider_lower_bound_tokens=lower_bound,
                 episode_id=episode_id,
+                observation=observation,
             )
             return
         if attempted:
@@ -2387,6 +2385,74 @@ class LLMProcessExecutor:
             assessment=assessment,
             episode_id=episode_id,
             observation=observation,
+        )
+
+    def _apply_context_pressure_prompt(
+        self,
+        state: _LLMCallState,
+        *,
+        policy: ContextManagementPolicy,
+        base_assessment: ContextPressureAssessment,
+        provider_lower_bound_tokens: int,
+        episode_id: str,
+        observation: dict[str, Any],
+    ) -> None:
+        notice, prompted_messages, assessment = self._pressure_prompt_request(
+            state,
+            policy=policy,
+            base_assessment=base_assessment,
+            provider_lower_bound_tokens=provider_lower_bound_tokens,
+        )
+        notice_tokens = max(
+            0,
+            assessment.local_input_estimate_tokens
+            - base_assessment.local_input_estimate_tokens,
+        )
+        observation.update(
+            {
+                **assessment.to_dict(),
+                "active": assessment.triggered,
+                "action": "prompted",
+                "prompt_notice_estimate_tokens": notice_tokens,
+            }
+        )
+        if assessment.projected_tokens > assessment.context_window_tokens:
+            observation.update(
+                {
+                    "action": "failed",
+                    "failure_reason": "prompt_notice_exceeds_context_window",
+                }
+            )
+            self._audit_context_pressure(
+                state.pid,
+                "llm.context_pressure_failed",
+                assessment,
+                policy,
+                episode_id=episode_id,
+                extra={
+                    "reason": "prompt_notice_exceeds_context_window",
+                    "prompt_notice_estimate_tokens": notice_tokens,
+                },
+            )
+            raise ResourceLimitExceeded(
+                "context-pressure prompt would exceed the configured LLM "
+                "context window: "
+                f"projected_tokens={assessment.projected_tokens}, "
+                f"context_window_tokens={assessment.context_window_tokens}"
+            )
+        state.request_messages = prompted_messages
+        self._audit_context_pressure(
+            state.pid,
+            "llm.context_pressure_prompted",
+            assessment,
+            policy,
+            episode_id=episode_id,
+            extra={
+                "prompt_notice_estimate_tokens": notice_tokens,
+                "prompt_notice_sha256": hashlib.sha256(
+                    notice.encode("utf-8")
+                ).hexdigest(),
+            },
         )
 
     async def _attempt_auto_context_management(
@@ -2711,6 +2777,48 @@ class LLMProcessExecutor:
             message["content"] = "\n\n".join(part for part in (content, notice) if part)
             return
         messages.append({"role": "user", "content": notice})
+
+    @classmethod
+    def _pressure_prompt_request(
+        cls,
+        state: _LLMCallState,
+        *,
+        policy: ContextManagementPolicy,
+        base_assessment: ContextPressureAssessment,
+        provider_lower_bound_tokens: int,
+    ) -> tuple[str, list[dict[str, Any]], ContextPressureAssessment]:
+        """Build and assess the exact prompt-mode request.
+
+        The diagnostic notice includes numeric values from the assessment, so
+        its own serialized size can change those values at a digit boundary.
+        Iterate to a stable notice while always returning an assessment of the
+        exact messages that would be sent.
+        """
+
+        resolved = state.resolved
+        assert resolved is not None
+        notice_assessment = base_assessment
+        notice = ""
+        candidate_messages: list[dict[str, Any]] = []
+        candidate_assessment = base_assessment
+        for _ in range(8):
+            notice = context_pressure_prompt(policy, notice_assessment)
+            candidate_messages = [dict(message) for message in state.request_messages]
+            cls._append_context_pressure_notice(candidate_messages, notice)
+            candidate_assessment = assess_context_pressure(
+                messages=candidate_messages,
+                tools=state.tools,
+                context_window_tokens=resolved.context_window_tokens,
+                reserved_output_tokens=resolved.max_tokens,
+                threshold_ratio=policy.threshold_ratio,
+                profile_id=resolved.profile_id,
+                context_generation=base_assessment.context_generation,
+                provider_lower_bound_tokens=provider_lower_bound_tokens,
+            )
+            if context_pressure_prompt(policy, candidate_assessment) == notice:
+                break
+            notice_assessment = candidate_assessment
+        return notice, candidate_messages, candidate_assessment
 
     @staticmethod
     def _context_compaction_succeeded(

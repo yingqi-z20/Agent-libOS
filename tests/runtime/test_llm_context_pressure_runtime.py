@@ -11,6 +11,7 @@ from agent_libos import AgentImage, Runtime
 from agent_libos.llm.context_management import (
     DEFAULT_CONTEXT_PRESSURE_PROMPT,
     ContextPressureAssessment,
+    assess_context_pressure,
 )
 from agent_libos.llm.pending import pending_metadata
 from agent_libos.models import (
@@ -857,6 +858,126 @@ def test_prompt_policy_applies_to_every_prompt_mode(
         assert "reserved output:" in client.user_prompts[0]
         assert "projected occupancy:" in client.user_prompts[0]
         assert "utilization:" in client.user_prompts[0]
+    finally:
+        runtime.close()
+
+
+def test_prompt_policy_accounts_for_the_exact_notice_bearing_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="prompt-context-exact-accounting:v0",
+        name="prompt-context-exact-accounting",
+        default_tools=["process_exit"],
+        planner={
+            "context_management": {
+                "mode": "prompt",
+                "threshold_ratio": 0.001,
+                "prompt": "Preserve exact context pressure accounting.",
+            }
+        },
+    )
+    runtime, client, pid = _runtime_with_image(image)
+    captured_messages: list[list[dict[str, Any]]] = []
+    original_complete = client.complete_action
+
+    def capture_complete(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> Any:
+        captured_messages.append([dict(message) for message in messages])
+        return original_complete(messages, tools)
+
+    monkeypatch.setattr(client, "complete_action", capture_complete)
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["ok"] is True
+        assert len(captured_messages) == 1
+        call = runtime.store.get_latest_llm_call(pid=pid, purpose="action_selection")
+        assert call is not None
+        resolved = runtime.llms.resolve("default")
+        expected = assess_context_pressure(
+            messages=captured_messages[0],
+            tools=client.tool_batches[0],
+            context_window_tokens=resolved.context_window_tokens,
+            reserved_output_tokens=resolved.max_tokens,
+            threshold_ratio=0.001,
+            profile_id=resolved.profile_id,
+            context_generation=call.request_options["llm_context_generation"],
+        )
+        pressure = call.request_options["context_pressure"]
+        assert pressure["local_input_estimate_tokens"] == expected.local_input_estimate_tokens
+        assert pressure["estimated_input_tokens"] == expected.estimated_input_tokens
+        assert pressure["projected_tokens"] == expected.projected_tokens
+        assert pressure["utilization_ratio"] == expected.utilization_ratio
+        assert pressure["prompt_notice_estimate_tokens"] > 0
+        prompted = next(
+            record
+            for record in runtime.audit.trace(actor=pid)
+            if record.action == "llm.context_pressure_prompted"
+        )
+        assert prompted.decision["projected_tokens"] == expected.projected_tokens
+        assert prompted.decision["prompt_notice_estimate_tokens"] > 0
+        assert prompted.decision["prompt_notice_sha256"]
+    finally:
+        runtime.close()
+
+
+def test_prompt_policy_does_not_dispatch_when_notice_would_cross_context_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="prompt-context-overflow:v0",
+        name="prompt-context-overflow",
+        default_tools=["process_exit"],
+        planner={"context_management": {"mode": "prompt"}},
+    )
+    runtime, client, pid = _runtime_with_image(image)
+    assessments = 0
+
+    def crosses_window(**kwargs: Any) -> ContextPressureAssessment:
+        nonlocal assessments
+        assessments += 1
+        window = int(kwargs["context_window_tokens"])
+        reserved = int(kwargs["reserved_output_tokens"])
+        projected = window - 1 if assessments == 1 else window + 1
+        estimated = projected - reserved
+        provider_lower_bound = int(kwargs.get("provider_lower_bound_tokens", 0))
+        return ContextPressureAssessment(
+            context_window_tokens=window,
+            local_input_estimate_tokens=max(1, estimated - provider_lower_bound),
+            provider_usage_lower_bound_tokens=provider_lower_bound,
+            estimated_input_tokens=estimated,
+            reserved_output_tokens=reserved,
+            projected_tokens=projected,
+            utilization_ratio=projected / window,
+            threshold_ratio=float(kwargs["threshold_ratio"]),
+            triggered=True,
+            profile_id=str(kwargs["profile_id"]),
+            context_generation=str(kwargs["context_generation"]),
+        )
+
+    monkeypatch.setattr(
+        "agent_libos.llm.executor.assess_context_pressure",
+        crosses_window,
+    )
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["ok"] is False
+        assert result["resource_limit_exceeded"] is True
+        assert client.user_prompts == []
+        assert runtime.process.get(pid).status.value == "killed"
+        failure = next(
+            record
+            for record in runtime.audit.trace(actor=pid)
+            if record.action == "llm.context_pressure_failed"
+        )
+        assert failure.decision["reason"] == "prompt_notice_exceeds_context_window"
+        assert failure.decision["projected_tokens"] == (
+            failure.decision["context_window_tokens"] + 1
+        )
     finally:
         runtime.close()
 

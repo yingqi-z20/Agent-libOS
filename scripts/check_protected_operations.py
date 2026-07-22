@@ -14,6 +14,13 @@ FORBIDDEN_EFFECT_LIFECYCLE = frozenset(
         "record_external_effect",
     }
 )
+EFFECT_LIFECYCLE_EXPORT_MODULES = frozenset(
+    {
+        "agent_libos.evidence",
+        "agent_libos.evidence.external_effects",
+        "agent_libos.runtime.external_effects",
+    }
+)
 ALLOWED_LIFECYCLE_FILES = frozenset(
     {
         Path("agent_libos/evidence/external_effects.py"),
@@ -114,6 +121,7 @@ DATA_FLOW_DESCRIPTOR_FIELDS = frozenset(
 INGRESS_DESCRIPTOR_FIELD = "data_flow_ingress_context"
 
 FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
+LifecycleScope = FunctionNode | None
 
 
 def _attribute_path(node: ast.AST) -> tuple[str, ...]:
@@ -167,6 +175,191 @@ def _function_name(function: FunctionNode) -> str:
     if isinstance(function, ast.Lambda):
         return f"lambda@{function.lineno}"
     return function.name
+
+
+def _import_from_module(node: ast.ImportFrom, *, relative: Path) -> str | None:
+    """Resolve an absolute module name for one ImportFrom statement."""
+
+    if node.level == 0:
+        return node.module
+    package = list(relative.with_suffix("").parts[:-1])
+    parents_to_remove = node.level - 1
+    if parents_to_remove > len(package):
+        return None
+    if parents_to_remove:
+        package = package[:-parents_to_remove]
+    if node.module:
+        package.extend(node.module.split("."))
+    return ".".join(package) or None
+
+
+def _scope_parent(
+    scope: LifecycleScope,
+    parents: dict[ast.AST, ast.AST],
+) -> LifecycleScope:
+    if scope is None:
+        return None
+    parent = parents.get(scope)
+    return _nearest_owner(parent, parents) if parent is not None else None
+
+
+def _scope_chain(
+    scope: LifecycleScope,
+    parents: dict[ast.AST, ast.AST],
+) -> tuple[LifecycleScope, ...]:
+    selected: list[LifecycleScope] = []
+    current = scope
+    while current is not None:
+        selected.append(current)
+        current = _scope_parent(current, parents)
+    selected.append(None)
+    return tuple(selected)
+
+
+def _bound_target_names(target: ast.AST) -> tuple[str, ...]:
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, ast.Starred):
+        return _bound_target_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return tuple(
+            name
+            for item in target.elts
+            for name in _bound_target_names(item)
+        )
+    return ()
+
+
+def _lifecycle_name_definitions(
+    tree: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+) -> set[tuple[LifecycleScope, str]]:
+    definitions: set[tuple[LifecycleScope, str]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            arguments = node.args
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+            ):
+                definitions.add((node, argument.arg))
+            if arguments.vararg is not None:
+                definitions.add((node, arguments.vararg.arg))
+            if arguments.kwarg is not None:
+                definitions.add((node, arguments.kwarg.arg))
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            definitions.add((_nearest_owner(node, parents), node.id))
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            scope = _nearest_owner(node, parents)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                definitions.add((scope, bound))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            parent = parents.get(node)
+            definitions.add(
+                (
+                    _nearest_owner(parent, parents) if parent is not None else None,
+                    node.name,
+                )
+            )
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            definitions.add((_nearest_owner(node, parents), node.name))
+    return definitions
+
+
+def _resolve_lifecycle_helper(
+    node: ast.AST,
+    *,
+    owner: LifecycleScope,
+    bindings: dict[tuple[LifecycleScope, str], str],
+    definitions: set[tuple[LifecycleScope, str]],
+    parents: dict[ast.AST, ast.AST],
+) -> str | None:
+    path = _attribute_path(node)
+    if path[-1:] and path[-1] in FORBIDDEN_EFFECT_LIFECYCLE:
+        return path[-1]
+    if not isinstance(node, ast.Name):
+        return None
+    if node.id in FORBIDDEN_EFFECT_LIFECYCLE:
+        return node.id
+    for scope in _scope_chain(owner, parents):
+        key = (scope, node.id)
+        helper = bindings.get(key)
+        if helper is not None:
+            return helper
+        if key in definitions:
+            return None
+    return None
+
+
+def _lifecycle_alias_bindings(
+    tree: ast.AST,
+    *,
+    relative: Path,
+    parents: dict[ast.AST, ast.AST],
+    definitions: set[tuple[LifecycleScope, str]],
+) -> dict[tuple[LifecycleScope, str], str]:
+    bindings: dict[tuple[LifecycleScope, str], str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module = _import_from_module(node, relative=relative)
+        if module not in EFFECT_LIFECYCLE_EXPORT_MODULES:
+            continue
+        scope = _nearest_owner(node, parents)
+        for alias in node.names:
+            if alias.name not in FORBIDDEN_EFFECT_LIFECYCLE:
+                continue
+            bindings[(scope, alias.asname or alias.name)] = alias.name
+
+    assignments: list[tuple[LifecycleScope, tuple[str, ...], ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            names = tuple(
+                name
+                for target in node.targets
+                for name in _bound_target_names(target)
+            )
+            assignments.append((_nearest_owner(node, parents), names, node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignments.append(
+                (
+                    _nearest_owner(node, parents),
+                    _bound_target_names(node.target),
+                    node.value,
+                )
+            )
+        elif isinstance(node, ast.NamedExpr):
+            assignments.append(
+                (
+                    _nearest_owner(node, parents),
+                    _bound_target_names(node.target),
+                    node.value,
+                )
+            )
+
+    changed = True
+    while changed:
+        changed = False
+        for owner, names, value in assignments:
+            helper = _resolve_lifecycle_helper(
+                value,
+                owner=owner,
+                bindings=bindings,
+                definitions=definitions,
+                parents=parents,
+            )
+            if helper is None:
+                continue
+            for name in names:
+                key = (owner, name)
+                if key not in bindings:
+                    bindings[key] = helper
+                    changed = True
+    return bindings
 
 
 def _has_leading_recovery_cleanup_guard(function: FunctionNode) -> bool:
@@ -578,6 +771,13 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
     parents: dict[ast.AST, ast.AST] = {
         child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
     }
+    lifecycle_definitions = _lifecycle_name_definitions(tree, parents)
+    lifecycle_aliases = _lifecycle_alias_bindings(
+        tree,
+        relative=relative,
+        parents=parents,
+        definitions=lifecycle_definitions,
+    )
     call_graph = _CallGraph(tree, parents)
     assigned_invocations = _assigned_invocations(tree, parents)
     assigned_factory_invocations = _assigned_factory_invocations(
@@ -612,28 +812,49 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
             direct_provider_functions.add(owner)
     provider_reaching = call_graph.provider_reaching_functions(direct_provider_functions)
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module in {
-            "agent_libos.evidence.external_effects",
-            "agent_libos.runtime.external_effects",
-        }:
+        if (
+            isinstance(node, ast.ImportFrom)
+            and _import_from_module(node, relative=relative)
+            in EFFECT_LIFECYCLE_EXPORT_MODULES
+        ):
             for alias in node.names:
-                if alias.name in FORBIDDEN_EFFECT_LIFECYCLE and not lifecycle_allowed:
+                if alias.name == "*" and not lifecycle_allowed:
                     errors.append(
-                        f"{relative}:{node.lineno}: direct import of {alias.name} bypasses agent_libos.sdk"
+                        f"{relative}:{node.lineno}: wildcard lifecycle import bypasses agent_libos.sdk"
+                    )
+                if alias.name in FORBIDDEN_EFFECT_LIFECYCLE and not lifecycle_allowed:
+                    imported_as = (
+                        ""
+                        if alias.asname is None
+                        else f" as {alias.asname}"
+                    )
+                    errors.append(
+                        f"{relative}:{node.lineno}: direct import of {alias.name}"
+                        f"{imported_as} bypasses agent_libos.sdk"
                     )
         if isinstance(node, ast.Call):
-            name: str | None = None
-            if isinstance(node.func, ast.Name):
-                name = node.func.id
-            elif isinstance(node.func, ast.Attribute):
-                name = node.func.attr
-                if name == "_restore_reserved_use":
-                    errors.append(
-                        f"{relative}:{node.lineno}: use public restore_reserved_use or ProtectedOperationSDK"
-                    )
-            if name in FORBIDDEN_EFFECT_LIFECYCLE and not lifecycle_allowed:
+            path = _attribute_path(node.func)
+            if path[-1:] == ("_restore_reserved_use",):
                 errors.append(
-                    f"{relative}:{node.lineno}: direct {name} call bypasses agent_libos.sdk"
+                    f"{relative}:{node.lineno}: use public restore_reserved_use or ProtectedOperationSDK"
+                )
+            lifecycle_helper = _resolve_lifecycle_helper(
+                node.func,
+                owner=_nearest_owner(node, parents),
+                bindings=lifecycle_aliases,
+                definitions=lifecycle_definitions,
+                parents=parents,
+            )
+            if lifecycle_helper is not None and not lifecycle_allowed:
+                called_name = path[-1] if path else lifecycle_helper
+                alias_suffix = (
+                    ""
+                    if called_name == lifecycle_helper
+                    else f" via alias {called_name}"
+                )
+                errors.append(
+                    f"{relative}:{node.lineno}: direct {lifecycle_helper} call"
+                    f"{alias_suffix} bypasses agent_libos.sdk"
                 )
             if _attribute_path(node.func)[-1:] == ("ProtectedOperationInvocation",):
                 fields = {keyword.arg for keyword in node.keywords if keyword.arg is not None}

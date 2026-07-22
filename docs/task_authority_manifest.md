@@ -74,9 +74,10 @@ ceiling is used: `git.read`, `git.mutate`, `git.fetch`, `git.push`, and
 Explain evidence, while the protected provider descriptor supplies the effect
 class. An existing `shell:git` authorized capability or old image requirement
 does not imply any Git effect or capability; a new manifest must explicitly
-authorize `git:workspace`, any filesystem paths, and the selected remote/PR
-resources. Mandatory destructive-operation approval remains necessary even
-when the effect family is within the manifest ceiling.
+authorize the configured `git.repository_resource` (default `git:workspace`),
+any filesystem paths, and the selected remote/PR resources. Mandatory
+destructive-operation approval remains necessary even when the effect family is
+within the manifest ceiling.
 
 The durable effect-policy envelope is schema version 2 so unrestricted `null`
 and deny-all `[]` cannot collapse during persistence. Legacy version 1 rows are
@@ -132,11 +133,17 @@ uv run agent-libos spawn \
     "authorized_capabilities": [
       {"resource":"filesystem:workspace:reports/*","rights":["read"]}
     ],
-    "permitted_effects": ["filesystem.read_text"],
+    "permitted_effects": ["filesystem.read_bytes"],
     "resource_budget": {"max_tool_calls": 20},
     "metadata": {"policy":"review-v1"}
   }'
 ```
+
+Effect classes use protected-operation provider/operation ids, not model-facing
+tool or syscall names. For example, the `read_text` convenience operation is
+classified as `filesystem.read_bytes`. The canonical built-in inventory is the
+descriptor registry in `agent_libos/primitives/descriptors.py`; unknown effect
+classes fail closed.
 
 `POST /api/processes` and `POST /api/workflows/run` accept the same object as
 `authority_manifest`. Explain summaries show the manifest id/hash, declared

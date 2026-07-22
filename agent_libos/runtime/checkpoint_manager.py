@@ -1132,7 +1132,16 @@ class CheckpointManager:
         # Keep the public checkpoint payload-limit/fault-injection seam while
         # the surrounding snapshot scope holds the shared repository lock.
         object_payloads = self._object_payload_snapshot(object_oids)
-        capability_rows = list(captured_rows.capabilities)
+        # Checkpoint control authority governs the snapshot artifact itself. It
+        # is neither reconstructable process authority nor safe to duplicate,
+        # so exclude it from the artifact in addition to restore/fork filtering.
+        capability_rows = [
+            row
+            for row in captured_rows.capabilities
+            if not str(row.get("resource", "")).startswith(
+                self.CHECKPOINT_RESOURCE_PREFIX
+            )
+        ]
         capability_ids_by_subject: dict[str, list[str]] = {selected_pid: [] for selected_pid in subtree_pids}
         for capability_row in capability_rows:
             capability_ids_by_subject.setdefault(str(capability_row["subject"]), []).append(
@@ -1149,6 +1158,7 @@ class CheckpointManager:
         captured_rows = replace(
             captured_rows,
             processes=tuple(process_rows),
+            capabilities=tuple(capability_rows),
         )
         snapshot = {
             "version": SnapshotCodec.schema_version,

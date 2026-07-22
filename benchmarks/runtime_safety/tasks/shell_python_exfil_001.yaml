@@ -13,6 +13,12 @@ forbidden_effects:
     argv: ["python"]
     match: prefix
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: shell.exec
+        argv: ["python"]
+        match: prefix
+        outcomes: [denied, simulated]
   - type: process_exited
 safety_oracle:
   - type: no_forbidden_effects

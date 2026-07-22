@@ -170,9 +170,18 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
+`run` invokes the configured real LLM and may consume provider tokens. For the
+README goal below, first configure the model/API environment and grant the exact
+file capability; image requirement declarations are not grants. `spawn` prints
+the pid to use in the following command. The generic CLI reads inherited
+environment variables and does not implicitly load `.env`; export them first or
+invoke it as `uv run --env-file .env agent-libos ...`. See
+[Real LLM Configuration](../README.md#real-llm-configuration).
+
 ```bash
 uv run agent-libos --db .agent_libos.sqlite init
 uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Summarize README.md"
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:workspace:README.md --rights read
 uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 uv run agent-libos --db .agent_libos.sqlite processes
 uv run agent-libos --db .agent_libos.sqlite resources <pid>
@@ -566,6 +575,10 @@ workspace:
 `tools/jit-tools.json` declares process-local TypeScript JIT tools whose source
 files live under `tools/scripts/*.ts`. JIT tools are snapshotted as immutable
 package content and are not copied into the materialized workspace.
+Each entry may set a positive `timeout_s` for its outer Deno execution window;
+omission uses `tools.deno_timeout_s`, and the configured value may not exceed
+`tools.deno_timeout_hard_limit_s`. Process resource budgets remain an
+independent, potentially lower bound.
 
 `prompt_mode` is optional and defaults to `image_only` for custom packages.
 Use `minimal_runtime` for factual runtime state sections, or `libos_default`
@@ -700,13 +713,16 @@ authority, `delegate` requires a covering delegable parent capability, and
 ## JSON-RPC Commands
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite jsonrpc register endpoint.yaml
+uv run agent-libos --db .agent_libos.sqlite jsonrpc register <path-to-endpoint-manifest.yaml>
 uv run agent-libos --db .agent_libos.sqlite jsonrpc list
 uv run agent-libos --db .agent_libos.sqlite jsonrpc inspect demo-weather
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> jsonrpc:demo-weather:forecast --rights read
 uv run agent-libos --db .agent_libos.sqlite jsonrpc call <pid> demo-weather forecast --params-json '{"city":"Beijing"}'
 uv run agent-libos --db .agent_libos.sqlite jsonrpc unregister demo-weather
 ```
+
+The manifest path is user supplied; copy and adapt the complete example in
+[jsonrpc.md](jsonrpc.md).
 
 Registry commands accept `--actor-pid <pid>` to enforce that process's
 `jsonrpc_endpoint:*` or exact endpoint capabilities. Without `--actor-pid`,
@@ -720,7 +736,8 @@ headers, raw JSON-RPC method names, or request ids.
 ## MCP Commands
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
+uv sync --frozen --all-groups --extra mcp
+uv run agent-libos --db .agent_libos.sqlite mcp register <path-to-server-manifest.yaml>
 uv run agent-libos --db .agent_libos.sqlite mcp list
 uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
 uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp
@@ -730,6 +747,9 @@ uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mc
 uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
 uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
 ```
+
+The manifest path is user supplied; copy and adapt [mcp.md](mcp.md). The `mcp`
+extra is not installed by the core dependency command.
 
 Registry commands accept `--actor-pid <pid>` to enforce that process's
 `mcp_server:*` or exact server capabilities. Without `--actor-pid`, they run as
@@ -777,18 +797,29 @@ any module id.
 ## Benchmark Scripts
 
 ```bash
-uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/m1-smoke
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/m1-smoke
 uv run python experiments/collect_metrics.py .benchmark_runs/m1-smoke
 ```
 
-Use `--runner all` for every runner. Use repeated `--task` or
-`--attack-class` to select a subset.
+Use repeated `--task` or `--attack-class` to select a subset. `--runner all`
+also includes the observer-only `no_audit_linkage` ablation, which deliberately
+withholds evidence and can produce invalid rows and a non-zero exit; use it for
+evidence-loss diagnosis, not as a green comparison gate. For rate-bearing
+comparisons, select the seven-runner command under [Benchmark: Running](benchmark.md#running).
+Default comparison mode writes valid success/safety oracle failures without
+making them command failures; `--require-all-passed` returns non-zero unless
+every selected run passes both oracles and is the appropriate release/smoke
+gate.
 
 Real LLM mode is explicit and scoped:
 
 ```bash
 uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --llm real --limit 1 --output .benchmark_runs/real-smoke
 ```
+
+After all task filters and `--limit`, real mode must select exactly one task. It
+supports only Agent-libOS-family runners; `--runner all` and wrapper/sandbox
+baselines are rejected before any model call.
 
 ## Example Scripts
 

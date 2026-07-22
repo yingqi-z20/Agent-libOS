@@ -11,7 +11,7 @@ configuration has been release-validated.
   It validates repository/config/executable identity, uses state-token CAS and
   a cross-process lock, requires affected filesystem plus Git authority, and
   separates local mutation, fetch, push, and simulated-PR evidence. Managed
-  managed checkouts, immutable patch Objects, existing Host-configured remotes, and
+  checkouts, immutable patch Objects, existing Host-configured remotes, and
   repository-local simulated PRs are implemented without arbitrary Git argv,
   model URLs, executable hooks/helpers, or a Git hosting dependency.
 - Publication-owned launch and exec artifacts use exact durable receipts,
@@ -155,13 +155,15 @@ configuration has been release-validated.
 
 - Compilation, architecture/blocking-work checks, protected-operation coverage,
   release-contract checks, whitespace checks, and the invariant manifest pass.
-  All 83 declared invariants resolve against 3,297 collected pytest nodes.
+  All 86 declared invariants resolve against 3,568 collected pytest nodes.
 - The per-lane deterministic matrix passes all selected tests. PostgreSQL,
   MCP, and real-LLM coverage remains in dedicated or explicit gates, while
   platform-specific skips stay documented and real Deno runs by default when
   installed.
-- The complete PostgreSQL service gate passes 259 selected tests with no skips
-  or failures.
+- The PostgreSQL CI job runs the complete `postgres` marker gate against
+  PostgreSQL 17 on Python 3.11 and permits no skips; the current collection
+  selects 259 tests. This is a service-backed CI gate, not evidence that an
+  arbitrary local PostgreSQL configuration has been validated.
 - The GUI lane passes all 19 Vitest files and 67 tests, TypeScript type checking,
   and the production frontend build.
 - The runtime-safety release smoke passes all three selected tasks with complete
@@ -186,9 +188,10 @@ configuration has been release-validated.
   The profile validates exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The 0.3.4 wheel and source distribution pass content, metadata, entrypoint,
-  isolated-install, dependency-consistency, CLI, GUI-server, and deterministic
-  demo checks on Python 3.11. CI preserves the same validated distributions for
+- The Python 3.11 `release-artifacts` CI job builds the 0.3.4 wheel and source
+  distribution, checks content and metadata, clean-installs each artifact,
+  checks dependency consistency, exercises both entrypoints plus the
+  deterministic demo, and preserves those exact validated distributions for
   release use.
 
 ## Supported release scope

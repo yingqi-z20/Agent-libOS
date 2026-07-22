@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import errno
 import hashlib
-import json
+import math
 import os
 import re
 import stat
@@ -50,7 +50,7 @@ from agent_libos.skills.schema import JitToolSpec
 from agent_libos.storage import ExtensionRepository
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
-from agent_libos.utils.serde import dumps, loads
+from agent_libos.utils.serde import bounded_json_loads, dumps, loads
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _IMAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
@@ -755,8 +755,8 @@ class ImageRegistryPrimitive:
         if raw is None:
             raise ValidationError(f"image package jit_tools file is missing: {path}")
         try:
-            data = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            data = bounded_json_loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise ValidationError(f"invalid image package jit_tools JSON: {path}: {exc}") from exc
         if not isinstance(data, list):
             raise ValidationError("image package jit_tools JSON must be a list")
@@ -790,6 +790,7 @@ class ImageRegistryPrimitive:
                     source=source,
                     tests=tool.tests,
                     metadata=tool.metadata,
+                    timeout_s=tool.timeout_s,
                 )
             )
         return result
@@ -806,7 +807,16 @@ class ImageRegistryPrimitive:
     def _coerce_package_jit_tool(self, value: Any) -> JitToolSpec:
         if not isinstance(value, dict):
             raise ValidationError("image package jit_tools entries must be mappings")
-        allowed = {"name", "description", "input_schema", "output_schema", "source_path", "tests", "metadata"}
+        allowed = {
+            "name",
+            "description",
+            "input_schema",
+            "output_schema",
+            "source_path",
+            "tests",
+            "metadata",
+            "timeout_s",
+        }
         unknown = sorted(set(value) - allowed)
         if unknown:
             raise ValidationError(f"unknown image package JIT tool fields: {unknown}")
@@ -837,7 +847,31 @@ class ImageRegistryPrimitive:
             output_schema=output_schema,
             tests=tests,
             metadata=self._mapping(value.get("metadata"), "jit_tools[].metadata"),
+            timeout_s=self._coerce_jit_timeout(value.get("timeout_s")),
         )
+
+    def _coerce_jit_timeout(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValidationError("jit_tools[].timeout_s must be a number")
+        if isinstance(value, int):
+            if value <= 0:
+                raise ValidationError("jit_tools[].timeout_s must be finite and > 0")
+            if value > self.config.tools.deno_timeout_hard_limit_s:
+                raise ValidationError(
+                    "jit_tools[].timeout_s exceeds tools.deno_timeout_hard_limit_s="
+                    f"{self.config.tools.deno_timeout_hard_limit_s}"
+                )
+        timeout = float(value)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValidationError("jit_tools[].timeout_s must be finite and > 0")
+        if timeout > self.config.tools.deno_timeout_hard_limit_s:
+            raise ValidationError(
+                "jit_tools[].timeout_s exceeds tools.deno_timeout_hard_limit_s="
+                f"{self.config.tools.deno_timeout_hard_limit_s}"
+            )
+        return timeout
 
     def _static_check_package_jit_source(self, source: str, name: str) -> None:
         result = self.tools.static_check_jit_source(source)
@@ -968,7 +1002,7 @@ class ImageRegistryPrimitive:
         return hashlib.sha256(dumps({"kind": _PACKAGE_BOOT_KIND, "files": canonical}).encode("utf-8")).hexdigest()
 
     def _jit_tool_to_artifact(self, tool: JitToolSpec) -> dict[str, Any]:
-        return {
+        artifact = {
             "name": tool.name,
             "description": tool.description,
             "source_path": tool.source_path,
@@ -978,6 +1012,9 @@ class ImageRegistryPrimitive:
             "tests": list(tool.tests),
             "metadata": dict(tool.metadata),
         }
+        if tool.timeout_s is not None:
+            artifact["timeout_s"] = tool.timeout_s
+        return artifact
 
     def _normalize_package_reference(self, path: str) -> str:
         if not isinstance(path, str) or not path.strip():

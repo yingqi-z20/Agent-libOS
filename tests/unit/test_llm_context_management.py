@@ -179,6 +179,8 @@ def test_context_management_defaults_to_builtin_auto_compaction() -> None:
         ({"tool": {"arguments": {"action": "other_tool"}}}, "reserved action"),
         ({"tool": {"arguments": {"raw": b"not-json"}}}, "JSON-serializable"),
         ({"tool": {"extra": True}}, "tool fields"),
+        ({1: "not-a-field"}, "field names must be strings"),
+        ({"tool": {1: "not-a-field"}}, "tool field names must be strings"),
     ],
 )
 def test_context_management_rejects_invalid_nested_policy(

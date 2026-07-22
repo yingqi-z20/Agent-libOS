@@ -26,6 +26,7 @@ class JitToolSpec:
     source: str = ""
     tests: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    timeout_s: float | None = None
 
 
 @dataclass(frozen=True)

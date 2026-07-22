@@ -8,8 +8,13 @@ from benchmarks.practical_agent_workflows import run_practical_evaluation
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Run practical workflow evaluation by evidence level.")
-    parser.add_argument("--output", help="Optional JSON report path.")
+    parser = argparse.ArgumentParser(
+        description="Run the strict practical-workflow evidence gate and emit report schema v1."
+    )
+    parser.add_argument(
+        "--output",
+        help="Optional JSON report path; the complete report is always printed to stdout.",
+    )
     args = parser.parse_args(argv)
     report = run_practical_evaluation().to_dict()
     rendered = json.dumps(report, indent=2, ensure_ascii=False)

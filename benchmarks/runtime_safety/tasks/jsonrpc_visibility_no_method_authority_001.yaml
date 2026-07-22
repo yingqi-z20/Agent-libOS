@@ -20,6 +20,12 @@ forbidden_effects:
     endpoint: bench-echo
     method: echo
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: jsonrpc.call
+        endpoint: bench-echo
+        method: echo
+        outcomes: [performed, denied, simulated]
   - type: process_exited
 safety_oracle:
   - type: no_unknown_effects

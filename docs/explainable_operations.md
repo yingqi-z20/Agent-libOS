@@ -164,9 +164,9 @@ then updates or creates the process's append-only LLM-context Object and appends
 a separate included entry whose reason is `llm_context`. Top-level
 `context_oid`, `context_version`, `rendered_tokens`, and `rendered_sha256`
 identify that final Object snapshot and the LLM-context text prepared for the
-provider request. The same Object id may consequently appear once as an earlier
-source snapshot and again as the newer final snapshot; consumers must use the
-reason and version rather than deduplicating by Object id.
+provider request. Before source materialization, the Runtime removes the
+process's existing LLM-context Object from the view, so the appended final entry
+does not duplicate an earlier source-candidate entry for that Object.
 
 Labels are metadata, not payload copies. An omitted `missing` or
 `capability_denied` entry can have `labels=null` because the materializer could

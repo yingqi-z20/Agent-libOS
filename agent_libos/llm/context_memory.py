@@ -43,8 +43,6 @@ if TYPE_CHECKING:
     from agent_libos.memory.object_memory import ObjectMemoryManager
 
 _LLM_CONTEXT_DEFAULTS = DEFAULT_CONFIG.llm_context
-LLM_CONTEXT_POLICY = _LLM_CONTEXT_DEFAULTS.policy
-LLM_CONTEXT_SCHEMA_VERSION = _LLM_CONTEXT_DEFAULTS.schema_version
 
 
 class LLMContextMemory:
@@ -172,7 +170,7 @@ class LLMContextMemory:
             object_refs=[obj.oid, *source_context.object_refs],
             token_count=token_count,
             omitted_objects=source_context.omitted_objects,
-            policy_used=LLM_CONTEXT_POLICY,
+            policy_used=self._config.llm_context.policy,
             materialization_id=materialization_id,
             view_id=source_context.view_id,
             budget_tokens=source_context.budget_tokens,
@@ -196,7 +194,7 @@ class LLMContextMemory:
             context={
                 "view_id": process.memory_view.view_id if process.memory_view is not None else None,
                 "object_oid": context_oid,
-                "policy": LLM_CONTEXT_POLICY,
+                "policy": self._config.llm_context.policy,
             },
             allow_overage=False,
             kill_on_exceed=False,
@@ -513,7 +511,7 @@ class LLMContextMemory:
     ) -> dict[str, Any]:
         return {
             "kind": "llm_context",
-            "schema_version": LLM_CONTEXT_SCHEMA_VERSION,
+            "schema_version": self._config.llm_context.schema_version,
             "cache_strategy": {
                 "mode": "append_only_stable_prefix",
                 "reason": "Keep repeated instructions, tool names, and early process context at the front; append changes at the end.",
@@ -592,8 +590,15 @@ class LLMContextMemory:
             changed = True
 
         captured_events = set(captured.get("event_ids", []))
+        # ``events`` is already the store-bounded post-cursor window selected
+        # with the active Runtime configuration.  Applying the import-time
+        # default here used to discard the leading rows whenever an operator
+        # configured a window larger than the default, even though the caller
+        # advanced the durable cursor past those rows afterwards.
         new_events = [
-            event for event in events[-_LLM_CONTEXT_DEFAULTS.recent_event_limit :] if event.event_id not in captured_events
+            event
+            for event in events
+            if event.event_id not in captured_events
         ]
         if new_events:
             entries.append(
@@ -759,6 +764,13 @@ class LLMContextMemory:
     def _payload_dict(self, payload: Any, *, label: str = "payload") -> dict[str, Any]:
         if not isinstance(payload, dict) or payload.get("kind") != "llm_context":
             raise ValidationError(f"object is not an LLM context object: {label}")
+        expected_schema = self._config.llm_context.schema_version
+        found_schema = payload.get("schema_version")
+        if type(found_schema) is not int or found_schema != expected_schema:
+            raise ValidationError(
+                "LLM context object schema_version mismatch: "
+                f"expected {expected_schema}, found {found_schema!r}"
+            )
         return payload
 
     def _context_oid(self, pid: str) -> str | None:

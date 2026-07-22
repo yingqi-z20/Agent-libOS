@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import tomllib
@@ -55,11 +56,34 @@ def test_python_wheel_scope_is_the_core_package() -> None:
     assert "The Python wheel contains the core `agent_libos` package" in readme
 
 
+def test_readme_clean_install_smoke_covers_wheel_and_source_distribution() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "dist/*.whl" in readme
+    assert "dist/*.tar.gz" in readme
+    assert readme.count("/agent-libos --help") >= 2
+    assert readme.count("/agent-libos-gui-server --help") >= 2
+    assert readme.count("uv pip check --python /tmp/agent-libos-") >= 2
+
+
 def test_declared_python_support_has_an_explicit_upper_bound() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert pyproject["project"]["requires-python"] == ">=3.11,<3.15"
     lock_header = (ROOT / "uv.lock").read_text(encoding="utf-8").splitlines()[:4]
     assert 'requires-python = ">=3.11, <3.15"' in lock_header
+
+
+def test_gui_runtime_engines_are_explicit_and_lockfile_aligned() -> None:
+    package = json.loads((ROOT / "gui" / "package.json").read_text(encoding="utf-8"))
+    lockfile = json.loads(
+        (ROOT / "gui" / "package-lock.json").read_text(encoding="utf-8")
+    )
+
+    assert package["engines"] == {
+        "node": "^20.19.0 || >=22.12.0",
+        "npm": ">=8",
+    }
+    assert lockfile["packages"][""]["engines"] == package["engines"]
 
 
 def test_console_entrypoint_uses_the_domain_error_boundary() -> None:

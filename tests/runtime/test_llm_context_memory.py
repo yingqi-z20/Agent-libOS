@@ -233,6 +233,101 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    def test_event_window_larger_than_default_is_fully_captured_before_cursor_advance(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm_context=replace(DEFAULT_CONFIG.llm_context, recent_event_limit=30),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='capture every event')
+            emitted = {
+                runtime.events.emit(
+                    EventType.EXTERNAL_WRITE,
+                    source='large-event-window-test',
+                    target=pid,
+                    payload={'sequence': index},
+                ).event_id
+                for index in range(25)
+            }
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 1}},
+            ])
+
+            first = runtime.run_next_process_once()
+
+            assert first['ok']
+            context = runtime.store.get_object_by_name(
+                context_object_name(pid, config=config),
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert context is not None
+            assert emitted <= set(context.payload['captured']['event_ids'])
+        finally:
+            runtime.close()
+
+    def test_llm_context_policy_and_schema_version_use_active_runtime_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm_context=replace(
+                DEFAULT_CONFIG.llm_context,
+                policy='configured_llm_context_policy',
+                schema_version=7,
+                object_name_prefix='configured_llm_context',
+            ),
+        )
+        runtime = Runtime.open('local', config=config)
+        materialized_policies: list[str] = []
+        original_prepare = runtime.llm.context_memory.prepare
+
+        def tracked_prepare(*args: Any, **kwargs: Any) -> Any:
+            prepared = original_prepare(*args, **kwargs)
+            materialized_policies.append(prepared.policy_used)
+            return prepared
+
+        monkeypatch.setattr(runtime.llm.context_memory, 'prepare', tracked_prepare)
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='use active context config')
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'create_memory_object', 'type': 'observation', 'payload': {'done': True}},
+            ])
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok'], result
+            context = runtime.store.get_object_by_name(
+                context_object_name(pid, config=config),
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert context is not None
+            assert context.payload['schema_version'] == 7
+            assert materialized_policies == ['configured_llm_context_policy']
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'payload',
+        [
+            {'kind': 'llm_context', 'schema_version': True},
+            {'kind': 'llm_context', 'schema_version': 1.0},
+            {'kind': 'llm_context'},
+        ],
+        ids=['bool', 'float', 'missing'],
+    )
+    def test_llm_context_schema_version_requires_an_explicit_integer(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            with pytest.raises(ValidationError, match='schema_version mismatch'):
+                runtime.llm.context_memory._payload_dict(payload)
+        finally:
+            runtime.close()
+
     def test_llm_context_is_process_readable_writable_memory_object(self) -> None:
         runtime = Runtime.open('local')
         try:

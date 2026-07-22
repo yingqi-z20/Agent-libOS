@@ -54,7 +54,8 @@ The implementation currently includes:
   object capabilities. Output reading and process-tree resource supervision
   use independent workers, and concurrent lifecycle closes converge on one
   close transition. On Windows, real PTY support requires installing the
-  optional `pty` extra; see [docs/modules.md](docs/modules.md).
+  optional `pty` extra with `uv sync --all-groups --extra pty`; see
+  [docs/modules.md](docs/modules.md).
 - Durable process message queues for IPC, including interrupt delivery.
 - Object-bound background tool tasks that can notify processes through the
   same durable message queues, including optional owner-change watches, without
@@ -130,11 +131,16 @@ Start here, then read the deeper references as needed:
 
 - [docs/release_status.md](docs/release_status.md): current-version readiness,
   validation outcomes, and remaining environment boundaries.
+- [docs/python_api.md](docs/python_api.md): public Python imports, Runtime
+  lifecycle, manager properties, sync/async usage, exceptions, and
+  compatibility boundaries.
 - [docs/prelaunch_hardening_report.md](docs/prelaunch_hardening_report.md):
   historical, commit-bound 2026-07-10 subsystem review and validation snapshot;
   it is not the current release-status source.
 - [docs/architecture.md](docs/architecture.md): runtime layers, provider
   substrate, and the tool/primitive boundary.
+- [docs/threat_model.md](docs/threat_model.md): assets, adversaries, TCB,
+  trust boundaries, guarantees, non-goals, and severity calibration.
 - [docs/runtime_model.md](docs/runtime_model.md): process lifecycle, scheduler,
   cwd, human queue, IPC, fork/spawn/exec, and waits.
 - [docs/explainable_operations.md](docs/explainable_operations.md): operation
@@ -206,6 +212,11 @@ Start here, then read the deeper references as needed:
 
 ## Quick Start
 
+Prerequisites are Python 3.11–3.14 and [uv](https://docs.astral.sh/uv/). The
+typed Git provider and full test matrix require system Git 2.26 or newer. GUI
+development requires Node `^20.19.0` or `>=22.12.0` and npm 8 or newer; CI uses
+Node 24. Deno is optional unless running real TypeScript/JIT coverage.
+
 Install dependencies:
 
 ```bash
@@ -229,6 +240,29 @@ Build and validate both release artifacts with:
 uv build --clear --out-dir dist
 uv run python scripts/check_release_artifacts.py dist
 ```
+
+Validate the installed console entrypoints from an artifact, rather than only
+from the source checkout, in a disposable environment:
+
+```bash
+uv venv /tmp/agent-libos-wheel-check
+uv pip install --python /tmp/agent-libos-wheel-check/bin/python dist/*.whl
+uv pip check --python /tmp/agent-libos-wheel-check/bin/python
+/tmp/agent-libos-wheel-check/bin/agent-libos --help
+/tmp/agent-libos-wheel-check/bin/agent-libos-gui-server --help
+
+uv venv /tmp/agent-libos-sdist-check
+uv pip install --python /tmp/agent-libos-sdist-check/bin/python dist/*.tar.gz
+uv pip check --python /tmp/agent-libos-sdist-check/bin/python
+/tmp/agent-libos-sdist-check/bin/agent-libos --help
+/tmp/agent-libos-sdist-check/bin/agent-libos-gui-server --help
+```
+
+Use fresh paths for each check. On Windows, replace `/tmp/...` with a disposable
+directory and use the environment's `Scripts` directory instead of `bin`. The
+source archive additionally contains repository-level examples, benchmarks,
+documentation, and the optional PTY module that are intentionally absent from
+the core wheel.
 
 Run tests:
 
@@ -277,13 +311,16 @@ object creation, and audit trace generation.
 Run a small deterministic benchmark smoke:
 
 ```bash
-uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/m1-smoke
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/m1-smoke
 uv run python experiments/collect_metrics.py .benchmark_runs/m1-smoke
 ```
 
 The benchmark defaults to mock/planned actions and does not spend model tokens.
-Real-model benchmark smoke is opt-in and must be scoped with `--llm real
---limit 1` or a single `--task`.
+`--require-all-passed` is the release/smoke gate; without it, expected oracle
+failures are written for comparative analysis without forcing a non-zero exit.
+Real-model benchmark smoke is opt-in, must select exactly one task after all
+filters, and supports only one or more Agent-libOS-family runners; wrapper and
+sandbox baselines cannot use `--llm real`.
 
 The historical deterministic snapshot was produced from clean
 source snapshot `c03a4ec764e02bd4df59e2769edeb1278d5ea545`; its ignored local
@@ -319,11 +356,16 @@ and Explain evidence; it never falls back to a modeled success.
 ## Persistent Runtime
 
 Use `--db` to keep runtime state in a persistent store. A filesystem path uses
-SQLite and remains the default local option:
+SQLite and remains the default local option. The `spawn` command prints the new
+pid; substitute it for `<pid>` below. Running a quantum invokes the configured
+real LLM, consumes provider tokens, and requires the model/API environment
+described in the next section. Image requirement declarations do not grant
+authority, so grant the exact README read capability before running this goal:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite init
 uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Summarize README.md"
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:workspace:README.md --rights read
 uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 uv run agent-libos --db .agent_libos.sqlite processes
 uv run agent-libos --db .agent_libos.sqlite resources <pid>
@@ -397,14 +439,22 @@ uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
 
 ## Real LLM Configuration
 
-Create a local `.env` file for real-model execution:
+Export the real-model settings into the Host process environment:
 
 ```bash
-OPENAI_BASE_URL=https://example-openai-compatible-endpoint/v1
-OPENAI_LANGUAGE_MODEL=your-model
-OPENAI_API_KEY=...
-AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1
+export OPENAI_BASE_URL=https://example-openai-compatible-endpoint/v1
+export OPENAI_LANGUAGE_MODEL=your-model
+export OPENAI_API_KEY=...
+export AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1
 ```
+
+The Runtime and generic CLI do not implicitly load a workspace `.env`. If these
+values are stored as plain `KEY=value` lines in an untracked `.env`, load it in
+the shell or invoke the CLI explicitly with
+`uv run --env-file .env agent-libos ...`. The repository's
+`scripts/run_coding_agent.py` launcher is a separate convenience path that does
+support an env file. PowerShell users can set the same inherited variables with
+`$env:NAME = "value"`.
 
 The client uses the OpenAI Python SDK. It uses the Responses API for
 OpenAI-hosted models by default and falls back to Chat Completions for custom
@@ -471,21 +521,29 @@ uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent
 Register and call a preconfigured JSON-RPC endpoint:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite jsonrpc register endpoint.yaml
+uv run agent-libos --db .agent_libos.sqlite jsonrpc register <path-to-endpoint-manifest.yaml>
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> jsonrpc:demo-weather:forecast --rights read
 uv run agent-libos --db .agent_libos.sqlite jsonrpc call <pid> demo-weather forecast --params-json '{"city":"Beijing"}'
 ```
 
+Create the manifest from the complete schema/example in
+[docs/jsonrpc.md](docs/jsonrpc.md); the angle-bracket path is a user-supplied
+file, not a file shipped at the repository root.
+
 Register and call a preconfigured MCP tool:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
-uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-tools
+uv sync --frozen --all-groups --extra mcp
+uv run agent-libos --db .agent_libos.sqlite mcp register <path-to-server-manifest.yaml>
+uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> <stdio_authority_resource-from-inspect> --rights execute
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-tools:forecast --rights read
-uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-tools forecast --arguments-json '{"city":"Beijing"}'
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mcp:forecast --rights read
+uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
 ```
+
+Create the manifest from [docs/mcp.md](docs/mcp.md); the angle-bracket path is
+user supplied. The `mcp` extra is not installed by the core Quick Start command.
 
 The `process:spawn` and exact `mcp_stdio:<sha256>` grants are required only for
 stdio servers. Copy `stdio_authority_resource` from `mcp inspect`; do not derive
@@ -532,9 +590,11 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   general OS sandbox for hostile native binaries. Strong hostile-code isolation
   requires a container, WASM, or service provider with an explicit deployment
   trust boundary.
-- Deno JIT validation may resolve pinned allowlisted JSR dependencies; runtime
-  execution uses cached dependencies only, so a tool call cannot implicitly
-  fetch remote code.
+- Deno JIT validation rejects every static import/re-export (including `jsr:`,
+  `npm:`, `node:`, `http:`, `https:`, and `file:`) and dynamic `import()`.
+  Runtime execution is no-permission and cached-only, so a tool call cannot
+  implicitly fetch remote code. `tools.deno_jsr_allowlist` is retained metadata,
+  not an import-policy exception.
 - JSON-RPC and MCP calls gate on endpoint/method or server/tool capability
   resources before loading provider metadata or input schemas, so missing call
   authority cannot enumerate registered manifests.
@@ -546,9 +606,12 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   inspection commands even under an always-allow shell policy. As with other
   direct I/O, an authorized general interpreter or native program remains a
   host-user process and is outside that argv-only compatibility boundary.
-- Human approval is part of a primitive/syscall. Callers see a final success or
-  final failure, not a pending/retry protocol. Run-local automatic decisions
-  are isolated across concurrent scheduler workers, and terminal process states
+- Human approval is part of a primitive/syscall. Model-facing Tool and JIT
+  callers see a final success or final failure, not a public pending/retry
+  protocol. A direct Python Host call may instead raise
+  `HumanApprovalRequired` or `HumanResponseRequired` with the durable
+  `request_id`; see the Python API contract. Run-local automatic decisions are
+  isolated across concurrent scheduler workers, and terminal process states
   cancel pending requests.
 - Runtime-mediated egress requires both ordinary operation authority and Sink
   clearance. Trusted Sink configuration cannot grant a capability, bypass a
@@ -592,9 +655,10 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - Providers classify successful external effects as `irreversible`,
   `rollbackable`, or `no_rollback_required`. Filesystem mutations, clock,
   shell, and PTY spawn reserve finite-use authority before the provider
-  boundary. Only `ProviderEffectNotStarted` with no earlier information flow
-  can certify the whole operation did not start and permit intent abandonment;
-  ambiguous failures consume authority and persist an `unknown` effect.
+  boundary. `ProviderEffectNotStarted` permits intent abandonment only when no
+  completed earlier phase mutated provider state, observed information, or
+  committed authority (the phase default); ambiguous failures consume authority
+  and persist an `unknown` effect.
   Filesystem/clock/shell, human output and terminal I/O, PTY
   spawn/write/resize/close, and live JSON-RPC/MCP calls persist a pending
   unknown intent before the
@@ -625,7 +689,7 @@ Run the standard local checks:
 ```bash
 uv sync --frozen --all-groups
 npm --prefix gui install
-uv run python -m compileall agent_libos tests scripts experiments benchmarks
+uv run python -m compileall agent_libos tests scripts experiments benchmarks modules
 uv run python scripts/test_matrix.py --lane all --workers 4
 uv run python scripts/check_architecture.py
 uv run python scripts/check_test_invariants.py

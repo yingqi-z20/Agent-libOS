@@ -12,21 +12,20 @@ wire method names at call time. They pass only:
 - `method_id`
 - `params`
 
-The runtime resolves endpoint metadata from the JSON-RPC endpoint registry,
-checks the caller pid's capabilities, optionally asks the human, performs a
-single primitive/provider call through the JSON-RPC provider, records
+The runtime first constructs the endpoint/method capability resource from the
+two public ids and applies the early visibility gate. Only an authorized caller
+can cause the runtime to resolve endpoint metadata from the registry and validate
+the method schema. It then performs exact authorization, optionally asks the
+human, makes a primitive/provider call through the JSON-RPC provider, records
 audit/events, and writes a provider-classified external-effect row. The default
 HTTP provider may try another previously validated pinned address if connection
 setup fails before a response is received; endpoint methods must not rely on a
 single wire-level POST attempt for non-idempotency guarantees.
-For call attempts, the primitive first constructs the capability resource from
-`endpoint_id` and `method_id` and requires call authority before loading the
-endpoint manifest or method schema. A caller without invocation authority gets a
-generic denial and cannot use call errors to enumerate registered endpoint
-metadata. This early visibility gate does not consume a one-shot method grant;
-the exact method is then authorized after the method spec is known, and any
-one-shot use from that decision is consumed only after pre-provider validation
-has passed.
+A caller without invocation authority gets a generic denial and cannot use call
+errors to enumerate registered endpoint metadata. This early visibility gate
+does not consume a one-shot method grant; the exact method is then authorized
+after the method spec is known, and any one-shot use from that decision is
+consumed only after pre-provider validation has passed.
 
 Per-use Human approval is bound to the canonical params hash, the immutable
 SHA-256 digest of the complete registered endpoint spec, and the durable

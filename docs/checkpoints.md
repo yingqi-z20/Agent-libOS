@@ -14,7 +14,7 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 - borrowed MemoryView root references and their types, without treating the
   referenced Object as subtree-owned state,
 - process namespaces and object links,
-- subtree capabilities,
+- subtree capabilities other than `checkpoint:*` control authority,
 - parent/child resource-budget reservations whose two processes are both in
   the captured subtree,
 - process tool tables,
@@ -30,6 +30,13 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 - embedded boot artifacts needed by those image definitions, for both
   `checkpoint_commit` and `image_package` boot kinds,
 - loaded startup Runtime Module ids and source hashes.
+
+Capabilities whose resource starts with `checkpoint:` control access to a
+checkpoint artifact; they are not reconstructable process state. They are
+excluded from the snapshot, and restore and fork also reject them defensively
+when reading an older or externally supplied artifact. Consequently,
+checkpoint creation, restore, and fork cannot duplicate or resurrect
+checkpoint read, execute, or admin authority.
 
 Transient `running` state is normalized to `runnable` at snapshot time. Forking
 from a checkpoint also normalizes transient wait states such as waiting for an
@@ -116,8 +123,9 @@ restore itself still only reports those effects.
 Filesystem mutations, clock operations, shell execution, and PTY spawn reserve
 finite-use authority before entering their provider boundary.
 `ProviderEffectNotStarted` restores that exact reservation only when it
-certifies that the operation's first provider observation did not start and no
-earlier information flow occurred. Clock sleep/asleep begins its intent before
+certifies the current provider phase did not start and every completed earlier
+phase has no mutation or information flow and explicitly does not commit
+authority. Clock sleep/asleep begins its intent before
 the first `monotonic()` measurement; ordinary first-measurement failure and all
 failures after that observation consume the use, and elapsed-time measurement
 marks the effect as information flow. Timeout, cancellation, resource-limit,
@@ -210,6 +218,11 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint restore <checkpoint_id>
 uv run agent-libos --db .agent_libos.sqlite checkpoint fork <checkpoint_id>
 uv run agent-libos --db .agent_libos.sqlite checkpoint replay <checkpoint_id> <event_id>
 ```
+
+A relative `--db` path such as `.agent_libos.sqlite` is resolved from the CLI
+process's current working directory. Use an absolute path when separate CLI
+invocations must select the same database independently of their working
+directory.
 
 Passing `--actor-pid` makes the CLI enforce that process's checkpoint
 capabilities. Omitting it runs as an audited admin CLI actor.
@@ -522,6 +535,14 @@ Loaded startup module summaries are copied into image `required_modules`; the
 committed image fails closed at boot unless those exact module ids and source
 hashes are loaded in the current runtime.
 
+Image registry authority is separate from the image's declared external
+requirements. When child spawn selects an image different from the parent's
+current image, or exec switches the process to a different image, the acting
+process must hold `read` on the exact `image:<image_id>` resource in addition to
+the relevant process lifecycle authority. Reusing the already active image does
+not repeat that read check. A declaration such as `image:*` in
+`required_capabilities` does not replace a required boot-time check.
+
 CLI example:
 
 ```bash
@@ -625,6 +646,21 @@ Checkpoint defaults live in `CheckpointDefaults`:
 - payload capture limit,
 - snapshot hard byte limit,
 - diff preview size.
+
+Checkpoint-to-image construction has an independent `ImageCommitDefaults`
+budget and does not inherit or reuse those checkpoint capture limits. Its
+separate controls are:
+
+- `artifact_hard_limit_bytes`, for the whole committed artifact;
+- `payload_capture_limit_bytes`, for each captured Object payload;
+- `max_required_capabilities`;
+- `max_committed_tools`;
+- `max_committed_jit_sources`;
+- `metadata_preview_chars`.
+
+Exceeding an image-commit limit fails the commit even when creation of the
+source checkpoint succeeded. Conversely, increasing a checkpoint snapshot
+limit does not increase any image-commit limit.
 
 Snapshot version is not a `CheckpointDefaults` setting. The checkpoint snapshot
 codec is the fixed `CHECKPOINT_SNAPSHOT_VERSION`, currently version 4. Version

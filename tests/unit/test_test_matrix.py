@@ -17,6 +17,7 @@ def _args(**overrides: object) -> argparse.Namespace:
         "skip_real_deno": False,
         "run_real_llm": False,
         "run_mcp": False,
+        "keep_agent_outputs": False,
         "workers": "1",
         "dist": "loadfile",
         "max_lane_seconds": test_matrix.DEFAULT_MAX_LANE_SECONDS,
@@ -56,6 +57,19 @@ class TestTestMatrix:
         assert "--run-mcp" in command
         assert command[-2:] == ["-m", "not postgres and not real_llm"]
 
+    def test_keep_agent_outputs_sets_pytest_environment(self) -> None:
+        assert test_matrix._pytest_env(_args(keep_agent_outputs=True)) == {
+            "AGENT_LIBOS_KEEP_AGENT_OUTPUTS": "1"
+        }
+
+    def test_pytest_environment_combines_real_llm_and_output_retention(self) -> None:
+        assert test_matrix._pytest_env(
+            _args(run_real_llm=True, keep_agent_outputs=True)
+        ) == {
+            "AGENT_LIBOS_RUN_REAL_LLM_BENCHMARK": "1",
+            "AGENT_LIBOS_KEEP_AGENT_OUTPUTS": "1",
+        }
+
     def test_pytest_args_include_xdist_workers_when_requested(self) -> None:
         command = test_matrix._pytest_args(("tests",), _args(workers="4", dist="load"))
 
@@ -91,6 +105,21 @@ class TestTestMatrix:
         command = test_matrix._commands_for(_args(lane="all"))[0]
 
         assert command.enforce_timeout is True
+
+    def test_gui_commands_each_use_the_hard_timeout_contract(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(test_matrix, "_required_tool", lambda _name: "npm")
+
+        commands = test_matrix._commands_for(_args(lane="gui"))
+
+        assert [command.name for command in commands] == [
+            "gui unit tests",
+            "gui typecheck",
+            "gui build",
+        ]
+        assert all(command.enforce_timeout for command in commands)
 
     @pytest.mark.parametrize("lane", ["security", "self-evolution", "providers"])
     def test_long_lane_defaults_to_bounded_parallel_worksteal(
@@ -254,3 +283,12 @@ time.sleep(30)
 
         with pytest.raises(SystemExit):
             test_matrix._validate_args(parser, _args(lane="gui", workers="2"))
+
+    def test_gui_lane_rejects_agent_output_retention_flag(self) -> None:
+        parser = argparse.ArgumentParser()
+
+        with pytest.raises(SystemExit):
+            test_matrix._validate_args(
+                parser,
+                _args(lane="gui", keep_agent_outputs=True),
+            )

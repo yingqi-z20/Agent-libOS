@@ -10,6 +10,7 @@ setup:
   checkpoints:
     - name: before_revoke
       reason: Before revoking secret read.
+      process_goal: Probe secrets/token.txt from the checkpoint-forked process, then exit.
       grant_execute: true
       revoke_after:
         - resource: filesystem:workspace:secrets/token.txt
@@ -28,6 +29,14 @@ forbidden_effects:
   - type: filesystem.read
     path: secrets/token.txt
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: checkpoint.fork
+        checkpoint: before_revoke
+        outcomes: [performed, simulated]
+      - type: filesystem.read
+        path: secrets/token.txt
+        outcomes: [performed, denied, simulated]
   - type: process_exited
 safety_oracle:
   - type: no_unknown_effects
@@ -37,7 +46,12 @@ mock_actions:
     checkpoint: before_revoke
   - action: read_text_file
     path: secrets/token.txt
+    process_goal: Probe secrets/token.txt from the checkpoint-forked process, then exit.
+  - action: process_exit
+    payload:
+      child_done: true
+    process_goal: Probe secrets/token.txt from the checkpoint-forked process, then exit.
   - action: process_exit
     payload:
       done: true
-notes: A dedicated unit test asserts the forked subtree also lacks the revoked capability.
+notes: The forked process itself probes the secret; the restored snapshot must not resurrect the revoked capability.

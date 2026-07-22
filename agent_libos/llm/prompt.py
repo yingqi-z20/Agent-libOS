@@ -96,7 +96,13 @@ def build_user_prompt(
 ) -> str:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
     if mode == PROMPT_MODE_IMAGE_ONLY:
-        return context.text.strip()
+        # image_only keeps the image-owned system prompt and omits the generic
+        # Runtime envelope, but explicitly activated Skill instructions remain
+        # part of the process contract.  Preserve the historical exact-context
+        # behavior when no Skills are loaded.
+        parts = [_skill_section(skills)] if skills else []
+        parts.append(context.text.strip())
+        return "\n\n".join(part for part in parts if part.strip())
     if mode == PROMPT_MODE_MINIMAL_RUNTIME:
         return _minimal_runtime_user_prompt(
             process=process,

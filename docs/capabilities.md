@@ -301,13 +301,23 @@ model requests cannot ask for broad high-risk authority such as
 `capability:*` with privileged rights (`admin`, `grant`, `revoke`, `write`,
 `execute`, or `delete`), `shell:*` execute, or root/global filesystem write such
 as `filesystem:/:*` or `filesystem:*`. Workspace-level write
-(`filesystem:workspace:*`) can be approved by the human. Admin CLI and
-bootstrap paths can still issue broader policy explicitly, with audit.
+(`filesystem:workspace:*`) can be approved by the human, but workspace-wide
+delete cannot: model requests for delete must name a concrete file or directory
+subtree. Model requests for Shell execute are rejected for every non-Git command
+class; `shell:git` is the only model-requestable class and is constrained to six
+exact read-only argv forms (`status`, `status --short`, `branch --show-current`,
+`rev-parse --show-toplevel`, `diff`, and `diff --stat`). Other Shell authority
+cannot be obtained through model-facing `request_permission`; it must come from
+an exact per-use Shell approval or an audited Host/admin-issued capability or
+shell policy. Admin CLI and bootstrap paths can still issue broader policy
+explicitly, with audit.
 
-When `ask_each_time` applies, the primitive creates a human approval request and
-waits inside the operation. The caller eventually receives either the final
-payload or a final denial error; there is no exposed pending/retry syscall
-protocol.
+When `ask_each_time` applies, the primitive creates a durable Human approval
+request. A model-facing Tool or JIT syscall invocation eventually receives the
+final payload or a final denial error; those surfaces expose no pending/retry
+protocol. A direct Python Host manager or primitive call may instead raise
+`HumanApprovalRequired` or `HumanResponseRequired` with the `request_id` so the
+Host can inspect or service that durable wait.
 
 Approval context includes path, resource, caller-declared overwrite policy,
 byte count, SHA-256, argv, risk, rule id, sandbox profile, and escaped previews
@@ -492,9 +502,13 @@ classification, audit, and external-effect recording. MCP Resources and
 Prompts are not exposed in v1.
 
 For `stdio` MCP transports, actor-mode server registration, live tool refresh,
-and tool calls additionally require `process:spawn` `write`, because those
-operations can start a local child process. Host/admin paths that explicitly
-bypass actor capability checks remain audited host operations.
+and tool calls additionally require both `process:spawn` `write` and `execute`
+on the exact `mcp_stdio:<sha256>` launch resource. The hash covers the canonical
+command, argv, environment mapping, and cwd, so a grant for one launch surface
+cannot authorize another. Registration authorizes persisting that surface;
+refresh and calls are the operations that actually start a local child process.
+Host/admin paths that explicitly bypass actor capability checks remain audited
+host operations.
 
 For both JSON-RPC and MCP, one-time Human approval is bound to the immutable
 registry specification SHA-256 and a monotonic registry generation, as well as
@@ -609,13 +623,23 @@ and refuses a resolution inside the workspace or selected process cwd. Shell
 subprocesses receive a constrained environment with `HOME` and `USERPROFILE`
 pointing at the workspace root instead of the host user's real home.
 
+When the local provider has a workspace root, Shell also enforces that the cwd
+and every path-like argv token remain inside it before policy or approval is
+evaluated. This includes positional paths, `--option=path`, attached short-option
+operands, `~`, and POSIX or foreign absolute-path syntax. URL-like arguments are
+not treated as paths except that `file:` URLs are always rejected. An
+`always_allow` policy does not bypass this containment check.
+
 An authorized Shell subprocess still runs as the host user. Argv policy, safe
 PATH resolution, the constrained environment, and resource monitoring are not
 an operating-system filesystem or network sandbox. Filesystem and JSON-RPC
 Capabilities govern their corresponding runtime primitives; they cannot mediate
 direct file or network I/O performed by an authorized child executable. Use the
-Deno JIT boundary when code requires an OS-backed syscall allowlist. On Windows,
-the local Shell provider rejects budgeted execution that supplies
+Deno JIT boundary for code that can operate through Deno's no-permission,
+cached-only process plus the libOS syscall protocol. This is not an OS syscall
+filter, seccomp profile, container, or VM; hostile native-code isolation still
+requires an explicit container, WASM, VM, or service-provider boundary. On
+Windows, the local Shell provider rejects budgeted execution that supplies
 `SubprocessLimits` because it cannot enforce that profile; unbudgeted Shell
 execution may still run, while Deno uses its separate Windows supervision and
 budget backend.
@@ -730,7 +754,8 @@ Block-list checks also scan nested executable-looking argv tokens such as
 ## Git Authority
 
 Typed Git authority is separate from Shell authority. The repository resource
-is `git:workspace` with `read`, `diff`, `write`, `delete`, and `admin` rights.
+is configured by `git.repository_resource` (default `git:workspace`) with
+`read`, `diff`, `write`, `delete`, and `admin` rights.
 Existing remotes use `git_remote:workspace:<remote>`: `read` permits fetch/pull
 input, `write` permits push, and `delete`/`admin` cover remote ref deletion and
 force-with-lease. Simulated pull requests use
@@ -751,10 +776,11 @@ safe preflight cannot enumerate every path. A Git write grant therefore cannot
 rewrite files without matching filesystem rights, while filesystem authority
 cannot directly access `.git` metadata.
 
-Reset, clean, amend, destructive restore/integration, branch/tag/stash/worktree
-deletion, fetch prune, remote-ref deletion, force-with-lease, simulated-PR
-merge, and patch deletion require the applicable `delete` and `admin` rights
-and a one-use Human approval bound to exact canonical arguments, state token,
+Reset, clean, amend, every restore, ref-rewriting integration, forced branch
+creation, branch/tag/stash/worktree deletion, fetch prune, remote-ref deletion,
+force-with-lease, simulated-PR merge, and patch deletion require the applicable
+`delete` and `admin` rights and a one-use Human approval bound to exact
+canonical arguments, state token,
 and old OIDs. A broad allowed capability without that approval binding cannot
 satisfy a mandatory approval. Ordinary commit, merge, fast-forward pull, and
 non-forced push follow the capability record's normal `allow`/`ask`/`deny`

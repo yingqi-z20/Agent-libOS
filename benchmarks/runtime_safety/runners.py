@@ -6,12 +6,14 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
 from agent_libos import Runtime
-from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.models import (
@@ -30,7 +32,11 @@ from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.substrate.local import LocalShellProvider
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SyscallHandler
 from agent_libos.models import ValidationResult
-from agent_libos.utils.serde import to_jsonable
+from agent_libos.utils.serde import loads, to_jsonable
+from benchmarks.runtime_safety.ablations import (
+    install_agent_libos_ablation,
+    sandbox_only_denial_reason,
+)
 from benchmarks.runtime_safety.fixtures import prepare_workspace, safe_workspace_path
 from benchmarks.runtime_safety.models import (
     BenchmarkResult,
@@ -39,7 +45,11 @@ from benchmarks.runtime_safety.models import (
     EffectRecord,
     TaskRun,
 )
-from benchmarks.runtime_safety.oracle import classify_effects, safety_summary
+from benchmarks.runtime_safety.oracle import (
+    classify_effects,
+    safety_summary,
+    spec_matches_effect,
+)
 
 RUNNER_NAMES = (
     "direct_tool_wrapper",
@@ -52,18 +62,39 @@ RUNNER_NAMES = (
     "no_fork_attenuation",
 )
 RUNNER_INTERVENTIONS = {
-    "direct_tool_wrapper": "Direct wrapper baseline without Agent libOS primitive enforcement.",
-    "confirmation_wrapper": "Wrapper baseline that asks for confirmation before configured risky actions.",
-    "sandbox_only": "Sandbox baseline without Agent libOS capability and audit enforcement.",
+    "direct_tool_wrapper": (
+        "Workspace-contained deterministic wrapper: filesystem and in-memory Object actions are "
+        "performed; shell and unsupported Runtime/provider actions are simulated; Agent libOS "
+        "capability and audit enforcement is absent."
+    ),
+    "confirmation_wrapper": (
+        "Direct-wrapper variant that asks before each modeled side effect other than filesystem "
+        "and Object reads, using the task's configured default decision."
+    ),
+    "sandbox_only": (
+        "Static tool-category sandbox exposing only fixture-contained filesystem and in-memory "
+        "Object actions; shell, provider, process-control, Skill, JIT, image, checkpoint, remote, "
+        "and unknown actions are denied without Agent libOS capability or audit enforcement."
+    ),
     "agent_libos_full": "Full Agent libOS runtime boundary and evidence pipeline.",
-    "no_primitive_approval": "Agent libOS runtime with primitive approval disabled for the benchmark policy.",
+    "no_primitive_approval": (
+        "Agent libOS runtime where matching final ASK capability decisions, rule-driven shell ASK "
+        "steps, and mandatory Git approval bindings are bypassed; missing authority, explicit DENY, "
+        "capability constraints, and data-flow checks remain active."
+    ),
     "no_audit_linkage": (
         "Audit-linkage observer ablation: the runtime still emits audit rows, but benchmark effect "
         "normalization and Explain-summary reporting receive no audit linkage; persisted external-effect "
         "rows and explicit runtime-result denials remain available."
     ),
-    "no_namespace_isolation": "Agent libOS runtime with benchmark Object Memory namespace isolation removed.",
-    "no_fork_attenuation": "Agent libOS runtime with benchmark child-authority attenuation removed.",
+    "no_namespace_isolation": (
+        "Agent libOS runtime where the target receives read/materialize authority for every "
+        "benchmark setup-seeded Object and its namespace."
+    ),
+    "no_fork_attenuation": (
+        "Agent libOS runtime where each benchmark child receives an unattenuated copy of every "
+        "active parent capability instead of authority derived from the requested child specs."
+    ),
 }
 AGENT_LIBOS_RUNNERS = {
     "agent_libos_full",
@@ -73,22 +104,76 @@ AGENT_LIBOS_RUNNERS = {
     "no_fork_attenuation",
 }
 _TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
-_BENCHMARK_ACTION_KEYS = {"benchmark_effects", "checkpoint_ref", "tool_args"}
+_BENCHMARK_ACTION_KEYS = {
+    "benchmark_effects",
+    "checkpoint_ref",
+    "process_goal",
+    "tool_args",
+}
 
 
 class PlannedActionClient:
     def __init__(self, actions: list[dict[str, Any]]):
         self.actions = [dict(action) for action in actions]
+        self.scoped_actions: dict[str, list[dict[str, Any]]] = {}
         self.calls = 0
+        self._lock = threading.Lock()
+        self.before_action: Any | None = None
+
+    def configure_actions(
+        self,
+        actions: list[tuple[str | None, dict[str, Any]]],
+    ) -> None:
+        """Install deterministic root and child-goal action queues.
+
+        The runtime scheduler advances parent and child processes concurrently.
+        A single shared FIFO therefore cannot deterministically direct an
+        action at the child that owns the corresponding goal.  Benchmark tasks
+        may scope an action with ``process_goal``; the client recognizes the
+        exact persisted goal text in that process's context and consumes only
+        that queue.
+        """
+
+        root_actions: list[dict[str, Any]] = []
+        scoped_actions: dict[str, list[dict[str, Any]]] = {}
+        for process_goal, action in actions:
+            if process_goal is None:
+                root_actions.append(dict(action))
+            else:
+                scoped_actions.setdefault(process_goal, []).append(dict(action))
+        with self._lock:
+            self.actions = root_actions
+            self.scoped_actions = scoped_actions
 
     def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
-        self.calls += 1
-        action = self.actions.pop(0) if self.actions else {"action": "process_exit", "payload": {"done": True}}
+        del tools
+        serialized_messages = "\n".join(
+            str(message.get("content") or "")
+            for message in messages
+            if isinstance(message, dict)
+        )
+        with self._lock:
+            queue = self.actions
+            for process_goal, candidate in self.scoped_actions.items():
+                marker = f'"text": {json.dumps(process_goal, ensure_ascii=False)}'
+                if marker in serialized_messages:
+                    queue = candidate
+                    break
+            self.calls += 1
+            call_number = self.calls
+            action = (
+                queue.pop(0)
+                if queue
+                else {"action": "process_exit", "payload": {"done": True}}
+            )
+            before_action = self.before_action
+        if callable(before_action):
+            before_action(action)
         name = str(action["action"])
         args = {key: value for key, value in action.items() if key != "action"}
         return LLMCompletion(
             content="planned benchmark action",
-            tool_calls=[{"id": f"bench_{self.calls}", "name": name, "arguments": json.dumps(args)}],
+            tool_calls=[{"id": f"bench_{call_number}", "name": name, "arguments": json.dumps(args)}],
             api="mock",
             model="planned-action-client",
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -215,6 +300,7 @@ def _run_wrapper_task(
         "errors": [],
         "approvals": 0,
         "memory": _setup_wrapper_memory(task),
+        "sandbox_denials": [],
     }
     effects: list[EffectRecord] = []
     for action in task.mock_actions:
@@ -222,12 +308,42 @@ def _run_wrapper_task(
             state["exited"] = True
             state["process_status"] = ProcessStatus.EXITED.value
             continue
+        sandbox_denial = (
+            sandbox_only_denial_reason(action)
+            if runner == "sandbox_only"
+            else None
+        )
         action_effects = _effects_from_action(task, runner, action)
         if not action_effects:
+            if sandbox_denial is not None:
+                state["sandbox_denials"].append(
+                    {
+                        "action": str(action.get("action") or ""),
+                        "reason": sandbox_denial,
+                    }
+                )
             continue
         for effect in action_effects:
+            if sandbox_denial is not None:
+                effect.performed = False
+                effect.denied = True
+                effect.error = sandbox_denial
+                effects.append(effect)
+                continue
             if runner == "confirmation_wrapper" and _is_side_effect(effect):
                 state["approvals"] += 1
+                effects.append(
+                    EffectRecord(
+                        task_id=task.id,
+                        runner=runner,
+                        type="human.request",
+                        performed=True,
+                        operation="approval",
+                        metadata={
+                            "confirmation_for_effect_type": effect.type,
+                        },
+                    )
+                )
                 approved = str(task.policy.get("confirmation_default_decision", "approve")).lower() != "deny"
                 if not approved:
                     effect.performed = False
@@ -244,10 +360,21 @@ def _run_wrapper_task(
                 state["errors"].append(str(exc))
             effects.append(effect)
     _finalize_wrapper_effects(task, runner, effects)
-    classify_effects(task, effects)
+    classification_task = (
+        replace(
+            task,
+            allowed_effects=[
+                *task.allowed_effects,
+                {"type": "human.request", "request_kind": "approval"},
+            ],
+        )
+        if runner == "confirmation_wrapper"
+        else task
+    )
+    classify_effects(classification_task, effects)
     invalid_reasons = _effect_invalid_reasons(effects)
-    safety = safety_summary(task, effects)
-    success = _evaluate_success(task, workspace, state)
+    safety = safety_summary(classification_task, effects)
+    success = _evaluate_success(task, workspace, state, effects)
     wall_time = time.perf_counter() - started
     result = BenchmarkResult(
         task_id=task.id,
@@ -270,9 +397,11 @@ def _run_wrapper_task(
         errors=list(state["errors"]),
         workspace=str(workspace),
         metadata={
-            "simulated_shell": True,
+            "simulated_shell": runner != "sandbox_only",
             "fixture_workspace": str(workspace),
             "self_evolution_counts": _self_evolution_counts(effects),
+            "runner_intervention": RUNNER_INTERVENTIONS[runner],
+            "sandbox_denied_actions": list(state["sandbox_denials"]),
         },
     )
     return TaskRun(result=result, effects=effects)
@@ -308,6 +437,7 @@ def _run_agent_libos_task(
             llm_client=client,
             substrate=substrate,
         )
+        install_agent_libos_ablation(runtime, runner)
         if llm_mode == "mock":
             runtime.tools.sandbox = BenchmarkDenoSandbox()
         pid = runtime.process.spawn(image="review-agent:v0", goal=task.goal)
@@ -320,9 +450,24 @@ def _run_agent_libos_task(
             pid,
             setup_objects,
         )
+        git_patch_artifact_witnesses: dict[str, dict[str, Any]] = {}
         if isinstance(client, PlannedActionClient):
-            client.actions = [_dispatch_action(action, setup_state) for action in task.mock_actions]
-            for action in client.actions:
+            client.before_action = lambda _action: _capture_live_git_patch_artifacts(
+                runtime,
+                setup_objects,
+                git_patch_artifact_witnesses,
+            )
+            planned_actions = [
+                (
+                    str(action["process_goal"])
+                    if action.get("process_goal") is not None
+                    else None,
+                    _dispatch_action(action, setup_state),
+                )
+                for action in task.mock_actions
+            ]
+            client.configure_actions(planned_actions)
+            for _process_goal, action in planned_actions:
                 group = runtime.tools.tool_group_for(str(action.get("action") or ""))
                 if group is not None:
                     runtime.tools.activate_tool_group(pid, group)
@@ -332,6 +477,9 @@ def _run_agent_libos_task(
         }
         baseline_operation_ids = {
             operation.operation_id for operation in runtime.store.list_operations()
+        }
+        baseline_llm_call_ids = {
+            call.call_id for call in _all_llm_calls(runtime)
         }
         selected_quanta = max_quanta if max_quanta is not None else max(len(task.mock_actions) + 4, 4)
         results = runtime.run_until_idle(
@@ -350,6 +498,14 @@ def _run_agent_libos_task(
             for effect in runtime.store.list_external_effects()
             if effect.effect_id not in baseline_external_effect_ids
         ]
+        llm_calls = [
+            call
+            for call in _all_llm_calls(runtime)
+            if call.call_id not in baseline_llm_call_ids
+        ]
+        action_pids = {
+            str(call.pid) for call in llm_calls if call.pid is not None
+        }
         normalization_audit = [] if runner == "no_audit_linkage" else action_audit
         effects = _effects_from_runtime_results(
             task,
@@ -358,11 +514,18 @@ def _run_agent_libos_task(
             external_effects=external_effects,
             audit_records=normalization_audit,
             pid=pid,
+            pids=action_pids,
+            checkpoint_aliases=setup_state.get("checkpoints", {}),
+        )
+        _enrich_git_patch_artifact_lineage(
+            runtime,
+            effects,
+            setup_objects,
+            git_patch_artifact_witnesses,
         )
         classify_effects(task, effects)
         invalid_reasons = _effect_invalid_reasons(effects)
         safety = safety_summary(task, effects)
-        llm_calls = runtime.store.list_llm_calls(pid=pid)
         tokens = sum(int(call.usage.get("total_tokens") or 0) for call in llm_calls)
         primitive_calls = len([record for record in audit if record.action.startswith("primitive.")])
         approvals = len([record for record in audit if record.action in {"human.query", "human.approve", "human.reject"}])
@@ -373,7 +536,7 @@ def _run_agent_libos_task(
             "process_status": process.status.value,
             "errors": errors,
         }
-        success = _evaluate_success(task, workspace, state)
+        success = _evaluate_success(task, workspace, state, effects)
         wall_time = time.perf_counter() - started
         result = BenchmarkResult(
             task_id=task.id,
@@ -492,6 +655,166 @@ def _safe_audit_record_count(runtime: Runtime | None) -> int:
         return len(runtime.audit.trace())
     except Exception:
         return 0
+
+
+def _all_llm_calls(runtime: Runtime) -> list[Any]:
+    """Return the complete bounded LLM-call view or fail on possible truncation.
+
+    Checkpoint forks intentionally create a new root whose ``parent_pid`` is
+    null, so process-tree traversal cannot account for it.  Agent runner code
+    snapshots call IDs immediately before scheduling and subtracts that
+    baseline from this store-wide view, covering ordinary children and forked
+    roots without including setup-time calls.
+    """
+
+    hard_limit = runtime.config.llm.call_record_hard_limit
+    calls = runtime.store.list_llm_calls(limit=hard_limit)
+    if len(calls) >= hard_limit:
+        raise BenchmarkValidationError(
+            "benchmark LLM accounting reached the store hard limit "
+            f"({hard_limit}); refusing a possibly truncated result"
+        )
+    return sorted(calls, key=lambda call: (call.created_at, call.call_id))
+
+
+def _capture_live_git_patch_artifacts(
+    runtime: Runtime,
+    setup_objects: list[dict[str, Any]],
+    captured: dict[str, dict[str, Any]],
+) -> None:
+    """Capture real CODE_PATCH metadata before process-exit payload release."""
+
+    for artifact in runtime.store.list_objects():
+        if artifact.type.value != "code_patch" or artifact.oid in captured:
+            continue
+        captured[artifact.oid] = _live_git_patch_witness(
+            runtime,
+            artifact,
+            setup_objects,
+        )
+
+
+def _live_git_patch_witness(
+    runtime: Runtime,
+    artifact: Any,
+    setup_objects: list[dict[str, Any]],
+) -> dict[str, Any]:
+    parent_oids = [str(oid) for oid in artifact.provenance.parent_oids]
+    return {
+        "oid": artifact.oid,
+        "type": artifact.type.value,
+        "immutable": artifact.immutable,
+        "lifecycle_state_at_capture": artifact.lifecycle_state.value,
+        "patch_sha256": (
+            str(artifact.payload.get("patch_sha256"))
+            if isinstance(artifact.payload, dict)
+            and artifact.payload.get("patch_sha256") is not None
+            else None
+        ),
+        "sensitivity": artifact.metadata.sensitivity,
+        "artifact_origin": artifact.metadata.origin,
+        "parent_oids": parent_oids,
+        "benchmark_parents": _persisted_setup_parent_witnesses(
+            runtime,
+            parent_oids,
+            setup_objects,
+        ),
+    }
+
+
+def _enrich_git_patch_artifact_lineage(
+    runtime: Runtime,
+    effects: list[EffectRecord],
+    setup_objects: list[dict[str, Any]],
+    captured: dict[str, dict[str, Any]],
+) -> None:
+    """Attach a serialized witness for the CODE_PATCH object's labels."""
+
+    _capture_live_git_patch_artifacts(runtime, setup_objects, captured)
+    for effect in effects:
+        patch_result = effect.metadata.get("git_patch_result")
+        if not isinstance(patch_result, dict):
+            continue
+        artifact_oid = patch_result.get("oid")
+        if not isinstance(artifact_oid, str) or not artifact_oid:
+            continue
+        witness = captured.get(artifact_oid)
+        if witness is None:
+            # Real-LLM runs do not use the planned client's pre-action hook.
+            # Released rows retain authentic labels and provenance, while the
+            # trusted runtime result supplies the payload digest.
+            witness = _released_git_patch_witness(
+                runtime,
+                artifact_oid,
+                setup_objects,
+                patch_sha256=patch_result.get("patch_sha256"),
+            )
+        if witness is not None:
+            effect.metadata["git_patch_artifact"] = witness
+
+
+def _released_git_patch_witness(
+    runtime: Runtime,
+    artifact_oid: str,
+    setup_objects: list[dict[str, Any]],
+    *,
+    patch_sha256: Any,
+) -> dict[str, Any] | None:
+    rows = runtime.store._query(  # noqa: SLF001 - benchmark evidence read
+        "SELECT oid, type, immutable, lifecycle_state, metadata_json, "
+        "provenance_json FROM objects WHERE oid = ?",
+        (artifact_oid,),
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    metadata = loads(row["metadata_json"], {})
+    provenance = loads(row["provenance_json"], {})
+    parent_oids = [str(oid) for oid in provenance.get("parent_oids", [])]
+    return {
+        "oid": str(row["oid"]),
+        "type": str(row["type"]),
+        "immutable": bool(row["immutable"]),
+        "lifecycle_state_at_capture": str(row["lifecycle_state"]),
+        "patch_sha256": patch_sha256,
+        "sensitivity": metadata.get("sensitivity"),
+        "artifact_origin": metadata.get("origin"),
+        "parent_oids": parent_oids,
+        "benchmark_parents": _persisted_setup_parent_witnesses(
+            runtime,
+            parent_oids,
+            setup_objects,
+        ),
+    }
+
+
+def _persisted_setup_parent_witnesses(
+    runtime: Runtime,
+    parent_oids: list[str],
+    setup_objects: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read exact setup-parent labels from durable live-or-released rows."""
+
+    setup_names_by_oid = {
+        str(item["oid"]): str(item["name"])
+        for item in setup_objects
+        if item.get("oid") is not None and item.get("name") is not None
+    }
+    witnesses: list[dict[str, Any]] = []
+    for parent_oid in parent_oids:
+        name = setup_names_by_oid.get(parent_oid)
+        if name is None:
+            continue
+        metadata = runtime.uow.objects.get_persisted_object_metadata(parent_oid)
+        witnesses.append(
+            {
+                "oid": parent_oid,
+                "name": name,
+                "sensitivity": metadata.sensitivity if metadata is not None else None,
+                "origin": metadata.origin if metadata is not None else None,
+            }
+        )
+    return witnesses
 
 
 def _setup_wrapper_memory(task: BenchmarkTask) -> dict[tuple[str, str], Any]:
@@ -670,14 +993,6 @@ def _grant_task_capabilities(
                 [str(right) for right in rights],
                 issued_by=f"benchmark:{task.id}",
             )
-    if runner == "no_primitive_approval":
-        runtime.capability.grant(pid, runtime.filesystem.workspace_resource(), ["read", "write", "delete"], issued_by="benchmark:ablation")
-        runtime.shell.grant_policy(pid, "always_allow", issued_by="benchmark:ablation")
-        for item in setup_objects:
-            runtime.capability.grant(pid, f"object_namespace:{item['namespace']}", ["read"], issued_by="benchmark:ablation")
-            runtime.capability.grant(pid, f"object:{item['oid']}", ["read", "materialize"], issued_by="benchmark:ablation")
-    if runner == "no_fork_attenuation":
-        runtime.capability.grant(pid, runtime.filesystem.workspace_resource(), ["read", "write"], issued_by="benchmark:ablation")
 
 
 def _setup_runtime_benchmark_resources(
@@ -755,11 +1070,18 @@ def _setup_runtime_benchmark_resources(
     if extra_tools:
         _add_process_tools(runtime, pid, [str(tool) for tool in extra_tools])
     git_setup = setup.get("git") if isinstance(setup.get("git"), dict) else {}
-    objects_by_name = {
-        str(item.get("name")): str(item.get("oid"))
-        for item in (setup_objects or [])
-        if item.get("name") and item.get("oid")
-    }
+    objects_by_name: dict[str, str] = {}
+    for setup_object in setup_objects or []:
+        name = setup_object.get("name")
+        oid = setup_object.get("oid")
+        if not name or not oid:
+            continue
+        selected_name = str(name)
+        if selected_name in objects_by_name:
+            raise BenchmarkValidationError(
+                f"{task.id}: setup memory object name {selected_name!r} is ambiguous"
+            )
+        objects_by_name[selected_name] = str(oid)
     for index, item in enumerate(git_setup.get("file_labels", []) or []):
         if not isinstance(item, dict):
             raise BenchmarkValidationError(
@@ -790,7 +1112,55 @@ def _setup_runtime_benchmark_resources(
         if not isinstance(item, dict):
             continue
         name = str(item["name"])
-        checkpoint_id = runtime.checkpoint.create(pid, str(item.get("reason") or name), actor=pid)
+        checkpoint_goal = item.get("process_goal")
+        original_goal_oid: str | None = None
+        original_memory_view: Any = None
+        if checkpoint_goal is not None:
+            if not isinstance(checkpoint_goal, str) or not checkpoint_goal.strip():
+                raise BenchmarkValidationError(
+                    f"{task.id}: setup.checkpoints[{name!r}].process_goal "
+                    "must be a non-empty string"
+                )
+            # A checkpoint-forked process inherits the checkpoint's model tool
+            # projection, not tool groups activated later on the parent.  Make
+            # every goal-scoped planned action visible before taking the
+            # snapshot so the fork can actually attempt its directed probe.
+            for action in task.mock_actions:
+                if action.get("process_goal") != checkpoint_goal:
+                    continue
+                group = runtime.tools.tool_group_for(
+                    str(action.get("action") or "")
+                )
+                if group is not None:
+                    runtime.tools.activate_tool_group(pid, group)
+            original_process = runtime.process.get(pid)
+            original_goal_oid = original_process.goal_oid
+            original_memory_view = deepcopy(original_process.memory_view)
+            runtime.process.apply_exec_state(
+                pid,
+                original_process.image_id,
+                goal=checkpoint_goal,
+                preserve_memory=True,
+                preserve_capabilities=True,
+                _record_evidence=False,
+            )
+        try:
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                str(item.get("reason") or name),
+                actor=pid,
+            )
+        finally:
+            if checkpoint_goal is not None:
+                current_process = runtime.process.get(pid)
+                runtime.store.patch_process(
+                    pid,
+                    {
+                        "goal_oid": original_goal_oid,
+                        "memory_view": original_memory_view,
+                    },
+                    expected_revision=current_process.revision,
+                )
         state["checkpoints"][name] = checkpoint_id
         if bool(item.get("grant_execute", False)):
             runtime.capability.grant(pid, f"checkpoint:{checkpoint_id}", [CapabilityRight.EXECUTE], issued_by=f"benchmark:{task.id}")
@@ -824,14 +1194,28 @@ def _dispatch_action(action: dict[str, Any], setup_state: dict[str, Any]) -> dic
     if tool_args is not None:
         if not isinstance(tool_args, dict):
             raise BenchmarkValidationError("benchmark tool_args must be a mapping")
+        if "action" in tool_args:
+            raise BenchmarkValidationError(
+                "benchmark tool_args.action is reserved for the top-level tool name; "
+                "use the tool's current operation argument instead"
+            )
         selected.update(tool_args)
+    # The benchmark action is the runtime tool name.  Keep it authoritative
+    # even if future benchmark-only argument expansion grows new keys.
+    selected["action"] = action["action"]
     selected = _replace_action_placeholders(selected, setup_state)
     checkpoint_ref = action.get("checkpoint_ref")
     if checkpoint_ref is not None:
         checkpoints = setup_state.get("checkpoints", {})
         if checkpoint_ref not in checkpoints:
             raise ValueError(f"unknown benchmark checkpoint_ref: {checkpoint_ref}")
-        selected["checkpoint_id"] = checkpoints[checkpoint_ref]
+        checkpoint_id = str(checkpoints[checkpoint_ref])
+        selected["checkpoint_id"] = checkpoint_id
+        # Some benchmark actions retain a human-readable ``checkpoint`` label
+        # for their oracle.  Do not send that setup alias into normalization as
+        # though it were the durable checkpoint identity recorded by Audit.
+        if selected.get("checkpoint") == checkpoint_ref:
+            selected["checkpoint"] = checkpoint_id
     return selected
 
 
@@ -943,6 +1327,8 @@ def _effects_from_runtime_results(
     external_effects: list[ExternalEffectRecord] | None = None,
     audit_records: list[AuditRecord] | None = None,
     pid: str | None = None,
+    pids: set[str] | None = None,
+    checkpoint_aliases: dict[str, str] | None = None,
 ) -> list[EffectRecord]:
     """Normalize attempts using persisted evidence, never ``result.ok`` alone.
 
@@ -969,17 +1355,33 @@ def _effects_from_runtime_results(
         action = item.get("action")
         if not isinstance(action, dict):
             continue
-        source_action = _matching_source_action(task.mock_actions, action, used_source_indices)
+        source_action = _matching_source_action(
+            task.mock_actions,
+            action,
+            used_source_indices,
+        )
         action_effects: list[EffectRecord] = []
         inferred = _effect_from_action(task, runner, action)
         if inferred is not None:
             if source_action is not None:
-                _apply_source_effect_labels(inferred, source_action)
+                _apply_source_effect_labels(
+                    inferred,
+                    source_action,
+                    action,
+                    checkpoint_aliases=checkpoint_aliases,
+                )
             action_effects.append(inferred)
         if source_action is not None:
             for spec in source_action.get("benchmark_effects", []) or []:
                 if isinstance(spec, dict):
-                    action_effects.append(_effect_from_spec(task, runner, spec))
+                    specified = _effect_from_spec(task, runner, spec)
+                    _apply_source_effect_labels(
+                        specified,
+                        source_action,
+                        action,
+                        checkpoint_aliases=checkpoint_aliases,
+                    )
+                    action_effects.append(specified)
         if not action_effects:
             continue
 
@@ -987,6 +1389,17 @@ def _effects_from_runtime_results(
         error = str(result.get("error") or "")
         denied = not bool(result.get("ok")) and _runtime_result_is_denial(result, error)
         for expected in action_effects:
+            _apply_runtime_result_identity(expected, result)
+            runtime_evidence = _runtime_result_benchmark_evidence(expected, result)
+            if runtime_evidence:
+                expected.metadata.update(runtime_evidence)
+            _apply_runtime_audit_checkpoint_identity(
+                expected,
+                audit,
+                used_audit,
+                pid=pid,
+                pids=pids,
+            )
             persisted_index = _matching_persisted_effect(expected, persisted, used_persisted)
             if persisted_index is not None:
                 actual = persisted[persisted_index]
@@ -994,10 +1407,18 @@ def _effects_from_runtime_results(
                 if error:
                     actual.error = error
                     actual.metadata["runtime_result_error"] = error
+                if runtime_evidence:
+                    actual.metadata.update(runtime_evidence)
                 effects.append(actual)
                 continue
 
-            audit_index = _matching_audit_record(expected, audit, used_audit, pid=pid)
+            audit_index = _matching_audit_record(
+                expected,
+                audit,
+                used_audit,
+                pid=pid,
+                pids=pids,
+            )
             if audit_index is not None:
                 record = audit[audit_index]
                 used_audit.add(audit_index)
@@ -1162,13 +1583,18 @@ def _effect_identity_matches(expected: EffectRecord, actual: EffectRecord) -> bo
         "skill_id",
         "tool",
         "image",
+        "checkpoint",
         "resource",
         "operation",
         "endpoint",
         "method",
         "provider",
     ):
-        selected = getattr(expected, field)
+        selected = (
+            _audit_checkpoint_identity(expected)
+            if field == "checkpoint"
+            else getattr(expected, field)
+        )
         if selected is not None and selected != getattr(actual, field):
             return False
     return True
@@ -1180,6 +1606,7 @@ def _matching_audit_record(
     used: set[int],
     *,
     pid: str | None,
+    pids: set[str] | None = None,
 ) -> int | None:
     actions = _AUDIT_ACTIONS_BY_EFFECT.get(expected.type)
     if not actions:
@@ -1190,13 +1617,21 @@ def _matching_audit_record(
         )
         if (index in used and not reusable_skill_activation) or record.action not in actions:
             continue
+        allowed_pids = pids if pids is not None else ({pid} if pid is not None else set())
         if (
-            pid is not None
-            and record.actor != pid
+            allowed_pids
+            and record.actor not in allowed_pids
             and not (expected.type == "jit.register" and record.actor.startswith("skill:"))
         ):
             continue
         decision = record.decision if isinstance(record.decision, dict) else {}
+        if not _audit_effect_identity_matches(
+            expected,
+            record,
+            decision,
+            pid=record.actor,
+        ):
+            continue
         if expected.type.startswith("object."):
             audited_namespace = decision.get("namespace")
             namespace_matches = (
@@ -1204,8 +1639,7 @@ def _matching_audit_record(
                 or str(audited_namespace) == expected.namespace
                 or (
                     expected.namespace == "process"
-                    and pid is not None
-                    and str(audited_namespace) == f"process:{pid}"
+                    and str(audited_namespace) == f"process:{record.actor}"
                 )
             )
             if not namespace_matches:
@@ -1238,6 +1672,65 @@ def _matching_audit_record(
     return None
 
 
+def _audit_effect_identity_matches(
+    expected: EffectRecord,
+    record: AuditRecord,
+    decision: dict[str, Any],
+    *,
+    pid: str | None,
+) -> bool:
+    if expected.type == "image.register":
+        return _audit_target_matches(record.target, "image", expected.image)
+    if expected.type == "image.commit":
+        return (
+            _audit_target_matches(record.target, "image", expected.image)
+            and _audit_decision_matches(
+                decision,
+                "checkpoint_id",
+                _audit_checkpoint_identity(expected),
+            )
+        )
+    if expected.type == "checkpoint.create":
+        if not _audit_target_matches(
+            record.target,
+            "checkpoint",
+            _audit_checkpoint_identity(expected),
+        ):
+            return False
+        target_pid = expected.metadata.get("checkpoint_pid") or pid
+        return target_pid is None or str(decision.get("pid")) == str(target_pid)
+    if expected.type == "checkpoint.fork":
+        return _audit_target_matches(
+            record.target,
+            "checkpoint",
+            _audit_checkpoint_identity(expected),
+        )
+    return True
+
+
+def _audit_target_matches(
+    target: str | None,
+    resource_kind: str,
+    identity: str | None,
+) -> bool:
+    return bool(identity) and target == f"{resource_kind}:{identity}"
+
+
+def _audit_decision_matches(
+    decision: dict[str, Any],
+    field: str,
+    identity: str | None,
+) -> bool:
+    return bool(identity) and str(decision.get(field)) == identity
+
+
+def _audit_checkpoint_identity(effect: EffectRecord) -> str | None:
+    resolved = effect.metadata.get("audit_checkpoint_id")
+    if isinstance(resolved, str) and resolved:
+        return resolved
+    return effect.checkpoint
+
+
 def _generated_effect_id(task_id: str, runner: str, index: int) -> str:
     return f"{runner}:{task_id}:effect:{index}"
 
@@ -1258,9 +1751,25 @@ def _matching_source_action(
     return None
 
 
-def _apply_source_effect_labels(effect: EffectRecord, source_action: dict[str, Any]) -> None:
-    if effect.type == "checkpoint.fork" and source_action.get("checkpoint") is not None:
-        effect.checkpoint = str(source_action["checkpoint"])
+def _apply_source_effect_labels(
+    effect: EffectRecord,
+    source_action: dict[str, Any],
+    dispatched_action: dict[str, Any],
+    *,
+    checkpoint_aliases: dict[str, str] | None,
+) -> None:
+    dispatched_checkpoint_id = dispatched_action.get("checkpoint_id")
+    if effect.type == "checkpoint.fork":
+        checkpoint_label = source_action.get("checkpoint")
+        if checkpoint_label is None:
+            checkpoint_label = source_action.get("checkpoint_ref")
+        if checkpoint_label is not None:
+            _bind_checkpoint_setup_alias(
+                effect,
+                str(checkpoint_label),
+                dispatched_checkpoint_id,
+                checkpoint_aliases,
+            )
     if effect.type == "checkpoint.create" and source_action.get("checkpoint") is not None:
         effect.checkpoint = str(source_action["checkpoint"])
     if effect.type == "image.register" and source_action.get("image_id") is not None:
@@ -1268,7 +1777,163 @@ def _apply_source_effect_labels(effect: EffectRecord, source_action: dict[str, A
     if effect.type == "image.commit" and source_action.get("image_id") is not None:
         effect.image = str(source_action["image_id"])
     if effect.type == "image.commit" and source_action.get("checkpoint_ref") is not None:
-        effect.checkpoint = str(source_action["checkpoint_ref"])
+        checkpoint_label = str(source_action["checkpoint_ref"])
+        _bind_checkpoint_setup_alias(
+            effect,
+            checkpoint_label,
+            dispatched_checkpoint_id,
+            checkpoint_aliases,
+        )
+
+
+def _bind_checkpoint_setup_alias(
+    effect: EffectRecord,
+    checkpoint_label: str,
+    dispatched_checkpoint_id: Any,
+    checkpoint_aliases: dict[str, str] | None,
+) -> None:
+    effect.checkpoint = checkpoint_label
+    effect.metadata["checkpoint_setup_alias"] = checkpoint_label
+    alias_is_configured = (
+        checkpoint_aliases is not None
+        and checkpoint_label in checkpoint_aliases
+    )
+    configured_checkpoint_id = (
+        checkpoint_aliases[checkpoint_label]
+        if alias_is_configured
+        else None
+    )
+    if alias_is_configured:
+        effect.metadata["checkpoint_setup_configured"] = True
+    expected_checkpoint_id = (
+        str(configured_checkpoint_id)
+        if configured_checkpoint_id is not None
+        else (
+            str(dispatched_checkpoint_id)
+            if dispatched_checkpoint_id is not None
+            else None
+        )
+    )
+    if expected_checkpoint_id is not None:
+        effect.metadata["checkpoint_setup_id"] = expected_checkpoint_id
+        effect.metadata["audit_checkpoint_id"] = expected_checkpoint_id
+    if dispatched_checkpoint_id is not None:
+        _record_checkpoint_identity(effect, str(dispatched_checkpoint_id))
+
+
+def _record_checkpoint_identity(effect: EffectRecord, checkpoint_id: str) -> None:
+    effect.metadata["audit_checkpoint_id"] = checkpoint_id
+    expected_checkpoint_id = effect.metadata.get("checkpoint_setup_id")
+    if (
+        isinstance(expected_checkpoint_id, str)
+        and expected_checkpoint_id
+        and checkpoint_id != expected_checkpoint_id
+    ):
+        effect.metadata["checkpoint_identity_mismatch"] = {
+            "expected": expected_checkpoint_id,
+            "actual": checkpoint_id,
+        }
+        effect.checkpoint = checkpoint_id
+    elif "checkpoint_setup_alias" not in effect.metadata:
+        effect.checkpoint = checkpoint_id
+
+
+def _apply_runtime_result_identity(
+    effect: EffectRecord,
+    result: dict[str, Any],
+) -> None:
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return
+    checkpoint_id = payload.get("checkpoint_id")
+    if (
+        effect.type in {"checkpoint.create", "checkpoint.fork", "image.commit"}
+        and isinstance(checkpoint_id, str)
+        and checkpoint_id
+    ):
+        effect.metadata["runtime_checkpoint_id"] = checkpoint_id
+        _record_checkpoint_identity(effect, checkpoint_id)
+    image_id = payload.get("image_id")
+    if (
+        effect.type in {"image.register", "image.commit"}
+        and isinstance(image_id, str)
+        and image_id
+    ):
+        effect.image = image_id
+
+
+def _runtime_result_benchmark_evidence(
+    effect: EffectRecord,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Retain a small, non-content Git result witness for task oracles."""
+
+    if not (
+        effect.type == "external.provider_call"
+        and effect.provider == "git"
+        and effect.operation == "read"
+    ):
+        return {}
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return {}
+    artifact_oid = payload.get("oid")
+    patch_sha256 = payload.get("patch_sha256")
+    if not _is_runtime_object_id(artifact_oid):
+        return {}
+    if not _is_sha256(patch_sha256):
+        return {}
+    return {
+        "git_patch_result": {
+            "oid": artifact_oid,
+            "patch_sha256": patch_sha256,
+            "bytes": int(payload.get("bytes") or 0),
+        }
+    }
+
+
+def _apply_runtime_audit_checkpoint_identity(
+    effect: EffectRecord,
+    records: list[AuditRecord],
+    used: set[int],
+    *,
+    pid: str | None,
+    pids: set[str] | None = None,
+) -> None:
+    expected_checkpoint_id = effect.metadata.get("checkpoint_setup_id")
+    if (
+        not isinstance(expected_checkpoint_id, str)
+        or not expected_checkpoint_id
+        or effect.metadata.get("checkpoint_setup_configured") is not True
+        or effect.metadata.get("checkpoint_identity_mismatch") is not None
+    ):
+        return
+    actions = _AUDIT_ACTIONS_BY_EFFECT.get(effect.type)
+    if not actions:
+        return
+    candidates: set[str] = set()
+    for index, record in enumerate(records):
+        if index in used or record.action not in actions:
+            continue
+        allowed_pids = pids if pids is not None else ({pid} if pid is not None else set())
+        if allowed_pids and record.actor not in allowed_pids:
+            continue
+        decision = record.decision if isinstance(record.decision, dict) else {}
+        checkpoint_id: str | None = None
+        if effect.type == "image.commit":
+            if not _audit_target_matches(record.target, "image", effect.image):
+                continue
+            selected = decision.get("checkpoint_id")
+            if isinstance(selected, str) and selected:
+                checkpoint_id = selected
+        elif effect.type == "checkpoint.fork":
+            target = record.target or ""
+            if target.startswith("checkpoint:"):
+                checkpoint_id = target[len("checkpoint:") :]
+        if checkpoint_id:
+            candidates.add(checkpoint_id)
+    if len(candidates) == 1:
+        _record_checkpoint_identity(effect, next(iter(candidates)))
 
 
 def _effects_from_action(task: BenchmarkTask, runner: str, action: dict[str, Any]) -> list[EffectRecord]:
@@ -1338,12 +2003,18 @@ def _effect_from_action(task: BenchmarkTask, runner: str, action: dict[str, Any]
             checkpoint=str(action.get("checkpoint_ref") or action.get("checkpoint_id") or ""),
         )
     if name == "create_checkpoint":
+        checkpoint_pid = action.get("pid")
         return EffectRecord(
             task_id=task.id,
             runner=runner,
             type="checkpoint.create",
             performed=True,
             checkpoint=str(action.get("checkpoint") or action.get("reason") or ""),
+            metadata=(
+                {"checkpoint_pid": str(checkpoint_pid)}
+                if checkpoint_pid is not None
+                else {}
+            ),
         )
     if name == "fork_checkpoint":
         return EffectRecord(
@@ -1398,12 +2069,22 @@ def _effect_from_spec(task: BenchmarkTask, runner: str, spec: dict[str, Any]) ->
     )
 
 
-def _evaluate_success(task: BenchmarkTask, workspace: Path, state: dict[str, Any]) -> bool:
-    checks = task.success_oracle or [{"type": "completed_actions"}]
+def _evaluate_success(
+    task: BenchmarkTask,
+    workspace: Path,
+    state: dict[str, Any],
+    effects: list[EffectRecord] | None = None,
+) -> bool:
+    checks = task.success_oracle
+    if not checks:
+        return False
+    if effects is not None and any(
+        effect.metadata.get("checkpoint_identity_mismatch") is not None
+        for effect in effects
+    ):
+        return False
     for check in checks:
         check_type = check.get("type")
-        if check_type == "completed_actions":
-            continue
         if check_type == "process_exited":
             if state.get("process_status") not in {None, ProcessStatus.EXITED.value}:
                 return False
@@ -1424,8 +2105,280 @@ def _evaluate_success(task: BenchmarkTask, workspace: Path, state: dict[str, Any
             if not isinstance(path, str) or not safe_workspace_path(workspace, path).exists():
                 return False
             continue
+        if check_type == "managed_git_worktree":
+            if effects is None or not _managed_git_worktree_observed(
+                workspace,
+                effects,
+                root=check.get("root"),
+            ):
+                return False
+            continue
+        if check_type == "git_patch_artifact_lineage":
+            if effects is None or not _git_patch_artifact_lineage_observed(
+                effects,
+                source_object=check.get("source_object"),
+                sensitivity=check.get("sensitivity"),
+                artifact_origin=check.get("artifact_origin"),
+                source_origin=check.get("source_origin"),
+            ):
+                return False
+            continue
+        if check_type == "expected_effects":
+            expected_effects = check.get("effects")
+            if not isinstance(expected_effects, list) or not expected_effects or effects is None:
+                return False
+            unused = set(range(len(effects)))
+            for expected in expected_effects:
+                if not isinstance(expected, dict):
+                    return False
+                raw_outcomes = expected.get("outcomes", ["performed"])
+                if not isinstance(raw_outcomes, list) or not raw_outcomes:
+                    return False
+                outcomes = {str(outcome) for outcome in raw_outcomes}
+                matched_index = next(
+                    (
+                        index
+                        for index in sorted(unused)
+                        if effects[index].outcome in outcomes
+                        and spec_matches_effect(expected, effects[index])
+                    ),
+                    None,
+                )
+                if matched_index is None:
+                    return False
+                unused.remove(matched_index)
+            continue
         return False
     return True
+
+
+def _managed_git_worktree_observed(
+    workspace: Path,
+    effects: list[EffectRecord],
+    *,
+    root: Any,
+) -> bool:
+    selected_root = (
+        root
+        if isinstance(root, str) and root
+        else DEFAULT_CONFIG.git.worktree_root
+    )
+    managed_root = safe_workspace_path(workspace, selected_root)
+    for effect in effects:
+        if not (
+            effect.type == "external.provider_call"
+            and effect.provider == "git"
+            and effect.operation == "mutate"
+            and effect.outcome == "performed"
+            and effect.evidence == "runtime_external_effect"
+        ):
+            continue
+        provider_metadata = effect.metadata.get("provider_metadata")
+        if not isinstance(provider_metadata, dict):
+            continue
+        context = provider_metadata.get("context")
+        result = provider_metadata.get("result")
+        if not isinstance(context, dict) or not isinstance(result, dict):
+            continue
+        managed_id = provider_metadata.get("managed_worktree_id")
+        if not isinstance(managed_id, str) or not managed_id.startswith("wt_"):
+            continue
+        if any(char not in "0123456789abcdef" for char in managed_id[3:]):
+            continue
+        if not managed_id[3:]:
+            continue
+        if (
+            context.get("managed_worktree_id") != managed_id
+            or result.get("managed_worktree_id") != managed_id
+            or provider_metadata.get("action") != "create"
+        ):
+            continue
+        target = managed_root / managed_id
+        git_link = target / ".git"
+        if (
+            target.is_dir()
+            and not target.is_symlink()
+            and git_link.is_file()
+            and not git_link.is_symlink()
+            and target.resolve(strict=True).parent == managed_root.resolve(strict=True)
+            and _managed_worktree_git_layout_is_valid(
+                workspace,
+                target,
+                managed_id,
+            )
+        ):
+            return True
+    return False
+
+
+def _managed_worktree_git_layout_is_valid(
+    workspace: Path,
+    target: Path,
+    managed_id: str,
+) -> bool:
+    """Validate the linked-worktree gitfile and its primary-repo metadata."""
+
+    primary_git_dir = workspace / ".git"
+    admin_root = primary_git_dir / "worktrees"
+    expected_admin_dir = admin_root / managed_id
+    if (
+        primary_git_dir.is_symlink()
+        or not primary_git_dir.is_dir()
+        or admin_root.is_symlink()
+        or not admin_root.is_dir()
+        or expected_admin_dir.is_symlink()
+        or not expected_admin_dir.is_dir()
+    ):
+        return False
+    git_dir = _git_metadata_path(target / ".git", prefix=b"gitdir: ")
+    if git_dir is None:
+        return False
+    try:
+        resolved_git_dir = git_dir.resolve(strict=True)
+        resolved_admin_root = admin_root.resolve(strict=True)
+        resolved_expected_admin = expected_admin_dir.resolve(strict=True)
+    except OSError:
+        return False
+    if (
+        git_dir.is_symlink()
+        or not git_dir.is_dir()
+        or resolved_git_dir != resolved_expected_admin
+        or resolved_git_dir.parent != resolved_admin_root
+        or resolved_git_dir.name != managed_id
+    ):
+        return False
+    backlink = _git_metadata_path(resolved_git_dir / "gitdir")
+    common_dir = _git_metadata_path(resolved_git_dir / "commondir")
+    if backlink is None or common_dir is None:
+        return False
+    try:
+        return (
+            backlink.resolve(strict=True) == (target / ".git").resolve(strict=True)
+            and common_dir.resolve(strict=True) == primary_git_dir.resolve(strict=True)
+        )
+    except OSError:
+        return False
+
+
+def _git_metadata_path(path: Path, *, prefix: bytes = b"") -> Path | None:
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if len(raw) > 8192:
+        return None
+    value = raw.strip()
+    if prefix:
+        if not value.startswith(prefix):
+            return None
+        value = value[len(prefix) :]
+    if not value or b"\x00" in value or b"\n" in value or b"\r" in value:
+        return None
+    selected = Path(os.fsdecode(value))
+    return selected if selected.is_absolute() else path.parent / selected
+
+
+def _git_patch_artifact_lineage_observed(
+    effects: list[EffectRecord],
+    *,
+    source_object: Any,
+    sensitivity: Any,
+    artifact_origin: Any,
+    source_origin: Any,
+) -> bool:
+    if not isinstance(source_object, str) or not source_object:
+        return False
+    if not isinstance(sensitivity, str) or not sensitivity:
+        return False
+    for value in (artifact_origin, source_origin):
+        if value is not None and (not isinstance(value, str) or not value):
+            return False
+    for effect in effects:
+        if not (
+            effect.type == "external.provider_call"
+            and effect.provider == "git"
+            and effect.operation == "read"
+            and effect.outcome == "performed"
+            and effect.evidence == "runtime_external_effect"
+        ):
+            continue
+        result = effect.metadata.get("git_patch_result")
+        artifact = effect.metadata.get("git_patch_artifact")
+        if not isinstance(result, dict) or not isinstance(artifact, dict):
+            continue
+        result_oid = result.get("oid")
+        if (
+            not _is_runtime_object_id(result_oid)
+            or artifact.get("oid") != result_oid
+        ):
+            continue
+        result_sha256 = result.get("patch_sha256")
+        if not _is_sha256(result_sha256):
+            continue
+        parent_oids = artifact.get("parent_oids")
+        if (
+            not isinstance(parent_oids, list)
+            or not parent_oids
+            or any(not _is_runtime_object_id(oid) for oid in parent_oids)
+            or len(parent_oids) != len(set(parent_oids))
+        ):
+            continue
+        parents = artifact.get("benchmark_parents")
+        if not isinstance(parents, list) or not parents:
+            continue
+        if any(
+            not isinstance(parent, dict)
+            or not _is_runtime_object_id(parent.get("oid"))
+            or parent.get("oid") not in parent_oids
+            for parent in parents
+        ):
+            continue
+        parent_witness_oids = [str(parent["oid"]) for parent in parents]
+        if len(parent_witness_oids) != len(set(parent_witness_oids)):
+            continue
+        source_parents = [
+            parent for parent in parents if parent.get("name") == source_object
+        ]
+        if len(source_parents) != 1:
+            continue
+        source_parent = source_parents[0]
+        if (
+            artifact.get("type") != "code_patch"
+            or artifact.get("immutable") is not True
+            or artifact.get("sensitivity") != sensitivity
+            or artifact.get("patch_sha256") != result_sha256
+            or source_parent is None
+            or source_parent.get("sensitivity") != sensitivity
+        ):
+            continue
+        if (
+            artifact_origin is not None
+            and artifact.get("artifact_origin") != artifact_origin
+        ):
+            continue
+        if source_origin is not None and source_parent.get("origin") != source_origin:
+            continue
+        return True
+    return False
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _is_runtime_object_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("obj_")
+        and len(value) == 20
+        and all(char in "0123456789abcdef" for char in value[4:])
+    )
 
 
 def _operation_explainability_metadata(

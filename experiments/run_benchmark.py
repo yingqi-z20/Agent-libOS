@@ -14,6 +14,7 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import GitError
 from benchmarks.runtime_safety.loader import load_task_file, load_tasks
 from benchmarks.runtime_safety.runners import (
+    AGENT_LIBOS_RUNNERS,
     RUNNER_INTERVENTIONS,
     RUNNER_NAMES,
     run_suite,
@@ -43,7 +44,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--attack-class", action="append", default=[], help="Attack class to include, repeated.")
     parser.add_argument("--limit", type=_positive_int, help="Maximum number of tasks after filtering.")
     parser.add_argument("--output", default=".benchmark_runs/m1", help="Output run directory.")
-    parser.add_argument("--llm", choices=["mock", "real"], default="mock", help="LLM mode for Agent libOS runners.")
+    parser.add_argument(
+        "--llm",
+        choices=["mock", "real"],
+        default="mock",
+        help="LLM mode; real mode requires exactly one task and only Agent libOS runners.",
+    )
     parser.add_argument(
         "--max-quanta",
         type=_positive_int,
@@ -52,7 +58,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--require-all-passed",
         action="store_true",
-        help="Return non-zero unless every selected task passes both success and safety oracles.",
+        help=(
+            "Return non-zero unless every selected task passes both success and safety oracles; "
+            "by default oracle failures are reported without changing an otherwise valid run's exit status."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -69,8 +78,19 @@ def main(argv: list[str] | None = None) -> None:
     if not tasks:
         raise SystemExit("no benchmark tasks selected")
     runners = _selected_runners(args.runner)
-    if args.llm == "real" and not (args.limit == 1 or len(args.task) == 1):
-        raise SystemExit("--llm real requires --limit 1 or exactly one --task to avoid accidental token spend")
+    if args.llm == "real":
+        if len(tasks) != 1:
+            raise SystemExit(
+                "--llm real must select exactly one task after filtering to avoid accidental token spend"
+            )
+        unsupported_runners = [
+            runner for runner in runners if runner not in AGENT_LIBOS_RUNNERS
+        ]
+        if unsupported_runners:
+            raise SystemExit(
+                "--llm real supports only Agent libOS runners; unsupported: "
+                + ", ".join(unsupported_runners)
+            )
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     metadata: dict[str, Any] = {
@@ -191,7 +211,15 @@ def _build_provenance(
     task_entries, fixture_entries = _workload_provenance(suite, tasks)
     runner_sources = [
         REPO_ROOT / "benchmarks" / "runtime_safety" / name
-        for name in ("runners.py", "oracle.py", "metrics.py", "models.py", "loader.py", "fixtures.py")
+        for name in (
+            "ablations.py",
+            "runners.py",
+            "oracle.py",
+            "metrics.py",
+            "models.py",
+            "loader.py",
+            "fixtures.py",
+        )
     ]
     return {
         "schema_version": 1,

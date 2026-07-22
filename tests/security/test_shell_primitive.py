@@ -636,6 +636,7 @@ class TestShellPrimitive:
                     'name': 'resolve_argv',
                     'state_mutation': False,
                     'information_flow': True,
+                    'commits_authority': True,
                 }
             ]
         finally:

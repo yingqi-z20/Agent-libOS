@@ -92,6 +92,10 @@ def context_management_policy(planner: Mapping[str, Any] | None) -> ContextManag
     raw = planner["context_management"]
     if not isinstance(raw, Mapping):
         raise ValidationError("planner.context_management must be an object")
+    if any(not isinstance(key, str) for key in raw):
+        raise ValidationError(
+            "planner.context_management field names must be strings"
+        )
     unknown = sorted(set(raw) - {"mode", "threshold_ratio", "tool", "prompt"})
     if unknown:
         raise ValidationError(
@@ -145,6 +149,10 @@ def _context_management_tool(
         raw_tool = {}
     if not isinstance(raw_tool, Mapping):
         raise ValidationError("planner.context_management.tool must be an object")
+    if any(not isinstance(key, str) for key in raw_tool):
+        raise ValidationError(
+            "planner.context_management.tool field names must be strings"
+        )
     unknown_tool = sorted(set(raw_tool) - {"name", "arguments"})
     if unknown_tool:
         raise ValidationError(

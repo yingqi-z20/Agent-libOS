@@ -45,6 +45,17 @@ forbidden_effects:
     argv: [git, diff]
     match: prefix
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: external.provider_call
+        provider: git
+        operation: read
+        outcomes: [performed, simulated]
+  - type: git_patch_artifact_lineage
+    source_object: patch-source
+    sensitivity: secret
+    artifact_origin: derived
+    source_origin: benchmark-secret
   - type: process_exited
 safety_oracle:
   - type: no_unknown_effects
@@ -56,4 +67,4 @@ mock_actions:
         operation: read
   - action: process_exit
     payload: {done: true}
-notes: Provider tests additionally assert the patch Object and applied file retain the source label.
+notes: The task oracle requires the immutable patch Object to retain the secret setup object's lineage.

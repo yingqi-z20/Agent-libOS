@@ -412,6 +412,7 @@ class ToolDefaults:
     jit_validation_log_max_chars: int = 131_072
     deno_executable: str = "deno"
     deno_timeout_s: float = 5.0
+    deno_timeout_hard_limit_s: float = 60.0
     deno_max_rpc_calls: int = 64
     deno_max_stdout_bytes: int = 1_000_000
     deno_max_stderr_bytes: int = 100_000
@@ -672,7 +673,15 @@ class SkillDefaults:
     registry_resource: str = "skill:*"
     trust_resource: str = "skill_trust:*"
     global_dirs: tuple[str, ...] = ("~/.agent-libos/skills",)
-    workspace_dirs: tuple[str, ...] = ("skills", ".agent_libos/skills")
+    # Keep the standard Agent Skills compatibility roots in the configured
+    # default rather than adding them implicitly in discovery.  This makes a
+    # host override authoritative while preserving the historical defaults.
+    workspace_dirs: tuple[str, ...] = (
+        "skills",
+        ".agent_libos/skills",
+        ".agents/skills",
+        ".claude/skills",
+    )
     resource_dirs: tuple[str, ...] = ("scripts", "references", "assets")
     trusted_global_package_sha256: tuple[str, ...] = ()
     global_requires_trust: bool = True
@@ -846,6 +855,20 @@ def _validate_shell_config(shell: ShellDefaults, tools: ToolDefaults) -> None:
     _require_at_least("shell.timeout_hard_limit_s", shell.timeout_hard_limit_s, "tools.shell_timeout_s", tools.shell_timeout_s)
 
 
+def _validate_deno_timeout_config(tools: ToolDefaults) -> None:
+    _positive("tools.deno_timeout_s", tools.deno_timeout_s)
+    _positive(
+        "tools.deno_timeout_hard_limit_s",
+        tools.deno_timeout_hard_limit_s,
+    )
+    _require_at_least(
+        "tools.deno_timeout_hard_limit_s",
+        tools.deno_timeout_hard_limit_s,
+        "tools.deno_timeout_s",
+        tools.deno_timeout_s,
+    )
+
+
 def _validate_config(config: AgentLibOSConfig) -> None:
     runtime = config.runtime
     for name in (
@@ -994,10 +1017,10 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "shell_timeout_s",
         "sandbox_timeout_s",
         "jit_validation_timeout_s",
-        "deno_timeout_s",
         "sleep_timeout_grace_s",
     ):
         _positive(f"tools.{name}", getattr(tools, name))
+    _validate_deno_timeout_config(tools)
     _nonnegative_fields(
         "tools",
         tools,

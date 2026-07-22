@@ -393,7 +393,11 @@ to a mapping before loading the module, and can inject a fake provider by
 setting `substrate.pty`. Without that injection, the module constructs its own
 local provider from the runtime workspace root. On Windows, the real backend
 uses `pywinpty`; install it through the optional `pty` extra when real ConPTY
-support is needed.
+support is needed:
+
+```bash
+uv sync --all-groups --extra pty
+```
 
 ## CLI
 

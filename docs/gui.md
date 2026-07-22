@@ -330,7 +330,7 @@ the final request to the server:
 - image package registration and checkpoint-to-image commit,
 - checkpoint restore and fork,
 - capability grant, delegate, and revoke,
-- JSON-RPC method calls,
+- JSON-RPC endpoint registration and method calls,
 - MCP server registration and tool calls,
 - Skill registration, activation, and unload.
 

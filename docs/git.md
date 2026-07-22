@@ -14,9 +14,15 @@ with GitHub, GitLab, or another hosting service.
 The provider is pinned to the Runtime workspace root. That path must already
 be the root of a non-bare Git repository; the provider does not search parent
 directories, initialize a repository, or clone one. `worktree_id="main"`
-selects the root checkout. Other ids are accepted only when they resolve to a
-Runtime-created managed worktree or to a linked worktree whose metadata root
-is explicitly listed in `git.trusted_metadata_roots`.
+selects the root checkout. Other ids map deterministically to
+`<managed-worktree-root>/<id>` and are accepted only after structural checks:
+the candidate and Git-file path must not traverse a link/reparse indirection,
+Git must report the expected worktree identity, and the metadata root must be
+the repository common directory or an explicitly configured
+`git.trusted_metadata_roots` entry. This is structural containment and Host
+trust, not a persistent proof that this Runtime instance originally created the
+worktree. Linked worktrees outside those roots are omitted from process-visible
+lists and cannot be selected.
 
 Git is optional at Runtime startup. `git.enabled: false`, a missing executable,
 or a version older than `git.minimum_version` leaves the rest of the Runtime
@@ -49,6 +55,13 @@ checkout cannot become visible by redirecting that root.
 Every method below has a synchronous form on `Runtime.git` and an asynchronous
 form prefixed with `a`, such as `status`/`astatus` and `push`/`apush`. All model
 arguments use strict Pydantic schemas with unknown fields rejected.
+
+For `git_branch`, `git_tag`, `git_stash`, and `git_worktree`, the model-facing
+JSON schema names the discriminator `operation`; the accepted values are
+`create/delete/rename`, `create/delete`, `push/apply/pop/drop/clear`, and
+`create/remove`, respectively. The legacy input spelling `action` is accepted
+for compatibility and is also the keyword used by the lower-level Python
+Runtime methods, but it is not emitted in the model-facing schema.
 
 | Category | Model tools |
 | --- | --- |
@@ -96,6 +109,17 @@ cross-process repository lock and compares the token again immediately before
 dispatch. Drift returns `stale_state`; success returns a new token in
 `GitOperationResult.after`.
 
+Repository reads as well as mutations acquire the same bounded cross-process
+repository lock, so either kind of operation can fail with `repository_busy`.
+Worktree access then acquires canonical filesystem-label locks in repository →
+file-label order and retains them through final label refresh and settlement.
+Reads that observe checkout bytes lock their normalized paths, or the selected
+worktree root for a whole-tree read. Any mutation that may write or delete
+checkout bytes conservatively locks that whole worktree root even when its
+paths are enumerable; staged/ref-only operations may need no file-label lock.
+The repository lock is reentrant within one thread, but extensions must not
+invert this ordering.
+
 Refs are restricted to validated full refs, strict branch/tag names, or exact
 object ids resolved by the provider. Model-supplied revision expressions,
 path/ref ambiguity, option injection, and arbitrary refspecs are not accepted.
@@ -106,7 +130,7 @@ Git authority is independent of tool visibility and legacy Shell grants:
 
 | Resource | Rights and use |
 | --- | --- |
-| `git:workspace` | `read`, `diff`, `write`, `delete`, and `admin` for the fixed repository |
+| value of `git.repository_resource` (default `git:workspace`) | `read`, `diff`, `write`, `delete`, and `admin` for the fixed repository |
 | `git_remote:workspace:<remote>` | `read` for fetch/pull input, `write` for push, and `delete`/`admin` for deletion or force-with-lease |
 | `git_pr:workspace:<pr-id>` | `read`, `write`, `approve`, and `delete` for one simulated PR; wildcard read is used for listing |
 
@@ -124,13 +148,20 @@ The following actions require `delete` and `admin` authority plus a mandatory
 one-use Human approval bound to the exact parameters, old state token, and
 relevant old OID:
 
-- reset, clean, amend, destructive restore, and ref-rewriting integration;
-- branch/tag/stash/worktree/ref deletion and branch rename;
+- reset, clean, amend, every restore, and ref-rewriting integration;
+- branch/tag/stash/worktree/ref deletion, branch rename, and forced branch create;
 - stash pop, stash including untracked files, forced switch/tag, and fetch
   prune;
 - remote-ref deletion and force-with-lease;
 - simulated-PR merge;
 - a patch application whose preview deletes files.
+
+Restore has an additional exact filesystem matrix. Every form has the Git
+`write/delete/admin` and approval requirements above. When `worktree=true`,
+each selected path also requires filesystem `write` and `delete` subtree
+authority so file/tree type changes remain authorized. A staged-only restore
+(`worktree=false`) requires no filesystem authority. A source-specific,
+worktree-only restore is unsupported; select `staged` as well.
 
 Ordinary commit, non-destructive merge, fast-forward pull, and non-forced push
 follow the selected capability effect (`allow`, `ask`, or `deny`). A mandatory
@@ -175,7 +206,9 @@ configuration. The model can supply only the commit message; author overrides,
 environment identity, signing, and editor invocation are unavailable.
 
 Filesystem reads/writes/deletes reject `.git` path components, the worktree
-`.git` file, and Git metadata aliases when `git.protect_git_metadata` is true.
+`.git` file, and Git metadata aliases. `git.protect_git_metadata` is a
+compatibility/configuration field fixed to `true`; configuration validation
+rejects attempts to disable this security invariant.
 Recursive deletion preflights and then removes entries without following
 symlinks or reparse points; it fails closed if any descendant is Git metadata,
 including metadata inserted during traversal. A partial deletion is recorded
@@ -233,8 +266,13 @@ Before approval the primitive captures hashes of the fetch/push URLs, effective
 configuration, credential/SSH executable identities, remote-tracking refs, and
 the expected old remote OID. The provider recomputes that fingerprint after
 approval and immediately before dispatch. A change returns `stale_state`.
-Timeout or ambiguous transport failure remains `unknown`; startup
-reconciliation may query refs/receipts but never replays the operation.
+Timeout or ambiguous transport failure remains `unknown`. Startup
+reconciliation is local and query-only: it returns current repository state and,
+when the configured remote remains locally valid, freshly computed
+configuration/helper/ref fingerprint components as bounded evidence. The
+current reconciler does not compare them with the recorded fingerprint, prove a
+remote dispatch outcome, or change the `unknown` state. It does not contact the
+remote, query a network-side receipt, or replay the operation.
 
 Host-configured remotes are the only first-class Git-provider network exception
 to the general rule that remote targets must be separately registered. This is
@@ -246,9 +284,13 @@ requests.
 `git_create_patch` creates an immutable `ObjectType.CODE_PATCH`. Its payload
 contains the complete patch bytes, base/head/index OIDs, source state token,
 changed byte-safe paths, byte count, and SHA-256. Object provenance and data
-labels include the files, index, and every returned commit that contributed to
-the patch. Git diff, show, log, and blame reads recover the same lineage and
-revalidate repository and label generations before returning. A monotonic,
+labels conservatively include observed file bindings, repository/index carriers,
+and returned commits. A range patch also includes the current index carrier even
+when unrelated staged content did not contribute patch bytes, so this is safe
+overtainting rather than an exact-minimal contributor set. Every Git read
+inherits the stable repository carrier; diff, show, log, and blame additionally
+recover their operation-specific lineage and revalidate repository and label
+generations before returning. A monotonic,
 repository-scoped content carrier also preserves the highest classification of
 every Runtime-mediated mutation. It is bound after final policy revalidation
 and before the first Host effect, so renamed or deleted content, ref-only
@@ -262,14 +304,20 @@ runs `git apply --check` as a preview, determines affected/deleted paths, then
 applies through the typed mutation boundary. The source Object's labels flow to
 the result and affected file bindings.
 
-Simulated pull requests are repository-local workflow records. Immutable base
-and head snapshots live below `refs/agent-libos/pull-requests/`; versioned
+Simulated pull requests are repository-local workflow records. Creation accepts
+only `refs/heads/*` refs (or shorthand local branch names), resolves them through
+the main checkout's repository, and requires `write` on both the PR resource and
+configured repository resource. Immutable base and head snapshots live below
+`refs/agent-libos/pull-requests/`; versioned
 metadata and review-body hashes are written atomically below the Git common
 directory. Creation captures base/head OIDs and patch hash. Review supports
 comment, approve, and request-changes. Close retains evidence. Merge supports
-fast-forward, merge commit, and squash, always compares the live base/head and
-metadata hashes with the recorded values, requires a clean selected worktree,
-and uses mandatory approval. PR metadata has persistent per-record and
+fast-forward, merge commit, and squash. The selected worktree must be clean and
+its live HEAD ref and OID must exactly match the recorded base, while the live
+head and metadata hashes must still match their recorded values. Merge requires
+PR `approve`, repository `write/delete/admin`, selected-worktree subtree
+filesystem `read/write/delete`, and mandatory one-use approval. PR metadata has
+persistent per-record and
 collection lineage, prebound before provider writes so an unknown settlement
 cannot downgrade later inspection. Creation and merge must pass both the PR
 sink and repository sink clearances in one protected operation. These records
@@ -291,8 +339,16 @@ Provider-certified failures before any protected Git effect starts abandon the
 pending intent and may restore a finite capability reservation. After dispatch,
 timeouts, cancellation, repository identity loss, failed post-validation, and
 unclassifiable outcomes retain an `unknown` effect. Startup reconciliation is
-query-only; it inspects repository refs, worktree state, simulated-PR metadata,
-or remote receipts and never automatically retries a mutation or network call.
+query-only; it inspects local repository refs, worktree state, simulated-PR
+metadata, and locally available remote fingerprints. It does not contact a
+remote or inspect a network-side receipt, and never automatically retries a
+mutation or network call.
+
+When a caller supplies a `LocalResourceProviderSubstrate`, `Runtime.open` binds
+the active Runtime Git configuration atomically to both the Local Git provider
+and the Shell raw-Git guard. An explicitly conflicting provider configuration,
+including a Local provider subclass whose effective configuration differs,
+causes open to fail closed rather than leaving a partially bound substrate.
 
 Checkpoint restore and image commit do not capture, package, rewind, or delete
 Git metadata, checkout state, managed worktrees, remote state, or simulated-PR

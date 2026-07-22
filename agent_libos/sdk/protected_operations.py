@@ -1338,6 +1338,7 @@ class ProtectedOperation:
                         "name": phase.name,
                         "state_mutation": phase.state_mutation,
                         "information_flow": phase.information_flow,
+                        "commits_authority": phase.commits_authority,
                     },
                 }
                 if not self.sdk.effects.transition_external_effect(
@@ -1383,6 +1384,7 @@ class ProtectedOperation:
                 "name": phase.name,
                 "state_mutation": phase.state_mutation,
                 "information_flow": phase.information_flow,
+                "commits_authority": phase.commits_authority,
             }
         )
         metadata = {
@@ -1696,6 +1698,7 @@ class ProtectedOperation:
                 "name": phase.name,
                 "state_mutation": phase.state_mutation,
                 "information_flow": phase.information_flow,
+                "commits_authority": phase.commits_authority,
             }
             for phase in self._completed_phases
         ]

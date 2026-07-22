@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-libos:schema:practical-agent-workflows:report:v1",
+  "title": "Agent libOS practical workflow report v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "results",
+    "scenario_counts",
+    "semantic_effect_counts",
+    "native_tool_calls",
+    "native_operations",
+    "modeled_fallback",
+    "native_live_ok",
+    "modeled_suite_ok"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/scenario_result"
+      }
+    },
+    "scenario_counts": {
+      "$ref": "#/$defs/evidence_level_counts"
+    },
+    "semantic_effect_counts": {
+      "$ref": "#/$defs/evidence_level_counts"
+    },
+    "native_tool_calls": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "native_operations": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "modeled_fallback": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "native_live_ok": {
+      "type": "boolean"
+    },
+    "modeled_suite_ok": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "evidence_level_counts": {
+      "type": "object",
+      "required": [
+        "native-live",
+        "modeled"
+      ],
+      "properties": {
+        "native-live": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "modeled": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "scenario_result": {
+      "type": "object",
+      "required": [
+        "scenario_id",
+        "evidence_level",
+        "ok",
+        "semantic_effects",
+        "tool_calls",
+        "operations",
+        "external_effect_ids",
+        "operation_ids",
+        "errors"
+      ],
+      "properties": {
+        "scenario_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_level": {
+          "enum": [
+            "native-live",
+            "modeled"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "semantic_effects": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tool_calls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "external_effect_ids": {
+          "$ref": "#/$defs/identifier_list"
+        },
+        "operation_ids": {
+          "$ref": "#/$defs/identifier_list"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "evidence_level": {
+                "const": "modeled"
+              }
+            },
+            "required": [
+              "evidence_level"
+            ]
+          },
+          "then": {
+            "properties": {
+              "tool_calls": {
+                "const": 0
+              },
+              "operations": {
+                "const": 0
+              },
+              "external_effect_ids": {
+                "maxItems": 0
+              },
+              "operation_ids": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "ok": {
+                "const": true
+              }
+            },
+            "required": [
+              "ok"
+            ]
+          },
+          "then": {
+            "properties": {
+              "errors": {
+                "maxItems": 0
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "errors": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "identifier_list": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    }
+  }
+}

@@ -7,6 +7,32 @@ from enum import Enum
 from typing import Any
 
 
+# Match CPython's default integer conversion ceiling explicitly so manifest
+# parsing stays bounded even when the interpreter-wide limit is disabled.
+_MAX_JSON_INTEGER_DIGITS = 4_300
+
+
+def _parse_bounded_json_integer(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > _MAX_JSON_INTEGER_DIGITS:
+        raise ValueError(
+            "JSON integer exceeds maximum digits="
+            f"{_MAX_JSON_INTEGER_DIGITS}"
+        )
+    return int(value)
+
+
+def bounded_json_loads(value: str | bytes | bytearray) -> Any:
+    """Decode externally supplied JSON with a fixed integer-size ceiling.
+
+    Callers retain responsibility for their byte limit and for translating
+    parser ``ValueError``/``RecursionError`` failures into the appropriate
+    domain error.
+    """
+
+    return json.loads(value, parse_int=_parse_bounded_json_integer)
+
+
 def to_jsonable(value: Any) -> Any:
     if is_dataclass(value):
         return {key: to_jsonable(item) for key, item in asdict(value).items()}

@@ -75,12 +75,17 @@ recover.
 `data_flow_direction` is independently `none`, `ingress`, `egress`, or
 `bidirectional`. Do not infer egress from `information_flow`: filesystem reads,
 DNS, and clocks observe information but do not send the caller's payload.
-Every egress/bidirectional invocation must provide a concrete `DataSink`,
-trusted `DataFlowContext`, canonical payload descriptor, and non-empty
-data-flow operation. Every ingress/bidirectional invocation must additionally
-provide a trusted `data_flow_ingress_context`; `none` and egress-only
-invocations must omit it. A contract with a data-flow direction must also
-declare `information_flow=True`.
+Every egress/bidirectional invocation must provide a concrete primary
+`DataSink`, trusted `DataFlowContext`, canonical payload descriptor, and
+non-empty data-flow operation. When the same provider operation has more than
+one real recipient, it must also provide every other recipient in
+`additional_data_sinks`; modeling only the primary recipient is not sufficient.
+The value must be a tuple of concrete Sinks and all Sink identities must be
+unique. Additional Sink identities must remain stable for the invocation; the
+single `data_sink_revalidator` hook described below applies only to the primary
+Sink. Every ingress/bidirectional invocation must additionally provide a trusted
+`data_flow_ingress_context`; `none` and egress-only invocations must omit it. A
+contract with a data-flow direction must also declare `information_flow=True`.
 
 If `prepare` changes durable domain state, declare a named
 `prepared_recovery` policy on the contract and register its trusted recovery
@@ -115,6 +120,7 @@ invocation = ProtectedOperationInvocation(
     ),
     data_flow_ingress_context=ingress_context,
     data_sink=sink,
+    additional_data_sinks=(repository_sink,),
     data_flow_context=flow_context,
     data_flow_payload=provider_request,
     data_flow_operation="example.fetch",
@@ -129,17 +135,29 @@ not make a provider call or place exception text in persisted context.
 Do not put Object payloads, credentials, Human content, raw LLM I/O, provider
 payloads, stdout/stderr, or exception text in observations or evidence.
 
-Before preparing the effect, the SDK reauthorizes the data flow against the
-current Sink-registry generation and exact source Object versions/content
-hashes, checks the payload and release binding, then reserves ordinary and
-release capabilities with the intent in one transaction. It repeats the full
-data-flow recheck immediately before every provider phase; a release consumed by
-an earlier phase is accepted only through the same protected-operation
-reservation. A failed prepare recheck creates no intent, while a failed dispatch
-recheck calls no later provider phase. Effect metadata stores only the
-decision/trust/source/label hashes and ids. Together, the early primitive check,
-transactional prepare, and per-phase dispatch recheck close
-provider-before-policy and mutable-source TOCTOU paths.
+Before preparing the effect, the SDK authorizes the primary and every additional
+Sink against one Sink-registry generation and the exact source Object
+versions/content hashes. It checks the shared payload and release bindings, then
+reserves ordinary authority and every required release capability with the
+intent in one transaction. It repeats the complete all-Sink data-flow check
+immediately before every provider phase; a release consumed by an earlier phase
+is accepted only through that same protected-operation reservation. Prepare,
+not-started restoration, success commit, and unknown settlement treat the
+complete release set atomically. A failed prepare recheck creates no intent,
+while a failed dispatch recheck calls no later provider phase. Effect metadata
+stores the primary egress under the normal fields and additional recipients in
+`additional_egresses`. Each entry contains the same metadata-only decision,
+Sink identity/trust, labels, source references, hashes, registry generation, and
+release-capability reference; it never contains the egress payload. Together,
+the early primitive check, transactional prepare, and per-phase dispatch recheck
+close provider-before-policy and mutable-source TOCTOU paths.
+
+Preflight authorization visits the primary and additional Sinks in tuple order.
+The first successful authorization captures the registry generation used by the
+rest. If a conditional Sink needs Human release, that attempt suspends before
+later Sinks are visited; resumed attempts can therefore surface independent
+per-Sink release requests sequentially. The complete release set becomes atomic
+at protected-operation prepare, after all Sinks have authorized successfully.
 
 Use the invocation revalidators for mutable identities that the generic checks
 cannot reconstruct:
@@ -151,10 +169,12 @@ cannot reconstruct:
   each provider phase, the SDK then reauthorizes reusable decisions and checks
   the exact finite-use reservations; it does not call the custom revalidator a
   second time.
-- `data_sink_revalidator` resolves the live `DataSink` identity immediately
-  before every provider phase. It must return the same trusted identity captured
-  by `data_sink`; a changed or unresolvable Sink is denied before provider code
-  runs and the denial is retained as data-flow evidence.
+- `data_sink_revalidator` resolves the live primary `DataSink` identity
+  immediately before every provider phase. It must return the same trusted
+  identity captured by `data_sink`; a changed or unresolvable Sink is denied
+  before provider code runs and the denial is retained as data-flow evidence.
+  There is no per-additional-Sink resolver, so extensions must not place a
+  mutable identity in `additional_data_sinks`.
 - `data_flow_target_state_version` binds the preflight decision to the captured
   target-state version. When the target can change, pair it with
   `data_flow_target_state_version_resolver`; the resolver supplies the live
@@ -236,10 +256,19 @@ reply = await operation.acall(
 )
 ```
 
-After the first phase that may have observed or changed provider state, finite
-authority is committed. If a later phase raises `ProviderEffectNotStarted`, the
-SDK finalizes the confirmed partial effect; it does not erase the earlier
-information flow or restore authority.
+`ProviderPhase.commits_authority` defaults to `True`. A successful phase with
+that default commits finite authority even if both `state_mutation` and
+`information_flow` are false. A purely local coordination phase such as a lock
+or validation fence must explicitly use `commits_authority=False`; it must also
+remain free of provider-visible mutation and information flow. If dispatch is
+rejected after only completed phases whose three effect flags are all false,
+the SDK can abandon the not-started intent and restore all ordinary and release
+reservations. Once any completed phase mutates state, observes information, or
+commits authority, a later `ProviderEffectNotStarted` or revalidation failure
+finalizes the confirmed partial/unknown effect and cannot restore authority.
+The active-phase record, completed-phase transcript, and final
+`provider_phases` evidence persist the phase name and all three flags, so this
+authority floor remains explainable after settlement or reopen.
 
 For an ingress/bidirectional contract, the SDK observes the invocation's
 ingress context automatically and at most once after the first actually
@@ -317,7 +346,9 @@ otherwise the effect stays `unknown`.
 under `agent_libos/` and the repository-level `modules/` directory. It rejects:
 
 - direct imports or calls of the internal prepare/dispatch/finalize/abandon
-  helpers outside the four explicitly allowed lifecycle implementation files;
+  helpers outside the four explicitly allowed lifecycle implementation files,
+  including imports through the public evidence re-export, `as` aliases,
+  wildcard lifecycle imports, and simple or chained assignment aliases;
 - use of the former private reservation-restoration API;
 - recognized direct `self.provider.*()` calls and recognized provider-handle
   methods outside a callable passed to an SDK `call()`/`acall()` phase; and
@@ -325,11 +356,13 @@ under `agent_libos/` and the repository-level `modules/` directory. It rejects:
   contract inventory when the local invocation construction can be resolved.
 
 The intentional exceptions are narrow and visible in the checker: filesystem
-path normalization, Human delivery-buffer `read`/`write`, the lifecycle
-implementation files, and recovery-time `handle.close()` in a function whose
+path normalization; Human delivery-buffer `read`/`write`; Git's local,
+non-dispatching `preflight_remote_fingerprint`, `preflight_path_kind`,
+`repository_lock`, and `validate_read_only_operation`; the lifecycle
+implementation files; and recovery-time `handle.close()` in a function whose
 first executable statement is the exact recovery-cleanup lease guard. The last
 exception is evidence-free cleanup of an already-published transient handle;
-it is not a general provider-call allowance.
+none of these entries is a general provider-call allowance.
 
 The checker is not a sound whole-program Python call-graph analysis. It does not
 scan tests, scripts, examples, installed third-party packages, or module source

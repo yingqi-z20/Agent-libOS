@@ -445,6 +445,11 @@ class ImagePackageInstaller:
             description=str(item.get("description") or ""),
             input_schema=dict(item.get("input_schema") or {}),
             output_schema=dict(item.get("output_schema") or {}),
+            policy=(
+                {"sandbox_timeout_s": float(item["timeout_s"])}
+                if item.get("timeout_s") is not None
+                else {}
+            ),
             tags=["image", "jit", "package"],
             metadata={
                 "image_id": image.image_id,

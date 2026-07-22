@@ -753,6 +753,7 @@
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_jit_syscall_denies_missing_capability",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_runtime_execution_uses_cached_only_while_validation_can_resolve_imports",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_candidate_specs_are_conservative_side_effects",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_jit_candidate_rejects_oversized_integer_sandbox_timeout",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_registration_publishes_durable_alias_and_executable_handle_together",
         "tests/security/test_jit_security.py::TestJitSecurity::test_jit_registration_audit_failure_rolls_back_alias_source_and_handle",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_validation_logs_are_bounded",
@@ -1781,6 +1782,8 @@
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_unload_rejects_noncanonical_persisted_skill_provenance[image]",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_unload_rejects_noncanonical_persisted_skill_provenance[manual]",
         "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_skill_discovery_rejects_unbounded_limits",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_programmatic_skill_registration_rejects_invalid_jit_timeouts",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_programmatic_skill_registration_accepts_valid_jit_timeouts",
         "tests/self_evolution/test_skill_integrations.py::TestSkillIntegration::test_jit_skill_reactivation_replaces_alias_and_unload_removes_registration",
         "tests/self_evolution/test_skill_integrations.py::TestSkillIntegration::test_jit_activation_failure_rolls_back_alias_rows_and_one_time_execute",
         "tests/self_evolution/test_skill_integrations.py::TestSkillIntegration::test_tool_registration_failure_does_not_leave_partial_jit_state",
@@ -1790,6 +1793,29 @@
         "tests/providers/test_gui_server.py::TestGuiServer::test_skill_register_actor_mode_requires_skill_write_capability"
       ],
       "benchmark_attack_classes": ["self_evolution_skill"]
+    },
+    {
+      "id": "workspace-skill-snapshots-reject-truncated-inputs",
+      "title": "Workspace Skill registration rejects every truncated manifest, metadata, or JIT source read before parsing or hashing it.",
+      "lane": "self-evolution",
+      "node_ids": [
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_skill_rejects_truncated_skill_markdown",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_skill_rejects_truncated_explicit_metadata_reference",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_skill_rejects_truncated_jit_source",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_jit_source_character_limit_preserves_complete_multibyte_source"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "package-json-manifests-fail-closed-at-parser-limits",
+      "title": "Skill and image package JSON manifests reject excessive integer and nesting inputs as domain validation failures.",
+      "lane": "self-evolution",
+      "node_ids": [
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_host_skill_json_metadata_rejects_pathological_parser_inputs",
+        "tests/self_evolution/test_skill_packages.py::TestSkillPackageLoading::test_workspace_skill_json_metadata_rejects_pathological_parser_inputs",
+        "tests/self_evolution/test_image_registration.py::TestImageRegistration::test_image_package_jit_manifest_rejects_pathological_json_parser_inputs"
+      ],
+      "benchmark_attack_classes": []
     },
     {
       "id": "runtime-modules-load-trusted-code-atomically",
@@ -1937,6 +1963,7 @@
         "tests/self_evolution/test_checkpoint_jit.py::TestCheckpointJit::test_checkpoint_restore_rejects_legacy_owner_unbound_cross_owner_jit",
         "tests/self_evolution/test_checkpoint_jit.py::TestCheckpointJit::test_checkpoint_restore_prune_failure_recovers_before_rehydrate",
         "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_capabilities_gate_inspect_restore_and_fork",
+        "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_control_authority_is_not_snapshotted",
         "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_one_shot_checkpoint_read_is_consumed_by_inspect",
         "tests/self_evolution/test_checkpoint_authority.py::TestCheckpointAuthority::test_checkpoint_list_rejects_unbounded_limits",
         "tests/self_evolution/test_checkpoint_fork.py::TestCheckpointFork::test_fork_from_checkpoint_does_not_resurrect_revoked_capability",
@@ -2446,6 +2473,11 @@
       "node_ids": [
         "tests/runtime/test_protected_operation_coverage.py::test_provider_subsystems_do_not_call_effect_lifecycle_directly",
         "tests/runtime/test_protected_operation_coverage.py::test_static_check_rejects_direct_effect_lifecycle",
+        "tests/runtime/test_protected_operation_coverage.py::test_static_check_rejects_reexport_and_alias_lifecycle_calls[public-reexport-import-alias]",
+        "tests/runtime/test_protected_operation_coverage.py::test_static_check_rejects_reexport_and_alias_lifecycle_calls[external-effects-import-alias]",
+        "tests/runtime/test_protected_operation_coverage.py::test_static_check_rejects_reexport_and_alias_lifecycle_calls[module-attribute-chained-alias]",
+        "tests/runtime/test_protected_operation_coverage.py::test_static_check_rejects_reexport_and_alias_lifecycle_calls[relative-reexport-import-alias]",
+        "tests/runtime/test_protected_operation_coverage.py::test_static_check_rejects_wildcard_lifecycle_reexport",
         "tests/runtime/test_protected_operation_coverage.py::test_static_check_rejects_provider_call_outside_sdk_phase",
         "tests/runtime/test_protected_operation_coverage.py::test_static_check_rejects_protected_provider_helper_called_directly",
         "tests/runtime/test_protected_operation_coverage.py::test_static_check_accepts_callback_invoked_only_inside_sdk_phase",
@@ -2463,6 +2495,8 @@
         "tests/runtime/test_protected_operation_sdk.py::test_sdk_preserves_classifier_provider_receipt_when_evidence_has_none",
         "tests/runtime/test_protected_operation_sdk.py::test_sdk_first_not_started_restores_reservation_and_abandons_intent",
         "tests/runtime/test_protected_operation_sdk.py::test_sdk_later_not_started_keeps_prior_information_flow",
+        "tests/runtime/test_protected_operation_sdk.py::test_sdk_later_not_started_after_noncommitting_phase_restores_authority",
+        "tests/runtime/test_protected_operation_sdk.py::test_sdk_later_not_started_after_default_phase_keeps_committed_authority",
         "tests/runtime/test_protected_operation_sdk.py::test_sdk_ordinary_provider_failure_is_unknown",
         "tests/runtime/test_protected_operation_sdk.py::test_sdk_preserve_result_does_not_replay_after_settlement_failure",
         "tests/runtime/test_protected_operation_sdk.py::test_sdk_prepare_failure_rolls_back_all_reservations_and_intent",

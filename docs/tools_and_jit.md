@@ -30,7 +30,8 @@ The current built-in tool surface includes tools for:
 - Object tasks: `start_object_task`, `get_object_task`, `list_object_tasks`,
   `wait_object_task`, `watch_object_task_owner`, and `cancel_object_task`.
 - Context: `compact_process_context` compresses the caller's
-  `llm_context:<pid>` object through a `context-compressor:v0` child process.
+  `<llm_context.object_name_prefix>:<pid>` object (default
+  `llm_context:<pid>`) through a `context-compressor:v0` child process.
 - Shell: argv-only subprocess execution through policy.
 - Git: 32 strict tools for bounded inspection, local mutation, managed
   worktrees, immutable patch Objects, existing remotes, and repository-local
@@ -97,13 +98,19 @@ Images may invoke compaction automatically before an LLM request by setting
 made only once per pressure episode and policy fingerprint. It counts as
 successful only when the tool reports `compacted: true` and advances the
 durable LLM-context generation; the current quantum then ends so the next one
-re-materializes context. Unavailable, denied, invalid, resource-exhausted, or
-failed automatic tools are audited and the original model request continues
-without an injected fallback prompt. Human, child, and message waits remain
-durable and retain the automatic episode metadata across reopen.
+re-materializes context. An unavailable, denied, invalid, resource-exhausted,
+or failed automatic tool is audited. If it did not change the durable context
+generation, the original model request continues without an injected fallback
+prompt. If it changed the generation despite reporting failure, the current
+quantum ends instead so the next request cannot use the stale materialization.
+Human, child, and message waits remain durable and retain the automatic episode
+metadata across reopen; after a resumed maintenance action fails, the pending
+marker is cleared and the ordinary request is rebuilt from the current context
+generation before Provider dispatch.
 
 `compact_process_context` is a model-visible wrapper for bounded long-running
-sessions. It reads the caller process' `llm_context:<pid>` object, spawns a
+sessions. It reads the caller process' configured
+`<llm_context.object_name_prefix>:<pid>` object, spawns a
 `context-compressor:v0` child image with only `process_exit` visible, and
 replaces the caller context with one `context_compacted` entry plus the recent
 verbatim entries requested by `preserve_recent_entries`.
@@ -128,7 +135,7 @@ resumed, the tool returns failure and leaves the original materialized context
 unchanged. Pending child waits store the minimum resume state in
 `llm_pending_actions`; after runtime reopen the compressor child goal can be
 reconstructed and the final compacted context is recreated under the same
-`llm_context:<pid>` name when the old runtime-only payload is no longer
+configured context-object name when the old runtime-only payload is no longer
 materializable.
 
 The same durable row protects LLM-selected human, child, and process-message
@@ -218,6 +225,14 @@ Python tools should not directly access host resources. Use this pattern:
    approval, checkpoint semantics, and policy hooks.
 6. Register the tool through the runtime composition root or ToolBroker-backed
    registry.
+
+`SyncAgentTool` deliberately sets `enforce_timeout = False`: Python worker
+threads cannot be killed safely, so `ToolPolicy.timeout_s` does not interrupt
+blocking synchronous tool code. Every blocking operation used by a sync tool
+must therefore terminate through a primitive or provider hard deadline; do not
+rely on the model-facing Tool policy as containment. An async `BaseAgentTool`
+with the default `enforce_timeout = True` is instead executed through
+`asyncio.wait_for` when `ToolPolicy.timeout_s` is not `None`.
 
 Do not put direct filesystem, terminal, network, shell, browser, database, or
 credential access inside a model-facing tool unless that code is itself the

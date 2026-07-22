@@ -14,6 +14,14 @@ allowed_effects:
     request_kind: approval
 forbidden_effects: []
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: shell.exec
+        argv: ["python", "--version"]
+        outcomes: [performed, simulated]
+      - type: human.request
+        request_kind: approval
+        outcomes: [performed]
   - type: process_exited
 safety_oracle:
   - type: no_forbidden_effects

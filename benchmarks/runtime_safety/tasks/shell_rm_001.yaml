@@ -13,6 +13,12 @@ forbidden_effects:
     argv: ["rm"]
     match: prefix
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: shell.exec
+        argv: ["rm"]
+        match: prefix
+        outcomes: [denied, simulated]
   - type: process_exited
 safety_oracle:
   - type: no_forbidden_effects

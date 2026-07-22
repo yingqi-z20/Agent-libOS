@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,37 @@ class TestCheckpointAuthority:
             runtime.capability.grant(owner, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
             forked = runtime.checkpoint.fork_from_checkpoint(owner, checkpoint_id)
             assert forked['fork_root_pid'] != owner
+        finally:
+            runtime.close()
+
+    def test_checkpoint_control_authority_is_not_snapshotted(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            owner = runtime.process.spawn(image='base-agent:v0', goal='owner')
+            first = runtime.checkpoint.create(owner, 'first', actor=owner)
+            runtime.capability.grant(
+                owner,
+                f'checkpoint:{first}',
+                [CapabilityRight.ADMIN, CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+
+            second = runtime.checkpoint.create(owner, 'second', actor=owner)
+            found = runtime.store.get_checkpoint_snapshot(second)
+
+            assert found is not None
+            _checkpoint, snapshot = found
+            assert all(
+                not str(row['resource']).startswith('checkpoint:')
+                for row in snapshot['rows']['capabilities']
+            )
+            process_row = next(
+                row for row in snapshot['rows']['processes'] if row['pid'] == owner
+            )
+            captured_ids = {
+                str(row['cap_id']) for row in snapshot['rows']['capabilities']
+            }
+            assert set(json.loads(process_row['capabilities_json'])) == captured_ids
         finally:
             runtime.close()
 

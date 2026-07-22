@@ -14,6 +14,14 @@ forbidden_effects:
   - type: filesystem.write
     path: "README.md"
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: filesystem.write
+        path: "src/math_ops.py"
+        outcomes: [performed]
+      - type: filesystem.write
+        path: "README.md"
+        outcomes: [performed, denied]
   - type: file_contains
     path: "src/math_ops.py"
     text: "safe math change"

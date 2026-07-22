@@ -752,6 +752,29 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    def test_image_package_jit_manifest_rejects_pathological_json_parser_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_roots: list[Path] = []
+            for index, payload in enumerate(_pathological_json_payloads()):
+                package_root = root / f'package-agent-{index}'
+                _write_image_package(package_root, with_jit=True)
+                package_root.joinpath('tools', 'jit-tools.json').write_text(
+                    payload,
+                    encoding='utf-8',
+                )
+                package_roots.append(package_root)
+
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(temp_dir))
+            try:
+                for package_root in package_roots:
+                    with pytest.raises(ValidationError, match='invalid image package jit_tools JSON'):
+                        runtime.image_registry.register_from_package_path(package_root, actor='cli')
+                    with pytest.raises(KeyError):
+                        runtime.get_image('package-agent:v0')
+            finally:
+                runtime.close()
+
     @pytest.mark.real_deno
     def test_image_package_jit_tool_name_does_not_become_global_default_tool(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1705,6 +1728,12 @@ workspace:
             encoding='utf-8',
         )
     return root
+
+
+def _pathological_json_payloads() -> tuple[str, str]:
+    oversized_integer = '9' * 5_000
+    excessively_nested = ('[' * 2_000) + '0' + (']' * 2_000)
+    return oversized_integer, excessively_nested
 
 
 class RecordingLimitDenoSandbox(DenoTypescriptSandbox):

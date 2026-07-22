@@ -82,22 +82,49 @@ checkpoint-committed image restores the process's captured
 `loaded_skills.package_snapshot`, but does not replace the current global Skill
 or Image registry with historical nested metadata.
 
-`prompt_mode` controls prompt composition. `image_only` uses the image prompt as
-the system prompt and gives the model only materialized task context; this is
-the default for custom images and image packages. `minimal_runtime` adds a
-short factual runtime note and state sections. `libos_default` preserves the
-native Agent libOS planner envelope and fallback JSON instructions used by the
-built-in images.
+`prompt_mode` controls prompt composition. `image_only` keeps the image prompt
+as the exact system prompt and omits the generic Runtime envelope. Its user
+prompt is exactly the materialized task context when no Skill is active; when
+the process has explicitly activated Skills, their loaded instructions precede
+that context without adding tool, capability, or generic action-protocol text.
+This is the default for custom images and image packages. `minimal_runtime`
+adds a short factual runtime note and state sections. `libos_default` preserves
+the native Agent libOS planner envelope and fallback JSON instructions used by
+the built-in images.
+
+The context helper uses the active Runtime's `llm_context.policy`,
+`llm_context.schema_version`, `llm_context.object_name_prefix`, and
+`llm_context.recent_event_limit`; these are not import-time constants. New
+context Objects carry the active schema version, and an existing context Object
+with a different schema fails closed before reuse. Event capture consumes the
+same configured, store-bounded window whose cursor the executor advances, so a
+window larger than the default does not silently lose its leading events.
 
 `planner.context_management` controls model-window pressure handling. With no
 entry, the image uses `auto_compact` at 80% projected occupancy and calls
 `compact_process_context`. `prompt` appends the image-owned literal reminder
 and numeric pressure facts in every prompt mode, including `image_only`;
-`disabled` records pressure but takes no action. Projected occupancy is the
-conservative complete-input estimate plus the profile's `max_tokens` output
-reservation. A configured automatic tool is never added to the process tool
-table: it must already be present and remains subject to its argument schema,
-Capability, resource, approval, event, and audit checks.
+`disabled` records pressure but takes no action. For stateless requests,
+projected occupancy is the deterministic conservative estimate of the complete
+assembled input plus the profile's `max_tokens` output reservation. An eligible
+Responses chain additionally adds the provider-reported lower bound for retained
+history; usage from a prior stateless/chat request is not reused. In `prompt`
+mode the Runtime applies a bounded fixed-point pass to the numeric notice, then
+re-estimates and records the exact notice-inclusive request. If that final
+request would exceed the configured context window, it records
+`prompt_notice_exceeds_context_window` and fails before provider dispatch.
+
+A configured automatic tool is never added to the process tool table: it must
+already be present and remains subject to its argument schema, Capability,
+resource, approval, event, and audit checks. One attempt is made per pressure
+episode and policy fingerprint. A successful compaction, or an initial failure
+that nevertheless changes the durable context generation, ends the current
+quantum so the next quantum re-materializes context. An initial failure with no
+generation change is audited and the original model request continues without
+an injected tool result or fallback prompt. Human, child, and message waits are
+durable; after such a wait resumes, failure terminally completes that pending
+generation and immediately rebuilds the ordinary request from the current
+context generation.
 
 Root process spawn never grants image `required_capabilities`.
 Requirements are copied into the Host-authored
@@ -305,12 +332,15 @@ by that program.
 
 Finite object write/delete decisions for `pty_write`, `pty_resize`, and
 `pty_close` are reserved before the host call. A certified not-started result
-restores that exact reservation only when no earlier provider observation in
-the operation flowed information; ordinary or ambiguous failures commit the
-use and retain pending/unknown evidence. When the child exits on its own, the
-monitor writes a close intent before reading the exit code and closing the
-handle. Once the exit-code read succeeds, even a later not-started close cannot
-abandon that information-flow intent.
+restores that exact reservation only when every completed earlier phase has
+`state_mutation=False`, `information_flow=False`, and
+`commits_authority=False`; ordinary or ambiguous failures commit the use and
+retain pending/unknown evidence. Because `commits_authority` defaults to true,
+even a successful otherwise non-effectful phase closes this restoration floor
+unless it explicitly opts out. When the child exits on its own, the monitor
+writes a close intent before reading the exit code and closing the handle. Once
+the exit-code read succeeds, even a later not-started close cannot abandon that
+information-flow intent.
 
 PTY spawn, write, resize, and close are external-effect operations. Each writes
 a structured pending intent before its provider boundary and conditionally
@@ -336,9 +366,9 @@ success lets same-process reopen perform the normal stale-object recovery.
 
 ## External Effect Ledger
 
-LLM, filesystem, clock, shell, human output/terminal I/O, PTY, JSON-RPC, and live MCP
-primitives close the crash gap around provider calls with a durable
-external-effect intent.
+LLM, filesystem, Git, clock, shell, human output/terminal I/O, PTY, JSON-RPC,
+and live MCP primitives close the crash gap around provider calls with a
+durable external-effect intent.
 Immediately before the provider boundary they insert an `unknown` record with
 structured `effect_state: pending`. A classified success or ambiguous provider
 exception CASes that same `effect_id` to `finalized`, matching its pid,
@@ -356,16 +386,18 @@ propagates `unknown` to its operation tree.
 
 `ProviderEffectNotStarted` is the only provider result that can prove its call
 boundary was not crossed. The primitive conditionally deletes a still-pending
-intent only when no earlier provider observation in the composite operation
-flowed information. Filesystem/clock/shell and PTY spawn restore any exact
-finite-use reservation and abandon the intent in one transaction. If an earlier
-filesystem state read or MCP live validation succeeded, a later not-started
-mutation/tool call finalizes an information-flow-only record. After the provider
-may have run, a failure in capability commit, resource/event/audit handling,
-classification, or final effect persistence leaves the pending `unknown` record
-in place. Checkpoint diff/restore and the runtime-safety benchmark consume that
-row conservatively, so a process crash cannot turn an uncertain external effect
-into “no effect recorded.”
+intent only when every completed earlier phase has neither mutated state nor
+observed information and explicitly used `commits_authority=False`. It restores
+any exact finite-use reservation and abandons the intent in one transaction. If
+an earlier filesystem state read or MCP live validation succeeded, a later
+not-started mutation/tool call finalizes the observed partial effect; a phase
+with the default `commits_authority=True` likewise prevents restoration even if
+its other two flags are false. After the provider may have run, a failure in
+capability commit, resource/event/audit handling, classification, or final
+effect persistence leaves the pending `unknown` record in place. Checkpoint
+diff/restore and the runtime-safety benchmark consume that row conservatively,
+so a process crash cannot turn an uncertain external effect into “no effect
+recorded.”
 
 Terminal human reads and automatic prompt/decision writes follow the same
 protocol. Their effect context contains request id, purpose, byte/character
@@ -464,12 +496,18 @@ By default it:
    budget is exhausted.
 
 `max_quanta` is a global budget across all process workers, not a per-process
-limit. A bounded run may briefly reserve extra dependency quanta when a running
-process is already waiting on a runnable child or message dependency and the
-main worker pool is full; that keeps parent/child waits from deadlocking behind
-the nominal budget. After budget exhaustion, `config.scheduler.drain_window_s`
-gives already-running workers a short chance to finish before unfinished quanta
-are cancelled or detached.
+limit. After a bounded run spends that nominal budget, it may reserve one extra
+quantum when at least one submitted future is still active but its persisted
+process status is `waiting_event`, `waiting_tool`, or `waiting_human`, and a
+different schedulable PID is runnable but has no submitted future. These
+unblock quanta use a separate executor and are capped at
+`max(1, max_quanta)` for the run; each reservation is audited as
+`scheduler.unblock_quantum_reserved`. This prevents a blocked future from
+starving work that may unblock it without claiming that the Runtime has proved
+a particular dependency relationship. Once neither an unblock reservation nor
+normal progress is possible, `config.scheduler.drain_window_s` gives active
+workers a short chance to finish before unfinished quanta are cancelled or
+detached.
 
 The scheduler serializes top-level `run_until_idle`, `run_pid_until_idle`, and
 single-step invocations for one `Runtime` instance, so two host calls cannot
@@ -493,14 +531,64 @@ For debugging pending approval states, disable human queue processing:
 results = await runtime.arun_until_idle(max_quanta=1, process_human_queue=False)
 ```
 
-`Runtime.shutdown()` first asks the scheduler to cancel and join tracked worker
-futures for up to `config.scheduler.shutdown_join_timeout_s`, then asks
-ObjectTask runners to drain their tool executor for up to
-`config.object_tasks.shutdown_join_timeout_s`. If a synchronous quantum or
-ObjectTask tool thread cannot stop safely, shutdown reports `ok: false` with
-`scheduler_stopped: false` or `object_tasks_stopped: false` and leaves the
-runtime store open rather than closing it underneath a live worker. Once the
-worker finishes, a later shutdown can complete normal resource cleanup.
+Hosts must always close a Runtime they own. Use the synchronous API only from a
+synchronous host:
+
+```python
+from agent_libos import Runtime
+
+runtime = Runtime.open("runtime.sqlite")
+try:
+    run_host(runtime)
+finally:
+    shutdown_result = runtime.shutdown()
+```
+
+An event-loop host must use the async lifecycle pair so loop-affine finalizers
+and components run on the caller loop:
+
+```python
+from agent_libos import Runtime
+
+runtime = await Runtime.aopen("runtime.sqlite")
+try:
+    await run_host(runtime)
+finally:
+    shutdown_result = await runtime.ashutdown()
+```
+
+`ashutdown()` also drains synchronous blocking cleanup off-loop. Calling
+`shutdown()` from a running event loop is rejected before admission closes when
+the Runtime has async-only shutdown work; event-loop hosts should not select it
+dynamically. In either form the host must inspect `shutdown_result["ok"]` and
+retain the Runtime for a retry or diagnostics handoff when it is false.
+Store-readiness misuse such as calling shutdown from the current store
+transaction raises during preflight before a shutdown attempt or result exists.
+
+Ordinary shutdown closes admission and drains active admission leases before it
+invokes component callbacks. While store ownership remains, it next attempts to
+record a `runtime.shutdown` audit row and `RUNTIME_SHUTDOWN` event; an evidence
+failure returns before any component callback. After successful evidence it
+stops the scheduler, stops ObjectTask runners, runs registered finalizers, stops
+modules, LLM clients, supervised blocking work, and the substrate, and finally
+claims and closes the store. The audit/event therefore means that a shutdown
+attempt reached the evidence phase; it is not a success marker for the later
+teardown stages.
+
+Scheduler shutdown cancels and joins tracked worker futures for up to
+`config.scheduler.shutdown_join_timeout_s`; ObjectTask shutdown drains its tool
+executor for up to `config.object_tasks.shutdown_join_timeout_s`. A retryable
+stage failure returns `ok: false`, `already_shutdown: false`, `reason`, a dynamic
+`<stage>_stopped: false` key such as `admission_stopped`,
+`shutdown_evidence_stopped`, `scheduler_stopped`, `object_tasks_stopped`, a
+`<finalizer-handle>_stopped` key, `modules_stopped`, `llms_stopped`,
+`blocking_work_stopped`, `substrate_stopped`, or `store_stopped`, and optional
+structured `errors`. The store remains open rather than closing underneath live
+work. Once the failed stage can stop, a later shutdown repeats the evidence when
+available and continues cleanup. Success returns `ok: true`,
+`already_shutdown`, and `reason`, plus optional `warnings`; a recovery fence
+instead returns `recovery_required: true` and requires the explicit handoff
+described below.
 Persistent stores also take an active-runtime lease: SQLite uses a secure
 sidecar `flock` where available or an exclusive database lock as fallback, and
 PostgreSQL uses a database/schema-scoped session advisory lock. Another
@@ -609,7 +697,8 @@ Context materialization has both a per-call cap
 (`max_context_materialization_total_tokens`). The cumulative context token
 budget is charged when Object Memory materializes prompt context and is
 accounted independently from provider-reported LLM tokens. In the LLM executor,
-the final rendered `llm_context:<pid>` prompt context is the charged unit;
+the final rendered `<config.llm_context.object_name_prefix>:<pid>` prompt
+context is the charged unit (the default prefix is `llm_context`);
 source object materialization for delta capture does not double-charge the same
 quantum, and over-budget rendered context fails closed before the model call.
 

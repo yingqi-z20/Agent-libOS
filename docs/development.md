@@ -5,6 +5,10 @@ real LLM paths, and documentation rules for Agent libOS contributors.
 
 ## Setup
 
+Use Python 3.11–3.14 and uv. The full matrix also requires system Git 2.26 or
+newer. GUI work requires Node `^20.19.0` or `>=22.12.0` with npm 8 or newer (CI
+uses Node 24). Deno is optional unless validating real TypeScript/JIT execution.
+
 Install dependencies:
 
 ```bash
@@ -12,12 +16,18 @@ uv sync --all-groups
 npm --prefix gui install
 ```
 
-Use frozen dependency resolution for artifact and CI-style checks:
+Use frozen resolution for the locked runtime/development dependency graph in
+artifact and CI-style checks:
 
 ```bash
 uv sync --frozen --all-groups
 npm --prefix gui ci
 ```
+
+`uv sync --frozen` does not freeze the isolated PEP 517 build backend:
+`pyproject.toml` currently requests an unconstrained `hatchling`. Do not describe
+`uv build` as build-backend reproducible unless a build constraint or pinned
+backend is added separately.
 
 Deno-backed tests run by default when `deno` is installed. If `deno` is absent,
 tests marked `real_deno` skip with a clear pytest reason; use
@@ -30,7 +40,7 @@ built with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))`.
 Run:
 
 ```bash
-uv run python -m compileall agent_libos tests scripts experiments benchmarks
+uv run python -m compileall agent_libos tests scripts experiments benchmarks modules
 uv run python scripts/test_matrix.py --lane unit
 uv run python scripts/test_matrix.py --lane security
 uv run python scripts/test_matrix.py --lane runtime
@@ -47,6 +57,19 @@ Run all deterministic Python lanes:
 uv run python scripts/test_matrix.py --lane all
 ```
 
+Optional provider gates are excluded unless selected explicitly:
+
+```bash
+uv sync --frozen --all-groups --extra mcp
+uv run python scripts/test_matrix.py --lane providers --run-mcp
+uv run python scripts/test_matrix.py --lane all --run-real-llm
+uv sync --frozen --all-groups --extra postgres
+uv run python -m pytest -m postgres --run-postgres
+```
+
+The real-LLM command may consume paid provider tokens and requires the Host
+environment described below. PostgreSQL requires a configured test service.
+
 Use pytest-xdist workers for faster local Python feedback:
 
 ```bash
@@ -60,9 +83,11 @@ execution with at most four workers and `--dist worksteal`, which balances long
 persistence and runtime-reopen tests. Pass `--workers 1` for serial failure
 diagnosis, or set `AGENT_LIBOS_TEST_WORKERS` / `AGENT_LIBOS_TEST_DIST` to
 override defaults. Pass `--durations 25` to report the slowest tests.
-`--max-lane-seconds` is a hard process-tree timeout for every selected lane,
-including `all`; timeout exits with status 124 after terminating the process
-group/tree. Standard lanes deselect `postgres` tests because the PostgreSQL CI
+`--max-lane-seconds` is a hard process-tree timeout for each selected command;
+the Python `all` lane is one command, while the GUI test, typecheck, and build
+commands each receive the full timeout independently. Timeout exits with status
+124 after terminating the process group/tree. Standard lanes deselect
+`postgres` tests because the PostgreSQL CI
 service runs them separately with `pytest -m postgres --run-postgres`. CI runs
 each standard lane with a 360-second process deadline and a 15-minute outer
 step deadline. Run the `gui` lane separately; it cleans Electron output before
@@ -114,7 +139,7 @@ uv run python experiments/collect_metrics.py --help
 Benchmark smoke:
 
 ```bash
-uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/docs-smoke
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/docs-smoke
 uv run python experiments/collect_metrics.py .benchmark_runs/docs-smoke
 ```
 
@@ -158,11 +183,16 @@ Configure the host environment, or pass an explicit env file to scripts that
 offer one. The runtime LLM client does not implicitly read a workspace `.env`.
 
 ```bash
-OPENAI_BASE_URL=https://example-openai-compatible-endpoint/v1
-OPENAI_LANGUAGE_MODEL=your-model
-OPENAI_API_KEY=...
-AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1
+export OPENAI_BASE_URL=https://example-openai-compatible-endpoint/v1
+export OPENAI_LANGUAGE_MODEL=your-model
+export OPENAI_API_KEY=...
+export AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1
 ```
+
+Use plain `KEY=value` lines in an env file and pass it only to an entrypoint
+that explicitly supports one, for example
+`uv run --env-file .env agent-libos ...`. In PowerShell, set inherited values
+with `$env:NAME = "value"`.
 
 Useful optional variables:
 

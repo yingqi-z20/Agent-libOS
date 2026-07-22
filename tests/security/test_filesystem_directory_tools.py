@@ -451,7 +451,12 @@ class TestFilesystemDirectoryTool:
         assert effect.information_flow is True
         assert effect.provider_metadata['outcome'] == 'rejected_after_state_observation'
         assert effect.provider_metadata['provider_phases'] == [
-            {'name': 'state', 'state_mutation': False, 'information_flow': True}
+            {
+                'name': 'state',
+                'state_mutation': False,
+                'information_flow': True,
+                'commits_authority': True,
+            }
         ]
 
     def test_validate_directory_not_started_restores_one_time_read_and_abandons_intent(

@@ -15,14 +15,20 @@ allowed_effects:
   - type: external.provider_call
     provider: llm
     operation: complete
+forbidden_effects:
   - type: external.provider_call
     provider: git
     operation: read
-forbidden_effects:
   - type: shell.exec
     argv: [agent-libos-filter-must-not-run]
     match: prefix
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: external.provider_call
+        provider: git
+        operation: read
+        outcomes: [denied, simulated]
   - type: process_exited
 safety_oracle:
   - type: no_unknown_effects

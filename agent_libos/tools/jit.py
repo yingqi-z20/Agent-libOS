@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import math
 from collections.abc import Callable, Iterable
 from itertools import islice
 from typing import Any
@@ -853,6 +854,28 @@ class JITToolService:
             spec.output_schema or {"type": "object"},
             "output_schema",
         )
+        timeout = spec.policy.get("sandbox_timeout_s")
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                raise ValidationError("JIT tool sandbox_timeout_s must be a number")
+            if isinstance(timeout, int):
+                if timeout <= 0:
+                    raise ValidationError(
+                        "JIT tool sandbox_timeout_s must be finite and > 0"
+                    )
+                if timeout > self.config.tools.deno_timeout_hard_limit_s:
+                    raise ValidationError(
+                        "JIT tool sandbox_timeout_s exceeds tools.deno_timeout_hard_limit_s="
+                        f"{self.config.tools.deno_timeout_hard_limit_s}"
+                    )
+            selected_timeout = float(timeout)
+            if not math.isfinite(selected_timeout) or selected_timeout <= 0:
+                raise ValidationError("JIT tool sandbox_timeout_s must be finite and > 0")
+            if selected_timeout > self.config.tools.deno_timeout_hard_limit_s:
+                raise ValidationError(
+                    "JIT tool sandbox_timeout_s exceeds tools.deno_timeout_hard_limit_s="
+                    f"{self.config.tools.deno_timeout_hard_limit_s}"
+                )
 
     def _validate_json_schema(self, schema: dict[str, Any], field: str) -> None:
         if not isinstance(schema, dict):

@@ -21,6 +21,24 @@ Objects have:
 Object handles carry object-specific rights such as `read`, `write`,
 `materialize`, `link`, `diff`, or `delete`.
 
+`ObjectType` is a closed enum. The accepted values are `task`, `goal`, `plan`,
+`step`, `constraint`, `message`, `human_decision`, `human_request`,
+`tool_result`, `observation`, `error_trace`, `code_patch`, `test_result`,
+`evidence`, `claim`, `summary`, `skill`, `tool_spec`, `tool_candidate`,
+`tool_artifact`, `checkpoint`, `process_state`, `external_ref`, and `artifact`.
+`Runtime.memory.create_object(...)` accepts an `ObjectType` member or its exact
+string value and rejects values outside this set.
+
+Object metadata passed to `Runtime.memory.create_object(...)` is a complete
+`ObjectMetadata` value, not a mapping merged with the configured defaults. If
+it is omitted, the manager starts with the active Runtime's
+`memory.metadata_sensitivity` and `memory.metadata_retention_policy`. The
+model-facing `create_memory_object` tool accepts a partial metadata mapping and
+uses those same active Runtime values when `sensitivity` or `retention_policy`
+is absent. In both APIs, `token_estimate` is Runtime-managed derived metadata:
+the manager computes it from the payload rather than trusting a caller-supplied
+value.
+
 `created_by` is provenance and does not drive cleanup. Runtime cleanup uses the
 explicit owner pair. Ordinary process-created objects start as
 `owner_kind=process`, `owner_id=<pid>`. A final result is retained by
@@ -145,6 +163,48 @@ first successful listing and is absent from the next; listing cannot use a
 temporary visibility grant as a reusable directory oracle. Validation, audit,
 or settlement failure rolls back the whole listing consumption.
 
+## Query API
+
+The public Python API accepts an `ObjectQuery` and returns bounded, read-only
+handles rather than Object payloads:
+
+```python
+from agent_libos import ObjectQuery, ObjectType
+
+handles = runtime.memory.query_objects(
+    pid,
+    ObjectQuery(
+        namespace="project/research",
+        type=ObjectType.OBSERVATION,
+        tags=["source"],
+        text="README",
+        limit=10,
+    ),
+)
+```
+
+`namespace` defaults to the caller's process namespace. `name` selects an exact
+namespace-local name. The `type`, required `tags`, and case-insensitive `text`
+filters are ANDed; text search covers the namespace, name, title, summary,
+tags, and a bounded payload preview. Results use deterministic recent-first
+ordering. A missing `limit` uses the active `memory.query_limit`; an explicit
+limit must be an integer from 1 through that configured maximum. It is
+validated before the namespace scan.
+
+Querying requires `read` on `object_namespace:<namespace>`, and each returned
+Object independently requires `read` on `object:<oid>`. Objects without that
+authority are omitted. Returned handles carry only `read`; querying does not
+grant `materialize`, `link`, or any write right.
+
+Finite-use authority is settled while the handles are issued. A finite Object
+read used for a result is consumed and yields a correspondingly finite derived
+handle, rather than a reusable one. A full namespace query consumes the
+namespace-read decision even when no Object matches because the scan itself is
+the authorized operation. An exact-name query that finds no readable Object
+returns an empty list without consuming the namespace-read use. Concurrent
+attempts cannot turn one finite namespace use into multiple successful query
+operations.
+
 ## Memory Views
 
 Processes hold `MemoryView` objects that summarize which objects are visible as
@@ -176,7 +236,13 @@ the exact reservation removes the unpublished handle, so a failed merge cannot
 leave durable authority behind.
 
 `ObjectPatch()` leaves object payload unchanged. `ObjectPatch(payload=None)`
-explicitly writes JSON `null` as the payload.
+explicitly writes JSON `null` as the payload. Omitting `ObjectPatch.metadata`
+preserves all current metadata; supplying it replaces the complete
+`ObjectMetadata` value rather than merging individual fields. The manager then
+recomputes the Runtime-owned `token_estimate` from the selected payload. Thus a
+payload-only update preserves labels and descriptive fields while refreshing
+the estimate, and a payload-plus-metadata update cannot retain an estimate for
+the old payload.
 
 ## Object Links
 
@@ -353,7 +419,9 @@ revalidate source versions before dispatch. See [Data Flow](data_flow.md).
 
 The LLM executor materializes prompt context from process state, event facts,
 capability snapshots, object summaries, loaded Skills, and visible tool schemas.
-Each process also has a mutable context object named `llm_context:<pid>`.
+Each process also has a mutable context object named
+`<llm_context.object_name_prefix>:<pid>`. The prefix is configurable; its
+default is `llm_context`, so the default name is `llm_context:<pid>`.
 
 The runtime appends new process facts and summaries to the end of that object so
 repeated prompt prefixes remain stable for prompt caching.
@@ -390,11 +458,11 @@ append-style writes still refresh that estimate as advisory metadata, but stale
 or attacker-supplied estimates cannot make enlarged rendered content fit under
 the prompt budget.
 
-For LLM execution, the append-only `llm_context:<pid>` render is the charged
-context. Source object materialization selects and records deltas without
-double-charging the same quantum. The rendered context must fit both the
-per-call materialization window and the cumulative materialization budget before
-the model is called.
+For LLM execution, the append-only configured context Object render is the
+charged context. Source object materialization selects and records deltas
+without double-charging the same quantum. The rendered context must fit both
+the per-call materialization window and the cumulative materialization budget
+before the model is called.
 
 LLM context preparation now persists a metadata-only Context Materialization
 Manifest. For each source Object it records oid/version/type, included or

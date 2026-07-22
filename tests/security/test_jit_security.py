@@ -142,6 +142,28 @@ class TestJitSecurity:
         assert 'filesystem.write' in candidate.spec.side_effects
         assert 'jsonrpc.call' in candidate.spec.side_effects
 
+    def test_jit_candidate_rejects_oversized_integer_sandbox_timeout(self) -> None:
+        owner = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='reject oversized timeout',
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match='deno_timeout_hard_limit_s=60.0',
+        ):
+            self.runtime.tools.propose(
+                owner,
+                {
+                    'name': 'oversized_timeout',
+                    'description': 'Must fail before integer-to-float conversion.',
+                    'input_schema': {'type': 'object'},
+                    'output_schema': {'type': 'object'},
+                    'policy': {'sandbox_timeout_s': 10**400},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
     def test_jit_registration_publishes_durable_alias_and_executable_handle_together(
         self,
         monkeypatch: pytest.MonkeyPatch,

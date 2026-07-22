@@ -813,6 +813,14 @@ class TestConfigDefaults:
                     executable_snapshot_sibling_limit=0,
                 )
             )
+        with pytest.raises(PydanticValidationError, match='deno_timeout_hard_limit_s'):
+            AgentLibOSConfig(
+                tools=replace(
+                    DEFAULT_CONFIG.tools,
+                    deno_timeout_s=61,
+                    deno_timeout_hard_limit_s=60,
+                )
+            )
 
     def test_config_rejects_unknown_image_grant_mode(self) -> None:
         with pytest.raises(PydanticValidationError, match="launch_authority_mode"):

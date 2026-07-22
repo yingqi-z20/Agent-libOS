@@ -7,7 +7,11 @@ import pytest
 from agent_libos.models import DataFlowDirection
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.sdk import ProtectedOperationInvocation
-from scripts.check_protected_operations import check_tree, scan_source
+from scripts.check_protected_operations import (
+    ALLOWED_LIFECYCLE_FILES,
+    check_tree,
+    scan_source,
+)
 from tests.support.runtime import temporary_runtime
 
 
@@ -27,6 +31,88 @@ def test_static_check_rejects_direct_effect_lifecycle(tmp_path: Path) -> None:
     errors = scan_source(source, relative=Path("agent_libos/primitives/bad_provider.py"))
     assert any("direct import" in error for error in errors)
     assert any("direct record_external_effect call" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    (
+        pytest.param(
+            "from agent_libos.evidence import record_external_effect as effect\n"
+            "def unsafe(store):\n"
+            "    return effect(store)\n",
+            id="public-reexport-import-alias",
+        ),
+        pytest.param(
+            "from agent_libos.evidence.external_effects import (\n"
+            "    record_external_effect as imported_effect,\n"
+            ")\n"
+            "def unsafe(store):\n"
+            "    effect = imported_effect\n"
+            "    return effect(store)\n",
+            id="external-effects-import-alias",
+        ),
+        pytest.param(
+            "import agent_libos.evidence as evidence\n"
+            "def unsafe(store):\n"
+            "    first = evidence.record_external_effect\n"
+            "    second = first\n"
+            "    return second(store)\n",
+            id="module-attribute-chained-alias",
+        ),
+        pytest.param(
+            "from ..evidence import record_external_effect as effect\n"
+            "def unsafe(store):\n"
+            "    return effect(store)\n",
+            id="relative-reexport-import-alias",
+        ),
+    ),
+)
+def test_static_check_rejects_reexport_and_alias_lifecycle_calls(
+    tmp_path: Path,
+    source_text: str,
+) -> None:
+    source = tmp_path / "aliased_lifecycle.py"
+    source.write_text(source_text, encoding="utf-8")
+
+    errors = scan_source(
+        source,
+        relative=Path("agent_libos/primitives/aliased_lifecycle.py"),
+    )
+
+    assert any("direct record_external_effect call" in error for error in errors)
+    assert any("bypasses agent_libos.sdk" in error for error in errors)
+
+
+def test_static_check_rejects_wildcard_lifecycle_reexport(tmp_path: Path) -> None:
+    source = tmp_path / "wildcard_lifecycle.py"
+    source.write_text(
+        "from agent_libos.evidence import *\n",
+        encoding="utf-8",
+    )
+
+    errors = scan_source(
+        source,
+        relative=Path("agent_libos/primitives/wildcard_lifecycle.py"),
+    )
+
+    assert any("wildcard lifecycle import" in error for error in errors)
+
+
+@pytest.mark.parametrize("relative", tuple(ALLOWED_LIFECYCLE_FILES))
+def test_static_check_allows_lifecycle_aliases_in_lifecycle_files(
+    tmp_path: Path,
+    relative: Path,
+) -> None:
+    source = tmp_path / "allowed_lifecycle.py"
+    source.write_text(
+        "from agent_libos.evidence import record_external_effect as effect\n"
+        "alias = effect\n"
+        "def allowed(store):\n"
+        "    return alias(store)\n",
+        encoding="utf-8",
+    )
+
+    assert scan_source(source, relative=relative) == []
 
 
 def test_static_check_rejects_provider_call_outside_sdk_phase(tmp_path: Path) -> None:

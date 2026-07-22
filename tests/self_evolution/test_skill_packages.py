@@ -10,10 +10,11 @@ from typing import Any
 import pytest
 
 from agent_libos import Runtime
-from agent_libos.config import AgentLibOSConfig, SkillDefaults
+from agent_libos.config import AgentLibOSConfig, SkillDefaults, ToolDefaults
 from agent_libos.models import AgentImage, CapabilityRight
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
+from agent_libos.skills.schema import JitToolSpec, SkillPackage
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from tests.support.skills import write_raw_skill, write_skill_package
 
@@ -56,6 +57,47 @@ class TestSkillPackageLoading:
         finally:
             runtime.close()
 
+    def test_skill_discovery_uses_only_configured_workspace_roots_and_deduplicates_aliases(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_raw_skill(
+                root / 'custom-catalog',
+                'configured-skill',
+                'name: configured-skill\ndescription: Configured catalog Skill.\n',
+            )
+            write_raw_skill(
+                root / 'skills',
+                'implicit-skill',
+                'name: implicit-skill\ndescription: Must not be discovered implicitly.\n',
+            )
+            monkeypatch.chdir(root)
+            config = AgentLibOSConfig(
+                skills=replace(
+                    SkillDefaults(),
+                    workspace_dirs=('custom-catalog', './custom-catalog'),
+                    global_dirs=(str(root / 'global-catalog'),),
+                )
+            )
+            runtime = Runtime.open('local', config=config)
+            try:
+                loaded_paths: list[Path] = []
+                original_load = runtime.skills._load_package_from_host_path
+
+                def record_load(path: str | Path):
+                    loaded_paths.append(Path(path).resolve())
+                    return original_load(path)
+
+                monkeypatch.setattr(runtime.skills, '_load_package_from_host_path', record_load)
+                discovered = runtime.skills.discover_skills(require_capability=False)
+
+                assert [item['skill_id'] for item in discovered] == ['configured-skill']
+                assert loaded_paths == [(root / 'custom-catalog' / 'configured-skill').resolve()]
+            finally:
+                runtime.close()
+
 
     def test_standard_package_validation_and_global_trust(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -91,6 +133,67 @@ class TestSkillPackageLoading:
                     write_skill_package(root, 'bad-right', required_capabilities=[{'resource': 'filesystem:workspace:*', 'rights': ['*']}])
             finally:
                 runtime.close()
+
+    def test_programmatic_skill_registration_rejects_invalid_jit_timeouts(self) -> None:
+        hard_limit = 7.0
+        config = AgentLibOSConfig(
+            tools=replace(
+                ToolDefaults(),
+                deno_timeout_s=5.0,
+                deno_timeout_hard_limit_s=hard_limit,
+            )
+        )
+        invalid_cases = (
+            (True, 'must be a number'),
+            ('5', 'must be a number'),
+            (float('nan'), 'must be finite and > 0'),
+            (float('inf'), 'must be finite and > 0'),
+            (0, 'must be finite and > 0'),
+            (-1.0, 'must be finite and > 0'),
+            (hard_limit + 0.01, 'deno_timeout_hard_limit_s=7.0'),
+            (10**400, 'deno_timeout_hard_limit_s=7.0'),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            for index, (timeout_s, message) in enumerate(invalid_cases):
+                skill_id = f'invalid-jit-timeout-{index}'
+                package = _programmatic_jit_skill(skill_id, timeout_s)
+
+                with pytest.raises(ValidationError, match=message):
+                    runtime.skills.register_skill_package(
+                        package,
+                        actor='cli',
+                        require_capability=False,
+                    )
+
+                assert runtime.store.get_skill(skill_id) is None
+        finally:
+            runtime.close()
+
+    def test_programmatic_skill_registration_accepts_valid_jit_timeouts(self) -> None:
+        hard_limit = 7.0
+        config = AgentLibOSConfig(
+            tools=replace(
+                ToolDefaults(),
+                deno_timeout_s=5.0,
+                deno_timeout_hard_limit_s=hard_limit,
+            )
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            for index, timeout_s in enumerate((None, 1, 1.25, hard_limit)):
+                skill_id = f'valid-jit-timeout-{index}'
+                registered = runtime.skills.register_skill_package(
+                    _programmatic_jit_skill(skill_id, timeout_s),
+                    actor='cli',
+                    require_capability=False,
+                )
+                persisted, _metadata = runtime.store.get_skill(skill_id)
+
+                assert registered['skill_id'] == skill_id
+                assert persisted.jit_tools[0].timeout_s == timeout_s
+        finally:
+            runtime.close()
 
     def test_failed_skill_replace_rolls_back_registry_and_restores_one_time_write(self, monkeypatch) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -461,6 +564,285 @@ class TestSkillPackageLoading:
                 assert not runtime.capability.check(pid, 'skill:workspace-skill', CapabilityRight.EXECUTE)
                 resource = runtime.skills.read_skill_resource(pid, 'workspace-skill', 'references/guide.md')
                 assert resource['content'] == 'Workspace resource guide.'
+            finally:
+                runtime.close()
+
+    def test_host_skill_json_metadata_rejects_pathological_parser_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime = Runtime.open('local')
+            try:
+                for index, payload in enumerate(_pathological_json_payloads()):
+                    skill_dir = write_skill_package(
+                        root,
+                        f'host-json-limit-{index}',
+                        actions=[{'name': 'review', 'use_cases': ['Review a change.']}],
+                    )
+                    (skill_dir / 'references' / 'agent-libos' / 'actions.json').write_text(
+                        payload,
+                        encoding='utf-8',
+                    )
+
+                    with pytest.raises(ValidationError, match='invalid JSON skill metadata resource'):
+                        runtime.skills.validate_package_path(skill_dir)
+            finally:
+                runtime.close()
+
+    def test_workspace_skill_json_metadata_rejects_pathological_parser_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_names: list[str] = []
+            for index, payload in enumerate(_pathological_json_payloads()):
+                name = f'workspace-json-limit-{index}'
+                package_names.append(name)
+                skill_dir = write_skill_package(
+                    root,
+                    name,
+                    jit_tools=[
+                        {
+                            'name': f'check_{index}',
+                            'description': 'Return a deterministic result.',
+                            'source_path': 'scripts/check.ts',
+                        }
+                    ],
+                    scripts={
+                        'scripts/check.ts': (
+                            'export async function run() { return {ok: true}; }\n'
+                        )
+                    },
+                )
+                (skill_dir / 'references' / 'agent-libos' / 'jit-tools.json').write_text(
+                    payload,
+                    encoding='utf-8',
+                )
+
+            runtime = Runtime.open(
+                'local',
+                substrate=LocalResourceProviderSubstrate(temp_dir),
+            )
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='reject pathological Skill JSON')
+                for name in package_names:
+                    runtime.filesystem.grant_path(
+                        pid,
+                        f'{name}/SKILL.md',
+                        [CapabilityRight.READ],
+                        issued_by='test',
+                    )
+                    runtime.filesystem.grant_path(
+                        pid,
+                        f'{name}/references/agent-libos/jit-tools.json',
+                        [CapabilityRight.READ],
+                        issued_by='test',
+                    )
+
+                    with pytest.raises(ValidationError, match='invalid JSON skill metadata resource'):
+                        runtime.skills.register_skill_from_workspace_path(
+                            pid,
+                            name,
+                            require_capability=False,
+                        )
+                    assert runtime.store.get_skill(name) is None
+            finally:
+                runtime.close()
+
+    def test_workspace_skill_rejects_truncated_skill_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill_dir = root / 'truncated-skill-md'
+            skill_dir.mkdir()
+            complete_prefix = (
+                '---\n'
+                'name: truncated-skill-md\n'
+                'description: Reject a partial Skill manifest.\n'
+                '---\n\n'
+                '# Complete visible prefix\n'
+            ).encode('utf-8')
+            (skill_dir / 'SKILL.md').write_bytes(complete_prefix + b'Hidden suffix must not be omitted.\n')
+            config = AgentLibOSConfig(
+                skills=replace(SkillDefaults(), skill_md_max_bytes=len(complete_prefix))
+            )
+            runtime = Runtime.open(
+                'local',
+                substrate=LocalResourceProviderSubstrate(temp_dir),
+                config=config,
+            )
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='reject truncated Skill')
+                runtime.filesystem.grant_path(
+                    pid,
+                    'truncated-skill-md/SKILL.md',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                with pytest.raises(ValidationError, match='skill_md_max_bytes'):
+                    runtime.skills.register_skill_from_workspace_path(
+                        pid,
+                        'truncated-skill-md',
+                        require_capability=False,
+                    )
+                assert runtime.store.get_skill('truncated-skill-md') is None
+            finally:
+                runtime.close()
+
+    def test_workspace_skill_rejects_truncated_explicit_metadata_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill_dir = write_skill_package(
+                root,
+                'truncated-reference',
+                actions=[{'name': 'review', 'use_cases': ['Review a change.']}],
+            )
+            reference = skill_dir / 'references' / 'agent-libos' / 'actions.json'
+            complete_prefix = reference.read_bytes()
+            reference.write_bytes(complete_prefix + b' ')
+            config = AgentLibOSConfig(
+                skills=replace(SkillDefaults(), resource_read_max_bytes=len(complete_prefix))
+            )
+            runtime = Runtime.open(
+                'local',
+                substrate=LocalResourceProviderSubstrate(temp_dir),
+                config=config,
+            )
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='reject truncated Skill reference')
+                runtime.filesystem.grant_path(
+                    pid,
+                    'truncated-reference/SKILL.md',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                runtime.filesystem.grant_path(
+                    pid,
+                    'truncated-reference/references/agent-libos/actions.json',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                with pytest.raises(ValidationError, match='metadata resource exceeds'):
+                    runtime.skills.register_skill_from_workspace_path(
+                        pid,
+                        'truncated-reference',
+                        require_capability=False,
+                    )
+                assert runtime.store.get_skill('truncated-reference') is None
+            finally:
+                runtime.close()
+
+    def test_workspace_skill_rejects_truncated_jit_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path = 'scripts/check.ts'
+            source_prefix = 'export default async function main() { return {ok: true}; }\n'
+            skill_dir = write_skill_package(
+                root,
+                'truncated-jit-source',
+                jit_tools=[
+                    {
+                        'name': 'check',
+                        'description': 'Return a deterministic result.',
+                        'source_path': source_path,
+                    }
+                ],
+                scripts={source_path: source_prefix},
+            )
+            jit_manifest = skill_dir / 'references' / 'agent-libos' / 'jit-tools.json'
+            read_limit = max(len(jit_manifest.read_bytes()), len(source_prefix.encode('utf-8')))
+            padded_source = source_prefix.encode('utf-8').ljust(read_limit, b' ')
+            (skill_dir / source_path).write_bytes(padded_source + b'// omitted suffix\n')
+            config = AgentLibOSConfig(
+                skills=replace(
+                    SkillDefaults(),
+                    resource_read_max_bytes=read_limit,
+                    max_jit_source_chars=read_limit,
+                )
+            )
+            runtime = Runtime.open(
+                'local',
+                substrate=LocalResourceProviderSubstrate(temp_dir),
+                config=config,
+            )
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='reject truncated Skill JIT')
+                for path in (
+                    'truncated-jit-source/SKILL.md',
+                    'truncated-jit-source/references/agent-libos/jit-tools.json',
+                    'truncated-jit-source/scripts/check.ts',
+                ):
+                    runtime.filesystem.grant_path(pid, path, [CapabilityRight.READ], issued_by='test')
+
+                with pytest.raises(ValidationError, match='JIT source exceeds'):
+                    runtime.skills.register_skill_from_workspace_path(
+                        pid,
+                        'truncated-jit-source',
+                        require_capability=False,
+                    )
+                assert runtime.store.get_skill('truncated-jit-source') is None
+            finally:
+                runtime.close()
+
+    def test_workspace_jit_source_character_limit_preserves_complete_multibyte_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path = 'scripts/unicode.ts'
+            source = (
+                f"// {'界' * 20}\n"
+                'export default async function main() { return {ok: true}; }\n'
+            )
+            skill_dir = write_skill_package(
+                root,
+                'unicode-jit-source',
+                jit_tools=[
+                    {
+                        'name': 'unicode_check',
+                        'description': 'Keep the complete Unicode source.',
+                        'source_path': source_path,
+                    }
+                ],
+                scripts={source_path: source},
+            )
+            jit_manifest = skill_dir / 'references' / 'agent-libos' / 'jit-tools.json'
+            resource_limit = max(len(source.encode('utf-8')), len(jit_manifest.read_bytes()))
+            assert len(source.encode('utf-8')) > len(source)
+            config = AgentLibOSConfig(
+                skills=replace(
+                    SkillDefaults(),
+                    resource_read_max_bytes=resource_limit,
+                    max_jit_source_chars=len(source),
+                ),
+                # Skill packages have a fixed UTF-8 format and their hashes
+                # must not depend on the general-purpose text-tool encoding.
+                tools=replace(ToolDefaults(), default_text_encoding='utf-16'),
+            )
+            runtime = Runtime.open(
+                'local',
+                substrate=LocalResourceProviderSubstrate(temp_dir),
+                config=config,
+            )
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='snapshot Unicode Skill JIT')
+                for path in (
+                    'unicode-jit-source/SKILL.md',
+                    'unicode-jit-source/references/agent-libos/jit-tools.json',
+                    'unicode-jit-source/scripts/unicode.ts',
+                ):
+                    runtime.filesystem.grant_path(pid, path, [CapabilityRight.READ], issued_by='test')
+
+                registered = runtime.skills.register_skill_from_workspace_path(
+                    pid,
+                    'unicode-jit-source',
+                    require_capability=False,
+                )
+                package, _metadata = runtime.store.get_skill('unicode-jit-source')
+
+                assert registered['skill_id'] == 'unicode-jit-source'
+                assert package.jit_tools[0].source == source
+                source_resource = next(
+                    resource for resource in package.resources if resource.path == source_path
+                )
+                assert source_resource.size_bytes == len(source.encode('utf-8'))
+                assert source_resource.content == source
             finally:
                 runtime.close()
 
@@ -880,3 +1262,30 @@ class TestSkillPackageLoading:
 
     def _run(self, awaitable: Any) -> Any:
         return asyncio.run(awaitable)
+
+
+def _programmatic_jit_skill(skill_id: str, timeout_s: Any) -> SkillPackage:
+    return SkillPackage(
+        skill_id=skill_id,
+        name=skill_id,
+        description='Programmatic Skill JIT timeout validation.',
+        instructions='Use the programmatic JIT tool.',
+        jit_tools=[
+            JitToolSpec(
+                name=f'{skill_id}_tool'.replace('-', '_'),
+                description='Return a deterministic result.',
+                source_path='scripts/check.ts',
+                source=(
+                    'export async function run(args: unknown, libos: unknown) '
+                    '{ return {ok: true}; }\n'
+                ),
+                timeout_s=timeout_s,
+            )
+        ],
+    )
+
+
+def _pathological_json_payloads() -> tuple[str, str]:
+    oversized_integer = '9' * 5_000
+    excessively_nested = ('[' * 2_000) + '0' + (']' * 2_000)
+    return oversized_integer, excessively_nested

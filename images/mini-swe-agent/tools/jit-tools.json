@@ -3,6 +3,7 @@
     "name": "bash",
     "description": "Run one bash command for the current mini-swe-agent step and return the command observation.",
     "source_path": "tools/scripts/bash.ts",
+    "timeout_s": 35,
     "input_schema": {
       "type": "object",
       "properties": {

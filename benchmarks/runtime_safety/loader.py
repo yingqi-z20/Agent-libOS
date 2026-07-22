@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.utils.yaml_loader import load_yaml_mapping
-from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationError, VALID_EFFECT_TYPES
+from benchmarks.runtime_safety.models import (
+    BenchmarkTask,
+    BenchmarkValidationError,
+    VALID_EFFECT_OUTCOMES,
+    VALID_EFFECT_TYPES,
+)
 
 REQUIRED_FIELDS = {
     "schema_version",
@@ -51,9 +56,11 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
         raise BenchmarkValidationError(f"{source}: id must be lowercase snake_case, got {task_id!r}")
     allowed = _validate_effect_list(data.get("allowed_effects"), source, "allowed_effects")
     forbidden = _validate_effect_list(data.get("forbidden_effects"), source, "forbidden_effects")
-    success_oracle = _validate_mapping_list(data.get("success_oracle"), source, "success_oracle")
+    success_oracle = _validate_success_oracle(data.get("success_oracle"), source)
     safety_oracle = _validate_mapping_list(data.get("safety_oracle"), source, "safety_oracle")
     mock_actions = _validate_mapping_list(data.get("mock_actions", []), source, "mock_actions")
+    setup = _optional_mapping(data.get("setup", {}), source, "setup")
+    _validate_git_source_references(setup, success_oracle, source)
     for index, action in enumerate(mock_actions):
         if not isinstance(action.get("action"), str) or not action["action"]:
             raise BenchmarkValidationError(f"{source}: mock_actions[{index}] requires non-empty action")
@@ -69,7 +76,7 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
         success_oracle=success_oracle,
         safety_oracle=safety_oracle,
         schema_version=1,
-        setup=_optional_mapping(data.get("setup", {}), source, "setup"),
+        setup=setup,
         capabilities=_optional_mapping(data.get("capabilities", {}), source, "capabilities"),
         policy=_optional_mapping(data.get("policy", {}), source, "policy"),
         human_responses=_validate_mapping_list(data.get("human_responses", []), source, "human_responses"),
@@ -166,6 +173,118 @@ def _validate_effect_list(value: Any, source: Path, field: str) -> list[dict[str
     return effects
 
 
+def _validate_success_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
+    checks = _validate_mapping_list(value, source, "success_oracle")
+    if not checks:
+        raise BenchmarkValidationError(f"{source}: success_oracle must be non-empty")
+    for index, check in enumerate(checks):
+        check_type = check.get("type")
+        if check_type == "managed_git_worktree":
+            root = check.get("root")
+            if root is not None:
+                check["root"] = _safe_relative_path(
+                    str(root),
+                    source,
+                    f"success_oracle[{index}].root",
+                )
+            continue
+        if check_type == "git_patch_artifact_lineage":
+            for key in ("source_object", "sensitivity"):
+                _validate_non_empty_string(
+                    check,
+                    key,
+                    source,
+                    f"success_oracle[{index}].{key}",
+                )
+            _validate_non_empty_string(
+                check,
+                "artifact_origin",
+                source,
+                f"success_oracle[{index}].artifact_origin",
+                required=False,
+            )
+            _validate_non_empty_string(
+                check,
+                "source_origin",
+                source,
+                f"success_oracle[{index}].source_origin",
+                required=False,
+            )
+            continue
+        if check_type != "expected_effects":
+            continue
+        field = f"success_oracle[{index}].effects"
+        effects = _validate_effect_list(check.get("effects"), source, field)
+        if not effects:
+            raise BenchmarkValidationError(f"{source}: {field} must be non-empty")
+        for effect_index, effect in enumerate(effects):
+            outcomes = effect.get("outcomes", ["performed"])
+            if not isinstance(outcomes, list) or not outcomes:
+                raise BenchmarkValidationError(
+                    f"{source}: {field}[{effect_index}].outcomes must be a non-empty list"
+                )
+            invalid = [
+                outcome
+                for outcome in outcomes
+                if not isinstance(outcome, str)
+                or outcome not in VALID_EFFECT_OUTCOMES
+            ]
+            if invalid:
+                raise BenchmarkValidationError(
+                    f"{source}: {field}[{effect_index}].outcomes contains invalid values {invalid!r}"
+                )
+            effect["outcomes"] = list(dict.fromkeys(outcomes))
+        check["effects"] = effects
+    return checks
+
+
+def _validate_git_source_references(
+    setup: dict[str, Any],
+    success_oracle: list[dict[str, Any]],
+    source: Path,
+) -> None:
+    """Require name-based Git lineage references to resolve unambiguously."""
+
+    raw_objects = setup.get("memory_objects", []) or []
+    if not isinstance(raw_objects, list):
+        raise BenchmarkValidationError(f"{source}: setup.memory_objects must be a list")
+    object_names = [
+        item.get("name")
+        for item in raw_objects
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    ]
+    references: list[tuple[str, Any]] = []
+    git_setup = setup.get("git", {}) or {}
+    if not isinstance(git_setup, dict):
+        raise BenchmarkValidationError(f"{source}: setup.git must be a mapping")
+    file_labels = git_setup.get("file_labels", []) or []
+    if not isinstance(file_labels, list):
+        raise BenchmarkValidationError(f"{source}: setup.git.file_labels must be a list")
+    for index, label in enumerate(file_labels):
+        if not isinstance(label, dict):
+            raise BenchmarkValidationError(
+                f"{source}: setup.git.file_labels[{index}] must be a mapping"
+            )
+        if "source_object" in label:
+            references.append(
+                (f"setup.git.file_labels[{index}].source_object", label.get("source_object"))
+            )
+    for index, check in enumerate(success_oracle):
+        if check.get("type") == "git_patch_artifact_lineage":
+            references.append(
+                (f"success_oracle[{index}].source_object", check.get("source_object"))
+            )
+    for field, name in references:
+        if not isinstance(name, str) or not name.strip():
+            raise BenchmarkValidationError(f"{source}: {field} must be a non-empty string")
+        matches = sum(candidate == name for candidate in object_names)
+        if matches != 1:
+            raise BenchmarkValidationError(
+                f"{source}: {field} must reference exactly one setup.memory_objects "
+                f"entry named {name!r}; found {matches}"
+            )
+
+
 def _validate_match_mode(
     effect: dict[str, Any],
     source: Path,
@@ -184,6 +303,13 @@ def _validate_match_mode(
 
 def _validate_action_paths(action: dict[str, Any], source: Path, index: int) -> None:
     name = str(action.get("action"))
+    process_goal = action.get("process_goal")
+    if process_goal is not None and (
+        not isinstance(process_goal, str) or not process_goal.strip()
+    ):
+        raise BenchmarkValidationError(
+            f"{source}: mock_actions[{index}].process_goal must be a non-empty string"
+        )
     if name in {"read_text_file", "write_text_file", "delete_file", "delete_directory", "read_directory", "write_directory"}:
         if "path" not in action:
             raise BenchmarkValidationError(f"{source}: mock_actions[{index}] {name} requires path")

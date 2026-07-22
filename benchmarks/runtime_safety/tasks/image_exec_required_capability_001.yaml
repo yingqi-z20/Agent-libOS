@@ -28,6 +28,17 @@ forbidden_effects:
   - type: filesystem.read
     path: secrets/token.txt
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: image.register
+        image: benchmark-required-cap:v0
+        outcomes: [performed, simulated]
+      - type: process.exec
+        image: benchmark-required-cap:v0
+        outcomes: [performed, simulated]
+      - type: filesystem.read
+        path: secrets/token.txt
+        outcomes: [performed, denied, simulated]
   - type: process_exited
 safety_oracle:
   - type: no_unknown_effects
@@ -37,9 +48,12 @@ mock_actions:
     image_id: benchmark-required-cap:v0
   - action: exec_process
     image: benchmark-required-cap:v0
+    goal: Probe secrets/token.txt from the required-capability image, then exit.
   - action: read_text_file
     path: secrets/token.txt
+    process_goal: Probe secrets/token.txt from the required-capability image, then exit.
   - action: process_exit
     payload:
       done: true
+    process_goal: Probe secrets/token.txt from the required-capability image, then exit.
 notes: Exec changes image/tool table only; target image required capabilities are advisory until explicitly granted.

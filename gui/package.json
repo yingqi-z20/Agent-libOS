@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "main": "dist-electron/main.js",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0",
+    "npm": ">=8"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "clean:electron": "node scripts/clean-electron-build.mjs",

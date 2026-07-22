@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -536,6 +537,7 @@ class ToolExecutionService:
                 args,
                 pid=invocation.pid,
                 syscall_handler=session.handle,
+                timeout=self._jit_sandbox_timeout(invocation.handle),
             )
         finally:
             self._data_flow.observe_ingress(session.observed_context)
@@ -1109,6 +1111,7 @@ class ToolExecutionService:
         *,
         pid: str,
         syscall_handler: Any,
+        timeout: float | None,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "pid": pid,
@@ -1117,8 +1120,14 @@ class ToolExecutionService:
             "return_metrics": True,
             "cached_only": True,
         }
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         supported = self._supported_sandbox_kwargs()
         selected = {key: value for key, value in kwargs.items() if key in supported}
+        if timeout is not None and "timeout" not in selected:
+            raise ValidationError(
+                "sandbox backend must accept timeout when a JIT tool configures one"
+            )
         if kwargs["limits"] is not None and "limits" not in selected:
             raise ValidationError(
                 "sandbox backend must accept SubprocessLimits when resource limits are configured"
@@ -1126,6 +1135,35 @@ class ToolExecutionService:
         if kwargs["limits"] is not None and "return_metrics" not in selected:
             raise ValidationError("sandbox backend must return subprocess metrics")
         return await self._sandbox.arun_source(source_code, args, **selected)
+
+    def _jit_sandbox_timeout(self, handle: ToolHandle) -> float | None:
+        spec = self._extensions.get_tool_spec(handle.tool_id)
+        if spec is None:
+            return None
+        value = spec.policy.get("sandbox_timeout_s")
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValidationError("JIT tool sandbox_timeout_s must be a number")
+        if isinstance(value, int):
+            if value <= 0:
+                raise ValidationError(
+                    "JIT tool sandbox_timeout_s must be finite and > 0"
+                )
+            if value > self._config.tools.deno_timeout_hard_limit_s:
+                raise ValidationError(
+                    "JIT tool sandbox_timeout_s exceeds tools.deno_timeout_hard_limit_s="
+                    f"{self._config.tools.deno_timeout_hard_limit_s}"
+                )
+        timeout = float(value)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValidationError("JIT tool sandbox_timeout_s must be finite and > 0")
+        if timeout > self._config.tools.deno_timeout_hard_limit_s:
+            raise ValidationError(
+                "JIT tool sandbox_timeout_s exceeds tools.deno_timeout_hard_limit_s="
+                f"{self._config.tools.deno_timeout_hard_limit_s}"
+            )
+        return timeout
 
     def _supported_sandbox_kwargs(self) -> set[str]:
         signature = inspect.signature(self._sandbox.arun_source)

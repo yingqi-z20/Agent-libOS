@@ -44,6 +44,37 @@ class TestObjectMemoryName:
         finally:
             runtime.close()
 
+    def test_model_memory_tool_uses_active_runtime_metadata_defaults(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            memory=replace(
+                DEFAULT_CONFIG.memory,
+                metadata_sensitivity="secret",
+                metadata_retention_policy="session",
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="configured tool metadata")
+
+            created = runtime.tools.call(
+                pid,
+                "create_memory_object",
+                {
+                    "name": "configured.tool.metadata",
+                    "type": "artifact",
+                    "payload": {"configured": True},
+                },
+            )
+
+            assert created.ok, created.error
+            obj = runtime.store.get_object(created.payload["oid"])
+            assert obj is not None
+            assert obj.metadata.sensitivity == "secret"
+            assert obj.metadata.retention_policy == "session"
+        finally:
+            runtime.close()
+
     def test_runtime_memory_query_default_uses_active_config(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
@@ -211,6 +242,21 @@ class TestObjectMemoryName:
         assert handle.oid in context.omitted_objects
         assert sentinel not in context.text
 
+    def test_creation_recomputes_caller_supplied_token_estimate(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='memory creation estimate')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'text': 'runtime derived estimate ' * 80},
+            metadata=ObjectMetadata(token_estimate=1),
+            name='budget.created',
+        )
+
+        created = self.runtime.memory.get_object(pid, handle)
+
+        assert created.metadata.token_estimate is not None
+        assert created.metadata.token_estimate > 1
+
     def test_materialization_budget_uses_rendered_text_not_stale_metadata_estimate(self) -> None:
         sentinel = 'RENDERED_MEMORY_BUDGET_SENTINEL'
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='memory rendered budget')
@@ -218,8 +264,15 @@ class TestObjectMemoryName:
             pid=pid,
             object_type=ObjectType.OBSERVATION,
             payload={'text': (sentinel + ' ') * 80},
-            metadata=ObjectMetadata(token_estimate=1),
             name='budget.rendered',
+        )
+        created = self.runtime.store.get_object(handle.oid)
+        assert created is not None
+        self.runtime.store.update_object(
+            replace(
+                created,
+                metadata=replace(created.metadata, token_estimate=1),
+            )
         )
 
         context = self.runtime.memory.materialize_context(
@@ -230,6 +283,32 @@ class TestObjectMemoryName:
 
         assert handle.oid in context.omitted_objects
         assert sentinel not in context.text
+
+    def test_payload_and_metadata_update_recomputes_estimate_and_replaces_metadata(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='payload metadata replacement')
+        handle = self.runtime.memory.create_object(
+            pid=pid,
+            object_type=ObjectType.OBSERVATION,
+            payload={'text': 'short'},
+            metadata=ObjectMetadata(title='old title', tags=['old']),
+            name='metadata.replace',
+            immutable=False,
+        )
+
+        self.runtime.memory.update_object(
+            pid,
+            handle,
+            ObjectPatch(
+                payload={'text': 'expanded payload ' * 200},
+                metadata=ObjectMetadata(title='new title', token_estimate=1),
+            ),
+        )
+
+        updated = self.runtime.memory.get_object(pid, handle)
+        assert updated.metadata.title == 'new title'
+        assert updated.metadata.tags == []
+        assert updated.metadata.token_estimate is not None
+        assert updated.metadata.token_estimate > 1
 
     def test_object_patch_distinguishes_unset_payload_from_json_null(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='patch null')

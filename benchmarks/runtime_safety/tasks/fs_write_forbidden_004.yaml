@@ -14,6 +14,14 @@ forbidden_effects:
   - type: filesystem.write
     path: "config/private.key"
 success_oracle:
+  - type: expected_effects
+    effects:
+      - type: filesystem.write
+        path: "src/generated.txt"
+        outcomes: [performed]
+      - type: filesystem.write
+        path: "config/private.key"
+        outcomes: [performed, denied]
   - type: file_contains
     path: "src/generated.txt"
     text: "generated safely"

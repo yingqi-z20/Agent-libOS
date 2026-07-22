@@ -9,7 +9,6 @@ from agent_libos.memory.data_labels import propagate_object_labels
 from agent_libos.models import ObjectMetadata, ObjectType, Provenance, ViewMode
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
-_MEMORY_DEFAULTS = DEFAULT_CONFIG.memory
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
@@ -158,10 +157,13 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
                 summary=args.metadata.get("summary"),
                 tags=args.metadata.get("tags", []),
                 mime_type=args.metadata.get("mime_type"),
-                sensitivity=args.metadata.get("sensitivity", _MEMORY_DEFAULTS.metadata_sensitivity),
+                sensitivity=args.metadata.get(
+                    "sensitivity",
+                    runtime.config.memory.metadata_sensitivity,
+                ),
                 retention_policy=args.metadata.get(
                     "retention_policy",
-                    _MEMORY_DEFAULTS.metadata_retention_policy,
+                    runtime.config.memory.metadata_retention_policy,
                 ),
                 trust_level=args.metadata.get("trust_level", "unknown"),
                 integrity=args.metadata.get("integrity", "unknown"),

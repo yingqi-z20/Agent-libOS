@@ -54,7 +54,7 @@
     "agent_libos/llm/executor.py::LLMProcessExecutor._arun_once_impl": 182,
     "agent_libos/llm/executor.py::LLMProcessExecutor._dispatch_action_batch": 150,
     "agent_libos/llm/executor.py::LLMProcessExecutor._resume_pending_llm_release_action": 136,
-    "agent_libos/memory/object_memory.py::ObjectMemoryManager.append_object_by_name": 155,
+    "agent_libos/memory/object_memory.py::ObjectMemoryManager.append_object_by_name": 151,
     "agent_libos/memory/object_memory.py::ObjectMemoryManager.materialize_context": 146,
     "agent_libos/memory/object_memory.py::ObjectMemoryManager.update_object": 142,
     "agent_libos/primitives/filesystem.py::FilesystemAdapter._delete_directory_serialized": 243,

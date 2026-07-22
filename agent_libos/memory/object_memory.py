@@ -919,7 +919,7 @@ class ObjectMemoryManager:
                 next_metadata = (
                     current.metadata
                     if not payload_is_set
-                    else self._metadata_for_payload(next_payload, current.metadata, force_token_estimate=True)
+                    else self._metadata_for_payload(next_payload, current.metadata)
                 )
             else:
                 next_metadata = self._metadata_for_payload(next_payload, patch.metadata)
@@ -1098,11 +1098,7 @@ class ObjectMemoryManager:
                 obj,
                 payload=payload,
                 metadata=propagate_object_labels(
-                    self._metadata_for_payload(
-                        payload,
-                        obj.metadata,
-                        force_token_estimate=True,
-                    ),
+                    self._metadata_for_payload(payload, obj.metadata),
                     inherited_metadata,
                 ),
                 provenance=provenance,
@@ -2379,8 +2375,6 @@ class ObjectMemoryManager:
         self,
         payload: Any,
         metadata: ObjectMetadata | None,
-        *,
-        force_token_estimate: bool = False,
     ) -> ObjectMetadata:
         meta = (
             deepcopy(metadata)
@@ -2390,8 +2384,10 @@ class ObjectMemoryManager:
                 retention_policy=self.config.memory.metadata_retention_policy,
             )
         )
-        if force_token_estimate or meta.token_estimate is None:
-            meta.token_estimate = estimate_tokens(payload)
+        # token_estimate is derived from the stored payload. Treating a caller's
+        # value as authoritative would let create or a payload+metadata update
+        # retain an estimate for different content.
+        meta.token_estimate = estimate_tokens(payload)
         return meta
 
     def _included_context_oids_for_operation(self, operation_id: str) -> list[str]:

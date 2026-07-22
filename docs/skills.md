@@ -63,6 +63,13 @@ Package validation is bounded by `AgentLibOSConfig.skills`: `SKILL.md` is read
 with `skill_md_max_bytes` for process-driven workspace registration and the
 hard host limit is `skill_md_hard_limit_bytes`; bundled resources are limited
 by `resource_read_max_bytes`, `package_max_bytes`, and `max_package_files`.
+Every bounded workspace read is fail-closed: if `SKILL.md`, an explicitly
+referenced metadata file, a JIT source, or an optionally discovered resource
+reports `truncated: true`, registration rejects the package rather than hashing
+or parsing the prefix. JIT source files are subject to the resource byte limit
+and the decoded source is then subject to `max_jit_source_chars`. Package text
+is decoded as UTF-8 from those snapshotted bytes; the general-purpose
+`tools.default_text_encoding` setting does not change Skill hashes or parsing.
 Packages whose prompt instructions exceed `max_prompt_instruction_chars` are
 rejected during parsing/registration; an oversized package is not accepted by
 clipping its instructions. Loaded snapshots are validated against the same
@@ -102,6 +109,7 @@ entry references a `scripts/*.ts` source file:
     "source_path": "scripts/count_lines.ts",
     "input_schema": {"type": "object"},
     "output_schema": {"type": "object"},
+    "timeout_s": 10,
     "tests": []
   }
 ]
@@ -111,6 +119,12 @@ JIT sources are snapshotted at registration. At activation, bundled JIT tools
 are validated and registered through the same ToolBroker path as proposed JIT
 tools, including sandbox resource limits and metrics. They can only access libOS
 through `libos.syscall()`.
+
+`timeout_s` is optional. When present it sets this JIT tool's outer Deno
+execution window; when omitted, `tools.deno_timeout_s` applies. The value must
+be a finite, non-boolean number greater than zero and no greater than
+`tools.deno_timeout_hard_limit_s`. Process
+subprocess wall-time budgets can still terminate execution sooner.
 
 The bundled `swe-agent` editor uses a 1 MiB bounded filesystem read. It refuses
 to write when that read reports `truncated: true`; otherwise a partial prefix
@@ -122,6 +136,13 @@ file workflow that preserves the complete source rather than retrying
 They do not create capabilities.
 
 ## Sources And Trust
+
+Host-side catalog discovery searches exactly the roots in
+`skills.workspace_dirs`, followed by `skills.global_dirs`, with equivalent
+paths de-duplicated. Defaults include `skills/`, `.agent_libos/skills/`, and
+the compatible `.agents/skills/` and `.claude/skills/` roots. Overriding
+`workspace_dirs` replaces that workspace-root set; there are no additional
+implicit catalog roots.
 
 Workspace Skills are registered through the filesystem primitive when an
 AgentProcess is the actor. The process must be able to read `SKILL.md` and any
@@ -173,9 +194,9 @@ Capability requirements:
 - Trusting or untrusting global Skill package hashes requires
   `skill_trust:*` `admin`.
 
-The host catalog shown to admin callers currently scans `skills/`,
-`.agents/skills/`, `.claude/skills/`, and configured global Skill directories.
-Process-driven workspace registration remains path-based and must pass
+The host catalog shown to admin callers uses the configured and de-duplicated
+workspace/global roots described above; it does not add a second implicit root
+list. Process-driven workspace registration remains path-based and must pass
 filesystem authority for each package file it snapshots.
 
 ## Activation And Unload
