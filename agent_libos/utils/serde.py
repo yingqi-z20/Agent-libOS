@@ -10,6 +10,10 @@ from typing import Any
 # Match CPython's default integer conversion ceiling explicitly so manifest
 # parsing stays bounded even when the interpreter-wide limit is disabled.
 _MAX_JSON_INTEGER_DIGITS = 4_300
+# Keep externally supplied manifests well below interpreter recursion limits.
+# CPython versions differ in whether deeply nested JSON raises RecursionError,
+# so enforce one stable container-depth ceiling after decoding.
+_MAX_JSON_NESTING_DEPTH = 256
 
 
 def _parse_bounded_json_integer(value: str) -> int:
@@ -22,15 +26,41 @@ def _parse_bounded_json_integer(value: str) -> int:
     return int(value)
 
 
+def _validate_json_nesting_depth(value: Any) -> None:
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    while pending:
+        current, parent_depth = pending.pop()
+        if isinstance(current, dict):
+            children = current.values()
+        elif isinstance(current, list):
+            children = current
+        else:
+            continue
+
+        depth = parent_depth + 1
+        if depth > _MAX_JSON_NESTING_DEPTH:
+            raise ValueError(
+                "JSON nesting exceeds maximum depth="
+                f"{_MAX_JSON_NESTING_DEPTH}"
+            )
+        pending.extend(
+            (child, depth)
+            for child in children
+            if isinstance(child, (dict, list))
+        )
+
+
 def bounded_json_loads(value: str | bytes | bytearray) -> Any:
-    """Decode externally supplied JSON with a fixed integer-size ceiling.
+    """Decode externally supplied JSON with fixed integer and depth ceilings.
 
     Callers retain responsibility for their byte limit and for translating
     parser ``ValueError``/``RecursionError`` failures into the appropriate
     domain error.
     """
 
-    return json.loads(value, parse_int=_parse_bounded_json_integer)
+    decoded = json.loads(value, parse_int=_parse_bounded_json_integer)
+    _validate_json_nesting_depth(decoded)
+    return decoded
 
 
 def to_jsonable(value: Any) -> Any:
