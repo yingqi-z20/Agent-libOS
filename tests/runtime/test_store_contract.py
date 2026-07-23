@@ -36,9 +36,11 @@ from agent_libos.models import (
     EventType,
     ExitedProcessOutcome,
     ExternalEffectClassification,
+    ExternalEffectRecord,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
     FileLabelBinding,
+    HumanRequest,
     HumanRequestStatus,
     HumanProcessWait,
     JsonRpcEndpointSpec,
@@ -5550,3 +5552,137 @@ def test_prepared_protected_operation_restores_reservation_across_reopen(
         finally:
             if not store_closed:
                 runtime.close()
+
+
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+def test_prepared_recovery_handler_store_write_rolls_back_with_intent_and_reservation(
+    kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        pid = runtime.process.spawn(goal=f"{kind} prepared recovery rollback")
+        contract_name = "primitive.test.prepared_recovery_rollback"
+        capability = runtime.capability.issue_trusted(
+            pid,
+            "test:prepared-recovery-rollback",
+            [CapabilityRight.READ],
+            issued_by="test",
+            uses_remaining=1,
+        )
+        decision = runtime.capability.require(
+            pid,
+            capability.resource,
+            CapabilityRight.READ,
+            consume=False,
+        )
+        reservation_id = runtime.capability.reserve_decision_use(
+            decision,
+            used_by=pid,
+            reason=f"protected operation reserved authority for {contract_name}",
+        )
+        assert reservation_id is not None
+
+        now = utc_now()
+        effect_id = f"effect-prepared-recovery-rollback-{uuid4().hex}"
+        runtime.store.insert_external_effect(
+            ExternalEffectRecord(
+                effect_id=effect_id,
+                record_id=None,
+                event_id=None,
+                pid=pid,
+                provider="test",
+                operation="prepared_recovery_rollback",
+                target=capability.resource,
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=True,
+                information_flow=False,
+                provider_metadata={
+                    "protected_operation": {
+                        "contract_name": contract_name,
+                        "actor": pid,
+                        "reservation_ids": [reservation_id],
+                        "prepared_recovery": "test_prepared_repair_rollback",
+                    }
+                },
+                created_at=now,
+                effect_state="pending",
+                transaction_state="prepared",
+                updated_at=now,
+            )
+        )
+        repair_marker = HumanRequest(
+            request_id=f"hreq-prepared-repair-{uuid4().hex}",
+            pid=pid,
+            human="owner",
+            payload={"type": "approval", "question": "prepared repair marker"},
+            status=HumanRequestStatus.PENDING,
+            decision=None,
+            blocking=False,
+            created_at=now,
+            updated_at=now,
+        )
+        runtime.store.insert_human_request(repair_marker)
+        fail_recovery = [True]
+
+        def recover(effect: ExternalEffectRecord) -> None:
+            marker = runtime.store.get_human_request(repair_marker.request_id)
+            assert marker is not None
+            marker.status = HumanRequestStatus.DELIVERED
+            marker.decision = {"prepared_repair_effect_id": effect.effect_id}
+            marker.updated_at = utc_now()
+            runtime.store.update_human_request(marker)
+            if fail_recovery[0]:
+                raise RuntimeError("prepared repair store write failed")
+
+        runtime.protected_operations.register_prepared_recovery(
+            "test_prepared_repair_rollback",
+            recover,
+        )
+        monkeypatch.setattr(
+            runtime.protected_operations,
+            "_require_recovery_lease",
+            lambda: None,
+        )
+
+        with pytest.raises(RuntimeError, match="prepared repair store write failed"):
+            runtime.protected_operations.recover_prepared()
+
+        rolled_back_marker = runtime.store.get_human_request(
+            repair_marker.request_id
+        )
+        assert rolled_back_marker is not None
+        assert rolled_back_marker.status == HumanRequestStatus.PENDING
+        assert rolled_back_marker.decision is None
+        retained_effect = runtime.store.get_external_effect(effect_id)
+        assert retained_effect is not None
+        assert retained_effect.transaction_state == "prepared"
+        retained_reservation = runtime.store.get_capability_use_reservation(
+            reservation_id
+        )
+        assert retained_reservation is not None
+        assert retained_reservation["status"] == "reserved"
+        retained_capability = runtime.store.get_capability(capability.cap_id)
+        assert retained_capability is not None
+        assert retained_capability.uses_remaining == 0
+
+        fail_recovery[0] = False
+        summary = runtime.protected_operations.recover_prepared()
+        assert summary.total_count == 1
+        assert summary.sample_effect_ids == (effect_id,)
+        committed_marker = runtime.store.get_human_request(repair_marker.request_id)
+        assert committed_marker is not None
+        assert committed_marker.status == HumanRequestStatus.DELIVERED
+        assert committed_marker.decision == {
+            "prepared_repair_effect_id": effect_id,
+        }
+        assert runtime.store.get_external_effect(effect_id) is None
+        restored_reservation = runtime.store.get_capability_use_reservation(
+            reservation_id
+        )
+        assert restored_reservation is not None
+        assert restored_reservation["status"] == "restored"
+        restored_capability = runtime.store.get_capability(capability.cap_id)
+        assert restored_capability is not None
+        assert restored_capability.uses_remaining == 1

@@ -169,8 +169,32 @@ class TestResourceBudgets:
             assert process.resource_usage.llm_calls == 1
             assert len(calls) == 1
             assert calls[0].status == "error"
-            assert calls[0].messages["sha256"]
-            assert "secret-token" not in json.dumps(calls[0].__dict__, sort_keys=True)
+            retention_key = "$agent_libos_payload_retention"
+            assert calls[0].messages[retention_key]["sha256"]
+            assert json.loads(calls[0].error or "{}")[retention_key]["sha256"]
+            serialized = json.dumps(calls[0].__dict__, sort_keys=True)
+            assert "secret-token" not in serialized
+            assert "PROVIDER_ERROR_SECRET" not in serialized
+            assert "provider unavailable" not in serialized
+            assert "preview" not in serialized
+
+            assert "PROVIDER_ERROR_SECRET" not in result["error"]
+            assert process.outcome is not None
+            assert process.outcome.result_oid is not None
+            result_object = runtime.store.get_object(process.outcome.result_oid)
+            assert result_object is not None
+            durable_sinks = json.dumps(
+                {
+                    "audit": [record.__dict__ for record in runtime.audit.trace()],
+                    "events": [event.__dict__ for event in runtime.store.list_events()],
+                    "result": result_object.__dict__,
+                },
+                sort_keys=True,
+                default=str,
+            )
+            assert "PROVIDER_ERROR_SECRET" not in durable_sinks
+            assert "provider unavailable" not in durable_sinks
+            assert "sha256=" in str(result_object.payload.get("message"))
         finally:
             runtime.close()
 
@@ -229,4 +253,4 @@ class ParallelBudgetClient:
 
 class FailingClient:
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
-        raise RuntimeError("provider unavailable")
+        raise RuntimeError("provider unavailable: PROVIDER_ERROR_SECRET")

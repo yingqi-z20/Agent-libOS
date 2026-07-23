@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Any, Iterator, Mapping, Protocol
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
@@ -691,13 +691,15 @@ class SubprocessTimeoutExpired(TimeoutError):
 
 
 class ProviderEffectNotStarted(RuntimeError):
-    """Provider-certified failure before an externally visible effect began.
+    """Provider-certified failure before the current provider phase began.
 
     Primitives treat every other exception from an effectful provider call as
     an ambiguous outcome: one-shot authority remains consumed and an unknown
     external-effect record is persisted.  A provider may raise this exception
-    only when it can guarantee that no mutation, delivery, remote request, or
-    other externally visible operation was attempted.
+    only when it can guarantee that this callable/phase attempted no mutation,
+    delivery, remote request, or other externally visible operation.  The
+    certificate is phase-local: it does not erase DNS, validation, ingress, or
+    any other phase already completed by a composite operation.
     """
 
 
@@ -931,6 +933,7 @@ class JsonRpcProvider(Protocol):
         timeout_s: float,
         max_response_bytes: int,
         resolved_addresses: tuple[str, ...] | None = None,
+        resolved_headers: Mapping[str, str] | None = None,
     ) -> JsonRpcTransportResult: ...
 
     def classify_external_effect(
@@ -951,6 +954,7 @@ class McpProvider(Protocol):
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpProviderCallResult: ...
 
     def list_tools(
@@ -960,6 +964,7 @@ class McpProvider(Protocol):
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpToolListResult: ...
 
     def call_tool(
@@ -971,6 +976,7 @@ class McpProvider(Protocol):
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpProviderCallResult: ...
 
     def classify_external_effect(

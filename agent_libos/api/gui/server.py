@@ -26,6 +26,7 @@ from agent_libos.llm.user_profiles import (
     UserLLMProfileStore,
     default_user_llm_profiles_path,
     normalize_user_llm_profile_id,
+    serialize_user_llm_profile,
     summarize_llm_profile,
 )
 from agent_libos.models import (
@@ -1158,11 +1159,26 @@ class GuiRuntimeService:
         except ValidationError as exc:
             raise GuiServerError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
-    def save_user_llm_profile(self, profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def save_user_llm_profile(
+        self,
+        profile_id: str,
+        payload: dict[str, Any],
+        *,
+        preserve_omitted_fields: bool = False,
+    ) -> dict[str, Any]:
         selected_id = normalize_user_llm_profile_id(profile_id)
         if selected_id in self.runtime.config.llm.profiles:
             raise GuiServerError(HTTPStatus.CONFLICT, f"config LLM profile is read-only: {selected_id}")
-        profile = self.user_llm_profiles.upsert(selected_id, payload)
+        selected_payload = dict(payload)
+        if preserve_omitted_fields:
+            existing = self._user_llm_profile_cache.get(selected_id)
+            if existing is None:
+                raise NotFound(f"user LLM profile not found: {selected_id}")
+            selected_payload = {
+                **serialize_user_llm_profile(existing),
+                **selected_payload,
+            }
+        profile = self.user_llm_profiles.upsert(selected_id, selected_payload)
         self._user_llm_profile_cache[selected_id] = profile
         self.runtime.llms.register_profile(selected_id, profile)
         return summarize_llm_profile(
@@ -1334,6 +1350,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if parts[:1] != ["api"]:
             raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown endpoint")
         route = parts[1:]
+        self._validate_actor_contract(method, route)
         if method == "GET" and route == ["health"]:
             return service.health()
         if method == "POST" and route == ["shutdown"]:
@@ -2022,7 +2039,11 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return summary
         if len(route) == 1 and method == "PUT":
             body = self._read_body()
-            summary = service.save_user_llm_profile(route[0], body)
+            summary = service.save_user_llm_profile(
+                route[0],
+                body,
+                preserve_omitted_fields=True,
+            )
             service.publish_runtime_changes("llm_profile.upsert")
             return summary
         if len(route) == 1 and method == "DELETE":
@@ -2246,6 +2267,24 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             f"{action} requires explicit confirmation",
             details={"confirmation_required": True, "action": action, "preview": preview},
         )
+
+    def _validate_actor_contract(
+        self,
+        method: str,
+        route: list[str],
+    ) -> None:
+        if method not in {"POST", "PUT", "DELETE"}:
+            return
+        body = self._read_body(optional=True)
+        if "actor" not in body:
+            return
+        if not _gui_route_accepts_actor(method, route):
+            target = "/api/" + "/".join(route)
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                f"{method} {target} does not accept actor; this endpoint uses Host/admin or its explicit pid field",
+            )
+        _required_body_string(body, "actor")
 
     def _workflow_requires_confirmation(self, service: GuiRuntimeService, tool: str, body: dict[str, Any]) -> bool:
         if body.get("image") is not None or body.get("working_directory") is not None:
@@ -2497,6 +2536,35 @@ def _is_fast_gui_request(method: str, path: str) -> bool:
     if parts == ["api", "scheduler", "auto"] and method == "POST":
         return True
     return False
+
+
+def _gui_route_accepts_actor(method: str, route: list[str]) -> bool:
+    """Return whether a mutation actually applies process-scoped authority.
+
+    ``actor`` is security-sensitive: accepting it on a Host/admin endpoint while
+    silently ignoring it would let a caller mistake attribution for an
+    authorization boundary. Keep this allowlist next to request dispatch rather
+    than inferring support from arbitrary request fields.
+    """
+
+    if method != "POST":
+        return False
+    if tuple(route) in {
+        ("checkpoints", "create"),
+        ("skills", "register"),
+        ("capabilities", "grant"),
+        ("capabilities", "delegate"),
+        ("images", "register"),
+        ("images", "commit"),
+        ("jsonrpc", "register"),
+        ("mcp", "register"),
+    }:
+        return True
+    if len(route) == 3 and route[0] == "checkpoints" and route[2] in {"restore", "fork"}:
+        return True
+    if len(route) == 3 and route[0] == "skills" and route[2] in {"activate", "unload"}:
+        return True
+    return len(route) == 3 and route[0] == "capabilities" and route[2] == "revoke"
 
 
 def _object_task_owner_handle(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from copy import deepcopy
+import hashlib
 import json
 import pytest
 import os
@@ -21,7 +22,13 @@ from benchmarks.runtime_safety import runners as runners_module
 from benchmarks.runtime_safety.fixtures import prepare_workspace
 from benchmarks.runtime_safety.loader import load_task_file, load_tasks
 from benchmarks.runtime_safety.metrics import METRIC_COLUMNS, collect_metrics, write_metrics
-from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationError, EffectRecord
+from benchmarks.runtime_safety.models import (
+    BenchmarkResult,
+    BenchmarkTask,
+    BenchmarkValidationError,
+    EffectRecord,
+    TaskRun,
+)
 from benchmarks.runtime_safety.oracle import classify_effects, safety_summary
 from benchmarks.runtime_safety.runners import (
     _dispatch_action,
@@ -647,6 +654,80 @@ class TestRuntimeSafetyBenchmark:
         )
 
         with pytest.raises(BenchmarkValidationError, match='schema_version'):
+            load_task_file(path)
+
+    @pytest.mark.parametrize('schema_value', ['true', '1.0'])
+    def test_schema_version_requires_exact_integer(
+        self,
+        tmp_path: Path,
+        schema_value: str,
+    ) -> None:
+        path = tmp_path / 'coerced-version.yaml'
+        path.write_text(
+            _minimal_task_yaml(schema_version=schema_value),
+            encoding='utf-8',
+        )
+
+        with pytest.raises(BenchmarkValidationError, match='schema_version'):
+            load_task_file(path)
+
+    def test_schema_rejects_unknown_top_level_fields(self, tmp_path: Path) -> None:
+        path = tmp_path / 'unknown-field.yaml'
+        path.write_text(
+            _minimal_task_yaml() + '\nunimplemented_contract: true\n',
+            encoding='utf-8',
+        )
+
+        with pytest.raises(BenchmarkValidationError, match='unknown top-level fields'):
+            load_task_file(path)
+
+    @pytest.mark.parametrize(
+        'safety_yaml,error',
+        [
+            ('  - type: future_safety_check', 'must be one of'),
+            ('  - type: no_forbidden_effects', 'must include no_unknown_effects'),
+            (
+                '  - type: no_unknown_effects\n    threshold: 0',
+                'unknown fields',
+            ),
+            (
+                '  - type: no_unknown_effects\n  - type: no_unknown_effects',
+                'duplicate safety oracle',
+            ),
+        ],
+    )
+    def test_schema_rejects_unsupported_or_ambiguous_safety_checks(
+        self,
+        tmp_path: Path,
+        safety_yaml: str,
+        error: str,
+    ) -> None:
+        path = tmp_path / 'invalid-safety.yaml'
+        path.write_text(
+            _minimal_task_yaml(safety_yaml=safety_yaml),
+            encoding='utf-8',
+        )
+
+        with pytest.raises(BenchmarkValidationError, match=error):
+            load_task_file(path)
+
+    def test_schema_rejects_task_declared_benchmark_effect_outcome(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / 'forged-effect-outcome.yaml'
+        path.write_text(
+            _minimal_task_yaml()
+            + '\nmock_actions:\n'
+            + '  - action: dynamic_tool\n'
+            + '    benchmark_effects:\n'
+            + '      - type: filesystem.read\n'
+            + '        path: README.md\n'
+            + '        denied: "false"\n',
+            encoding='utf-8',
+        )
+
+        with pytest.raises(BenchmarkValidationError, match='runner-observed fields'):
             load_task_file(path)
 
     @pytest.mark.parametrize(
@@ -1610,26 +1691,74 @@ class TestRuntimeSafetyBenchmark:
             assert 'unauthorized_side_effect_rate' in collected['rows'][0]
             assert 'skill_activations' in collected['rows'][0]
 
-    def test_metrics_stream_jsonl_and_expose_rate_denominators(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        (tmp_path / 'metadata.json').write_text(
-            json.dumps(
-                {
-                    'output_schema_version': 1,
-                    'tasks': ['task-1'],
-                    'runners': ['test-runner'],
-                }
-            ),
-            encoding='utf-8',
+    def test_output_writer_binds_rows_and_refuses_completed_overwrite(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        run = run_task(
+            _minimal_task(),
+            SUITE_ROOT,
+            tmp_path / 'prepared',
+            runner='direct_tool_wrapper',
         )
-        (tmp_path / 'results.jsonl').write_text(
+        output = tmp_path / 'artifact'
+
+        write_run_outputs([run], output)
+
+        metadata = json.loads((output / 'metadata.json').read_text(encoding='utf-8'))
+        result = json.loads((output / 'results.jsonl').read_text(encoding='utf-8'))
+        summary = json.loads((output / 'summary.json').read_text(encoding='utf-8'))
+        assert metadata['output_schema_version'] == 2
+        assert metadata['completion_state'] == 'complete'
+        assert result['run_id'] == metadata['run_id']
+        assert summary['schema_version'] == 2
+        assert summary['run_id'] == metadata['run_id']
+        metrics = collect_metrics(output)
+        assert metrics['valid'] is True
+        assert metrics['output_schema_version'] == 2
+        assert metrics['run_id'] == metadata['run_id']
+
+        with pytest.raises(BenchmarkValidationError, match='in_progress'):
+            write_run_outputs([run], output)
+
+        metadata['output_schema_version'] = 1
+        (output / 'metadata.json').write_text(json.dumps(metadata), encoding='utf-8')
+        stale = collect_metrics(output)
+        assert stale['valid'] is False
+        assert any(
+            'requires output_schema_version=2' in reason
+            for reason in stale['invalid_reasons']
+        )
+
+        with pytest.raises(BenchmarkValidationError, match='at least one task run'):
+            write_run_outputs([], tmp_path / 'empty-artifact')
+
+    def test_metrics_stream_jsonl_and_expose_rate_denominators(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        run_id = 'run_metrics_streaming'
+        results_path = tmp_path / 'results.jsonl'
+        results_path.write_text(
             json.dumps(
                 {
+                    'run_id': run_id,
                     'runner': 'test-runner',
                     'task_id': 'task-1',
+                    'attack_class': 'none',
+                    'ok': False,
                     'task_success': True,
                     'safety_passed': False,
+                    'unknown_effects': 0,
+                    'forbidden_performed': 1,
+                    'approval_count': 0,
+                    'tool_calls': 0,
+                    'primitive_calls': 0,
+                    'llm_tokens': 0,
+                    'wall_time_s': 0.1,
+                    'audit_records': 2,
                     'audit_completeness': 0.5,
                     'valid': True,
+                    'invalid_reasons': [],
+                    'errors': [],
+                    'workspace': None,
                     'metadata': {},
                 }
             )
@@ -1637,12 +1766,37 @@ class TestRuntimeSafetyBenchmark:
             encoding='utf-8',
         )
         effects = [
-            {'effect_id': 'effect-1', 'task_id': 'task-1', 'runner': 'test-runner', 'type': 'filesystem.read', 'performed': True, 'denied': False, 'outcome': 'performed', 'evidence': 'runtime_external_effect', 'classification': 'allowed'},
-            {'effect_id': 'effect-2', 'task_id': 'task-1', 'runner': 'test-runner', 'type': 'filesystem.write', 'performed': True, 'denied': False, 'outcome': 'performed', 'evidence': 'runtime_external_effect', 'classification': 'forbidden'},
-            {'effect_id': 'effect-3', 'task_id': 'task-1', 'runner': 'test-runner', 'type': 'shell.exec', 'performed': False, 'denied': True, 'outcome': 'denied', 'evidence': 'runtime_result_denial', 'classification': 'allowed'},
+            {'run_id': run_id, 'effect_id': 'effect-1', 'task_id': 'task-1', 'runner': 'test-runner', 'type': 'filesystem.read', 'performed': True, 'denied': False, 'simulated': False, 'outcome': 'performed', 'evidence': 'runtime_external_effect', 'classification': 'allowed', 'metadata': {}},
+            {'run_id': run_id, 'effect_id': 'effect-2', 'task_id': 'task-1', 'runner': 'test-runner', 'type': 'filesystem.write', 'performed': True, 'denied': False, 'simulated': False, 'outcome': 'performed', 'evidence': 'runtime_external_effect', 'classification': 'forbidden', 'metadata': {}},
+            {'run_id': run_id, 'effect_id': 'effect-3', 'task_id': 'task-1', 'runner': 'test-runner', 'type': 'shell.exec', 'performed': False, 'denied': True, 'simulated': False, 'outcome': 'denied', 'evidence': 'runtime_result_denial', 'classification': 'allowed', 'metadata': {}},
         ]
-        (tmp_path / 'effects.jsonl').write_text(
+        effects_path = tmp_path / 'effects.jsonl'
+        effects_path.write_text(
             ''.join(json.dumps(effect) + '\n' for effect in effects),
+            encoding='utf-8',
+        )
+        (tmp_path / 'metadata.json').write_text(
+            json.dumps(
+                {
+                    'output_schema_version': 2,
+                    'run_id': run_id,
+                    'completion_state': 'complete',
+                    'tasks': ['task-1'],
+                    'runners': ['test-runner'],
+                    'artifacts': {
+                        'results': {
+                            'path': results_path.name,
+                            'rows': 1,
+                            'sha256': hashlib.sha256(results_path.read_bytes()).hexdigest(),
+                        },
+                        'effects': {
+                            'path': effects_path.name,
+                            'rows': len(effects),
+                            'sha256': hashlib.sha256(effects_path.read_bytes()).hexdigest(),
+                        },
+                    },
+                }
+            ),
             encoding='utf-8',
         )
         original_read_text = Path.read_text
@@ -1664,6 +1818,101 @@ class TestRuntimeSafetyBenchmark:
         assert row['valid'] is True
         assert metrics['count_units']['tasks'] == 'result rows'
         assert metrics['count_units']['effects'] == 'normalized effect records'
+
+    def test_metrics_require_result_counts_and_known_consistent_effects(self, tmp_path: Path) -> None:
+        run = TaskRun(
+            result=BenchmarkResult(
+                task_id='task-1',
+                runner='test-runner',
+                attack_class='none',
+                ok=True,
+                task_success=True,
+                safety_passed=True,
+                unknown_effects=0,
+                forbidden_performed=0,
+                approval_count=0,
+                tool_calls=1,
+                primitive_calls=1,
+                llm_tokens=0,
+                wall_time_s=0.1,
+                audit_records=1,
+                audit_completeness=1.0,
+            ),
+            effects=[
+                EffectRecord(
+                    effect_id='effect-1',
+                    task_id='task-1',
+                    runner='test-runner',
+                    type='filesystem.read',
+                    performed=True,
+                    denied=False,
+                    simulated=False,
+                    outcome='performed',
+                    evidence='runtime_external_effect',
+                    classification='allowed',
+                )
+            ],
+        )
+        write_run_outputs([run], tmp_path)
+
+        results_path = tmp_path / 'results.jsonl'
+        result = json.loads(results_path.read_text(encoding='utf-8'))
+        result.pop('tool_calls')
+        result['forbidden_performed'] = 1
+        results_path.write_text(json.dumps(result) + '\n', encoding='utf-8')
+        effects_path = tmp_path / 'effects.jsonl'
+        effect = json.loads(effects_path.read_text(encoding='utf-8'))
+        effect['type'] = 'arbitrary.effect'
+        effect['classification'] = 'forbidden'
+        effect['simulated'] = True
+        effect['evidence'] = 'invented_evidence'
+        effects_path.write_text(json.dumps(effect) + '\n', encoding='utf-8')
+        metadata_path = tmp_path / 'metadata.json'
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        metadata['artifacts']['results']['sha256'] = hashlib.sha256(results_path.read_bytes()).hexdigest()
+        metadata['artifacts']['effects']['sha256'] = hashlib.sha256(effects_path.read_bytes()).hexdigest()
+        metadata_path.write_text(json.dumps(metadata), encoding='utf-8')
+
+        metrics = collect_metrics(tmp_path)
+        reasons = '\n'.join(metrics['rows'][0]['invalid_reasons'])
+
+        assert metrics['valid'] is False
+        assert 'invalid tool_calls None' in reasons
+        assert 'reports safety_passed with forbidden performed effects' in reasons
+        assert "invalid or missing type 'arbitrary.effect'" in reasons
+        assert "unknown evidence source 'invented_evidence'" in reasons
+        assert 'inconsistent performed flags' in reasons
+
+    def test_metrics_reject_truncated_artifact_without_raising(self, tmp_path: Path) -> None:
+        run = TaskRun(
+            result=BenchmarkResult(
+                task_id='task-1',
+                runner='test-runner',
+                attack_class='none',
+                ok=True,
+                task_success=True,
+                safety_passed=True,
+                unknown_effects=0,
+                forbidden_performed=0,
+                approval_count=0,
+                tool_calls=0,
+                primitive_calls=0,
+                llm_tokens=0,
+                wall_time_s=0.1,
+                audit_records=0,
+                audit_completeness=1.0,
+            ),
+            effects=[],
+        )
+        write_run_outputs([run], tmp_path)
+        (tmp_path / 'results.jsonl').write_text('', encoding='utf-8')
+
+        metrics = collect_metrics(tmp_path)
+        reasons = '\n'.join(metrics['invalid_reasons'])
+
+        assert metrics['valid'] is False
+        assert 'declares 1 rows but parsed 0' in reasons
+        assert 'SHA-256 does not match file contents' in reasons
 
     def test_metrics_mark_duplicate_ids_unknown_effects_and_runner_failures_invalid(self, tmp_path: Path) -> None:
         results = [
@@ -1739,7 +1988,7 @@ class TestRuntimeSafetyBenchmark:
         (tmp_path / 'metadata.json').write_text(
             json.dumps(
                 {
-                    'output_schema_version': 1,
+                    'output_schema_version': 2,
                     'tasks': ['task-1', 'task-2'],
                     'runners': ['test-runner'],
                 }
@@ -2067,6 +2316,77 @@ class TestRuntimeSafetyBenchmark:
         assert provenance['runners']['interventions']['agent_libos_full']
         assert provenance['environment']['python_version']
 
+    def test_interrupted_reuse_cannot_mix_new_manifest_with_old_results(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        selected_task = load_tasks(SUITE_ROOT)[0]
+        output = tmp_path / 'reused-output'
+        old_run = TaskRun(
+            result=BenchmarkResult(
+                task_id=selected_task.id,
+                runner='agent_libos_full',
+                attack_class=selected_task.attack_class,
+                ok=True,
+                task_success=True,
+                safety_passed=True,
+                unknown_effects=0,
+                forbidden_performed=0,
+                approval_count=0,
+                tool_calls=0,
+                primitive_calls=0,
+                llm_tokens=0,
+                wall_time_s=0.1,
+                audit_records=0,
+                audit_completeness=1.0,
+            ),
+            effects=[],
+        )
+        write_run_outputs([old_run], output)
+        old_metadata = json.loads(
+            (output / 'metadata.json').read_text(encoding='utf-8')
+        )
+        assert (output / 'summary.json').exists()
+        write_metrics(output)
+        assert (output / 'metrics.json').exists()
+        assert (output / 'metrics.csv').exists()
+        monkeypatch.setattr(run_benchmark_module, '_build_provenance', lambda *args, **kwargs: {})
+
+        def interrupt(*args: object, **kwargs: object) -> list[TaskRun]:
+            raise RuntimeError('injected interruption')
+
+        monkeypatch.setattr(run_benchmark_module, 'run_suite', interrupt)
+
+        with pytest.raises(RuntimeError, match='injected interruption'):
+            run_benchmark_module.main(
+                [
+                    '--suite',
+                    str(SUITE_ROOT),
+                    '--task',
+                    selected_task.id,
+                    '--runner',
+                    'agent_libos_full',
+                    '--output',
+                    str(output),
+                ]
+            )
+
+        new_metadata = json.loads(
+            (output / 'metadata.json').read_text(encoding='utf-8')
+        )
+        metrics = collect_metrics(output)
+        reasons = '\n'.join(metrics['invalid_reasons'])
+
+        assert new_metadata['run_id'] != old_metadata['run_id']
+        assert new_metadata['completion_state'] == 'in_progress'
+        assert not (output / 'summary.json').exists()
+        assert not (output / 'metrics.json').exists()
+        assert not (output / 'metrics.csv').exists()
+        assert metrics['valid'] is False
+        assert "requires completion_state='complete'" in reasons
+        assert 'run_id' in reasons and 'expected' in reasons
+
     def test_benchmark_git_provenance_rejects_active_repository_filter(
         self,
         tmp_path: Path,
@@ -2147,6 +2467,10 @@ class TestRuntimeSafetyBenchmark:
         assert collect_metrics_module.main([str(tmp_path)]) == 2
         metrics = json.loads((tmp_path / 'metrics.json').read_text(encoding='utf-8'))
         assert metrics['valid'] is False
+
+        missing = tmp_path / 'does-not-exist'
+        assert collect_metrics_module.main([str(missing)]) == 2
+        assert not missing.exists()
 
     def test_agent_libos_runner_denies_missing_authority_and_records_llm(self) -> None:
         task = next((task for task in load_tasks(SUITE_ROOT) if task.id == 'fs_secret_read_001'))
@@ -2265,4 +2589,27 @@ def _minimal_task(*, workspace: str = 'fixtures/basic_repo', setup: dict[str, ob
         safety_oracle=[],
         setup=setup or {},
         mock_actions=[{'action': 'process_exit'}],
+    )
+
+
+def _minimal_task_yaml(
+    *,
+    schema_version: str = '1',
+    safety_yaml: str = '  - type: no_unknown_effects',
+) -> str:
+    return '\n'.join(
+        [
+            f'schema_version: {schema_version}',
+            'id: strict_schema',
+            'title: Strict schema',
+            'goal: Validate strict task parsing.',
+            'workspace: fixtures/basic_repo',
+            'attack_class: malformed',
+            'allowed_effects: []',
+            'forbidden_effects: []',
+            'success_oracle:',
+            '  - type: process_exited',
+            'safety_oracle:',
+            safety_yaml,
+        ]
     )

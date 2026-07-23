@@ -181,25 +181,27 @@ def test_gui_api_schema_tracks_every_explicit_confirmation_operation() -> None:
 
 
 def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
-    _validator_for("snapshotResponse").validate(
-        {
-            "db": "local",
-            "scheduler": {"auto_run": True, "running": False, "paused": False},
-            "processes": [{"pid": "pid_1", "status": "waiting"}],
-            "human_requests": [],
-            "events": [],
-            "audit": [],
-            "llm_calls": [],
-            "object_tasks": [],
-            "tools": [],
-            "images": [],
-            "skills": [],
-            "jsonrpc_endpoints": [],
-            "mcp_servers": [],
-            "modules": [],
-            "llm_profiles": [],
-        }
-    )
+    snapshot = {
+        "db": "local",
+        "scheduler": {"auto_run": True, "running": False, "paused": False},
+        "processes": [{"pid": "pid_1", "status": "waiting"}],
+        "human_requests": [],
+        "events": [],
+        "audit": [],
+        "llm_calls": [],
+        "object_tasks": [],
+        "tools": [],
+        "images": [],
+        "skills": [],
+        "jsonrpc_endpoints": [],
+        "mcp_servers": [],
+        "modules": [],
+        "llm_profiles": [],
+    }
+    snapshot_validator = _validator_for("snapshotResponse")
+    snapshot_validator.validate(snapshot)
+    invalid_snapshot = {**snapshot, "events": [42]}
+    assert list(snapshot_validator.iter_errors(invalid_snapshot))
     _validator_for("errorEnvelope").validate(
         {
             "ok": False,
@@ -217,10 +219,20 @@ def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path(
     process_exec = _validator_for("processExecPayload")
     assert list(process_exec.iter_errors({"image": "review:v0"}))
     process_exec.validate({"confirmed": True, "image": "review:v0"})
+    assert list(
+        process_exec.iter_errors(
+            {"confirmed": True, "actor": "pid_1", "image": "review:v0"}
+        )
+    )
 
     skill_register = _validator_for("skillRegisterPayload")
     skill_register.validate(
         {"confirmed": True, "actor": "pid_1", "path": "skills/reviewer"}
+    )
+    assert list(
+        skill_register.iter_errors(
+            {"confirmed": True, "path": "skills/reviewer"}
+        )
     )
     assert list(
         skill_register.iter_errors(
@@ -234,9 +246,16 @@ def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path(
             )
         )
 
+    skill_process_mutation = _validator_for("skillProcessMutationPayload")
+    skill_process_mutation.validate({"confirmed": True, "pid": "pid_1"})
+    skill_process_mutation.validate(
+        {"confirmed": True, "pid": "pid_1", "actor": "pid_1"}
+    )
+
     _validator_for("capabilityDelegatePayload").validate(
         {
             "confirmed": True,
+            "actor": "pid_parent",
             "parent": "pid_parent",
             "child": "pid_child",
             "resource": "filesystem:workspace:docs",
@@ -256,6 +275,24 @@ def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path(
             {"confirmed": True, "files": {"IMAGE.yaml": 7}}
         )
     )
+    image_register = _validator_for("imageRegisterPayload")
+    image_register.validate(
+        {
+            "confirmed": True,
+            "source": "selected-package",
+            "files": {"IMAGE.yaml": "schema_version: 1"},
+        }
+    )
+    assert list(
+        image_register.iter_errors(
+            {
+                "confirmed": True,
+                "source": "selected-package",
+                "files": {"IMAGE.yaml": "schema_version: 1"},
+                "path": "/tmp/package",
+            }
+        )
+    )
     assert list(
         _validator_for("registryManifestPayload").iter_errors(
             {"confirmed": True, "manifest_text": "schema_version: 1", "path": "server.yaml"}
@@ -265,6 +302,16 @@ def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path(
     mcp_call = _validator_for("mcpCallPayload")
     mcp_call.validate(
         {"confirmed": True, "pid": "pid_1", "tool_id": "echo", "arguments": None}
+    )
+    assert list(
+        mcp_call.iter_errors(
+            {
+                "confirmed": True,
+                "actor": "pid_1",
+                "pid": "pid_1",
+                "tool_id": "echo",
+            }
+        )
     )
     assert list(
         mcp_call.iter_errors(

@@ -10,7 +10,8 @@ import threading
 import time
 from functools import partial
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from jsonschema import ValidationError as JsonSchemaValidationError
@@ -84,6 +85,7 @@ _CALL_RIGHTS = {CapabilityRight.READ.value, CapabilityRight.WRITE.value, Capabil
 _ALLOWED_HEADER_PREFIXES = {"", "Bearer ", "Token ", "Basic "}
 _ALLOWED_HEADER_SUFFIXES = {""}
 _TRANSPORTS = {"stdio", "streamable_http"}
+_MCP_PLATFORM_ENV_KEYS = ("SYSTEMROOT", "WINDIR") if os.name == "nt" else ()
 _STDIO_EXECUTABLE_IDENTITY_UNSET = object()
 _PROVIDER_RESULT_RETURNED_ATTR = "_agent_libos_provider_result_returned"
 _SERVER_FIELDS = {
@@ -472,7 +474,7 @@ class McpPrimitive:
                     )
                 )
                 authority_decisions.extend(self._require_stdio_process_spawn(actor, spec, consume=False))
-            self._require_runtime_environment(spec)
+            runtime_environment = self._require_runtime_environment(spec)
             request_bytes = len(dumps({"method": "tools/list", "server_id": spec.server_id}).encode("utf-8"))
             if request_bytes > spec.max_request_bytes:
                 raise ValidationError(f"MCP list_tools request exceeds max_request_bytes={spec.max_request_bytes}")
@@ -495,7 +497,10 @@ class McpPrimitive:
                     )
                 )
             )
-            stdio_executable_identity = self._stdio_executable_identity(spec)
+            stdio_executable_identity = self._stdio_executable_identity(
+                spec,
+                runtime_environment=runtime_environment,
+            )
             list_sink = DataSink(
                 f"mcp:{server_id}:list_tools",
                 self._list_tools_identity_sha256(
@@ -538,37 +543,17 @@ class McpPrimitive:
             with self._protected().start(contract_name, invocation, provider=self.provider) as protected:
                 started = time.monotonic()
                 deadline = started + spec.timeout_s
-                if spec.transport == "streamable_http":
-                    observes_host = self._runtime_resolution_observes_host(spec)
-                    protected.call(
-                        ProviderPhase(
-                            "dns_resolution",
-                            information_flow=observes_host,
-                            commits_authority=observes_host,
-                        ),
-                        self._validate_runtime_resolution,
-                        spec,
-                    )
-                executable_snapshot = self._stdio_snapshot_for_dispatch(
+                result, provider_error = self._dispatch_list_tools(
+                    protected,
+                    spec,
+                    deadline=deadline,
                     pid=effect_actor,
-                    spec=spec,
                     expected_identity=stdio_executable_identity,
                     sink=list_sink,
                     context=request_flow,
                     payload={"method": "tools/list", "server_id": server_id},
+                    runtime_environment=runtime_environment,
                 )
-
-                try:
-                    result, provider_error = protected.call(
-                        ProviderPhase("provider_not_started_after_dns", information_flow=True),
-                        self._invoke_list_tools_provider,
-                        spec,
-                        deadline=deadline,
-                        executable_snapshot=executable_snapshot,
-                    )
-                finally:
-                    if executable_snapshot is not None:
-                        executable_snapshot.close()
                 if provider_error is not None:
                     result_payload = self._list_tools_failure_payload(
                         provider_error,
@@ -830,7 +815,7 @@ class McpPrimitive:
         with self._protected().start("primitive.mcp.call", invocation, provider=self.provider) as protected:
             started = time.monotonic()
             deadline = started + spec.timeout_s
-            self._require_runtime_environment(spec)
+            runtime_environment = self._require_runtime_environment(spec)
             if spec.transport == "streamable_http":
                 observes_host = self._runtime_resolution_observes_host(spec)
                 protected.call(
@@ -852,16 +837,17 @@ class McpPrimitive:
                     sink=sink,
                     context=flow_context,
                     payload=selected_args,
+                    runtime_environment=runtime_environment,
                 )
 
                 def invoke_validated_tool() -> Any:
                     try:
-                        provider_kwargs: dict[str, Any] = {
-                            "timeout_s": self._remaining_timeout(deadline),
-                            "max_response_bytes": spec.max_response_bytes,
-                        }
-                        if executable_snapshot is not None:
-                            provider_kwargs["executable_snapshot"] = executable_snapshot
+                        provider_kwargs = self._provider_dispatch_kwargs(
+                            spec,
+                            deadline=deadline,
+                            runtime_environment=runtime_environment,
+                            executable_snapshot=executable_snapshot,
+                        )
                         raw_result = validate_and_call(
                             spec,
                             tool,
@@ -937,27 +923,20 @@ class McpPrimitive:
                     ),
                 )
 
-            live_executable_snapshot = self._stdio_snapshot_for_dispatch(
-                pid=pid,
-                spec=spec,
-                expected_identity=stdio_executable_identity,
-                sink=sink,
-                context=flow_context,
-                payload=selected_args,
-            )
-            try:
-                live_list_result, validation_error, list_response_bytes = protected.call(
-                    ProviderPhase("live_validation_not_started_after_dns", information_flow=True),
-                    lambda: self._validate_live_tool_for_call(
-                        spec,
-                        tool,
-                        deadline=deadline,
-                        executable_snapshot=live_executable_snapshot,
-                    ),
+            live_list_result, validation_error, list_response_bytes = (
+                self._dispatch_live_tool_validation(
+                    protected,
+                    spec,
+                    tool,
+                    deadline=deadline,
+                    pid=pid,
+                    expected_identity=stdio_executable_identity,
+                    sink=sink,
+                    context=flow_context,
+                    payload=selected_args,
+                    runtime_environment=runtime_environment,
                 )
-            finally:
-                if live_executable_snapshot is not None:
-                    live_executable_snapshot.close()
+            )
             resource_progress["list_response_bytes"] = list_response_bytes
             if validation_error is not None:
                 result = self._live_validation_failure_result(
@@ -1003,12 +982,12 @@ class McpPrimitive:
                 | ProviderEffectNotStartedResult
             ):
                 try:
-                    provider_kwargs: dict[str, Any] = {
-                        "timeout_s": self._remaining_timeout(deadline),
-                        "max_response_bytes": spec.max_response_bytes,
-                    }
-                    if executable_snapshot is not None:
-                        provider_kwargs["executable_snapshot"] = executable_snapshot
+                    provider_kwargs = self._provider_dispatch_kwargs(
+                        spec,
+                        deadline=deadline,
+                        runtime_environment=runtime_environment,
+                        executable_snapshot=executable_snapshot,
+                    )
                     raw_result = self.provider.call_tool(
                         spec,
                         tool,
@@ -1057,6 +1036,7 @@ class McpPrimitive:
                 sink=sink,
                 context=flow_context,
                 payload=selected_args,
+                runtime_environment=runtime_environment,
             )
             try:
                 provider_outcome = protected.call(
@@ -1312,10 +1292,12 @@ class McpPrimitive:
         *,
         timeout_s: float | None = None,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpToolListResult:
         provider_kwargs: dict[str, Any] = {
             "timeout_s": server.timeout_s if timeout_s is None else timeout_s,
             "max_response_bytes": server.max_response_bytes,
+            "runtime_environment": runtime_environment,
         }
         if executable_snapshot is not None:
             provider_kwargs["executable_snapshot"] = executable_snapshot
@@ -1334,11 +1316,7 @@ class McpPrimitive:
                     f"MCP server {server.server_id} no longer exposes tool {tool.mcp_name}",
                     result,
                 )
-            if (
-                tool.input_schema
-                and live.input_schema
-                and live.input_schema != tool.input_schema
-            ):
+            if tool.input_schema and live.input_schema != tool.input_schema:
                 raise _McpLiveToolValidationError(
                     f"MCP tool schema changed for {server.server_id}/{tool.tool_id}",
                     result,
@@ -1363,11 +1341,13 @@ class McpPrimitive:
         *,
         deadline: float,
         executable_snapshot: ExecutableSnapshot | None,
+        runtime_environment: Mapping[str, str],
     ) -> tuple[McpToolListResult | None, ProviderHostError | None]:
         try:
             provider_kwargs: dict[str, Any] = {
                 "timeout_s": self._remaining_timeout(deadline),
                 "max_response_bytes": server.max_response_bytes,
+                "runtime_environment": runtime_environment,
             }
             if executable_snapshot is not None:
                 provider_kwargs["executable_snapshot"] = executable_snapshot
@@ -1383,6 +1363,55 @@ class McpPrimitive:
                 error_type=type(error).__name__,
                 correlation_id=new_id("corr"),
             )
+
+    def _dispatch_list_tools(
+        self,
+        protected: Any,
+        server: McpServerSpec,
+        *,
+        deadline: float,
+        pid: str,
+        expected_identity: dict[str, str] | None,
+        sink: DataSink,
+        context: DataFlowContext,
+        payload: Any,
+        runtime_environment: Mapping[str, str],
+    ) -> tuple[McpToolListResult | None, ProviderHostError | None]:
+        if server.transport == "streamable_http":
+            observes_host = self._runtime_resolution_observes_host(server)
+            protected.call(
+                ProviderPhase(
+                    "dns_resolution",
+                    information_flow=observes_host,
+                    commits_authority=observes_host,
+                ),
+                self._validate_runtime_resolution,
+                server,
+            )
+        executable_snapshot = self._stdio_snapshot_for_dispatch(
+            pid=pid,
+            spec=server,
+            expected_identity=expected_identity,
+            sink=sink,
+            context=context,
+            payload=payload,
+            runtime_environment=runtime_environment,
+        )
+        try:
+            return protected.call(
+                ProviderPhase(
+                    "provider_not_started_after_dns",
+                    information_flow=True,
+                ),
+                self._invoke_list_tools_provider,
+                server,
+                deadline=deadline,
+                executable_snapshot=executable_snapshot,
+                runtime_environment=runtime_environment,
+            )
+        finally:
+            if executable_snapshot is not None:
+                executable_snapshot.close()
 
     def _validated_tool_list_result(
         self,
@@ -1577,6 +1606,7 @@ class McpPrimitive:
         *,
         deadline: float,
         executable_snapshot: ExecutableSnapshot | None,
+        runtime_environment: Mapping[str, str],
     ) -> tuple[McpToolListResult | None, Exception | None, int]:
         """Retain known list bytes while keeping not-started failures exceptional."""
 
@@ -1586,6 +1616,7 @@ class McpPrimitive:
                 tool,
                 timeout_s=self._remaining_timeout(deadline),
                 executable_snapshot=executable_snapshot,
+                runtime_environment=runtime_environment,
             )
         except _McpLiveToolValidationError as error:
             return error.result, error, error.result.response_bytes
@@ -1595,6 +1626,47 @@ class McpPrimitive:
             return None, error, 0
         return result, None, result.response_bytes
 
+    def _dispatch_live_tool_validation(
+        self,
+        protected: Any,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        *,
+        deadline: float,
+        pid: str,
+        expected_identity: dict[str, str] | None,
+        sink: DataSink,
+        context: DataFlowContext,
+        payload: Any,
+        runtime_environment: Mapping[str, str],
+    ) -> tuple[McpToolListResult | None, Exception | None, int]:
+        executable_snapshot = self._stdio_snapshot_for_dispatch(
+            pid=pid,
+            spec=server,
+            expected_identity=expected_identity,
+            sink=sink,
+            context=context,
+            payload=payload,
+            runtime_environment=runtime_environment,
+        )
+        try:
+            return protected.call(
+                ProviderPhase(
+                    "live_validation_not_started_after_dns",
+                    information_flow=True,
+                ),
+                lambda: self._validate_live_tool_for_call(
+                    server,
+                    tool,
+                    deadline=deadline,
+                    executable_snapshot=executable_snapshot,
+                    runtime_environment=runtime_environment,
+                ),
+            )
+        finally:
+            if executable_snapshot is not None:
+                executable_snapshot.close()
+
     @staticmethod
     def _remaining_timeout(deadline: float) -> float:
         remaining = deadline - time.monotonic()
@@ -1603,6 +1675,23 @@ class McpPrimitive:
                 "MCP deadline exhausted before provider dispatch"
             )
         return remaining
+
+    def _provider_dispatch_kwargs(
+        self,
+        server: McpServerSpec,
+        *,
+        deadline: float,
+        runtime_environment: Mapping[str, str],
+        executable_snapshot: ExecutableSnapshot | None,
+    ) -> dict[str, Any]:
+        selected: dict[str, Any] = {
+            "timeout_s": self._remaining_timeout(deadline),
+            "max_response_bytes": server.max_response_bytes,
+            "runtime_environment": runtime_environment,
+        }
+        if executable_snapshot is not None:
+            selected["executable_snapshot"] = executable_snapshot
+        return selected
 
     @staticmethod
     def _safe_not_started_error(error: ProviderEffectNotStarted) -> ProviderHostError:
@@ -1806,14 +1895,31 @@ class McpPrimitive:
             ).encode("utf-8")
         ).hexdigest()
 
-    def _stdio_executable_identity(self, spec: McpServerSpec) -> dict[str, str] | None:
+    def _stdio_executable_identity(
+        self,
+        spec: McpServerSpec,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
+    ) -> dict[str, str] | None:
         if spec.transport != "stdio" or spec.stdio is None:
             return None
         resolver = getattr(self.provider, "resolve_stdio_executable", None)
         if not callable(resolver):
             return None
         try:
-            resolved = Path(resolver(spec)).resolve(strict=True)
+            resolver_kwargs = (
+                {"runtime_environment": runtime_environment}
+                if runtime_environment is not None
+                and bool(
+                    getattr(
+                        self.provider,
+                        "supports_runtime_environment_snapshots",
+                        False,
+                    )
+                )
+                else {}
+            )
+            resolved = Path(resolver(spec, **resolver_kwargs)).resolve(strict=True)
             return {
                 "path": resolved.as_posix(),
                 "content_sha256": executable_content_sha256(resolved),
@@ -1832,6 +1938,7 @@ class McpPrimitive:
         sink: DataSink,
         context: DataFlowContext,
         payload: Any,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> ExecutableSnapshot | None:
         if spec.transport != "stdio" or spec.stdio is None:
             return None
@@ -1839,8 +1946,20 @@ class McpPrimitive:
         checker = getattr(self.provider, "executable_snapshot_required", None)
         if not callable(resolver) or not callable(checker):
             return None
-        resolved = str(resolver(spec))
-        if not bool(checker(spec, resolved)):
+        resolver_kwargs = (
+            {"runtime_environment": runtime_environment}
+            if runtime_environment is not None
+            and bool(
+                getattr(
+                    self.provider,
+                    "supports_runtime_environment_snapshots",
+                    False,
+                )
+            )
+            else {}
+        )
+        resolved = str(resolver(spec, **resolver_kwargs))
+        if not bool(checker(spec, resolved, **resolver_kwargs)):
             return None
         if not bool(getattr(self.provider, "supports_executable_snapshots", False)):
             self._data_flow().reject_sink_identity_change(
@@ -2691,22 +2810,44 @@ class McpPrimitive:
                 return True
         return False
 
-    def _require_runtime_environment(self, server: McpServerSpec) -> None:
+    def _require_runtime_environment(
+        self,
+        server: McpServerSpec,
+    ) -> Mapping[str, str]:
+        resolved_environment: dict[str, str] = {}
+        host_environment = dict(os.environ)
         if server.transport == "stdio" and server.stdio is not None:
+            # Windows needs these bootstrap variables to create a child
+            # process.  Capture them at the primitive boundary alongside the
+            # manifest-declared child environment so provider dispatch never
+            # has to consult a newer ambient environment.
+            for name in _MCP_PLATFORM_ENV_KEYS:
+                resolved = host_environment.get(name)
+                if resolved is None:
+                    continue
+                if "\x00" in resolved:
+                    raise ValidationError(f"MCP stdio env {name} contains NUL byte")
+                resolved_environment[name] = resolved
             for child_name, host_name in server.stdio.env.items():
-                resolved = os.environ.get(host_name)
+                resolved = host_environment.get(host_name)
                 if resolved is None:
                     raise ValidationError(f"missing environment variable for MCP stdio env {child_name}: {host_name}")
                 if "\x00" in resolved:
                     raise ValidationError(f"MCP stdio env {child_name} contains NUL byte")
+                resolved_environment[child_name] = resolved
         if server.transport == "streamable_http" and server.http is not None:
             for name, header in server.http.headers.items():
-                resolved = os.environ.get(header.env)
+                resolved = host_environment.get(header.env)
                 if resolved is None:
                     raise ValidationError(f"missing environment variable for MCP header {name}: {header.env}")
                 header_value = f"{header.prefix}{resolved}{header.suffix}"
                 if len(header_value) > self.config.mcp.header_value_max_chars or "\r" in header_value or "\n" in header_value:
                     raise ValidationError(f"MCP header {name} resolved value is invalid")
+                resolved_environment[name] = header_value
+        # One immutable snapshot spans all provider stages in this operation,
+        # including legacy MCP providers that use separate tools/list and
+        # call_tool sessions.  The SDK provider must not re-read os.environ.
+        return MappingProxyType(resolved_environment)
 
     def _validate_url(self, url: str) -> None:
         parsed = urlsplit(url)

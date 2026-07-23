@@ -9,12 +9,16 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
   if (!pattern) throw new Error("pattern is required");
   const path = String(args.path ?? ".");
   const maxResults = numberValue(args.max_results, 50, 1, 200);
+  const requestedTimeout = Number(args.timeout_s ?? 10);
+  const timeoutSeconds = Number.isFinite(requestedTimeout)
+    ? Math.max(Number.EPSILON, Math.min(10, requestedTimeout))
+    : 10;
   const argv = ["rg", "-n", "--hidden", "--glob", "!.git/*"];
   if (args.literal !== false) argv.push("-F");
   argv.push("--", pattern, path);
   const result = await libos.syscall("shell.run", {
     argv,
-    timeout_s: Number(args.timeout_s ?? 10),
+    timeout_s: timeoutSeconds,
   });
   const text = String(result.stdout ?? "");
   const rawMatches = text.split(/\r?\n/).filter((line) => line.length > 0);

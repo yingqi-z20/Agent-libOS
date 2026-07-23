@@ -530,8 +530,8 @@ class AuthorityManifestManager:
             "resource": resource,
             "rights": rights,
             "constraints": self._mapping(value.get("constraints"), "capability constraints"),
-            "delegable": bool(value.get("delegable", False)),
-            "revocable": bool(value.get("revocable", True)),
+            "delegable": self._capability_boolean(value, "delegable", default=False),
+            "revocable": self._capability_boolean(value, "revocable", default=True),
         }
         for key in ("expires_at", "uses_remaining"):
             if value.get(key) is not None:
@@ -703,15 +703,45 @@ class AuthorityManifestManager:
         return selected
 
     @staticmethod
+    def _capability_boolean(
+        value: Mapping[str, Any],
+        field: str,
+        *,
+        default: bool,
+    ) -> bool:
+        selected = value[field] if field in value else default
+        if not isinstance(selected, bool):
+            raise ValidationError(
+                f"authority manifest capability entry {field} must be a boolean"
+            )
+        return selected
+
+    @staticmethod
     def _effect_classes(value: Any) -> list[str] | None:
         if value is None:
             return None
         if not isinstance(value, list):
             raise ValidationError("permitted_effects must be a list")
-        selected = sorted({str(item).strip() for item in value if str(item).strip()})
-        if any(item != "*" and item.count("*") and not item.endswith(".*") for item in selected):
-            raise ValidationError("effect wildcards must be '*' or terminal '.*'")
-        return selected
+        selected: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValidationError("permitted_effects entries must be strings")
+            effect_class = item.strip()
+            if not effect_class:
+                raise ValidationError("permitted_effects entries must be non-empty strings")
+            if "*" in effect_class and not (
+                effect_class == "*"
+                or (
+                    effect_class.endswith(".*")
+                    and effect_class.count("*") == 1
+                    and len(effect_class) > 2
+                )
+            ):
+                raise ValidationError(
+                    "permitted_effects wildcards must be '*' or one terminal '.*'"
+                )
+            selected.add(effect_class)
+        return sorted(selected)
 
     @staticmethod
     def _effect_matches(pattern: str, selected: str) -> bool:

@@ -823,6 +823,31 @@ def test_publication_scale_cli_writes_structural_metrics(tmp_path: Path) -> None
     assert payload["handler_query_calls"] == 3
     assert payload["handler_raw_rows_fetched"] == 41
     assert payload["timing_is_informational_only"] is True
+    metadata = payload["artifact_metadata"]
+    assert metadata["schema_version"] == 1
+    assert metadata["benchmark_id"] == "runtime-publication-reconciliation-scale"
+    assert metadata["run_id"].startswith("benchmark_run_")
+    assert metadata["started_at"] <= metadata["completed_at"]
+    invocation = metadata["invocation"]
+    assert invocation["selected_profile"] == "ci"
+    assert invocation["classification"] == "custom-overrides"
+    assert invocation["named_profile_evidence"] is False
+    assert invocation["profile_matches_parameters"] is False
+    assert invocation["explicit_overrides"] == {
+        "total_records": 101,
+        "unreconciled_records": 39,
+        "page_size": 17,
+    }
+    assert invocation["effective_parameters"] == {
+        "total_records": 101,
+        "unreconciled_records": 39,
+        "page_size": 17,
+    }
+    provenance = metadata["provenance"]
+    assert provenance["schema_version"] == 1
+    assert len(provenance["benchmark_sources"]) == 3
+    assert len(provenance["benchmark_source_sha256"]) == 64
+    assert "git" in provenance
 
 
 @pytest.mark.parametrize(

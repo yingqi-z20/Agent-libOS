@@ -517,11 +517,19 @@ def test_real_persist_full_io_opt_out_view_is_recognized_and_can_be_normalized()
 
     assert llm_call_payload_retention_tier(legacy) is PayloadRetentionTier.SUMMARY
     assert not llm_call_payload_is_runtime_dependency(legacy)
+    summary_sha256 = llm_call_payload_sha256(legacy)
+    assert summary_sha256 == legacy.observability[
+        "$agent_libos_payload_retention"
+    ]["payload_sha256"]
 
     normalized = retain_llm_call_payload(legacy, PayloadRetentionTier.SUMMARY)
+    hash_only = retain_llm_call_payload(legacy, PayloadRetentionTier.HASH_ONLY)
 
     assert llm_call_payload_retention_tier(normalized) is PayloadRetentionTier.SUMMARY
+    assert llm_call_payload_retention_tier(hash_only) is PayloadRetentionTier.HASH_ONLY
+    assert llm_call_payload_sha256(hash_only) == summary_sha256
     assert _SENTINEL not in json.dumps(normalized.__dict__, sort_keys=True)
+    assert _SENTINEL not in json.dumps(hash_only.__dict__, sort_keys=True)
     assert "preview" not in json.dumps(normalized.__dict__, sort_keys=True)
 
 

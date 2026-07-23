@@ -92,7 +92,10 @@ prototype:
   Host-configured remotes, and repository-local simulated pull requests with
   capability/state-token/approval enforcement. It is not a GitHub/GitLab API.
 - Scoped checkpointing: reconstructable process-subtree state can be restored
-  or forked while audit/events/LLM calls/external effects remain append-only.
+  or forked without rewinding audit/events, LLM-call identity, or external
+  provider evidence. Audit and effect-transition history remain append-only;
+  guarded effect state and retained LLM/effect payload projections can advance
+  in place.
 - SQLite persistence: process metadata, capabilities, messages, human
   requests, LLM calls, audit, events, tool candidates, Skills, JSON-RPC
   endpoints, modules, checkpoints, and external-effect records.
@@ -153,7 +156,8 @@ Exit criteria:
 - `docs/invariants.md` maps core invariants to tests or explicit gaps.
 - `docs/paper_thesis.md` states the fixed Agent libOS title and thesis.
 - Artifact checklist exists and no longer uses the old temporary PAR name.
-- Benchmark schema v0 exists.
+- The historical M0 benchmark-schema milestone is recorded; the current
+  shipped contract uses task schema v1 and run-output schema v2.
 - No current docs claim Python JIT, direct external framework adapters,
   unsupported rollback, or Skill-as-permission behavior.
 

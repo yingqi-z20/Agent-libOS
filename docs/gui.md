@@ -67,10 +67,17 @@ operations, but it does not expose a Sink-trust mutation route or model tool.
 Sink trust remains Host configuration/API state; adding a GUI view later must
 not turn renderer visibility into `data_flow_sink_registry:*` authority.
 
-For endpoints that accept an optional `actor`, omitting `actor` runs in GUI
-admin mode. Supplying `actor` opts into process-authority mode and requires
-that process to hold the capability needed by the underlying primitive, keeping
-audit attribution aligned with the capability decision.
+Only the checkpoint create/restore/fork, Skill activation/unload, Capability
+grant/delegate/revoke, image registration/commit, JSON-RPC registration, and
+MCP registration endpoints accept an optional `actor`. On those endpoints,
+omitting `actor` runs in GUI admin mode; supplying a non-empty process id opts
+into process-authority mode and requires that process to hold the capability
+needed by the underlying primitive. Skill registration is deliberately
+stricter: `POST /api/skills/register` requires a non-empty process `actor` and
+reads the package path through that process's workspace filesystem authority;
+there is no GUI-admin registration mode. Other mutation endpoints use
+Host/admin authority or an explicit `pid` field and reject a top-level `actor`
+instead of treating unused attribution as an authorization boundary.
 
 Closing the GUI server pauses auto-run and asks the scheduler to stop before it
 calls `Runtime.shutdown()` on an owned runtime. Every request that reads or
@@ -169,23 +176,30 @@ fix is available.
 
 ## Current Workspace
 
-The first screen is process-centered:
+The first screen is the streamlined user page. It provides task/process
+selection, conversation and pending Human-request cards, task start/message/run
+controls, image import and save-as-image, ratings, LLM profile selection, and a
+button for the operator console. Image import and commit both require explicit
+confirmation. Saving as an image creates a checkpoint only after that
+confirmation, then commits the checkpoint into an immutable image artifact.
 
-- left pane: process tree, status, image, cwd, resource budget/usage, unread
-  message badges,
-- center pane: selected process timeline with type filters and human request
-  cards,
-- right pane: details for overview, capabilities, tools/Skills, checkpoints,
-  audit, LLM calls, Images, JSON-RPC, MCP, Object Memory summary, and selected
-  process ratings,
-- top bar: database, spawn, auto-run, quanta budget, run, step, pause, refresh.
+The operator console is the three-column process workspace:
 
-The default user page exposes the image workflow without opening raw runtime
-panels: users can choose a registered image for a new task, import an
-AgentImage package, or save the current selected process as a checkpoint-
-derived image. Import and commit both require explicit confirmation. Saving as
-an image creates a checkpoint only after that confirmation, then commits the
-checkpoint into an immutable image artifact.
+- the left pane contains spawn controls and a process tree with pid, image,
+  status, and unread-message indicators;
+- the center pane contains the selected process timeline, Human request cards,
+  and message controls;
+- the right pane contains exec/exit controls and tabs for overview, ratings,
+  capabilities, tools/Skills, checkpoints, audit, Explain, LLM calls, Images,
+  JSON-RPC, MCP, and an Object Memory reference showing the goal OID and
+  capability-control note;
+- the top bar contains database, spawn, auto-run, quanta, run, step, pause, and
+  refresh controls.
+
+Detailed cwd and resource budget/usage values are shown in process metadata and
+detail views rather than as fields on every process-tree row. The Object Memory
+tab does not materialize arbitrary objects; payload materialization remains a
+runtime capability-checked operation.
 
 Users can also score the selected AgentProcess from 1 to 5 and add an optional
 comment. The GUI stores one current rating per process, default human, and GUI
@@ -208,14 +222,18 @@ libOS/llm-profiles.json` on macOS, and the `agent-libos/llm-profiles.json`
 file under `${XDG_CONFIG_HOME:-~/.config}` on Linux. The file stores model routing fields such
 as profile id, model, base URL, API mode, tuning options, optional
 `context_window_tokens`, and the `api_key_env` name. It never stores the API
-key value. When a profile has a base URL,
+key value. The bundled editor exposes the common routing and tuning fields. A
+`PUT` is a partial update: profile fields not exposed or omitted by the current
+renderer are preserved rather than silently reset. When a profile has a base URL,
 `allow_custom_base_url: false` is preserved explicitly rather than inferred
 away, so disabling custom-base-url use remains stable across GUI restarts.
 
 The scheduler defaults to automatic mode. Users can pause auto-run, step a
 selected process, or run the selected process with an optional quantum budget.
-Leaving the budget blank runs until the process/runtime becomes idle; entering a
-number bounds that run. Automatic runs after spawn/message/exec may advance all
+Leaving the budget blank omits `max_quanta`, so the server uses
+`runtime.run_until_idle_max_quanta`; the run is unbounded only when that
+configured default is `null`. Entering a number explicitly bounds that run.
+Automatic runs after spawn/message/exec may advance all
 runnable processes, but `POST /api/processes/{pid}/run` is intentionally scoped
 to that pid. `POST /api/processes/{pid}/step` is synchronous: its response and
 the snapshot it publishes contain the final scheduler state (`running: false`)
@@ -224,8 +242,8 @@ show token usage, errors, full stored LLM inputs and outputs, and bounded
 prompt/output observability metadata. This default supports self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. If
 the host runtime is configured with `llm.persist_full_io=False`, the same
-`llm_calls` API returns only bounded previews and hashes for sensitive prompt,
-tool, reasoning, and provider payload fields.
+`llm_calls` API returns content-free hashes, counts, and structural envelopes
+for sensitive prompt, tool, reasoning, and provider payload fields.
 
 GUI background auto-run deliberately sets `process_human_queue=false`. It may
 advance runnable model work, but it never auto-approves, auto-denies, or invents
@@ -304,8 +322,8 @@ Event and audit rows persist a derived `gui_snapshot_visible` flag. Snapshot
 queries filter that indexed flag before applying `LIMIT`, preventing internal
 GUI-presentation evidence from displacing causal runtime rows. The flag is
 required by the 0.3 schema; missing or malformed persisted visibility state is
-rejected rather than repaired during open. The full event/audit histories can
-still include presentation evidence when requested.
+rejected rather than repaired during open. Bounded event/audit page endpoints
+can still include presentation evidence when requested.
 The process window orders non-terminal processes before the most recently
 updated terminal history, so a full snapshot does not hide current work behind
 old completed rows. If the bounded window contains a child but not its parent,
@@ -320,13 +338,13 @@ process.
 
 ## High-Risk Operations
 
-The GUI requires explicit confirmation for high-risk operations before sending
-the final request to the server:
+The Python GUI server requires `confirmed: true` for the following high-risk
+operations before invoking the runtime:
 
 - process `exec` and `exit`,
 - process `signal` requests that cancel or terminate a process,
-- workflow runs for side-effecting tools, custom images, or custom working
-  directories,
+- workflow runs for side-effecting or unresolved tools, or requests with an
+  explicit image or working directory,
 - image package registration and checkpoint-to-image commit,
 - checkpoint restore and fork,
 - capability grant, delegate, and revoke,
@@ -334,9 +352,13 @@ the final request to the server:
 - MCP server registration and tool calls,
 - Skill registration, activation, and unload.
 
-The confirmation dialog shows the pid/resource/action summary. The server also
-rejects high-risk requests without `confirmed: true`, so accidental direct HTTP
-calls fail closed before invoking the runtime operation.
+The bundled renderer currently provides confirmation dialogs for process exec
+and exit, image package registration, and checkpoint-to-image commit. The other
+listed routes are server-side administration contracts and are not currently
+exposed as renderer controls. Same-build clients that use them must present
+their own confirmation UX and send `confirmed: true`; `LibOSClient.runWorkflow`
+accepts an explicit `confirmed` option for high-risk workflow calls. The server
+rejects a missing or false confirmation before invoking the runtime operation.
 
 JSON-RPC endpoint and MCP server registration through the GUI accept manifest
 text only. The renderer cannot ask the Python GUI server to read an arbitrary
@@ -344,9 +366,14 @@ host file path; file/path based registration remains a CLI/admin workflow.
 
 Image package registration follows the same rule. Electron may read a package
 directory selected by the user and pass bounded package file payloads to the
-local GUI server, but the server rejects host file paths. The default GUI
-request body limit is sized to carry the Electron 16 MiB raw package-file
-limit after base64 and JSON wrapping. Registering or
+local GUI server, but the server rejects host file paths. The selector rejects
+symbolic and multiply-linked files, more than 512 files, more than 512 directories,
+directory depth above 32, and more than 16 MiB of raw file data; it separately
+caps the selected manifest at 1 MiB. Runtime image limits then apply as a second
+boundary, including the configured manifest, per-file, total-byte, and file-count
+limits (defaults: 256 KiB, 1 MiB, 16 MiB, and 512 respectively). The default GUI
+request body limit is sized to carry that raw package limit after base64 and
+JSON wrapping. Registering or
 committing an image changes image visibility and baked internal runtime state
 only; it does not grant the target image's declared capabilities. Package
 workspace grants apply only to the private materialized copy declared by the
@@ -365,10 +392,12 @@ configuration.
 The Electron renderer and Python server are shipped and tested as one build.
 The local `/api` surface is not a complete, independently versioned public REST
 API, and compatibility for arbitrary external clients is not promised. The
-machine-readable [GUI API contract subset v1](gui_api_schema.json) deliberately
-covers the snapshot response, JSON error envelope, and payloads for every
-operation that the server gates with explicit confirmation. It is JSON Schema,
-not a complete OpenAPI document.
+machine-readable [GUI API contract subset v1](gui_api_schema.json)
+deliberately covers the snapshot's required top-level collections, the minimal
+process/scheduler shape consumed during bootstrap, the JSON error envelope, and
+payloads for every operation that the server gates with explicit confirmation.
+Other snapshot collection item schemas and renderer routes remain same-build
+implementation details. It is JSON Schema, not a complete OpenAPI document.
 
 `tests/unit/test_gui_api_schema.py` parses that schema, validates representative
 payloads, and compares its high-risk operation map with the server's
@@ -448,7 +477,9 @@ Important endpoints:
   `POST /api/mcp/{server_id}/call`
 - `GET /api/modules`, `GET /api/modules/{module_id}`
 
-All endpoints require `Authorization: Bearer <session-token>`.
+All non-`OPTIONS` endpoints require `Authorization: Bearer <session-token>`.
+Unauthenticated `OPTIONS` is limited to CORS preflight and does not read or
+mutate Runtime state.
 Mutation endpoints validate required ids, image names, and paths as non-empty
 JSON strings. Malformed enum values such as an unknown process signal, missing
 required fields, non-object request bodies, and incorrectly typed booleans

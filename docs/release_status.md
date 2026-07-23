@@ -1,9 +1,11 @@
 # Agent libOS 0.3.4 Status
 
-Agent libOS 0.3.4 is release-ready for the core Python runtime scope exercised
-by the checked-in CI workflow and defined in `docs/support_matrix.md`. This is
-not a claim that every platform, desktop package, or real external-provider
-configuration has been release-validated.
+Agent libOS 0.3.4 is a release candidate for the core Python runtime scope
+defined in `docs/support_matrix.md`. Release-ready status for any source tree is
+conditional on that exact tree passing the checked-in CI workflow; local
+deterministic results do not substitute for its Python-version, PostgreSQL, and
+artifact gates. This is not a claim that every platform, desktop package, or
+real external-provider configuration has been release-validated.
 
 ## Closed release blockers and P1 architecture debt
 
@@ -122,8 +124,10 @@ configuration has been release-validated.
   exceptions, incomplete results, and renewed cancellation, and is idempotent
   after release.
 - External-effect startup recovery is state-filtered, keyset-paged, hard-bounded,
-  and index-backed. LLM/effect payload retention is disabled by default and is
-  explicit, monotonic, CAS-protected, transactionally audited, and recovery-safe.
+  and index-backed. The payload-retention reduction/maintenance policy is
+  disabled by default; when enabled it is explicit, monotonic, CAS-protected,
+  transactionally audited, and recovery-safe. This is separate from the default
+  `llm.persist_full_io: true` setting for newly recorded LLM calls.
 - Provider-usage reservation recovery is startup-lease-only, status-first
   keyset-paged, and hard-bounded. Ambiguous reservations settle and charge
   atomically, overage convergence continues across the complete backlog, and
@@ -155,16 +159,17 @@ configuration has been release-validated.
 
 - Compilation, architecture/blocking-work checks, protected-operation coverage,
   release-contract checks, whitespace checks, and the invariant manifest pass.
-  All 86 declared invariants resolve against 3,568 collected pytest nodes.
-- The per-lane deterministic matrix passes all selected tests. PostgreSQL,
-  MCP, and real-LLM coverage remains in dedicated or explicit gates, while
-  platform-specific skips stay documented and real Deno runs by default when
-  installed.
+  All 86 declared invariants resolve against 3,695 collected pytest nodes.
+- The per-lane deterministic matrix passes all selected tests. PostgreSQL
+  service coverage, real MCP SDK/server integration, and real-LLM coverage
+  remain in dedicated or explicit gates; deterministic mocked MCP coverage is
+  part of the normal matrix. Platform-specific skips stay documented and real
+  Deno runs by default when installed.
 - The PostgreSQL CI job runs the complete `postgres` marker gate against
   PostgreSQL 17 on Python 3.11 and permits no skips; the current collection
-  selects 259 tests. This is a service-backed CI gate, not evidence that an
+  selects 261 tests. This is a service-backed CI gate, not evidence that an
   arbitrary local PostgreSQL configuration has been validated.
-- The GUI lane passes all 19 Vitest files and 67 tests, TypeScript type checking,
+- The GUI lane passes all 19 Vitest files and 68 tests, TypeScript type checking,
   and the production frontend build.
 - The runtime-safety release smoke passes all three selected tasks with complete
   audit evidence, no unauthorized effects, and no false denials. Four focused

@@ -225,7 +225,16 @@ invocations must select the same database independently of their working
 directory.
 
 Passing `--actor-pid` makes the CLI enforce that process's checkpoint
-capabilities. Omitting it runs as an audited admin CLI actor.
+capabilities. Omitting it runs as the trusted `cli` administrator and bypasses
+process capability checks; it does not make every command automatically
+audited. Checkpoint creation and restore publish their normal operation audit,
+fork attempts a post-commit operation audit, and replay publishes a diagnostic
+`checkpoint.replay_to_event` audit. `list`, `inspect`, and `diff` do not
+themselves publish operation-specific audit records in either mode. In actor
+mode, consuming a finite read still publishes the generic capability
+reservation/settlement audit records. Deployments that require an audit record
+for every administrator read must add that control at the CLI invocation or
+host access boundary.
 
 Finite read authority follows the operation shape. Actor-mode `list` consumes
 the selected `checkpoint:*` read immediately, or the selected

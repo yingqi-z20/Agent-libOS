@@ -5,7 +5,7 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
     tests: Array.isArray(args.tests) ? args.tests.map((item) => String(item)) : [],
     residual_risks: Array.isArray(args.residual_risks) ? args.residual_risks.map((item) => String(item)) : [],
   };
-  const exitResult = await libos.syscall("process.exit", { result: payload });
+  const exitResult = await libos.syscall("process.exit", { payload });
   return {
     submitted: true,
     payload,

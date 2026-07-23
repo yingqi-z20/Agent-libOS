@@ -52,7 +52,10 @@ http:
 ```
 
 `stdio.env` maps child process environment variable names to host environment
-variable names. The runtime does not inherit the full host environment.
+variable names. The runtime does not inherit the full host environment. On
+Windows, it additionally forwards `SYSTEMROOT` and `WINDIR`, when present,
+because they are child-process bootstrap variables rather than manifest
+credentials.
 
 The accepted v1 shape is closed: unknown server, transport, tool, or header
 fields are rejected instead of being silently ignored. `metadata` and JSON
@@ -84,8 +87,10 @@ An explicitly supplied `rollback_status` is preserved instead of applying this
 default mapping.
 
 A tool cannot combine `no_rollback_required` with `state_mutation: true`. A
-non-empty `input_schema` must be valid JSON Schema and is pinned against live
-tool metadata before calls.
+non-empty `input_schema` must be valid JSON Schema and is pinned exactly against
+live tool metadata before calls. If the live server omits the schema or reports
+`{}`, that is a mismatch rather than an opt-out; only a manifest whose own
+`input_schema` is `{}` leaves the live schema unpinned.
 
 With `DEFAULT_CONFIG`, omitted limits resolve to `timeout_s: 10`,
 `max_request_bytes: 65,536`, and `max_response_bytes: 1,048,576`. Manifest
@@ -127,6 +132,11 @@ actually start the local child process.
 covers the canonical command, args, environment mapping, and cwd. HTTP servers
 return `null` for this field. `call_mcp_tool` requires the right declared by the
 tool spec on `mcp:<server_id>:<tool_id>`.
+
+Actor-mode registration also reads the user-supplied manifest through the
+filesystem primitive, so the actor needs filesystem `read` authority for that
+path in addition to the exact server registry authority (and the stdio launch
+authority described above).
 
 For a live refresh/call, every finite decision needed by that one composite
 boundary is reserved together before provider work: the main tool or server
@@ -217,6 +227,16 @@ Runtime environment resolution has operation-specific ordering:
   therefore takes the no-provider-start path, restoring all reservations and
   abandoning that intent.
 
+Each resolving operation materializes the configured HTTP headers or stdio
+child variables once into an immutable, in-memory snapshot. On Windows, the
+same snapshot includes the optional `SYSTEMROOT` and `WINDIR` child bootstrap
+values. The same snapshot is supplied to all provider stages, including both
+`tools/list` and `call_tool` for a legacy two-session provider. The SDK provider
+does not read the mapped host environment variables or Windows bootstrap
+variables again, so a concurrent change cannot replace a validated value
+before dispatch. Snapshots are not persisted or included in audit/effect
+observations.
+
 For non-local Streamable HTTP, reservation and pending-effect persistence
 precede DNS because host resolution is itself an external observation; an
 ordinary DNS failure therefore consumes the use and finalizes information-flow
@@ -225,9 +245,13 @@ tool metadata and fails closed if the
 server no longer exposes the tool or if a pinned `input_schema` changed; those
 post-boundary failures do not restore the use.
 
-One absolute deadline covers dispatch setup, DNS, executable snapshotting,
-live `tools/list`, validation, and `call_tool`; each phase receives only the
-remaining time. An exhausted deadline cannot start the next provider phase.
+For `call_tool`, one absolute deadline begins after protected preparation and
+covers environment snapshotting, primitive DNS, executable snapshotting, live
+`tools/list`, validation, and `call_tool`; each subsequent stage receives only
+the remaining time. For live refresh, environment snapshotting and initial
+executable identity selection precede its deadline; that deadline then covers
+primitive DNS, final executable snapshotting, and `tools/list`. An exhausted
+deadline cannot start the next provider phase.
 Legacy two-call providers reserve the complete request/response envelope before
 dispatch, but settlement follows observed stage progress: completed response
 bytes are charged exactly, an ordinary exception with unknown response size
@@ -238,10 +262,23 @@ settles `128 + max_response_bytes`, while a list-stage failure settles one
 provider-certified not-started phase retains the existing narrower release or
 prior-stage settlement semantics described below.
 
-HTTP transport follows the same default network posture as JSON-RPC: HTTPS for
-remote hosts, plain HTTP only for local development hosts, no URL userinfo or
-fragments, no literal header secrets, no forbidden request headers, and
-environment-backed header secrets restricted by `mcp.header_env_allowlist`.
+HTTP transport shares JSON-RPC's manifest restrictions: HTTPS for remote hosts,
+plain HTTP only for local development hosts, no URL userinfo or fragments, no
+literal header secrets, no forbidden request headers, and environment-backed
+header secrets restricted by `mcp.header_env_allowlist`. The SDK transport also
+disables redirects and ambient proxy/environment routing (`trust_env=false`),
+uses the platform TLS trust store, forces HTTP/1.1 with no keepalive, and sets
+httpcore retries to zero. Its network backend may try another validated address
+only while establishing a TCP connection; the custom HTTP transport adds no
+retry for an already-issued request after a write/read failure.
+
+For non-local HTTP, the primitive first resolves every address and rejects the
+operation if any result is non-public. The SDK connection backend resolves and
+applies the same policy again immediately before opening a socket. Unlike the
+JSON-RPC provider, it does not pin the socket to the primitive's earlier tuple;
+DNS may move among public addresses, but a private, loopback, link-local,
+reserved, multicast, or metadata-service destination still fails closed at
+connect time.
 
 stdio transport uses argv, not a shell string. The command must be a single
 argv token; args are separate strings. Environment injection is explicit and
@@ -292,6 +329,12 @@ abandon. If live validation succeeded and the main `call_tool` then reports
 not-started, the validation already flowed server metadata: the intent is finalized
 `unknown` with `state_mutation=false, information_flow=true`, not abandoned.
 
+Completed protected phases impose a conservative classification floor. A
+non-local primitive DNS observation and every live provider boundary force
+`information_flow=true`; the actual tool-call phase also carries the tool's
+declared mutation flag. Manifest classification cannot erase an earlier phase
+already observed by the composite operation.
+
 Checkpoint reports and benchmark evidence include both finalized and still
 pending MCP effects. v1 does not compensate remote MCP state.
 
@@ -315,7 +358,11 @@ uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
 
 Registry commands accept `--actor-pid <pid>` to enforce that process's
 `mcp_server:*` or exact server capabilities. Without `--actor-pid`, they run as
-audited admin registry operations.
+audited admin registry operations. Actor-mode `register` also requires
+filesystem `read` for the manifest path; stdio registration additionally
+requires the launch rights described above. For `mcp call <pid>`, an explicitly
+supplied group-level `--actor-pid` must equal the target `<pid>` and adds no
+authority.
 
 For stdio actor mode, run `mcp inspect` after host/admin registration and use
 the returned `stdio_authority_resource` verbatim for the exact execute grant.
@@ -325,9 +372,12 @@ the store loads existing server metadata. `replace=true` always requires
 server `admin`; non-replace registration requires `write`. Registration,
 replacement, and unregistration commit the server row, stale tool-grant
 invalidation, finite composite authority reservation/commit, event, and audit
-in one store transaction. Local validation or an event/audit sink failure
-therefore restores all reservations and cannot leave a half-published registry
-mutation.
+in one store transaction. The finite composite decisions are reauthorized and
+reserved when that transaction begins, before the existing-row lookup and its
+duplicate/not-found check or any registry mutation. A duplicate/not-found
+outcome or any later row, event, or audit failure rolls back every reservation
+and cannot leave a half-published registry mutation. Validation completed
+before transaction entry cannot consume finite authority.
 
 The optional SDK-backed provider requires:
 
@@ -357,8 +407,8 @@ or raw MCP tool names.
 
 ## Persistence And Checkpoints
 
-MCP server specs are runtime store registry rows. Resolved secret values are
-not persisted.
+MCP server specs are runtime store registry rows. Resolved secret values and
+their per-operation immutable snapshots are not persisted.
 
 Checkpoint snapshots preserve process capabilities that reference MCP
 resources, but they do not copy or restore MCP server registry rows. Restore

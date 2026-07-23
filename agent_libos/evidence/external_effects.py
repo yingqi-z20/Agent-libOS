@@ -148,6 +148,13 @@ def prepare_external_effect_intent(
     ``dispatched`` immediately before invoking a provider.  Keeping these two
     steps separate lets the protected-operation SDK distinguish a local
     pre-provider abort from a process crash at the provider boundary.
+
+    An explicit idempotency key is unique only within ``pid`` and remains
+    claimed for every retained effect state.  When omitted, the generated key
+    includes the current operation/effect identity and therefore prevents a
+    duplicate lifecycle for that identity; it is not a cross-operation retry
+    key.  Abandoning a certified-not-started intent deletes the row and releases
+    its key because no provider phase began.
     """
 
     manifest = _effect_manifest(authority_policy, pid, provider, operation)
@@ -544,7 +551,13 @@ def abandon_external_effect_intent(
     *,
     operations: OperationPort | None = None,
 ) -> None:
-    """Remove an intent only when the provider certifies the effect never started."""
+    """Remove an intent only when no effectful provider phase can have begun.
+
+    Valid callers are a pre-dispatch abort, startup recovery of a transaction
+    still durably marked ``prepared``, or a phase-local not-started certificate
+    when no earlier phase mutated state, observed information, or committed
+    authority.
+    """
 
     if intent_effect_id is not None:
         if not store.abandon_external_effect_intent(intent_effect_id):

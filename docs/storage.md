@@ -70,6 +70,12 @@ database-level isolation design (for example row locks/epochs and corresponding
 multi-connection tests), rather than relying on the in-process repository
 lock.
 
+Within one RuntimeStore, one backend connection and one process-local
+`threading.RLock` serialize queries and transactions across threads. Reentrant
+transactions on the owning thread use savepoints; another thread cannot join an
+active outer transaction. PostgreSQL database concurrency does not imply that
+this repository has a connection pool or concurrent per-Runtime transactions.
+
 ## Strict 0.3 schema
 
 Fresh 0.3 databases create a `runtime_schema` table with one marker row; the

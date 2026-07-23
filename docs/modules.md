@@ -109,9 +109,10 @@ def register_module(ctx):
     ctx.add_startup_hook(initialize_example)
 ```
 
-The module context buffers registrations first. The registry verifies that the
-module registered only declared resources, checks name collisions, then applies
-the registrations before the runtime is returned to the caller. Registration,
+The entrypoint's buffered `ModuleContext` records registrations first. The
+registry verifies that these buffered registrations use only resources declared
+in `provides`, checks name collisions, then applies them before the runtime is
+returned to the caller. Registration,
 module metadata, audit/event rows, and the in-memory tool/image/syscall/hook
 registries commit as one lifecycle transaction. Startup hooks run under the
 same registration-journal discipline: if a hook registers a runtime tool,
@@ -137,7 +138,11 @@ There are two deliberately different context lifecycles:
    provider/startup hook receives a `ModuleHookContext`. The context is backed
    by `ModuleHookServices`, and every supported registration or installed
    module-owned attribute records an inverse in the module's registration
-   journal.
+   journal. Hook-time registrations are trusted TCB behavior and are not checked
+   against the entrypoint-oriented `provides` inventory; the journal provides
+   lifecycle rollback, not declarative least-authority enforcement. Modules that
+   need a complete supply-chain inventory should still declare and review those
+   dynamic surfaces explicitly.
 
 `ModuleHookServices.from_host(...)` is the assembly/test boundary that captures
 the explicit services used to build hook contexts. Its current public fields
@@ -297,17 +302,21 @@ values use `PtyModuleSettings` defaults such as `default_cols`,
 a mutable Object Memory `EXTERNAL_REF` object id as `session_oid`; the payload
 is descriptive metadata only and is not an authority source.
 If provider spawn succeeds but any later registration, reader startup,
-event/audit, or effect-recording step fails, the adapter closes the host handle,
-removes the in-memory session, and releases the object before returning
-failure.
+event/audit, or effect-recording step fails, the adapter attempts to close the
+host handle, remove the in-memory session, and release the object before
+returning failure. Cleanup is best effort: an ambiguous close retains an
+unresolved session/Object and its evidence instead of pretending that the host
+resource was removed.
 
 A finite-use shell-policy decision is reserved before the SDK's
 `provider.spawn` phase.
 The adapter then persists a structured pending spawn-effect intent before
-`provider.spawn`. `ProviderEffectNotStarted` is the only provider failure that
-certifies no child was created; reservation restoration and conditional intent
-abandonment share one store transaction. Any other spawn exception commits the
-use and conditionally finalizes the same effect id as `unknown` when the result
+`provider.spawn`. `ProviderEffectNotStarted` certifies only that this spawn
+phase did not create a child. Reservation restoration and intent abandonment
+are permitted only when no earlier effectful phase has already observed
+information; for example, a preceding resolver observation still commits the
+reservation and retains conservative evidence. Any other spawn exception
+commits the use and conditionally finalizes the same effect id as `unknown` when the result
 sinks succeed; a post-provider sink failure leaves it pending. Successful spawn
 followed by setup/classification failure is contained by closing the handle and
 removing the Object, but the already-crossed provider outcome remains

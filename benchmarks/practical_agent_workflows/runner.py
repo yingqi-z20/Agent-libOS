@@ -26,6 +26,7 @@ from benchmarks.practical_agent_workflows.models import (
 )
 from benchmarks.practical_agent_workflows.catalog import build_modeled_scenarios
 from benchmarks.practical_agent_workflows.oracle import validate_modeled_scenario
+from benchmarks.practical_agent_workflows.validation import validate_practical_report
 
 
 class StatefulConnectorProvider:
@@ -146,7 +147,7 @@ def run_practical_evaluation(
     native = [item for item in results if item.evidence_level == EvidenceLevel.NATIVE_LIVE]
     # There is intentionally no fallback path in the native executor. Any
     # absent tool/effect/operation evidence makes that scenario fail.
-    return PracticalRunReport(
+    report = PracticalRunReport(
         schema_version=1,
         results=results,
         scenario_counts=scenario_counts,
@@ -159,6 +160,12 @@ def run_practical_evaluation(
             item.ok for item in results if item.evidence_level == EvidenceLevel.MODELED
         ),
     )
+    invariant_errors = validate_practical_report(report.to_dict())
+    if invariant_errors:
+        raise AssertionError(
+            "practical report invariant violation: " + "; ".join(invariant_errors)
+        )
+    return report
 
 
 def _run_native_scenario(

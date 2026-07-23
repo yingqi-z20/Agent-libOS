@@ -4,7 +4,11 @@ import argparse
 import json
 from pathlib import Path
 
-from benchmarks.practical_agent_workflows import run_practical_evaluation
+from benchmarks.practical_agent_workflows import (
+    run_practical_evaluation,
+    validate_practical_report,
+    validate_practical_report_schema,
+)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -17,6 +21,18 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
     report = run_practical_evaluation().to_dict()
+    schema_errors = validate_practical_report_schema(report)
+    if schema_errors:
+        raise RuntimeError(
+            "refusing to emit a practical report that violates report.schema.json: "
+            + "; ".join(schema_errors)
+        )
+    invariant_errors = validate_practical_report(report)
+    if invariant_errors:
+        raise RuntimeError(
+            "refusing to emit an internally inconsistent practical report: "
+            + "; ".join(invariant_errors)
+        )
     rendered = json.dumps(report, indent=2, ensure_ascii=False)
     if args.output:
         output = Path(args.output)

@@ -47,6 +47,10 @@ _EXACT_JSR_VERSION_RE = re.compile(
 )
 _RUNTIME_CODE_GENERATION_NAMES = {"eval", "Function", "AsyncFunction", "GeneratorFunction", "AsyncGeneratorFunction"}
 _RUNTIME_GLOBAL_OBJECT_NAMES = {"globalThis", "window"}
+_TYPESCRIPT_DEPENDENCY_DIRECTIVE_RE = re.compile(
+    r"(?im)^\s*///\s*<\s*(?:reference|amd-dependency)\b"
+)
+_DENO_TYPES_DIRECTIVE_RE = re.compile(r"(?im)^\s*//\s*@deno-types\s*=")
 
 SyscallHandler = Callable[[str, dict[str, Any]], Any | Awaitable[Any]]
 
@@ -55,6 +59,22 @@ SyscallHandler = Callable[[str, dict[str, Any]], Any | Awaitable[Any]]
 class SandboxExecutionResult:
     value: Any
     metrics: CommandMetrics | None = None
+
+
+@dataclass(frozen=True)
+class _SupervisedProcessHandle:
+    process: asyncio.subprocess.Process
+    death_write_fd: int | None
+    windows_job: WindowsJobObject | None
+
+
+@dataclass(frozen=True)
+class _DenoCheckTasks:
+    communicate: asyncio.Task[tuple[bytes, bytes]]
+    monitor: asyncio.Task[CommandMetrics]
+
+    def all(self) -> tuple[asyncio.Task[Any], ...]:
+        return (self.communicate, self.monitor)
 
 
 class SandboxBackend:
@@ -168,12 +188,19 @@ class DenoTypescriptSandbox(SandboxBackend):
         warnings: list[str] = []
         if len(source_code) > self.max_source_chars:
             errors.append(f"TypeScript tool source exceeds max chars: {self.max_source_chars}")
+        if "\ufeff" in source_code:
+            errors.append("Unicode byte-order marks are not allowed in JIT tool source")
         if not self._RUN_EXPORT_RE.search(source_code):
             errors.append("TypeScript tool source must export function run(args, libos)")
         if self._contains_dynamic_import(source_code):
             errors.append("dynamic import() is not allowed")
         if self._contains_runtime_code_generation(source_code):
             errors.append("runtime code generation is not allowed")
+        if (
+            _TYPESCRIPT_DEPENDENCY_DIRECTIVE_RE.search(source_code)
+            or _DENO_TYPES_DIRECTIVE_RE.search(source_code)
+        ):
+            errors.append("TypeScript dependency directives are not allowed")
         for specifier in self._extract_imports(source_code):
             errors.append(f"imports are not allowed in JIT tool source: {specifier}")
         return ValidationResult(ok=not errors, errors=errors, warnings=warnings)
@@ -244,7 +271,6 @@ class DenoTypescriptSandbox(SandboxBackend):
                     return_when=asyncio.FIRST_EXCEPTION,
                 )
                 if not done:
-                    await self._kill_process(proc)
                     for task in pending:
                         task.cancel()
                     raise SubprocessTimeoutExpired(
@@ -329,6 +355,22 @@ class DenoTypescriptSandbox(SandboxBackend):
         errors: list[str] = []
         logs: list[str] = [f"language=typescript", f"deno={version}"]
         metrics: list[CommandMetrics] = []
+        if not tests:
+            try:
+                check_metrics = self._check_source_with_deno(
+                    source_code,
+                    timeout=timeout,
+                    limits=limits,
+                )
+                metrics.append(check_metrics)
+                logs.append("deno_check=ok")
+            except (SubprocessLimitExceeded, SubprocessTimeoutExpired):
+                raise
+            except Exception as exc:
+                errors.append(
+                    "source failed Deno type-check: "
+                    f"{self._bounded_result_repr(exc)}"
+                )
         for index, test in enumerate(tests, start=1):
             syscall_handler, assert_syscalls_consumed = self._test_syscall_handler(test, index)
             try:
@@ -361,6 +403,265 @@ class DenoTypescriptSandbox(SandboxBackend):
                 )
         metadata = {"metrics": self._aggregate_metrics(metrics)} if return_metrics else {}
         return ValidationResult(ok=not errors, errors=errors, logs=self._bounded_logs(logs), metadata=metadata)
+
+    def _check_source_with_deno(
+        self,
+        source_code: str,
+        *,
+        timeout: float | None,
+        limits: SubprocessLimits | None,
+    ) -> CommandMetrics:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self._acheck_source_with_deno(
+                    source_code,
+                    timeout=timeout,
+                    limits=limits,
+                )
+            )
+        raise RuntimeError(
+            "Cannot type-check JIT source inside a running event loop. "
+            "Run validation in a worker."
+        )
+
+    async def _acheck_source_with_deno(
+        self,
+        source_code: str,
+        *,
+        timeout: float | None,
+        limits: SubprocessLimits | None,
+    ) -> CommandMetrics:
+        """Type-check an otherwise untested candidate without executing it."""
+
+        deno = self._resolve_deno()
+        selected_timeout = self.default_timeout_s if timeout is None else timeout
+        with tempfile.TemporaryDirectory(prefix="agent_libos_deno_check_") as tmp:
+            tmp_path = Path(tmp)
+            self._write_deno_check_files(tmp_path, source_code)
+            handle = await self._start_deno_check_process(
+                self._deno_check_command(deno),
+                tmp_path,
+            )
+            tasks: _DenoCheckTasks | None = None
+            try:
+                tasks = self._start_deno_check_tasks(handle.process, limits)
+                stdout, stderr, metrics = await self._wait_for_deno_check(
+                    tasks,
+                    selected_timeout,
+                )
+                self._validate_deno_check_output(
+                    handle.process,
+                    stdout,
+                    stderr,
+                )
+                return metrics
+            finally:
+                await self._cleanup_deno_check(handle, tasks)
+
+    @staticmethod
+    def _write_deno_check_files(tmp_path: Path, source_code: str) -> None:
+        (tmp_path / "candidate.ts").write_text(source_code, encoding="utf-8")
+        (tmp_path / "deno.json").write_text(
+            json.dumps({"compilerOptions": {"strict": False}}),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _deno_check_command(deno: str) -> list[str]:
+        return [
+            deno,
+            "check",
+            "--quiet",
+            "--config",
+            "deno.json",
+            "--no-lock",
+            "--no-remote",
+            "--no-npm",
+            "candidate.ts",
+        ]
+
+    async def _start_deno_check_process(
+        self,
+        command: list[str],
+        tmp_path: Path,
+    ) -> _SupervisedProcessHandle:
+        (
+            launch_command,
+            launch_kwargs,
+            death_read_fd,
+            death_write_fd,
+            windows_job,
+            windows_gate,
+        ) = self._prepare_supervised_launch(command, tmp_path)
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *launch_command,
+                cwd=str(tmp_path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **launch_kwargs,
+            )
+            if death_read_fd is not None:
+                os.close(death_read_fd)
+                death_read_fd = None
+            self._attach_windows_supervisor(process, windows_job, windows_gate)
+            return _SupervisedProcessHandle(
+                process=process,
+                death_write_fd=death_write_fd,
+                windows_job=windows_job,
+            )
+        except BaseException:
+            try:
+                if process is not None and process.returncode is None:
+                    await self._kill_process(process)
+            finally:
+                self._close_supervisor_resources(
+                    death_read_fd=death_read_fd,
+                    death_write_fd=death_write_fd,
+                    windows_job=windows_job,
+                )
+            raise
+
+    @staticmethod
+    def _attach_windows_supervisor(
+        process: asyncio.subprocess.Process,
+        windows_job: WindowsJobObject | None,
+        windows_gate: Path | None,
+    ) -> None:
+        if windows_job is None:
+            return
+        try:
+            windows_job.assign_pid(process.pid)
+            assert windows_gate is not None
+            windows_gate.write_text("contained\n", encoding="utf-8")
+        except Exception as exc:
+            raise SandboxError(
+                "failed to attach Deno supervisor to Windows Job Object"
+            ) from exc
+
+    def _start_deno_check_tasks(
+        self,
+        process: asyncio.subprocess.Process,
+        limits: SubprocessLimits | None,
+    ) -> _DenoCheckTasks:
+        return _DenoCheckTasks(
+            communicate=asyncio.create_task(
+                process.communicate(),
+                name="deno-check-communicate",
+            ),
+            monitor=asyncio.create_task(
+                self._monitor_process(process, limits),
+                name="deno-check-resource-monitor",
+            ),
+        )
+
+    async def _wait_for_deno_check(
+        self,
+        tasks: _DenoCheckTasks,
+        selected_timeout: float,
+    ) -> tuple[bytes, bytes, CommandMetrics]:
+        all_tasks = tasks.all()
+        done, pending = await asyncio.wait(
+            all_tasks,
+            timeout=selected_timeout,
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
+        if not done:
+            self._cancel_tasks(pending)
+            raise SubprocessTimeoutExpired(
+                f"Deno JIT type-check timed out after {selected_timeout}s",
+                metrics=CommandMetrics(
+                    wall_seconds=float(selected_timeout),
+                    killed=True,
+                    limit_kind="subprocess_timeout",
+                ),
+            )
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                self._cancel_tasks(pending)
+                raise exc
+        if tasks.communicate not in done or tasks.monitor not in done:
+            self._cancel_tasks(pending)
+            raise SandboxError("Deno JIT type-check did not settle")
+        stdout, stderr = tasks.communicate.result()
+        return stdout, stderr, tasks.monitor.result()
+
+    def _validate_deno_check_output(
+        self,
+        process: asyncio.subprocess.Process,
+        stdout: bytes,
+        stderr: bytes,
+    ) -> None:
+        ready_line, separator, child_stdout = stdout.partition(b"\n")
+        try:
+            ready_frame = json.loads(ready_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SandboxError(
+                f"Deno supervisor produced invalid readiness frame: {ready_line[:200]!r}"
+            ) from exc
+        if not separator or ready_frame != {
+            "type": "supervisor_ready",
+            "version": 1,
+        }:
+            raise SandboxError(
+                f"unexpected Deno supervisor readiness frame: {ready_frame!r}"
+            )
+        if len(child_stdout) > self.max_stdout_bytes:
+            raise SandboxError("Deno JIT type-check stdout exceeded max bytes")
+        if len(stderr) > self.max_stderr_bytes:
+            raise SandboxError("Deno JIT type-check stderr exceeded max bytes")
+        if process.returncode != 0:
+            detail = (
+                stderr.decode("utf-8", errors="replace").strip()
+                or child_stdout.decode("utf-8", errors="replace").strip()
+                or f"deno check exited {process.returncode}"
+            )
+            raise SandboxError(detail)
+
+    async def _cleanup_deno_check(
+        self,
+        handle: _SupervisedProcessHandle,
+        tasks: _DenoCheckTasks | None,
+    ) -> None:
+        all_tasks = tasks.all() if tasks is not None else ()
+        try:
+            if handle.process.returncode is None:
+                await asyncio.shield(self._kill_process(handle.process))
+        finally:
+            try:
+                self._cancel_tasks(all_tasks)
+                if all_tasks:
+                    await asyncio.gather(*all_tasks, return_exceptions=True)
+            finally:
+                self._close_supervisor_resources(
+                    death_write_fd=handle.death_write_fd,
+                    windows_job=handle.windows_job,
+                )
+
+    @staticmethod
+    def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    @staticmethod
+    def _close_supervisor_resources(
+        *,
+        death_read_fd: int | None = None,
+        death_write_fd: int | None = None,
+        windows_job: WindowsJobObject | None = None,
+    ) -> None:
+        if death_read_fd is not None:
+            os.close(death_read_fd)
+        if death_write_fd is not None:
+            os.close(death_write_fd)
+        if windows_job is not None:
+            windows_job.close()
 
     def metadata_for_source(self, source_code: str) -> dict[str, Any]:
         metadata: dict[str, Any] = {
@@ -967,7 +1268,30 @@ class DenoTypescriptSandbox(SandboxBackend):
         if next_token[0] == "string":
             return [next_token[1]]
         specifier = self._string_after_from(tokens, index + 1)
+        if specifier is None:
+            specifier = self._string_after_import_require(tokens, index + 1)
         return [specifier] if specifier is not None else []
+
+    def _string_after_import_require(
+        self,
+        tokens: list[tuple[str, str]],
+        index: int,
+    ) -> str | None:
+        for cursor in range(index, len(tokens)):
+            token = tokens[cursor]
+            if token == ("punct", ";"):
+                return None
+            if token != ("identifier", "require"):
+                continue
+            open_token = tokens[cursor + 1] if cursor + 1 < len(tokens) else None
+            value_token = tokens[cursor + 2] if cursor + 2 < len(tokens) else None
+            if (
+                open_token == ("punct", "(")
+                and value_token is not None
+                and value_token[0] == "string"
+            ):
+                return value_token[1]
+        return None
 
     def _module_specifier_after_export(self, tokens: list[tuple[str, str]], index: int) -> list[str]:
         next_token = tokens[index + 1] if index + 1 < len(tokens) else None

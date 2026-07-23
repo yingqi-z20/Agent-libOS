@@ -5,9 +5,11 @@ from pathlib import Path
 import re
 import tomllib
 
+import pytest
 import yaml
 
 from scripts.check_release_artifacts import validate_version_alignment
+from tests.conftest import pytest_sessionfinish
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -136,6 +138,31 @@ def test_release_workflow_runs_release_smokes_without_repeating_lane_matrix() ->
     assert "--require-all-passed" in runtime_safety_step
 
 
+def test_fail_on_skip_gate_changes_a_successful_session_to_failure() -> None:
+    reporter = type("Reporter", (), {"stats": {"skipped": [object()]}})()
+
+    class Config:
+        rootpath = ROOT
+        pluginmanager = type(
+            "PluginManager",
+            (),
+            {"get_plugin": staticmethod(lambda name: reporter if name == "terminalreporter" else None)},
+        )()
+
+        @staticmethod
+        def getoption(name: str, default: object = None) -> object:
+            return {
+                "--keep-agent-outputs": True,
+                "--fail-on-skip": True,
+            }.get(name, default)
+
+    session = type("Session", (), {"config": Config(), "exitstatus": pytest.ExitCode.OK})()
+
+    pytest_sessionfinish(session, int(pytest.ExitCode.OK))
+
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+
 def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> None:
     workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(
         encoding="utf-8"
@@ -259,6 +286,15 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     )
     assert postgres_step["env"]["AGENT_LIBOS_POSTGRES_DSN"] == (
         "postgresql://agent_libos:agent_libos@127.0.0.1:5432/agent_libos"
+    )
+    assert "--fail-on-skip" in str(postgres_step["run"])
+    compile_step = next(
+        item
+        for item in parsed["jobs"]["static"]["steps"]
+        if item.get("name") == "Compile Python sources"
+    )
+    assert "compileall agent_libos tests scripts experiments benchmarks modules" in str(
+        compile_step["run"]
     )
     release_steps = release_job["steps"]
     release_run_scripts = "\n".join(

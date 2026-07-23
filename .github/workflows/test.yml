@@ -33,7 +33,7 @@ jobs:
         run: uv sync --frozen --all-groups
 
       - name: Compile Python sources
-        run: uv run python -m compileall agent_libos tests scripts experiments benchmarks
+        run: uv run python -m compileall agent_libos tests scripts experiments benchmarks modules
 
       - name: Check architecture and blocking-work boundaries
         run: uv run python scripts/check_architecture.py
@@ -282,7 +282,7 @@ jobs:
       - name: Run PostgreSQL store integration tests
         env:
           AGENT_LIBOS_POSTGRES_DSN: postgresql://agent_libos:agent_libos@127.0.0.1:5432/agent_libos
-        run: uv run python -m pytest -m postgres --run-postgres
+        run: uv run python -m pytest -m postgres --run-postgres --fail-on-skip
 
   gui:
     runs-on: ubuntu-latest

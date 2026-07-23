@@ -14,8 +14,14 @@ from benchmarks.practical_agent_workflows import (
     build_modeled_scenarios,
     default_scenarios,
     run_practical_evaluation,
+    validate_practical_report,
+    validate_practical_report_schema,
 )
-from benchmarks.practical_agent_workflows.models import PracticalRunReport
+from benchmarks.practical_agent_workflows.models import (
+    PracticalRunReport,
+    PracticalScenarioResult,
+)
+from benchmarks.practical_agent_workflows.oracle import validate_modeled_scenario
 from experiments import run_practical_evaluation as practical_cli
 
 
@@ -48,22 +54,9 @@ def test_practical_report_matches_published_json_schema(tmp_path) -> None:
     Draft202012Validator(schema).validate(report)
 
 
-@pytest.mark.parametrize(
-    ("native_live_ok", "modeled_suite_ok", "modeled_fallback", "exit_code"),
-    [
-        (True, True, 0, None),
-        (False, True, 0, 1),
-        (True, False, 0, 1),
-        (True, True, 1, 1),
-    ],
-)
 def test_practical_cli_exit_contract_writes_completed_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    native_live_ok: bool,
-    modeled_suite_ok: bool,
-    modeled_fallback: int,
-    exit_code: int | None,
 ) -> None:
     report = PracticalRunReport(
         schema_version=1,
@@ -72,24 +65,92 @@ def test_practical_cli_exit_contract_writes_completed_report(
         semantic_effect_counts={"native-live": 0, "modeled": 0},
         native_tool_calls=0,
         native_operations=0,
-        modeled_fallback=modeled_fallback,
-        native_live_ok=native_live_ok,
-        modeled_suite_ok=modeled_suite_ok,
+        modeled_fallback=0,
+        native_live_ok=True,
+        modeled_suite_ok=True,
     )
     monkeypatch.setattr(practical_cli, "run_practical_evaluation", lambda: report)
     output = tmp_path / "report.json"
 
-    if exit_code is None:
-        practical_cli.main(["--output", str(output)])
-    else:
-        with pytest.raises(SystemExit) as exc_info:
-            practical_cli.main(["--output", str(output)])
-        assert exc_info.value.code == exit_code
+    practical_cli.main(["--output", str(output)])
 
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload == report.to_dict()
     schema = json.loads(REPORT_SCHEMA.read_text(encoding="utf-8"))
     Draft202012Validator(schema).validate(payload)
+
+
+def test_practical_cli_emits_schema_valid_failed_gate_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = PracticalScenarioResult(
+        scenario_id="modeled-failure",
+        evidence_level=EvidenceLevel.MODELED,
+        ok=False,
+        semantic_effects=1,
+        tool_calls=0,
+        operations=0,
+        errors=["oracle mismatch"],
+    )
+    report = PracticalRunReport(
+        schema_version=1,
+        results=[failed],
+        scenario_counts={"native-live": 0, "modeled": 1},
+        semantic_effect_counts={"native-live": 0, "modeled": 1},
+        native_tool_calls=0,
+        native_operations=0,
+        modeled_fallback=0,
+        native_live_ok=True,
+        modeled_suite_ok=False,
+    )
+    monkeypatch.setattr(practical_cli, "run_practical_evaluation", lambda: report)
+    output = tmp_path / "failed-report.json"
+
+    with pytest.raises(SystemExit) as exc_info:
+        practical_cli.main(["--output", str(output)])
+    assert exc_info.value.code == 1
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    schema = json.loads(REPORT_SCHEMA.read_text(encoding="utf-8"))
+    Draft202012Validator(schema).validate(payload)
+    assert validate_practical_report(payload) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("scenario_counts", {"native-live": 1, "modeled": 0}, "scenario_counts"),
+        ("native_tool_calls", 1, "native_tool_calls"),
+        ("modeled_fallback", 1, "modeled_fallback"),
+        ("native_live_ok", False, "report.schema.json"),
+    ],
+)
+def test_practical_cli_refuses_internally_inconsistent_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    report = PracticalRunReport(
+        schema_version=1,
+        results=[],
+        scenario_counts={"native-live": 0, "modeled": 0},
+        semantic_effect_counts={"native-live": 0, "modeled": 0},
+        native_tool_calls=0,
+        native_operations=0,
+        modeled_fallback=0,
+        native_live_ok=True,
+        modeled_suite_ok=True,
+    )
+    setattr(report, field, value)
+    monkeypatch.setattr(practical_cli, "run_practical_evaluation", lambda: report)
+    output = tmp_path / "invalid-report.json"
+
+    with pytest.raises(RuntimeError, match=message):
+        practical_cli.main(["--output", str(output)])
+    assert not output.exists()
 
 
 def test_eva_scenario_matrix_is_migrated_as_design_only_modeled_evidence() -> None:
@@ -123,6 +184,69 @@ def test_modeled_oracle_failure_does_not_become_runtime_evidence() -> None:
     assert not report.results[0].ok
     assert report.native_tool_calls == 0
     assert report.native_operations == 0
+
+
+@pytest.mark.parametrize(
+    ("claim_field", "replacement", "message"),
+    [
+        ("utility_oracle", {"requires": []}, "require at least one"),
+        (
+            "utility_oracle",
+            {"requires": [{"effect_class": "filesystem.write", "target": "absent"}]},
+            "absent from the scenario",
+        ),
+        ("security_oracle", {"forbidden_committed": 0, "forbidden": []}, "do not exactly match"),
+        ("provenance_requirement", "runtime-backed", "disclaim runtime evidence"),
+    ],
+)
+def test_modeled_oracle_validates_declared_claims_exactly(
+    claim_field: str,
+    replacement: object,
+    message: str,
+) -> None:
+    scenario = next(
+        item
+        for item in build_modeled_scenarios()
+        if item.modeled_claim["variant"] != "benign"
+    )
+    changed_claim = dict(scenario.modeled_claim)
+    changed_claim[claim_field] = replacement
+    invalid = replace(scenario, modeled_claim=changed_claim)
+
+    assert any(message in error for error in validate_modeled_scenario(invalid))
+
+
+def test_practical_report_semantic_validator_rejects_forged_native_evidence(
+    tmp_path: Path,
+) -> None:
+    payload = run_practical_evaluation(default_scenarios(), work_dir=tmp_path).to_dict()
+    native = next(
+        row for row in payload["results"] if row["evidence_level"] == "native-live"
+    )
+    native["external_effect_ids"] = []
+
+    errors = validate_practical_report(payload)
+
+    assert any("one external effect id per semantic effect" in error for error in errors)
+
+
+def test_practical_schema_validator_rejects_wrong_scalar_type() -> None:
+    payload = PracticalRunReport(
+        schema_version=1,
+        results=[],
+        scenario_counts={"native-live": 0, "modeled": 0},
+        semantic_effect_counts={"native-live": 0, "modeled": 0},
+        native_tool_calls=0,
+        native_operations=0,
+        modeled_fallback=0,
+        native_live_ok=True,
+        modeled_suite_ok=True,
+    ).to_dict()
+    payload["schema_version"] = True
+
+    errors = validate_practical_report_schema(payload)
+
+    assert errors and errors[0].startswith("schema_version:")
 
 
 def test_native_live_scenario_cannot_smuggle_a_modeled_effect() -> None:

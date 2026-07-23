@@ -9,6 +9,7 @@ import urllib.request
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from jsonschema import Draft202012Validator
 from agent_libos.api.gui.server import (
     GuiEventBroadcaster,
     GuiRuntimeService,
@@ -258,6 +259,8 @@ class TestGuiServer:
         assert interrupt['message']['kind'] == 'interrupt'
         status, snapshot = self.request('GET', '/api/snapshot')
         assert status == 200
+        schema = json.loads((Path(__file__).resolve().parents[2] / 'docs' / 'gui_api_schema.json').read_text(encoding='utf-8'))
+        Draft202012Validator({**schema, '$ref': '#/$defs/snapshotResponse'}).validate(snapshot)
         assert len(snapshot['processes']) == 1
         assert snapshot['processes'][0]['llm_profile_id'] == 'gui-spawn'
         assert snapshot['processes'][0]['unread_message_count'] >= 2
@@ -1936,12 +1939,20 @@ class TestGuiServer:
                 'base_url': 'https://kimi.example/v1',
                 'api_key_env': 'KIMI_API_KEY',
                 'api_mode': 'chat',
+                'timeout_s': 17.5,
+                'max_retries': 4,
+                'store': False,
                 'temperature': 0.1,
-                'store': None,
-                'responses_previous_response_id': None,
-                'parallel_tool_calls': None,
-                'auto_wait_on_empty_tool_calls': None,
-                'allow_custom_base_url': None,
+                'reasoning_effort': 'high',
+                'verbosity': 'low',
+                'safety_identifier_env': 'OPENAI_SAFETY_IDENTIFIER',
+                'prompt_cache_retention': '24h',
+                'responses_previous_response_id': True,
+                'parallel_tool_calls': False,
+                'auto_wait_on_empty_tool_calls': True,
+                'max_tokens': 2048,
+                'context_window_tokens': 100000,
+                'allow_custom_base_url': False,
             },
         )
         assert status == 200
@@ -1949,28 +1960,58 @@ class TestGuiServer:
         assert created['source'] == 'user'
         assert created['editable'] is True
         assert created['api_key_env_present'] is True
-        assert created['store'] is None
-        assert created['parallel_tool_calls'] is None
-        assert created['auto_wait_on_empty_tool_calls'] is None
+        assert created['timeout_s'] == 17.5
+        assert created['max_retries'] == 4
+        assert created['store'] is False
+        assert created['reasoning_effort'] == 'high'
+        assert created['verbosity'] == 'low'
+        assert created['parallel_tool_calls'] is False
+        assert created['auto_wait_on_empty_tool_calls'] is True
         assert created['allow_custom_base_url'] is False
 
+        omitted_fields = {
+            'kind': 'openai_compatible',
+            'model': 'kimi-k2.7-code',
+            'base_url': 'https://kimi.example/v1',
+            'api_key_env': 'KIMI_API_KEY',
+            'api_mode': 'chat',
+            'timeout_s': 17.5,
+            'max_retries': 4,
+            'store': False,
+            'reasoning_effort': 'high',
+            'verbosity': 'low',
+            'safety_identifier_env': 'OPENAI_SAFETY_IDENTIFIER',
+            'prompt_cache_retention': '24h',
+            'responses_previous_response_id': True,
+            'parallel_tool_calls': False,
+            'auto_wait_on_empty_tool_calls': True,
+            'temperature': 0.1,
+        }
+        updates = {
+            'max_tokens': 4096,
+            'context_window_tokens': 200000,
+            'allow_custom_base_url': True,
+        }
+        before_update = self.server.service.runtime.llms.profile('kimi-k2.7-code')
+        assert all(getattr(before_update, field) != value for field, value in updates.items())
         status, updated = self.request(
             'PUT',
             '/api/llm-profiles/kimi-k2.7-code',
-            {
-                'model': 'kimi-k2.7-code',
-                'base_url': 'https://kimi.example/v1/',
-                'api_key_env': 'KIMI_API_KEY',
-                'api_mode': 'chat',
-                'max_tokens': 4096,
-                'context_window_tokens': 200000,
-                'allow_custom_base_url': True,
-            },
+            updates,
         )
         assert status == 200
         assert updated['max_tokens'] == 4096
         assert updated['context_window_tokens'] == 200000
         assert updated['allow_custom_base_url'] is True
+        assert updated['reasoning_effort'] == 'high'
+        assert updated['verbosity'] == 'low'
+        updated_profile = self.server.service.runtime.llms.profile('kimi-k2.7-code')
+        for field, expected in {**omitted_fields, **updates}.items():
+            assert getattr(updated_profile, field) == expected, field
+        persisted_profile = json.loads(self.llm_profiles_file.read_text(encoding='utf-8'))['profiles']['kimi-k2.7-code']
+        for field, expected in {**omitted_fields, **updates}.items():
+            if field != 'kind':
+                assert persisted_profile[field] == expected, field
         assert 'secret' not in self.llm_profiles_file.read_text(encoding='utf-8')
 
         status, rejected = self.request(
@@ -2002,8 +2043,22 @@ class TestGuiServer:
             profile['profile_id'] == 'kimi-k2.7-code'
             and profile['max_tokens'] == 4096
             and profile['context_window_tokens'] == 200000
+            and profile['timeout_s'] == 17.5
+            and profile['max_retries'] == 4
+            and profile['store'] is False
+            and profile['reasoning_effort'] == 'high'
+            and profile['verbosity'] == 'low'
+            and profile['parallel_tool_calls'] is False
+            and profile['auto_wait_on_empty_tool_calls'] is True
             for profile in profiles
         )
+        reopened_profile = self.server.service.runtime.llms.profile('kimi-k2.7-code')
+        for field, expected in {**omitted_fields, **updates}.items():
+            assert getattr(reopened_profile, field) == expected, field
+        reopened_persisted = json.loads(self.llm_profiles_file.read_text(encoding='utf-8'))['profiles']['kimi-k2.7-code']
+        for field, expected in {**omitted_fields, **updates}.items():
+            if field != 'kind':
+                assert reopened_persisted[field] == expected, field
 
     def test_llm_profile_spawn_exec_validation_and_delete_in_use(self) -> None:
         status, body = self.request('POST', '/api/processes', {'goal': 'bad profile', 'auto_run': False, 'llm_profile': 'missing'})
@@ -2591,6 +2646,105 @@ class TestGuiServer:
         assert checkpoint_status == 400
         assert 'pid must be a non-empty JSON string' in checkpoint_body['error']['message']
         assert self.server.service.runtime.process.get(pid).image_id == 'base-agent:v0'
+
+    def test_actor_is_rejected_on_routes_that_do_not_apply_actor_authority(self) -> None:
+        service = self.server.service
+        runtime = service.runtime
+        _status, spawned = self.request(
+            'POST',
+            '/api/processes',
+            {'goal': 'actor contract target', 'auto_run': False},
+        )
+        pid = spawned['pid']
+        request_id = 'hreq_actor_contract'
+        now = utc_now()
+        runtime.store.insert_human_request(
+            HumanRequest(
+                request_id=request_id,
+                pid=pid,
+                human=runtime.config.runtime.default_human,
+                payload={'type': 'question', 'question': 'must remain pending'},
+                status=HumanRequestStatus.PENDING,
+                decision=None,
+                blocking=True,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        service.save_user_llm_profile(
+            'actor-contract-profile',
+            {'model': 'actor-contract-model', 'api_key_env': 'ACTOR_CONTRACT_API_KEY'},
+        )
+
+        def observable_state() -> dict[str, Any]:
+            return {
+                'processes': to_jsonable(runtime.process.list()),
+                'messages': to_jsonable(runtime.messages.list(pid, include_acked=True)),
+                'rating': to_jsonable(runtime.ratings.get(pid)),
+                'human_requests': to_jsonable(runtime.human.list()),
+                'object_tasks': to_jsonable(runtime.object_tasks.list()),
+                'capabilities': to_jsonable(runtime.store.list_capabilities()),
+                'external_effects': to_jsonable(runtime.store.list_external_effects()),
+                'jsonrpc_endpoints': runtime.jsonrpc.list_endpoints(require_capability=False),
+                'mcp_servers': runtime.mcp.list_servers(require_capability=False),
+                'llm_profiles': service._llm_profile_summaries(),
+                'llm_profiles_file': self.llm_profiles_file.read_text(encoding='utf-8'),
+                'audit': to_jsonable(runtime.audit.trace()),
+                'events': to_jsonable(runtime.events.list()),
+                'gui_events': to_jsonable(service.broadcaster.replay_after(0)),
+                'scheduler': service.scheduler.status(),
+                'service_closing': service._closing,
+                'service_closed': service.closed,
+            }
+
+        before = observable_state()
+        unsupported_actor_routes = [
+            ('process.spawn', 'POST', '/api/processes', {'goal': 'must not spawn', 'actor': pid}),
+            ('workflow.run', 'POST', '/api/workflows/run', {'tool': 'get_working_directory', 'args': {}, 'actor': pid}),
+            ('object_task.start', 'POST', '/api/object-tasks/start', {'pid': pid, 'tool': 'get_working_directory', 'args': {}, 'actor': pid}),
+            ('object_task.cancel', 'POST', '/api/object-tasks/missing/cancel', {'pid': pid, 'actor': pid}),
+            ('object_task.wait', 'POST', '/api/object-tasks/missing/wait', {'pid': pid, 'actor': pid}),
+            ('object_task.watch_owner', 'POST', '/api/object-tasks/missing/watch-owner', {'pid': pid, 'enabled': True, 'actor': pid}),
+            ('scheduler.auto', 'POST', '/api/scheduler/auto', {'enabled': True, 'actor': pid}),
+            ('scheduler.pause', 'POST', '/api/scheduler/pause', {'actor': pid}),
+            ('process.rating', 'POST', f'/api/processes/{pid}/rating', {'score': 5, 'actor': pid}),
+            ('process.run', 'POST', f'/api/processes/{pid}/run', {'max_quanta': 1, 'actor': pid}),
+            ('process.step', 'POST', f'/api/processes/{pid}/step', {'actor': pid}),
+            ('process.pause', 'POST', f'/api/processes/{pid}/pause', {'reason': 'must not pause', 'actor': pid}),
+            ('process.resume', 'POST', f'/api/processes/{pid}/resume', {'actor': pid}),
+            ('process.signal', 'POST', f'/api/processes/{pid}/signal', {'signal': ProcessSignal.PAUSE.value, 'actor': pid}),
+            ('process.message', 'POST', f'/api/processes/{pid}/message', {'body': 'must not deliver', 'actor': pid}),
+            ('process.interrupt', 'POST', f'/api/processes/{pid}/interrupt', {'body': 'must not interrupt', 'actor': pid}),
+            ('process.cd', 'POST', f'/api/processes/{pid}/cd', {'path': '.', 'actor': pid}),
+            ('process.exec', 'POST', f'/api/processes/{pid}/exec', {'image': 'coding-agent:v0', 'confirmed': True, 'actor': pid}),
+            ('process.exit', 'POST', f'/api/processes/{pid}/exit', {'confirmed': True, 'actor': pid}),
+            ('human.respond', 'POST', f'/api/human-requests/{request_id}/respond', {'approved': True, 'answer': 'must not answer', 'actor': pid}),
+            ('capability.explain', 'POST', '/api/capabilities/explain', {'subject': pid, 'resource': 'object:actor-contract', 'right': 'read', 'actor': pid}),
+            ('llm_profile.create', 'POST', '/api/llm-profiles', {'profile_id': 'must-not-create', 'model': 'unused', 'api_key_env': 'UNUSED_API_KEY', 'actor': pid}),
+            ('llm_profile.update', 'PUT', '/api/llm-profiles/actor-contract-profile', {'model': 'must-not-update', 'actor': pid}),
+            ('llm_profile.delete', 'DELETE', '/api/llm-profiles/actor-contract-profile', {'actor': pid}),
+            ('jsonrpc.call', 'POST', '/api/jsonrpc/missing/call', {'pid': pid, 'method_id': 'read', 'confirmed': True, 'actor': pid}),
+            ('mcp.call', 'POST', '/api/mcp/missing/call', {'pid': pid, 'tool_id': 'read', 'confirmed': True, 'actor': pid}),
+            ('shutdown', 'POST', '/api/shutdown', {'actor': pid}),
+        ]
+        for route_name, method, path, payload in unsupported_actor_routes:
+            status, body = self.request(method, path, payload)
+            assert status == 400, route_name
+            assert 'does not accept actor' in body['error']['message'], route_name
+            assert observable_state() == before, route_name
+
+        status, invalid_actor = self.request(
+            'POST',
+            '/api/checkpoints/create',
+            {'pid': pid, 'actor': None},
+        )
+        assert status == 400
+        assert 'actor must be a non-empty JSON string' in invalid_actor['error']['message']
+        process = runtime.process.get(pid)
+        assert process.status == ProcessStatus.RUNNABLE
+        assert process.image_id == 'base-agent:v0'
+        assert runtime.human.get(request_id).status == HumanRequestStatus.PENDING
+        assert observable_state() == before
 
     def test_high_risk_image_commit_requires_confirmation(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'commit source', 'auto_run': False})

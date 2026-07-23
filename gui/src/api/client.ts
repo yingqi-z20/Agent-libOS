@@ -153,20 +153,23 @@ export class LibOSClient {
     args = {},
     image,
     goal,
-    workingDirectory
+    workingDirectory,
+    confirmed
   }: {
     tool: string;
     args?: Record<string, unknown>;
     image?: string;
     goal?: string;
     workingDirectory?: string;
+    confirmed?: boolean;
   }) {
     return this.request<WorkflowRunResult>("POST", "/api/workflows/run", {
       tool,
       args,
       ...(image ? { image } : {}),
       ...(goal ? { goal } : {}),
-      ...(workingDirectory ? { working_directory: workingDirectory } : {})
+      ...(workingDirectory ? { working_directory: workingDirectory } : {}),
+      ...(confirmed !== undefined ? { confirmed } : {})
     });
   }
 

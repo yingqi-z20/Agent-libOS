@@ -24,6 +24,10 @@ from benchmarks.external_effect_recovery import (
 )
 from benchmarks.external_effect_recovery import runner as recovery_runner
 from experiments.run_external_effect_recovery_scale import main
+from experiments.recovery_artifact_metadata import (
+    build_recovery_artifact_metadata,
+    new_recovery_run_identity,
+)
 
 
 def test_ci_and_million_profiles_are_stable() -> None:
@@ -466,6 +470,66 @@ def test_scale_cli_writes_machine_readable_structural_metrics(
     assert payload["handler_observed_stale_operation_selects"] == 1
     assert payload["handler_rejected_selects"] == 0
     assert payload["timing_is_informational_only"] is True
+    metadata = payload["artifact_metadata"]
+    assert metadata["schema_version"] == 1
+    assert metadata["benchmark_id"] == "external-effect-recovery-scale"
+    assert metadata["run_id"].startswith("benchmark_run_")
+    assert metadata["started_at"] <= metadata["completed_at"]
+    invocation = metadata["invocation"]
+    assert invocation["selected_profile"] == "ci"
+    assert invocation["classification"] == "custom-overrides"
+    assert invocation["named_profile_evidence"] is False
+    assert invocation["profile_matches_parameters"] is False
+    assert invocation["explicit_overrides"] == {
+        "total_records": 1_001,
+        "pending_records": 129,
+        "page_size": 64,
+    }
+    assert invocation["effective_parameters"] == {
+        "total_records": 1_001,
+        "pending_records": 129,
+        "page_size": 64,
+        "transaction_states": ["prepared"],
+    }
+    provenance = metadata["provenance"]
+    assert provenance["schema_version"] == 1
+    assert len(provenance["benchmark_sources"]) == 3
+    assert len(provenance["benchmark_source_sha256"]) == 64
+    assert "git" in provenance
+
+
+@pytest.mark.parametrize(
+    ("explicit_overrides", "classification", "named_profile_evidence"),
+    [
+        ({}, "named-profile", True),
+        ({"page_size": 500}, "custom-overrides", False),
+    ],
+)
+def test_recovery_artifact_does_not_conflate_overrides_with_named_profile(
+    explicit_overrides: dict[str, int],
+    classification: str,
+    named_profile_evidence: bool,
+) -> None:
+    run_id, started_at = new_recovery_run_identity()
+    defaults = {"total_records": 100, "pending_records": 10, "page_size": 500}
+
+    metadata = build_recovery_artifact_metadata(
+        benchmark_id="test-recovery",
+        run_id=run_id,
+        started_at=started_at,
+        selected_profile="ci",
+        profile_defaults=defaults,
+        explicit_overrides=explicit_overrides,
+        effective_parameters={**defaults, "transaction_states": ["prepared"]},
+        source_paths=(Path(__file__),),
+    )
+
+    assert metadata["invocation"]["classification"] == classification
+    assert metadata["invocation"]["profile_matches_parameters"] is True
+    assert (
+        metadata["invocation"]["named_profile_evidence"]
+        is named_profile_evidence
+    )
 
 
 @pytest.mark.parametrize(

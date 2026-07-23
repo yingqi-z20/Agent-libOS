@@ -386,6 +386,9 @@ class TestLLMClient:
         monkeypatch.setenv('OPENAI_PROMPT_CACHE_RETENTION', 'in-memory')
         monkeypatch.setenv('OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID', 'true')
         monkeypatch.setenv('OPENAI_PARALLEL_TOOL_CALLS', 'true')
+        monkeypatch.setenv('OPENAI_ENABLE_THINKING', 'true')
+        monkeypatch.setenv('OPENAI_ORG_ID', 'org-one')
+        monkeypatch.setenv('OPENAI_PROJECT_ID', 'project-one')
 
         client = LLMClient.from_env()
 
@@ -394,6 +397,18 @@ class TestLLMClient:
         assert client.prompt_cache_retention == 'in-memory'
         assert client.responses_previous_response_id is True
         assert client.parallel_tool_calls is True
+        assert client._extra_body() == {'enable_thinking': True}
+        assert client.organization == 'org-one'
+        assert client.project == 'project-one'
+        assert client.inherit_ambient_openai_sdk_config is False
+
+        monkeypatch.setenv('OPENAI_ENABLE_THINKING', 'false')
+        monkeypatch.setenv('OPENAI_ORG_ID', 'org-two')
+        monkeypatch.setenv('OPENAI_PROJECT_ID', 'project-two')
+
+        assert client._extra_body() == {'enable_thinking': True}
+        assert client._client_kwargs()['organization'] == 'org-one'
+        assert client._client_kwargs()['project'] == 'project-one'
 
     def test_from_env_does_not_implicitly_load_workspace_dotenv(self, tmp_path, monkeypatch) -> None:
         (tmp_path / '.env').write_text(
@@ -409,6 +424,63 @@ class TestLLMClient:
 
         assert client.model == 'host-model'
         assert client.base_url is None
+
+    def test_isolated_profile_strips_openai_sdk_ambient_custom_headers(self, monkeypatch) -> None:
+        monkeypatch.setenv(
+            'OPENAI_CUSTOM_HEADERS',
+            'X-Ambient-Secret: do-not-send\nOpenAI-Organization: injected-org',
+        )
+        monkeypatch.setenv('OPENAI_ADMIN_KEY', 'ambient-admin-key')
+        monkeypatch.setenv('OPENAI_WEBHOOK_SECRET', 'ambient-webhook-secret')
+        client = LLMClient(
+            model='isolated-model',
+            api_key='profile-key',
+            inherit_ambient_openai_sdk_config=False,
+        )
+
+        sync_sdk = client._client_or_raise()
+        async_sdk = client._async_client_or_raise()
+        try:
+            assert 'X-Ambient-Secret' not in sync_sdk.default_headers
+            assert 'X-Ambient-Secret' not in async_sdk.default_headers
+            assert sync_sdk.default_headers['OpenAI-Organization'] == ''
+            assert async_sdk.default_headers['OpenAI-Organization'] == ''
+            assert sync_sdk.admin_api_key is None
+            assert async_sdk.admin_api_key is None
+            assert sync_sdk.webhook_secret is None
+            assert async_sdk.webhook_secret is None
+        finally:
+            client.close()
+            asyncio.run(async_sdk.close())
+
+    def test_default_profile_does_not_inherit_unsupported_openai_sdk_state(self, monkeypatch) -> None:
+        monkeypatch.setenv('OPENAI_CUSTOM_HEADERS', 'X-Ambient-Secret: do-not-send')
+        monkeypatch.setenv('OPENAI_ADMIN_KEY', 'ambient-admin-key')
+        monkeypatch.setenv('OPENAI_WEBHOOK_SECRET', 'ambient-webhook-secret')
+        client = LLMClient(model='default-model', api_key='profile-key')
+
+        sdk = client._client_or_raise()
+        try:
+            assert 'X-Ambient-Secret' not in sdk.default_headers
+            assert sdk.admin_api_key is None
+            assert sdk.webhook_secret is None
+        finally:
+            client.close()
+
+    def test_sdk_header_isolation_does_not_depend_on_a_second_environment_read(self, monkeypatch) -> None:
+        monkeypatch.delenv('OPENAI_CUSTOM_HEADERS', raising=False)
+        sdk = SimpleNamespace(
+            _custom_headers={'X-Captured-Before-Environment-Change': 'do-not-send'},
+            admin_api_key='ambient-admin-key',
+            webhook_secret='ambient-webhook-secret',
+        )
+
+        normalized = LLMClient._normalize_openai_sdk_client(sdk)
+
+        assert normalized is sdk
+        assert sdk._custom_headers == {}
+        assert sdk.admin_api_key is None
+        assert sdk.webhook_secret is None
 
     def test_from_env_and_requests_use_configured_llm_defaults(self, monkeypatch) -> None:
         config = AgentLibOSConfig(

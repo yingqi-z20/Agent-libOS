@@ -17,10 +17,14 @@ two public ids and applies the early visibility gate. Only an authorized caller
 can cause the runtime to resolve endpoint metadata from the registry and validate
 the method schema. It then performs exact authorization, optionally asks the
 human, makes a primitive/provider call through the JSON-RPC provider, records
-audit/events, and writes a provider-classified external-effect row. The default
-HTTP provider may try another previously validated pinned address if connection
-setup fails before a response is received; endpoint methods must not rely on a
-single wire-level POST attempt for non-idempotency guarantees.
+audit/events, and writes a provider-classified external-effect row. For a
+remote host with several validated addresses, the default HTTP provider may
+try the next pinned address after any exception during connect, TLS, request
+write, response-header parsing, or response-body read. The retry window is the
+single endpoint timeout, and an earlier POST may already have reached the
+server. Endpoint methods therefore must not rely on a single wire-level POST
+attempt for non-idempotency guarantees. A complete HTTP response, including a
+non-2xx or redirect response, is returned without trying another address.
 A caller without invocation authority gets a generic denial and cannot use call
 errors to enumerate registered endpoint metadata. This early visibility gate
 does not consume a one-shot method grant; the exact method is then authorized
@@ -143,7 +147,12 @@ The registry rejects:
 Headers are environment-backed. The registry stores the environment variable
 name and a small approved prefix such as `Bearer `, never the resolved secret
 value. Environment names and their allowlist are checked at registration, but
-values are resolved only for a call. Parameter-schema and request-size
+values are resolved only for a call. Each call resolves and validates all
+configured headers once into an immutable, in-memory operation snapshot. That
+snapshot is passed through DNS and transport dispatch; the default provider
+does not read those environment variables again. A concurrent environment
+change therefore cannot replace a credential after validation. The snapshot
+is neither persisted nor included in audit/effect observations. Parameter-schema and request-size
 validation occur before protected preparation; resource-budget and preflight
 classifier checks run in its pre-transaction portion. All four precede finite
 reservation and pending-intent creation. Header environment resolution is
@@ -163,7 +172,10 @@ a different private or loopback address.
 
 The default provider does not follow HTTP redirects. Redirects are treated as
 HTTP failures so a registered endpoint cannot silently move a call to a new
-host.
+host. It also disables ambient HTTP proxy discovery. Remote pinned connections
+use the platform TLS trust store, preserve the registered host as the TLS SNI
+and HTTP `Host`, force `Connection: close`, and speak HTTP/1.1. Local-development
+HTTP uses the same no-redirect/no-proxy policy but does not need DNS pinning.
 
 ## Capability Resources
 
@@ -192,8 +204,8 @@ Endpoint registry operations use endpoint metadata authority:
 | --- | --- |
 | list endpoints | `jsonrpc_endpoint:* read` |
 | inspect endpoint | `jsonrpc_endpoint:<endpoint_id> read` |
-| register new endpoint | `jsonrpc_endpoint:<endpoint_id> write` |
-| replace endpoint | `jsonrpc_endpoint:<endpoint_id> admin` |
+| register new endpoint | filesystem `read` for the manifest path plus `jsonrpc_endpoint:<endpoint_id> write` |
+| replace endpoint | filesystem `read` for the manifest path plus `jsonrpc_endpoint:<endpoint_id> admin` |
 | unregister endpoint | `jsonrpc_endpoint:<endpoint_id> admin` |
 
 These per-item checks occur before the store loads existing endpoint metadata,
@@ -202,9 +214,11 @@ an existing id from a missing one. `replace=true` always requests `admin` and a
 non-replace registration always requests `write`; the right does not depend on
 an existence lookup. Registration, replacement, and unregistration commit the
 endpoint row, stale method-grant invalidation, event, and audit in one store
-transaction. Finite registry authority is reserved after duplicate/not-found
-preflight and committed inside that same transaction, so validation or
-event/audit failure leaves the exact one-shot grant available.
+transaction. Finite registry authority is reauthorized and reserved when that
+transaction begins, before the existing-row lookup and its duplicate/not-found
+check or any registry mutation. A duplicate/not-found outcome or any later
+row, event, or audit failure rolls back the transaction and restores the exact
+one-shot grant; success commits the reservation with the mutation and evidence.
 
 Tool visibility does not grant remote authority. Default images expose
 `list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, and
@@ -230,12 +244,19 @@ release; an untrusted endpoint cannot be elevated above `normal`. See
 
 ## External Effects
 
-The JSON-RPC provider classifies every call from the method spec:
+The JSON-RPC provider starts classification from the method spec:
 
 - `rollback_class`
 - `rollback_status`
 - `state_mutation`
 - `information_flow`
+
+Completed protected provider phases impose a conservative floor on that
+classification. DNS observation makes `information_flow=true`. The transport
+phase also makes `information_flow=true`, and is mutation-capable whenever the
+method declares mutation or its right is not `read`. Manifest flags can make a
+result more conservative, but cannot erase a phase the runtime already
+observed.
 
 After schema/request-size/budget/classifier preflight, the runtime atomically
 reserves finite method authority and creates an `external_effects` row with
@@ -301,7 +322,10 @@ uv run agent-libos --db .agent_libos.sqlite jsonrpc unregister demo-weather
 
 `--actor-pid <pid>` on registry commands enforces that process's
 `jsonrpc_endpoint:*` or exact endpoint capabilities. Method calls always run as
-the target pid and are authorized by that pid's method capability.
+the target pid and are authorized by that pid's method capability. Actor-mode
+registration reads the manifest through the filesystem primitive. For
+`jsonrpc call <pid>`, an explicitly supplied group-level `--actor-pid` must
+equal the target `<pid>` and adds no authority.
 
 Replacing an existing endpoint requires endpoint `admin` when an actor pid is
 used. A replace invalidates existing exact method grants for that endpoint so
@@ -333,7 +357,7 @@ or raw wire methods.
 ## Persistence And Checkpoints
 
 Endpoint specs are stored as runtime store registry rows. Resolved header secret
-values are not persisted.
+values and their per-call immutable snapshots are not persisted.
 
 Checkpoint snapshots preserve process capabilities that reference JSON-RPC
 resources, but they do not copy or restore endpoint registry rows. Restore and

@@ -112,10 +112,20 @@ gate.
 
 ## Failure semantics
 
-An effectful provider may raise `ProviderEffectNotStarted` only when it can
-certify that no external mutation, delivery, request, spawn, or information
-observation began. Every ordinary exception, timeout, cancellation, resource
-limit, missing classifier, or sink failure after dispatch is ambiguous:
+`ProviderEffectNotStarted` is a certificate about the current provider callable
+and phase, not about the whole composite operation. An effectful provider may
+raise it only when it can certify that the current phase attempted no external
+mutation, delivery, request, spawn, or information observation. The SDK then
+examines the completed-phase transcript. It abandons the intent and restores
+finite authority only when every earlier phase was non-mutating,
+non-information-flowing, and explicitly `commits_authority=False`. Otherwise it
+settles the earlier phases as a confirmed partial outcome (or leaves their
+durable pending evidence if settlement itself fails), does not restore authority
+they committed, preserves their information-flow consequences, and excludes
+only the certified current phase.
+
+Every ordinary exception, timeout, cancellation, resource limit, missing
+classifier, or sink failure once a phase may have started is ambiguous:
 
 - finite authority remains consumed;
 - the prepared effect is finalized or retained as `unknown`;
@@ -165,7 +175,8 @@ A new backend or operation is not complete until it has:
    bidirectional invocation. Unclassified responses combine the request
    context with a `normal/untrusted` external origin; resource-backed reads
    capture the file binding or PTY session labels before dispatch.
-3. Prepare-before-observation ordering and exact PENS boundary.
+3. Prepare-before-observation ordering and an exact, phase-local PENS boundary;
+   a PENS certificate for a later phase must never erase prior provider work.
 4. Bounded inputs, outputs, time, cancellation, and process/network cleanup.
 5. A success classifier plus conservative fallback for classifier failure.
 6. Pending-effect reconciliation semantics that query but never replay.

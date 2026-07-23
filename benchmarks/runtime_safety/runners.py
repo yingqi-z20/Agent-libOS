@@ -8,6 +8,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -39,6 +40,7 @@ from benchmarks.runtime_safety.ablations import (
 )
 from benchmarks.runtime_safety.fixtures import prepare_workspace, safe_workspace_path
 from benchmarks.runtime_safety.models import (
+    BENCHMARK_EFFECT_OBSERVATION_FIELDS,
     BenchmarkResult,
     BenchmarkTask,
     BenchmarkValidationError,
@@ -2041,17 +2043,19 @@ def _effect_from_action(task: BenchmarkTask, runner: str, action: dict[str, Any]
 
 
 def _effect_from_spec(task: BenchmarkTask, runner: str, spec: dict[str, Any]) -> EffectRecord:
+    observed = sorted(
+        BENCHMARK_EFFECT_OBSERVATION_FIELDS & set(spec)
+    )
+    if observed:
+        raise BenchmarkValidationError(
+            f"benchmark_effects may not declare runner-observed fields: {observed}"
+        )
     effect_type = str(spec["type"])
     return EffectRecord(
         task_id=task.id,
         runner=runner,
         type=effect_type,
-        performed=bool(spec.get("performed", True)),
-        denied=bool(spec.get("denied", False)),
-        simulated=bool(spec.get("simulated", False)),
-        effect_id=str(spec["effect_id"]) if spec.get("effect_id") is not None else None,
-        outcome=str(spec["outcome"]) if spec.get("outcome") is not None else None,
-        evidence=str(spec["evidence"]) if spec.get("evidence") is not None else None,
+        performed=True,
         path=str(spec["path"]) if spec.get("path") is not None else None,
         argv=[str(item) for item in spec["argv"]] if isinstance(spec.get("argv"), list) else None,
         namespace=str(spec["namespace"]) if spec.get("namespace") is not None else None,
@@ -2065,7 +2069,6 @@ def _effect_from_spec(task: BenchmarkTask, runner: str, spec: dict[str, Any]) ->
         endpoint=str(spec["endpoint"]) if spec.get("endpoint") is not None else None,
         method=str(spec["method"]) if spec.get("method") is not None else None,
         provider=str(spec["provider"]) if spec.get("provider") is not None else None,
-        metadata=dict(spec.get("metadata") or {}),
     )
 
 
@@ -2502,31 +2505,62 @@ def _runtime_result_is_denial(result: dict[str, Any], error: str) -> bool:
 
 
 def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
+    if not runs:
+        raise BenchmarkValidationError("benchmark output requires at least one task run")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     metadata_path = output / "metadata.json"
-    if not metadata_path.exists():
-        metadata_path.write_text(
-            json.dumps(
-                to_jsonable(
-                    {
-                        "output_schema_version": 1,
-                        "tasks": sorted({run.result.task_id for run in runs}),
-                        "runners": sorted({run.result.runner for run in runs}),
-                    }
-                ),
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-    _write_jsonl(output / "results.jsonl", (run.result.to_dict() for run in runs))
-    _write_jsonl(
-        output / "effects.jsonl",
-        (effect.to_dict() for run in runs for effect in run.effects),
-    )
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            raise BenchmarkValidationError("metadata.json must contain an object")
+        if (
+            type(metadata.get("output_schema_version")) is not int
+            or metadata["output_schema_version"] != 2
+        ):
+            raise BenchmarkValidationError(
+                "metadata.json requires output_schema_version=2"
+            )
+        run_id = metadata.get("run_id")
+        if (
+            not isinstance(run_id, str)
+            or not run_id
+            or run_id != run_id.strip()
+        ):
+            raise BenchmarkValidationError("metadata.json requires a non-empty run_id")
+        if metadata.get("completion_state") != "in_progress":
+            raise BenchmarkValidationError(
+                "metadata.json completion_state must be 'in_progress' before outputs are written"
+            )
+    else:
+        run_id = f"run_{uuid.uuid4().hex}"
+        metadata = {
+            "output_schema_version": 2,
+            "run_id": run_id,
+            "completion_state": "in_progress",
+            "tasks": sorted({run.result.task_id for run in runs}),
+            "runners": sorted({run.result.runner for run in runs}),
+        }
+        _write_json_atomic(metadata_path, metadata)
+
+    result_rows: list[dict[str, Any]] = []
+    effect_rows: list[dict[str, Any]] = []
+    for run in runs:
+        result_row = run.result.to_dict()
+        result_row["run_id"] = run_id
+        result_rows.append(result_row)
+        for effect in run.effects:
+            effect_row = effect.to_dict()
+            effect_row["run_id"] = run_id
+            effect_rows.append(effect_row)
+
+    results_path = output / "results.jsonl"
+    effects_path = output / "effects.jsonl"
+    _write_jsonl_atomic(results_path, result_rows)
+    _write_jsonl_atomic(effects_path, effect_rows)
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "run_id": run_id,
         "results": len(runs),
         "effects": sum(len(run.effects) for run in runs),
         "runners": sorted({run.result.runner for run in runs}),
@@ -2538,7 +2572,21 @@ def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
         ),
         "invalid_runs": sum(1 for run in runs if not run.result.valid),
     }
-    (output / "summary.json").write_text(json.dumps(to_jsonable(summary), indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_json_atomic(output / "summary.json", summary)
+    metadata["completion_state"] = "complete"
+    metadata["artifacts"] = {
+        "results": {
+            "path": results_path.name,
+            "rows": len(result_rows),
+            "sha256": hashlib.sha256(results_path.read_bytes()).hexdigest(),
+        },
+        "effects": {
+            "path": effects_path.name,
+            "rows": len(effect_rows),
+            "sha256": hashlib.sha256(effects_path.read_bytes()).hexdigest(),
+        },
+    }
+    _write_json_atomic(metadata_path, metadata)
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -2546,6 +2594,21 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
         for row in rows:
             handle.write(json.dumps(to_jsonable(row), ensure_ascii=False, sort_keys=True))
             handle.write("\n")
+
+
+def _write_jsonl_atomic(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    _write_jsonl(temporary, rows)
+    os.replace(temporary, path)
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(to_jsonable(value), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
 
 
 def env_has_real_llm_config() -> bool:

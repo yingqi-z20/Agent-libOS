@@ -27,6 +27,26 @@ VALID_EFFECT_TYPES = {
 }
 
 VALID_EFFECT_OUTCOMES = {"performed", "denied", "not_started", "simulated", "unknown"}
+VALID_EFFECT_EVIDENCE = {
+    "runtime_external_effect",
+    "runtime_audit",
+    "runtime_result_denial",
+    "wrapper_observed",
+    "benchmark_simulation",
+    "missing",
+}
+
+BENCHMARK_EFFECT_OBSERVATION_FIELDS = {
+    "effect_id",
+    "performed",
+    "denied",
+    "simulated",
+    "outcome",
+    "evidence",
+    "error",
+    "classification",
+    "metadata",
+}
 
 
 class BenchmarkValidationError(ValueError):

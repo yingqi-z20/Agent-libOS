@@ -34,7 +34,14 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.substrate import CommandMetrics, LocalResourceProviderSubstrate, SubprocessLimits, WindowsJobObject
+from agent_libos.substrate import (
+    CommandMetrics,
+    LocalResourceProviderSubstrate,
+    SubprocessLimitExceeded,
+    SubprocessLimits,
+    SubprocessTimeoutExpired,
+    WindowsJobObject,
+)
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
 from agent_libos.utils.serde import dumps
@@ -894,6 +901,454 @@ class TestJitSecurity:
         assert any(('imports are not allowed in JIT tool source: file:///tmp/tool.ts' in error for error in denied.errors))
         assert any(('imports are not allowed in JIT tool source: jsr:@bad/pkg@1.0.0' in error for error in denied.errors))
         assert any(('imports are not allowed in JIT tool source: jsr:@std/path' in error for error in denied.errors))
+
+    def test_deno_static_check_rejects_typescript_dependency_directives(self) -> None:
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+
+        for directive in (
+            '/// <reference path="/tmp/host-types.d.ts" />',
+            '/// <amd-dependency path="/tmp/host-module.ts" />',
+            '// @deno-types="file:///tmp/host-types.d.ts"',
+        ):
+            validation = checker.static_check(
+                f'{directive}\nexport function run(args, libos) {{ return {{}}; }}'
+            )
+
+            assert not validation.ok
+            assert 'TypeScript dependency directives are not allowed' in validation.errors
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            '\ufeff/// <reference path="/tmp/host-types.d.ts" />\n'
+            'export function run(args, libos) { return {}; }',
+            '\ufeff// @deno-types="file:///tmp/host-types.d.ts"\n'
+            'export function run(args, libos) { return {}; }',
+            '\ufeffimport host = require("file:///tmp/host.ts");\n'
+            'export function run(args, libos) { return {}; }',
+        ],
+        ids=['triple_slash', 'deno_types', 'import_assignment'],
+    )
+    def test_deno_static_check_rejects_bom_dependency_prefix_bypasses(
+        self,
+        source: str,
+    ) -> None:
+        validation = DenoTypescriptSandbox(deno_executable='deno').static_check(
+            source
+        )
+
+        assert not validation.ok
+        assert (
+            'Unicode byte-order marks are not allowed in JIT tool source'
+            in validation.errors
+        )
+
+    def test_deno_empty_test_bom_reference_is_rejected_before_host_file_read(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        sentinel = 'JIT_BOM_HOST_READ_SENTINEL_6dcfe74a'
+        host_types = tmp_path / 'host-secret.d.ts'
+        host_types.write_text(
+            f'// {sentinel}\nexport type HostSecret = string;\n',
+            encoding='utf-8',
+        )
+        source = (
+            f'\ufeff/// <reference path="{host_types}" />\n'
+            'export function run(args, libos) { return {}; }'
+        )
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+        calls = {'deno_version': 0, 'deno_check': 0}
+
+        def deno_version() -> str:
+            calls['deno_version'] += 1
+            return 'deno must not start'
+
+        def deno_check(*_args: Any, **_kwargs: Any) -> CommandMetrics:
+            calls['deno_check'] += 1
+            return CommandMetrics()
+
+        monkeypatch.setattr(checker, 'deno_version', deno_version)
+        monkeypatch.setattr(checker, '_check_source_with_deno', deno_check)
+
+        validation = checker.run_tests(source, [])
+        observation = '\n'.join([*validation.errors, validation.logs])
+
+        assert not validation.ok
+        assert validation.errors == [
+            'Unicode byte-order marks are not allowed in JIT tool source'
+        ]
+        assert calls == {'deno_version': 0, 'deno_check': 0}
+        assert sentinel not in observation
+        assert str(host_types) not in observation
+
+    def test_deno_static_check_rejects_typescript_import_assignment(self) -> None:
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+        validation = checker.static_check(
+            'import host = require("file:///tmp/host.ts");\n'
+            'export function run(args, libos) { return {}; }'
+        )
+
+        assert not validation.ok
+        assert (
+            'imports are not allowed in JIT tool source: file:///tmp/host.ts'
+            in validation.errors
+        )
+
+    @pytest.mark.real_deno
+    def test_deno_empty_test_validation_compiles_without_executing_candidate(self) -> None:
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+        invalid = checker.run_tests(
+            'export function run(args, libos) { return {}; }\n'
+            'const syntaxError: string = ;',
+            [],
+        )
+        nonexecuting = checker.run_tests(
+            'throw new Error("must not execute during validation");\n'
+            'export function run(args, libos) { return {}; }',
+            [],
+        )
+
+        assert not invalid.ok
+        assert any('Deno type-check' in error for error in invalid.errors)
+        assert nonexecuting.ok, nonexecuting.errors
+        assert 'deno_check=ok' in nonexecuting.logs
+
+    @pytest.mark.parametrize('failure_kind', ['timeout', 'resource_monitor'])
+    def test_deno_empty_test_failures_kill_cancel_and_close_supervisor_resources(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_kind: str,
+    ) -> None:
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+        process = SimpleNamespace(returncode=None)
+        death_read_fd, death_write_fd = os.pipe()
+        os.close(death_read_fd)
+        kill_calls: list[Any] = []
+        captured_tasks: list[Any] = []
+
+        class FakeJob:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        job = FakeJob()
+
+        async def start_process(*_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                process=process,
+                death_write_fd=death_write_fd,
+                windows_job=job,
+            )
+
+        def start_tasks(*_args: Any, **_kwargs: Any) -> Any:
+            async def block() -> None:
+                await asyncio.sleep(3600)
+
+            async def monitor() -> CommandMetrics:
+                if failure_kind == 'resource_monitor':
+                    await asyncio.sleep(0)
+                    raise SubprocessLimitExceeded(
+                        'Deno JIT subprocess exceeded subprocess_memory_bytes',
+                        metrics=CommandMetrics(
+                            killed=True,
+                            limit_kind='subprocess_memory_bytes',
+                        ),
+                    )
+                await asyncio.sleep(3600)
+                return CommandMetrics()
+
+            communicate_task = asyncio.create_task(block())
+            monitor_task = asyncio.create_task(monitor())
+            captured_tasks.extend([communicate_task, monitor_task])
+            return SimpleNamespace(
+                communicate=communicate_task,
+                monitor=monitor_task,
+                all=lambda: (communicate_task, monitor_task),
+            )
+
+        async def kill(fake_process: Any) -> None:
+            kill_calls.append(fake_process)
+            fake_process.returncode = -9
+
+        monkeypatch.setattr(checker, 'deno_version', lambda: 'deno test')
+        monkeypatch.setattr(checker, '_resolve_deno', lambda: 'deno')
+        monkeypatch.setattr(checker, '_start_deno_check_process', start_process)
+        monkeypatch.setattr(checker, '_start_deno_check_tasks', start_tasks)
+        monkeypatch.setattr(checker, '_kill_process', kill)
+
+        expected_error = (
+            SubprocessTimeoutExpired
+            if failure_kind == 'timeout'
+            else SubprocessLimitExceeded
+        )
+        timeout = 0.001 if failure_kind == 'timeout' else 1.0
+        with pytest.raises(expected_error):
+            checker.run_tests(
+                'export function run(args, libos) { return {}; }',
+                [],
+                timeout=timeout,
+            )
+
+        assert kill_calls == [process]
+        assert len(captured_tasks) == 2
+        assert all(task.done() for task in captured_tasks)
+        assert captured_tasks[0].cancelled()
+        if failure_kind == 'timeout':
+            assert captured_tasks[1].cancelled()
+        else:
+            assert not captured_tasks[1].cancelled()
+            assert isinstance(captured_tasks[1].exception(), SubprocessLimitExceeded)
+        assert job.closed
+        with pytest.raises(OSError):
+            os.fstat(death_write_fd)
+
+    @pytest.mark.parametrize(
+        ('stdout', 'max_stdout_bytes', 'error_fragment'),
+        [
+            (
+                b'{"type":"unexpected","version":1}\n',
+                1_000_000,
+                'unexpected Deno supervisor readiness frame',
+            ),
+            (
+                b'{"type":"supervisor_ready","version":1}\n12345',
+                4,
+                'Deno JIT type-check stdout exceeded max bytes',
+            ),
+        ],
+        ids=['bad_readiness', 'stdout_limit'],
+    )
+    def test_deno_empty_test_output_failures_close_supervisor_resources(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        stdout: bytes,
+        max_stdout_bytes: int,
+        error_fragment: str,
+    ) -> None:
+        checker = DenoTypescriptSandbox(
+            deno_executable='deno',
+            max_stdout_bytes=max_stdout_bytes,
+        )
+        process = SimpleNamespace(returncode=1)
+        death_read_fd, death_write_fd = os.pipe()
+        os.close(death_read_fd)
+        kill_calls: list[Any] = []
+        captured_tasks: list[Any] = []
+
+        class FakeJob:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        job = FakeJob()
+
+        async def start_process(*_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                process=process,
+                death_write_fd=death_write_fd,
+                windows_job=job,
+            )
+
+        def start_tasks(*_args: Any, **_kwargs: Any) -> Any:
+            async def communicate() -> tuple[bytes, bytes]:
+                return stdout, b''
+
+            async def monitor() -> CommandMetrics:
+                return CommandMetrics()
+
+            communicate_task = asyncio.create_task(communicate())
+            monitor_task = asyncio.create_task(monitor())
+            captured_tasks.extend([communicate_task, monitor_task])
+            return SimpleNamespace(
+                communicate=communicate_task,
+                monitor=monitor_task,
+                all=lambda: (communicate_task, monitor_task),
+            )
+
+        async def kill(fake_process: Any) -> None:
+            kill_calls.append(fake_process)
+
+        monkeypatch.setattr(checker, 'deno_version', lambda: 'deno test')
+        monkeypatch.setattr(checker, '_resolve_deno', lambda: 'deno')
+        monkeypatch.setattr(checker, '_start_deno_check_process', start_process)
+        monkeypatch.setattr(checker, '_start_deno_check_tasks', start_tasks)
+        monkeypatch.setattr(checker, '_kill_process', kill)
+
+        validation = checker.run_tests(
+            'export function run(args, libos) { return {}; }',
+            [],
+        )
+
+        assert not validation.ok
+        assert any(error_fragment in error for error in validation.errors)
+        assert kill_calls == []
+        assert len(captured_tasks) == 2
+        assert all(task.done() for task in captured_tasks)
+        assert job.closed
+        with pytest.raises(OSError):
+            os.fstat(death_write_fd)
+
+    def test_deno_empty_test_stderr_limit_kills_and_cleans_live_supervisor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        checker = DenoTypescriptSandbox(
+            deno_executable='deno',
+            max_stderr_bytes=4,
+        )
+        process = SimpleNamespace(returncode=None)
+        death_read_fd, death_write_fd = os.pipe()
+        os.close(death_read_fd)
+        kill_calls: list[Any] = []
+        captured_tasks: list[Any] = []
+
+        class FakeJob:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        job = FakeJob()
+
+        async def start_process(*_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                process=process,
+                death_write_fd=death_write_fd,
+                windows_job=job,
+            )
+
+        def start_tasks(*_args: Any, **_kwargs: Any) -> Any:
+            async def block() -> None:
+                await asyncio.sleep(3600)
+
+            communicate_task = asyncio.create_task(block())
+            monitor_task = asyncio.create_task(block())
+            captured_tasks.extend([communicate_task, monitor_task])
+            return SimpleNamespace(
+                communicate=communicate_task,
+                monitor=monitor_task,
+                all=lambda: (communicate_task, monitor_task),
+            )
+
+        async def wait_for_check(*_args: Any, **_kwargs: Any) -> Any:
+            return (
+                b'{"type":"supervisor_ready","version":1}\n',
+                b'12345',
+                CommandMetrics(),
+            )
+
+        async def kill(fake_process: Any) -> None:
+            kill_calls.append(fake_process)
+            fake_process.returncode = -9
+
+        monkeypatch.setattr(checker, 'deno_version', lambda: 'deno test')
+        monkeypatch.setattr(checker, '_resolve_deno', lambda: 'deno')
+        monkeypatch.setattr(checker, '_start_deno_check_process', start_process)
+        monkeypatch.setattr(checker, '_start_deno_check_tasks', start_tasks)
+        monkeypatch.setattr(checker, '_wait_for_deno_check', wait_for_check)
+        monkeypatch.setattr(checker, '_kill_process', kill)
+
+        validation = checker.run_tests(
+            'export function run(args, libos) { return {}; }',
+            [],
+        )
+
+        assert not validation.ok
+        assert any(
+            'Deno JIT type-check stderr exceeded max bytes' in error
+            for error in validation.errors
+        )
+        assert kill_calls == [process]
+        assert len(captured_tasks) == 2
+        assert all(task.done() and task.cancelled() for task in captured_tasks)
+        assert job.closed
+        with pytest.raises(OSError):
+            os.fstat(death_write_fd)
+
+    def test_deno_empty_test_outer_cancellation_kills_and_cleans_supervisor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+        process = SimpleNamespace(returncode=None)
+        death_read_fd, death_write_fd = os.pipe()
+        os.close(death_read_fd)
+        kill_calls: list[Any] = []
+        captured_tasks: list[Any] = []
+
+        class FakeJob:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        job = FakeJob()
+
+        async def start_process(*_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                process=process,
+                death_write_fd=death_write_fd,
+                windows_job=job,
+            )
+
+        def start_tasks(*_args: Any, **_kwargs: Any) -> Any:
+            async def block() -> None:
+                await asyncio.sleep(3600)
+
+            communicate_task = asyncio.create_task(block())
+            monitor_task = asyncio.create_task(block())
+            captured_tasks.extend([communicate_task, monitor_task])
+            return SimpleNamespace(
+                communicate=communicate_task,
+                monitor=monitor_task,
+                all=lambda: (communicate_task, monitor_task),
+            )
+
+        async def kill(fake_process: Any) -> None:
+            kill_calls.append(fake_process)
+            fake_process.returncode = -9
+
+        monkeypatch.setattr(checker, '_resolve_deno', lambda: 'deno')
+        monkeypatch.setattr(checker, '_start_deno_check_process', start_process)
+        monkeypatch.setattr(checker, '_start_deno_check_tasks', start_tasks)
+        monkeypatch.setattr(checker, '_kill_process', kill)
+
+        async def exercise_cancellation() -> None:
+            wait_started = asyncio.Event()
+
+            async def wait_for_check(*_args: Any, **_kwargs: Any) -> Any:
+                wait_started.set()
+                await asyncio.sleep(3600)
+
+            monkeypatch.setattr(
+                checker,
+                '_wait_for_deno_check',
+                wait_for_check,
+            )
+            validation_task = asyncio.create_task(
+                checker._acheck_source_with_deno(
+                    'export function run(args, libos) { return {}; }',
+                    timeout=5,
+                    limits=None,
+                )
+            )
+            await asyncio.wait_for(wait_started.wait(), timeout=1)
+            validation_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await validation_task
+
+        asyncio.run(exercise_cancellation())
+
+        assert kill_calls == [process]
+        assert len(captured_tasks) == 2
+        assert all(task.done() and task.cancelled() for task in captured_tasks)
+        assert job.closed
+        with pytest.raises(OSError):
+            os.fstat(death_write_fd)
 
     def test_deno_static_check_rejects_mutable_jsr_versions(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')

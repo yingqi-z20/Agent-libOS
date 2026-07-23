@@ -13,6 +13,7 @@ from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
 from agent_libos.models import CapabilityRight
 from agent_libos.models.exceptions import CapabilityDenied
+from agent_libos.skills.manager import SkillManager
 from tests.support.skills import write_skill_package
 
 
@@ -56,6 +57,43 @@ class TestSkillCli:
                 runtime.close()
             registered = self._cli_json(['--db', db_path, 'skills', '--actor-pid', pid, 'register', relative_skill])
             assert registered['skill_id'] == 'cli-actor-skill'
+
+    def test_skill_cli_actor_pid_rejects_host_filesystem_validation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = str(root / 'runtime.sqlite')
+            skill_dir = write_skill_package(root, 'cli-host-validation', allowed_tools=['echo'])
+            runtime = Runtime.open(db_path)
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='actor validation')
+            finally:
+                runtime.close()
+
+            validate_calls = 0
+
+            def fail_if_called(*_args: object, **_kwargs: object) -> object:
+                nonlocal validate_calls
+                validate_calls += 1
+                raise AssertionError('actor rejection must precede Host-path validation')
+
+            monkeypatch.setattr(SkillManager, 'validate_package_path', fail_if_called)
+
+            with pytest.raises(SystemExit, match='Host filesystem operation'):
+                self._cli_json(
+                    [
+                        '--db',
+                        db_path,
+                        'skills',
+                        '--actor-pid',
+                        pid,
+                        'validate',
+                        str(skill_dir),
+                    ]
+                )
+            assert validate_calls == 0
 
     def _cli_json(self, argv: list[str]) -> Any:
         stdout = io.StringIO()

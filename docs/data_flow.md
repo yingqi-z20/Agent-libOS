@@ -21,10 +21,12 @@ permission. All of those checks still apply.
 - optional `origin`, `tenant`, `principal`, and
   `declassification_authority`.
 
-Unknown enum values, malformed identities, unknown fields in a typed flow
-record, and the reserved `mixed` identity outside an aggregate fail closed.
-Derived values take the highest sensitivity, lowest trust and integrity, and
-the union of identity evidence. Combining different non-empty tenants or
+Unknown enum values, malformed identities, and unknown fields in a typed flow
+record fail closed. `mixed` is a valid conservative aggregate marker and may be
+constructed or produced by aggregation, but any receive or egress carrying it
+fails closed until a Host reclassifies it. Derived values take the highest
+sensitivity, lowest trust and integrity, and the union of identity evidence.
+Combining different non-empty tenants or
 principals produces `mixed`; a mixed value can neither be sent automatically
 nor released. It must first be reclassified by a Host operation.
 
@@ -268,12 +270,15 @@ fail-closed. See [Explainable Operations](explainable_operations.md) and
 
 A conditional send above `normal` creates a separate requested
 `data_release:<sink>` `approve` capability with `uses_remaining=1` for every
-Sink that needs a release. Each binding includes:
+Sink that needs a release. The capability subject binds the pid. Its
+`DataReleaseBinding` includes:
 
-- pid, Sink identity and identity hash;
+- Sink identity and identity hash;
 - trust id/hash and current registry generation;
 - Task Authority manifest hash;
-- source Object id/version/content hash and aggregate label hash;
+- a SHA-256 over the canonical source-reference tuple (whose entries encode
+  Object or file-binding identity, version, and content hash) plus the aggregate
+  label hash;
 - canonical payload/argument hash, operation, and target-state version.
 
 The Human request carries bounded metadata only—not the payload—including Sink

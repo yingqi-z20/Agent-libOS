@@ -49,4 +49,10 @@ Use this skill when the goal is to fix, review, or improve a software repository
 5. Run the most relevant tests after every meaningful patch. If a test fails, inspect the failure, patch again, and rerun a focused command before broader tests.
 6. Before submit, summarize changed files, tests run, remaining risk, and any missing authority. If the runtime denies filesystem or shell access, request the least privilege needed instead of working around the primitive.
 
+`swe_run` caps its mediated shell deadline at 55 seconds inside a 60-second
+Deno sandbox window; `swe_grep` uses a 10-second shell deadline inside a
+15-second sandbox window. The outer margin is reserved for returning the
+observation and cleaning up the contained Deno process. `swe_submit` stores its
+status, summary, tests, and residual risks as the process-exit result payload.
+
 This skill reproduces the useful SWE-Agent ACI shape inside Agent libOS. It does not grant filesystem, shell, process, human, object, or remote authority; every side effect still goes through libOS primitives and process capabilities.

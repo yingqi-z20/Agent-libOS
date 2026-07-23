@@ -7,12 +7,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, LLMDefaults, LLMProfile
 from agent_libos.llm.user_profiles import UserLLMProfileStore, default_user_llm_profiles_path
+from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
@@ -27,6 +29,14 @@ from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.builder import RuntimeBuilder
 from agent_libos.storage import SQLiteStore
 from tests.support.fakes import RecordingActionClient
+
+_AMBIENT_ACCOUNT_POLICY_ENV = (
+    "OPENAI_ENABLE_THINKING",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT",
+    "OPENAI_PROJECT_ID",
+)
 
 
 def _profile_config() -> AgentLibOSConfig:
@@ -560,6 +570,8 @@ class TestLLMProfiles:
             runtime.close()
 
     def test_only_default_profile_inherits_legacy_openai_environment(self, monkeypatch) -> None:
+        for env_name in _AMBIENT_ACCOUNT_POLICY_ENV:
+            monkeypatch.delenv(env_name, raising=False)
         monkeypatch.setenv("OPENAI_BASE_URL", "https://ambient.example/v1")
         monkeypatch.setenv("OPENAI_MODEL", "ambient-model")
         monkeypatch.setenv("OPENAI_API_MODE", "chat")
@@ -569,6 +581,9 @@ class TestLLMProfiles:
         monkeypatch.setenv("OPENAI_REASONING_EFFORT", "medium")
         monkeypatch.setenv("OPENAI_VERBOSITY", "high")
         monkeypatch.setenv("OPENAI_PARALLEL_TOOL_CALLS", "1")
+        monkeypatch.setenv("OPENAI_ENABLE_THINKING", "1")
+        monkeypatch.setenv("OPENAI_ORG_ID", "ambient-org")
+        monkeypatch.setenv("OPENAI_PROJECT_ID", "ambient-project")
         monkeypatch.setenv("AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL", "1")
         monkeypatch.setenv("OPENAI_API_KEY", "ambient-key")
         monkeypatch.setenv("PROFILE_API_KEY", "profile-key")
@@ -596,6 +611,9 @@ class TestLLMProfiles:
             assert default_client.reasoning_effort == "medium"
             assert default_client.verbosity == "high"
             assert default_client.parallel_tool_calls is True
+            assert default_client._extra_body() == {"enable_thinking": True}
+            assert default_client.organization == "ambient-org"
+            assert default_client.project == "ambient-project"
             assert default_resolved.parallel_tool_calls is True
             assert isolated_client.base_url is None
             assert isolated_client.model == "isolated-model"
@@ -606,7 +624,183 @@ class TestLLMProfiles:
             assert isolated_client.reasoning_effort is None
             assert isolated_client.verbosity is None
             assert isolated_client.parallel_tool_calls == config.llm.parallel_tool_calls
+            assert isolated_client._extra_body() == {}
+            assert isolated_client.organization is None
+            assert isolated_client.project is None
+            assert isolated_client.inherit_ambient_openai_sdk_config is False
+            isolated_kwargs = isolated_client._client_kwargs()
+            assert isolated_kwargs["base_url"] == "https://api.openai.com/v1"
+            assert isolated_kwargs["organization"] == ""
+            assert isolated_kwargs["project"] == ""
             assert isolated_client.api_key == "profile-key"
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        "env_name",
+        (
+            pytest.param("OPENAI_ENABLE_THINKING", id="thinking"),
+            pytest.param("OPENAI_ORGANIZATION", id="organization"),
+            pytest.param("OPENAI_ORG_ID", id="org-id"),
+            pytest.param("OPENAI_PROJECT", id="project"),
+            pytest.param("OPENAI_PROJECT_ID", id="project-id"),
+        ),
+    )
+    def test_named_profile_chain_identity_ignores_ambient_account_routing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_name: str,
+    ) -> None:
+        for selected_env_name in _AMBIENT_ACCOUNT_POLICY_ENV:
+            monkeypatch.delenv(selected_env_name, raising=False)
+        monkeypatch.setenv("PROFILE_API_KEY", "profile-key")
+        config = AgentLibOSConfig(
+            llm=LLMDefaults(
+                profiles={
+                    "default": LLMProfile(model="default-model"),
+                    "isolated": LLMProfile(model="isolated-model", api_key_env="PROFILE_API_KEY"),
+                }
+            )
+        )
+        runtime = Runtime(SQLiteStore(":memory:"), config=config)
+        try:
+            client = runtime.llms.resolve("isolated").client
+            baseline_profile = runtime.llms.profile_identity_sha256("isolated")
+            baseline_chain = LLMProcessExecutor._openai_provider_chain_fingerprint(client)
+
+            assert len(baseline_profile) == 64
+            assert baseline_chain is not None
+            assert len(baseline_chain) == 64
+
+            monkeypatch.setenv(env_name, "1" if env_name == "OPENAI_ENABLE_THINKING" else "changed")
+
+            assert runtime.llms.profile_identity_sha256("isolated") == baseline_profile
+            assert LLMProcessExecutor._openai_provider_chain_fingerprint(client) == baseline_chain
+            assert client._extra_body() == {}
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("env_name", "before", "after", "client_attribute"),
+        (
+            pytest.param("OPENAI_ENABLE_THINKING", "1", "0", "enable_thinking", id="thinking"),
+            pytest.param("OPENAI_ORGANIZATION", "org-a", "org-b", "organization", id="organization"),
+            pytest.param("OPENAI_ORG_ID", "org-a", "org-b", "organization", id="org-id"),
+            pytest.param("OPENAI_PROJECT", "project-a", "project-b", "project", id="project"),
+            pytest.param("OPENAI_PROJECT_ID", "project-a", "project-b", "project", id="project-id"),
+        ),
+    )
+    def test_default_profile_snapshot_identity_tracks_each_account_and_thinking_field(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_name: str,
+        before: str,
+        after: str,
+        client_attribute: str,
+    ) -> None:
+        for selected_env_name in _AMBIENT_ACCOUNT_POLICY_ENV:
+            monkeypatch.delenv(selected_env_name, raising=False)
+        monkeypatch.setenv(env_name, before)
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            snapshot = runtime.llms.profile_snapshot("default")
+            monkeypatch.setenv(env_name, after)
+
+            current_identity = runtime.llms.profile_identity_sha256("default")
+            assert len(snapshot.identity_sha256) == 64
+            assert len(current_identity) == 64
+            assert current_identity != snapshot.identity_sha256
+
+            frozen = runtime.llms.resolve("default", snapshot=snapshot).client
+            current = runtime.llms.resolve("default").client
+            expected_before: object = before == "1" if client_attribute == "enable_thinking" else before
+            expected_after: object = after == "1" if client_attribute == "enable_thinking" else after
+            assert getattr(frozen, client_attribute) == expected_before
+            assert getattr(current, client_attribute) == expected_after
+            assert current is not frozen
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("env_name", "before", "after"),
+        (
+            pytest.param("OPENAI_ENABLE_THINKING", "1", "0", id="thinking"),
+            pytest.param("OPENAI_ORGANIZATION", "org-a", "org-b", id="organization"),
+            pytest.param("OPENAI_ORG_ID", "org-a", "org-b", id="org-id"),
+            pytest.param("OPENAI_PROJECT", "project-a", "project-b", id="project"),
+            pytest.param("OPENAI_PROJECT_ID", "project-a", "project-b", id="project-id"),
+        ),
+    )
+    def test_default_profile_responses_chain_resets_when_one_account_or_thinking_field_changes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_name: str,
+        before: str,
+        after: str,
+    ) -> None:
+        for selected_env_name in _AMBIENT_ACCOUNT_POLICY_ENV:
+            monkeypatch.delenv(selected_env_name, raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "profile-chain-key")
+        monkeypatch.setenv(env_name, before)
+        config = AgentLibOSConfig(
+            llm=LLMDefaults(
+                profiles={
+                    "default": LLMProfile(
+                        model="gpt-test",
+                        api_mode="responses",
+                        store=True,
+                        responses_previous_response_id=True,
+                    )
+                }
+            )
+        )
+        runtime = Runtime(SQLiteStore(":memory:"), config=config)
+        try:
+            first_client = runtime.llms.resolve("default").client
+            first_fake = _ProfileFakeAsyncOpenAIResponses(
+                [
+                    _profile_response_tool_call(
+                        "resp_profile_a",
+                        "create_memory_object",
+                        {"type": "note", "name": "profile-step", "payload": {"ok": True}},
+                    )
+                ]
+            )
+            first_client._async_client = first_fake
+            pid = runtime.process.spawn(image="base-agent:v0", goal="reset changed profile chain")
+
+            first = runtime.run_next_process_once()
+            assert first["action"]["action"] == "create_memory_object"
+
+            monkeypatch.setenv(env_name, after)
+            second_client = runtime.llms.resolve("default").client
+            second_fake = _ProfileFakeAsyncOpenAIResponses(
+                [
+                    _profile_response_tool_call(
+                        "resp_profile_b",
+                        "process_exit",
+                        {"payload": {"done": True}},
+                    )
+                ]
+            )
+            second_client._async_client = second_fake
+
+            assert second_client is not first_client
+            second = runtime.run_next_process_once()
+
+            assert second["action"]["action"] == "process_exit"
+            assert "previous_response_id" not in second_fake.responses.payloads[0]
+            assert not any(
+                item.get("type") == "function_call_output"
+                for item in second_fake.responses.payloads[0]["input"]
+            )
+            calls = runtime.store.list_llm_calls(pid)
+            first_chain = calls[0].request_options["openai_provider_chain_fingerprint"]
+            second_chain = calls[1].request_options["openai_provider_chain_fingerprint"]
+            assert first_chain is not None and len(first_chain) == 64
+            assert second_chain is not None and len(second_chain) == 64
+            assert second_chain != first_chain
+            assert calls[1].request_options["openai_previous_response_id"] is None
         finally:
             runtime.close()
 
@@ -723,6 +917,44 @@ class TestUserLLMProfileStore:
             return client.closed
 
         assert asyncio.run(run()) is True
+
+
+class _ProfileFakeAsyncOpenAIResponses:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = _ProfileSequencedResponses(responses)
+
+
+class _ProfileSequencedResponses:
+    def __init__(self, responses: list[object]) -> None:
+        self._responses = list(responses)
+        self.payloads: list[dict[str, object]] = []
+
+    async def create(self, **payload: object) -> object:
+        self.payloads.append(payload)
+        return self._responses.pop(0)
+
+
+def _profile_response_tool_call(
+    response_id: str,
+    name: str,
+    arguments: dict[str, object],
+) -> object:
+    return SimpleNamespace(
+        id=response_id,
+        _request_id=f"req_{response_id}",
+        model="gpt-test",
+        usage=SimpleNamespace(input_tokens=5, output_tokens=2, total_tokens=7),
+        output_text="",
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                id=f"fc_{response_id}",
+                call_id=f"call_{response_id}",
+                name=name,
+                arguments=json.dumps(arguments),
+            )
+        ],
+    )
 
 
 class AsyncCloseOnlyClient:

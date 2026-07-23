@@ -21,12 +21,17 @@ _API_MODES = {"auto", "responses", "chat"}
 _LEGACY_PROFILE_ENV_KEYS = {
     "OPENAI_API_MODE",
     "OPENAI_BASE_URL",
+    "OPENAI_ENABLE_THINKING",
     "OPENAI_LANGUAGE_MODEL",
     "OPENAI_MAX_RETRIES",
     "OPENAI_MODEL",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_ORG_ID",
     "OPENAI_PARALLEL_TOOL_CALLS",
     "OPENAI_PROMPT_CACHE_KEY",
     "OPENAI_PROMPT_CACHE_RETENTION",
+    "OPENAI_PROJECT",
+    "OPENAI_PROJECT_ID",
     "OPENAI_REASONING_EFFORT",
     "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
     "OPENAI_SAFETY_IDENTIFIER",
@@ -248,6 +253,19 @@ class LLMProfileRegistry:
                 "prompt_cache_retention": policy.prompt_cache_retention,
                 "responses_previous_response_id": policy.responses_previous_response_id,
                 "api_key_env": profile.api_key_env,
+                "enable_thinking": (
+                    _bool_env(legacy_env, "OPENAI_ENABLE_THINKING", False)
+                    if "OPENAI_ENABLE_THINKING" in legacy_env
+                    else None
+                ),
+                "organization": (
+                    _optional_env(legacy_env, "OPENAI_ORGANIZATION")
+                    or _optional_env(legacy_env, "OPENAI_ORG_ID")
+                ),
+                "project": (
+                    _optional_env(legacy_env, "OPENAI_PROJECT")
+                    or _optional_env(legacy_env, "OPENAI_PROJECT_ID")
+                ),
             },
         }
         return _LLMProfileSnapshot(
@@ -370,6 +388,23 @@ class LLMProfileRegistry:
                     self.config.llm.parallel_tool_calls,
                 )
             ),
+            enable_thinking=(
+                _bool_env(legacy_env, "OPENAI_ENABLE_THINKING", False)
+                if "OPENAI_ENABLE_THINKING" in legacy_env
+                else None
+            ),
+            organization=(
+                _optional_env(legacy_env, "OPENAI_ORGANIZATION")
+                or _optional_env(legacy_env, "OPENAI_ORG_ID")
+            ),
+            project=(
+                _optional_env(legacy_env, "OPENAI_PROJECT")
+                or _optional_env(legacy_env, "OPENAI_PROJECT_ID")
+            ),
+            # Resolution has snapshotted the only ambient OPENAI_* values that
+            # may apply. Prevent the SDK from re-reading a different account,
+            # endpoint, or provider policy while constructing its client.
+            inherit_ambient_openai_sdk_config=False,
             allow_custom_base_url=(
                 profile.allow_custom_base_url
                 or _bool_env(env, "AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL", False)

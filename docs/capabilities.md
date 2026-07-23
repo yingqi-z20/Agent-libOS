@@ -270,9 +270,9 @@ the target image's declared `required_capabilities`.
 
 Image-package boot is also not an external authority grant. Its
 `workspace.grants` entries apply only to the package workspace seed after it is
-materialized into that process's private directory under
-`agent_outputs/image_workspaces/`; they cannot name arbitrary host or workspace
-paths.
+materialized into that process's private directory under the configured
+`image.materialized_workspace_root` (`agent_outputs/image_workspaces/` by
+default); they cannot name arbitrary host or workspace paths.
 
 ## Permission Policy And Human Approval
 
@@ -327,11 +327,17 @@ used as an existence or metadata oracle.
 
 `human_output` requires `human:<name>` write and reserves finite-use authority.
 Before provider delivery, one transaction marks its request `delivered` and
-persists the output event, audit record, and a structured pending external-effect
-intent. Provider failure finalizes unknown evidence when possible; successful
-delivery followed by classifier/finalization failure leaves the pending intent
-and still returns without replay. The terminal queue cannot deliver that request
-again, and the one-shot use is not restored after the provider boundary.
+persists a structured pending external-effect intent. The success event, audit
+record, and effect finalization are settlement evidence and are written only
+after the provider call returns; the runtime never pre-records successful
+delivery. Provider failure finalizes unknown evidence when possible; successful
+delivery followed by classifier failure uses conservative unknown
+classification/finalization when possible. A later finalization or settlement
+failure leaves the pending intent and still returns without replay. In that case
+the success event or audit row may be absent, so the pending intent and delivered
+request are the conservative durable evidence. The terminal queue cannot deliver
+that request again, and the one-shot use is not restored after the provider
+boundary.
 
 Terminal queue questions, permission-policy prompts, and ordinary approval
 prompts also cross the configured Human provider through structured `read` or

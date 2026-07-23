@@ -7,8 +7,10 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import threading
 import time
+from types import MappingProxyType, ModuleType
 from typing import Any
 
 import pytest
@@ -23,6 +25,7 @@ from agent_libos.models import (
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
+    McpHeaderSpec,
     McpProviderCallResult,
     McpProviderTool,
     McpHttpTransportSpec,
@@ -184,8 +187,12 @@ class TestMcpPrimitive:
             http=McpHttpTransportSpec(url="https://mcp.example.test/tools"),
         )
         session_entries = 0
+        session_environments: list[Any] = []
         call_started = threading.Event()
         call_completed = threading.Event()
+        runtime_environment = MappingProxyType(
+            {'Authorization': 'Bearer approved-token'},
+        )
 
         class FakeSession:
             async def list_tools(self) -> Any:
@@ -208,9 +215,10 @@ class TestMcpPrimitive:
                 return type("CallResult", (), {"content": [], "isError": False})()
 
         @contextlib.asynccontextmanager
-        async def fake_session(*_args: Any, **_kwargs: Any):
+        async def fake_session(*_args: Any, **kwargs: Any):
             nonlocal session_entries
             session_entries += 1
+            session_environments.append(kwargs.get('runtime_environment'))
             yield FakeSession()
 
         monkeypatch.setattr(provider, "_session", fake_session)
@@ -223,13 +231,438 @@ class TestMcpPrimitive:
                 {},
                 timeout_s=server.timeout_s,
                 max_response_bytes=server.max_response_bytes,
+                runtime_environment=runtime_environment,
             )
         elapsed = time.monotonic() - started
 
         assert session_entries == 1
+        assert session_environments == [runtime_environment]
+        assert session_environments[0] is runtime_environment
         assert call_started.is_set()
         assert not call_completed.is_set()
         assert elapsed < 0.45
+
+    def test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import httpx
+        provider = SdkMcpProvider()
+        server = McpServerSpec(
+            schema_version=1,
+            server_id='sdk-http-snapshot',
+            transport='streamable_http',
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            http=McpHttpTransportSpec(
+                url='https://mcp.example.test/tools',
+                headers={
+                    'Authorization': McpHeaderSpec(
+                        env='AGENT_LIBOS_MCP_TEST_TOKEN',
+                        prefix='Bearer ',
+                    ),
+                },
+            ),
+        )
+        runtime_environment = MappingProxyType(
+            {'Authorization': 'Bearer approved-token'},
+        )
+        captured: dict[str, Any] = {}
+
+        class FakeAsyncClient:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+            async def __aenter__(self) -> 'FakeAsyncClient':
+                return self
+
+            async def __aexit__(self, *_exc: Any) -> None:
+                return None
+
+        monkeypatch.setenv(
+            'AGENT_LIBOS_MCP_TEST_TOKEN',
+            'attacker-token\r\nX-Injected: yes',
+        )
+        monkeypatch.setattr(httpx, 'AsyncClient', FakeAsyncClient)
+
+        async def exercise() -> None:
+            async with provider._http_client(
+                server,
+                timeout_s=server.timeout_s,
+                max_response_bytes=server.max_response_bytes,
+                runtime_environment=runtime_environment,
+            ) as client:
+                assert isinstance(client, FakeAsyncClient)
+
+        asyncio.run(exercise())
+
+        assert captured['headers'] == {
+            'Authorization': 'Bearer approved-token',
+            'Accept-Encoding': 'identity',
+        }
+        assert captured['follow_redirects'] is False
+        assert captured['trust_env'] is False
+
+    @pytest.mark.parametrize('entry_point', ['list_tools', 'call_tool'])
+    def test_sdk_list_and_call_forward_snapshot_to_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        entry_point: str,
+    ) -> None:
+        provider = SdkMcpProvider()
+        tool = McpToolSpec(
+            tool_id='echo',
+            mcp_name='demo.echo',
+            right='read',
+            rollback_class='no_rollback_required',
+            state_mutation=False,
+            information_flow=True,
+        )
+        server = McpServerSpec(
+            schema_version=1,
+            server_id='sdk-entry-snapshot',
+            transport='streamable_http',
+            tools=[tool],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            http=McpHttpTransportSpec(url='https://mcp.example.test/tools'),
+        )
+        runtime_environment = MappingProxyType(
+            {'Authorization': 'Bearer approved-token'},
+        )
+        session_environments: list[Any] = []
+
+        class FakeSession:
+            async def list_tools(self) -> Any:
+                item = type(
+                    'LiveTool',
+                    (),
+                    {
+                        'name': 'demo.echo',
+                        'description': None,
+                        'inputSchema': {},
+                    },
+                )()
+                return type('LiveTools', (), {'tools': [item]})()
+
+            async def call_tool(
+                self,
+                _name: str,
+                _arguments: dict[str, Any],
+            ) -> Any:
+                return type(
+                    'CallResult',
+                    (),
+                    {
+                        'content': [],
+                        'structuredContent': {'ok': True},
+                        'isError': False,
+                    },
+                )()
+
+        @contextlib.asynccontextmanager
+        async def fake_session(*_args: Any, **kwargs: Any):
+            session_environments.append(kwargs.get('runtime_environment'))
+            yield FakeSession()
+
+        monkeypatch.setattr(provider, '_session', fake_session)
+
+        if entry_point == 'list_tools':
+            result = provider.list_tools(
+                server,
+                timeout_s=server.timeout_s,
+                max_response_bytes=server.max_response_bytes,
+                runtime_environment=runtime_environment,
+            )
+            assert result.tools[0].name == 'demo.echo'
+        else:
+            result = provider.call_tool(
+                server,
+                tool,
+                {'text': 'hello'},
+                timeout_s=server.timeout_s,
+                max_response_bytes=server.max_response_bytes,
+                runtime_environment=runtime_environment,
+            )
+            assert result.structured_content == {'ok': True}
+
+        assert session_environments == [runtime_environment]
+        assert session_environments[0] is runtime_environment
+
+    def test_sdk_http_session_forwards_snapshot_to_http_client(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = SdkMcpProvider()
+        server = McpServerSpec(
+            schema_version=1,
+            server_id='sdk-http-session-snapshot',
+            transport='streamable_http',
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            http=McpHttpTransportSpec(url='https://mcp.example.test/tools'),
+        )
+        runtime_environment = MappingProxyType(
+            {'Authorization': 'Bearer approved-token'},
+        )
+        http_environments: list[Any] = []
+        selected_http_client = object()
+
+        @contextlib.asynccontextmanager
+        async def fake_http_client(*_args: Any, **kwargs: Any):
+            http_environments.append(kwargs.get('runtime_environment'))
+            yield selected_http_client
+
+        @contextlib.asynccontextmanager
+        async def fake_streamable_http_client(
+            url: str,
+            *,
+            http_client: Any,
+        ):
+            assert url == server.http.url
+            assert http_client is selected_http_client
+            yield object(), object(), None
+
+        class FakeClientSession:
+            def __init__(self, _read: Any, _write: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> 'FakeClientSession':
+                return self
+
+            async def __aexit__(self, *_exc: Any) -> None:
+                return None
+
+            async def initialize(self) -> None:
+                return None
+
+        class UnusedStdioServerParameters:
+            pass
+
+        mcp_module = ModuleType('mcp')
+        mcp_module.ClientSession = FakeClientSession  # type: ignore[attr-defined]
+        mcp_client_module = ModuleType('mcp.client')
+        mcp_stdio_module = ModuleType('mcp.client.stdio')
+        mcp_stdio_module.StdioServerParameters = UnusedStdioServerParameters  # type: ignore[attr-defined]
+        mcp_http_module = ModuleType('mcp.client.streamable_http')
+        mcp_http_module.streamable_http_client = fake_streamable_http_client  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, 'mcp', mcp_module)
+        monkeypatch.setitem(sys.modules, 'mcp.client', mcp_client_module)
+        monkeypatch.setitem(sys.modules, 'mcp.client.stdio', mcp_stdio_module)
+        monkeypatch.setitem(
+            sys.modules,
+            'mcp.client.streamable_http',
+            mcp_http_module,
+        )
+        monkeypatch.setattr(provider, '_http_client', fake_http_client)
+
+        async def exercise() -> None:
+            async with provider._session(
+                server,
+                timeout_s=server.timeout_s,
+                max_response_bytes=server.max_response_bytes,
+                runtime_environment=runtime_environment,
+            ):
+                pass
+
+        asyncio.run(exercise())
+
+        assert http_environments == [runtime_environment]
+        assert http_environments[0] is runtime_environment
+
+    def test_sdk_stdio_session_uses_primitive_snapshot_without_platform_reread(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = SdkMcpProvider()
+        server = McpServerSpec(
+            schema_version=1,
+            server_id='sdk-stdio-snapshot',
+            transport='stdio',
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            stdio=McpStdioTransportSpec(
+                command=sys.executable,
+                args=[],
+                env={'DEMO_TOKEN': 'AGENT_LIBOS_MCP_ALLOWED_TOKEN'},
+            ),
+        )
+        monkeypatch.setattr(
+            'agent_libos.primitives.mcp._MCP_PLATFORM_ENV_KEYS',
+            ('SYSTEMROOT', 'WINDIR'),
+        )
+        monkeypatch.setenv('SYSTEMROOT', r'C:\\Windows-approved')
+        monkeypatch.setenv('WINDIR', r'C:\\Windows-approved')
+        monkeypatch.setenv(
+            'AGENT_LIBOS_MCP_ALLOWED_TOKEN',
+            'approved-token',
+        )
+        runtime = Runtime.open('local')
+        try:
+            runtime_environment = runtime.mcp._require_runtime_environment(server)
+        finally:
+            runtime.close()
+
+        monkeypatch.setenv('SYSTEMROOT', r'C:\\Windows-attacker')
+        monkeypatch.setenv('WINDIR', r'C:\\Windows-attacker')
+        monkeypatch.setenv(
+            'AGENT_LIBOS_MCP_ALLOWED_TOKEN',
+            'attacker-token',
+        )
+
+        def fail_platform_reread() -> dict[str, str]:
+            raise AssertionError('SDK dispatch must not reread platform environment')
+
+        monkeypatch.setattr(
+            'agent_libos.substrate.local._mcp_platform_env',
+            fail_platform_reread,
+        )
+        captured: dict[str, str] = {}
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_client(params: Any, **_kwargs: Any):
+            captured.update(dict(params.env or {}))
+            yield object(), object()
+
+        class FakeClientSession:
+            def __init__(self, _read: Any, _write: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> 'FakeClientSession':
+                return self
+
+            async def __aexit__(self, *_exc: Any) -> None:
+                return None
+
+            async def initialize(self) -> None:
+                return None
+
+        class FakeStdioServerParameters:
+            def __init__(
+                self,
+                *,
+                command: str,
+                args: list[str],
+                env: dict[str, str],
+                cwd: str,
+            ) -> None:
+                self.command = command
+                self.args = args
+                self.env = env
+                self.cwd = cwd
+
+        async def unused_streamable_http_client(*_args: Any, **_kwargs: Any):
+            raise AssertionError('stdio session must not use HTTP transport')
+
+        mcp_module = ModuleType('mcp')
+        mcp_module.ClientSession = FakeClientSession  # type: ignore[attr-defined]
+        mcp_client_module = ModuleType('mcp.client')
+        mcp_stdio_module = ModuleType('mcp.client.stdio')
+        mcp_stdio_module.StdioServerParameters = FakeStdioServerParameters  # type: ignore[attr-defined]
+        mcp_http_module = ModuleType('mcp.client.streamable_http')
+        mcp_http_module.streamable_http_client = unused_streamable_http_client  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, 'mcp', mcp_module)
+        monkeypatch.setitem(sys.modules, 'mcp.client', mcp_client_module)
+        monkeypatch.setitem(sys.modules, 'mcp.client.stdio', mcp_stdio_module)
+        monkeypatch.setitem(
+            sys.modules,
+            'mcp.client.streamable_http',
+            mcp_http_module,
+        )
+
+        monkeypatch.setattr(
+            'agent_libos.substrate.local._strict_stdio_client',
+            fake_stdio_client,
+        )
+
+        async def exercise() -> None:
+            async with provider._session(
+                server,
+                timeout_s=server.timeout_s,
+                max_response_bytes=server.max_response_bytes,
+                runtime_environment=runtime_environment,
+            ):
+                pass
+
+        asyncio.run(exercise())
+
+        assert captured == {
+            'SYSTEMROOT': r'C:\\Windows-approved',
+            'WINDIR': r'C:\\Windows-approved',
+            'DEMO_TOKEN': 'approved-token',
+        }
+
+    def test_sdk_validate_and_call_rejects_missing_live_pinned_schema(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = SdkMcpProvider()
+        tool = McpToolSpec(
+            tool_id="echo",
+            mcp_name="demo.echo",
+            right="read",
+            rollback_class="no_rollback_required",
+            state_mutation=False,
+            information_flow=True,
+            input_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+            },
+        )
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="missing-live-schema",
+            transport="streamable_http",
+            tools=[tool],
+            timeout_s=1,
+            max_request_bytes=65_536,
+            max_response_bytes=1_048_576,
+            http=McpHttpTransportSpec(url="https://mcp.example.test/tools"),
+        )
+        call_started = False
+
+        class FakeSession:
+            async def list_tools(self) -> Any:
+                item = type(
+                    "LiveTool",
+                    (),
+                    {
+                        "name": "demo.echo",
+                        "description": None,
+                        "inputSchema": {},
+                    },
+                )()
+                return type("LiveTools", (), {"tools": [item]})()
+
+            async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> Any:
+                nonlocal call_started
+                call_started = True
+                raise AssertionError("call_tool must not run after schema drift")
+
+        @contextlib.asynccontextmanager
+        async def fake_session(*_args: Any, **_kwargs: Any):
+            yield FakeSession()
+
+        monkeypatch.setattr(provider, "_session", fake_session)
+
+        result = provider.validate_and_call(
+            server,
+            tool,
+            {"text": "hello"},
+            timeout_s=server.timeout_s,
+            max_response_bytes=server.max_response_bytes,
+        )
+
+        assert result.error_type == "LiveToolValidationError"
+        assert not result.call_started
+        assert not call_started
 
     def test_total_mcp_budget_denial_does_not_start_provider(self) -> None:
         runtime = Runtime.open('local')
@@ -1161,6 +1594,141 @@ class TestMcpPrimitive:
             for text in invalid_cases:
                 with pytest.raises(ValidationError):
                     runtime.mcp.register_server_from_yaml_text(text, actor="cli", require_capability=False)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('transport', ['streamable_http', 'stdio'])
+    def test_runtime_environment_is_snapshotted_before_provider_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        transport: str,
+    ) -> None:
+        env_name = (
+            'AGENT_LIBOS_MCP_TEST_TOKEN'
+            if transport == 'streamable_http'
+            else 'AGENT_LIBOS_MCP_ALLOWED_TOKEN'
+        )
+        expected = (
+            {'Authorization': 'Bearer approved-token'}
+            if transport == 'streamable_http'
+            else {'DEMO_TOKEN': 'approved-token'}
+        )
+        manifest = (
+            _http_manifest(
+                'credential-snapshot',
+                'http://localhost:8765/tools',
+            )
+            if transport == 'streamable_http'
+            else _stdio_manifest(
+                'credential-snapshot',
+                env_source=env_name,
+            )
+        )
+        runtime = Runtime.open('local')
+        provider = _EnvironmentMutatingSdkMcpProvider(env_name)
+        runtime.mcp.provider = provider
+        monkeypatch.setenv(env_name, 'approved-token')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'{transport} credential snapshot')
+            runtime.mcp.register_server_from_yaml_text(
+                manifest,
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:credential-snapshot:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            if transport == 'stdio':
+                _grant_stdio_spawn(
+                    runtime,
+                    pid,
+                    env={'DEMO_TOKEN': env_name},
+                )
+
+            result = runtime.mcp.call_tool(
+                pid,
+                'credential-snapshot',
+                'echo',
+                {'text': 'hello'},
+            )
+
+            assert result.ok
+            assert provider.dispatched_environment == expected
+            assert provider.snapshot_was_immutable
+        finally:
+            runtime.close()
+
+    def test_legacy_list_call_and_refresh_use_operation_environment_snapshots(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        env_name = 'AGENT_LIBOS_MCP_ALLOWED_TOKEN'
+        runtime = Runtime.open('local')
+        provider = _EnvironmentRecordingLegacyMcpProvider(env_name)
+        runtime.mcp.provider = provider
+        monkeypatch.setenv(env_name, 'approved-call-token')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='legacy MCP credential snapshot',
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('legacy-credential-snapshot', env_source=env_name),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:legacy-credential-snapshot:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(
+                runtime,
+                pid,
+                env={'DEMO_TOKEN': env_name},
+            )
+
+            result = runtime.mcp.call_tool(
+                pid,
+                'legacy-credential-snapshot',
+                'echo',
+                {'text': 'hello'},
+            )
+
+            assert result.ok
+            assert [stage for stage, _snapshot in provider.environments] == [
+                'list',
+                'call',
+            ]
+            call_list_snapshot = provider.environments[0][1]
+            call_tool_snapshot = provider.environments[1][1]
+            assert call_list_snapshot is call_tool_snapshot
+            assert dict(call_list_snapshot) == {'DEMO_TOKEN': 'approved-call-token'}
+
+            monkeypatch.setenv(env_name, 'approved-refresh-token')
+            refreshed = runtime.mcp.list_tools(
+                'legacy-credential-snapshot',
+                actor=None,
+                require_capability=False,
+                refresh=True,
+            )
+
+            assert refreshed['refreshed']
+            assert [stage for stage, _snapshot in provider.environments] == [
+                'list',
+                'call',
+                'list',
+            ]
+            refresh_snapshot = provider.environments[2][1]
+            assert refresh_snapshot is not call_list_snapshot
+            assert dict(refresh_snapshot) == {
+                'DEMO_TOKEN': 'approved-refresh-token',
+            }
+            assert provider.snapshots_were_immutable == [True, True, True]
         finally:
             runtime.close()
 
@@ -2297,6 +2865,39 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    def test_missing_live_schema_fails_closed_for_pinned_manifest_schema(self) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        provider.live_schema = {}
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp missing live schema")
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("missing-live-schema"),
+                actor="cli",
+                require_capability=False,
+            )
+            cap = runtime.capability.grant_once(
+                pid,
+                "mcp:missing-live-schema:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            with pytest.raises(ValidationError, match="schema changed"):
+                runtime.mcp.call_tool(
+                    pid,
+                    "missing-live-schema",
+                    "echo",
+                    {"text": "hello"},
+                )
+
+            assert provider.call_args == []
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
+        finally:
+            runtime.close()
+
     def test_live_validation_provider_error_taints_context_before_reraise(self) -> None:
         runtime = Runtime.open("local")
         provider = _FailingListMcpProvider("MCP_PROVIDER_ERROR_SENTINEL")
@@ -2497,7 +3098,9 @@ export async function run(args, libos) {
   try {
     await libos.syscall("mcp.tools", {server_id: args.server_id, refresh: true});
   } catch (_) {
-    const error = new Error("candidate sandbox failure");
+    const error = new Error("candidate sandbox failure") as Error & {
+      details?: Record<string, unknown>;
+    };
     error.details = {
       code: "forged_provider_code",
       error_type: "ForgedProviderError",
@@ -3193,6 +3796,86 @@ class _ValidatedCallMcpProvider(_RecordingMcpProvider):
             call_response_bytes=19,
             call_started=True,
         )
+
+
+class _EnvironmentMutatingSdkMcpProvider(SdkMcpProvider):
+    def __init__(self, env_name: str) -> None:
+        super().__init__()
+        self.env_name = env_name
+        self.dispatched_environment: dict[str, str] = {}
+        self.snapshot_was_immutable = False
+
+    def validate_and_call(
+        self,
+        server: McpServerSpec,
+        _tool: McpToolSpec,
+        arguments: dict[str, Any],
+        **kwargs: Any,
+    ) -> McpProviderCallResult:
+        runtime_environment = kwargs.get('runtime_environment')
+        try:
+            runtime_environment['forged'] = 'credential'
+        except TypeError:
+            self.snapshot_was_immutable = True
+        os.environ[self.env_name] = 'attacker-token\r\nX-Injected: yes'
+        if server.transport == 'streamable_http':
+            self.dispatched_environment = self._resolved_http_headers(
+                server,
+                runtime_environment=runtime_environment,
+            )
+        else:
+            resolved = self._resolved_stdio_env(
+                server,
+                runtime_environment=runtime_environment,
+            )
+            self.dispatched_environment = {
+                name: resolved[name]
+                for name in (server.stdio.env if server.stdio is not None else {})
+            }
+        return McpProviderCallResult(
+            structured_content={'echo': dict(arguments)},
+            content=[{'type': 'text', 'text': 'ok'}],
+            response_bytes=19,
+            duration_s=0.02,
+            list_request_bytes=11,
+            list_response_bytes=13,
+            call_request_bytes=17,
+            call_response_bytes=19,
+            call_started=True,
+        )
+
+
+class _EnvironmentRecordingLegacyMcpProvider(_RecordingMcpProvider):
+    def __init__(self, env_name: str) -> None:
+        super().__init__()
+        self.env_name = env_name
+        self.environments: list[tuple[str, Any]] = []
+        self.snapshots_were_immutable: list[bool] = []
+
+    def _record_environment(self, stage: str, kwargs: dict[str, Any]) -> None:
+        runtime_environment = kwargs.get('runtime_environment')
+        self.environments.append((stage, runtime_environment))
+        try:
+            runtime_environment['forged'] = 'credential'
+        except TypeError:
+            self.snapshots_were_immutable.append(True)
+        else:
+            self.snapshots_were_immutable.append(False)
+
+    def list_tools(self, server: Any, **kwargs: Any) -> McpToolListResult:
+        self._record_environment('list', kwargs)
+        os.environ[self.env_name] = 'attacker-token'
+        return super().list_tools(server, **kwargs)
+
+    def call_tool(
+        self,
+        server: Any,
+        tool: Any,
+        arguments: dict[str, Any],
+        **kwargs: Any,
+    ) -> McpProviderCallResult:
+        self._record_environment('call', kwargs)
+        return super().call_tool(server, tool, arguments, **kwargs)
 
 
 class _MalformedValidatedMcpProvider(_ValidatedCallMcpProvider):

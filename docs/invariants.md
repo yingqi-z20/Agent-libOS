@@ -65,7 +65,9 @@ longer defines.
   creation, while unrelated paths remain concurrent and widening reentrant
   lock upgrades fail.
 - `task-authority-manifest-bounds-launch`: image requirements are declarations;
-  Host manifests compile launch grants and bound model requests, child
+  Host manifest inputs are closed and strictly typed. Unknown fields, invalid
+  scalar types, and malformed provider-effect wildcard forms fail closed before
+  launch; valid manifests compile launch grants and bound model requests, child
   transitions, budgets, approval policy, and provider effect classes.
 - `effect-ceilings-distinguish-unrestricted-and-deny-all`: omission of a Task
   Authority effect ceiling remains unrestricted, while an explicit empty
@@ -297,7 +299,11 @@ longer defines.
   instead of raw sensitive args or results.
 - `jit-security-does-not-rely-on-static-blacklist`: JIT safety is enforced by
   Deno no-permission isolation, libOS syscalls, capabilities, human approval,
-  and budgets rather than dangerous API regex blacklists.
+  and budgets rather than dangerous API regex blacklists. Unsupported
+  dependency forms and BOM-prefixed dependency bypasses are rejected before
+  Deno starts. Timeout, output-limit, resource-monitor, readiness, cancellation,
+  and validation failures supervise and clean up the child process, monitor and
+  cancellation tasks, file descriptors, and platform Job resources.
 - `tool-policy-cannot-self-grant-authority`: ToolPolicy declarations cannot
   grant execution, resource authority, or confirmation.
 - `tool-result-size-boundary-is-explicit`: tool result payload limits prevent
@@ -534,9 +540,14 @@ longer defines.
   behind, and owner-watch resumes only replay tools with explicitly safe
   message-receive semantics.
 - `llm-call-records-opt-out-are-bounded-and-redacted`: when
-  `llm.persist_full_io` is false, LLM call persistence stores bounded preview,
-  size, hash, and truncation metadata instead of raw prompts, tool arguments,
-  reasoning, or provider responses. Pending conditional releases likewise
+  `llm.persist_full_io` is false, new LLM call rows store canonical content-free
+  summary envelopes containing only schema version, tier, byte count, hash, and
+  JSON kind/item count where applicable. No prompt, schema, response, tool-call
+  argument, reasoning,
+  provider payload, error text, key name, scalar value, or preview is durable
+  in the row. The same content-free summary and hash boundary applies to
+  related audit records, events, and result Objects; none persist raw provider
+  I/O. Pending conditional releases likewise
   persist only hashes and non-sensitive resume metadata before approval;
   same-runtime approval reuses the hash-bound in-memory request, while reopen
   fails closed without provider dispatch.
@@ -590,8 +601,10 @@ longer defines.
   Cleanup falls back to explicit descendant signaling when process-group
   signaling is denied and serializes concurrent close attempts.
 - `skill-activation-does-not-grant-authority`: Skills change visibility and
-  prompt context without granting resources; API actor mode must still honor
-  skill capability or human-approval gates. Finite-use Skill permissions are
+  prompt context without granting resources. Actor-scoped validation,
+  registration, and activation must still honor process authority and Skill
+  capability or human-approval gates; actor mode cannot invoke Host-path
+  validation. Finite-use Skill permissions are
   reserved before a registry, trust, activation, or unload mutation and are
   committed only with that mutation. Registry/trust/audit state changes are
   transactional; failed activation cannot leave a visible JIT alias, and
@@ -646,9 +659,11 @@ longer defines.
   handler preserves its work and moves the publication to `manual` rather than
   claiming completion. Fork post-commit failures are reported without claiming
   rollback.
-  Legacy minimal flow carriers canonicalize during restore; incomplete active
-  pending carriers fail closed through the retryable terminal lifecycle, while
-  completed history receives conservative labels without failing its process.
+  Restore and fork require canonical data-flow metadata on every captured
+  pending-action row, including completed history, and on every captured
+  process message. Missing, incomplete, or malformed carriers reject the
+  artifact before process-state publication; restore never invents
+  conservative labels for legacy rows.
   Post-checkpoint terminal ObjectTask history is retained as
   `superseded_by_restore` with stale live runner/result references cleared;
   the comparison uses the terminal transition time so delayed notification
@@ -666,9 +681,9 @@ longer defines.
   rows as one batch or restores the complete prior cache. Durable finalizer
   handlers are buffered by trusted module entrypoints, so they are reconstructed
   before checkpoint publication recovery rather than waiting for startup hooks.
-  The implementation uses one reservation scope for diagnostic
-  inspect/diff/replay; the mapped one-shot regression directly proves inspect
-  consumes the selected finite checkpoint/process read exactly once.
+  Diagnostic inspect/diff/replay use one reservation scope: each finite
+  checkpoint/process read claim rolls back on failure and settles exactly once
+  on success.
   `checkpoint:*` control capabilities are excluded from new snapshot artifacts
   and are also filtered during restore and fork, so snapshot transitions cannot
   duplicate or resurrect authority over checkpoint artifacts.
@@ -689,15 +704,19 @@ longer defines.
 - `jsonrpc-provider-effects-are-registered-and-classified`: JSON-RPC endpoint
   registration and calls use registered endpoint/method authority, gate calls
   and per-item registry operations before manifest metadata is exposed, and
-  classify provider effects. Registry row/stale-grant/event/audit mutations are
+  classify provider effects. Provider dispatch uses immutable Host-snapshotted
+  transport inputs and ignores ambient proxy configuration. Registry
+  row/stale-grant/event/audit mutations are
   transactional, including finite registry-authority reservation/settlement.
   A call reserves finite authority and persists pending evidence
   before non-local DNS and transport; DNS observation prevents later transport
   PENS from erasing information flow or restoring the use.
 - `mcp-provider-effects-are-registered-and-classified`: MCP server registration
   and tool calls use registered server/tool authority, gate calls before server
-  metadata is exposed, and classify provider effects. Registry mutations are
-  transactional. Refreshed tool listing/tool calls atomically reserve their
+  metadata is exposed, and classify provider effects. Validation, discovery,
+  and calls share immutable Host-snapshotted transport inputs and do not inherit
+  ambient transport environment. Registry mutations are transactional.
+  Refreshed tool listing/tool calls atomically reserve their
   deduplicated main, server, process-spawn, and exact stdio authority and persist
   pending evidence before DNS/live-provider boundaries. Local/stdio first-call
   PENS may restore; non-local DNS observation cannot be erased.
@@ -731,9 +750,9 @@ longer defines.
   final context generation/Object, and compaction metadata without copying
   Object payloads or rendered prompt text.
 - `runtime-safety-benchmark-is-deterministic`: benchmark tasks and smoke runs
-  remain schema-v1, deterministic, and token-free by default. Effect outcome
-  and evidence are explicit; exact/prefix/glob matching cannot broaden
-  implicitly; unknown/invalid/orphan/runner-failure output nulls rate fields;
+  remain task-schema-v1/run-output-schema-v2, deterministic, and token-free by
+  default. Effect outcome and evidence are explicit; exact/prefix/glob matching
+  cannot broaden implicitly; unknown/invalid/orphan/runner-failure output nulls rate fields;
   false-denial and unauthorized-effect denominators use only their documented
   qualified effect subsets.
 - `practical-native-evidence-has-no-modeled-fallback`: native practical rows
@@ -747,4 +766,29 @@ longer defines.
 - Explainability tests verify provenance completeness and deterministic
   summaries, but do not yet measure whether operators understand explanations
   better in a user study.
-- MCP Resources/Prompts remain planned but are not implemented.
+- Per-change Python CI exercises 3.11 and 3.14 on Ubuntu. Python 3.12/3.13 are
+  inside the declared package range but are not separate jobs, and native
+  macOS/Windows SQLite locking and ACL behavior, process-tree containment,
+  Deno parent-death handling, PTY lifecycle, and Git path/credential behavior
+  remain environment-gated.
+- PostgreSQL CI uses PostgreSQL 17 on Ubuntu. Other supported server versions
+  and deployment TLS/authentication topologies are not release-gated here.
+- JSON-RPC, MCP, and Git remote tests use deterministic loopback or local
+  remotes. Real proxy/TLS/DNS policy, HTTPS/OpenSSH authentication, and the
+  optional real MCP SDK/server path require environment-gated runs. GitHub and
+  GitLab API integrations, and MCP Resources/Prompts, are not implemented.
+- Real LLM credentials and token-spending paths are opt-in. The default matrix
+  covers mock/action-selection behavior, not a live request for every supported
+  profile or provider deployment.
+- GUI CI covers React tests, TypeScript typechecking, production build, and the
+  Python HTTP/SSE server on Ubuntu. Accessibility/usability studies, native
+  Electron lifecycle, packaging/signing/notarization, and packaged-window
+  smoke remain environment-gated.
+- Data-flow tests cover runtime-mediated payloads; trusted modules/providers,
+  native child I/O, Sink re-forwarding, and direct RuntimeStore administration
+  remain operator trust boundaries rather than containment-test guarantees.
+- Practical and recovery benchmarks validate their documented deterministic
+  profiles. Hosted-provider workflows, real-model benchmark breadth, and the
+  unimplemented million-publication recovery profile remain outside the
+  per-change gate. See `docs/support_matrix.md` for the authoritative coverage
+  matrix and release-gate procedure.

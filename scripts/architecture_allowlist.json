@@ -65,9 +65,9 @@
     "agent_libos/primitives/git.py::GitPrimitive._mutate": 150,
     "agent_libos/primitives/git.py::GitPrimitive._read": 157,
     "agent_libos/primitives/git.py::GitPrimitive.create_pull_request": 125,
-    "agent_libos/primitives/jsonrpc.py::JsonRpcPrimitive._call": 161,
-    "agent_libos/primitives/mcp.py::McpPrimitive._call_tool": 394,
-    "agent_libos/primitives/mcp.py::McpPrimitive._list_tools": 184,
+    "agent_libos/primitives/jsonrpc.py::JsonRpcPrimitive._call": 147,
+    "agent_libos/primitives/mcp.py::McpPrimitive._call_tool": 389,
+    "agent_libos/primitives/mcp.py::McpPrimitive._list_tools": 167,
     "agent_libos/primitives/shell.py::ShellAdapter.authorize_operation": 232,
     "agent_libos/primitives/shell.py::ShellAdapter.run": 262,
     "agent_libos/runtime/authority_manifest_manager.py::AuthorityManifestManager.prepare_launch": 128,
@@ -84,7 +84,7 @@
     "agent_libos/substrate/local.py::_strict_stdio_client": 129,
     "agent_libos/tools/base.py::BaseAgentTool.ainvoke": 138,
     "agent_libos/tools/builtin/context.py::CompactProcessContextTool.run": 131,
-    "agent_libos/tools/sandbox.py::DenoTypescriptSandbox.arun_source": 128
+    "agent_libos/tools/sandbox.py::DenoTypescriptSandbox.arun_source": 127
   },
   "schema_version": 1,
   "violation_budgets": {

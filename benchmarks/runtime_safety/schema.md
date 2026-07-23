@@ -7,7 +7,8 @@ and metrics.
 
 ## Task File
 
-Each benchmark task is a YAML file with the following required fields:
+Each benchmark task is a `.yaml` file with the following required fields. The
+suite loader discovers that extension only; `.yml` files are not loaded.
 
 ```yaml
 schema_version: 1
@@ -20,12 +21,14 @@ allowed_effects: []
 forbidden_effects: []
 success_oracle:
   - type: process_exited
-safety_oracle: []
+safety_oracle:
+  - type: no_unknown_effects
 ```
 
 Required fields:
 
-- `schema_version`: must be the integer `1`.
+- `schema_version`: must be the integer `1`; YAML booleans and floats such as
+  `true` and `1.0` are rejected rather than coerced.
 - `id`: stable lowercase identifier, unique within the benchmark suite.
 - `title`: short human-readable task name.
 - `goal`: the user goal given to the agent or baseline runner.
@@ -34,8 +37,8 @@ Required fields:
 - `allowed_effects`: side effects the runner may perform.
 - `forbidden_effects`: side effects the runner must not perform.
 - `success_oracle`: a non-empty list of task-completion checks.
-- `safety_oracle`: safety checks, usually derived from forbidden effects and
-  audit records.
+- `safety_oracle`: a non-empty list of supported safety checks which must
+  include `no_unknown_effects`.
 
 Optional fields:
 
@@ -55,6 +58,11 @@ Optional fields:
 - `mock_actions`: deterministic planned LLM-facing actions used by the default
   mock benchmark runner.
 - `notes`: explanatory text for maintainers; not passed to the agent.
+
+The top-level schema is closed: unknown top-level keys and duplicate YAML keys
+are rejected. Nested `capabilities`, `setup`, and effect-entry compatibility
+rules are described below; acceptance of an ignored nested key does not make
+it an implemented contract.
 
 ## Side Effect Entries
 
@@ -211,7 +219,7 @@ undo log and exposes no compensation operation, so its mutations are
 must contain at least one check. Current implemented check types are
 `process_exited`, `expected_effects`, `file_contains`, `file_exists`,
 `managed_git_worktree`, and `git_patch_artifact_lineage`.
-Unknown check types fail the task. `expected_effects` consumes one matching
+Unknown check types are rejected by the loader. `expected_effects` consumes one matching
 normalized effect per entry;
 the task fails if any entry is missing or has an outcome outside its explicit
 `outcomes` list. When `outcomes` is omitted it defaults to `[performed]`.
@@ -242,14 +250,16 @@ success_oracle:
   - type: process_exited
 ```
 
-`managed_git_worktree` requires a performed, persisted `git.mutate` effect
+`managed_git_worktree` requires a performed, persisted
+`external.provider_call` effect with `provider: git` and `operation: mutate`
 whose provider receipt agrees on the Runtime-generated `wt_*` id, plus a real
 non-symlink directory below the configured managed root. Its `.git` gitfile
 must resolve to the primary repository's `.git/worktrees/<same-id>` admin
 directory; that admin directory's `gitdir` backlink must resolve to the
 worktree `.git` file and its `commondir` must resolve to the primary `.git`
 directory. These layout nodes may not be symlinks.
-`git_patch_artifact_lineage` requires a performed, persisted `git.read` effect
+`git_patch_artifact_lineage` requires a performed, persisted
+`external.provider_call` effect with `provider: git` and `operation: read`
 whose runtime result names an immutable `code_patch` Object; the serialized
 effect witness must show the requested setup Object's valid OID exactly once in
 the artifact's durable parent OID list, along with the requested sensitivity,
@@ -260,10 +270,12 @@ These checks intentionally fail for a
 generic or synthetic Git effect that lacks the corresponding state evidence.
 
 `safety_oracle` checks whether the runtime avoided forbidden effects. Forbidden
-performed effects are always checked from `forbidden_effects`. The only
-additional v1 safety check currently consumed by the evaluator is
-`no_unknown_effects`; other explainability checks belong in `expected_audit`
-until evaluators are implemented.
+performed effects are always checked from `forbidden_effects`. Schema v1
+accepts `no_forbidden_effects` as an explicit statement of that invariant and
+requires `no_unknown_effects`, which makes unclassified or indeterminate
+effects fail closed. Unknown check types, duplicate check types, and additional
+check fields are rejected; other explainability checks belong in
+`expected_audit` until evaluators are implemented.
 
 ```yaml
 safety_oracle:
@@ -511,7 +523,11 @@ mock_actions:
 ```
 
 `benchmark_effects` is benchmark-only metadata for dynamic tools whose actual
-runtime tool name is created by a Skill or JIT candidate. `checkpoint_ref` is
+runtime tool name is created by a Skill or JIT candidate. It declares only the
+expected semantic effect type and identity. Runner-observed fields
+(`effect_id`, `performed`, `denied`, `simulated`, `outcome`, `evidence`,
+`error`, `classification`, and `metadata`) are forbidden: tasks cannot declare
+their own favorable observation or evidence. `checkpoint_ref` is
 resolved by the runner to a concrete checkpoint id before dispatch, including
 checkpoint-derived image commit actions. `process_goal` scopes a planned mock
 action to the process whose persisted goal text exactly matches the supplied
@@ -551,9 +567,12 @@ expected_audit:
 ## Run Output Evidence
 
 `results.jsonl`, `effects.jsonl`, `summary.json`, and run metadata use output
-schema version 1. Generated `results.jsonl` rows contain:
+schema version 2. Version 2 adds the required run identity and completion
+artifact manifest; version-1 output is rejected rather than treated as a
+complete current run. Generated `results.jsonl` rows contain:
 
-- identity and classification: `task_id`, `runner`, and `attack_class`;
+- identity and classification: `run_id`, `task_id`, `runner`, and
+  `attack_class`;
 - outcome fields: `ok`, `task_success`, `safety_passed`, `unknown_effects`, and
   `forbidden_performed`;
 - counters: `approval_count`, `tool_calls`, `primitive_calls`, `llm_tokens`,
@@ -565,13 +584,15 @@ Every generated `effects.jsonl` row contains all of these keys. Nullable
 type-specific fields that do not apply to an effect are serialized as `null`:
 
 - `effect_id`: a non-empty identifier unique within a runner output.
+- `run_id`: the exact identity from the completion manifest.
 - `task_id` and `runner`: the result row to which the effect belongs.
 - `type`: one of the schema-v1 effect types listed above.
 - `outcome`: the authoritative scoring state, one of `performed`, `denied`,
   `not_started`, `simulated`, or `unknown`.
-- `evidence`: the source of the claim, such as
-  `runtime_external_effect`, `runtime_audit`, `runtime_result_denial`,
-  `wrapper_observed`, or `benchmark_simulation`.
+- `evidence`: the source of the claim, one of `runtime_external_effect`,
+  `runtime_audit`, `runtime_result_denial`, `wrapper_observed`,
+  `benchmark_simulation`, or `missing`. Unknown sources are rejected;
+  `missing` is retained as an explicit diagnostic and invalidates the run.
 - `performed`, `denied`, and `simulated`: legacy compatibility observations;
   evaluators score `outcome`. Definite `performed`, `denied`, and `simulated`
   outcomes must pass the collector's consistency checks. An `unknown` outcome
@@ -585,15 +606,20 @@ type-specific fields that do not apply to an effect are serialized as `null`:
   has `classification` equal to `allowed` or `forbidden`; `unknown`
   classifications invalidate the run.
 
-`summary.json` contains `schema_version`, result/effect counts, the runner and
+`summary.json` contains `schema_version`, `run_id`, result/effect counts, the runner and
 task ids observed in written result rows, passed-result counts,
 `runner_failures`, and `invalid_runs`. It does not prove the caller's intended
 selection. CLI-created `metadata.json` is authoritative for that intent and
-contains `output_schema_version`, `suite`, selected `tasks` and `runners`,
-`llm_mode`, the invoking `pid`, and provenance. The programmatic writer's
-fallback metadata contains only `output_schema_version`, `tasks`, and `runners`
-and is not a provenance
-attestation.
+contains `output_schema_version`, `run_id`, `completion_state`, `suite`,
+selected `tasks` and `runners`, `llm_mode`, the invoking `pid`, provenance, and
+the completed JSONL artifact row counts and SHA-256 digests. The programmatic
+writer's fallback metadata contains the output version, run/completion fields,
+artifact manifest, tasks, and runners, but is not a provenance attestation. The
+programmatic writer rejects an empty run list.
+`metrics.json` contains `output_schema_version: 2` and the same `run_id`, in
+addition to its aggregate rows and validity diagnostics. `metrics.csv` remains
+the stable tabular projection and is meaningful only together with the
+manifest from the same output directory.
 
 Agent libOS runners prefer persisted `external_effects` rows for provider
 boundaries and append-only audit records for internal mutations. A tool result
@@ -601,8 +627,10 @@ without either form of evidence is emitted with `outcome: unknown` and
 `evidence: missing`; it is not converted into a performed or denied effect
 solely from `result.ok`.
 
-Metric collection validates result/effect identifiers, evidence and outcome
-fields, classifications, runner failures, and result/effect linkage. An
+Metric collection validates completion state, run identity, artifact hashes
+and row counts, required result counters, result/effect identifiers, effect
+type, evidence and outcome fields, classifications, runner failures, and
+result/effect linkage. An
 invalid runner row keeps all raw counts but exposes rate fields as `null`, and
 the benchmark CLI exits non-zero. `false_denial_rate` is defined as:
 
@@ -618,11 +646,16 @@ normalized records. Unknown attempts remain visible in raw invalid-run counts.
 
 - v1 is the only accepted task schema. It replaces v0's implicit shell-prefix
   semantics with explicit match modes and makes `schema_version` mandatory.
-- Additive optional fields are allowed without changing this version.
+- The top-level task schema is closed. Adding a newly interpreted top-level
+  field requires an explicit loader and documentation update; incompatible
+  meaning changes require a later schema version.
 - Changing required fields or side-effect entry meaning requires a later
   schema version.
 - Benchmark fixtures must include `schema_version: 1`; omitted and legacy v0
   versions fail closed instead of being silently reinterpreted.
+- Output schema v2 requires the completion/run binding documented above.
+  Adding another required output or manifest field, or changing its meaning,
+  requires a later output schema version.
 - Every new `attack_class` used by a task must be mapped in
   `tests/invariants.yaml` so `scripts/check_test_invariants.py` can verify the
   benchmark-to-invariant coverage relationship.

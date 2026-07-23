@@ -195,6 +195,182 @@ def test_manifest_rejects_unknown_capability_entry_fields(
         runtime.close()
 
 
+@pytest.mark.parametrize("field", ["delegable", "revocable"])
+@pytest.mark.parametrize(
+    "value",
+    ["false", "true", 0, 1, 0.0, 1.0, None],
+    ids=[
+        "false-string",
+        "true-string",
+        "zero",
+        "one",
+        "zero-float",
+        "one-float",
+        "null",
+    ],
+)
+def test_manifest_capability_boolean_fields_require_json_booleans(
+    field: str,
+    value: object,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        before_events = runtime.store.list_events()
+        before_audit = runtime.store.list_audit()
+        with pytest.raises(
+            ValidationError,
+            match=rf"authority manifest capability entry {field} must be a boolean",
+        ):
+            runtime.authority_manifests.prepare_launch(
+                pid="pid_invalid_capability_boolean",
+                image_id="base-agent:v0",
+                goal_ref=None,
+                supplied={
+                    "authorized_capabilities": [
+                        {
+                            "resource": "filesystem:workspace:report.txt",
+                            "rights": [CapabilityRight.READ.value],
+                            field: value,
+                        }
+                    ]
+                },
+            )
+        assert runtime.store.list_events() == before_events
+        assert runtime.store.list_audit() == before_audit
+        assert (
+            runtime.authority_manifests.get_for_process(
+                "pid_invalid_capability_boolean"
+            )
+            is None
+        )
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("field", ["delegable", "revocable"])
+def test_requestable_manifest_capability_boolean_fields_require_json_booleans(
+    field: str,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        before_events = runtime.store.list_events()
+        before_audit = runtime.store.list_audit()
+        with pytest.raises(
+            ValidationError,
+            match=rf"authority manifest capability entry {field} must be a boolean",
+        ):
+            runtime.authority_manifests.prepare_launch(
+                pid="pid_invalid_requestable_boolean",
+                image_id="base-agent:v0",
+                goal_ref=None,
+                supplied={
+                    "approval_policy": {
+                        "requestable_capabilities": [
+                            {
+                                "resource": "filesystem:workspace:report.txt",
+                                "rights": [CapabilityRight.READ.value],
+                                field: "false",
+                            }
+                        ]
+                    }
+                },
+            )
+        assert runtime.store.list_events() == before_events
+        assert runtime.store.list_audit() == before_audit
+        assert (
+            runtime.authority_manifests.get_for_process(
+                "pid_invalid_requestable_boolean"
+            )
+            is None
+        )
+    finally:
+        runtime.close()
+
+
+def test_manifest_capability_boolean_fields_compile_exact_values() -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(
+            goal="compile exact capability booleans",
+            authority_manifest={
+                "authorized_capabilities": [
+                    {
+                        "resource": "filesystem:workspace:delegable.txt",
+                        "rights": [CapabilityRight.READ.value],
+                        "delegable": True,
+                        "revocable": False,
+                    }
+                ]
+            },
+        )
+
+        capability = next(
+            item
+            for item in runtime.capability.capabilities_for(pid)
+            if item.resource == "filesystem:workspace:delegable.txt"
+        )
+        assert capability.delegable is True
+        assert capability.revocable is False
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "effect",
+    [None, 1, True, "", "   ", "git.*.*", "git*"],
+    ids=[
+        "null",
+        "integer",
+        "boolean",
+        "empty",
+        "whitespace",
+        "multiple-wildcards",
+        "embedded-wildcard",
+    ],
+)
+def test_manifest_effect_entries_require_strings_and_one_terminal_wildcard(
+    effect: object,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        before_events = runtime.store.list_events()
+        before_audit = runtime.store.list_audit()
+        with pytest.raises(ValidationError, match="permitted_effects"):
+            runtime.authority_manifests.prepare_launch(
+                pid="pid_invalid_effect_class",
+                image_id="base-agent:v0",
+                goal_ref=None,
+                supplied={"permitted_effects": [effect]},
+            )
+        assert runtime.store.list_events() == before_events
+        assert runtime.store.list_audit() == before_audit
+        assert (
+            runtime.authority_manifests.get_for_process("pid_invalid_effect_class")
+            is None
+        )
+    finally:
+        runtime.close()
+
+
+def test_unknown_effect_entries_grant_no_current_effect_but_global_wildcard_does() -> None:
+    runtime = Runtime.open("local")
+    try:
+        unknown = runtime.process.spawn(
+            goal="future extension effect",
+            authority_manifest={"permitted_effects": ["extension.future"]},
+        )
+        wildcard = runtime.process.spawn(
+            goal="all effects",
+            authority_manifest={"permitted_effects": ["*"]},
+        )
+
+        with pytest.raises(CapabilityDenied, match="does not permit effect class"):
+            runtime.authority_manifests.assert_effect(unknown, "filesystem.read_bytes")
+        runtime.authority_manifests.assert_effect(wildcard, "filesystem.read_bytes")
+    finally:
+        runtime.close()
+
+
 def test_data_flow_policy_requires_lists_in_python_manifests() -> None:
     runtime = Runtime.open("local")
     try:

@@ -473,14 +473,34 @@ class LLMProcessExecutor:
             self._data_flow.reset(flow_token)
 
     def _fail_llm_quantum(self, pid: str, error: Exception) -> dict[str, Any]:
-        self._process.exit(pid, failed=True, message=f"LLM quantum failed: {error}")
+        durable_error = self._durable_llm_error(error)
+        self._process.exit(
+            pid,
+            failed=True,
+            message=f"LLM quantum failed: {durable_error}",
+        )
         self._audit.record(
             actor=pid,
             action="llm.action_failed",
             target=f"process:{pid}",
-            decision={"error": str(error)},
+            decision={"error": durable_error},
         )
-        return {"ok": False, "error": str(error)}
+        return {"ok": False, "error": durable_error}
+
+    def _durable_llm_error(self, error: BaseException) -> str:
+        detail = str(error)
+        if self.config.llm.persist_full_io:
+            return detail
+        encoded = detail.encode("utf-8", errors="replace")
+        return (
+            f"{type(error).__name__}: provider error detail redacted "
+            f"(bytes={len(encoded)}, sha256={hashlib.sha256(encoded).hexdigest()})"
+        )
+
+    def _completion_content_preview(self, content: Any) -> str:
+        if not self.config.llm.persist_full_io:
+            return ""
+        return str(content)[: self.config.llm.content_preview_chars]
 
     def _advance_event_cursor(self, pid: str, event_id: str) -> None:
         """Advance one worker's cursor without racing cross-process accounting.
@@ -549,7 +569,7 @@ class LLMProcessExecutor:
             )
         action = actions[-1]
         tool_call_context = self._selected_completion_tool_call_context(completion)
-        content_preview = str(completion.content)[: self.config.llm.content_preview_chars]
+        content_preview = self._completion_content_preview(completion.content)
         tool_call_count = len(completion.tool_calls)
         try:
             result = await self.adispatch(pid, action)
@@ -606,7 +626,7 @@ class LLMProcessExecutor:
     ) -> dict[str, Any]:
         completed_actions: list[dict[str, Any]] = []
         completed_results: list[dict[str, Any]] = []
-        content_preview = str(getattr(completion, "content", ""))[: self.config.llm.content_preview_chars]
+        content_preview = self._completion_content_preview(getattr(completion, "content", ""))
         tool_call_count = len(getattr(completion, "tool_calls", []) or [])
         stop_reason = "completed"
         stopped_action: dict[str, Any] | None = None
@@ -1933,7 +1953,9 @@ class LLMProcessExecutor:
                             "attempt": attempt_number,
                             "llm_profile_id": profile_id,
                             "action": self._auto_wait_message_action(),
-                            "content_preview": completion.content[: self.config.llm.content_preview_chars],
+                            "content_preview": self._completion_content_preview(
+                                completion.content
+                            ),
                             "tool_call_count": len(completion.tool_calls),
                         },
                     )
@@ -1954,10 +1976,12 @@ class LLMProcessExecutor:
                     target=f"process:{pid}",
                     decision={
                         "attempt": attempt_number,
-                        "error": str(exc),
+                        "error": self._durable_llm_error(exc),
                         "tool_call_count": len(completion.tool_calls),
                         "tool_calls_preview": self._tool_call_previews(completion.tool_calls),
-                        "content_preview": completion.content[: self.config.llm.content_preview_chars],
+                        "content_preview": self._completion_content_preview(
+                            completion.content
+                        ),
                     },
                 )
                 if attempt_number >= selected_max_attempts:
@@ -1986,7 +2010,7 @@ class LLMProcessExecutor:
 
     def _tool_call_previews(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         previews: list[dict[str, Any]] = []
-        for tool_call in tool_calls:
+        for ordinal, tool_call in enumerate(tool_calls):
             raw_args = tool_call.get("arguments")
             if isinstance(raw_args, str):
                 raw_bytes = raw_args.encode("utf-8", errors="replace")
@@ -2002,19 +2026,24 @@ class LLMProcessExecutor:
                 observable_args,
                 preview_chars=self.config.llm.tool_arguments_preview_chars,
             )
-            previews.append(
-                {
-                    "id": tool_call.get("id"),
-                    "call_id": tool_call.get("call_id"),
-                    "name": tool_call.get("name"),
-                    "arguments_type": type(raw_args).__name__,
-                    "arguments_preview": observation["preview"],
-                    "arguments_sha256": hashlib.sha256(raw_bytes).hexdigest(),
-                    "arguments_bytes": len(raw_bytes),
-                    "arguments_truncated": observation["truncated"],
-                    "arguments_redacted": observation["redacted"],
-                }
-            )
+            preview = {
+                "ordinal": ordinal,
+                "arguments_type": type(raw_args).__name__,
+                "arguments_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                "arguments_bytes": len(raw_bytes),
+            }
+            if self.config.llm.persist_full_io:
+                preview.update(
+                    {
+                        "id": tool_call.get("id"),
+                        "call_id": tool_call.get("call_id"),
+                        "name": tool_call.get("name"),
+                        "arguments_preview": observation["preview"],
+                        "arguments_truncated": observation["truncated"],
+                        "arguments_redacted": observation["redacted"],
+                    }
+                )
+            previews.append(preview)
         return previews
 
     async def _complete_action_recorded(
@@ -2163,7 +2192,7 @@ class LLMProcessExecutor:
             )
         self._set_llm_provider_scope(state)
         previous_outputs: list[dict[str, Any]]
-        if force_stateless:
+        if force_stateless or not self.config.llm.persist_full_io:
             state.previous_response_id, previous_outputs = None, []
         else:
             state.previous_response_id, previous_outputs = (
@@ -2251,7 +2280,8 @@ class LLMProcessExecutor:
         client = state.client
         assert resolved is not None
         provider_eligible = bool(
-            isinstance(client, LLMClient)
+            self.config.llm.persist_full_io
+            and isinstance(client, LLMClient)
             and client.responses_previous_response_id
             and client.store
             and client._use_responses_api()
@@ -2268,7 +2298,8 @@ class LLMProcessExecutor:
                 "real_llm_client": isinstance(client, LLMClient),
                 "openai_tool_schema": self._tool_schema_observation(state.tools),
                 "openai_responses_previous_response_id_enabled": bool(
-                    isinstance(client, LLMClient)
+                    self.config.llm.persist_full_io
+                    and isinstance(client, LLMClient)
                     and client.responses_previous_response_id
                 ),
                 "openai_provider_chain_eligible": provider_eligible,
@@ -2925,7 +2956,16 @@ class LLMProcessExecutor:
         state.provider_chain_fingerprint = (
             str(prepared_provider) if prepared_provider is not None else None
         )
-        state.previous_response_id = prepared_request.get("previous_response_id")
+        prepared_previous_response_id = prepared_request.get("previous_response_id")
+        if (
+            not self.config.llm.persist_full_io
+            and prepared_previous_response_id is not None
+        ):
+            raise _LLMProviderChainScopeChanged(
+                "provider-side Responses state cannot be resumed when full-I/O "
+                "persistence is disabled"
+            )
+        state.previous_response_id = prepared_previous_response_id
         state.parallel_tool_calls = bool(prepared_request["parallel_tool_calls"])
         state.auto_wait_on_empty_tool_calls = bool(
             prepared_request["auto_wait_on_empty_tool_calls"]
@@ -3006,6 +3046,14 @@ class LLMProcessExecutor:
 
     def _assert_llm_call_scope(self, state: _LLMCallState) -> None:
         assert state.resolved is not None and state.sink is not None
+        if (
+            not self.config.llm.persist_full_io
+            and state.previous_response_id is not None
+        ):
+            raise _LLMProviderChainScopeChanged(
+                "provider-side Responses state is disabled without full-I/O "
+                "persistence"
+            )
         self._assert_llm_provider_chain_scope(
             pid=state.pid,
             profile_id=state.resolved.profile_id,
@@ -3134,6 +3182,16 @@ class LLMProcessExecutor:
             source="llm.error",
             context={"error_type": type(error).__name__},
         )
+        observable = observable_llm_call_fields(
+            messages=state.request_messages,
+            tools=state.tools,
+            response_content="",
+            tool_calls=[],
+            reasoning=None,
+            raw_response=None,
+            error=str(error),
+            config=self.config,
+        )
         self._processes.insert_llm_call(
             LLMCallRecord(
                 call_id=state.call_id,
@@ -3141,17 +3199,15 @@ class LLMProcessExecutor:
                 image_id=state.process.image_id,
                 purpose="action_selection",
                 status="error",
-                **observable_llm_call_fields(
-                    messages=state.request_messages,
-                    tools=state.tools,
-                    response_content="",
-                    tool_calls=[],
-                    reasoning=None,
-                    raw_response=None,
-                    config=self.config,
-                ),
+                messages=observable["messages"],
+                tools=observable["tools"],
                 request_options=state.request_options,
-                error=str(error),
+                response_content=observable["response_content"],
+                tool_calls=observable["tool_calls"],
+                reasoning=observable["reasoning"],
+                raw_response=observable["raw_response"],
+                observability=observable["observability"],
+                error=observable["error"],
                 created_at=state.created_at,
                 completed_at=utc_now(),
             )
@@ -3168,16 +3224,24 @@ class LLMProcessExecutor:
         state: _LLMCallState,
         completion: Any,
     ) -> tuple[Any, bool, bool, str]:
-        usage = dict(getattr(completion, "usage", {}) or {})
+        usage, invalid_usage_fields = self._canonical_llm_usage(completion)
         self._charge_llm_attempt(
             state.pid,
             source="llm.completion",
             context={"usage": usage},
         )
         if getattr(completion, "api", None) == "responses":
-            state.request_options["openai_response_tool_calls"] = (
-                self._response_tool_call_manifest(completion)
-            )
+            manifest = self._response_tool_call_manifest(completion)
+            if self.config.llm.persist_full_io:
+                state.request_options["openai_response_tool_calls"] = manifest
+            else:
+                # The manifest carries provider-generated call ids and model-
+                # selected tool names. It is needed only for durable, lossless
+                # Responses chaining, which is disabled in content-free mode.
+                state.request_options.pop("openai_response_tool_calls", None)
+                state.request_options["openai_response_tool_call_count"] = len(
+                    manifest
+                )
         observable = observable_llm_call_fields(
             messages=state.request_messages,
             tools=state.tools,
@@ -3207,6 +3271,7 @@ class LLMProcessExecutor:
                 usage=usage,
                 raw_response=observable["raw_response"],
                 observability=observable["observability"],
+                error=observable["error"],
                 created_at=state.created_at,
                 completed_at=utc_now(),
             )
@@ -3225,7 +3290,11 @@ class LLMProcessExecutor:
                 "invocation",
                 metadata={"call_id": state.call_id},
             )
-        self._charge_llm_completion(state.pid, completion)
+        self._charge_llm_completion(
+            state.pid,
+            usage,
+            invalid_usage_fields=invalid_usage_fields,
+        )
         return (
             completion,
             state.parallel_tool_calls,
@@ -3257,14 +3326,47 @@ class LLMProcessExecutor:
             kill_on_exceed=True,
         )
 
-    def _charge_llm_completion(self, pid: str, completion: Any) -> None:
+    @staticmethod
+    def _canonical_llm_usage(completion: Any) -> tuple[dict[str, int], set[str]]:
+        raw_usage = getattr(completion, "usage", None)
+        if not isinstance(raw_usage, Mapping):
+            return {}, set()
+        known_fields = (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+        )
+        usage: dict[str, int] = {}
+        invalid_fields: set[str] = set()
+        for key in known_fields:
+            if key not in raw_usage or raw_usage[key] is None:
+                continue
+            value = raw_usage[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                invalid_fields.add(key)
+                continue
+            usage[key] = value
+        return usage, invalid_fields
+
+    def _charge_llm_completion(
+        self,
+        pid: str,
+        usage: Mapping[str, int],
+        *,
+        invalid_usage_fields: set[str] | None = None,
+    ) -> None:
         resources = self._resources
         if resources is None:
             return
-        usage = dict(getattr(completion, "usage", {}) or {})
+        canonical_usage = dict(usage)
+        invalid_fields = invalid_usage_fields or set()
         has_token_limit = resources.has_limit(pid, "max_llm_total_tokens")
         token_keys = {"prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"}
-        if has_token_limit and not any(key in usage for key in token_keys):
+        if has_token_limit and not any(
+            key in canonical_usage or key in invalid_fields for key in token_keys
+        ):
             resources.charge(
                 pid,
                 ResourceUsage(),
@@ -3275,9 +3377,23 @@ class LLMProcessExecutor:
             )
             raise ResourceLimitExceeded("LLM token budget is configured, but provider response did not include token usage")
         if has_token_limit:
-            prompt_value = self._budget_usage_int(usage, "prompt_tokens", "input_tokens")
-            completion_value = self._budget_usage_int(usage, "completion_tokens", "output_tokens")
-            total_value = self._budget_usage_int(usage, "total_tokens")
+            prompt_value = self._budget_usage_int(
+                canonical_usage,
+                "prompt_tokens",
+                "input_tokens",
+                invalid_fields=invalid_fields,
+            )
+            completion_value = self._budget_usage_int(
+                canonical_usage,
+                "completion_tokens",
+                "output_tokens",
+                invalid_fields=invalid_fields,
+            )
+            total_value = self._budget_usage_int(
+                canonical_usage,
+                "total_tokens",
+                invalid_fields=invalid_fields,
+            )
             prompt_tokens = prompt_value or 0
             completion_tokens = completion_value or 0
             component_total = prompt_tokens + completion_tokens
@@ -3287,9 +3403,13 @@ class LLMProcessExecutor:
                     "LLM token budget is configured, but provider total_tokens is smaller than prompt/completion usage"
                 )
         else:
-            prompt_tokens = self._usage_int(usage, "prompt_tokens", "input_tokens")
-            completion_tokens = self._usage_int(usage, "completion_tokens", "output_tokens")
-            total_tokens = self._usage_int(usage, "total_tokens")
+            prompt_tokens = self._usage_int(
+                canonical_usage, "prompt_tokens", "input_tokens"
+            )
+            completion_tokens = self._usage_int(
+                canonical_usage, "completion_tokens", "output_tokens"
+            )
+            total_tokens = self._usage_int(canonical_usage, "total_tokens")
             if total_tokens == 0 and (prompt_tokens or completion_tokens):
                 total_tokens = prompt_tokens + completion_tokens
         resources.charge(
@@ -3300,32 +3420,34 @@ class LLMProcessExecutor:
                 llm_total_tokens=total_tokens,
             ),
             source="llm.completion",
-            context={"usage": usage},
+            context={"usage": canonical_usage},
             allow_overage=True,
             kill_on_exceed=True,
         )
 
-    def _usage_int(self, usage: dict[str, Any], *keys: str) -> int:
+    def _usage_int(self, usage: Mapping[str, int], *keys: str) -> int:
         for key in keys:
             value = usage.get(key)
             if value is None:
                 continue
-            try:
-                return max(0, int(value))
-            except (TypeError, ValueError):
-                continue
+            return value
         return 0
 
-    def _budget_usage_int(self, usage: dict[str, Any], *keys: str) -> int | None:
+    def _budget_usage_int(
+        self,
+        usage: Mapping[str, int],
+        *keys: str,
+        invalid_fields: set[str],
+    ) -> int | None:
         for key in keys:
-            if key not in usage or usage[key] is None:
-                continue
-            value = usage[key]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            if key in invalid_fields:
                 raise ResourceLimitExceeded(
-                    f"LLM token budget is configured, but provider returned invalid {key}: {value!r}"
+                    "LLM token budget is configured, but provider returned "
+                    f"invalid {key}"
                 )
-            return value
+            if key not in usage:
+                continue
+            return usage[key]
         return None
 
     def _data_flow_provider_chain_fingerprint(
@@ -3513,12 +3635,19 @@ class LLMProcessExecutor:
         # treating distinct endpoints as identical.
         base_url = str(client.base_url or "https://api.openai.com/v1").strip().rstrip("/")
         sdk_client = client._async_client or client._client
-        organization = (
-            getattr(sdk_client, "organization", None)
-            or os.getenv("OPENAI_ORGANIZATION")
-            or os.getenv("OPENAI_ORG_ID")
-        )
-        project = getattr(sdk_client, "project", None) or os.getenv("OPENAI_PROJECT")
+        organization = getattr(sdk_client, "organization", None) or client.organization
+        project = getattr(sdk_client, "project", None) or client.project
+        if client.inherit_ambient_openai_sdk_config:
+            organization = (
+                organization
+                or os.getenv("OPENAI_ORGANIZATION")
+                or os.getenv("OPENAI_ORG_ID")
+            )
+            project = (
+                project
+                or os.getenv("OPENAI_PROJECT")
+                or os.getenv("OPENAI_PROJECT_ID")
+            )
         material = {
             "client_class": f"{type(client).__module__}.{type(client).__qualname__}",
             "base_url": base_url,

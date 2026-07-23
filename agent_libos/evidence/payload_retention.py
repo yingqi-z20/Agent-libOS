@@ -657,6 +657,71 @@ def retain_llm_call_payload(
     )
 
 
+def content_free_llm_call_fields(
+    *,
+    messages: Any,
+    tools: Any,
+    response_content: str,
+    tool_calls: Any,
+    reasoning: Any | None,
+    raw_response: Any | None,
+    error: str | None,
+    source_observability: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a canonical write-time ``summary`` projection for one LLM call.
+
+    This is the write-time counterpart of :func:`retain_llm_call_payload` for
+    ``llm.persist_full_io=false``.  It intentionally does not apply the
+    maintenance runtime-dependency checks: disabling full-I/O persistence is a
+    Host policy that prevents the raw provider payload from being written in
+    the first place.  The resulting marker and field envelopes use the same
+    canonical shape and digest rules as retention maintenance, so storage can
+    index and validate the row as an actual ``summary`` tier.
+    """
+
+    if not isinstance(source_observability, dict):
+        raise ValueError("LLM source observability must be a mapping")
+    source_fields = {
+        "messages": messages,
+        "tools": tools,
+        "response_content": response_content,
+        "tool_calls": tool_calls,
+        "reasoning": reasoning,
+        "raw_response": raw_response,
+        "error": error,
+    }
+    retained_fields: dict[str, Any] = {}
+    for field_name in _LLM_PAYLOAD_FIELDS:
+        value = source_fields[field_name]
+        if value is None and field_name in {"reasoning", "raw_response", "error"}:
+            retained_fields[field_name] = None
+            continue
+        envelope = content_free_payload_envelope(
+            value,
+            PayloadRetentionTier.SUMMARY,
+            source_tier=PayloadRetentionTier.FULL,
+            trust_retention_envelopes=False,
+        )
+        retained_fields[field_name] = (
+            dumps(envelope)
+            if field_name in {"response_content", "error"}
+            else envelope
+        )
+    payload_sha256 = _field_digest(
+        retained_fields,
+        source_tier=PayloadRetentionTier.SUMMARY,
+    )
+    retained_fields["observability"] = {
+        _RETENTION_KEY: {
+            "schema_version": _RETENTION_SCHEMA_VERSION,
+            "tier": PayloadRetentionTier.SUMMARY.value,
+            "payload_sha256": payload_sha256,
+            "source_observability_sha256": _json_sha256(source_observability),
+        }
+    }
+    return retained_fields
+
+
 def retain_external_effect_payload(
     record: ExternalEffectRecord,
     target: PayloadRetentionTier,

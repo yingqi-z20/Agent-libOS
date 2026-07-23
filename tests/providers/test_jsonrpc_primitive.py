@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -439,6 +440,101 @@ class TestJsonRpcPrimitive:
                 assert effect.information_flow
             finally:
                 runtime.close()
+
+    def test_header_environment_is_snapshotted_before_provider_dispatch(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            monkeypatch.setenv('AGENT_LIBOS_JSONRPC_TEST_TOKEN', 'approved-token')
+            provider = _EnvironmentMutatingJsonRpcProvider(
+                'AGENT_LIBOS_JSONRPC_TEST_TOKEN',
+            )
+            runtime.jsonrpc.provider = provider
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='credential snapshot')
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _manifest('credential-snapshot', server.url),
+                    actor='cli',
+                    require_capability=False,
+                )
+                runtime.capability.grant(
+                    pid,
+                    'jsonrpc:credential-snapshot:echo',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                result = runtime.jsonrpc.call(
+                    pid,
+                    'credential-snapshot',
+                    'echo',
+                    {'city': 'Beijing'},
+                )
+
+                assert result.ok
+                assert provider.resolved_headers == {
+                    'Authorization': 'Bearer approved-token',
+                }
+                assert provider.snapshot_was_immutable
+                assert server.requests[0]['authorization'] == 'Bearer approved-token'
+            finally:
+                runtime.close()
+
+    def test_default_provider_ignores_ambient_http_proxy(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        with _jsonrpc_server() as server:
+            provider = HttpJsonRpcProvider()
+            endpoint = JsonRpcEndpointSpec(
+                schema_version=1,
+                endpoint_id='no-ambient-proxy',
+                url=server.url,
+                headers={},
+                methods=[
+                    JsonRpcMethodSpec(
+                        method_id='echo',
+                        rpc_method='demo.echo',
+                        right='read',
+                        rollback_class='no_rollback_required',
+                        state_mutation=False,
+                        information_flow=True,
+                    )
+                ],
+                timeout_s=1,
+                max_request_bytes=1024,
+                max_response_bytes=1024,
+            )
+            monkeypatch.setenv('http_proxy', 'http://127.0.0.1:1')
+            monkeypatch.setenv('no_proxy', '')
+
+            def fail_pinned(*_args: Any, **_kwargs: Any) -> Any:
+                raise AssertionError('unpinned provider call must use the urllib opener')
+
+            monkeypatch.setattr(provider, '_call_pinned', fail_pinned)
+            request_body = json.dumps(
+                {
+                    'jsonrpc': '2.0',
+                    'id': 'direct-no-proxy',
+                    'method': 'demo.echo',
+                    'params': {'ok': True},
+                }
+            ).encode('utf-8')
+
+            result = provider.call(
+                endpoint,
+                endpoint.methods[0],
+                request_body,
+                timeout_s=endpoint.timeout_s,
+                max_response_bytes=endpoint.max_response_bytes,
+                resolved_addresses=None,
+                resolved_headers={},
+            )
+
+            assert result.status_code == 200, result.error
+            assert len(server.requests) == 1
 
     @pytest.mark.parametrize('sink', ['event', 'audit'])
     def test_call_post_provider_sink_failure_leaves_pending_effect_intent(
@@ -1338,6 +1434,23 @@ class _RecordingJsonRpcProvider:
             metadata={'operation': operation, 'endpoint_id': context.get('endpoint_id'), 'status': result.get('status') if isinstance(result, dict) else None},
         )
 
+
+class _EnvironmentMutatingJsonRpcProvider(HttpJsonRpcProvider):
+
+    def __init__(self, env_name: str) -> None:
+        self.env_name = env_name
+        self.resolved_headers: dict[str, str] = {}
+        self.snapshot_was_immutable = False
+
+    def call(self, *args: Any, **kwargs: Any) -> JsonRpcTransportResult:
+        resolved_headers = kwargs.get('resolved_headers')
+        self.resolved_headers = dict(resolved_headers or {})
+        try:
+            resolved_headers['Authorization'] = 'Bearer forged-token'
+        except TypeError:
+            self.snapshot_was_immutable = True
+        os.environ[self.env_name] = 'attacker-token\r\nX-Injected: yes'
+        return super().call(*args, **kwargs)
 
 class _ExplodingJsonRpcTransportResult(JsonRpcTransportResult):
     def __init__(self, *, explode_field: str, secret: str, **kwargs: Any) -> None:

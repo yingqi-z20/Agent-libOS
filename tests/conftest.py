@@ -57,6 +57,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="preserve files written under agent_outputs during this pytest run",
     )
+    parser.addoption(
+        "--fail-on-skip",
+        action="store_true",
+        default=False,
+        help="fail the pytest session when any selected test is skipped",
+    )
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -69,11 +75,15 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     config = session.config
-    if _skip_agent_outputs_cleanup(config):
-        return
-    root = Path(config.rootpath) / "agent_outputs"
-    baseline = getattr(config, "_agent_outputs_baseline", set())
-    cleanup_agent_outputs(root, baseline=set(baseline))
+    if not _skip_agent_outputs_cleanup(config):
+        root = Path(config.rootpath) / "agent_outputs"
+        baseline = getattr(config, "_agent_outputs_baseline", set())
+        cleanup_agent_outputs(root, baseline=set(baseline))
+    if bool(config.getoption("--fail-on-skip", default=False)):
+        reporter = config.pluginmanager.get_plugin("terminalreporter")
+        skipped = list(getattr(reporter, "stats", {}).get("skipped", ()))
+        if skipped and exitstatus == pytest.ExitCode.OK:
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

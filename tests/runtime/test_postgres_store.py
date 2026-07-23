@@ -28,6 +28,7 @@ from agent_libos.models.exceptions import CapabilityDenied
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import StoreCloseClaimOutcome, open_store
 from agent_libos.storage.postgres import PostgresStore
+from agent_libos.storage.sql import STORE_SCHEMA_VERSION
 from agent_libos.utils.ids import utc_now
 
 
@@ -67,6 +68,28 @@ def _dsn_with_search_path(dsn: str, schema: str) -> str:
 
 @pytest.mark.postgres
 class TestPostgresStore:
+    def test_fresh_schema_rejects_a_second_schema_marker(self) -> None:
+        from psycopg.errors import CheckViolation
+
+        with _postgres_schema_dsn() as dsn:
+            store = PostgresStore(dsn)
+            try:
+                with pytest.raises(CheckViolation):
+                    store.conn.execute(
+                        "INSERT INTO runtime_schema (singleton, schema_version) "
+                        "VALUES (?, ?)",
+                        (2, STORE_SCHEMA_VERSION),
+                    )
+                row = store.conn.execute(
+                    "SELECT singleton, schema_version FROM runtime_schema"
+                ).fetchone()
+                assert row == {
+                    "singleton": 1,
+                    "schema_version": STORE_SCHEMA_VERSION,
+                }
+            finally:
+                store.close()
+
     def test_admission_guard_handoff_closes_session_lease_and_allows_reopen(
         self,
     ) -> None:

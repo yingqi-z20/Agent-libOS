@@ -10,7 +10,8 @@ import socket
 import threading
 import time
 from functools import partial
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from jsonschema import ValidationError as JsonSchemaValidationError
@@ -404,25 +405,11 @@ class JsonRpcPrimitive:
             data_flow_operation="jsonrpc.call",
         )
         with self._protected().start("primitive.jsonrpc.call", invocation, provider=self.provider) as protected:
-            self._require_header_environment(spec)
-            resolved_addresses = protected.call(
-                ProviderPhase("dns_resolution", information_flow=True),
-                self._validate_runtime_resolution,
-                spec,
-            )
-            started = time.monotonic()
-            transport = protected.call(
-                ProviderPhase(
-                    "transport_not_started_after_dns",
-                    state_mutation=bool(method.state_mutation or method.right != CapabilityRight.READ.value),
-                    information_flow=True,
-                ),
-                self._invoke_transport_provider,
+            transport = self._dispatch_transport(
+                protected,
                 spec,
                 method,
                 request_body,
-                resolved_addresses=resolved_addresses,
-                started=started,
             )
             transport = self._validated_transport_result(transport)
             resource_progress["response_bytes"] = transport.response_bytes
@@ -827,6 +814,7 @@ class JsonRpcPrimitive:
         request_body: bytes,
         *,
         resolved_addresses: tuple[str, ...],
+        resolved_headers: Mapping[str, str],
         started: float,
     ) -> JsonRpcTransportResult:
         try:
@@ -837,6 +825,7 @@ class JsonRpcPrimitive:
                 timeout_s=endpoint.timeout_s,
                 max_response_bytes=endpoint.max_response_bytes,
                 resolved_addresses=resolved_addresses,
+                resolved_headers=resolved_headers,
             )
         except ProviderEffectNotStarted:
             raise
@@ -851,6 +840,37 @@ class JsonRpcPrimitive:
                 correlation_id=new_id("corr"),
             )
         return self._validated_transport_result(raw_result)
+
+    def _dispatch_transport(
+        self,
+        protected: Any,
+        endpoint: JsonRpcEndpointSpec,
+        method: JsonRpcMethodSpec,
+        request_body: bytes,
+    ) -> JsonRpcTransportResult:
+        resolved_headers = self._require_header_environment(endpoint)
+        resolved_addresses = protected.call(
+            ProviderPhase("dns_resolution", information_flow=True),
+            self._validate_runtime_resolution,
+            endpoint,
+        )
+        return protected.call(
+            ProviderPhase(
+                "transport_not_started_after_dns",
+                state_mutation=bool(
+                    method.state_mutation
+                    or method.right != CapabilityRight.READ.value
+                ),
+                information_flow=True,
+            ),
+            self._invoke_transport_provider,
+            endpoint,
+            method,
+            request_body,
+            resolved_addresses=resolved_addresses,
+            resolved_headers=resolved_headers,
+            started=time.monotonic(),
+        )
 
     @staticmethod
     def _provider_result_failure_resource(
@@ -1415,11 +1435,16 @@ class JsonRpcPrimitive:
                 return
         raise ValidationError(f"JSON-RPC header env is not allowed for endpoint manifests: {value!r}")
 
-    def _require_header_environment(self, endpoint: JsonRpcEndpointSpec) -> None:
+    def _require_header_environment(
+        self,
+        endpoint: JsonRpcEndpointSpec,
+    ) -> Mapping[str, str]:
         missing: list[str] = []
         invalid: list[str] = []
-        for spec in endpoint.headers.values():
-            value = os.environ.get(spec.env)
+        resolved_headers: dict[str, str] = {}
+        host_environment = dict(os.environ)
+        for name, spec in endpoint.headers.items():
+            value = host_environment.get(spec.env)
             if value is None:
                 missing.append(spec.env)
                 continue
@@ -1431,10 +1456,17 @@ class JsonRpcPrimitive:
                 resolved.encode("iso-8859-1")
             except UnicodeEncodeError:
                 invalid.append(spec.env)
+                continue
+            resolved_headers[name] = resolved
         if missing:
             raise ValidationError(f"missing JSON-RPC header environment variables: {missing}")
         if invalid:
             raise ValidationError(f"invalid JSON-RPC header environment variable values: {invalid}")
+        # The provider receives a per-operation immutable snapshot.  It must
+        # not re-read ambient environment variables after this preflight,
+        # otherwise a concurrent mutation can replace an already-validated
+        # credential or introduce invalid header bytes before dispatch.
+        return MappingProxyType(resolved_headers)
 
     def _validate_url(self, url: str) -> None:
         parsed = urlsplit(url)

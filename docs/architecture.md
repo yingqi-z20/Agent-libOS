@@ -115,6 +115,14 @@ that reserves ordinary/release capabilities and prepares the effect intent.
 Low-level effect-ledger functions remain Runtime-internal for the SDK and
 startup reconciliation.
 
+Trusted runtime artifact publication is an explicit exception, not a
+model-facing provider boundary. Image-package materialization writes and removes
+the Runtime-owned private workspace directly with Host filesystem APIs while a
+durable runtime-publication program records recovery and compensation. Those
+writes do not receive filesystem-provider data-flow/effect-ledger semantics and
+must not be generalized into an extension escape hatch; untrusted or
+process-selected filesystem work still goes through the filesystem primitive.
+
 Providers are normally the source of truth for successful external-effect
 rollback classification, and contracts require a provider classifier by
 default. A trusted primitive or executor may instead supply an explicit
@@ -221,6 +229,13 @@ phase receipts, exact recovery leases, and operation bindings so recovery can
 compensate or terminalize a specific owner rather than infer success from
 adjacent rows. A failed or manual publication keeps mutation admission closed.
 
+That recovery-lease pass is followed by a second, still pre-`OPEN` STARTING
+phase. Under the startup lease the Runtime runs trusted startup hooks, starts
+the ObjectTask worker, performs checkpoint payload begin/prepare/complete
+delivery, reconciles terminal restore publications again, and commits the
+payload acknowledgement before publishing `OPEN`. Normal mutation admission
+does not open between these two phases.
+
 Before an async entrypoint offloads allocation or assembly, its event-loop
 caller atomically installs an identity-only `StoreAssemblyReservation`. New
 `locked()`, `transaction()`, and query scopes from every non-claimant fail fast
@@ -302,7 +317,7 @@ bindings is itself ratcheted so new late bindings cannot accumulate unnoticed.
 
 The assembled graph includes:
 
-- `RuntimeStore` persists metadata and append-only records through a backend
+- `RuntimeStore` persists mutable state plus append-only evidence through a backend
   abstraction. SQLite is the default backend; PostgreSQL is available through
   an optional extra. Both SQL backends share the same `SQLRuntimeStore`
   repository contract while backend classes own connection setup and dialect
@@ -420,9 +435,14 @@ still enters the filesystem primitive, which checks:
 
 - workspace containment,
 - process working directory resolution,
-- filesystem capability or permission policy,
+- data-flow Sink clearance and source/carrier labels,
+- filesystem capability, Task Authority effect ceiling, and permission policy,
 - human approval if policy requires it,
 - overwrite and content preview metadata,
+- resource and finite-authority reservations plus a pending external-effect
+  intent,
+- source, target, payload, and policy revalidation immediately before dispatch,
+- provider classification and label/resource/authority settlement,
 - event emission,
 - audit recording.
 
@@ -469,7 +489,7 @@ fails closed if that containment cannot be established.
 
 ## Persistence And Audit
 
-The runtime store keeps durable metadata and append-only records:
+The runtime store keeps durable mutable state and append-only evidence:
 
 - processes, working directories, loaded Skills, and tool tables,
 - Object Memory metadata and namespace directories,
@@ -496,7 +516,9 @@ The runtime store keeps durable metadata and append-only records:
   persistence is enabled by default for self-evolution training and
   fine-tuning pipelines; this may include sensitive prompt, tool, reasoning,
   and provider payload fields. Set `llm.persist_full_io: false` to opt out and
-  store only previews plus hashes for those fields. Conditional LLM release
+  store content-free byte counts, JSON-kind/item-count metadata where
+  applicable, and hashes for those fields.
+  Conditional LLM release
   rows apply the same policy before Human approval: with full-I/O persistence
   enabled, SQL stores the prepared request; with it disabled, SQL receives only
   hashes and non-sensitive resume metadata while the exact pending request

@@ -8,6 +8,7 @@
       "properties": {
         "path": {"type": "string", "default": "."},
         "kind": {"type": "string", "enum": ["file", "directory"], "default": "file"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1024, "default": 200},
         "start_line": {"type": "integer", "minimum": 1, "default": 1},
         "window": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
         "max_bytes": {"type": "integer", "minimum": 1, "default": 65536}
@@ -28,11 +29,12 @@
         "path": {"type": "string", "default": "."},
         "literal": {"type": "boolean", "default": true},
         "max_results": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
-        "timeout_s": {"type": "number", "default": 10}
+        "timeout_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 10, "default": 10}
       }
     },
     "output_schema": {"type": "object"},
     "tests": [],
+    "timeout_s": 15,
     "metadata": {"aci_role": "repository_search"}
   },
   {
@@ -66,11 +68,12 @@
           "type": "array",
           "items": {"type": "string"}
         },
-        "timeout_s": {"type": "number", "default": 60}
+        "timeout_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 55, "default": 55}
       }
     },
     "output_schema": {"type": "object"},
     "tests": [],
+    "timeout_s": 60,
     "metadata": {"aci_role": "command_runner"}
   },
   {

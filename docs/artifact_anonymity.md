@@ -31,7 +31,8 @@ and generated paper/artifact files for:
 
 - author names, lab names, school names, school emails, and personal emails,
 - personal GitHub, GitLab, homepage, cloud bucket, or institutional URLs,
-- absolute local paths such as `C:\Users\...`, `/Users/...`, or `/home/...`,
+- absolute local paths such as `C:\Users\...`, `/Users/...`, `/home/...`,
+  `/private/...`, or `/tmp/...`,
 - private API endpoints, dashboard URLs, project ids, tenant ids, and account ids,
 - `.env` contents, API keys, access tokens, SSH keys, cookies, and credentials,
 - LLM provider account metadata in logs, traces, screenshots, notebooks, or
@@ -81,8 +82,8 @@ ANON_IDENTITY_PATTERN='author-one|author@example\.edu|lab-name|institution-domai
 git grep -nEI "$ANON_IDENTITY_PATTERN"
 rg -ni --hidden --no-ignore -e "$ANON_IDENTITY_PATTERN" "$ANON_OUTPUT_DIR"
 
-git grep -nEI '(/Users/|/home/|[A-Za-z]:\\Users\\)'
-rg -ni --hidden --no-ignore -e '(/Users/|/home/|[A-Za-z]:\\Users\\)' "$ANON_OUTPUT_DIR"
+git grep -nEI '(/Users/|/home/|/private/|/tmp/|[A-Za-z]:\\Users\\)'
+rg -ni --hidden --no-ignore -e '(/Users/|/home/|/private/|/tmp/|[A-Za-z]:\\Users\\)' "$ANON_OUTPUT_DIR"
 
 git grep -nEI '(api[_-]?key|access[_-]?token|client[_-]?secret|password|authorization)[[:space:]]*[:=]'
 rg -n --hidden --no-ignore -e '(?i)(api[_-]?key|access[_-]?token|client[_-]?secret|password|authorization)[[:space:]]*[:=]' "$ANON_OUTPUT_DIR"
@@ -170,7 +171,7 @@ These commands are the M0 baseline checks for the code artifact:
 
 ```bash
 uv sync --frozen --all-groups
-uv run python -m compileall agent_libos tests scripts experiments benchmarks
+uv run python -m compileall agent_libos tests scripts experiments benchmarks modules
 uv run python scripts/test_matrix.py --lane all
 uv run python scripts/check_test_invariants.py
 ```
@@ -196,10 +197,12 @@ real Deno installation skip with a clear message when `deno` is missing; use
 - `docs/invariants.md` is the invariant-to-test map.
 - `docs/paper_thesis.md` carries the fixed paper title, thesis, contributions,
   and non-goals.
-- `docs/architecture.md`, `docs/runtime_model.md`, `docs/capabilities.md`,
+- `docs/architecture.md`, `docs/threat_model.md`, `docs/runtime_model.md`,
+  `docs/python_api.md`, `docs/capabilities.md`,
   `docs/task_authority_manifest.md`, `docs/data_flow.md`,
   `docs/object_memory.md`, `docs/tools_and_jit.md`, `docs/skills.md`,
-  `docs/checkpoints.md`, `docs/jsonrpc.md`, `docs/mcp.md`, `docs/modules.md`,
+  `docs/checkpoints.md`, `docs/git.md`, `docs/jsonrpc.md`, `docs/mcp.md`,
+  `docs/modules.md`,
   `docs/storage.md`, `docs/evidence_payload_retention.md`,
   `docs/protected_operation_sdk.md`, `docs/explainable_operations.md`,
   `docs/gui.md`, `docs/cli.md`, `docs/configuration.md`, `docs/providers.md`,
@@ -221,9 +224,13 @@ real Deno installation skip with a clear message when `deno` is missing; use
 M0 is complete when:
 
 - the license metadata is internally consistent,
-- the CI workflow runs compile and unit tests on supported Python versions,
+- the CI workflow runs static compilation on Python 3.11 and deterministic
+  Python/security lanes on the endpoint versions listed in
+  `docs/support_matrix.md`; Python 3.12/3.13 remain declared but are not claimed
+  as per-change CI jobs,
 - every core invariant has test coverage or an explicit gap,
-- benchmark task/output schema v1 exists,
+- benchmark task/output schema v1 existed at the M0 milestone; the current
+  contract keeps task schema v1 and uses run-output schema v2,
 - benchmark harness documentation exists,
 - a one-page paper thesis with the fixed Agent libOS title exists,
 - this anonymity checklist exists and is linked from README,

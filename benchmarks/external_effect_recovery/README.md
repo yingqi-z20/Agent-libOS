@@ -61,8 +61,25 @@ select another file. The same JSON object is printed to stdout. It has
 `schema_version: 3`, the selected population/page sizes, expected and observed
 page/query/row/work-unit counts, startup and handler statement counts,
 convergence counts, required index and query plans, timing fields, and
-`timing_is_informational_only: true`. A structural-contract failure raises and
-the command exits nonzero instead of writing a favorable result.
+`timing_is_informational_only: true`. CLI artifacts also require an
+`artifact_metadata` object with nested `schema_version: 1`:
+
+- `benchmark_id`, an opaque `run_id`, and UTC `started_at`/`completed_at`
+  identify one completed invocation;
+- `invocation.selected_profile` records the CLI selection,
+  `explicit_overrides` records exactly which size flags were supplied, and
+  `effective_parameters` records the values actually passed to the runner;
+- `invocation.classification` is `named-profile` only when no override flag was
+  supplied. `named_profile_evidence` additionally requires the effective
+  parameters to equal the selected profile defaults;
+- `provenance.git` records commit, dirty state, and the working-tree digest
+  when the guarded Git inspection is available. Benchmark source-file hashes
+  and non-secret Python/OS/package versions are recorded alongside it.
+
+The run id and hashes support identity and comparison; they are not a digital
+signature or an attestation against a party that can rewrite the artifact. A
+structural-contract failure raises and the command exits nonzero instead of
+writing a favorable result.
 
 See the repository [benchmark guide](../../docs/benchmark.md#recovery-scale-gates)
 for how this gate relates to the runtime-safety and practical-workflow suites.

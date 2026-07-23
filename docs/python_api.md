@@ -93,7 +93,8 @@ Both factories accept the same inputs:
 - `config`: an explicit `AgentLibOSConfig`. The library factories do not load
   the repository's `config.yaml` or a workspace `.env` file.
 - `substrate`: an injected `ResourceProviderSubstrate`. If omitted, the
-  Runtime builds the local substrate rooted at the selected workspace.
+  Runtime builds the local substrate rooted at `Path.cwd()` as observed when
+  the Runtime opens; changing the process directory later does not re-root it.
 - `module_manifests`, `trusted_modules`, and `trusted_module_sha256`: trusted
   startup-module inputs. Module registration and startup hooks finish before
   the factory returns.
@@ -103,9 +104,10 @@ See [Configuration](configuration.md), [Storage](storage.md),
 contracts behind these arguments.
 
 `Runtime.open(...)` rejects use inside an active event loop. Use
-`await Runtime.aopen(...)` there. The asynchronous factory performs blocking
-store work away from the caller loop and finishes loop-affine assembly on that
-loop.
+`await Runtime.aopen(...)` there. The asynchronous factory performs store open
+and the complete Runtime assembly in a blocking worker. The caller loop owns
+the startup authorization/cancellation handshake and drains any required async
+cleanup before returning or raising; it does not run the assembly itself.
 
 ### Shutdown contract
 
@@ -179,28 +181,46 @@ enforce their own authority.
 | `llms`, `llm` | LLM profile registry and process executor |
 | `substrate`, `store`, `uow` | Provider substrate and persistence composition boundary |
 
-Manager methods generally require an actor or process id and preserve the same
-capability, data-label, approval, resource, event, and audit semantics described
-in the subsystem references. A property being Host-accessible does not mean its
+Manager methods have per-operation authority contracts; the presence of an
+`actor` or `pid` parameter alone does not tell a caller whether capability
+checks are enabled. A property being Host-accessible does not mean its
 operations are authority-free. Conversely, explicitly Host-only control-plane
-methods are not model-callable merely because the Runtime exposes them.
+methods are not model-callable merely because the Runtime exposes them. Never
+hand a Runtime manager or facade to untrusted/model code; project model access
+through the process tool table or a Skill.
 
-Prefer the Runtime facade where one exists:
+Prefer the Runtime facade where one exists. The following table records the
+authority mode and public return shape of the less obvious facades; parameters
+shown are the supported signature, with the typed source remaining
+authoritative for imported model types.
 
-- process boot: `exec_process`, `spawn_child_process`, `fork_child_process`,
-  `set_process_working_directory`, and `resolve_process_working_directory`;
-- direct workflows and scheduling: the sync/async methods above;
-- images: `register_image` and `get_image`;
-- Skills: `register_skill_from_path`, `discover_skills`, `inspect_skill`,
-  `activate_skill`, `unload_skill`, and `trust_skill_source`;
-- Host Sink trust: `register_sink_trust`, `unregister_sink_trust`,
-  `inspect_sink_trust`, and `list_sink_trust`;
-- Object view publication: `add_handle_to_process_view`.
+| Facade signature | Return | Authority contract |
+| --- | --- | --- |
+| `exec_process(pid, image, *, args=None, goal=None, preserve_memory=True, preserve_capabilities=False, llm_profile_id=None, source_oids=None, source_labels=None, source_context=None)` | updated process value | Process-authorized image boot/exec, label release, resource, event, and audit path |
+| `spawn_child_process(parent, goal, *, image=None, inherit_capabilities=None, resource_budget=None, working_directory=None, llm_profile_id=None, source_oids=None, source_labels=None, source_context=None)` | child pid `str` | Parent process spawn/image/cwd/data-flow authority and hierarchical budget path |
+| `fork_child_process(parent, goal, *, memory_view=None, capabilities=None, inherit_capabilities=None, resource_budget=None, image=None, mode=ForkMode.RESTRICTED, working_directory=None, llm_profile_id=None, source_oids=None, source_labels=None, source_context=None)` | child pid `str` | Parent process fork, view, capability, image/cwd/data-flow authority and budget path |
+| `set_process_working_directory(pid, path)` / `resolve_process_working_directory(pid, path)` | updated process / normalized `str` | Process filesystem-directory `read` authority |
+| `register_image(image, *, actor="runtime", replace=False)` | `None` | Host-authorized registry facade; it deliberately calls the registry with capability enforcement disabled |
+| `get_image(image_id)` | detached `AgentImage` copy | Host read; missing ids raise `KeyError`, not `NotFound` |
+| `register_skill_from_path(path, *, actor="runtime", replace=False, source_type="runtime")` | Skill summary `dict` | Host-filesystem/Host-authorized facade; capability enforcement is disabled |
+| `discover_skills(text=None)` / `inspect_skill(skill_id)` | summaries / summary `dict` | Host registry reads; capability enforcement is disabled |
+| `activate_skill(pid, skill_id)` / `unload_skill(pid, skill_id)` | Skill summary `dict` | Host-authorized target-process mutation; these facades deliberately disable capability enforcement |
+| `trust_skill_source(*, source_type, source, package_sha256, actor="runtime")` | trust summary `dict` | Host trust mutation; capability enforcement is disabled |
+| `register_sink_trust(spec, *, actor, replace=False)` / `unregister_sink_trust(pattern, *, actor)` | `SinkTrustSpec` | Host-only control plane, but the supplied actor must hold Sink-registry mutation authority |
+| `inspect_sink_trust(pattern)` / `list_sink_trust(*, active_only=True, generation=None)` | optional spec / tuple of specs | Host-only registry reads |
+| `add_handle_to_process_view(pid, handle)` | `None` | Host publication of an already issued Object handle; it is not a model-callable acquire operation |
+
+The scheduling and workflow signatures are listed in the previous section.
+`run_workflow`/`arun_workflow` still traverse ToolBroker and process authority;
+the Host-only image and Skill convenience facades above do not. Call the
+underlying manager method with `require_capability=True`, or expose the normal
+tool/Skill route, when a process actor rather than the Host initiates such an
+operation.
 
 For subsystem-specific signatures and security semantics, see
 [Runtime Model](runtime_model.md), [Capabilities](capabilities.md),
 [Object Memory](object_memory.md), [Data Flow](data_flow.md),
-[Checkpoints](checkpoints.md), [Git](git.md), and
+[Checkpoints](checkpoints.md), [Skills](skills.md), [Git](git.md), and
 [Tools and JIT](tools_and_jit.md).
 
 ## Common exceptions

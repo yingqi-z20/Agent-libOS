@@ -51,8 +51,10 @@ Prefer small, evidence-backed findings with file and line references.
 ```
 
 Supported frontmatter fields are `name`, `description`, `license`,
-`compatibility`, `allowed-tools`, and `metadata`. The `name` must be lowercase
-letters, digits, and hyphens, and must match the package directory name.
+`compatibility`, `allowed-tools`, and `metadata`. The `name` must be 1–64
+characters, start with a lowercase letter or digit, contain only lowercase
+letters, digits, and hyphens, and match the package directory name. A configured
+`skills.name_max_chars` below 64 imposes the lower limit.
 `metadata` values must be strings.
 
 Agent libOS reserves the `agent-libos.*` metadata namespace. Complex extension
@@ -88,6 +90,13 @@ hash, and high-level tool/action names. Activation materializes the full
 on the process. Bundled resources are read explicitly with `read_skill_resource`
 from that activation snapshot, so later registry replacement affects only new
 activations.
+
+Successful activation already required `skill:<name>` `execute` and binds the
+snapshot to the process. Reading a bundled resource from that loaded snapshot
+does not perform a second `skill:<name>` `read` check. The response returns text
+as `content` or binary bytes as `content_base64`, together with `kind`,
+`size_bytes`, and `sha256`. The `read` right below governs catalog discovery and
+inspection, not each loaded resource read.
 
 This prevents a Skill from keeping ambient read authority to the workspace path
 where it was registered.
@@ -133,7 +142,32 @@ file workflow that preserves the complete source rather than retrying
 `swe_edit` with a partial payload.
 
 `actions.json` and `required-capabilities.json` are advisory prompt metadata.
-They do not create capabilities.
+They do not create capabilities, but their package schemas are validated and
+their bytes participate in the package hash. An action entry accepts exactly
+`name`, `use_cases`, `input_schema`, `output_schema`,
+`required_capabilities`, `side_effects`, `failure_modes`, and `examples`.
+A required-capability entry has a non-empty `resource`, a non-empty `rights`
+array of Capability right strings, and an optional mapping `constraints`:
+
+```json
+{
+  "name": "summarize_file",
+  "use_cases": ["Summarize a workspace document"],
+  "input_schema": {"type": "object"},
+  "output_schema": {"type": "object"},
+  "required_capabilities": [
+    {"resource": "filesystem:workspace:*", "rights": ["read"]}
+  ],
+  "side_effects": [],
+  "failure_modes": ["file is unavailable"],
+  "examples": []
+}
+```
+
+JIT test entries use `args`, optional `expected`, and an ordered `syscalls`
+array. Each syscall fixture supplies `name`, optional exact `args`, optional
+`ok`/`error`, and either `result` or `payload`; unexpected, out-of-order, or
+unconsumed expected syscalls fail validation.
 
 ## Sources And Trust
 
@@ -180,8 +214,11 @@ uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
 uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent
 ```
 
-With `--actor-pid`, the CLI enforces that process's filesystem and Skill
-capabilities.
+With `--actor-pid`, process-mode commands enforce that process's applicable
+filesystem, registry, Skill, target-process, source, and trust capabilities.
+Static `skills validate` accepts a Host filesystem path and therefore rejects
+`--actor-pid`; use actor-mode `skills register` when package reads must cross
+the process workspace filesystem boundary.
 
 Capability requirements:
 

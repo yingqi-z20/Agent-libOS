@@ -174,11 +174,16 @@ not safely read the Object metadata. The `llm_context` reason is distinct from
 the source-selection reasons and is not evidence that every source candidate
 was included.
 
-The manifest does not copy Object payloads, rendered prompt text, Human answers,
-or provider responses. Direct `memory.materialize_context` calls return the same
-source-candidate selection metadata in memory, but do not append the final
-`llm_context` entry or create a durable manifest row. Durable rows are created
-only when the final LLM context is prepared for an LLM action-selection.
+Built-in LLM context producers write only the documented metadata projection;
+they do not copy Object payloads, rendered prompt text, Human answers, or
+provider responses. Explain applies the same allowlist projection. The lower
+level persisted model remains an open list of mappings for compatibility, so
+this is a producer/Explain guarantee rather than a database-level closed-schema
+guarantee for arbitrary trusted Host writers. Direct
+`memory.materialize_context` calls return the same source-candidate selection
+metadata in memory, but do not append the final `llm_context` entry or create a
+durable manifest row. Durable rows are created only when the final LLM context
+is prepared for an LLM action-selection.
 
 ## Host Interfaces
 

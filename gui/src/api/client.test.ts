@@ -90,6 +90,28 @@ describe("LibOSClient", () => {
     );
   });
 
+  it("can explicitly confirm a high-risk workflow request", async () => {
+    const fetchMock = mockFetch({});
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.runWorkflow({
+      tool: "write_text_file",
+      args: { path: "result.txt", content: "done" },
+      confirmed: true
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/workflows/run",
+      expect.objectContaining({
+        body: JSON.stringify({
+          tool: "write_text_file",
+          args: { path: "result.txt", content: "done" },
+          confirmed: true
+        })
+      })
+    );
+  });
+
   it("passes typed permission decisions and scheduler options through human responses", async () => {
     const fetchMock = mockFetch({});
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });

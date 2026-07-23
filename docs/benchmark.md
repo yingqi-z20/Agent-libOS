@@ -44,7 +44,9 @@ declare optional setup, authority, and policy inputs:
 - deterministic `mock_actions`.
 
 Fixtures live under `benchmarks/runtime_safety/fixtures/`. Runner workspaces are
-copied to temporary output directories so checked-in fixtures are not mutated.
+copied to persistent per-run directories below the user-selected output
+directory, so checked-in fixtures are not mutated. Remove the output directory
+explicitly when those workspace copies are no longer needed.
 
 ## Runners
 
@@ -97,6 +99,12 @@ metadata so downstream tables cannot silently reinterpret the runner name.
 
 ## Running
 
+Canonical deterministic benchmark lane:
+
+```bash
+uv run python scripts/test_matrix.py --lane benchmark
+```
+
 Default exploratory smoke:
 
 ```bash
@@ -116,6 +124,13 @@ but does not by itself change the command's exit status; this default supports
 counterfactual baseline collection. Runner failures and structurally invalid
 evidence always return nonzero. The flag changes only the final exit gate, not
 the generated results or metrics.
+
+`run_benchmark.py` returns 0 for a structurally valid exploratory run, 1 for a
+runner failure, invalid evidence, or a failed `--require-all-passed` gate, and
+2 for command-line parsing errors. An unexpected execution exception also
+terminates nonzero and leaves `metadata.json` marked `in_progress`.
+`collect_metrics.py` returns 0 for a valid complete artifact and 2 for an
+invalid, incomplete, or structurally malformed artifact.
 
 All rate-bearing runners (the observer-only audit ablation is excluded):
 
@@ -185,8 +200,10 @@ persistence.
 
 `run_benchmark.py` writes:
 
-- `metadata.json`: selected suite, tasks, runners, LLM mode, process id, and
-  CLI-run provenance.
+- `metadata.json`: selected suite, tasks, runners, LLM mode, process id,
+  CLI-run provenance, run identity, and completion manifest. Current artifacts
+  declare `output_schema_version: 2`; version 1 predates the binding and is not
+  accepted as a complete current run.
 - `results.jsonl`: one `BenchmarkResult` row per task/runner.
 - `effects.jsonl`: one `EffectRecord` row per normalized observed, denied,
   simulated, not-started, or unknown effect.
@@ -195,6 +212,12 @@ persistence.
   It is a descriptive summary, not the intended-workload manifest.
 - `metrics.json`: aggregate metrics.
 - `metrics.csv`: stable CSV metrics columns.
+
+`summary.json` and `metrics.json` carry the same `run_id` as the completion
+manifest; `metrics.json` also declares `output_schema_version: 2`. Starting a
+new run in an existing output directory removes stale summary/metric files
+after installing the new `in_progress` manifest, so a prior favorable summary
+is not left beside an interrupted new run.
 
 Agent libOS runner directories also include per-task runtime store databases
 under the output directory.
@@ -210,6 +233,7 @@ rows; complete per-run diagnostics remain in `results.jsonl`.
 
 `results.jsonl` rows include:
 
+- `run_id`
 - `task_id`
 - `runner`
 - `attack_class`
@@ -245,7 +269,7 @@ diagnostic provenance counts, not additional rate columns or a safety score.
 The existing `audit_completeness` metric keeps its historical benchmark
 definition and is not reinterpreted as semantic explanation quality.
 
-Every generated `effects.jsonl` row has `effect_id`, `task_id`, `runner`,
+Every generated `effects.jsonl` row has `run_id`, `effect_id`, `task_id`, `runner`,
 `type`, `performed`, `denied`, `simulated`, `outcome`, and `evidence`.
 Outcomes are `performed`, `denied`, `not_started`, `simulated`, or `unknown`.
 `outcome` is authoritative for scoring; `performed`, `denied`, and `simulated`
@@ -257,8 +281,8 @@ contains nullable type-specific fields `path`, `argv`, `namespace`, `name`,
 `skill_id`, `tool`, `image`, `checkpoint`, `resource`, `operation`, `endpoint`,
 `method`, and `provider`, plus `error`, `classification`, and the `metadata`
 mapping. A valid scored effect has classification `allowed` or `forbidden`.
-See the [schema-v1 reference](../benchmarks/runtime_safety/schema.md#run-output-evidence)
-for the full task and output contract.
+See the [runtime-safety schema reference](../benchmarks/runtime_safety/schema.md#run-output-evidence)
+for the task-schema-v1 and run-output-schema-v2 contract.
 
 Agent libOS runners use persisted runtime `external_effects` as primary provider
 evidence and correlated audit records for internal runtime mutations. An exact
@@ -328,7 +352,8 @@ The rate denominators are explicit in every row:
 
 Metric rows are fail-closed. Duplicate/missing result task keys or effect ids,
 orphan effects, invalid numeric/count fields, unknown classifications/outcomes,
-missing evidence, inconsistent outcome flags, or runner infrastructure failure
+unknown effect types or evidence sources, missing evidence, inconsistent outcome flags, artifact
+hash/count mismatch, run-id mismatch, or runner infrastructure failure
 set `valid: false`. Raw counts and invalid reasons remain available, but all
 rate fields (including task/safety/audit rates) become `null`, and the benchmark
 CLI exits nonzero. Invalid evidence is never silently folded into a favorable
@@ -339,19 +364,34 @@ nonzero after writing an invalid run, and a later standalone
 `collect_metrics.py <run-dir>` recomputation returns exit code 2 when
 `valid: false`.
 
-`metadata.json` is also a completion manifest. `run_benchmark.py` writes it
-before runner execution; its non-empty, unique `tasks` and `runners` lists
-therefore define the intended task×runner Cartesian product. Metrics are valid
-only when every declared pair has exactly one result and no result appears
-outside that matrix. Consequently an interrupted CLI run, truncated copy, or
-missing runner cannot be reported as a favorable partial sample.
+`metadata.json` is also a completion manifest. `run_benchmark.py` writes a new
+random `run_id` and `completion_state: in_progress` before runner execution;
+its non-empty, unique `tasks` and `runners` lists define the intended
+task×runner Cartesian product. The output writer atomically replaces both
+JSONL files, embeds that `run_id` in every row, records their row counts and
+SHA-256 digests under `metadata.artifacts`, and only then atomically changes
+the state to `complete`. Metrics are valid only when the state is complete,
+every row has the manifest run id, both artifacts match their declared counts
+and hashes, every declared pair has exactly one result, and no result appears
+outside that matrix. Reusing an output directory therefore cannot combine a
+new interrupted run's metadata with an older run's results, and an interrupted
+write, truncated copy, or missing runner cannot be reported as a favorable
+partial sample.
+
+The output directory has one writer and is not a concurrency lock. Sequential
+reuse is safe under the binding above, but concurrent benchmark processes must
+use different output directories.
 
 `write_run_outputs(...)` also supports direct programmatic/test callers. If no
-metadata file exists, that helper writes a self-describing fallback derived
-from the rows it was given. Such a post-hoc file cannot prove that an upstream
-caller supplied every task it originally intended; callers that need
-completion checking must write the intended metadata before execution, as the
-benchmark CLI does.
+metadata file exists, that helper generates a run id and writes a
+self-describing completion manifest derived from the rows it was given. Such a
+post-hoc file cannot prove that an upstream caller supplied every task it
+originally intended; callers that need selection completeness must write an
+`in_progress` manifest containing the intended matrix before execution, as the
+benchmark CLI does. The writer rejects an existing manifest that is not in the
+`in_progress` state instead of silently overwriting a completed artifact, and
+rejects an empty run list rather than producing a completed-but-unscorable
+artifact.
 
 CLI-created metadata also includes `provenance.schema_version: 1` with:
 
@@ -365,8 +405,10 @@ CLI-created metadata also includes `provenance.schema_version: 1` with:
 
 No credential value, hostname, or executable path is recorded. These fields let
 an artifact consumer distinguish code/workload/config/environment snapshots;
-the metrics collector currently checks matrix completeness, while release or
-paper packaging should additionally recompute and compare provenance hashes.
+the metrics collector checks completion state, output-artifact hashes, row
+counts, run identity, and matrix completeness. Release or paper packaging
+should additionally recompute and compare the workload, source, configuration,
+and environment provenance hashes.
 Programmatic `write_run_outputs(...)` fallback metadata remains intentionally
 post-hoc and is not a provenance attestation.
 
@@ -375,6 +417,18 @@ the number of result rows, the rate denominators above count different qualified
 subsets of normalized effect records, and `tool_calls` / `primitive_calls` are
 runner-reported execution trace counts. `metrics.json` records these units in
 `count_units`.
+
+The self-evolution columns (`skill_activations`, `jit_registrations`, image,
+process, checkpoint, and remote columns) count normalized effect records for
+those operation types. They are attempt/evidence counts, not success counts:
+denied, simulated, or not-started records remain visible in the corresponding
+column. Use each effect's `outcome` when a report needs successful/performed
+operation counts. The exact mappings are `skill.activate`, `jit.register`,
+`image.commit`, `image.register`, `process.exec`, `process.spawn` plus
+`process.fork`, and `checkpoint.fork`; `remote_calls` combines `jsonrpc.call`,
+`external.network`, and every `external.provider_call` record, including LLM
+and typed Git provider attempts. `result.metadata.self_evolution_counts` uses
+the same attempt-oriented mappings for its per-run values.
 
 Aggregation is per runner over all result and effect rows in the intended
 matrix. `task_success_rate` and `safety_pass_rate` are micro-averages over
@@ -449,6 +503,9 @@ recollected `metrics.json` SHA-256 is
 This artifact does not validate the current working tree. History consolidation
 was not a new benchmark run and did not by itself prove content identity. The
 artifact is ignored and must be copied separately when publishing evidence.
+It predates output schema v2's run/completion binding, so the current collector
+intentionally rejects it; reproduce its historical metrics with the collector
+from the commit named above rather than rewriting the hashed artifact.
 
 This population includes explicitly declared LLM provider effects as well as
 Human approval and the authorized attenuated child spawn; compare rates only

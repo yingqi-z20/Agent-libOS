@@ -246,7 +246,11 @@ are intentionally not supported.
 The manual lifecycle is:
 
 1. `propose_jit_tool`: validate the spec and size bounds, then store candidate
-   metadata, TypeScript source, tests, and requested-capability declarations.
+   metadata, TypeScript source, and tests. The model-facing tool deliberately
+   has no `requested_capabilities` argument. Host-side programmatic proposal
+   APIs can preserve such declarations for inspection, but validation rejects
+   every non-empty declaration because Deno JIT tools cannot acquire external
+   authority directly.
 2. `validate_jit_tool`: run static source checks, schema/source/test validation,
    and configured tests under the sandbox backend. Current JIT source must be
    import-free.
@@ -509,7 +513,9 @@ not fall under configured forbidden roots.
 
 All static imports and re-exports from module specifiers are rejected,
 including pinned `jsr:`, `npm:`, `node:`, `http:`, `https:`, and `file:`
-specifiers. Dynamic `import()` is also rejected. The configured
+specifiers. TypeScript `import name = require("...")`, triple-slash dependency
+references, `amd-dependency`, and `@deno-types` directives are rejected as
+well. Dynamic `import()` is also rejected. The configured
 `tools.deno_jsr_allowlist` is retained in sandbox configuration and validation
 metadata, but it is not currently an exception to the import-free policy and
 must not be treated as permission to import. Runtime execution remains
@@ -523,6 +529,14 @@ generation forms such as `eval`, `Function`, `AsyncFunction`,
 not try to blacklist every dangerous JavaScript spelling. Runtime safety comes
 from Deno no-permission cached-only execution, the libOS syscall protocol,
 primitive Capability checks, human approval, and resource budgets.
+
+Validation invokes the Deno compiler at least once. Each configured test
+compiles and runs the candidate in a fresh contained process. When the test
+list is empty, validation instead runs a contained, non-executing `deno check`
+with a runtime-generated non-strict compiler configuration and remote/npm
+resolution disabled. This rejects syntax and compiler errors that the lexical
+static checker cannot see; an empty test list still provides no behavioral
+evidence and should not be treated as representative test coverage.
 
 Validation and execution both use subprocess resource budgets when the process
 has them. A sandbox backend that cannot accept limits or return subprocess

@@ -176,6 +176,41 @@ and `git.pull_request`; their protected-operation descriptors use the
 `runtime.git.status` and `runtime.git.commit` are included in Explain evidence.
 An old `shell:git` grant confers none of these capabilities.
 
+Capability and Task Authority are necessary but not sufficient. Git also uses
+the runtime data-flow boundary:
+
+| Effect class | Data-flow direction | Additional behavior |
+| --- | --- | --- |
+| `git.read` | ingress | observed repository/file/ref labels are attached to returned data and carrier state |
+| `git.mutate` | bidirectional | source/carrier labels must clear the repository and affected-file Sinks; returned observations carry resulting labels |
+| `git.fetch` | bidirectional | remote ingress and local repository mutation are checked together |
+| `git.push` | egress | source/carrier labels must clear the exact configured remote/ref Sink |
+| `git.pull_request` | bidirectional | PR and repository Sinks are both checked for create/merge operations |
+
+The primitive aggregates source and carrier labels, binds stable repository,
+worktree, path/ref, PR, and remote Sink identities, and revalidates source and
+target state immediately before dispatch. Host Sink trust or an exact
+conditional release is therefore still required when labels exceed a Sink's
+clearance; a matching Git capability and manifest effect ceiling alone do not
+authorize the flow.
+
+## External-effect classification
+
+Every Git provider call uses the protected-operation intent lifecycle. Read-only
+provider results are classified `no_rollback_required/not_required`, with
+`state_mutation=false` and `information_flow=true`. Mutations are classified
+`irreversible/not_supported` with `state_mutation=true`; the provider marks
+network operations as information flow, while local mutations can still acquire
+information-flow evidence from earlier primitive phases. Mutation descriptors
+also use the irreversible/not-supported ceiling if post-dispatch classification
+fails.
+
+The pending intent is durable before the first Host effect and advances to a
+final classification when settlement succeeds. An ordinary provider error or a
+post-dispatch classification/settlement failure preserves `unknown` or pending
+evidence rather than implying rollback. Provider receipts and repository state
+tokens are evidence for reconciliation, not permission to replay.
+
 ## Repository configuration and command hardening
 
 Every Git subprocess uses a Host-selected executable outside the workspace and
@@ -330,7 +365,8 @@ do not contact a hosting platform.
 `repository_busy`, `stale_state`, `invalid_path`, `invalid_ref`,
 `dirty_worktree`, `conflict`, `identity_missing`,
 `unsafe_repository_config`, `auth_required`, `non_fast_forward`,
-`remote_rejected`, `timeout`, `output_too_large`, and `unknown_effect`.
+`remote_rejected`, `timeout`, `output_too_large`, `unknown_effect`,
+`command_failed`, `not_found`, `already_exists`, and `unsupported`.
 Model tools map these to the normal Tool error envelope and expose only the
 stable Git code and operation, never raw provider stderr that might contain a
 secret.

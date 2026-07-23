@@ -313,12 +313,12 @@ Run a benchmark smoke only with an explicit one-task limit:
 uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --llm real --limit 1 --output .benchmark_runs/real-smoke
 ```
 
-Every runtime LLM action-selection call must persist an `llm_calls` row with
-provider ids, model/API mode, usage, errors, full prompt, visible tools,
-output, tool calls, reasoning metadata, raw responses, and bounded
-observability envelopes. This default supports self-evolution training and
-fine-tuning pipelines; deployments should disclose that retention and use in
-their user agreement.
+Every runtime LLM action-selection call persists an `llm_calls` row with
+provider ids, model/API mode, usage, errors, and bounded observability
+envelopes. With the default `llm.persist_full_io: true`, that row also contains
+the full prompt, visible tools, output, tool calls, reasoning metadata, and raw
+responses. Deployments using that default for self-evolution or fine-tuning
+should disclose the retention and use in their user agreement.
 
 LLM providers are selected through host-configured named profiles. Processes
 persist only `llm_profile_id`; the Runtime resolves that id for each quantum and
@@ -372,10 +372,10 @@ Set `llm.persist_full_io: false` in a config overlay, or construct a replacement
 `AgentLibOSConfig`, to opt out of full prompt, visible tool schema, model
 output, tool call, reasoning, and raw response persistence. The config
 dataclasses and their mapping fields are immutable, so do not mutate
-`DEFAULT_CONFIG` in place. When full
-I/O persistence is disabled, the durable row keeps bounded previews, byte
-counts, truncation flags, and hashes instead of the raw values. This policy also
-applies before dispatch to conditional LLM release rows; `request_messages`,
+`DEFAULT_CONFIG` in place. When full I/O persistence is disabled, the durable
+row keeps content-free byte counts, JSON-kind/item-count metadata where
+applicable, and hashes instead of raw values or readable previews. This policy
+also applies before dispatch to conditional LLM release rows; `request_messages`,
 `egress_payload`, and the rest of the prepared provider request are never
 written to `llm_pending_actions.action_json` in opt-out mode.
 
@@ -416,7 +416,8 @@ Current default groups include:
 - LLM timeouts and provider compatibility knobs,
 - tool limits and text encodings,
 - filesystem and Object Memory size limits,
-- Deno sandbox limits and JSR import allowlist,
+- Deno sandbox limits and reserved JSR allowlist metadata (static imports are
+  still rejected),
 - ObjectTask notification, owner-watch, and shutdown limits,
 - shell policy allow/block lists,
 - JSON-RPC endpoint manifest, timeout, and request/response limits,
@@ -451,7 +452,7 @@ rules, but it cannot redefine the meanings of `always_deny`,
 `allowlist_auto_else_ask`, `blocklist_ask_else_auto`, or `always_allow`.
 Checkpoint defaults contain snapshot/list/payload/diff limits only; the former
 `auto_high_risk_checkpoint` field was never wired to an operation and has been
-removed. Strict overlays reject these legacy fields instead of ignoring them.
+removed. Strict overlays reject that legacy field instead of ignoring it.
 
 Do not scatter magic numbers in implementation code when a value affects
 runtime behavior, policy, persistence, or test reproducibility. Add a typed
@@ -502,9 +503,9 @@ Preserve the boundary:
 - primitives perform Capability authorization, policy, approval, events, and audit;
 - providers perform host effects only after primitive authorization;
 - JIT tools access libOS only through syscalls;
-- Deno JIT tool execution runs with cached dependencies only. Validation is the
-  phase that may resolve pinned allowlisted JSR imports and account for that
-  dependency surface;
+- Deno JIT tool execution has no network dependency-resolution phase. Current
+  validation rejects recognized static imports, including pinned JSR imports;
+  the JSR allowlist is reserved metadata and does not authorize imports;
 - Skills change visibility and prompt materialization only;
 - self-evolution mechanisms such as Skills, JIT tools, image registration,
   process exec, checkpoint forks, child processes, and JSON-RPC endpoint

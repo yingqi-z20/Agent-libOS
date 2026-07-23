@@ -90,8 +90,19 @@ class ProtectedOperationContract:
             self.internal_reason or ""
         ).strip():
             raise ValueError("runtime-internal protected operations require an explicit reason")
-        if self.prepared_recovery is not None and not str(self.prepared_recovery).strip():
-            raise ValueError("prepared recovery policy names must be non-empty")
+        if self.prepared_recovery is not None:
+            if (
+                not isinstance(self.prepared_recovery, str)
+                or not self.prepared_recovery.strip()
+            ):
+                raise ValueError(
+                    "prepared recovery policy names must be non-empty strings"
+                )
+            object.__setattr__(
+                self,
+                "prepared_recovery",
+                self.prepared_recovery.strip(),
+            )
         object.__setattr__(
             self,
             "data_flow_direction",
@@ -316,6 +327,8 @@ class ProtectedOperationSDK:
         name: str,
         handler: PreparedRecoveryHandler,
     ) -> None:
+        """Register one trusted, transaction-local prepared-state repair."""
+
         selected = str(name).strip()
         if not selected or not callable(handler):
             raise ValidationError("prepared recovery requires a name and callable handler")
@@ -325,7 +338,13 @@ class ProtectedOperationSDK:
         self._prepared_recovery_handlers[selected] = handler
 
     def recover_prepared(self, *, page_size: int = 500) -> ExternalEffectRecoverySummary:
-        """Restore local prepare state that never reached a provider phase."""
+        """Restore local prepare state that never reached a provider phase.
+
+        A handler failure propagates and leaves the intent and its reservations
+        unchanged because the handler, restoration, and abandonment share one
+        RuntimeStore transaction.  Startup therefore fails closed instead of
+        silently dropping local state that still needs repair.
+        """
 
         self._require_recovery_lease()
 
@@ -457,6 +476,15 @@ class ProtectedOperationSDK:
             raise ValidationError(f"protected operation contract is not registered: {name}")
         if not isinstance(contract, str) and registered != contract:
             raise ValidationError(f"protected operation contract does not match registry: {name}")
+        recovery_name = registered.prepared_recovery
+        if (
+            recovery_name is not None
+            and recovery_name not in self._prepared_recovery_handlers
+        ):
+            raise ValidationError(
+                "protected operation prepared recovery handler is not registered: "
+                f"{recovery_name}"
+            )
         return ProtectedOperation(self, registered, invocation, provider)
 
 

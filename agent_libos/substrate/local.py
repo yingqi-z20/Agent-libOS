@@ -23,7 +23,7 @@ import time
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import urlsplit
@@ -1763,7 +1763,13 @@ class HttpJsonRpcProvider:
         timeout_s: float,
         max_response_bytes: int,
         resolved_addresses: tuple[str, ...] | None = None,
+        resolved_headers: Mapping[str, str] | None = None,
     ) -> JsonRpcTransportResult:
+        selected_headers = (
+            dict(resolved_headers)
+            if resolved_headers is not None
+            else self._resolved_headers(endpoint)
+        )
         if resolved_addresses:
             return self._call_pinned(
                 endpoint,
@@ -1771,6 +1777,7 @@ class HttpJsonRpcProvider:
                 timeout_s=timeout_s,
                 max_response_bytes=max_response_bytes,
                 resolved_addresses=resolved_addresses,
+                resolved_headers=selected_headers,
             )
         started = time.monotonic()
         request = urlrequest.Request(
@@ -1779,11 +1786,15 @@ class HttpJsonRpcProvider:
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                **self._resolved_headers(endpoint),
+                **selected_headers,
             },
             method="POST",
         )
-        opener = urlrequest.build_opener(self._NoRedirectHandler)
+        # Provider calls must not silently inherit ambient proxy routing.
+        opener = urlrequest.build_opener(
+            urlrequest.ProxyHandler({}),
+            self._NoRedirectHandler,
+        )
         try:
             with opener.open(request, timeout=timeout_s) as response:
                 body = response.read(max_response_bytes + 1)
@@ -1830,6 +1841,7 @@ class HttpJsonRpcProvider:
         timeout_s: float,
         max_response_bytes: int,
         resolved_addresses: tuple[str, ...],
+        resolved_headers: Mapping[str, str],
     ) -> JsonRpcTransportResult:
         # Keep DNS policy and the actual socket target coupled. urlopen()
         # re-resolves hostnames internally, which can reopen DNS rebinding
@@ -1847,7 +1859,7 @@ class HttpJsonRpcProvider:
             "Accept": "application/json",
             "Content-Length": str(len(request_body)),
             "Connection": "close",
-            **self._resolved_headers(endpoint),
+            **resolved_headers,
         }
         request_head = self._http_request_head("POST", request_target, headers)
         last_error: str | None = None
@@ -1961,6 +1973,7 @@ class SdkMcpProvider:
     """MCP client provider backed by the optional official Python SDK."""
 
     supports_executable_snapshots = True
+    supports_runtime_environment_snapshots = True
 
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self.workspace_root = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
@@ -1972,10 +1985,12 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpToolListResult:
         with self._stdio_dispatch_snapshot(
             server,
             executable_snapshot,
+            runtime_environment=runtime_environment,
         ) as selected_snapshot:
             try:
                 return _run_mcp_async(
@@ -1984,6 +1999,7 @@ class SdkMcpProvider:
                         timeout_s=timeout_s,
                         max_response_bytes=max_response_bytes,
                         executable_snapshot=selected_snapshot,
+                        runtime_environment=runtime_environment,
                     )
                 )
             except BaseExceptionGroup as exc:
@@ -1999,10 +2015,12 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpProviderCallResult:
         with self._stdio_dispatch_snapshot(
             server,
             executable_snapshot,
+            runtime_environment=runtime_environment,
         ) as selected_snapshot:
             try:
                 return _run_mcp_async(
@@ -2013,6 +2031,7 @@ class SdkMcpProvider:
                         timeout_s=timeout_s,
                         max_response_bytes=max_response_bytes,
                         executable_snapshot=selected_snapshot,
+                        runtime_environment=runtime_environment,
                     )
                 )
             except BaseExceptionGroup as exc:
@@ -2028,10 +2047,15 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpProviderCallResult:
         """Validate and invoke through one MCP session and one wall-clock deadline."""
 
-        with self._stdio_dispatch_snapshot(server, executable_snapshot) as selected_snapshot:
+        with self._stdio_dispatch_snapshot(
+            server,
+            executable_snapshot,
+            runtime_environment=runtime_environment,
+        ) as selected_snapshot:
             try:
                 return _run_mcp_async(
                     asyncio.wait_for(
@@ -2042,6 +2066,7 @@ class SdkMcpProvider:
                             timeout_s=timeout_s,
                             max_response_bytes=max_response_bytes,
                             executable_snapshot=selected_snapshot,
+                            runtime_environment=runtime_environment,
                         ),
                         timeout=timeout_s,
                     )
@@ -2050,12 +2075,20 @@ class SdkMcpProvider:
                 self._raise_mcp_transport_limit_error(exc)
                 raise
 
-    def resolve_stdio_executable(self, server: McpServerSpec) -> str:
+    def resolve_stdio_executable(
+        self,
+        server: McpServerSpec,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
+    ) -> str:
         """Resolve the exact stdio executable used by the local MCP transport."""
 
         if server.transport != "stdio" or server.stdio is None:
             raise ValidationError("MCP stdio executable resolution requires stdio configuration")
-        candidate = self._stdio_command_candidate(server)
+        candidate = self._stdio_command_candidate(
+            server,
+            runtime_environment=runtime_environment,
+        )
         resolved_candidate = candidate.resolve(strict=True)
         if not resolved_candidate.is_file():
             raise ValidationError(
@@ -2063,7 +2096,12 @@ class SdkMcpProvider:
             )
         return str(resolved_candidate)
 
-    def _stdio_command_candidate(self, server: McpServerSpec) -> Path:
+    def _stdio_command_candidate(
+        self,
+        server: McpServerSpec,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
+    ) -> Path:
         if server.transport != "stdio" or server.stdio is None:
             raise ValidationError("MCP stdio executable resolution requires stdio configuration")
         command = server.stdio.command
@@ -2072,7 +2110,10 @@ class SdkMcpProvider:
         if raw.is_absolute() or "/" in command or "\\" in command:
             candidate = raw if raw.is_absolute() else selected_cwd / raw
         else:
-            child_env = self._resolved_stdio_env(server)
+            child_env = self._resolved_stdio_env(
+                server,
+                runtime_environment=runtime_environment,
+            )
             resolved = shutil.which(command, path=child_env.get("PATH", os.defpath))
             if resolved is None:
                 raise FileNotFoundError(f"MCP stdio executable not found: {command}")
@@ -2083,6 +2124,8 @@ class SdkMcpProvider:
         self,
         server: McpServerSpec,
         resolved_executable: str,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> bool:
         if server.transport != "stdio" or server.stdio is None:
             return False
@@ -2092,7 +2135,10 @@ class SdkMcpProvider:
 
         if is_workspace_path(Path(resolved_executable).resolve(strict=False)):
             return True
-        candidate = self._stdio_command_candidate(server)
+        candidate = self._stdio_command_candidate(
+            server,
+            runtime_environment=runtime_environment,
+        )
         return is_workspace_path(candidate)
 
     @contextlib.contextmanager
@@ -2100,6 +2146,8 @@ class SdkMcpProvider:
         self,
         server: McpServerSpec,
         executable_snapshot: ExecutableSnapshot | None,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> Iterator[ExecutableSnapshot | None]:
         if executable_snapshot is not None:
             executable_snapshot.verify()
@@ -2108,8 +2156,15 @@ class SdkMcpProvider:
         if server.transport != "stdio" or server.stdio is None:
             yield None
             return
-        resolved = self.resolve_stdio_executable(server)
-        if not self.executable_snapshot_required(server, resolved):
+        resolved = self.resolve_stdio_executable(
+            server,
+            runtime_environment=runtime_environment,
+        )
+        if not self.executable_snapshot_required(
+            server,
+            resolved,
+            runtime_environment=runtime_environment,
+        ):
             yield None
             return
         with snapshot_executable(resolved) as owned_snapshot:
@@ -2148,6 +2203,7 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpToolListResult:
         started = time.monotonic()
         async with self._session(
@@ -2155,6 +2211,7 @@ class SdkMcpProvider:
             timeout_s=timeout_s,
             max_response_bytes=max_response_bytes,
             executable_snapshot=executable_snapshot,
+            runtime_environment=runtime_environment,
         ) as session:
             result = await asyncio.wait_for(session.list_tools(), timeout=timeout_s)
         tools = [
@@ -2185,6 +2242,7 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpProviderCallResult:
         started = time.monotonic()
         async with self._session(
@@ -2192,6 +2250,7 @@ class SdkMcpProvider:
             timeout_s=timeout_s,
             max_response_bytes=max_response_bytes,
             executable_snapshot=executable_snapshot,
+            runtime_environment=runtime_environment,
         ) as session:
             result = await asyncio.wait_for(session.call_tool(tool.mcp_name, arguments), timeout=timeout_s)
         content = _jsonable_mcp_value(getattr(result, "content", None))
@@ -2221,6 +2280,7 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpProviderCallResult:
         started = time.monotonic()
         list_request_bytes = len(
@@ -2234,6 +2294,7 @@ class SdkMcpProvider:
             timeout_s=timeout_s,
             max_response_bytes=max_response_bytes,
             executable_snapshot=executable_snapshot,
+            runtime_environment=runtime_environment,
         ) as session:
             live_result = await session.list_tools()
             live_tools = [
@@ -2263,9 +2324,7 @@ class SdkMcpProvider:
                 )
             live = next((item for item in live_tools if item.name == tool.mcp_name), None)
             if live is None or (
-                tool.input_schema
-                and live.input_schema
-                and live.input_schema != tool.input_schema
+                tool.input_schema and live.input_schema != tool.input_schema
             ):
                 return McpProviderCallResult(
                     error="MCP live tool validation failed",
@@ -2311,6 +2370,7 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
     ):
         try:
             from mcp import ClientSession
@@ -2327,8 +2387,16 @@ class SdkMcpProvider:
                 executable_snapshot.verify()
                 command = str(executable_snapshot.executable_path)
             else:
-                resolved_executable = Path(self.resolve_stdio_executable(server))
-                command_candidate = self._stdio_command_candidate(server)
+                resolved_executable = Path(
+                    self.resolve_stdio_executable(
+                        server,
+                        runtime_environment=runtime_environment,
+                    )
+                )
+                command_candidate = self._stdio_command_candidate(
+                    server,
+                    runtime_environment=runtime_environment,
+                )
                 try:
                     dispatch_target = command_candidate.resolve(strict=True)
                 except OSError as exc:
@@ -2346,7 +2414,11 @@ class SdkMcpProvider:
             params = StdioServerParameters(
                 command=command,
                 args=list(server.stdio.args),
-                env=self._stdio_dispatch_env(server, executable_snapshot),
+                env=self._stdio_dispatch_env(
+                    server,
+                    executable_snapshot,
+                    runtime_environment=runtime_environment,
+                ),
                 cwd=self._resolved_stdio_cwd(server),
             )
             async with _strict_stdio_client(
@@ -2364,6 +2436,7 @@ class SdkMcpProvider:
                 server,
                 timeout_s=timeout_s,
                 max_response_bytes=max_response_bytes,
+                runtime_environment=runtime_environment,
             ) as http_client:
                 async with streamable_http_client(
                     server.http.url,
@@ -2382,6 +2455,7 @@ class SdkMcpProvider:
         *,
         timeout_s: float,
         max_response_bytes: int,
+        runtime_environment: Mapping[str, str] | None = None,
     ):
         try:
             import httpx
@@ -2391,7 +2465,10 @@ class SdkMcpProvider:
                 "install with `uv sync --extra mcp --all-groups`"
             ) from exc
         timeout = httpx.Timeout(timeout_s, read=timeout_s)
-        headers = self._resolved_http_headers(server)
+        headers = self._resolved_http_headers(
+            server,
+            runtime_environment=runtime_environment,
+        )
         headers["Accept-Encoding"] = "identity"
         transport = _McpPolicyAsyncHTTPTransport(max_response_bytes=max_response_bytes)
         try:
@@ -2410,9 +2487,16 @@ class SdkMcpProvider:
                 raise transport.limit_error from exc
             raise
 
-    def _resolved_http_headers(self, server: McpServerSpec) -> dict[str, str]:
+    def _resolved_http_headers(
+        self,
+        server: McpServerSpec,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
         if server.http is None:
             return {}
+        if runtime_environment is not None:
+            return dict(runtime_environment)
         headers: dict[str, str] = {}
         for name, spec in server.http.headers.items():
             value = os.environ.get(spec.env)
@@ -2421,9 +2505,18 @@ class SdkMcpProvider:
             headers[name] = f"{spec.prefix}{value}{spec.suffix}"
         return headers
 
-    def _resolved_stdio_env(self, server: McpServerSpec) -> dict[str, str]:
+    def _resolved_stdio_env(
+        self,
+        server: McpServerSpec,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
         if server.stdio is None:
             return {}
+        if runtime_environment is not None:
+            # The primitive snapshot already includes Windows child-process
+            # bootstrap variables.  Do not mix in a later ambient value.
+            return dict(runtime_environment)
         env = _mcp_platform_env()
         for child_name, host_name in server.stdio.env.items():
             value = os.environ.get(host_name)
@@ -2436,11 +2529,19 @@ class SdkMcpProvider:
         self,
         server: McpServerSpec,
         executable_snapshot: ExecutableSnapshot | None,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
-        env = self._resolved_stdio_env(server)
+        env = self._resolved_stdio_env(
+            server,
+            runtime_environment=runtime_environment,
+        )
         if executable_snapshot is None:
             return env
-        candidate = self._stdio_command_candidate(server)
+        candidate = self._stdio_command_candidate(
+            server,
+            runtime_environment=runtime_environment,
+        )
         name = candidate.name.lower()
         if re.fullmatch(r"python(?:w)?(?:\d+(?:\.\d+)*)?(?:\.exe)?", name) is None:
             return env

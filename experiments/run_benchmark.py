@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -94,7 +95,9 @@ def main(argv: list[str] | None = None) -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     metadata: dict[str, Any] = {
-        "output_schema_version": 1,
+        "output_schema_version": 2,
+        "run_id": f"run_{uuid.uuid4().hex}",
+        "completion_state": "in_progress",
         "suite": str(suite),
         "tasks": [task.id for task in tasks],
         "runners": runners,
@@ -108,7 +111,8 @@ def main(argv: list[str] | None = None) -> None:
             max_quanta=args.max_quanta,
         ),
     }
-    (output / "metadata.json").write_text(json.dumps(to_jsonable(metadata), indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_json_atomic(output / "metadata.json", metadata)
+    _clear_stale_derived_outputs(output)
     runs = run_suite(tasks, suite, output, runners=runners, llm_mode=args.llm, max_quanta=args.max_quanta)
     write_run_outputs(runs, output)
     metrics = write_metrics(output)
@@ -412,6 +416,20 @@ def _path_bytes(path: Path) -> bytes:
     if path.is_symlink():
         return b"symlink\0" + os.readlink(path).encode("utf-8", errors="surrogateescape")
     return b"file\0" + path.read_bytes()
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(to_jsonable(value), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _clear_stale_derived_outputs(output: Path) -> None:
+    for name in ("summary.json", "metrics.json", "metrics.csv"):
+        (output / name).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

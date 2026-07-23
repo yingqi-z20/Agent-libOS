@@ -247,7 +247,7 @@ class Runtime:
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> "Runtime":
-        """Assemble a Runtime on the caller loop with loop-affine cleanup."""
+        """Assemble a Runtime in a blocking worker with caller-loop coordination."""
 
         from agent_libos.runtime.builder import RuntimeBuilder
 

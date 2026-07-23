@@ -39,8 +39,7 @@
       "minimum": 0
     },
     "modeled_fallback": {
-      "type": "integer",
-      "minimum": 0
+      "const": 0
     },
     "native_live_ok": {
       "type": "boolean"
@@ -49,6 +48,120 @@
       "type": "boolean"
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "native_live_ok": {
+            "const": true
+          }
+        },
+        "required": [
+          "native_live_ok"
+        ]
+      },
+      "then": {
+        "properties": {
+          "results": {
+            "not": {
+              "contains": {
+                "type": "object",
+                "required": [
+                  "evidence_level",
+                  "ok"
+                ],
+                "properties": {
+                  "evidence_level": {
+                    "const": "native-live"
+                  },
+                  "ok": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "results": {
+            "contains": {
+              "type": "object",
+              "required": [
+                "evidence_level",
+                "ok"
+              ],
+              "properties": {
+                "evidence_level": {
+                  "const": "native-live"
+                },
+                "ok": {
+                  "const": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "modeled_suite_ok": {
+            "const": true
+          }
+        },
+        "required": [
+          "modeled_suite_ok"
+        ]
+      },
+      "then": {
+        "properties": {
+          "results": {
+            "not": {
+              "contains": {
+                "type": "object",
+                "required": [
+                  "evidence_level",
+                  "ok"
+                ],
+                "properties": {
+                  "evidence_level": {
+                    "const": "modeled"
+                  },
+                  "ok": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "results": {
+            "contains": {
+              "type": "object",
+              "required": [
+                "evidence_level",
+                "ok"
+              ],
+              "properties": {
+                "evidence_level": {
+                  "const": "modeled"
+                },
+                "ok": {
+                  "const": false
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "additionalProperties": true,
   "$defs": {
     "evidence_level_counts": {
@@ -146,6 +259,57 @@
               },
               "operation_ids": {
                 "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "evidence_level": {
+                "const": "native-live"
+              }
+            },
+            "required": [
+              "evidence_level"
+            ]
+          },
+          "then": {
+            "properties": {
+              "semantic_effects": {
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "evidence_level": {
+                "const": "native-live"
+              },
+              "ok": {
+                "const": true
+              }
+            },
+            "required": [
+              "evidence_level",
+              "ok"
+            ]
+          },
+          "then": {
+            "properties": {
+              "tool_calls": {
+                "minimum": 1
+              },
+              "operations": {
+                "minimum": 1
+              },
+              "external_effect_ids": {
+                "minItems": 1
+              },
+              "operation_ids": {
+                "minItems": 1
               }
             }
           }

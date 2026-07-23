@@ -1044,7 +1044,7 @@ class SQLRuntimeStore:
         self.conn.execute(
             """
             CREATE TABLE runtime_schema (
-              singleton INTEGER PRIMARY KEY,
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
               schema_version INTEGER NOT NULL
             )
             """

@@ -6,6 +6,7 @@ from typing import Any
 
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 from benchmarks.runtime_safety.models import (
+    BENCHMARK_EFFECT_OBSERVATION_FIELDS,
     BenchmarkTask,
     BenchmarkValidationError,
     VALID_EFFECT_OUTCOMES,
@@ -23,6 +24,25 @@ REQUIRED_FIELDS = {
     "forbidden_effects",
     "success_oracle",
     "safety_oracle",
+}
+OPTIONAL_FIELDS = {
+    "setup",
+    "capabilities",
+    "policy",
+    "human_responses",
+    "expected_audit",
+    "mock_actions",
+    "notes",
+}
+ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
+SAFETY_ORACLE_TYPES = {"no_forbidden_effects", "no_unknown_effects"}
+SUCCESS_ORACLE_TYPES = {
+    "process_exited",
+    "expected_effects",
+    "file_contains",
+    "file_exists",
+    "managed_git_worktree",
+    "git_patch_artifact_lineage",
 }
 _TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 
@@ -49,7 +69,7 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
     data = load_yaml_mapping(source.read_text(encoding="utf-8"))
     _validate_required(data, source)
     schema_version = data.get("schema_version")
-    if schema_version != 1:
+    if type(schema_version) is not int or schema_version != 1:
         raise BenchmarkValidationError(f"{source}: unsupported schema_version {schema_version!r}")
     task_id = _string_field(data, "id", source)
     if not _TASK_ID_RE.match(task_id):
@@ -57,10 +77,10 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
     allowed = _validate_effect_list(data.get("allowed_effects"), source, "allowed_effects")
     forbidden = _validate_effect_list(data.get("forbidden_effects"), source, "forbidden_effects")
     success_oracle = _validate_success_oracle(data.get("success_oracle"), source)
-    safety_oracle = _validate_mapping_list(data.get("safety_oracle"), source, "safety_oracle")
     mock_actions = _validate_mapping_list(data.get("mock_actions", []), source, "mock_actions")
     setup = _optional_mapping(data.get("setup", {}), source, "setup")
     _validate_git_source_references(setup, success_oracle, source)
+    safety_oracle = _validate_safety_oracle(data.get("safety_oracle"), source)
     for index, action in enumerate(mock_actions):
         if not isinstance(action.get("action"), str) or not action["action"]:
             raise BenchmarkValidationError(f"{source}: mock_actions[{index}] requires non-empty action")
@@ -82,7 +102,7 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
         human_responses=_validate_mapping_list(data.get("human_responses", []), source, "human_responses"),
         expected_audit=_validate_mapping_list(data.get("expected_audit", []), source, "expected_audit"),
         mock_actions=mock_actions,
-        notes=data.get("notes") if isinstance(data.get("notes"), str) else None,
+        notes=_optional_string(data.get("notes"), source, "notes"),
         source_path=source,
     )
 
@@ -91,6 +111,21 @@ def _validate_required(data: dict[str, Any], source: Path) -> None:
     missing = sorted(REQUIRED_FIELDS - set(data))
     if missing:
         raise BenchmarkValidationError(f"{source}: missing required fields: {missing}")
+    unknown = sorted(
+        repr(key)
+        for key in data
+        if not isinstance(key, str) or key not in ALLOWED_FIELDS
+    )
+    if unknown:
+        raise BenchmarkValidationError(f"{source}: unknown top-level fields: {unknown}")
+
+
+def _optional_string(value: Any, source: Path, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise BenchmarkValidationError(f"{source}: {field} must be a string")
+    return value
 
 
 def _string_field(data: dict[str, Any], field: str, source: Path) -> str:
@@ -125,7 +160,7 @@ def _validate_effect_list(value: Any, source: Path, field: str) -> list[dict[str
     effects = _validate_mapping_list(value, source, field)
     for index, effect in enumerate(effects):
         effect_type = effect.get("type")
-        if effect_type not in VALID_EFFECT_TYPES:
+        if not isinstance(effect_type, str) or effect_type not in VALID_EFFECT_TYPES:
             raise BenchmarkValidationError(
                 f"{source}: {field}[{index}].type must be one of {sorted(VALID_EFFECT_TYPES)}, got {effect_type!r}"
             )
@@ -179,6 +214,23 @@ def _validate_success_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
         raise BenchmarkValidationError(f"{source}: success_oracle must be non-empty")
     for index, check in enumerate(checks):
         check_type = check.get("type")
+        if not isinstance(check_type, str) or check_type not in SUCCESS_ORACLE_TYPES:
+            raise BenchmarkValidationError(
+                f"{source}: success_oracle[{index}].type must be one of "
+                f"{sorted(SUCCESS_ORACLE_TYPES)}, got {check_type!r}"
+            )
+        if check_type in {"file_contains", "file_exists"}:
+            path = _string_field(check, "path", source)
+            check["path"] = _safe_relative_path(
+                path,
+                source,
+                f"success_oracle[{index}].path",
+            )
+            if check_type == "file_contains" and not isinstance(check.get("text"), str):
+                raise BenchmarkValidationError(
+                    f"{source}: success_oracle[{index}].text must be a string"
+                )
+            continue
         if check_type == "managed_git_worktree":
             root = check.get("root")
             if root is not None:
@@ -235,6 +287,39 @@ def _validate_success_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
                 )
             effect["outcomes"] = list(dict.fromkeys(outcomes))
         check["effects"] = effects
+    return checks
+
+
+def _validate_safety_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
+    checks = _validate_mapping_list(value, source, "safety_oracle")
+    if not checks:
+        raise BenchmarkValidationError(f"{source}: safety_oracle must be non-empty")
+    seen: set[str] = set()
+    for index, check in enumerate(checks):
+        check_type = check.get("type")
+        if not isinstance(check_type, str) or check_type not in SAFETY_ORACLE_TYPES:
+            raise BenchmarkValidationError(
+                f"{source}: safety_oracle[{index}].type must be one of "
+                f"{sorted(SAFETY_ORACLE_TYPES)}, got {check_type!r}"
+            )
+        unknown = sorted(
+            repr(key)
+            for key in check
+            if not isinstance(key, str) or key != "type"
+        )
+        if unknown:
+            raise BenchmarkValidationError(
+                f"{source}: safety_oracle[{index}] has unknown fields: {unknown}"
+            )
+        if check_type in seen:
+            raise BenchmarkValidationError(
+                f"{source}: duplicate safety oracle type {check_type!r}"
+            )
+        seen.add(check_type)
+    if "no_unknown_effects" not in seen:
+        raise BenchmarkValidationError(
+            f"{source}: safety_oracle must include no_unknown_effects"
+        )
     return checks
 
 
@@ -318,7 +403,16 @@ def _validate_action_paths(action: dict[str, Any], source: Path, index: int) -> 
         _validate_argv(action.get("argv"), source, f"mock_actions[{index}].argv")
     effects = action.get("benchmark_effects")
     if effects is not None:
-        _validate_effect_list(effects, source, f"mock_actions[{index}].benchmark_effects")
+        field = f"mock_actions[{index}].benchmark_effects"
+        validated_effects = _validate_effect_list(effects, source, field)
+        for effect_index, effect in enumerate(validated_effects):
+            observed = sorted(BENCHMARK_EFFECT_OBSERVATION_FIELDS & set(effect))
+            if observed:
+                raise BenchmarkValidationError(
+                    f"{source}: {field}[{effect_index}] may not declare "
+                    f"runner-observed fields: {observed}"
+                )
+        action["benchmark_effects"] = validated_effects
     checkpoint_ref = action.get("checkpoint_ref")
     if checkpoint_ref is not None and (not isinstance(checkpoint_ref, str) or not checkpoint_ref.strip()):
         raise BenchmarkValidationError(f"{source}: mock_actions[{index}].checkpoint_ref must be a non-empty string")

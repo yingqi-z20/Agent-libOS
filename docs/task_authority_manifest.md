@@ -64,7 +64,9 @@ JSON `null` preserves capability-only effect gating for compatibility. An
 explicit empty list is deny-all: no provider effect may cross the Task
 Authority boundary even when an ordinary capability would otherwise allow it.
 That deny-all ceiling also covers runtime-mediated LLM and Human provider
-effects owned by the process.
+effects owned by the process. The explicit `"*"` entry permits every current
+and future effect class and should be used only when that deliberately broad
+ceiling is intended.
 
 Typed Git adds five effect families that must be present when a concrete
 ceiling is used: `git.read`, `git.mutate`, `git.fetch`, `git.push`, and
@@ -111,7 +113,12 @@ Each entry in `authorized_capabilities` and
   `uses_remaining`, and `max_delegation_depth` fields.
 
 Unknown capability-entry fields fail validation instead of being discarded.
-`resource_budget` is validated against `ResourceBudget`, while
+When present, `delegable` and `revocable` must be JSON booleans (or Python
+`bool` values through the mapping API). Strings such as `"false"`, numbers,
+and `null` are rejected rather than coerced. `permitted_effects` entries must
+be non-empty strings; a wildcard must be exactly `"*"` or a single terminal
+`.*`, such as `jsonrpc.*`. `resource_budget` is validated against
+`ResourceBudget`, while
 `data_flow_policy` has the separate closed schema below. Capability
 `constraints`, other `approval_policy` values, and `metadata` are deliberately
 policy-defined mappings rather than self-authorizing fields.
@@ -141,14 +148,25 @@ uv run agent-libos spawn \
 
 Effect classes use protected-operation provider/operation ids, not model-facing
 tool or syscall names. For example, the `read_text` convenience operation is
-classified as `filesystem.read_bytes`. The canonical built-in inventory is the
-descriptor registry in `agent_libos/primitives/descriptors.py`; unknown effect
-classes fail closed.
+classified as `filesystem.read_bytes`. The current built-in inventory is
+aggregated by `agent_libos/runtime/descriptor_catalog.py` from primitive, LLM,
+Human, and module descriptor sets. The manifest parser deliberately does not
+require catalog membership because a trusted Host extension may register an
+additional protected-operation contract. An unknown exact entry, or an unknown
+namespace wildcard, authorizes no currently emitted effect; it takes effect
+only if a registered operation emits a matching `provider.operation` class.
+It never bypasses the capability, approval, data-flow, or resource checks at
+that operation boundary.
 
 `POST /api/processes` and `POST /api/workflows/run` accept the same object as
-`authority_manifest`. Explain summaries show the manifest id/hash, declared
-authority, unmet image requirements, effect ceiling, budget, and policies. They
-do not reproduce opaque operator `metadata`.
+`authority_manifest`. The Host-only
+`AuthorityManifestManager.summary_for_process()` projection contains the
+manifest id/hash, declared authority, unmet image requirements, effect ceiling,
+budget, and policies, and omits opaque operator `metadata`. Explain does not
+embed that mapping verbatim: `summary.authority_manifest` is a sanitized,
+bounded observation envelope containing a preview, SHA-256 digest, byte count,
+and `truncated`/`redacted` flags. A large manifest therefore need not expose
+every summary field in its Explain preview.
 
 The manifest is not a substitute for primitive capability checks. Tool
 projection, Skills, image metadata, and requirement declarations remain
@@ -171,6 +189,14 @@ identities, and non-list fields fail closed. JSON inputs require arrays and the
 Python mapping API requires `list` values; Python tuples are rejected. A
 child/fork manifest inherits the parent sets when omitted and may only keep or
 remove entries. Empty sets allow only data without a tenant/principal.
+
+A fresh root goal created from text, a payload mapping, or the configured
+default goal has the ordinary Object-label defaults: `sensitivity=normal`,
+`trust_level=unknown`, `integrity=unknown`, `origin=local`, and no tenant or
+principal. An existing goal `ObjectHandle` retains its Host-managed labels.
+The manifest does not assign or reclassify those labels; after the manifest is
+bound, launch validates the goal's tenant/principal against this receive-domain
+policy before compiling the root capabilities.
 
 This policy controls what identity domain a process may receive through a
 goal, message, result, Object Task notification, memory merge, fork, or exec.

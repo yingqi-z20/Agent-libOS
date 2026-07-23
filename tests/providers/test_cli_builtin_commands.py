@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import pytest
 import contextlib
 import io
@@ -10,14 +11,20 @@ import sys
 import tempfile
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from agent_libos import Runtime
 from agent_libos.api.cli import cli as cli_entrypoint
+from agent_libos.api.cli import _handle_interactive_human_response
 from agent_libos.api.cli import main as cli_main
+from agent_libos.api.cli import _print_interactive_help
+from agent_libos.api.cli import _run_interactive_command
+from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     CapabilityRight,
     ObjectMetadata,
     ObjectType,
+    HumanRequestStatus,
     ProcessMessageKind,
     ProcessStatus,
     process_outcome_to_mapping,
@@ -43,6 +50,383 @@ def _create_store_with_schema_version(db: Path, version: int) -> None:
 
 
 class TestCLIBuiltinCommand:
+
+    def test_interactive_run_uses_configured_default_quantum_budget_when_omitted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            runtime=replace(DEFAULT_CONFIG.runtime, run_until_idle_max_quanta=7),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="interactive budget")
+            observed: list[int | None] = []
+
+            async def record_scheduler_call(
+                _runner: object,
+                *,
+                max_quanta: int | None = None,
+            ) -> list[object]:
+                observed.append(max_quanta)
+                return []
+
+            commands = iter((None, "exit"))
+            monkeypatch.setattr(runtime.scheduler, "arun_until_idle", record_scheduler_call)
+            monkeypatch.setattr("agent_libos.api.cli._redirect_human_output_to_stderr", lambda _runtime: None)
+            monkeypatch.setattr("agent_libos.api.cli._start_interactive_input_thread", lambda *_args: None)
+            monkeypatch.setattr("agent_libos.api.cli._print_interactive_help", lambda _pid: None)
+            monkeypatch.setattr("agent_libos.api.cli._drain_interactive_queue", lambda *_args: next(commands))
+
+            report = asyncio.run(
+                _run_interactive_command(
+                    runtime,
+                    SimpleNamespace(
+                        pid=pid,
+                        max_quanta=None,
+                        human=None,
+                        message_channel="human",
+                    ),
+                )
+            )
+
+            assert observed == [7]
+            assert report["remaining_quanta"] == 7
+            assert report["results"] == []
+        finally:
+            runtime.close()
+
+    def test_interactive_help_lists_process_and_pending_request_commands(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _print_interactive_help("pid-help")
+
+        output = capsys.readouterr()
+        assert output.out == ""
+        for command in (
+            "/message <text>",
+            "/interrupt <text>",
+            "/pid <pid>",
+            "/answer <text>",
+            "/approve",
+            "/reject",
+            "/allow",
+            "/ask",
+            "/help",
+            "/exit",
+        ):
+            assert command in output.err
+
+    @pytest.mark.parametrize(
+        ("request_type", "response", "message"),
+        (
+            ("approval", "/allow", "Approval response must be /approve or /reject"),
+            ("permission_request", "/answer maybe", "Permission response must be /allow, /ask, or /reject"),
+        ),
+        ids=("ordinary-approval", "permission"),
+    )
+    def test_invalid_interactive_decision_keeps_request_pending(
+        self,
+        request_type: str,
+        response: str,
+        message: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        request = SimpleNamespace(
+            request_id="req-pending",
+            human="operator",
+            status=HumanRequestStatus.PENDING,
+            payload={"type": request_type},
+        )
+
+        class FakeHuman:
+            def get(self, request_id: str) -> object:
+                assert request_id == request.request_id
+                return request
+
+            def approve(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError("invalid input must not approve the request")
+
+            def reject(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError("invalid input must not reject the request")
+
+        handled = _handle_interactive_human_response(
+            SimpleNamespace(human=FakeHuman()),
+            response,
+            "operator",
+            shown_request_id=request.request_id,
+        )
+
+        assert handled is True
+        assert message in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("response", "expected_status", "approved"),
+        (
+            ("/approve", HumanRequestStatus.APPROVED, True),
+            ("/reject", HumanRequestStatus.REJECTED, False),
+        ),
+        ids=("approve", "reject"),
+    )
+    def test_interactive_ordinary_decision_persists_request_status(
+        self,
+        response: str,
+        expected_status: HumanRequestStatus,
+        approved: bool,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="interactive approval")
+            request_id = runtime.human.query(
+                pid,
+                "owner",
+                {"type": "approval", "question": "Proceed with the reviewed action?"},
+                blocking=False,
+            )
+
+            handled = _handle_interactive_human_response(
+                runtime,
+                response,
+                "owner",
+                shown_request_id=request_id,
+            )
+
+            persisted = runtime.human.get(request_id)
+            assert handled is True
+            assert persisted.status is expected_status
+            assert persisted.decision == {
+                "approved": approved,
+                "source": "interactive_cli",
+            }
+            assert request_id not in {
+                request.request_id for request in runtime.human.pending()
+            }
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("response", "policy", "expected_status", "approved"),
+        (
+            (
+                "/allow",
+                CapabilityManager.ALWAYS_ALLOW,
+                HumanRequestStatus.APPROVED,
+                True,
+            ),
+            (
+                "/ask",
+                CapabilityManager.ASK_EACH_TIME,
+                HumanRequestStatus.APPROVED,
+                True,
+            ),
+            (
+                "/reject",
+                CapabilityManager.ALWAYS_DENY,
+                HumanRequestStatus.REJECTED,
+                False,
+            ),
+        ),
+        ids=("allow", "ask", "reject"),
+    )
+    def test_interactive_permission_decision_persists_status_and_policy(
+        self,
+        response: str,
+        policy: str,
+        expected_status: HumanRequestStatus,
+        approved: bool,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="review-agent:v0",
+                goal="interactive permission",
+                authority_manifest={
+                    "authorized_capabilities": [
+                        {
+                            "resource": "human:owner",
+                            "rights": [CapabilityRight.WRITE.value],
+                        }
+                    ],
+                    "approval_policy": {
+                        "requestable_capabilities": [
+                            {
+                                "resource": "filesystem:workspace:*",
+                                "rights": [CapabilityRight.WRITE.value],
+                            }
+                        ]
+                    },
+                },
+            )
+            runtime.capability.grant(
+                pid,
+                "human:owner",
+                [CapabilityRight.WRITE],
+                issued_by="test",
+            )
+            resource = runtime.filesystem.resource_for(
+                "agent_outputs/interactive_permission.txt"
+            )
+            request_id = runtime.human.request_permission(
+                pid,
+                "owner",
+                resource,
+                [CapabilityRight.WRITE.value],
+                "edit the reviewed output",
+                blocking=False,
+            )
+
+            handled = _handle_interactive_human_response(
+                runtime,
+                response,
+                "owner",
+                shown_request_id=request_id,
+            )
+
+            persisted = runtime.human.get(request_id)
+            assert handled is True
+            assert persisted.status is expected_status
+            assert persisted.decision == {
+                "approved": approved,
+                "policy": policy,
+                "source": "interactive_cli",
+            }
+            assert (
+                runtime.capability.permission_policy(
+                    pid,
+                    resource,
+                    CapabilityRight.WRITE,
+                )
+                == policy
+            )
+            assert request_id not in {
+                request.request_id for request in runtime.human.pending()
+            }
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("group", "message"),
+        (
+            (
+                "jsonrpc",
+                "jsonrpc call --actor-pid must match",
+            ),
+            (
+                "mcp",
+                "mcp call --actor-pid must match",
+            ),
+        ),
+    )
+    def test_remote_call_actor_pid_cannot_masquerade_as_the_target_process(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        group: str,
+        message: str,
+    ) -> None:
+        db = tmp_path / f"{group}.sqlite"
+        runtime = Runtime.open(str(db))
+
+        class NoDispatchProvider:
+            def __init__(self) -> None:
+                self.interactions: list[str] = []
+
+            def __getattr__(self, name: str):
+                def fail_if_called(*_args: object, **_kwargs: object) -> None:
+                    self.interactions.append(name)
+                    raise AssertionError(f"provider interaction must not occur: {name}")
+
+                return fail_if_called
+
+        try:
+            target_pid = runtime.process.spawn(image='base-agent:v0', goal=f'{group} target')
+            actor_pid = runtime.process.spawn(image='base-agent:v0', goal=f'{group} mismatched actor')
+            remote_id = f'cli-{group}-actor-mismatch'
+            provider = NoDispatchProvider()
+            protected_caps = []
+            if group == 'jsonrpc':
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _cli_jsonrpc_manifest(remote_id),
+                    actor='test',
+                    require_capability=False,
+                )
+                protected_caps.append(
+                    runtime.capability.grant_once(
+                        target_pid,
+                        f'jsonrpc:{remote_id}:echo',
+                        [CapabilityRight.READ],
+                        issued_by='test',
+                    )
+                )
+                runtime.jsonrpc.provider = provider
+            else:
+                runtime.mcp.register_server_from_yaml_text(
+                    _cli_mcp_manifest(remote_id),
+                    actor='test',
+                    require_capability=False,
+                )
+                protected_caps.extend(
+                    [
+                        runtime.capability.grant_once(
+                            target_pid,
+                            f'mcp:{remote_id}:echo',
+                            [CapabilityRight.READ],
+                            issued_by='test',
+                        ),
+                        runtime.capability.grant_once(
+                            target_pid,
+                            'process:spawn',
+                            [CapabilityRight.WRITE],
+                            issued_by='test',
+                        ),
+                        runtime.capability.grant_once(
+                            target_pid,
+                            runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_mcp']),
+                            [CapabilityRight.EXECUTE],
+                            issued_by='test',
+                        ),
+                    ]
+                )
+                runtime.mcp.provider = provider
+
+            before_effects = runtime.store.list_external_effects(pid=target_pid)
+            before_capabilities = {
+                cap.cap_id: runtime.store.get_capability(cap.cap_id)
+                for cap in protected_caps
+            }
+            before_audit = runtime.audit.trace()
+            before_events = runtime.events.list()
+            monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)
+            monkeypatch.setattr(runtime, 'shutdown', lambda **_kwargs: {'ok': True})
+
+            with pytest.raises(SystemExit, match=message):
+                cli_main(
+                    [
+                        "--db",
+                        str(db),
+                        group,
+                        "--actor-pid",
+                        actor_pid,
+                        "call",
+                        target_pid,
+                        remote_id,
+                        "echo",
+                    ]
+                )
+
+            assert provider.interactions == []
+            assert runtime.store.list_external_effects(pid=target_pid) == before_effects
+            assert {
+                cap_id: runtime.store.get_capability(cap_id)
+                for cap_id in before_capabilities
+            } == before_capabilities
+            assert all(capability is not None and capability.uses_remaining == 1 for capability in before_capabilities.values())
+            assert runtime.audit.trace() == before_audit
+            assert runtime.events.list() == before_events
+        finally:
+            runtime.close()
 
     def test_cli_processes_preserves_typed_wait_and_outcome_discriminators(
         self,
@@ -723,6 +1107,21 @@ def _run_cli_json(argv: list[str]) -> dict[str, object]:
     with contextlib.redirect_stdout(stdout):
         cli_main(argv)
     return json.loads(stdout.getvalue())
+
+
+def _cli_jsonrpc_manifest(endpoint_id: str) -> str:
+    return f"""
+schema_version: 1
+endpoint_id: {endpoint_id}
+url: https://api.example.test/jsonrpc
+methods:
+  - method_id: echo
+    rpc_method: demo.echo
+    right: read
+    rollback_class: no_rollback_required
+    state_mutation: false
+    information_flow: true
+""".lstrip()
 
 
 def _cli_mcp_manifest(server_id: str) -> str:

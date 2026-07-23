@@ -750,6 +750,17 @@ class TestUnsupportedStoreVersion:
         finally:
             store.close()
 
+    def test_fresh_schema_rejects_a_second_schema_marker(self) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                store.conn.execute(
+                    "INSERT INTO runtime_schema (singleton, schema_version) VALUES (?, ?)",
+                    (2, STORE_SCHEMA_VERSION),
+                )
+        finally:
+            store.close()
+
     def test_interrupted_bootstrap_rolls_back_and_reopens_cleanly(
         self,
         tmp_path: Path,

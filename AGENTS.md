@@ -3,9 +3,11 @@
 ## Project Structure & Module Organization
 
 Agent libOS is a Python runtime with an optional Electron GUI. Core runtime code
-lives in `agent_libos/`, organized by subsystem: `runtime/`, `primitives/`,
-`capability/`, `memory/`, `skills/`, `modules/`, `tools/`, `substrate/`, and
-`api/` for CLI/GUI server entrypoints. Pytest tests live in `tests/` and map to
+lives in `agent_libos/`, organized by subsystems including `runtime/`,
+`primitives/`, `capability/`, `memory/`, `skills/`, `modules/`, `tools/`,
+`substrate/`, `config/`, `evidence/`, `human/`, `images/`, `llm/`, `models/`,
+`ports/`, `sdk/`, `storage/`, `utils/`, and `api/` for CLI/GUI server
+entrypoints. Pytest tests live in `tests/` and map to
 test matrix lanes: `unit`, `runtime`, `security`, `self-evolution`,
 `providers`, `benchmark`, and `gui`; some lane names differ from directory
 names, for example `self-evolution` maps to `tests/self_evolution` and
@@ -21,7 +23,7 @@ skills live in `skills/`.
 
 - `uv sync --frozen --all-groups`: install the locked Python environment,
   including pytest tooling.
-- `uv run python -m compileall agent_libos tests scripts experiments benchmarks`:
+- `uv run python -m compileall agent_libos tests scripts experiments benchmarks modules`:
   catch syntax/import errors.
 - `uv run python scripts/test_matrix.py --lane unit`: run fast pure-Python tests.
 - `uv run python scripts/test_matrix.py --lane security`: run capability,
@@ -31,8 +33,8 @@ skills live in `skills/`.
 - `uv run python scripts/check_test_invariants.py`: verify the invariant
   coverage manifest.
 - `uv run agent-libos --help`: inspect CLI commands.
-- `uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/smoke`: run a deterministic benchmark smoke.
-- `uv run python experiments/run_practical_evaluation.py --output .benchmark_runs/practical/report.json`: run practical workflows while preserving native/mocked/modeled evidence labels.
+- `uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/smoke`: run a deterministic benchmark smoke and fail if an oracle fails.
+- `uv run python experiments/run_practical_evaluation.py --output .benchmark_runs/practical/report.json`: run practical workflows while preserving `native-live` and `modeled` evidence labels.
 - `uv run python scripts/test_matrix.py --lane gui`: run GUI Vitest,
   typecheck, and build. Run `npm --prefix gui install` first in a fresh
   checkout.
@@ -68,8 +70,11 @@ include GUI screenshots for visible frontend changes.
 
 Never commit local/real `.env`, credentials, benchmark outputs, generated
 `agent_outputs/`, or GUI build artifacts.
-Remote access must go through registered JSON-RPC endpoints or MCP servers, not
-model-supplied URLs or commands. Checkpoint restore and image commit do not roll
-back or package external provider state; provider-classified effects remain
-append-only RuntimeStore evidence, not tamper-proof evidence against a direct
-database administrator.
+Remote access must use Host-configured primitives or providers, such as
+registered JSON-RPC/MCP endpoints, named LLM profiles, or configured Git
+remotes; models must not supply ad hoc URLs, credentials, or transport commands.
+Checkpoint restore and image commit do not roll back or package external
+provider state. Audit and effect-transition history are append-only through the
+RuntimeStore API, while guarded external-effect rows and retained payload
+projections may be updated in place. None of this evidence is tamper-proof
+against a direct database administrator.

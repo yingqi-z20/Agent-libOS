@@ -200,11 +200,14 @@ Start here, then read the deeper references as needed:
 - [docs/paper_thesis.md](docs/paper_thesis.md): current paper thesis and
   non-goals.
 - [benchmarks/runtime_safety/schema.md](benchmarks/runtime_safety/schema.md):
-  benchmark task/output schema v1.
+  benchmark task schema v1 and run-output schema v2.
 - [benchmarks/external_effect_recovery/README.md](benchmarks/external_effect_recovery/README.md):
   100k CI and one-million-record external-effect recovery scale profiles.
 - [benchmarks/runtime_publication_recovery/README.md](benchmarks/runtime_publication_recovery/README.md):
   10k CI runtime-publication reopen and reconciliation scale gate.
+- [benchmarks/practical_agent_workflows/README.md](benchmarks/practical_agent_workflows/README.md):
+  native-live and modeled practical-workflow evidence contract and report
+  schema.
 - [plan.md](plan.md): dated paper-submission roadmap; not the implementation
   reference for current behavior.
 - [AGENTS.md](AGENTS.md): repository structure, testing, security, and
@@ -280,8 +283,8 @@ control. Pass `--workers 1` for serial failure diagnosis, or `--workers N` /
 `--workers auto` to override the worker count for any Python lane. Pass
 `--durations 25` to report the slowest tests. Standard lanes deselect tests
 marked `postgres`; the dedicated PostgreSQL service gate runs those tests with
-`pytest -m postgres --run-postgres`. The GUI lane builds shared frontend
-artifacts and should be run separately after `npm --prefix gui install`.
+`pytest -m postgres --run-postgres --fail-on-skip`. The GUI lane builds shared
+frontend artifacts and should be run separately after `npm --prefix gui install`.
 Pytest removes files created under ignored `agent_outputs/` at the end of a
 test session; use `--keep-agent-outputs` when debugging generated files.
 
@@ -290,6 +293,9 @@ Run the deterministic local demo:
 ```bash
 uv run agent-libos demo
 ```
+
+The demo overwrites `agent_outputs/demo_patch_preview.txt` below the Runtime
+workspace. Preserve or move an existing file at that path before running it.
 
 Run the Electron GUI in development mode:
 
@@ -335,7 +341,9 @@ allowed denials `0/97`, and zero unknown outcomes/classifications. Its
 `f6b3b0aa5e2a403c3ed0a7c848dcbccffa7faabe5eda7edf6cfe26ebccde53b6`.
 That artifact is not evidence for the current tree: its counts do not carry
 over across history consolidation or later runtime changes unless content
-identity is proved and a new validation artifact records that proof.
+identity is proved and a new validation artifact records that proof. It uses
+historical run-output schema v1; the current v2 collector intentionally rejects
+it, so it remains archival evidence only.
 The two rate denominators are qualified effect populations, not task counts,
 and missing/unknown evidence invalidates rates instead of being inferred from
 `result.ok`. The ignored artifact must be packaged separately. See the
@@ -408,8 +416,9 @@ savepoint-release failure triggers rollback, and a rollback failure poisons and
 closes the store rather than allowing further reads or writes. See
 [docs/storage.md](docs/storage.md).
 
-Omit `--max-quanta` to run until the runtime becomes idle; provide it only when
-you want a bounded run.
+Omitting `--max-quanta` uses `runtime.run_until_idle_max_quanta`. Its default
+`null` value runs until the Runtime becomes idle; configure that setting or pass
+an explicit flag when a bounded run is required.
 
 `workflow run <tool>` spawns a fresh process from the default image, calls one
 visible tool, persists the result object, and exits that process. Pass
@@ -598,7 +607,7 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - JSON-RPC and MCP calls gate on endpoint/method or server/tool capability
   resources before loading provider metadata or input schemas, so missing call
   authority cannot enumerate registered manifests.
-- Git calls operate only on the fixed workspace repository or a trusted
+- Git calls operate only on the configured, runtime-pinned workspace repository or a trusted
   managed worktree. Mutations require a prior state token plus Git and affected
   filesystem authority; destructive and remote-ref-rewriting operations bind
   one-use Human approval to exact state/OIDs. Direct Shell/PTY Git argv and
@@ -710,8 +719,9 @@ with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))`.
 Runtime defaults live in `agent_libos.config.DEFAULT_CONFIG`, including
 scheduler quantum, worker, drain, and shutdown limits; process budgets; image
 ids; workspace namespace; tool limits; filesystem/Object Memory size limits;
-Deno sandbox limits; ObjectTask notification and shutdown limits; JSR import
-allowlists; shell policy lists; launcher presets; Skill defaults; and
+Deno sandbox limits; ObjectTask notification and shutdown limits; reserved JSR
+import-allowlist metadata (static imports remain rejected); shell policy lists;
+launcher presets; Skill defaults; and
 checkpoint defaults. Optional modules such as `modules/pty` keep their own
 module-local settings outside `AgentLibOSConfig`.
 `AgentLibOSConfig` is validated at construction time, so invalid or inverted

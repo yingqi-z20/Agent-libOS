@@ -249,7 +249,7 @@ def main(argv: list[str] | None = None) -> None:
     run_group = exec_parser.add_mutually_exclusive_group()
     run_group.add_argument("--run", dest="run", action="store_true", default=False, help="Run the scheduler after exec.")
     run_group.add_argument("--no-run", dest="run", action="store_false", help="Only apply exec; do not run the scheduler.")
-    exec_parser.add_argument("--max-quanta", type=int, help="Optional quantum budget when --run is set; omitted runs until idle.")
+    exec_parser.add_argument("--max-quanta", type=int, help="Optional quantum budget when --run is set; omitted uses runtime.run_until_idle_max_quanta (which may be unbounded).")
     exit_parser = sub.add_parser("exit", help="Exit an AgentProcess")
     exit_parser.add_argument("pid")
     exit_parser.add_argument(
@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> None:
     llm_once_parser = sub.add_parser("llm-once", help="Run one LLM quantum for a process")
     llm_once_parser.add_argument("pid")
     run_parser = sub.add_parser("run", help="Run runnable processes with the LLM scheduler")
-    run_parser.add_argument("--max-quanta", type=int, help="Optional quantum budget; omitted runs until idle.")
+    run_parser.add_argument("--max-quanta", type=int, help="Optional quantum budget; omitted uses runtime.run_until_idle_max_quanta (which may be unbounded).")
     run_parser.add_argument("--interactive", action="store_true", help="Read human input while running and post it as process messages.")
     run_parser.add_argument("--pid", help="Default target process for interactive human messages.")
     run_parser.add_argument("--human", help="Human actor name for interactive messages.")
@@ -857,7 +857,11 @@ async def _run_interactive_command(runtime: Runtime, args: argparse.Namespace) -
     results: list[Any] = []
     posted: list[dict[str, Any]] = []
     state = {"pid": target_pid, "shown_request_id": ""}
-    remaining: int | None = args.max_quanta
+    remaining: int | None = (
+        runtime.config.runtime.run_until_idle_max_quanta
+        if args.max_quanta is None
+        else args.max_quanta
+    )
     selected_human = args.human or runtime.config.runtime.default_human
     try:
         while remaining is None or remaining > 0:
@@ -981,7 +985,14 @@ def _add_message_parser_args(parser: argparse.ArgumentParser, *, include_kind: b
     parser.add_argument("--reply-to", help="Optional message id this message replies to.")
     parser.add_argument("--payload-json", default="{}", help="Structured JSON object to include in the message payload.")
     parser.add_argument("--run", action="store_true", help="Run the scheduler after posting the message.")
-    parser.add_argument("--max-quanta", type=int, help="Optional quantum budget when --run is set; omitted runs until idle.")
+    parser.add_argument(
+        "--max-quanta",
+        type=int,
+        help=(
+            "Optional quantum budget when --run is set; omitted uses "
+            "runtime.run_until_idle_max_quanta (which may be unbounded)."
+        ),
+    )
 
 
 def _add_checkpoint_parser_args(parser: argparse.ArgumentParser) -> None:
@@ -1065,7 +1076,10 @@ def _run_checkpoint_command(runtime: Runtime, args: argparse.Namespace) -> dict[
 def _add_skills_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--actor-pid",
-        help="If set, execute as this process and enforce skill capabilities. Omit for admin CLI mode.",
+        help=(
+            "If set, execute supported subcommands as this process and enforce Skill capabilities. "
+            "The Host-filesystem 'validate' subcommand rejects this option. Omit for admin CLI mode."
+        ),
     )
     sub = parser.add_subparsers(dest="skills_command", required=True)
     discover = sub.add_parser("discover", help="Discover registered skills")
@@ -1109,6 +1123,11 @@ def _run_skills_command(runtime: Runtime, args: argparse.Namespace) -> dict[str,
             require_capability=require_capability,
         )
     if command == "validate":
+        if require_capability:
+            raise SystemExit(
+                "skills validate is a Host filesystem operation and does not support --actor-pid; "
+                "use skills register --actor-pid to validate and register through process filesystem authority"
+            )
         return runtime.skills.validate_package_path(args.path)
     if command == "register":
         if args.source_type == "global":
@@ -1415,6 +1434,8 @@ def _run_jsonrpc_command(runtime: Runtime, args: argparse.Namespace) -> dict[str
             include_sensitive_fields=not require_capability,
         )
     if command == "call":
+        if args.actor_pid is not None and args.actor_pid != args.pid:
+            raise SystemExit("jsonrpc call --actor-pid must match the target process pid")
         params = _parse_json_value(args.params_json) if args.params_json is not None else None
         return to_jsonable(runtime.jsonrpc.call(args.pid, args.endpoint_id, args.method_id, params))
     if command == "unregister":
@@ -1507,6 +1528,8 @@ def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, An
             refresh=args.refresh,
         )
     if command == "call":
+        if args.actor_pid is not None and args.actor_pid != args.pid:
+            raise SystemExit("mcp call --actor-pid must match the target process pid")
         arguments = _parse_json_value(args.arguments_json) if args.arguments_json is not None else {}
         return to_jsonable(runtime.mcp.call_tool(args.pid, args.server_id, args.tool_id, arguments))
     if command == "unregister":
@@ -1617,8 +1640,9 @@ def _print_interactive_help(target_pid: str) -> None:
     print(
         (
             f"Interactive human input target: {target_pid}\n"
-            "Plain text sends a normal message. Commands: /interrupt <text>, /message <text>, "
-            "/pid <pid>, /help, /exit"
+            "Plain text sends a normal message, or answers the currently displayed Human request.\n"
+            "Process commands: /message <text>, /interrupt <text>, /pid <pid>, /help, /exit.\n"
+            "Displayed-request commands: /answer <text>, /approve, /reject, /allow, /ask."
         ),
         file=sys.stderr,
         flush=True,
@@ -1796,6 +1820,13 @@ def _handle_interactive_human_response(
         return True
     if request_type == "permission_request":
         policy = _interactive_permission_policy(response)
+        if policy is None:
+            print(
+                "Permission response must be /allow, /ask, or /reject; request remains pending.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return True
         decision = {"policy": policy, "source": "interactive_cli"}
         if policy == CapabilityManager.ALWAYS_DENY:
             runtime.human.reject(request.request_id, {"approved": False, **decision}, responder=f"human:{human}")
@@ -1803,7 +1834,18 @@ def _handle_interactive_human_response(
             runtime.human.approve(request.request_id, {"approved": True, **decision}, responder=f"human:{human}")
         print(f"Resolved permission request {request.request_id} with policy={policy}", file=sys.stderr, flush=True)
         return True
-    approved = response.lower() in {"y", "yes", "approve", "approved", "a", "allow"}
+    normalized = response.strip().lower()
+    if normalized in {"y", "yes", "approve", "approved"}:
+        approved = True
+    elif normalized in {"n", "no", "reject", "rejected", "deny", "denied"}:
+        approved = False
+    else:
+        print(
+            "Approval response must be /approve or /reject; request remains pending.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return True
     if approved:
         runtime.human.approve(
             request.request_id,
@@ -1838,7 +1880,7 @@ def _interactive_response_text(stripped: str) -> str | None:
     return None
 
 
-def _interactive_permission_policy(answer: str) -> str:
+def _interactive_permission_policy(answer: str) -> str | None:
     normalized = answer.strip().lower()
     return {
         "a": CapabilityManager.ALWAYS_ALLOW,
@@ -1855,7 +1897,7 @@ def _interactive_permission_policy(answer: str) -> str:
         "always_deny": CapabilityManager.ALWAYS_DENY,
         "no": CapabilityManager.ALWAYS_DENY,
         "n": CapabilityManager.ALWAYS_DENY,
-    }.get(normalized, CapabilityManager.ALWAYS_DENY)
+    }.get(normalized)
 
 
 def _first_interactive_input_request(runtime: Runtime, human: str) -> Any | None:

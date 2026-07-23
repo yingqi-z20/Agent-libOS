@@ -1822,29 +1822,72 @@ class TestLLMContextMemory:
             config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, persist_full_io=False))
             runtime = Runtime.open(db, config=config)
             try:
-                runtime.llm.client = MetadataActionClient()
+                success_secret = 'PROVIDER_SUCCESS_PREVIEW_SECRET'
+                usage_secret = 'PROVIDER_USAGE_EXTRA_SECRET'
+                runtime.llm.client = MetadataActionClient(
+                    content=success_secret,
+                    usage_extra={
+                        'provider_extra': usage_secret,
+                        'input_tokens': True,
+                        'output_tokens': -1,
+                    },
+                )
                 pid = runtime.process.spawn(image='base-agent:v0', goal='do not persist full llm calls')
                 runtime.run_next_process_once()
 
                 call = runtime.store.list_llm_calls(pid)[0]
-                assert call.response_content == 'visible assistant text'
-                assert call.messages['sha256']
-                assert call.tools['sha256']
-                assert call.tool_calls['sha256']
-                assert call.raw_response['sha256']
-                assert call.reasoning['sha256']
-                assert call.observability['messages']['sha256']
+                retention_key = '$agent_libos_payload_retention'
+                assert json.loads(call.response_content)[retention_key]['sha256']
+                assert call.messages[retention_key]['sha256']
+                assert call.tools[retention_key]['sha256']
+                assert call.tool_calls[retention_key]['sha256']
+                assert call.raw_response[retention_key]['sha256']
+                assert call.reasoning[retention_key]['sha256']
+                assert set(call.observability) == {retention_key}
+                assert call.observability[retention_key]['tier'] == 'summary'
+                assert call.usage == {
+                    'prompt_tokens': 13,
+                    'completion_tokens': 4,
+                    'total_tokens': 17,
+                }
                 serialized = json.dumps(call.__dict__, sort_keys=True)
                 assert 'do not persist full llm calls' not in serialized
                 assert '"payload": {"done": true}' not in serialized
+                assert 'visible assistant text' not in serialized
+                assert 'process_exit' not in serialized
+                assert '"raw_resp"' not in serialized
+                assert 'selected process_exit' not in serialized
+                assert 'preview' not in serialized
+
+                process = runtime.process.get(pid)
+                assert process.outcome is not None
+                assert process.outcome.result_oid is not None
+                result_object = runtime.store.get_object(process.outcome.result_oid)
+                assert result_object is not None
+                durable_sinks = json.dumps(
+                    {
+                        'audit': [record.__dict__ for record in runtime.audit.trace()],
+                        'events': [event.__dict__ for event in runtime.store.list_events()],
+                        'result': result_object.__dict__,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+                assert success_secret not in durable_sinks
+                assert usage_secret not in durable_sinks
             finally:
                 runtime.close()
+
+            with sqlite3.connect(db) as connection:
+                database_dump = '\n'.join(connection.iterdump())
+            assert success_secret not in database_dump
+            assert usage_secret not in database_dump
 
             reopened = Runtime.open(db, config=config)
             try:
                 persisted = reopened.store.list_llm_calls(pid)[0]
-                assert persisted.messages['sha256']
-                assert persisted.raw_response['sha256']
+                assert persisted.messages[retention_key]['sha256']
+                assert persisted.raw_response[retention_key]['sha256']
             finally:
                 reopened.close()
 
@@ -2329,6 +2372,85 @@ class TestLLMContextMemory:
             assert second['action']['action'] == 'process_exit'
             assert 'previous_response_id' not in fake.responses.payloads[1]
             assert runtime.store.list_llm_tool_outputs(pid=pid, response_id='resp_redacted') == []
+            first_call = runtime.store.list_llm_calls(pid)[0]
+            assert first_call.request_options[
+                'openai_responses_previous_response_id_enabled'
+            ] is False
+            assert first_call.request_options['openai_response_tool_call_count'] == 1
+            assert 'openai_response_tool_calls' not in first_call.request_options
+            serialized = json.dumps(first_call.__dict__, sort_keys=True)
+            assert 'call_resp_redacted' not in serialized
+            assert 'read_process_messages' not in serialized
+        finally:
+            runtime.close()
+
+    def test_openai_responses_json_action_chain_stays_stateless_when_full_io_persistence_is_disabled(
+        self,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                store=True,
+                responses_previous_response_id=True,
+                persist_full_io=False,
+            ),
+        )
+        client = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='responses',
+            store=True,
+            responses_previous_response_id=True,
+            defaults=config.llm,
+        )
+        fake = FakeAsyncOpenAIResponses(
+            [
+                _responses_text_action(
+                    'resp_text_redacted',
+                    {
+                        'action': 'create_memory_object',
+                        'type': 'note',
+                        'name': 'text-step',
+                        'payload': {'ok': True},
+                    },
+                ),
+                _responses_text_action(
+                    'resp_text_after_redacted',
+                    {'action': 'process_exit', 'payload': {'done': True}},
+                ),
+            ]
+        )
+        client._async_client = fake
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='keep text responses stateless under retention opt-out',
+            )
+
+            first = runtime.run_next_process_once()
+            second = runtime.run_next_process_once()
+
+            assert first['action']['action'] == 'create_memory_object'
+            assert second['action']['action'] == 'process_exit'
+            assert 'previous_response_id' not in fake.responses.payloads[0]
+            assert 'previous_response_id' not in fake.responses.payloads[1]
+            calls = runtime.store.list_llm_calls(pid)
+            assert len(calls) == 2
+            assert all(
+                call.request_options['openai_previous_response_id'] is None
+                for call in calls
+            )
+            assert all(
+                call.request_options['openai_response_tool_call_count'] == 0
+                for call in calls
+            )
+            assert all(
+                'openai_response_tool_calls' not in call.request_options
+                for call in calls
+            )
         finally:
             runtime.close()
 
@@ -3324,9 +3446,17 @@ def _register_count_tool(
 
 
 class MetadataActionClient:
+    def __init__(
+        self,
+        *,
+        content: str = 'visible assistant text',
+        usage_extra: dict[str, Any] | None = None,
+    ) -> None:
+        self.content = content
+        self.usage_extra = dict(usage_extra or {})
 
     def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
-        return LLMCompletion(content='visible assistant text', tool_calls=[{'id': 'tool_123', 'name': 'process_exit', 'arguments': json.dumps({'payload': {'done': True}})}], raw=SimpleNamespace(id='raw_resp', provider='fake'), api='chat', response_id='resp_123', request_id='req_123', model='test-model', usage={'prompt_tokens': 13, 'completion_tokens': 4, 'total_tokens': 17}, reasoning={'summary': 'selected process_exit'})
+        return LLMCompletion(content=self.content, tool_calls=[{'id': 'tool_123', 'name': 'process_exit', 'arguments': json.dumps({'payload': {'done': True}})}], raw=SimpleNamespace(id='raw_resp', provider='fake'), api='chat', response_id='resp_123', request_id='req_123', model='test-model', usage={'prompt_tokens': 13, 'completion_tokens': 4, 'total_tokens': 17, **self.usage_extra}, reasoning={'summary': 'selected process_exit'})
 
 
 class TextOnlyActionClient:
@@ -3421,6 +3551,17 @@ def _responses_tool_call(response_id: str, name: str, arguments: dict[str, Any])
                 arguments=json.dumps(arguments),
             )
         ],
+    )
+
+
+def _responses_text_action(response_id: str, action: dict[str, Any]) -> Any:
+    return SimpleNamespace(
+        id=response_id,
+        _request_id=f'req_{response_id}',
+        model='gpt-test',
+        usage=SimpleNamespace(input_tokens=5, output_tokens=2, total_tokens=7),
+        output_text=json.dumps(action),
+        output=[],
     )
 
 

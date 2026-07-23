@@ -10,7 +10,8 @@ Objects have:
 - an object id (`oid`),
 - type,
 - namespace,
-- optional namespace-local name,
+- a non-empty namespace-local name (the create argument may be omitted, in
+  which case the Runtime generates `<type>:<oid>`),
 - version,
 - metadata,
 - payload,
@@ -126,6 +127,11 @@ runtime.memory.create_object(
 listing = runtime.memory.list_namespace(pid, "project/research")
 ```
 
+The trusted Host API returns full `AgentObject` values, including payloads, from
+`list_namespace`. Model-facing tools and syscalls deliberately return metadata
+projections instead. Do not expose the Host manager directly to an untrusted
+caller that should only see the projected form.
+
 Namespace capabilities gate listing, lookup, Object creation, and creation of
 a child namespace. Creating a child requires `write` on its existing parent;
 successful creation grants the creator `read`, `write`, and `admin` on the new
@@ -223,12 +229,15 @@ capability checks and before budget selection. Filters are ORed together; fields
 inside one filter are ANDed (`type`, required `tags`, and bounded text search).
 Filtered roots are audited as omitted objects.
 
-Merge scaffolding lets a parent merge child-created memory according to a merge
-policy. Merge operations still respect process relationships and capabilities.
-When a non-root child exits, its process-owned objects remain available for the
-direct parent to merge. A merge adopts merged child-owned objects into the
-parent and releases unmerged child-owned objects. If the parent exits before
-merging, terminal child-owned objects are released during parent cleanup.
+`ObjectMemoryManager.merge_view` is low-level handle-derivation scaffolding: it
+applies a merge policy and capability checks, but does not itself validate a
+parent/child process relationship or adopt/release object ownership. Normal
+process lifecycle callers use `ProcessManager.merge_child_memory`, which checks
+the direct relationship around that scaffolding. When a non-root child exits,
+its process-owned objects remain available for that parent to merge; the
+lifecycle operation adopts merged child-owned objects into the parent and
+releases unmerged child-owned objects. If the parent exits before merging,
+terminal child-owned objects are released during parent cleanup.
 
 When merge authority is finite-use, creation of the parent's derived handle and
 consumption of the source grant are one store transaction. Failure to consume
@@ -268,6 +277,11 @@ rights on the owner object, `process:spawn` `write`, available per-object and
 global ObjectTask concurrency slots, and the requested tool must already be
 visible in the creator process tool table. External capabilities are inherited
 only when explicitly delegated.
+
+Objects are immutable by default, so their initial owner handle does not include
+`write`. An Object intended to own an ObjectTask must be created with
+`immutable=False` or the creator must obtain an appropriate write handle by an
+authorized lifecycle path.
 
 ObjectTask rows are persisted, but active task execution is runtime-local. When
 a runtime reopens an existing store, unfinished tasks are marked `abandoned`,

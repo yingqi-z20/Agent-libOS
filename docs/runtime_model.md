@@ -27,7 +27,9 @@ The current lifecycle includes:
 - `waiting_human`: the process is blocked on a human question or approval.
 - `waiting_event`: the process is blocked on a child, message, or event.
 - `waiting_tool`: reserved waiting state for tool-level blocking.
-- `paused` / `suspended`: the process is not selected for normal execution.
+- `paused`: the process is not selected for normal execution.
+- `suspended`: compatibility status accepted by resume/state readers; current
+  production transitions use `paused` and do not create new suspended rows.
 - `exited`: completed successfully.
 - `failed`: completed with failure.
 - `killed`: terminated by signal or runtime decision.
@@ -201,7 +203,7 @@ Every runtime-mediated payload exit constructs a typed `DataSink` and a
 runtime-owned `DataFlowContext`. The context contains strict labels and exact
 Object id/version/content hashes from materialization, explicit Host
 `source_oids`, and ambient process observations. External LLM, Human,
-JSON-RPC, MCP, filesystem write, Shell, and PTY paths check Host Sink clearance
+JSON-RPC, MCP, Git, filesystem write, Shell, and PTY paths check Host Sink clearance
 before ordinary approval/provider state and revalidate immediately before
 dispatch. Prompt-visible process events contribute their trusted labels to the
 durable LLM context before this check. Process goals/messages/results and
@@ -263,7 +265,8 @@ not package or restore filesystem, shell, JSON-RPC endpoints, global Skill
 trust, human, network, or provider side effects.
 
 An image-package boot materializes the package `workspace/` seed into a private
-per-process directory under `agent_outputs/image_workspaces/`, sets the process
+per-process directory under the configured `image.materialized_workspace_root`
+(`agent_outputs/image_workspaces/` by default), sets the process
 cwd from the package manifest, and grants only the manifest-declared
 `workspace.grants` for that private copy. Package JIT tools live under
 `tools/jit-tools.json` and `tools/scripts/*.ts`; they are registered as
@@ -400,9 +403,11 @@ so a process crash cannot turn an uncertain external effect into “no effect
 recorded.”
 
 Terminal human reads and automatic prompt/decision writes follow the same
-protocol. Their effect context contains request id, purpose, byte/character
-counts, and hashes only; raw prompts, answers, and provider exception text are
-not persisted. A successful human interaction is not replayed when later
+protocol. Their effect and audit context contains request id, purpose,
+byte/character counts, and hashes only; provider exception text is not
+persisted there. The complete prompt/request payload and terminal answer are
+persisted separately in `human_requests.payload_json` and `decision_json` and
+survive reopen. A successful human interaction is not replayed when later
 event/audit/classification settlement fails: the request decision commits and
 the pending intent remains the reconciliation evidence. A Human provider that
 certifies `ProviderEffectNotStarted` instead abandons the intent and restores
@@ -423,6 +428,12 @@ claims, and recovers Object Tasks. Each backlog is read in configured,
 hard-bounded keyset pages. Runtime publications are also durably bound to their
 Explainable Operation rows, so startup converges a terminal publication and its
 operation outcome instead of inferring an outcome from process state alone.
+
+The Runtime then remains non-`OPEN` while it runs startup hooks, starts the
+ObjectTask worker, performs any checkpoint payload delivery handshake,
+reconciles terminal restore publications again, and commits the payload
+acknowledgement. Only after this STARTING phase completes does normal mutation
+admission open.
 
 For JSON-RPC and Streamable HTTP MCP, the pending intent and all finite remote
 authority reservations are durable before non-local DNS resolution. A
@@ -467,12 +478,18 @@ exact tiers and eligibility rules.
 
 ## Scheduler
 
-The scheduler is thread-backed. It starts one worker task per runnable process
-up to `config.scheduler.max_workers`, and each task advances only that process
+The scheduler is thread-backed. Its normal executor starts one worker task per
+runnable process up to `config.scheduler.max_workers`, and each task advances only that process
 until it blocks, exits, fails, or the shared quantum budget is exhausted. Public
 async APIs remain available for event-loop hosts, but they are wrappers around
 the same scheduler and do not mean process quanta are serialized on one asyncio
 loop.
+
+Unblock quanta use a second executor with the same configured capacity. During
+the bounded unblock window, normal and unblock work can therefore occupy up to
+approximately twice `max_workers`; the setting is a per-pool capacity, not a
+global thread ceiling. Scheduling is status/claim safe but does not promise
+round-robin fairness between runnable pids.
 
 The high-level synchronous entrypoint is:
 
@@ -486,7 +503,9 @@ Event-loop hosts should use:
 results = await runtime.arun_until_idle(max_quanta=10)
 ```
 
-By default it:
+When callers omit `max_quanta`, the Runtime uses
+`runtime.run_until_idle_max_quanta`; its default is `None`, meaning no nominal
+quantum limit and no bounded-run drain deadline. In all cases, a run:
 
 1. runs runnable processes,
 2. processes pending human terminal messages when work is blocked on human I/O,
@@ -668,8 +687,11 @@ run only after the store transaction and lock are released. Per killed process,
 Object finalization, `PROCESS_EXITED` publication, and terminal notification are
 attempted independently across the whole subtree; aggregated cleanup failures
 are recorded as `resource.limit_finalize_failed` when the warning sink remains
-available. Fork and spawn may request a child budget, but it must fit within the
-parent's remaining budget.
+available. Fork and spawn may request a child budget. Cumulative/reservable
+quantities must fit within the parent's remaining amount after sibling
+reservations. Peak/non-reservable limits such as subprocess RSS and maximum
+child count are checked against every ancestor's ceiling rather than subtracted
+as remaining capacity; actual use remains subject to all ancestor limits.
 `exec_process` keeps the same pid and does not reset usage or increase budget.
 Checkpoint restore replays recorded process rows, including their resource
 state, for the restored processes.
@@ -720,7 +742,9 @@ only when the primitive/provider implements one explicitly.
 
 ## Human Queue
 
-Human interaction is modeled as runtime objects, not raw prompt text.
+Human interaction is modeled as typed runtime objects rather than untracked
+terminal strings. Request and answer payloads may be retained in their dedicated
+Human records; effect and audit metadata remain content-free as described below.
 
 - `ask_human` creates a blocking question.
 - `request_permission` requires human write authority, creates a blocking scoped
@@ -730,13 +754,14 @@ Human interaction is modeled as runtime objects, not raw prompt text.
   privileged rights, `shell:*` execute, or root/global filesystem write such as
   `filesystem:/:*`; workspace write remains a human-approvable scope.
 - `human_output` writes through the HumanObject primitive and provider. It
-  commits `delivered` request state, audit, event, and a structured pending
-  external-effect intent in one transaction before calling the provider. A
-  provider exception is finalized as unknown when possible and records only
-  `provider_error_type`, never exception text; if delivery succeeds but
-  classification/final persistence fails, the pending row remains and the call
-  is not retried. Thus output is at-most-once: no post-provider failure can
-  leave a replayable request or restore already committed one-shot authority.
+  commits the `delivered` request marker and structured pending external-effect
+  intent before calling the provider. Event, audit, and effect finalization
+  follow a successful provider call. A provider exception is finalized as
+  unknown when possible and records only `provider_error_type`, never exception
+  text; if delivery succeeds but classification/final persistence fails, the
+  pending row remains and the call is not retried. Thus output is at-most-once:
+  no post-provider failure can leave a replayable request or restore already
+  committed one-shot authority.
 - Questions, permission context, approval prompts, and output are also
   data-flow checked against `human:<recipient>:<channel>`. A conditional
   release request contains public metadata and hashes only; it never embeds the

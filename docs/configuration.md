@@ -20,11 +20,19 @@ Product entrypoints use this order:
    the selected runtime store target.
 6. When an overlay is present, construct and validate a new frozen
    `AgentLibOSConfig`; without an overlay, the shared immutable baseline is
-   safe to reuse. Unknown fields and unsafe, inverted, non-finite, or
-   incorrectly typed bounds fail before the Runtime opens.
+   safe to reuse. Unknown fields and unsafe, inverted, or non-finite bounds
+   fail before the Runtime opens. Pydantic accepts its normal compatible
+   scalar coercions for ordinary dataclass fields (for example a numeric YAML
+   string may become a number); callers that generate overlays must not treat
+   this loader as a strict JSON-type validator. Fields whose security contract
+   uses strict numeric types, and the post-construction bound checks, still
+   reject booleans and invalid values.
 
-There is no runtime hot reload. Change the host configuration and open a new
-Runtime. Library callers should pass an explicit config object when they need a
+The frozen config object has no runtime hot reload. Change the host
+configuration and open a new Runtime. The configured default LLM profile is a
+narrow exception for its documented legacy environment mappings: each profile
+resolution snapshots those values and changes invalidate the cached client.
+Library callers should pass an explicit config object when they need a
 different composition:
 
 ```python
@@ -46,6 +54,16 @@ without a project-root config, `DEFAULT_CONFIG.runtime.local_store_target` is
 `local`, an in-memory SQLite store. Scripts and documentation that require state
 across separate CLI invocations should always pass `--db` explicitly.
 
+Relative paths intentionally have different owners. `--config` and explicit
+`module_manifests=` paths resolve from the caller's current working directory;
+configured `modules.manifest_paths` resolve from the Agent libOS project root.
+A relative SQLite `--db` or `runtime.local_store_target` resolves from the
+current working directory when the store opens. With the default local
+substrate, that same directory is the workspace root, and a relative
+`git.worktree_root` resolves below it. An injected substrate can select a
+different workspace root, so library hosts should use explicit absolute store
+and module paths when those roots must not depend on process startup location.
+
 ### Effective LLM profile precedence
 
 For a root spawn, an explicit Host-selected profile id wins, then the selected
@@ -53,8 +71,9 @@ image's `llm_profile`, then `llm.default_profile_id`. An exec keeps the
 process's current profile unless the Host supplies a replacement; a child
 process likewise inherits its parent's profile unless explicitly overridden.
 The CLI reads config profiles only. The GUI may dynamically register a
-user-level profile, and a dynamically registered profile with the same id wins
-over the config profile while that Runtime is open.
+user-level profile, but its create/update API rejects ids owned by config as
+read-only. At the lower-level Host registry API, an explicitly dynamically
+registered profile id shadows a config profile while that Runtime is open.
 
 Within a resolved profile, a non-null profile field wins. Only the profile
 whose id equals `llm.default_profile_id` then inherits the matching legacy
@@ -72,14 +91,24 @@ legacy mappings are
 `OPENAI_REASONING_EFFORT`; `OPENAI_VERBOSITY`; `OPENAI_SAFETY_IDENTIFIER`;
 `OPENAI_PROMPT_CACHE_KEY`; `OPENAI_PROMPT_CACHE_RETENTION`;
 `OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID`; and
-`OPENAI_PARALLEL_TOOL_CALLS`.
+`OPENAI_PARALLEL_TOOL_CALLS`. The default profile also snapshots
+`OPENAI_ENABLE_THINKING` and the OpenAI organization/project routing variables
+(`OPENAI_ORGANIZATION`/`OPENAI_ORG_ID` and
+`OPENAI_PROJECT`/`OPENAI_PROJECT_ID`). Named non-default profiles suppress the
+OpenAI SDK's own ambient endpoint and organization/project fallbacks. Agent
+libOS does not support `OPENAI_CUSTOM_HEADERS`, `OPENAI_ADMIN_KEY`, or
+`OPENAI_WEBHOOK_SECRET` as profile settings; SDK-side values for those variables
+are removed before any provider request rather than becoming untracked profile
+state.
 
 Secrets are the exception to that fallback description: every profile reads
 its API key only from the environment variable named by its `api_key_env`.
 `safety_identifier_env`, when set and no literal `safety_identifier` is set,
-is read before the default profile's legacy safety identifier. A custom base
-URL is permitted when either the profile sets `allow_custom_base_url: true` or
-the Host sets `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1`.
+is authoritative: an unset or empty named variable produces no safety
+identifier and does not fall back to the default profile's legacy identifier.
+A custom base URL is permitted when either the profile sets
+`allow_custom_base_url: true` or the Host sets
+`AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1`.
 
 ## Inspecting exact defaults
 
@@ -149,8 +178,9 @@ configurable. A runtime release emits only the snapshot version it can decode.
 - JSON-RPC/MCP header and stdio allowlists contain environment-variable names.
   Manifests reference those names; resolved secret values must not be persisted
   in registry rows, audit metadata, benchmark provenance, or GUI responses.
-- `git.executable` is resolved on a Host path outside the workspace and must be
-  Git 2.26 or newer. `git.worktree_root` must remain below the workspace, while
+- `git.executable` is resolved on a Host path outside the workspace. The
+  default `git.minimum_version` is `2.26.0`; deployments may configure a
+  different dotted numeric threshold. `git.worktree_root` must remain below the workspace, while
   `git.trusted_metadata_roots` is a Host trust decision for linked-worktree
   metadata and should be as narrow as possible. Remote URL schemes, local file
   remotes, credential-helper inheritance, and SSH-agent inheritance are Host
@@ -160,7 +190,10 @@ configurable. A runtime release emits only the snapshot version it can decode.
   startup. See [Git Provider and Primitive](git.md).
 - `llm.persist_full_io` defaults to true. Set it to false when the deployment's
   user agreement does not authorize retention of full prompts, tool schemas,
-  reasoning, outputs, and raw provider payloads. The opt-out also redacts
+  reasoning, outputs, provider errors, and raw provider payloads. The opt-out
+  persists canonical content-free summary envelopes containing byte counts,
+  JSON shape/count metadata when available, and hashes rather than readable
+  previews. It also redacts
   conditional LLM release resume rows before approval; exact same-runtime
   approval remains supported, while reopen fails that unrecoverable release
   closed instead of rebuilding or dispatching it.

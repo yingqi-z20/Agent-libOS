@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, RLock, Thread
@@ -76,14 +77,19 @@ def _evidence(pid: str) -> ProtectedOperationEvidence:
     )
 
 
-def _setup(runtime, *, preserve_result: bool = False):
+def _setup(
+    runtime,
+    *,
+    preserve_result: bool = False,
+    uses_remaining: int = 1,
+):
     pid = runtime.process.spawn(goal="protected operation sdk")
     capability = runtime.capability.issue_trusted(
         pid,
         "test:item",
         [CapabilityRight.READ],
         issued_by="test",
-        uses_remaining=1,
+        uses_remaining=uses_remaining,
     )
     decision = runtime.capability.require(
         pid,
@@ -265,6 +271,138 @@ def test_sdk_revalidates_provider_registry_binding_before_every_phase() -> None:
         assert len(effects) == 1
         assert effects[0].transaction_state == "unknown"
         assert effects[0].effect_state == "finalized"
+
+
+def test_sdk_registry_guard_covers_live_compare_and_provider_callable() -> None:
+    with temporary_runtime() as runtime:
+        pid, _capability, contract, base_invocation = _setup(runtime)
+        captured = ProviderRegistryBinding(
+            registry_spec_sha256="a" * 64,
+            registry_generation=1,
+        )
+        guard_active = False
+        trace: list[str] = []
+
+        @contextmanager
+        def phase_guard():
+            nonlocal guard_active
+            assert guard_active is False
+            guard_active = True
+            trace.append("guard_enter")
+            try:
+                yield
+            finally:
+                trace.append("guard_exit")
+                guard_active = False
+
+        def resolve() -> ProviderRegistryBinding:
+            assert guard_active is True
+            trace.append("resolve")
+            return captured
+
+        def provider_call() -> str:
+            assert guard_active is True
+            trace.append("provider")
+            return "ok"
+
+        invocation = replace(
+            base_invocation,
+            provider_registry_binding=captured,
+            provider_registry_binding_resolver=resolve,
+            provider_registry_phase_guard=phase_guard,
+        )
+        with runtime.protected_operations.start(
+            contract,
+            invocation,
+            provider=_Provider(),
+        ) as operation:
+            result = operation.call(
+                ProviderPhase("read", information_flow=True),
+                provider_call,
+            )
+            operation.complete(result, _evidence(pid))
+
+        assert trace == ["guard_enter", "resolve", "provider", "guard_exit"]
+
+
+def test_sdk_registry_guard_rejects_async_phase_before_provider_dispatch() -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, contract, base_invocation = _setup(runtime)
+        captured = ProviderRegistryBinding(
+            registry_spec_sha256="a" * 64,
+            registry_generation=1,
+        )
+        invocation = replace(
+            base_invocation,
+            provider_registry_binding=captured,
+            provider_registry_binding_resolver=lambda: captured,
+            provider_registry_phase_guard=lambda: RLock(),
+        )
+        provider_calls = 0
+
+        async def attempt() -> None:
+            nonlocal provider_calls
+
+            async def provider_call() -> str:
+                provider_calls += 1
+                return "unexpected"
+
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                await operation.acall(
+                    ProviderPhase("read", information_flow=True),
+                    provider_call,
+                )
+
+        with pytest.raises(
+            ValidationError,
+            match=r"registry-guarded provider phases must use synchronous call\(\)",
+        ):
+            asyncio.run(attempt())
+
+        assert provider_calls == 0
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+
+
+def test_sdk_requires_declared_prepared_recovery_handler_before_start() -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, base_contract, base_invocation = _setup(runtime)
+        contract = replace(
+            base_contract,
+            name="primitive.test.missing_prepared_recovery",
+            prepared_recovery="  missing_handler  ",
+        )
+        assert contract.prepared_recovery == "missing_handler"
+        runtime.protected_operations.register_contract(contract)
+        prepared: list[str] = []
+        invocation = replace(
+            base_invocation,
+            prepare=lambda: prepared.append("ran"),
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match="prepared recovery handler is not registered: missing_handler",
+        ):
+            runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            )
+
+        assert prepared == []
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+
+        with pytest.raises(
+            ValueError,
+            match="prepared recovery policy names must be non-empty strings",
+        ):
+            replace(contract, prepared_recovery=123)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -505,6 +643,122 @@ def test_sdk_success_consumes_authority_and_persists_safe_evidence() -> None:
                 "commits_authority": True,
             }
         ]
+
+
+def test_sdk_explicit_idempotency_key_blocks_retained_duplicate_before_provider() -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, contract, base_invocation = _setup(
+            runtime,
+            uses_remaining=2,
+        )
+        invocation = replace(
+            base_invocation,
+            idempotency_key="stable-request-7",
+        )
+        provider_calls = 0
+
+        def provider_call() -> str:
+            nonlocal provider_calls
+            provider_calls += 1
+            return "ok"
+
+        with runtime.protected_operations.start(
+            contract,
+            invocation,
+            provider=_Provider(),
+        ) as operation:
+            result = operation.call(
+                ProviderPhase("read", information_flow=True),
+                provider_call,
+            )
+            operation.complete(result, _evidence(pid))
+
+        with pytest.raises(
+            ValidationError,
+            match="duplicate external effect dispatch blocked by idempotency key",
+        ):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                result = operation.call(
+                    ProviderPhase("read", information_flow=True),
+                    provider_call,
+                )
+                operation.complete(result, _evidence(pid))
+
+        assert provider_calls == 1
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        effects = runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].idempotency_key == "stable-request-7"
+
+
+def test_sdk_default_idempotency_key_is_fresh_for_independent_operations() -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, contract, invocation = _setup(
+            runtime,
+            uses_remaining=2,
+        )
+
+        for _index in range(2):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                result = operation.call(
+                    ProviderPhase("read", information_flow=True),
+                    lambda: "ok",
+                )
+                operation.complete(result, _evidence(pid))
+
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
+        effects = runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 2
+        assert len({effect.idempotency_key for effect in effects}) == 2
+
+
+def test_sdk_not_started_abandonment_releases_explicit_idempotency_key() -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, contract, base_invocation = _setup(runtime)
+        invocation = replace(
+            base_invocation,
+            idempotency_key="not-started-request-9",
+        )
+
+        with pytest.raises(ProviderEffectNotStarted, match="not started"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                operation.call(
+                    ProviderPhase("read", information_flow=True),
+                    lambda: (_ for _ in ()).throw(
+                        ProviderEffectNotStarted("not started")
+                    ),
+                )
+
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=pid) == []
+
+        with runtime.protected_operations.start(
+            contract,
+            invocation,
+            provider=_Provider(),
+        ) as operation:
+            result = operation.call(
+                ProviderPhase("read", information_flow=True),
+                lambda: "ok",
+            )
+            operation.complete(result, _evidence(pid))
+
+        effects = runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].idempotency_key == "not-started-request-9"
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
 
 
 def test_sdk_preserves_classifier_provider_receipt_when_evidence_has_none() -> None:
@@ -2088,6 +2342,105 @@ def test_sdk_recovers_prepared_reservation_without_provider_reconciliation(
     finally:
         if not store_closed:
             runtime.close()
+
+
+def test_sdk_prepared_recovery_handler_failure_keeps_intent_and_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, base_contract, invocation = _setup(runtime)
+        now = utc_now()
+        repair_marker = HumanRequest(
+            request_id=new_id("hreq"),
+            pid=pid,
+            human="owner",
+            payload={"type": "approval", "question": "prepared repair marker"},
+            status=HumanRequestStatus.PENDING,
+            decision=None,
+            blocking=False,
+            created_at=now,
+            updated_at=now,
+        )
+        runtime.store.insert_human_request(repair_marker)
+        contract = replace(
+            base_contract,
+            name="primitive.test.prepared_recovery_failure",
+            prepared_recovery="test_prepared_repair",
+        )
+        runtime.protected_operations.register_contract(contract)
+        fail_recovery = [True]
+        recovery_calls: list[str] = []
+
+        def recover(effect) -> None:
+            marker = runtime.store.get_human_request(repair_marker.request_id)
+            assert marker is not None
+            marker.status = HumanRequestStatus.DELIVERED
+            marker.decision = {
+                "prepared_repair_effect_id": effect.effect_id,
+            }
+            marker.updated_at = utc_now()
+            runtime.store.update_human_request(marker)
+            recovery_calls.append(effect.effect_id)
+            if fail_recovery[0]:
+                raise RuntimeError("prepared repair failed")
+
+        runtime.protected_operations.register_prepared_recovery(
+            "test_prepared_repair",
+            recover,
+        )
+        operation = runtime.protected_operations.start(
+            contract,
+            invocation,
+            provider=_Provider(),
+        )
+        operation.__enter__()
+        effect_id = operation.effect_id
+        assert effect_id is not None
+        reservation_id = operation._reservation_ids[0]
+
+        scope = operation._operation_cm
+        assert scope is not None
+        interrupted = RuntimeError("simulated runtime crash")
+        scope.__exit__(type(interrupted), interrupted, interrupted.__traceback__)
+        operation._operation_cm = None
+        monkeypatch.setattr(
+            runtime.protected_operations,
+            "_require_recovery_lease",
+            lambda: None,
+        )
+
+        with pytest.raises(RuntimeError, match="prepared repair failed"):
+            runtime.protected_operations.recover_prepared()
+
+        retained = runtime.store.get_external_effect(effect_id)
+        assert retained is not None
+        assert retained.transaction_state == "prepared"
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
+        reservation = runtime.store.get_capability_use_reservation(reservation_id)
+        assert reservation is not None
+        assert reservation["status"] == "reserved"
+        rolled_back_marker = runtime.store.get_human_request(
+            repair_marker.request_id
+        )
+        assert rolled_back_marker is not None
+        assert rolled_back_marker.status == HumanRequestStatus.PENDING
+        assert rolled_back_marker.decision is None
+
+        fail_recovery[0] = False
+        summary = runtime.protected_operations.recover_prepared()
+        assert summary.total_count == 1
+        assert recovery_calls == [effect_id, effect_id]
+        assert runtime.store.get_external_effect(effect_id) is None
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        reservation = runtime.store.get_capability_use_reservation(reservation_id)
+        assert reservation is not None
+        assert reservation["status"] == "restored"
+        committed_marker = runtime.store.get_human_request(repair_marker.request_id)
+        assert committed_marker is not None
+        assert committed_marker.status == HumanRequestStatus.DELIVERED
+        assert committed_marker.decision == {
+            "prepared_repair_effect_id": effect_id,
+        }
 
 
 def test_sdk_recovery_restores_prepared_human_output_claim(tmp_path: Path) -> None:

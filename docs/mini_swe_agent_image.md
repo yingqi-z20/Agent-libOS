@@ -9,6 +9,12 @@ uv run agent-libos --db .agent_libos.sqlite images validate images/mini-swe-agen
 uv run agent-libos --db .agent_libos.sqlite images register images/mini-swe-agent
 ```
 
+Package validation and registration can inspect the package without Deno, but
+booting this image validates and registers its process-local TypeScript JIT
+tool. A usable `deno` executable is therefore required to spawn/boot and run the
+image; missing Deno makes boot fail validation rather than silently omitting the
+`bash` tool.
+
 The CLI loads the project-root `config.yaml` when it is present. In this
 checkout that configuration selects `.agent_libos.sqlite`, so omitting `--db`
 persists the registration there. A checkout without project configuration

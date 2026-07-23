@@ -150,6 +150,14 @@ return an opaque keyset cursor for the next call. A request cannot exceed the
 policy hard limit. `dry_run=True` performs the same eligibility decisions but
 does not update a payload.
 
+Retention ages are measured from terminal evidence, not from the page-order
+cursor. For an LLM call the age anchor is its durable `completed_at`. For an
+external effect it is `updated_at` (falling back to `created_at` only when the
+former is absent), which normally represents the finalization update. Rows with
+a missing, invalid, naive, or future terminal timestamp are not advanced. The
+storage scan may use the older `created_at` as a coarse indexed cutoff, but the
+maintenance service always repeats the exact terminal-age decision above.
+
 The SQL adapters push the coarse age cutoff, terminal-state predicate, and
 `full`/`summary` tier predicate into the keyset query. Consequently durable
 nonterminal and `hash_only` history does not consume a page and is not scanned
@@ -168,9 +176,16 @@ audit failure rolls back the batch.
 ## `persist_full_io` compatibility
 
 `llm.persist_full_io=true` remains the write-time choice for full LLM I/O.
-`persist_full_io=false` rows written by earlier releases contain bounded
-observation previews. The retention service recognizes those rows as the
-summary tier and can normalize them to the new content-free summary envelope;
+New `persist_full_io=false` rows are written directly at the `summary` tier:
+every content-bearing field and provider error is replaced by the canonical
+content-free envelope above, and `observability` contains only the aggregate
+retention marker. No prompt, schema, response, tool-call argument, reasoning,
+provider payload, error text, key name, scalar value, or preview is durable in
+that row.
+
+Opt-out rows written by earlier releases can contain bounded observation
+previews. The retention service recognizes those legacy rows as the summary
+tier and can normalize them to the canonical content-free summary envelope;
 normalization also replaces the complete legacy `observability` mapping with
 the retention marker described above. It never restores missing content. A
 legacy truncated tool-call preview remains protected when runtime-dependency

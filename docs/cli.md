@@ -10,7 +10,8 @@ host-facing control surfaces over the same runtime boundary.
 Use `--db` to select a runtime store. The sentinel target `local` is in-memory
 SQLite. Any other filesystem path creates or opens a persistent SQLite
 database. A `postgresql://` or `postgres://` DSN opens a PostgreSQL runtime
-store.
+store. PostgreSQL support is optional; install it before using a DSN, for
+example with `uv sync --frozen --all-groups --extra postgres`.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite <command>
@@ -32,10 +33,13 @@ explicit YAML overlay instead:
 uv run agent-libos --config ./agent-config.yaml spawn --goal "Inspect README.md"
 ```
 
-The file is a strict overlay on `agent_libos.config.DEFAULT_CONFIG`. Mapping
+The file is a validated overlay on `agent_libos.config.DEFAULT_CONFIG`. Mapping
 fields are merged recursively, so adding `llm.profiles.coding` keeps the default
 profile. Scalar fields and list/tuple fields replace the default value. Unknown
-fields, invalid types, and unsafe numeric limits fail at startup.
+fields and unsafe values fail at startup. The Pydantic dataclass loader accepts
+compatible coercions for ordinary scalar fields, so this is not a strict
+JSON-type boundary; security-sensitive numeric bounds still receive explicit
+post-construction validation.
 
 ```yaml
 runtime:
@@ -77,10 +81,18 @@ protected by `flock`, while the database and SQLite sidecars are tightened to
 owner-only (`0600`); otherwise SQLite's kernel-managed exclusive database
 lock is used instead of a stale-file protocol. PostgreSQL uses a session
 advisory key scoped to `current_database()` plus `current_schema()`. A second
-writable Runtime cannot open the same database/schema target until the first
-Runtime closes cleanly. See [Runtime Storage](storage.md).
+writable Runtime cannot open the same database/schema target while a live owner
+holds the lease. A normal close or process/session termination releases it;
+startup recovery then coordinates any durable interrupted state. See
+[Runtime Storage](storage.md).
 Relative `modules.manifest_paths` entries in the selected config resolve from
 the project root, not the shell's current working directory.
+By contrast, a relative `--config`, explicit `--module-manifest`, SQLite
+`--db`, or `runtime.local_store_target` is rooted at the current working
+directory. With the default local substrate that directory is also the Runtime
+workspace; `git.worktree_root` is relative to that workspace and must remain
+below it. See [Configuration](configuration.md) before combining these settings
+from different launch directories.
 `llm.parallel_tool_calls` is opt-in and can be overridden per profile. When it
 is enabled, OpenAI may return multiple tool calls in one action-selection
 response; Agent libOS dispatches them sequentially in the same quantum rather
@@ -96,11 +108,11 @@ Shell policy labels are fixed semantic values:
 `always_deny`, `allowlist_auto_else_ask`, `blocklist_ask_else_auto`, and
 `always_allow`. Configuration may select a default policy and edit exact/prefix
 argv rules, but it cannot remap those labels to different meanings. The removed
-`checkpoints.auto_high_risk_checkpoint` field was never an implemented
+`checkpoint.auto_high_risk_checkpoint` field was never an implemented
 primitive; high-risk confirmation remains explicit at the invoking host/tool
 surface, and checkpoints are created only by an explicit checkpoint operation.
-Because config overlays are strict, either legacy field now fails validation
-instead of being silently ignored.
+Because config overlays reject unknown keys, this former field now fails
+validation instead of being silently ignored.
 
 Each configured shell command rule must contain an executable, its first argv
 token must be non-blank, and no token may contain NUL. Invalid rules fail config
@@ -156,7 +168,14 @@ modules       startup Runtime Module inspection and verification
 human         process pending human messages manually
 ```
 
-Run `uv run agent-libos <command> --help` for argparse-generated details.
+Run `uv run agent-libos <command> --help` for the complete, argparse-generated
+parameter list. The narrative sections below document workflows and security
+contracts; lists labelled “useful options” are intentionally not exhaustive.
+
+`demo` writes the deterministic preview to
+`agent_outputs/demo_patch_preview.txt` below the Runtime workspace and uses
+overwrite mode. Preserve or move an existing file at that path before running
+the demo if it contains user data.
 
 `--actor-pid` is a command-group option for `checkpoint`, `skills`,
 `capabilities`, `images`, `jsonrpc`, and `mcp`. Place it after the group name
@@ -191,9 +210,12 @@ uv run agent-libos --db .agent_libos.sqlite workflow run get_working_directory
 ```
 
 `run` uses the high-level runtime scheduler, so human terminal messages are
-processed as part of runtime execution. Without `--max-quanta`, it runs until
-the runtime becomes idle; pass `--max-quanta <n>` to bound the total number of
-LLM/tool quanta across all runnable processes.
+processed as part of runtime execution. Without `--max-quanta`, it uses
+`runtime.run_until_idle_max_quanta`; the checked-in config may bound that value.
+Only a configured `null` value means run until the Runtime becomes idle without
+a quantum limit. Pass `--max-quanta <n>` to set an explicit bound on the total
+number of LLM/tool quanta across all runnable processes. Interactive run,
+`exec --run`, and `message --run` use the same default.
 
 `cd <pid> <path>` requires filesystem `read` authority for the selected
 directory. Explicit working directories for child processes and PTY creation
@@ -211,9 +233,11 @@ per-process LLM routing. The process row stores only the profile id; API keys
 remain in host environment variables configured by the profile. If omitted,
 spawn uses the selected image's `llm_profile` default and then
 `config.llm.default_profile_id`; exec keeps the current process profile unless
-overridden. Only the configured default profile inherits legacy `OPENAI_*`
-provider/model environment variables. Other named profiles should declare their
-model and endpoint explicitly.
+overridden. Only the configured default profile inherits the documented legacy
+`OPENAI_*` endpoint, model, account-routing, and provider-policy environment
+variables, including `OPENAI_ENABLE_THINKING`. Other named profiles should
+declare their model and endpoint explicitly; they still read their credential
+from the exact variable named by `api_key_env`.
 
 The CLI reads profiles from `config.yaml` or `--config`; it does not read the
 GUI's user-level profile file. The GUI stores profiles created from its model
@@ -347,8 +371,10 @@ show whether `parallel_tool_calls` was enabled for the action-selection request.
 Full LLM input/output persistence is enabled by default for self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. Set
 `config.llm.persist_full_io=False` when a user or operator opts out of storing
-sensitive prompt, tool, reasoning, and provider payload fields; the runtime
-then persists only bounded previews and hashes for those fields.
+sensitive prompt, tool, reasoning, provider-error, and provider payload fields.
+The runtime then writes canonical content-free summary envelopes with byte
+counts, JSON shape/count metadata when available, and hashes; it does not keep
+readable previews of those fields.
 
 ## Payload Retention
 
@@ -458,10 +484,12 @@ Interactive slash commands:
 - `/pid <pid>`: switch the default target process.
 - `/answer <text>` or plain text while a human question is pending: answer the
   pending request.
-- `/approve`, `/reject`, `/allow`, and `/ask`: respond to pending approval or
-  permission requests. For a permission request, `/approve` and `/allow` map to
-  `always_allow`, `/reject` maps to `always_deny`, and `/ask` maps to
-  `ask_each_time`; `allow_once` is not a terminal response policy.
+- `/approve` and `/reject`: resolve an ordinary approval or a permission
+  request. For a permission request, they map to `always_allow` and
+  `always_deny`.
+- `/allow` and `/ask`: permission requests only; they map to `always_allow` and
+  `ask_each_time`. `allow_once` is not a terminal response policy. A command
+  that is not valid for the displayed request leaves that request pending.
 - `/exit`: leave the interactive loop.
 
 ## Process Messages
@@ -482,7 +510,9 @@ Useful options:
 - `--reply-to <message_id>`
 - `--payload-json <object>`
 - `--run`
-- `--max-quanta <n>`: optional; omitted means run until idle.
+- `--max-quanta <n>`: optional; omitted uses
+  `runtime.run_until_idle_max_quanta`, whose `null` value means unbounded until
+  idle.
 
 ## Process Builtins
 
@@ -504,13 +534,16 @@ Useful exec options:
 - `--preserve-memory` / `--no-preserve-memory`
 - `--preserve-capabilities`
 - `--run` / `--no-run`
-- `--max-quanta <n>`: optional when `--run` is set; omitted means run until idle.
+- `--max-quanta <n>`: optional when `--run` is set; omitted uses
+  `runtime.run_until_idle_max_quanta`, whose `null` value means unbounded until
+  idle.
 
 Exec never grants target-image `required_capabilities` automatically. If the
 target is an image package, its `workspace/` seed is materialized into a private
-per-process directory under `agent_outputs/image_workspaces/`. For any target
-image, `required_modules` are checked before boot; the runtime must already
-have loaded each declared `(module_id, source_sha256)` pair.
+per-process directory under `image.materialized_workspace_root` (by default
+`agent_outputs/image_workspaces/`). For any target image, `required_modules` are
+checked before boot; the runtime must already have loaded each declared
+`(module_id, source_sha256)` pair.
 
 Exec is admitted only for a Host-owned `runnable` process or from the process's
 exact active execution lease. A child/message/Human/Tool/pause/Host-resume wait
@@ -618,8 +651,8 @@ tools in the process tool table.
 ```bash
 uv run agent-libos --db .agent_libos.sqlite images list
 uv run agent-libos --db .agent_libos.sqlite images inspect coding-agent:v0
-uv run agent-libos --db .agent_libos.sqlite images validate images/review-agent
-uv run agent-libos --db .agent_libos.sqlite images register images/review-agent
+uv run agent-libos --db .agent_libos.sqlite images validate images/mini-swe-agent
+uv run agent-libos --db .agent_libos.sqlite images register images/mini-swe-agent
 uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
 ```
 
@@ -686,8 +719,12 @@ uv run agent-libos --db .agent_libos.sqlite skills register ~/.agent-libos/skill
 uv run agent-libos --db .agent_libos.sqlite skills untrust ~/.agent-libos/skills/review-helper
 ```
 
-`--actor-pid <pid>` makes the CLI enforce that process's Skill, source, and
-trust capabilities.
+`--actor-pid <pid>` makes `discover`, `inspect`, `register`, `activate`,
+`unload`, `trust`, and `untrust` enforce that process's applicable registry,
+package-source, Skill, target-process, and trust capabilities. Static
+`skills validate` deliberately reads a Host filesystem path and rejects
+`--actor-pid`; use process-mode `skills register` when package bytes must be
+read through the actor's workspace filesystem authority.
 
 ## Capability Commands
 
@@ -705,10 +742,11 @@ pattern, rights, `allow`/`deny`/`ask` effect, issuer lineage, delegation depth,
 status, expiry, use count, constraints, and metadata. One-shot approval is
 represented as `effect=allow` with `uses_remaining=1`.
 
-Without `--actor-pid`, capability commands run as an audited admin actor. With
-`--actor-pid`, the command runs as that process: `grant` requires grant/admin
-authority, `delegate` requires a covering delegable parent capability, and
-`revoke` requires holder, issuer, revoke, or admin authority.
+Without `--actor-pid`, capability commands run as an audited admin actor; that
+Host mode changes who authorizes `grant` and `revoke`, but does not bypass
+delegation attenuation. `delegate` always requires a covering, delegable parent
+capability. With `--actor-pid`, `grant` additionally requires grant/admin
+authority and `revoke` requires holder, issuer, revoke, or admin authority.
 
 ## JSON-RPC Commands
 
@@ -724,9 +762,16 @@ uv run agent-libos --db .agent_libos.sqlite jsonrpc unregister demo-weather
 The manifest path is user supplied; copy and adapt the complete example in
 [jsonrpc.md](jsonrpc.md).
 
-Registry commands accept `--actor-pid <pid>` to enforce that process's
-`jsonrpc_endpoint:*` or exact endpoint capabilities. Without `--actor-pid`,
-they run as audited admin registry operations.
+Registry commands accept `--actor-pid <pid>` with the following authority
+contract. Without it, they run as audited admin registry operations.
+
+| JSON-RPC subcommand | Process-mode authority |
+| --- | --- |
+| `register` | filesystem `read` for the manifest plus exact endpoint `write`; `--replace` requires endpoint `admin` |
+| `list` | registry `read` |
+| `inspect` | exact endpoint `read`; sensitive manifest fields remain hidden |
+| `unregister` | exact endpoint `admin` |
+| `call <pid> ...` | the target `<pid>` supplies the declared method right; an explicitly supplied `--actor-pid` must equal `<pid>` and does not add authority |
 
 `jsonrpc call` always runs as the target process pid and requires that pid to
 hold the method capability, such as
@@ -751,9 +796,17 @@ uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
 The manifest path is user supplied; copy and adapt [mcp.md](mcp.md). The `mcp`
 extra is not installed by the core dependency command.
 
-Registry commands accept `--actor-pid <pid>` to enforce that process's
-`mcp_server:*` or exact server capabilities. Without `--actor-pid`, they run as
-audited admin registry operations.
+Registry commands accept `--actor-pid <pid>` with the following authority
+contract. Without it, they run as audited admin registry operations.
+
+| MCP subcommand | Process-mode authority |
+| --- | --- |
+| `register` | filesystem `read` for the manifest plus exact server `write`; `--replace` requires server `admin`; stdio also requires `process:spawn write` and exact command `execute` |
+| `list` | registry `read` |
+| `inspect` | exact server `read`; sensitive manifest fields remain hidden |
+| `tools` | exact server `read`; `--refresh` also requires server `execute` and the stdio local-spawn rights when applicable |
+| `unregister` | exact server `admin` |
+| `call <pid> ...` | the target `<pid>` supplies the declared tool right and any stdio local-spawn rights; an explicitly supplied `--actor-pid` must equal `<pid>` and does not add authority |
 
 Sink trust is intentionally not an MCP, model-tool, or process CLI registry.
 Administrators configure it under `data_flow.sink_rules` or use the Host-only

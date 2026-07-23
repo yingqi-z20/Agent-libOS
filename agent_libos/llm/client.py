@@ -59,6 +59,10 @@ class LLMClient:
     prompt_cache_retention: Literal["in-memory", "24h"] | None = None
     responses_previous_response_id: bool | None = None
     parallel_tool_calls: bool | None = None
+    enable_thinking: bool | None = None
+    organization: str | None = None
+    project: str | None = None
+    inherit_ambient_openai_sdk_config: bool = True
     allow_custom_base_url: bool = False
     defaults: LLMDefaults = field(default_factory=lambda: DEFAULT_CONFIG.llm, repr=False)
     _client: Any | None = field(default=None, init=False, repr=False)
@@ -134,6 +138,20 @@ class LLMClient:
                 "OPENAI_PARALLEL_TOOL_CALLS",
                 default=defaults.parallel_tool_calls,
             ),
+            enable_thinking=(
+                _bool_env_from(env, "OPENAI_ENABLE_THINKING", default=False)
+                if "OPENAI_ENABLE_THINKING" in env
+                else None
+            ),
+            organization=(
+                _optional_env_from(env, "OPENAI_ORGANIZATION")
+                or _optional_env_from(env, "OPENAI_ORG_ID")
+            ),
+            project=(
+                _optional_env_from(env, "OPENAI_PROJECT")
+                or _optional_env_from(env, "OPENAI_PROJECT_ID")
+            ),
+            inherit_ambient_openai_sdk_config=False,
             allow_custom_base_url=selected_allow_custom_base_url,
             defaults=defaults,
         )
@@ -423,7 +441,7 @@ class LLMClient:
             from openai import OpenAI
         except ImportError as exc:
             raise LLMError("The OpenAI Python SDK is not installed. Install it with `pip install openai`.") from exc
-        self._client = OpenAI(**self._client_kwargs())
+        self._client = self._normalize_openai_sdk_client(OpenAI(**self._client_kwargs()))
         return self._client
 
     def _async_client_or_raise(self) -> Any:
@@ -439,7 +457,32 @@ class LLMClient:
         # profile client makes the next quantum reuse a transport owned by a
         # closed (or different worker) loop.  Keep explicitly injected clients
         # for tests/hosts, but scope real SDK clients to one request.
-        return AsyncOpenAI(**self._client_kwargs())
+        return self._normalize_openai_sdk_client(AsyncOpenAI(**self._client_kwargs()))
+
+    @staticmethod
+    def _normalize_openai_sdk_client(client: Any) -> Any:
+        """Remove unsupported SDK-owned ambient state before the first request."""
+        # The SDK reads OPENAI_CUSTOM_HEADERS inside its constructor even when
+        # endpoint and account selectors are supplied explicitly. Agent libOS
+        # does not expose or identity-bind per-profile custom headers, so none
+        # are authorized. Clear them before the client can issue a request.
+        # Do not consult the environment again here: another thread can remove
+        # it after the SDK captured the headers but before construction returns.
+        custom_headers = getattr(client, "_custom_headers", None)
+        if not isinstance(custom_headers, dict):
+            raise LLMError(
+                "the installed OpenAI SDK cannot safely isolate custom headers"
+            )
+        custom_headers.clear()
+
+        # These fields are also SDK ambient fallbacks, not Agent libOS profile
+        # settings. They are unused by provider calls and must not become hidden
+        # state outside the resolved profile snapshot.
+        if hasattr(client, "admin_api_key"):
+            client.admin_api_key = None
+        if hasattr(client, "webhook_secret"):
+            client.webhook_secret = None
+        return client
 
     @asynccontextmanager
     async def _async_client_scope(self) -> Any:
@@ -472,6 +515,22 @@ class LLMClient:
             kwargs["api_key"] = api_key
         if self.base_url:
             kwargs["base_url"] = self.base_url
+        elif not self.inherit_ambient_openai_sdk_config:
+            # The OpenAI SDK otherwise re-reads OPENAI_BASE_URL even when the
+            # resolved Agent libOS profile intentionally selected the default
+            # OpenAI endpoint.
+            kwargs["base_url"] = "https://api.openai.com/v1"
+        if self.organization is not None:
+            kwargs["organization"] = self.organization
+        elif not self.inherit_ambient_openai_sdk_config:
+            # Empty values are explicit to the SDK and therefore suppress its
+            # ambient OPENAI_ORG_ID/OPENAI_PROJECT_ID fallbacks. Any generated
+            # account-routing headers therefore contain no ambient selector.
+            kwargs["organization"] = ""
+        if self.project is not None:
+            kwargs["project"] = self.project
+        elif not self.inherit_ambient_openai_sdk_config:
+            kwargs["project"] = ""
         return kwargs
 
     def _responses_payload(
@@ -750,19 +809,30 @@ class LLMClient:
         return self.base_url is None or _is_openai_base_url(self.base_url)
 
     def _extra_body(self) -> dict[str, Any]:
-        configured_thinking = os.getenv("OPENAI_ENABLE_THINKING")
-        if configured_thinking is None:
+        configured, enabled = self._enable_thinking_setting()
+        if not configured:
             return {}
-        return {"enable_thinking": _bool_env_value(configured_thinking)}
+        return {"enable_thinking": enabled}
 
     def _needs_non_thinking_retry(self, completion: LLMCompletion) -> bool:
         if completion.tool_calls or completion.content.strip():
             return False
-        if os.getenv("OPENAI_ENABLE_THINKING") is not None:
+        configured, _enabled = self._enable_thinking_setting()
+        if configured:
             return False
         if self.base_url is None or _is_openai_base_url(self.base_url):
             return False
         return True
+
+    def _enable_thinking_setting(self) -> tuple[bool, bool]:
+        if self.enable_thinking is not None:
+            return True, bool(self.enable_thinking)
+        if not self.inherit_ambient_openai_sdk_config:
+            return False, False
+        configured = os.getenv("OPENAI_ENABLE_THINKING")
+        if configured is None:
+            return False, False
+        return True, _bool_env_value(configured)
 
     def _temperature(self, value: float | None) -> float:
         return self.defaults.temperature if value is None else value

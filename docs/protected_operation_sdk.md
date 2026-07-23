@@ -89,11 +89,27 @@ contract with a data-flow direction must also declare `information_flow=True`.
 
 If `prepare` changes durable domain state, declare a named
 `prepared_recovery` policy on the contract and register its trusted recovery
-handler during Runtime composition. The effect row persists only the policy
-name, safe observation, and reservation IDs. On startup the SDK runs that local
-handler, restores still-live reservations, and abandons the intent before the
-general provider reconciler runs. A `prepared` SDK intent is never sent to a
-provider reconciler because no provider phase was dispatched.
+handler during Runtime composition with
+`register_prepared_recovery(name, handler)`. Policy names are non-empty strings
+and are normalized by trimming surrounding whitespace. Starting an operation
+whose declared policy has no registered handler fails before `prepare`,
+authority reservation, intent creation, or provider code.
+
+The recovery-specific effect metadata stores the policy name, safe observation,
+contract/actor identity, and reservation IDs; canonical arguments remain
+represented only by their hash. The handler has the signature
+`handler(effect: ExternalEffectRecord) -> None`, receives that payload-safe
+record, and may repair only local state in the current RuntimeStore transaction.
+It must not call a provider or perform another non-transactional side effect.
+On startup, under the internal recovery lease, the SDK validates the stored
+metadata and reservation bindings, runs the handler, restores still-live
+reservations, and abandons the intent in one transaction. A missing handler,
+invalid or mismatched recovery metadata, or handler exception fails recovery;
+the transaction rolls back, the prepared intent and reservations remain, and
+Runtime startup does not continue to general provider reconciliation. Restore
+the compatible trusted handler or repair the trusted store state instead of
+replaying the provider call. A `prepared` SDK intent is never sent to a provider
+reconciler because no provider phase was dispatched.
 
 An invocation contains full canonical arguments and a separate safe
 observation. The SDK hashes canonical arguments for approval/idempotency
@@ -185,16 +201,22 @@ provider, must return the declared typed value, and must not place payloads or
 secrets in exceptions or persisted evidence.
 
 Registry-backed provider invocations may additionally supply an immutable
-`ProviderRegistryBinding` and its typed live resolver. The SDK compares the
-captured spec SHA-256 and generation with the resolver result inside the same
-effect transaction before every provider phase. A mismatch before the first
+`ProviderRegistryBinding`, its typed live resolver, and a synchronous phase
+guard. These three fields are all-or-none. For every `call()`, the SDK enters the
+guard and, while it remains held, reauthorizes, compares the captured spec
+SHA-256 and generation with the resolver result, persists dispatch, and invokes
+the provider callable. The guard must be the same lock/context used by every
+supported registry mutator; this is a trusted extension obligation that the SDK
+cannot infer from an arbitrary context manager. A mismatch before the first
 phase abandons the prepared intent and restores finite-use reservations without
-calling provider code; a mismatch after an earlier phase blocks later phases
-and follows the existing conservative unknown-effect settlement. Registry-bound
-sync phases also provide a phase guard shared with their supported registry
-mutators, so the live compare and provider callable have one in-process
-linearization interval. Async facades for these primitives offload that complete
-synchronous interval rather than holding a thread lock across an `await`.
+calling provider code; a mismatch after an earlier effectful phase blocks later
+phases and follows conservative partial/unknown settlement.
+
+Registry-guarded operations must use synchronous `call()`. `acall()` rejects
+them before provider dispatch; the surrounding operation exit restores and
+abandons a first-phase preparation. Async facades must offload the complete
+synchronous `call()` interval rather than holding a thread lock across an
+`await` or guarding only the resolver.
 
 ## Synchronous operation
 
@@ -276,8 +298,10 @@ started phase whose `information_flow` flag is true. It observes before
 returning a successful result and before propagating an ordinary exception,
 cancellation, or otherwise uncertain failure. A current phase certified by
 `ProviderEffectNotStarted`, whether raised or returned as the structured marker
-below, does not propagate its ingress context. Any context already observed by
-an earlier completed information-flow phase remains in force.
+below, certifies only that current phase and does not propagate that phase's
+ingress context. It is not a certificate that the whole operation did not
+start. Any context already observed by an earlier completed information-flow
+phase remains in force.
 
 When a primitive must return a structured domain error instead of propagating
 `ProviderEffectNotStarted`, its provider callable may return
@@ -311,6 +335,37 @@ a not-started mutating phase from becoming a false committed mutation.
   or charging resources contrary to the contract raises
   `ProtectedOperationProtocolError`.
 
+The idempotency contract is deliberately narrower than exactly-once execution:
+
+- `ProtectedOperationInvocation.idempotency_key` is a Host-selected, non-secret
+  protocol token. The store claims it under the exact `(pid, idempotency_key)`
+  pair; another process may use the same token. The token is persisted in clear
+  and retained with summarized evidence, so it must not contain payloads or
+  credentials.
+- While an effect row is retained, the key is claimed in every transaction
+  state, including `prepared`, `dispatched`, `committed`, `failed`, and
+  `unknown`. A duplicate invocation raises `ValidationError` before provider
+  dispatch; it does not return the prior result, coalesce callers, or replay the
+  effect. Transactional `prepare` work and reservations from the duplicate
+  attempt roll back.
+- A pre-dispatch abort, a PENS certificate with no effectful or
+  authority-committing completed phase, or prepared startup recovery deletes the
+  not-started intent and therefore releases its key. Reusing it is then safe
+  because the lifecycle proved that no effectful provider phase began. An
+  ambiguous or reconciled row keeps its key. A new, intentionally distinct
+  attempt after a confirmed provider failure needs a new key.
+- If no explicit key is supplied, the SDK hashes the current operation/effect
+  identity together with the provider, operation, target, and canonical argument
+  hash. This blocks a duplicate lifecycle for that identity, including an
+  approval-bound effect, but a normal independent top-level operation receives a
+  fresh identity. The default is therefore not cross-request or cross-restart
+  semantic deduplication. Supply a stable explicit key only when the provider
+  protocol and recovery logic define that retry identity.
+
+Startup reconciliation may query by key or provider receipt, but never invokes
+the original provider operation. An unresolved outcome remains `unknown`; do
+not bypass the retained key and blindly retry it.
+
 Human terminal output uses
 `PostProviderFailureMode.PRESERVE_RESULT`. Once the sink accepts content, a
 later local settlement failure returns the accepted result, keeps pending
@@ -327,6 +382,7 @@ conservative state such as a file-path label when the provider outcome is
 unknown. A compensating host action is another phase on the same handle:
 
 ```python
+handle = None
 try:
     handle = operation.call(ProviderPhase("create", state_mutation=True), provider.create)
     publish_local_handle(handle)
