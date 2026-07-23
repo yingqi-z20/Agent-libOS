@@ -148,6 +148,12 @@ same change.
 | `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
 | `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
 
+`runtime.default_image_id` and `runtime.coding_image_id` name two different
+built-in images. They must also not collide with the fixed
+`review-agent:v0`, `toolmaker-agent:v0`, or `context-compressor:v0` ids; startup
+fails on a collision rather than allowing one built-in definition to replace
+another.
+
 The table is checked against the dataclass fields by
 `tests/unit/test_configuration_docs.py`.
 
@@ -171,10 +177,13 @@ configurable. A runtime release emits only the snapshot version it can decode.
   environment-specific untracked overlay; never commit a real DSN.
 - LLM profiles store an `api_key_env` variable name, never the API-key value.
   Only the selected host process reads the named environment variable.
-- `llm.context_window_tokens` defaults to `131072`; a profile may override it.
-  Effective `max_tokens` must be smaller than the effective model window. The
-  window controls local pressure management only and is deliberately excluded
-  from the Provider/Sink identity hash.
+- `llm.context_window_tokens` defaults to `131072` and `llm.max_tokens`
+  defaults to `16384`; a profile may override either value. Effective
+  `max_tokens` must be smaller than the effective model window. The
+  lower default output reservation leaves room for multi-quantum task context;
+  increase it per profile only when a task genuinely needs longer single-call
+  output. The window controls local pressure management only and is deliberately
+  excluded from the Provider/Sink identity hash.
 - JSON-RPC/MCP header and stdio allowlists contain environment-variable names.
   Manifests reference those names; resolved secret values must not be persisted
   in registry rows, audit metadata, benchmark provenance, or GUI responses.

@@ -5,7 +5,7 @@ import * as http from "node:http";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { databaseTargetFromRenderer } from "./database.js";
-import { requireLoopbackDevServerUrl, runtimeServerEnv } from "./env.js";
+import { redactGuiServerOutput, requireLoopbackDevServerUrl, runtimeServerEnv } from "./env.js";
 import { readImagePackageFiles } from "./imagePackage.js";
 import {
   productionRendererEntryUrl,
@@ -14,6 +14,7 @@ import {
   resolveProductionRendererPath
 } from "./rendererProtocol.js";
 import { isCompletedShutdownResponse } from "./shutdown.js";
+import { mainWindowBounds, shouldCreateBrowserWindow } from "./windowBounds.js";
 
 type ServerConnection = {
   url: string;
@@ -75,6 +76,7 @@ let serverProcess: ChildProcessWithoutNullStreams | null = null;
 let connection: ServerConnection | null = null;
 let stoppingServer: Promise<void> | null = null;
 let startingServer: Promise<ServerConnection> | null = null;
+let creatingWindow: Promise<void> | null = null;
 let quittingAfterServerStop = false;
 let productionRendererProtocolInstalled = false;
 
@@ -279,10 +281,11 @@ async function doStartRuntimeServer(db?: string): Promise<ServerConnection> {
     };
     const timer = setTimeout(() => fail(new Error(`GUI server did not start. ${stderr}`)), 15000);
     child.stdout.on("data", (chunk: Buffer) => {
+      if (settled) return;
       stdout += chunk.toString("utf8");
-      smokeLog("server.stdout", { preview: chunk.toString("utf8").slice(0, 200) });
       const line = stdout.split(/\r?\n/).find((item) => item.trim().startsWith("{"));
       if (!line) return;
+      smokeLog("server.stdout", { preview: redactGuiServerOutput(line).slice(0, 200) });
       try {
         succeed(JSON.parse(line) as ServerConnection);
       } catch (error) {
@@ -358,24 +361,23 @@ function resolveRuntimeServerCommand(): RuntimeServerCommand {
 }
 
 async function createWindow() {
-  smokeLog("window.create.start");
+  smokeLog("startup.begin");
   // Smoke validation must never open or mutate an operator's default
   // persistent database merely because the command runs from the repo root.
   connection = await startRuntimeServer(smokeMode ? "local" : undefined);
   smokeLog("window.server.ready", { db: connection.db, url: connection.url });
-  if (smokeMode && !smokeWindowMode) {
+  if (!shouldCreateBrowserWindow(smokeMode, smokeWindowMode)) {
     const health = await withTimeout(requestServer(connection, "/api/health", "GET", 5000), 5000, "server health");
     smokeLog("server.health.checked", { ok: health.ok, status: health.status });
     await stopRuntimeServer({ graceful: true, timeoutMs: 3000 });
     smokeLog("smoke.exiting", { code: health.ok ? 0 : 2 });
     app.exit(health.ok ? 0 : 2);
     process.exit(health.ok ? 0 : 2);
+    return;
   }
+  smokeLog("window.create.start");
   mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 920,
-    minWidth: 1100,
-    minHeight: 720,
+    ...mainWindowBounds,
     title: "Agent libOS Console",
     show: !smokeMode,
     webPreferences: {
@@ -443,6 +445,15 @@ async function createWindow() {
   }
 }
 
+function ensureWindow(): Promise<void> {
+  if (creatingWindow) return creatingWindow;
+  const request = createWindow().finally(() => {
+    if (creatingWindow === request) creatingWindow = null;
+  });
+  creatingWindow = request;
+  return request;
+}
+
 ipcMain.handle("libos:getConnection", () => connection);
 
 ipcMain.handle("libos:chooseDatabase", async () => {
@@ -472,7 +483,6 @@ ipcMain.handle("libos:chooseImagePackage", async () => {
     throw new Error(`Image manifest exceeds ${imageManifestMaxBytes} bytes.`);
   }
   return {
-    path: selected,
     name: path.basename(selected),
     manifest: manifest.toString("utf8"),
     files
@@ -521,14 +531,18 @@ function installProductionRendererProtocol() {
   productionRendererProtocolInstalled = true;
 }
 
-app.whenReady().then(createWindow).catch((error) => {
+app.whenReady().then(ensureWindow).catch((error) => {
   console.error(error instanceof Error ? error.stack : String(error));
   void stopRuntimeServer({ graceful: false });
   app.exit(1);
 });
 
 app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) void createWindow();
+  if (BrowserWindow.getAllWindows().length === 0) {
+    void ensureWindow().catch((error) => {
+      console.error(error instanceof Error ? error.stack : String(error));
+    });
+  }
 });
 
 app.on("window-all-closed", () => {

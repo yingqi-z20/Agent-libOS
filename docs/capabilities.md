@@ -319,6 +319,13 @@ protocol. A direct Python Host manager or primitive call may instead raise
 `HumanApprovalRequired` or `HumanResponseRequired` with the `request_id` so the
 Host can inspect or service that durable wait.
 
+Filesystem `read_text`, `read_bytes`, directory listing, and working-directory
+validation follow that same per-use path. They construct the exact logical path
+and requested limits before prompting, but do not inspect existence, kind,
+metadata, directory entries, or bytes until the one-shot read capability has
+been approved and reserved. After the read settles, that one-shot capability is
+consumed and the underlying `ask_each_time` policy remains in force.
+
 Approval context includes path, resource, caller-declared overwrite policy,
 byte count, SHA-256, argv, risk, rule id, sandbox profile, and escaped previews
 when available. Filesystem target state is deliberately omitted until the
@@ -349,7 +356,12 @@ provider interaction succeeds but later event, audit, classification, or CAS
 settlement fails, the request still commits its answer/policy so draining the
 queue cannot show the prompt again; the unresolved intent remains pending.
 Human output provider failures likewise persist only `provider_error_type`, not
-the exception message.
+the exception message. A successfully delivered output also stores a private
+SHA-256 binding for its message. GUI projection treats those fixed bytes as a
+delivered snapshot while retaining the original labels and provenance: current
+Sink clearance is still mandatory, but later mutation of an original source
+does not create a false denial. The private binding is omitted from public Human
+request payloads, and a mismatch is withheld.
 
 ## Data release is separate authority
 
@@ -360,6 +372,13 @@ Ordinary Human approval cannot make an external Sink trusted. Data above
 registry generation, Task Authority manifest hash, source Object
 id/version/content hashes, label hash, canonical payload hash, operation, and
 target-state version. Any mismatch makes it unusable.
+
+For GUI presentation of a successfully delivered `human_output`, the immutable
+message digest and complete public-view hash are the source snapshot boundary.
+The original source references remain in the private Human record as provenance
+and were validated at provider delivery, but the GUI release does not require a
+mutable source to stay at that historical version. Labels, Sink trust and
+generation, manifest, operation, and payload/view hashes remain exact.
 
 The release request contains bounded metadata only—Sink, trust, registry,
 label/source/request identities, operation, sizes, hashes, and the exact
@@ -395,7 +414,10 @@ primitive authorization path as built-in tools.
 
 The built-in base, coding, review, and toolmaker images expose
 `list_capabilities` and `inspect_capability` so a process can understand its own
-authority; the context-compressor image does not. `delegate_capability` and
+authority; the context-compressor image does not. For the lazy base, coding,
+and review projections, `list_capabilities` is in the initial core while
+`inspect_capability` becomes model-visible after activating the `authority`
+group. `delegate_capability` and
 `revoke_capability` are registered static tools but are not included in those
 default image tool tables.
 

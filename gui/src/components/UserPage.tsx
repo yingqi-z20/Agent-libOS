@@ -1,15 +1,20 @@
 import { AlertTriangle, Bot, Database, MessageSquare, Pause, Play, RefreshCw, Send, Settings, Square } from "lucide-react";
-import { useMemo, useState } from "react";
-import type { GuiConnection, HumanRequest, HumanResponseInput, ImageSummary, LLMProfileInput, LLMProfileSummary, RuntimeProcess, RuntimeSnapshot } from "../api/types";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import type { GuiConnection, HumanRequest, HumanResponseInput, ImageSummary, LLMProfileInput, LLMProfileSummary, RuntimeProcess, RuntimeSnapshot, StreamConnectionStatus } from "../api/types";
 import { useI18n } from "../i18n";
 import { parseOptionalQuanta } from "../quanta";
+import type { WorkspaceAccess } from "../taskAuthority";
 import { deriveUserConversation, humanRequestPrompt, type UserConversationItem } from "../userConversation";
 import { ImageSelect } from "./ImageSelect";
 import { HumanRequestCard } from "./HumanRequestCard";
 import { LanguageSwitch } from "./LanguageSwitch";
 import { LLMProfileSelect } from "./LLMProfileSelect";
-import { MarkdownMessage } from "./MarkdownMessage";
 import { RatingPanel } from "./RatingPanel";
+
+const MarkdownMessage = lazy(async () => {
+  const module = await import("./MarkdownMessage");
+  return { default: module.MarkdownMessage };
+});
 
 type UserPageProps = {
   connection: GuiConnection | null;
@@ -21,6 +26,8 @@ type UserPageProps = {
   spawnImage: string;
   spawnLlmProfile: string;
   spawnWorkingDirectory: string;
+  spawnWorkspaceAccess: WorkspaceAccess;
+  spawnAllowGitRequests: boolean;
   message: string;
   images: ImageSummary[];
   llmProfiles: LLMProfileSummary[];
@@ -30,6 +37,8 @@ type UserPageProps = {
   onSpawnImageChange(value: string): void;
   onSpawnLlmProfileChange(value: string): void;
   onSpawnWorkingDirectoryChange(value: string): void;
+  onSpawnWorkspaceAccessChange(value: WorkspaceAccess): void;
+  onSpawnAllowGitRequestsChange(value: boolean): void;
   onMessageChange(value: string): void;
   onSpawn(): void;
   onImportImage(): void;
@@ -46,6 +55,9 @@ type UserPageProps = {
   onOpenDb(): void;
   onShowOperator(): void;
   onStop(): void;
+  busy?: boolean;
+  streamStatus?: StreamConnectionStatus;
+  lastUpdatedAt?: Date | null;
 };
 
 export function UserPage({
@@ -58,6 +70,8 @@ export function UserPage({
   spawnImage,
   spawnLlmProfile,
   spawnWorkingDirectory,
+  spawnWorkspaceAccess,
+  spawnAllowGitRequests,
   message,
   images,
   llmProfiles,
@@ -67,6 +81,8 @@ export function UserPage({
   onSpawnImageChange,
   onSpawnLlmProfileChange,
   onSpawnWorkingDirectoryChange,
+  onSpawnWorkspaceAccessChange,
+  onSpawnAllowGitRequestsChange,
   onMessageChange,
   onSpawn,
   onImportImage,
@@ -82,9 +98,12 @@ export function UserPage({
   onRefresh,
   onOpenDb,
   onShowOperator,
-  onStop
+  onStop,
+  busy = false,
+  streamStatus = "connected",
+  lastUpdatedAt = null
 }: UserPageProps) {
-  const { t } = useI18n();
+  const { formatTime, t } = useI18n();
   const [commitImageId, setCommitImageId] = useState("");
   const [commitName, setCommitName] = useState("");
   const [commitVersion, setCommitVersion] = useState("v0");
@@ -93,6 +112,13 @@ export function UserPage({
   const isRunning = Boolean(snapshot?.scheduler.running);
   const hasProcess = Boolean(selectedProcess);
   const commitReady = Boolean(hasProcess && commitImageId.trim() && commitName.trim() && commitVersion.trim());
+  const conversationRef = useRef<HTMLElement>(null);
+  const followConversationRef = useRef(true);
+
+  useEffect(() => {
+    const container = conversationRef.current;
+    if (container && followConversationRef.current) container.scrollTop = container.scrollHeight;
+  }, [conversation.at(-1)?.id, selectedPid]);
 
   return (
     <main className="userPage">
@@ -105,9 +131,18 @@ export function UserPage({
           </div>
         </div>
         <div className="userTopActions">
+          <span className={`connectionBadge ${streamStatus}`} role="status">
+            <span className="statusDot" />
+            {t(`connection.${streamStatus}`)}
+          </span>
+          {lastUpdatedAt ? (
+            <time className="lastUpdated" dateTime={lastUpdatedAt.toISOString()}>
+              {t("connection.updated", { time: formatTime(lastUpdatedAt.toISOString()) })}
+            </time>
+          ) : null}
           <LanguageSwitch />
-          <button title={t("user.openDbTitle")} onClick={onOpenDb}><Database size={15} />{t("user.openDb")}</button>
-          <button title={t("user.refreshTitle")} onClick={onRefresh}><RefreshCw size={15} /></button>
+          <button disabled={busy} title={t("user.openDbTitle")} onClick={onOpenDb}><Database size={15} />{t("user.openDb")}</button>
+          <button disabled={busy} aria-label={t("user.refreshTitle")} title={t("user.refreshTitle")} onClick={onRefresh}><RefreshCw size={15} /></button>
           <button className="secondary" onClick={onShowOperator}><Settings size={15} />{t("user.operatorConsole")}</button>
         </div>
       </header>
@@ -116,7 +151,7 @@ export function UserPage({
         <div className="userTaskMain">
           <label>
             {t("user.process")}
-            <select value={selectedPid ?? ""} onChange={(event) => onSelectPid(event.currentTarget.value)}>
+            <select value={selectedPid ?? ""} disabled={busy} onChange={(event) => onSelectPid(event.currentTarget.value)}>
               {(snapshot?.processes.length ?? 0) === 0 ? <option value="">{t("user.noProcess")}</option> : null}
               {(snapshot?.processes ?? []).map((process) => (
                 <option key={process.pid} value={process.pid}>{process.pid} · {process.status}</option>
@@ -144,28 +179,29 @@ export function UserPage({
               type="number"
               min={1}
               step={1}
+              disabled={busy}
               value={maxQuanta ?? ""}
               placeholder={t("scheduler.unlimitedPlaceholder")}
               title={t("scheduler.unlimitedHint")}
               onChange={(event) => onMaxQuantaChange(parseOptionalQuanta(event.currentTarget.value))}
             />
           </label>
-          <button disabled={!hasProcess || isRunning} onClick={onRun}><Play size={15} />{t("user.run")}</button>
-          <button onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
-          <button className="danger" disabled={!hasProcess} onClick={onStop}><Square size={13} />{t("user.stop")}</button>
+          <button disabled={busy || !hasProcess || isRunning} onClick={onRun}><Play size={15} />{t("user.run")}</button>
+          <button disabled={busy} onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
+          <button className="danger" disabled={busy || !hasProcess} onClick={onStop}><Square size={13} />{t("user.stop")}</button>
         </div>
       </section>
 
       <div className="userNotices">
         <section className="userImageControls">
-          <ImageSelect images={images} value={spawnImage} onChange={onSpawnImageChange} />
-          <button onClick={() => onImportImage()}>{t("image.import")}</button>
-          <input value={commitImageId} onChange={(event) => setCommitImageId(event.currentTarget.value)} placeholder={t("image.commitIdPlaceholder")} />
-          <input value={commitName} onChange={(event) => setCommitName(event.currentTarget.value)} placeholder={t("image.commitNamePlaceholder")} />
-          <input value={commitVersion} onChange={(event) => setCommitVersion(event.currentTarget.value)} placeholder={t("image.version")} />
+          <ImageSelect images={images} value={spawnImage} disabled={busy} onChange={onSpawnImageChange} />
+          <button disabled={busy} onClick={() => onImportImage()}>{t("image.import")}</button>
+          <input disabled={busy} aria-label={t("image.commitIdPlaceholder")} value={commitImageId} onChange={(event) => setCommitImageId(event.currentTarget.value)} placeholder={t("image.commitIdPlaceholder")} />
+          <input disabled={busy} aria-label={t("image.commitNamePlaceholder")} value={commitName} onChange={(event) => setCommitName(event.currentTarget.value)} placeholder={t("image.commitNamePlaceholder")} />
+          <input disabled={busy} aria-label={t("image.version")} value={commitVersion} onChange={(event) => setCommitVersion(event.currentTarget.value)} placeholder={t("image.version")} />
           <button
             className="warning"
-            disabled={!commitReady}
+            disabled={busy || !commitReady}
             onClick={() => onCommitImage({
               imageId: commitImageId.trim(),
               name: commitName.trim(),
@@ -184,6 +220,7 @@ export function UserPage({
             <h1>{t("user.startTask")}</h1>
             <input
               value={spawnWorkingDirectory}
+              disabled={busy}
               onChange={(event) => onSpawnWorkingDirectoryChange(event.currentTarget.value)}
               placeholder={t("user.initialCwdPlaceholder")}
               aria-label={t("user.initialCwd")}
@@ -192,13 +229,37 @@ export function UserPage({
               profiles={llmProfiles}
               value={spawnLlmProfile}
               label={t("llmProfile.spawnLabel")}
+              disabled={busy}
               onChange={onSpawnLlmProfileChange}
               onCreate={onCreateLlmProfile}
               onUpdate={onUpdateLlmProfile}
               onDelete={onDeleteLlmProfile}
             />
-            <textarea value={spawnGoal} onChange={(event) => onSpawnGoalChange(event.currentTarget.value)} />
-            <button className="primary" disabled={!spawnGoal.trim()} onClick={onSpawn}>{t("user.start")}</button>
+            <label className="taskAuthorityField">
+              <span>{t("taskAuthority.workspaceAccess")}</span>
+              <select
+                value={spawnWorkspaceAccess}
+                disabled={busy}
+                onChange={(event) => onSpawnWorkspaceAccessChange(event.currentTarget.value as WorkspaceAccess)}
+              >
+                <option value="none">{t("taskAuthority.none")}</option>
+                <option value="read">{t("taskAuthority.read")}</option>
+                <option value="edit">{t("taskAuthority.edit")}</option>
+                <option value="manage">{t("taskAuthority.manage")}</option>
+              </select>
+            </label>
+            <label className="taskAuthorityToggle">
+              <input
+                type="checkbox"
+                checked={spawnAllowGitRequests}
+                disabled={busy}
+                onChange={(event) => onSpawnAllowGitRequestsChange(event.currentTarget.checked)}
+              />
+              <span>{t("taskAuthority.git")}</span>
+            </label>
+            <p className="taskAuthorityHint">{t("taskAuthority.hint")}</p>
+            <textarea disabled={busy} aria-label={t("user.startTask")} value={spawnGoal} onChange={(event) => onSpawnGoalChange(event.currentTarget.value)} />
+            <button className="primary" disabled={busy || !spawnGoal.trim()} onClick={onSpawn}>{t("user.start")}</button>
           </section>
         ) : null}
 
@@ -216,7 +277,18 @@ export function UserPage({
         ) : null}
       </div>
 
-      <section className="userConversation" aria-label={t("user.conversation")}>
+      <section
+        ref={conversationRef}
+        className="userConversation"
+        aria-label={t("user.conversation")}
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          followConversationRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+        }}
+      >
         {conversation.length === 0 ? (
           <div className="userEmpty">
             <MessageSquare size={20} />
@@ -231,14 +303,16 @@ export function UserPage({
         </div>
         <input
           value={message}
+          disabled={busy || !hasProcess}
+          aria-label={t("user.messageAgent")}
           onChange={(event) => onMessageChange(event.currentTarget.value)}
           placeholder={t("user.messageAgent")}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && message.trim()) onSend("message");
+            if (event.key === "Enter" && !event.nativeEvent.isComposing && message.trim()) onSend("message");
           }}
         />
-        <button disabled={!hasProcess || !message.trim()} onClick={() => onSend("message")}><Send size={15} />{t("user.send")}</button>
-        <button disabled={!hasProcess || !message.trim()} className="warning" onClick={() => onSend("interrupt")}>{t("user.interrupt")}</button>
+        <button disabled={busy || !hasProcess || !message.trim()} onClick={() => onSend("message")}><Send size={15} />{t("user.send")}</button>
+        <button disabled={busy || !hasProcess || !message.trim()} className="warning" onClick={() => onSend("interrupt")}>{t("user.interrupt")}</button>
       </footer>
     </main>
   );
@@ -265,11 +339,34 @@ function ConversationBubble({ item }: { item: UserConversationItem }) {
       </article>
     );
   }
+  if (item.role === "terminal") {
+    const title = item.outcome.kind === "exited"
+      ? t("user.taskCompleted")
+      : item.outcome.kind === "failed"
+        ? t("user.taskFailed")
+        : t("user.taskStopped");
+    const reference = item.outcome.kind === "killed" ? item.outcome.reason_oid : item.outcome.result_oid;
+    const code = item.outcome.kind === "exited" ? null : item.outcome.code;
+    return (
+      <article className={`conversationBubble terminal ${item.outcome.kind}`}>
+        <span className="bubbleRole">{t("user.taskStatus")}</span>
+        <p>{code ? `${title} (${code})` : title}</p>
+        {item.text ? <p>{item.text}</p> : null}
+        {reference ? <p className="terminalReference">{t("user.resultReference", { oid: reference })}</p> : null}
+        <time>{formatTime(item.time)}</time>
+      </article>
+    );
+  }
   return (
     <article className={`conversationBubble ${item.role}`}>
       <span className="bubbleRole">{item.role === "assistant" ? t("user.agent") : t("user.you")}</span>
       {item.role === "assistant" ? (
-        <MarkdownMessage text={item.text} fallback={t("user.empty")} />
+        <Suspense fallback={<p>{item.text || (item.protected ? t("user.protectedOutput") : t("user.empty"))}</p>}>
+          <MarkdownMessage
+            text={item.text}
+            fallback={item.protected ? t("user.protectedOutput") : t("user.empty")}
+          />
+        </Suspense>
       ) : (
         <p>{item.text || t("user.empty")}</p>
       )}

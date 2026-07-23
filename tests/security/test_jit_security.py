@@ -31,6 +31,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     ResourceLimitExceeded,
+    SandboxError,
     ValidationError,
 )
 from agent_libos.runtime.syscalls import LibOSSyscallSession
@@ -542,6 +543,100 @@ class TestJitSecurity:
 
         assert killed_groups == [(proc.pid, signal.SIGKILL)]
         assert child.killed
+        assert proc.killed
+        assert proc.waited
+
+    @pytest.mark.skipif(os.name == 'nt', reason='POSIX process-group semantics')
+    def test_deno_cleanup_group_permission_error_uses_verified_tree_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sandbox = DenoTypescriptSandbox()
+
+        class Child:
+            killed = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+        class Root:
+            def __init__(self, child: Child) -> None:
+                self.child = child
+
+            def children(self, recursive: bool = False) -> list[Child]:
+                assert recursive is True
+                return [self.child]
+
+        class Proc:
+            pid = 7332
+            returncode: int | None = None
+            killed = False
+            waited = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+            async def wait(self) -> int:
+                self.waited = True
+                self.returncode = -9
+                return self.returncode
+
+        child = Child()
+        proc = Proc()
+
+        def deny_group_signal(_pid: int, _signal: int) -> None:
+            raise PermissionError('process-group signal denied')
+
+        def wait_for_children(processes: list[Child], *, timeout: float) -> tuple[list[Child], list[Child]]:
+            assert processes == [child]
+            assert timeout == 0.0
+            assert child.killed
+            return processes, []
+
+        monkeypatch.setattr('agent_libos.tools.sandbox.psutil.Process', lambda _pid: Root(child))
+        monkeypatch.setattr('agent_libos.tools.sandbox.psutil.wait_procs', wait_for_children)
+        monkeypatch.setattr('agent_libos.tools.sandbox.os.killpg', deny_group_signal)
+
+        asyncio.run(sandbox._kill_process(proc))
+
+        assert child.killed
+        assert proc.killed
+        assert proc.waited
+
+    @pytest.mark.skipif(os.name == 'nt', reason='POSIX process-group semantics')
+    def test_deno_cleanup_group_permission_error_fails_closed_when_tree_is_unverified(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sandbox = DenoTypescriptSandbox()
+
+        class Proc:
+            pid = 7333
+            returncode: int | None = None
+            killed = False
+            waited = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+            async def wait(self) -> int:
+                self.waited = True
+                self.returncode = -9
+                return self.returncode
+
+        def deny_tree_access(_pid: int) -> Any:
+            raise PermissionError('process-tree inspection denied')
+
+        def deny_group_signal(_pid: int, _signal: int) -> None:
+            raise PermissionError('process-group signal denied')
+
+        proc = Proc()
+        monkeypatch.setattr('agent_libos.tools.sandbox.psutil.Process', deny_tree_access)
+        monkeypatch.setattr('agent_libos.tools.sandbox.os.killpg', deny_group_signal)
+
+        with pytest.raises(SandboxError, match='could not verify process-tree fallback'):
+            asyncio.run(sandbox._kill_process(proc))
+
         assert proc.killed
         assert proc.waited
 

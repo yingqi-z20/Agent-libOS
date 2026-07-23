@@ -343,7 +343,7 @@ class LLMDefaults:
     default_profile_id: str = "default"
     profiles: dict[str, LLMProfile] = field(default_factory=lambda: {"default": LLMProfile()})
     temperature: float = 0.2
-    max_tokens: int = 65_536
+    max_tokens: int = 16_384
     context_window_tokens: int = 131_072
     timeout_s: float = 60.0
     max_retries: int = 2

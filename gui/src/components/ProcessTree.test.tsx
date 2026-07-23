@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
 import type { RuntimeProcess } from "../api/types";
-import { indexProcessTree } from "./ProcessTree";
+import { I18nProvider } from "../i18n";
+import { filterProcesses, indexProcessTree, ProcessTree } from "./ProcessTree";
 
 describe("indexProcessTree", () => {
   it("groups roots and siblings in one pass while preserving snapshot order", () => {
@@ -24,6 +26,32 @@ describe("indexProcessTree", () => {
 
     expect(indexed.roots).toEqual([orphanedChild, root]);
     expect(indexed.children.size).toBe(0);
+  });
+
+  it("filters by process metadata while retaining visible ancestors", () => {
+    const root = process("root", null);
+    const child = { ...process("worker", "root"), image_id: "research-agent:v2", working_directory: "reports" };
+    const unrelated = process("other", null);
+
+    expect(filterProcesses([root, child, unrelated], "research")).toEqual([root, child]);
+    expect(filterProcesses([root, child, unrelated], "REPORTS")).toEqual([root, child]);
+    expect(filterProcesses([root, child, unrelated], "missing")).toEqual([]);
+    expect(filterProcesses([root, child, unrelated], "")).toEqual([root, child, unrelated]);
+  });
+
+  it("uses a single tab stop for tree keyboard navigation", () => {
+    const html = renderToStaticMarkup(
+      <I18nProvider initialLanguage="en">
+        <ProcessTree
+          processes={[process("root", null), process("child", "root")]}
+          selectedPid="child"
+          onSelect={() => undefined}
+        />
+      </I18nProvider>
+    );
+
+    expect(html.match(/tabindex="0"/g)).toHaveLength(1);
+    expect(html.match(/tabindex="-1"/g)).toHaveLength(1);
   });
 });
 

@@ -164,7 +164,8 @@ the same source tests.
 The Electron smoke path can be run headlessly with
 `AGENT_LIBOS_GUI_SMOKE=1`. By default it verifies the Electron main process,
 Python GUI server startup, authenticated `/api/health`, and graceful shutdown
-against an in-memory `local` store without creating a BrowserWindow. Set
+against an in-memory `local` store without creating a BrowserWindow. Smoke
+logging redacts the temporary bearer token. Set
 `AGENT_LIBOS_GUI_SMOKE_WINDOW=1` when a machine has a working desktop/GPU stack
 and you specifically want to exercise the packaged custom-protocol renderer,
 its API origin, and the preload bridge.
@@ -174,27 +175,80 @@ to the `gui/` directory. Production dependency audit should remain clean; any
 dev-server advisory must be handled with local-only exposure unless an upstream
 fix is available.
 
+For renderer-only browser development against a real local GUI server, set all
+of `VITE_AGENT_LIBOS_GUI_URL`, `VITE_AGENT_LIBOS_GUI_TOKEN`, and optionally
+`VITE_AGENT_LIBOS_GUI_DB` before starting Vite. This bridge is compiled only in
+Vite development mode, accepts only an `http://` loopback URL, and is absent
+from production builds. Do not reuse or publish the temporary bearer token.
+Production Electron always requires the preload-provided connection.
+
 ## Current Workspace
 
-The first screen is the streamlined user page. It provides task/process
+On first launch the default screen is the streamlined user page; later launches
+restore the last user/operator view when renderer storage is available. It provides task/process
 selection, conversation and pending Human-request cards, task start/message/run
 controls, image import and save-as-image, ratings, LLM profile selection, and a
-button for the operator console. Image import and commit both require explicit
+button for the operator console. Task-start controls include a workspace access
+scope and a separate local-Git request switch. These controls create an
+explicit Host-authored launch manifest: Human communication is granted to the
+root process, while filesystem and local-Git entries are only ceilings for
+later permission requests. They grant no workspace or Git access by
+themselves; arbitrary Shell commands still require separate Host authority. A
+nested initial cwd narrows the filesystem ceiling to that subtree. The
+normalized ceilings are shown to the model as permission-planning facts, clearly
+separate from active capabilities, so an agent can request a coherent task scope
+before attempting a filesystem effect. Runtime enforcement remains authoritative
+if the model ignores that guidance or asks outside the ceiling. The default edit
+mode omits delete, and the manage mode adds it. Image import
+and commit both require explicit
 confirmation. Saving as an image creates a checkpoint only after that
 confirmation, then commits the checkpoint into an immutable image artifact.
+Message drafts are retained per process so changing the selection cannot send a
+draft to the wrong process. The conversation follows new output only while the
+reader remains near the bottom; scrolling upward pauses automatic following.
+Interactive built-in images are instructed to send one concise final
+`human_output` before `process_exit`. The conversation also renders a terminal
+status fallback from the process outcome, including only a result/reason Object
+Memory reference when present. It does not materialize that object's payload;
+normal Object Memory capability checks still apply. When an output was delivered
+through another configured Human channel but its content is withheld from the
+GUI presentation Sink by data-flow policy, the conversation shows an explicit
+protected-output notice instead of an empty message.
+Successfully delivered output messages are private-digest-bound frozen
+snapshots for GUI presentation. The renderer still receives them only after the
+captured labels pass the current GUI Sink policy, but a later LLM-context or
+source-object version change no longer turns the already fixed message into a
+protected-output false positive. Digest mismatch and uncertain delivery remain
+withheld.
 
 The operator console is the three-column process workspace:
 
-- the left pane contains spawn controls and a process tree with pid, image,
-  status, and unread-message indicators;
+- the left pane contains spawn controls plus a searchable, keyboard-navigable
+  process tree with pid, image, status, and unread-message indicators;
 - the center pane contains the selected process timeline, Human request cards,
   and message controls;
-- the right pane contains exec/exit controls and tabs for overview, ratings,
-  capabilities, tools/Skills, checkpoints, audit, Explain, LLM calls, Images,
-  JSON-RPC, MCP, and an Object Memory reference showing the goal OID and
-  capability-control note;
+- the right pane contains cwd/pause/resume/exec/exit controls and tabs for a
+  structured process/resource overview, ratings, capability administration,
+  Skill lifecycle and workspace registration, checkpoint create/inspect/diff/
+  fork/restore, Object Tasks, audit, Explain, LLM calls, Images, JSON-RPC, MCP,
+  loaded module inspection, and an Object Memory reference showing the goal
+  OID and capability-control note;
 - the top bar contains database, spawn, auto-run, quanta, run, step, pause, and
   refresh controls.
+
+The renderer reports initialization failure with an explicit retry surface,
+shows refresh and live-stream connection state, preserves the last valid
+snapshot while reconnecting, surfaces scheduler failures, and warns when the
+bounded snapshot omitted any collection or value. Same-build snapshot responses
+from both HTTP refreshes and SSE events are minimally shape-validated before
+React consumes them. Destructive dialogs
+trap keyboard focus, close with Escape when idle, restore the previous focus,
+and expose linked ARIA title/description state. Detail tabs support arrow,
+Home, and End navigation. At narrower widths the operator pane moves from three
+columns to two rows and then to a single scrollable column; the user page,
+forms, dialogs, and image rows also collapse without requiring a wide desktop
+viewport. The packaged window can be resized down to 360px so those layouts are
+reachable. Reduced-motion preferences disable continuous animation.
 
 Detailed cwd and resource budget/usage values are shown in process metadata and
 detail views rather than as fields on every process-tree row. The Object Memory
@@ -221,8 +275,13 @@ libOS/llm-profiles.json` on Windows, `~/Library/Application Support/Agent
 libOS/llm-profiles.json` on macOS, and the `agent-libos/llm-profiles.json`
 file under `${XDG_CONFIG_HOME:-~/.config}` on Linux. The file stores model routing fields such
 as profile id, model, base URL, API mode, tuning options, optional
-`context_window_tokens`, and the `api_key_env` name. It never stores the API
-key value. The bundled editor exposes the common routing and tuning fields. A
+`context_window_tokens`, prompt-cache/Responses-chain settings, and the
+`api_key_env`/`safety_identifier_env` names. It never stores either environment
+variable's value. The bundled editor exposes every field returned by the GUI
+profile summary, including reasoning effort, verbosity, cache retention, and
+explicit Responses-chain reuse; profile deletion requires an inline second
+confirmation. Numeric fields reject fractional integers, non-finite values, and
+values outside their displayed minimums instead of silently coercing them. A
 `PUT` is a partial update: profile fields not exposed or omitted by the current
 renderer are preserved rather than silently reset. When a profile has a base URL,
 `allow_custom_base_url: false` is preserved explicitly rather than inferred
@@ -237,7 +296,12 @@ Automatic runs after spawn/message/exec may advance all
 runnable processes, but `POST /api/processes/{pid}/run` is intentionally scoped
 to that pid. `POST /api/processes/{pid}/step` is synchronous: its response and
 the snapshot it publishes contain the final scheduler state (`running: false`)
-after the quantum has completed. Real LLM calls are still persisted in `llm_calls`, so the GUI can
+after the quantum has completed. The background controller uses one completed
+quantum as its batching boundary. Once a provider/tool quantum has been
+admitted it is allowed to finish even when it takes longer than the core
+scheduler drain window; that exception is local to GUI batching, while ordinary
+bounded Runtime calls retain their cancellation boundary. Real LLM calls are
+still persisted in `llm_calls`, so the GUI can
 show token usage, errors, full stored LLM inputs and outputs, and bounded
 prompt/output observability metadata. This default supports self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. If
@@ -264,12 +328,15 @@ payload size and SHA-256, source count, and operation. Arbitrary nested payload
 values are not included in pre-release previews. The exact release hashes the
 complete gate-independent public view handed to the GUI provider, including
 status, timestamps, and `decision`; internal release-link/visibility metadata
-does not perturb that view. A source, Sink-trust registry, Task Authority
-manifest, public-view, or release-binding change invalidates the durable visible
-marker; the parent is redacted again and requires a fresh exact release before
-projection (including a newly recorded decision) or response. The freshness guard and Human
-decision commit share one store transaction, so concurrent Host registry or
-source mutations cannot land between them. Bounded snapshots project only the
+does not perturb that view. For pending questions and approvals, a source,
+Sink-trust registry, Task Authority manifest, public-view, or release-binding
+change invalidates the durable visible marker; the parent is redacted again and
+requires a fresh exact release before projection (including a newly recorded
+decision) or response. A successfully delivered output revalidates its frozen
+message digest, labels, Sink policy, manifest, and public view without requiring
+the original mutable sources to remain at the delivery version. The freshness
+guard and Human decision commit share one store transaction, so concurrent Host
+registry or source mutations cannot land between them. Bounded snapshots project only the
 final rows they will return: lookahead and release/parent pairing never consume
 a release or mark a parent visible for a row cropped from the JSON response.
 For an unchanged unrestricted view, one authenticated GUI provider session may
@@ -352,13 +419,18 @@ operations before invoking the runtime:
 - MCP server registration and tool calls,
 - Skill registration, activation, and unload.
 
-The bundled renderer currently provides confirmation dialogs for process exec
-and exit, image package registration, and checkpoint-to-image commit. The other
-listed routes are server-side administration contracts and are not currently
-exposed as renderer controls. Same-build clients that use them must present
-their own confirmation UX and send `confirmed: true`; `LibOSClient.runWorkflow`
-accepts an explicit `confirmed` option for high-risk workflow calls. The server
-rejects a missing or false confirmation before invoking the runtime operation.
+The bundled renderer provides confirmation dialogs for process exec and exit,
+image package registration and checkpoint-to-image commit, checkpoint restore
+and fork, capability grant/delegate/revoke, JSON-RPC registration/calls, MCP
+registration/calls, and Skill registration/activation/unload. Capability
+mutation previews explicitly identify Host-admin mode. Skill and remote
+registration can instead use the selected process authority; workspace Skill
+registration always requires it. Process cancel/terminate signals and generic
+workflow execution remain server/API-only and require a same-build client to
+present its own confirmation UX. `LibOSClient.runWorkflow` accepts an explicit
+`confirmed` option for that purpose. The server rejects a missing or false
+confirmation before invoking any high-risk runtime operation, regardless of
+renderer state.
 
 JSON-RPC endpoint and MCP server registration through the GUI accept manifest
 text only. The renderer cannot ask the Python GUI server to read an arbitrary
@@ -366,7 +438,8 @@ host file path; file/path based registration remains a CLI/admin workflow.
 
 Image package registration follows the same rule. Electron may read a package
 directory selected by the user and pass bounded package file payloads to the
-local GUI server, but the server rejects host file paths. The selector rejects
+local GUI server, but the preload result omits the selected host path and the
+server rejects host file paths. The selector rejects
 symbolic and multiply-linked files, more than 512 files, more than 512 directories,
 directory depth above 32, and more than 16 MiB of raw file data; it separately
 caps the selected manifest at 1 MiB. Runtime image limits then apply as a second
@@ -496,5 +569,12 @@ process syscalls. See [explainable_operations.md](explainable_operations.md).
 
 `POST /api/processes` and `POST /api/workflows/run` accept an optional
 `authority_manifest` JSON object. It is a Host/admin-plane launch contract;
-the GUI does not synthesize authority from image requirements. Explain shows
-the resulting id/hash, grants, unmet requirements, budget, and effect policy.
+the server does not synthesize authority from image requirements. The bundled
+renderer submits an explicit manifest built only from its visible task-access
+controls. It never copies image requirements into grants: its sole launch grant
+is non-delegable `human:owner` write for communication. Selected filesystem,
+the restricted `shell:git` class, and typed local-Git scopes are non-delegable
+`approval_policy.requestable_capabilities`, so an in-scope model request still
+creates a Human decision and an out-of-scope request is rejected before the
+Human queue. Explain shows the resulting id/hash, grants, unmet requirements,
+budget, and effect policy.

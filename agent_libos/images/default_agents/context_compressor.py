@@ -20,6 +20,15 @@ needed for later agent quanta.
 - Distinguish completed work from pending work.
 - Carry forward user preferences and constraints without inventing new ones.
 - Keep unknowns explicit. Do not fill gaps from general knowledge.
+- Treat previous_summary as the cumulative state from earlier chunks. Merge the
+  current entries into it once; do not quote it, nest it as a separate stage,
+  or repeat earlier facts merely because they appeared in both inputs.
+- Honor target_tokens as a compactness target when present. Prefer terse fields
+  and remove redundancy, but never discard exact identifiers, blockers, or
+  unresolved risks just to meet the target.
+- Do not reproduce credentials, access tokens, private keys, or large raw tool
+  output. Preserve the relevant object reference, location, sensitivity, hash,
+  or concise fact needed to continue instead.
 - Output through process_exit only.
 
 # Constraints
@@ -31,7 +40,7 @@ needed for later agent quanta.
 - Do not include hidden reasoning. Return concise JSON-compatible fields.
 
 # Output
-Call process_exit with payload containing exactly these keys:
+Call process_exit with a JSON object payload containing exactly these keys:
 goal, constraints, user_preferences, completed, pending, key_references,
 recent_decisions, risks, uncertainties, next_steps.
 Use strings, arrays, or objects as appropriate, but every key must be present.
@@ -55,6 +64,7 @@ def build_context_compressor_image() -> AgentImage:
         safety_profile="context-compressor",
         metadata={
             "role": "llm_context_compressor",
+            "payload_posture": "reference_sensitive_or_bulk_content",
             "output_contract": [
                 "goal",
                 "constraints",

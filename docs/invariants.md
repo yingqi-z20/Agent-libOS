@@ -143,7 +143,10 @@ longer defines.
   bounded pending-request windows cannot starve its prerequisite. Unchanged
   unrestricted GUI views reuse receipts only within the
   same provider session after a linearized current-policy check, and internal
-  presentation evidence cannot starve bounded causal snapshot windows. Current
+  presentation evidence cannot starve bounded causal snapshot windows.
+  Successfully delivered Human outputs are private-digest-bound frozen payloads:
+  later mutable-source versions do not hide fixed bytes, while digest mismatch
+  or current Sink-clearance failure remains withheld. Current
   file-tree labels use bounded keyset batches and a bytewise-collated exact
   prefix range, so backend locale and wildcard path characters cannot widen a
   subtree query. The
@@ -223,7 +226,10 @@ longer defines.
   Human output commits its delivered marker and pending intent before the
   provider; event/audit/effect finalization follows provider success. A later
   settlement failure preserves the dispatched pending intent and never replays
-  the Human sink. Classifier failure uses the conservative contract ceiling.
+  the Human sink. Later GUI presentation verifies the delivered message digest
+  and current labels/Sink policy without treating ordinary post-output context
+  advancement as a source-freshness failure. Classifier failure uses the
+  conservative contract ceiling.
   Terminal prompt reads and automatic-response writes also use structured
   pending intents; they retain only length/hash observations, never raw
   prompt, answer, or provider exception text. Human output provider failures
@@ -236,7 +242,8 @@ longer defines.
   including shell policy capability effects and finite-use leases, sandboxed,
   process-local, cached-only at runtime, and syscall-mediated. JIT lifecycle
   rows/aliases/handles commit atomically, composite failures discard unpublished
-  candidates, and cancellation terminates the isolated Deno process group;
+  candidates, and cancellation terminates the isolated Deno process group or a
+  verified discovered-tree fallback while incomplete cleanup fails closed;
   Host provider-error attribution requires both runner-private syscall-error
   provenance and a per-execution protocol proof, so candidate-authored error
   metadata remains an ordinary sandbox failure;

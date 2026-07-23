@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { RuntimeProcess, RuntimeSnapshot } from "../api/types";
 import { I18nProvider } from "../i18n";
-import { DetailTabs, explainRefreshKey } from "./DetailTabs";
+import { DetailTabs, explainRefreshKey, tabIndexForKey } from "./DetailTabs";
 
 describe("DetailTabs", () => {
   it("renders the MCP registry tab from snapshot data", () => {
@@ -33,6 +33,17 @@ describe("DetailTabs", () => {
     );
 
     expect(html).toContain("MCP");
+    expect(html).toContain('role="tablist"');
+    expect(html).toContain('role="tabpanel"');
+    expect(html).toContain('aria-selected="true"');
+  });
+
+  it("supports wrapped arrow and boundary keyboard navigation", () => {
+    expect(tabIndexForKey(0, "ArrowLeft", 4)).toBe(3);
+    expect(tabIndexForKey(3, "ArrowRight", 4)).toBe(0);
+    expect(tabIndexForKey(2, "Home", 4)).toBe(0);
+    expect(tabIndexForKey(1, "End", 4)).toBe(3);
+    expect(tabIndexForKey(1, "Enter", 4)).toBeNull();
   });
 
   it("changes the Explain refresh key when SSE-backed evidence advances", () => {

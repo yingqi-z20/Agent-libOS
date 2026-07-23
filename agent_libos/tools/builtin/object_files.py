@@ -8,16 +8,22 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.models import ObjectMetadata, ObjectType, Provenance
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+from agent_libos.tools.builtin.filesystem import normalize_process_path_argument
 from agent_libos.tools.observability import ensure_json_size, json_size_bytes
 from agent_libos.utils.ids import estimate_tokens
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_PROCESS_FILE_PATH_DESCRIPTION = (
+    "File path relative to the process's current working directory; do not "
+    "prepend that directory or the workspace root. The resolved path must "
+    "remain inside the runtime workspace."
+)
 
 
 class CreateObjectFromFileArgs(BaseModel):
     name: str = Field(description="Namespace-local Object Memory name to create.")
     namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
-    path: str = Field(description="Workspace-relative file path to import.")
+    path: str = Field(description=_PROCESS_FILE_PATH_DESCRIPTION)
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     max_bytes: int = Field(
         default=_TOOL_DEFAULTS.object_file_max_bytes,
@@ -42,7 +48,7 @@ class CreateObjectFromFileOutput(BaseModel):
 class WriteObjectToFileArgs(BaseModel):
     name: str = Field(description="Namespace-local Object Memory name to resolve and write.")
     namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
-    path: str = Field(description="Workspace-relative output file path.")
+    path: str = Field(description=_PROCESS_FILE_PATH_DESCRIPTION)
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     overwrite: bool = Field(default=True, description="Whether to overwrite an existing file.")
 
@@ -59,7 +65,9 @@ class WriteObjectToFileOutput(BaseModel):
 class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
     name = "create_object_from_file"
     description = (
-        "Create a named Object Memory object whose payload is the text content of a workspace file. "
+        "Create a named Object Memory object from a text file path relative to "
+        "the process's current working directory; do not prepend that directory. "
+        "The resolved path must remain under the runtime workspace root. "
         "The file content is stored inside Object Memory but is not returned in the tool result."
     )
     args_schema = CreateObjectFromFileArgs
@@ -77,10 +85,11 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         cwd = runtime.process.working_directory(ctx.pid)
+        path = normalize_process_path_argument(args.path, cwd)
         try:
             result = runtime.filesystem.read_text(
                 pid=ctx.pid,
-                path=args.path,
+                path=path,
                 encoding=args.encoding,
                 max_bytes=args.max_bytes,
                 cwd=cwd,
@@ -198,7 +207,9 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
 class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
     name = "write_object_to_file"
     description = (
-        "Resolve a named Object Memory object and write its text content to a workspace file. "
+        "Write a named Object Memory object's text to a path relative to the "
+        "process's current working directory; do not prepend that directory. "
+        "The resolved path must remain under the runtime workspace root. "
         "The object content is not returned in the tool result."
     )
     args_schema = WriteObjectToFileArgs
@@ -220,13 +231,15 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
         # The object payload is handed directly to the filesystem primitive; the
         # process-visible result below still omits the concrete content.
         try:
+            cwd = runtime.process.working_directory(ctx.pid)
+            path = normalize_process_path_argument(args.path, cwd)
             result = runtime.filesystem.write_text(
                 pid=ctx.pid,
-                path=args.path,
+                path=path,
                 text=text,
                 encoding=args.encoding,
                 overwrite=args.overwrite,
-                cwd=runtime.process.working_directory(ctx.pid),
+                cwd=cwd,
                 source_oids=[obj.oid],
             )
         except FileExistsError as exc:

@@ -30,9 +30,21 @@ Decision loop:
    Prefer compact structured objects over long prose.
 5. Verify. Re-check important claims against context or tool evidence before
    reporting them. If verification is unavailable, state the gap plainly.
-6. Exit. When done, call process_exit with summary, evidence, verification,
-   residual_risks, and follow_up. If blocked, include the blocker and the
-   smallest user or host action that would unblock it.
+6. Report and exit. Before process_exit, use human_output once for a concise
+   final user-facing result unless the goal explicitly requests machine-only
+   output; do not duplicate a final result already sent. Then call process_exit
+   with summary, evidence, verification, residual_risks, and follow_up. If
+   blocked, include the blocker and the smallest user or host action that would
+   unblock it.
+
+Tool projection:
+- The schemas visible in the current quantum are the only tools you may select
+  now. The full image tool table is intentionally projected in small groups.
+- If a needed tool is absent, use discover_tool_groups and then
+  activate_tool_group for the smallest relevant group. Activation changes only
+  model visibility; it never grants resource authority.
+- Distinguish a hidden tool from denied authority. Activate a group for the
+  former; inspect capabilities or request exact permission for the latter.
 
 Authority and risk:
 - Inspect current authority when uncertain. Request the least-privilege permission
@@ -57,6 +69,7 @@ def build_base_agent_image(config: AgentLibOSConfig) -> AgentImage:
         system_prompt=BASE_AGENT_PROMPT,
         prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
         default_tools=[
+            "activate_tool_group",
             "append_memory_object",
             "ask_human",
             "compact_process_context",
@@ -66,6 +79,7 @@ def build_base_agent_image(config: AgentLibOSConfig) -> AgentImage:
             "cancel_object_task",
             "diff_checkpoint",
             "discover_skills",
+            "discover_tool_groups",
             "exec_process",
             "fork_child_process",
             "get_current_time",
@@ -109,4 +123,16 @@ def build_base_agent_image(config: AgentLibOSConfig) -> AgentImage:
         ],
         context_policy=memory_defaults.context_policy,
         required_capabilities=[{"resource": runtime_defaults.default_human_resource, "rights": ["write"]}],
+        metadata={
+            "role": "general_purpose_agent",
+            "lazy_tool_groups": True,
+            "initial_tool_groups": ["process", "context", "clock"],
+            "completion_contract": [
+                "summary",
+                "evidence",
+                "verification",
+                "residual_risks",
+                "follow_up",
+            ],
+        },
     )

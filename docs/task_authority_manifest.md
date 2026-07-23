@@ -56,7 +56,21 @@ parent's ceiling).
 Model permission requests are checked against the manifest before a Human
 request is created. `approval_policy.requestable_capabilities` declares
 authority that may be requested but is not granted at launch; a Human decision
-still creates the narrower one-time or policy capability.
+still creates the narrower one-time or policy capability. The normalized
+requestable list is included in each model turn as an explicitly labeled
+permission-request ceiling, never in the active Capability table. This lets the
+model plan one coherent request before an effect instead of learning the scope
+through a denied probe; the runtime remains the authority and rejects every
+out-of-ceiling request regardless of prompt behavior.
+
+The bundled GUI is one such Host author. Its visible task-access controls create
+an explicit manifest instead of inferring grants from the selected image. The
+root process receives only non-delegable `human:owner` write for communication;
+the selected cwd-scoped filesystem rights and optional restricted
+`shell:git`/typed local-Git entries are requestable ceilings. Therefore selecting
+“edit” or local Git does not pregrant those effects, and a request outside the
+selected scope is rejected before a Human prompt. Arbitrary Shell commands are
+not included in this convenience contract and require separate Host authority.
 
 `permitted_effects` is an additional provider-boundary ceiling with exact
 entries or terminal wildcards such as `jsonrpc.*`. Omitting the field or using

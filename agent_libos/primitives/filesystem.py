@@ -175,16 +175,14 @@ class FilesystemAdapter:
 
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.directory_resource_for(relative)
-        authority_context = self._authorization_context(
+        decision, authority_context = self._require_read_operation(
             pid=pid,
             resource=resource,
+            target=target,
             relative=relative,
             primitive="runtime.filesystem.validate_directory",
             operation="state",
-            right=CapabilityRight.READ.value,
-        )
-        decision = self.capabilities.require(
-            pid, resource, CapabilityRight.READ, authority_context, consume=False
+            question=f"Allow this process to inspect directory {relative or '.'}?",
         )
         effect_context = {
             "path": relative,
@@ -260,17 +258,15 @@ class FilesystemAdapter:
         )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
-        authority_context = self._authorization_context(
+        decision, authority_context = self._require_read_operation(
             pid=pid,
             resource=resource,
+            target=target,
             relative=relative,
             primitive="runtime.filesystem.read_text",
             operation="read_text",
-            right=CapabilityRight.READ.value,
-            extra={"max_bytes": max_bytes, "encoding": encoding},
-        )
-        decision = self.capabilities.require(
-            pid, resource, CapabilityRight.READ, authority_context, consume=False
+            question=f"Allow this process to read {relative}?",
+            extra_context={"max_bytes": max_bytes, "encoding": encoding},
         )
         effect_context = {"path": relative, "resource": resource, "encoding": encoding, "max_bytes": max_bytes}
         with ExitStack() as stack:
@@ -378,17 +374,15 @@ class FilesystemAdapter:
         )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
-        authority_context = self._authorization_context(
+        decision, authority_context = self._require_read_operation(
             pid=pid,
             resource=resource,
+            target=target,
             relative=relative,
             primitive="runtime.filesystem.read_bytes",
             operation="read_bytes",
-            right=CapabilityRight.READ.value,
-            extra={"max_bytes": max_bytes},
-        )
-        decision = self.capabilities.require(
-            pid, resource, CapabilityRight.READ, authority_context, consume=False
+            question=f"Allow this process to read {relative}?",
+            extra_context={"max_bytes": max_bytes},
         )
         effect_context = {"path": relative, "resource": resource, "max_bytes": max_bytes}
         with ExitStack() as stack:
@@ -708,17 +702,15 @@ class FilesystemAdapter:
         )
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.directory_resource_for(relative)
-        authority_context = self._authorization_context(
+        decision, authority_context = self._require_read_operation(
             pid=pid,
             resource=resource,
+            target=target,
             relative=relative,
             primitive="runtime.filesystem.read_directory",
             operation="read_directory",
-            right=CapabilityRight.READ.value,
-            extra={"limit": limit},
-        )
-        decision = self.capabilities.require(
-            pid, resource, CapabilityRight.READ, authority_context, consume=False
+            question=f"Allow this process to list directory {relative or '.'}?",
+            extra_context={"limit": limit},
         )
         effect_context = {"path": relative, "resource": resource, "limit": limit}
         estimated_metadata_bytes = self._directory_metadata_preflight_bytes(limit)
@@ -1859,6 +1851,119 @@ class FilesystemAdapter:
         policy = self.capabilities.permission_policy(pid, resource, right, context)
         if policy in {CapabilityManager.MISSING, CapabilityManager.ALWAYS_DENY}:
             self.capabilities.require(pid, resource, right, context)
+
+    def _require_read_operation(
+        self,
+        *,
+        pid: str,
+        resource: str,
+        target: ResolvedPath,
+        relative: str,
+        primitive: str,
+        operation: str,
+        question: str,
+        extra_context: dict[str, Any] | None = None,
+        source_oids: Iterable[str] | None = None,
+    ) -> tuple[CapabilityDecision, dict[str, Any]]:
+        authority_context = self._authorization_context(
+            pid=pid,
+            resource=resource,
+            relative=relative,
+            primitive=primitive,
+            operation=operation,
+            right=CapabilityRight.READ.value,
+            extra=extra_context,
+        )
+        decision = self.capabilities.authorize(
+            pid,
+            resource,
+            CapabilityRight.READ,
+            authority_context,
+        )
+        if decision.allowed:
+            return (
+                self.capabilities.require(
+                    pid,
+                    resource,
+                    CapabilityRight.READ,
+                    authority_context,
+                    consume=False,
+                ),
+                authority_context,
+            )
+        if decision.policy == CapabilityManager.ALWAYS_DENY:
+            return (
+                self.capabilities.require(
+                    pid,
+                    resource,
+                    CapabilityRight.READ,
+                    authority_context,
+                    consume=False,
+                ),
+                authority_context,
+            )
+        if decision.policy == CapabilityManager.ASK_EACH_TIME:
+            operation_context = self._operation_context(
+                pid=pid,
+                resource=resource,
+                target=target,
+                relative=relative,
+                primitive=primitive,
+                operation=operation,
+                right=CapabilityRight.READ.value,
+                extra=extra_context or {},
+            )
+            decision = self.capabilities.authorize(
+                pid,
+                resource,
+                CapabilityRight.READ,
+                operation_context,
+                audit=True,
+            )
+            if decision.allowed:
+                return decision, operation_context
+            if decision.policy == CapabilityManager.ALWAYS_DENY:
+                raise CapabilityDenied(decision.reason)
+            if decision.policy != CapabilityManager.ASK_EACH_TIME:
+                raise CapabilityDenied(decision.reason)
+            if self.human is None:
+                raise CapabilityDenied(
+                    f"{pid} requires human approval for read on {resource}"
+                )
+            request_id = self.human.query(
+                pid=pid,
+                human=self.config.runtime.default_human,
+                request={
+                    "type": "external_operation_approval",
+                    "question": question,
+                    "requested_once_capability": {
+                        "subject": pid,
+                        "resource": resource,
+                        "rights": [CapabilityRight.READ.value],
+                        "constraints": self._approval_constraints(
+                            operation_context,
+                            right=CapabilityRight.READ.value,
+                        ),
+                    },
+                    "context": operation_context,
+                },
+                blocking=True,
+                source_oids=source_oids,
+            )
+            raise HumanApprovalRequired(
+                request_id=request_id,
+                message=f"{pid} is waiting for per-use human approval to read {resource}",
+            )
+        return (
+            self.capabilities.require(
+                pid,
+                resource,
+                CapabilityRight.READ,
+                authority_context,
+                consume=False,
+            ),
+            authority_context,
+        )
 
     def _require_write_operation(
         self,

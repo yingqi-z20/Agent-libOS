@@ -54,6 +54,22 @@ def _commit_tenant_image(runtime: Runtime) -> str:
 
 class TestImageCommit:
 
+    def test_commit_preserves_source_image_projection_policy(self) -> None:
+        with _runtime() as runtime:
+            source = runtime.process.spawn(image='coding-agent:v0', goal='commit coding projection')
+            checkpoint_id = runtime.checkpoint.create(source, 'coding projection', actor=source)
+            runtime.image_registry.grant_register(source, 'coding-projection:v0', issued_by='test')
+
+            result = runtime.image_registry.commit_from_checkpoint(
+                actor=source,
+                checkpoint_id=checkpoint_id,
+                image_id='coding-projection:v0',
+                name='coding-projection',
+            )
+
+            assert result.image.metadata['lazy_tool_groups'] is True
+            assert result.image.metadata['initial_tool_groups'] == ['filesystem']
+
     def test_pre_03_checkpoint_is_rejected_before_image_commit_write(self) -> None:
         with _runtime() as runtime:
             source = runtime.process.spawn(image='base-agent:v0', goal='old commit source')

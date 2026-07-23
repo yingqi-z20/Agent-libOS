@@ -213,6 +213,23 @@ Useful optional variables:
 endpoints require `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1` or an explicit
 `allow_custom_base_url=True` client construction.
 
+To exercise all five built-in image contracts against one configured real
+model, run the scoped opt-in suite:
+
+```bash
+uv run --env-file .env python -m pytest -q \
+  tests/self_evolution/test_builtin_agent_images_real_llm.py \
+  --run-real-llm --fail-on-skip
+```
+
+The same suite covers the coding-image read/write/readback/exit path in an
+isolated temporary workspace. `scripts/run_coding_agent.py` and
+`scripts/llm_write_goal_smoke.py` remain useful for manual coding-image smoke
+runs. The multi-round toolmaker case has a 360-second per-test timeout because
+it includes real provider latency plus Deno validation and registration; the
+other cases retain the ordinary test timeout. These tests spend provider tokens
+and are not part of the deterministic default matrix.
+
 Official OpenAI Responses requests may also be configured with
 privacy-preserving `safety_identifier`, prompt-cache routing fields, and
 opt-in `previous_response_id` chaining. The runtime keeps `llm.store=False` and

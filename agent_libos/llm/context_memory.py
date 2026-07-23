@@ -19,6 +19,7 @@ from agent_libos.models import (
     ContextMaterializationManifest,
     DataLabels,
     Event,
+    EventType,
     MaterializedContext,
     MemoryView,
     ObjectHandle,
@@ -451,6 +452,11 @@ class LLMContextMemory:
             "preserved_recent_entries": preserved_count,
         }
         compacted_payload["entries"] = [compact_entry, *preserved_entries]
+        captured = dict(compacted_payload.get("captured") or {})
+        captured["process_signature"] = None
+        captured["capability_signature"] = None
+        captured["tool_signature"] = None
+        compacted_payload["captured"] = captured
         compacted_payload["cache_strategy"] = {
             **dict(compacted_payload.get("cache_strategy") or {}),
             "mode": "compacted_stable_prefix",
@@ -562,6 +568,40 @@ class LLMContextMemory:
         captured = payload.setdefault("captured", {})
         entries = payload.setdefault("entries", [])
 
+        changed = self._append_process_delta(captured, entries, process, image) or changed
+        changed = self._append_signature_change(
+            captured,
+            entries,
+            captured_key="capability_signature",
+            current_signature=_capability_signature(capabilities),
+            signature_key="cap_id",
+            delta_kind="capabilities_delta",
+            snapshot_kind="capabilities_snapshot",
+            snapshot_field="capabilities",
+            removed_field="removed_capability_ids",
+        ) or changed
+        changed = self._append_signature_change(
+            captured,
+            entries,
+            captured_key="tool_signature",
+            current_signature=_tool_signature(tools),
+            signature_key="name",
+            delta_kind="tool_table_delta",
+            snapshot_kind="tool_table_snapshot",
+            snapshot_field="tools",
+            removed_field="removed_tool_names",
+        ) or changed
+        changed = self._append_event_delta(captured, entries, process, events) or changed
+        changed = self._append_memory_delta(captured, entries, source_context) or changed
+        return changed
+
+    @staticmethod
+    def _append_process_delta(
+        captured: dict[str, Any],
+        entries: list[dict[str, Any]],
+        process: AgentProcess,
+        image: AgentImage,
+    ) -> bool:
         process_signature = {
             "status": process.status.value,
             "status_message": process.status_message,
@@ -572,54 +612,89 @@ class LLMContextMemory:
             "image_id": image.image_id,
             "working_directory": process.working_directory,
         }
-        if captured.get("process_signature") != process_signature:
-            entries.append({"kind": "process_snapshot", "at": utc_now(), **process_signature})
-            captured["process_signature"] = process_signature
-            changed = True
+        if captured.get("process_signature") == process_signature:
+            return False
+        entries.append({"kind": "process_snapshot", "at": utc_now(), **process_signature})
+        captured["process_signature"] = process_signature
+        return True
 
-        capability_signature = _capability_signature(capabilities)
-        if captured.get("capability_signature") != capability_signature:
-            entries.append({"kind": "capabilities_snapshot", "at": utc_now(), "capabilities": capability_signature})
-            captured["capability_signature"] = capability_signature
-            changed = True
+    @staticmethod
+    def _append_signature_change(
+        captured: dict[str, Any],
+        entries: list[dict[str, Any]],
+        *,
+        captured_key: str,
+        current_signature: list[dict[str, Any]],
+        signature_key: str,
+        delta_kind: str,
+        snapshot_kind: str,
+        snapshot_field: str,
+        removed_field: str,
+    ) -> bool:
+        previous_signature = captured.get(captured_key)
+        if previous_signature == current_signature:
+            return False
+        if isinstance(previous_signature, list):
+            upserted, removed = _signature_delta(
+                previous_signature,
+                current_signature,
+                key=signature_key,
+            )
+            entry = {
+                "kind": delta_kind,
+                "at": utc_now(),
+                "upserted": upserted,
+                removed_field: removed,
+            }
+        else:
+            entry = {
+                "kind": snapshot_kind,
+                "at": utc_now(),
+                snapshot_field: current_signature,
+            }
+        entries.append(entry)
+        captured[captured_key] = current_signature
+        return True
 
-        tool_signature = _tool_signature(tools)
-        if captured.get("tool_signature") != tool_signature:
-            entries.append({"kind": "tool_table_snapshot", "at": utc_now(), "tools": tool_signature})
-            captured["tool_signature"] = tool_signature
-            changed = True
-
+    def _append_event_delta(
+        self,
+        captured: dict[str, Any],
+        entries: list[dict[str, Any]],
+        process: AgentProcess,
+        events: list[Event],
+    ) -> bool:
         captured_events = set(captured.get("event_ids", []))
         # ``events`` is already the store-bounded post-cursor window selected
         # with the active Runtime configuration.  Applying the import-time
-        # default here used to discard the leading rows whenever an operator
-        # configured a window larger than the default, even though the caller
-        # advanced the durable cursor past those rows afterwards.
-        new_events = [
-            event
-            for event in events
-            if event.event_id not in captured_events
-        ]
-        if new_events:
-            entries.append(
-                {
-                    "kind": "events_delta",
-                    "at": utc_now(),
-                    "events": [
-                        {
-                            "event_id": event.event_id,
-                            "type": event.type.value,
-                            "source": event.source,
-                            "target": event.target,
-                            "payload": event.payload,
-                        }
-                        for event in new_events
-                    ],
-                }
-            )
-            captured["event_ids"] = sorted(captured_events | {event.event_id for event in new_events})
-            changed = True
+        # default here used to discard leading rows from a larger configured
+        # window even though the durable cursor advanced past those rows.
+        new_events = [event for event in events if event.event_id not in captured_events]
+        if not new_events:
+            return False
+        projected_events, omitted_counts, resource_usage_delta = _project_prompt_events(
+            new_events,
+            context_object_name=self.object_name(process.pid),
+        )
+        event_entry: dict[str, Any] = {
+            "kind": "events_delta",
+            "at": utc_now(),
+            "events": projected_events,
+        }
+        if omitted_counts:
+            event_entry["omitted_evidence_event_counts"] = omitted_counts
+        if resource_usage_delta:
+            event_entry["resource_usage_delta"] = resource_usage_delta
+        entries.append(event_entry)
+        captured["event_ids"] = sorted(captured_events | {event.event_id for event in new_events})
+        return True
 
+    def _append_memory_delta(
+        self,
+        captured: dict[str, Any],
+        entries: list[dict[str, Any]],
+        source_context: MaterializedContext,
+    ) -> bool:
+        changed = False
         captured_objects = _captured_object_signatures(captured)
         changed_oids: list[str] = []
         next_captured_objects = dict(captured_objects)
@@ -646,10 +721,11 @@ class LLMContextMemory:
         if source_context.omitted_objects:
             omitted = sorted(set(source_context.omitted_objects))
             if captured.get("omitted_objects") != omitted:
-                entries.append({"kind": "context_omissions", "at": utc_now(), "omitted_objects": omitted})
+                entries.append(
+                    {"kind": "context_omissions", "at": utc_now(), "omitted_objects": omitted}
+                )
                 captured["omitted_objects"] = omitted
                 changed = True
-
         return changed
 
     def _context_metadata(
@@ -890,6 +966,96 @@ def _capability_policy(cap: Capability) -> str:
     if cap.effect.value == "ask":
         return "ask_each_time"
     return cap.effect.value
+
+
+def _signature_delta(
+    previous: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+    *,
+    key: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    previous_by_key = {
+        str(item[key]): item
+        for item in previous
+        if isinstance(item, dict) and item.get(key) is not None
+    }
+    current_by_key = {
+        str(item[key]): item
+        for item in current
+        if isinstance(item, dict) and item.get(key) is not None
+    }
+    upserted = [
+        deepcopy(item)
+        for item in current
+        if item.get(key) is not None
+        and previous_by_key.get(str(item[key])) != item
+    ]
+    removed = sorted(set(previous_by_key) - set(current_by_key))
+    return upserted, removed
+
+
+def _project_prompt_events(
+    events: list[Event],
+    *,
+    context_object_name: str,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int | float]]:
+    """Keep actionable event evidence while compacting repetitive bookkeeping."""
+
+    projected: list[dict[str, Any]] = []
+    omitted_counts: dict[str, int] = {}
+    resource_usage_delta: dict[str, int | float] = {}
+
+    def omit(kind: str) -> None:
+        omitted_counts[kind] = omitted_counts.get(kind, 0) + 1
+
+    for event in events:
+        if event.type == EventType.RESOURCE_CHARGED:
+            omit(event.type.value)
+            usage = event.payload.get("usage")
+            if isinstance(usage, dict):
+                for name, value in usage.items():
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        resource_usage_delta[str(name)] = resource_usage_delta.get(str(name), 0) + value
+            continue
+
+        if (
+            event.type in {EventType.OBJECT_CREATED, EventType.OBJECT_UPDATED}
+            and event.payload.get("name") == context_object_name
+        ):
+            omit(f"llm_context_{event.type.value}")
+            continue
+
+        payload = deepcopy(event.payload)
+        if event.type == EventType.DATA_FLOW_DECISION:
+            if payload.get("outcome") == "allow":
+                omit("allowed_data_flow_decision")
+                continue
+            payload = {
+                key: payload[key]
+                for key in (
+                    "decision_id",
+                    "direction",
+                    "outcome",
+                    "reason",
+                    "sink",
+                    "labels",
+                    "trust_id",
+                    "release_capability_id",
+                )
+                if key in payload
+            }
+
+        projected.append(
+            {
+                "event_id": event.event_id,
+                "type": event.type.value,
+                "source": event.source,
+                "target": event.target,
+                "payload": payload,
+            }
+        )
+
+    return projected, dict(sorted(omitted_counts.items())), dict(sorted(resource_usage_delta.items()))
 
 
 def _captured_object_signatures(captured: dict[str, Any]) -> dict[str, dict[str, Any]]:

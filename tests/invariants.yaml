@@ -382,7 +382,7 @@
     },
     {
       "id": "context-compaction-preserves-authority-and-fails-closed",
-      "title": "Context compaction preserves process authority, validates summaries, and fails closed on races or invalid output.",
+      "title": "Context compaction preserves process authority, keeps one rolling cumulative summary, validates output, and fails closed on races.",
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compact_process_context_waits_for_compressor_child_and_replaces_context",
@@ -559,6 +559,7 @@
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_concurrent_terminal_drains_install_one_auto_policy",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_cancelled_human_request_cannot_be_approved_later",
         "tests/security/test_permission_policy.py::TestPermissionPolicy::test_request_permission_requires_human_write_authority",
+        "tests/security/test_permission_policy.py::TestPermissionPolicy::test_ask_each_time_read_prompts_before_observation_and_consumes_one_time_grant",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_async_runtime_resumes_human_question_with_answer",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_ask_human_tool_waits_and_returns_answer_after_queue_processing",
         "tests/security/test_human_question_tool.py::TestHumanQuestionTool::test_auto_answer_write_is_recorded_without_persisting_prompt_or_answer",
@@ -667,6 +668,8 @@
         "tests/security/test_jit_security.py::TestJitSecurity::test_cancelled_deno_execution_kills_process_and_drains_workers",
         "tests/self_evolution/test_swe_agent_skill.py::TestSWEAgentSkill::test_swe_edit_refuses_truncated_source_before_write",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_cleanup_kills_process_group_and_descendants",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_cleanup_group_permission_error_uses_verified_tree_fallback",
+        "tests/security/test_jit_security.py::TestJitSecurity::test_deno_cleanup_group_permission_error_fails_closed_when_tree_is_unverified",
         "tests/security/test_jit_security.py::TestJitSecurity::test_deno_supervisor_kills_untrusted_process_after_host_sigkill",
         "tests/self_evolution/test_checkpoint_jit.py::TestCheckpointJit::test_process_tool_configuration_rejects_cross_owner_process_local_jit",
         "tests/runtime/test_persistent_runtime.py::TestPersistentRuntime::test_registered_jit_tool_source_survives_runtime_reopen"
@@ -1385,6 +1388,7 @@
         "tests/runtime/test_parallel_scheduler.py::TestParallelScheduler::test_concurrent_direct_single_step_calls_do_not_reenter_same_process",
         "tests/runtime/test_parallel_scheduler.py::TestParallelScheduler::test_terminal_process_rejects_direct_tool_table_mutation",
         "tests/runtime/test_parallel_scheduler.py::TestParallelScheduler::test_detached_quantum_token_cannot_mutate_after_external_cancel",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_scheduler_background_completes_slow_inflight_quantum_at_batch_boundary",
         "tests/runtime/test_store_contract.py::test_bound_worker_token_cannot_fall_back_to_cross_pid_host_write[sqlite-memory]",
         "tests/runtime/test_store_contract.py::test_bound_worker_token_cannot_fall_back_to_cross_pid_host_write[sqlite-file]",
         "tests/runtime/test_store_contract.py::test_bound_worker_token_cannot_fall_back_to_cross_pid_host_write[postgres]",
@@ -2089,10 +2093,12 @@
     },
     {
       "id": "agent-output-is-not-control-channel",
-      "title": "Untrusted command output cannot trigger agent lifecycle control actions.",
+      "title": "Untrusted command output cannot trigger lifecycle control; explicit submission stays bounded and a failed exit is not completion.",
       "lane": "self-evolution",
       "node_ids": [
         "tests/self_evolution/test_mini_swe_agent_image.py::TestMiniSWEAgentImage::test_bash_source_contract_uses_explicit_submit_flag",
+        "tests/self_evolution/test_mini_swe_agent_image.py::TestMiniSWEAgentImage::test_submit_uses_bounded_observation_instead_of_raw_shell_output",
+        "tests/self_evolution/test_mini_swe_agent_image.py::TestMiniSWEAgentImage::test_submit_failure_preserves_bounded_command_evidence",
         "tests/self_evolution/test_swe_agent_skill.py::TestSWEAgentSkill::test_swe_submit_uses_supported_process_exit_payload"
       ],
       "benchmark_attack_classes": []
@@ -2496,6 +2502,7 @@
         "tests/runtime/test_authority_manifest.py::test_data_flow_policy_rejects_mixed_non_string_unknown_fields",
         "tests/runtime/test_authority_manifest.py::test_model_permission_request_outside_manifest_is_denied_before_human_request",
         "tests/runtime/test_authority_manifest.py::test_requestable_manifest_authority_allows_prompt_without_pregranting_capability",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_process_spawn_authority_manifest_keeps_workspace_access_request_only",
         "tests/runtime/test_authority_manifest.py::test_implicit_manifest_denies_model_requests_but_preserves_host_transition_authority",
         "tests/runtime/test_authority_manifest.py::test_implicit_manifest_records_host_launch_capabilities",
         "tests/runtime/test_authority_manifest.py::test_explicit_empty_object_keeps_host_launch_capabilities_as_ceiling",
@@ -2765,6 +2772,9 @@
         "tests/providers/test_gui_server.py::TestGuiServer::test_gui_response_guard_and_decision_share_binding_transaction",
         "tests/providers/test_gui_server.py::TestGuiServer::test_gui_release_binds_the_returned_decision_view",
         "tests/providers/test_gui_server.py::TestGuiServer::test_repeated_snapshot_reuses_unchanged_human_presentation_evidence",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_delivered_output_snapshot_remains_visible_after_source_mutation_and_exit",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_delivered_output_snapshot_digest_mismatch_fails_closed",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_delivered_output_snapshot_still_obeys_current_sink_clearance",
         "tests/providers/test_gui_server.py::TestGuiServer::test_new_gui_presentation_session_does_not_reuse_an_old_receipt",
         "tests/providers/test_gui_server.py::TestGuiServer::test_cached_gui_projection_linearizes_with_sink_policy_changes",
         "tests/security/test_data_flow_egress.py::test_rejected_conditional_human_release_terminates_secret_question_once",
@@ -3022,7 +3032,8 @@
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_tool_projection.py::test_review_image_projects_small_model_schema_without_removing_callable_tools",
-        "tests/runtime/test_tool_projection.py::test_model_tool_projection_survives_runtime_reopen"
+        "tests/runtime/test_tool_projection.py::test_model_tool_projection_survives_runtime_reopen",
+        "tests/runtime/test_tool_projection.py::test_all_lazy_builtin_images_start_small_without_changing_authority"
       ],
       "benchmark_attack_classes": []
     },

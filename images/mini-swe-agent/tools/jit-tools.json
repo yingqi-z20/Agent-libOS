@@ -9,6 +9,8 @@
       "properties": {
         "command": {
           "type": "string",
+          "minLength": 1,
+          "maxLength": 32768,
           "description": "Bash command to run for this step."
         },
         "submit": {
@@ -29,11 +31,72 @@
         "elided_chars": {"type": "integer"},
         "warning": {"type": "string"},
         "exception_info": {"type": "string"}
-      }
+      },
+      "required": ["returncode", "exception_info"],
+      "additionalProperties": false
     },
-    "tests": [],
+    "tests": [
+      {
+        "args": {"command": "printf ok"},
+        "syscalls": [
+          {
+            "name": "shell.run",
+            "args": {"argv": ["bash", "-lc", "exec 2>&1; printf ok"], "timeout_s": 30},
+            "result": {"returncode": 0, "stdout": "ok", "stderr": ""}
+          }
+        ],
+        "expected": {"returncode": 0, "output": "ok", "exception_info": ""}
+      },
+      {
+        "args": {"command": "printf done", "submit": true},
+        "syscalls": [
+          {
+            "name": "shell.run",
+            "args": {"argv": ["bash", "-lc", "exec 2>&1; printf done"], "timeout_s": 30},
+            "result": {"returncode": 0, "stdout": "done", "stderr": ""}
+          },
+          {
+            "name": "process.exit",
+            "args": {"payload": {"status": "submitted", "returncode": 0, "output": "done", "exception_info": ""}},
+            "result": {"status": "exited"}
+          }
+        ],
+        "expected": {"returncode": 0, "output": "done", "exception_info": ""}
+      },
+      {
+        "args": {"command": "printf denied"},
+        "syscalls": [
+          {
+            "name": "shell.run",
+            "args": {"argv": ["bash", "-lc", "exec 2>&1; printf denied"], "timeout_s": 30},
+            "ok": false,
+            "error": "denied"
+          }
+        ],
+        "expected": {"returncode": -1, "output": "", "exception_info": "denied"}
+      },
+      {
+        "args": {"command": "printf done", "submit": true},
+        "syscalls": [
+          {
+            "name": "shell.run",
+            "args": {"argv": ["bash", "-lc", "exec 2>&1; printf done"], "timeout_s": 30},
+            "result": {"returncode": 0, "stdout": "done", "stderr": ""}
+          },
+          {
+            "name": "process.exit",
+            "args": {"payload": {"status": "submitted", "returncode": 0, "output": "done", "exception_info": ""}},
+            "ok": false,
+            "error": "exit denied"
+          }
+        ],
+        "expected": {"returncode": -1, "output": "done", "exception_info": "submission failed: exit denied"}
+      }
+    ],
     "metadata": {
-      "compatibility": "mini-swe-agent mini.yaml bash tool"
+      "compatibility": "mini-swe-agent mini.yaml bash tool",
+      "command_max_chars": 32768,
+      "final_output_max_chars": 10000
     }
   }
 ]

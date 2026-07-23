@@ -1,15 +1,43 @@
 from __future__ import annotations
 
+from pathlib import PurePosixPath, PureWindowsPath
+
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_FILE_PATH_DESCRIPTION = (
+    "File path relative to the process's current working directory; do not "
+    "prepend that directory or the workspace root. The resolved path must "
+    "remain inside the runtime workspace."
+)
+_DIRECTORY_PATH_DESCRIPTION = (
+    "Directory path relative to the process's current working directory; do "
+    "not prepend that directory or the workspace root. The resolved path must "
+    "remain inside the runtime workspace."
+)
+
+
+def normalize_process_path_argument(path: str, cwd: str) -> str:
+    """Accept an explicit workspace-relative cwd prefix without duplicating it."""
+
+    raw = str(path).replace("\\", "/")
+    if PurePosixPath(raw).is_absolute() or PureWindowsPath(raw).is_absolute():
+        return raw
+    cwd_parts = [part for part in str(cwd).replace("\\", "/").split("/") if part not in {"", "."}]
+    path_parts = [part for part in raw.split("/") if part not in {"", "."}]
+    if not cwd_parts or ".." in path_parts:
+        return raw
+    if path_parts[:len(cwd_parts)] != cwd_parts:
+        return raw
+    remaining = path_parts[len(cwd_parts):]
+    return "/".join(remaining) if remaining else raw
 
 
 class WriteTextFileArgs(BaseModel):
-    path: str = Field(description="Relative file path under the runtime workspace root.")
+    path: str = Field(description=_FILE_PATH_DESCRIPTION)
     content: str = Field(description="Exact UTF-8 text content to write.")
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     overwrite: bool = Field(default=True, description="Whether to overwrite an existing file.")
@@ -22,7 +50,7 @@ class WriteTextFileOutput(BaseModel):
 
 
 class ReadTextFileArgs(BaseModel):
-    path: str = Field(description="Relative file path under the runtime workspace root.")
+    path: str = Field(description=_FILE_PATH_DESCRIPTION)
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     max_bytes: int = Field(
         default=_TOOL_DEFAULTS.filesystem_read_max_bytes,
@@ -48,7 +76,7 @@ class DirectoryEntryOutput(BaseModel):
 
 
 class ReadDirectoryArgs(BaseModel):
-    path: str = Field(description="Relative directory path under the runtime workspace root.")
+    path: str = Field(description=_DIRECTORY_PATH_DESCRIPTION)
     limit: int = Field(
         default=_TOOL_DEFAULTS.directory_entry_limit,
         ge=1,
@@ -65,7 +93,7 @@ class ReadDirectoryOutput(BaseModel):
 
 
 class WriteDirectoryArgs(BaseModel):
-    path: str = Field(description="Relative directory path under the runtime workspace root.")
+    path: str = Field(description=_DIRECTORY_PATH_DESCRIPTION)
     parents: bool = Field(default=True, description="Whether to create missing parent directories.")
     exist_ok: bool = Field(default=True, description="Whether an existing directory is accepted.")
 
@@ -76,12 +104,12 @@ class WriteDirectoryOutput(BaseModel):
 
 
 class DeleteFileArgs(BaseModel):
-    path: str = Field(description="Relative file path under the runtime workspace root.")
+    path: str = Field(description=_FILE_PATH_DESCRIPTION)
     missing_ok: bool = Field(default=False, description="Whether a missing file should be treated as success.")
 
 
 class DeleteDirectoryArgs(BaseModel):
-    path: str = Field(description="Relative directory path under the runtime workspace root.")
+    path: str = Field(description=_DIRECTORY_PATH_DESCRIPTION)
     recursive: bool = Field(default=False, description="Whether to delete a non-empty directory recursively.")
     missing_ok: bool = Field(default=False, description="Whether a missing directory should be treated as success.")
 
@@ -96,7 +124,9 @@ class DeletePathOutput(BaseModel):
 class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
     name = "read_text_file"
     description = (
-        "Read UTF-8 text from a file under the runtime workspace root. "
+        "Read UTF-8 text from a path relative to the process's current working "
+        "directory; do not prepend that directory. "
+        "The resolved path must remain under the runtime workspace root. "
         "This is a Skills/Tools Layer wrapper around the libOS filesystem primitive; "
         "the primitive enforces filesystem read capability, path containment, audit, and events."
     )
@@ -116,10 +146,11 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         cwd = runtime.process.working_directory(ctx.pid)
+        path = normalize_process_path_argument(args.path, cwd)
         try:
             result = runtime.filesystem.read_text(
                 pid=ctx.pid,
-                path=args.path,
+                path=path,
                 encoding=args.encoding,
                 max_bytes=args.max_bytes,
                 cwd=cwd,
@@ -141,7 +172,8 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
 class ReadDirectoryTool(SyncAgentTool[ReadDirectoryArgs]):
     name = "read_directory"
     description = (
-        "List entries in a directory under the runtime workspace root. "
+        "List a directory relative to the process's current working directory; do not prepend that directory. "
+        "The resolved path must remain under the runtime workspace root. "
         "The filesystem primitive enforces directory read capability, path containment, audit, and events."
     )
     args_schema = ReadDirectoryArgs
@@ -160,9 +192,10 @@ class ReadDirectoryTool(SyncAgentTool[ReadDirectoryArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         cwd = runtime.process.working_directory(ctx.pid)
+        path = normalize_process_path_argument(args.path, cwd)
         result = runtime.filesystem.read_directory(
             pid=ctx.pid,
-            path=args.path,
+            path=path,
             limit=args.limit,
             cwd=cwd,
         )
@@ -177,7 +210,9 @@ class ReadDirectoryTool(SyncAgentTool[ReadDirectoryArgs]):
 class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
     name = "write_text_file"
     description = (
-        "Write UTF-8 text to a file under the runtime workspace root. "
+        "Write UTF-8 text to a path relative to the process's current working "
+        "directory; do not prepend that directory. "
+        "The resolved path must remain under the runtime workspace root. "
         "This is a Skills/Tools Layer wrapper around the libOS filesystem primitive; "
         "the primitive enforces filesystem write capability, path containment, audit, and events."
     )
@@ -197,10 +232,11 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         cwd = runtime.process.working_directory(ctx.pid)
+        path = normalize_process_path_argument(args.path, cwd)
         try:
             result = runtime.filesystem.write_text(
                 pid=ctx.pid,
-                path=args.path,
+                path=path,
                 text=args.content,
                 encoding=args.encoding,
                 overwrite=args.overwrite,
@@ -222,7 +258,9 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
 class WriteDirectoryTool(SyncAgentTool[WriteDirectoryArgs]):
     name = "write_directory"
     description = (
-        "Create or ensure a directory under the runtime workspace root. "
+        "Create or ensure a directory relative to the process's current working "
+        "directory; do not prepend that directory. "
+        "The resolved path must remain under the runtime workspace root. "
         "The filesystem primitive enforces directory write capability, path containment, audit, and events."
     )
     args_schema = WriteDirectoryArgs
@@ -241,10 +279,11 @@ class WriteDirectoryTool(SyncAgentTool[WriteDirectoryArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         cwd = runtime.process.working_directory(ctx.pid)
+        path = normalize_process_path_argument(args.path, cwd)
         try:
             result = runtime.filesystem.write_directory(
                 pid=ctx.pid,
-                path=args.path,
+                path=path,
                 parents=args.parents,
                 exist_ok=args.exist_ok,
                 cwd=cwd,
@@ -261,7 +300,8 @@ class WriteDirectoryTool(SyncAgentTool[WriteDirectoryArgs]):
 class DeleteFileTool(SyncAgentTool[DeleteFileArgs]):
     name = "delete_file"
     description = (
-        "Delete a file under the runtime workspace root. "
+        "Delete a file relative to the process's current working directory; do not prepend that directory. "
+        "The resolved path must remain under the runtime workspace root. "
         "The filesystem primitive enforces delete capability, path containment, audit, and events."
     )
     args_schema = DeleteFileArgs
@@ -280,9 +320,10 @@ class DeleteFileTool(SyncAgentTool[DeleteFileArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         cwd = runtime.process.working_directory(ctx.pid)
+        path = normalize_process_path_argument(args.path, cwd)
         result = runtime.filesystem.delete_file(
             pid=ctx.pid,
-            path=args.path,
+            path=path,
             missing_ok=args.missing_ok,
             cwd=cwd,
         )
@@ -297,7 +338,8 @@ class DeleteFileTool(SyncAgentTool[DeleteFileArgs]):
 class DeleteDirectoryTool(SyncAgentTool[DeleteDirectoryArgs]):
     name = "delete_directory"
     description = (
-        "Delete a directory under the runtime workspace root. "
+        "Delete a directory relative to the process's current working directory; do not prepend that directory. "
+        "The resolved path must remain under the runtime workspace root. "
         "The filesystem primitive enforces delete capability, path containment, audit, and events."
     )
     args_schema = DeleteDirectoryArgs
@@ -316,10 +358,11 @@ class DeleteDirectoryTool(SyncAgentTool[DeleteDirectoryArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         cwd = runtime.process.working_directory(ctx.pid)
+        path = normalize_process_path_argument(args.path, cwd)
         try:
             result = runtime.filesystem.delete_directory(
                 pid=ctx.pid,
-                path=args.path,
+                path=path,
                 recursive=args.recursive,
                 missing_ok=args.missing_ok,
                 cwd=cwd,

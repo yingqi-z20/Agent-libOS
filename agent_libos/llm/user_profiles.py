@@ -191,7 +191,7 @@ def validate_user_llm_profile_payload(
         raw.get("context_window_tokens"),
         "context_window_tokens",
     )
-    raw["temperature"] = _optional_float(raw.get("temperature"), "temperature")
+    raw["temperature"] = _optional_nonnegative_float(raw.get("temperature"), "temperature")
     for key in ("store", "responses_previous_response_id", "parallel_tool_calls", "auto_wait_on_empty_tool_calls", "allow_custom_base_url"):
         raw[key] = _optional_bool(raw.get(key), key)
     cleaned = {key: value for key, value in raw.items() if value is not None}
@@ -247,6 +247,9 @@ def summarize_llm_profile(
         "store": profile.store,
         "reasoning_effort": profile.reasoning_effort,
         "verbosity": profile.verbosity,
+        "safety_identifier_env": profile.safety_identifier_env,
+        "prompt_cache_retention": profile.prompt_cache_retention,
+        "responses_previous_response_id": profile.responses_previous_response_id,
         "parallel_tool_calls": profile.parallel_tool_calls,
         "auto_wait_on_empty_tool_calls": profile.auto_wait_on_empty_tool_calls,
         "temperature": profile.temperature,
@@ -343,6 +346,13 @@ def _optional_positive_float(value: Any, label: str) -> float | None:
     selected = _optional_float(value, label)
     if selected is not None and selected <= 0:
         raise ValidationError(f"LLM profile {label} must be positive")
+    return selected
+
+
+def _optional_nonnegative_float(value: Any, label: str) -> float | None:
+    selected = _optional_float(value, label)
+    if selected is not None and selected < 0:
+        raise ValidationError(f"LLM profile {label} must be non-negative")
     return selected
 
 

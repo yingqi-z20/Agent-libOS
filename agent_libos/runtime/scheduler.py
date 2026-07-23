@@ -147,21 +147,40 @@ class AsyncProcessScheduler:
     def is_active_quantum(self, pid: str) -> bool:
         return _ACTIVE_QUANTUM.get() == (id(self), pid)
 
-    async def arun_until_idle(self, quantum: Quantum, max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
+    async def arun_until_idle(
+        self,
+        quantum: Quantum,
+        max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta,
+        *,
+        cancel_inflight_on_budget_exhaustion: bool = True,
+    ) -> list[Any]:
         return await self._run_blocking(
             self.run_until_idle,
             quantum,
             max_quanta=max_quanta,
+            cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
         )
 
-    def run_until_idle(self, quantum: Quantum, max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta) -> list[Any]:
+    def run_until_idle(
+        self,
+        quantum: Quantum,
+        max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta,
+        *,
+        cancel_inflight_on_budget_exhaustion: bool = True,
+    ) -> list[Any]:
         with self._run_lock:
-            return self._run_until_idle_locked(quantum, max_quanta=max_quanta)
+            return self._run_until_idle_locked(
+                quantum,
+                max_quanta=max_quanta,
+                cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
+            )
 
     def _run_until_idle_locked(
         self,
         quantum: Quantum,
         max_quanta: int | None = _SCHEDULER_DEFAULTS.max_quanta,
+        *,
+        cancel_inflight_on_budget_exhaustion: bool = True,
     ) -> list[Any]:
         results: list[Any] = []
         futures: dict[str, Future[list[Any]]] = {}
@@ -266,24 +285,39 @@ class AsyncProcessScheduler:
                             unblock=True,
                         )
                     continue
-                if (
-                    drain_window_s is not None
-                    and self._has_pending_future(futures)
-                ):
-                    # Use a real wall-clock deadline instead of converting the
-                    # window to poll counts. On Windows the event-loop timer
-                    # granularity can be much larger than poll_interval_s, so a
-                    # count-based drain can wait several seconds even when the
-                    # scheduler promised a bounded run.
-                    now = time.perf_counter()
-                    if drain_deadline is None:
-                        drain_deadline = now + drain_window_s
-                    if now < drain_deadline:
-                        continue
+                keep_draining, drain_deadline = self._budget_drain_state(
+                    futures=futures,
+                    cancel_inflight=cancel_inflight_on_budget_exhaustion,
+                    drain_window_s=drain_window_s,
+                    drain_deadline=drain_deadline,
+                )
+                if keep_draining:
+                    continue
                 self._cancel_pending_futures(futures, results, reason="max_quanta_exhausted")
                 break
 
         return results
+
+    def _budget_drain_state(
+        self,
+        *,
+        futures: dict[str, Future[list[Any]]],
+        cancel_inflight: bool,
+        drain_window_s: float | None,
+        drain_deadline: float | None,
+    ) -> tuple[bool, float | None]:
+        # Host-managed incremental runners may use max_quanta only as a
+        # completed-batch boundary. An admitted provider/tool quantum then
+        # finishes normally while the budget still blocks another admission.
+        if not cancel_inflight:
+            return True, None
+        if drain_window_s is None or not self._has_pending_future(futures):
+            return False, drain_deadline
+        # A wall-clock deadline avoids Windows event-loop timer granularity
+        # turning a short bounded drain into a multi-second wait.
+        now = time.perf_counter()
+        selected_deadline = drain_deadline or now + drain_window_s
+        return now < selected_deadline, selected_deadline
 
     async def arun_pid_until_idle(
         self,

@@ -523,6 +523,7 @@ process:
 - loaded Skill records and package rows,
 - visible static tools and process-local JIT tool sources,
 - process cwd and image context settings,
+- lazy model-tool projection behavior, including validated initial tool groups,
 - required startup module summaries.
 
 It does not copy the real filesystem, shell state, remote JSON-RPC/MCP state,

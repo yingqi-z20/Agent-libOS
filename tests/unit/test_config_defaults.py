@@ -163,6 +163,7 @@ class TestConfigDefaults:
         assert DEFAULT_CONFIG.llm.persist_full_io is True
         assert DEFAULT_CONFIG.llm.auto_wait_on_empty_tool_calls is False
         assert DEFAULT_CONFIG.llm.context_window_tokens == 131_072
+        assert DEFAULT_CONFIG.llm.max_tokens == 16_384
         assert DEFAULT_CONFIG.llm.max_tokens < DEFAULT_CONFIG.llm.context_window_tokens
 
     def test_llm_context_window_requires_effective_output_reservation_to_fit(self) -> None:
@@ -193,7 +194,7 @@ class TestConfigDefaults:
             AgentLibOSConfig(
                 llm=LLMDefaults(
                     profiles={
-                        "default": LLMProfile(context_window_tokens=32_768),
+                        "default": LLMProfile(context_window_tokens=16_384),
                     }
                 )
             )

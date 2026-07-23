@@ -159,7 +159,7 @@ real external-provider configuration has been release-validated.
 
 - Compilation, architecture/blocking-work checks, protected-operation coverage,
   release-contract checks, whitespace checks, and the invariant manifest pass.
-  All 86 declared invariants resolve against 3,695 collected pytest nodes.
+  All 86 declared invariants resolve against 3,762 collected pytest nodes.
 - The per-lane deterministic matrix passes all selected tests. PostgreSQL
   service coverage, real MCP SDK/server integration, and real-LLM coverage
   remain in dedicated or explicit gates; deterministic mocked MCP coverage is
@@ -169,8 +169,19 @@ real external-provider configuration has been release-validated.
   PostgreSQL 17 on Python 3.11 and permits no skips; the current collection
   selects 261 tests. This is a service-backed CI gate, not evidence that an
   arbitrary local PostgreSQL configuration has been validated.
-- The GUI lane passes all 19 Vitest files and 68 tests, TypeScript type checking,
+- The GUI lane passes all 25 Vitest files and 100 tests, TypeScript type checking,
   and the production frontend build.
+- A scoped opt-in local GUI exercise used a configured real custom LLM
+  endpoint to read a policy plus CSV, compute regional revenue, write and
+  re-read a Markdown report, emit `human_output`, and exit. The original serial
+  path completed correctly in 10 LLM calls, 241,038 cumulative provider tokens,
+  and two approvals. Enabling provider parallel-tool mode did not help this
+  sequential authority workflow (11 calls, 304,779 tokens, four approvals), so
+  the default remains off. After exposing requestable ceilings as non-grant
+  model facts and tightening first-action permission planning, the same task
+  completed correctly in seven calls, 138,621 tokens, and one approval; the
+  final output remained visible after process exit. This is one provider- and
+  scenario-specific validation, not a latency SLA or general benchmark claim.
 - The runtime-safety release smoke passes all three selected tasks with complete
   audit evidence, no unauthorized effects, and no false denials. Four focused
   Git tasks additionally pass for managed-checkout containment, malicious

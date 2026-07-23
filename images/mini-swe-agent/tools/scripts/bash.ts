@@ -1,4 +1,5 @@
 const TIMEOUT_SECONDS = 30;
+const COMMAND_MAX_CHARS = 32768;
 const OUTPUT_LIMIT = 10000;
 const OUTPUT_EDGE = 5000;
 
@@ -9,6 +10,9 @@ type LibOS = {
 function commandText(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error("command must be a non-empty string");
+  }
+  if (value.length > COMMAND_MAX_CHARS) {
+    throw new Error(`command exceeds ${COMMAND_MAX_CHARS} characters`);
   }
   return value;
 }
@@ -31,6 +35,10 @@ function observation(returncode: number, output: string, exceptionInfo = ""): Re
   };
 }
 
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export async function run(args: Record<string, unknown>, libos: LibOS): Promise<Record<string, unknown>> {
   const command = commandText(args.command);
   const submit = args.submit === true;
@@ -43,17 +51,21 @@ export async function run(args: Record<string, unknown>, libos: LibOS): Promise<
     const stdout = String(result.stdout ?? "");
     const stderr = String(result.stderr ?? "");
     const output = stdout + stderr;
+    const resultObservation = observation(returncode, output);
     if (returncode === 0 && submit) {
-      await libos.syscall("process.exit", {
-        payload: {
-          status: "submitted",
-          output,
-        },
-      });
+      try {
+        await libos.syscall("process.exit", {
+          payload: {
+            status: "submitted",
+            ...resultObservation,
+          },
+        });
+      } catch (error) {
+        return observation(-1, output, `submission failed: ${errorText(error)}`);
+      }
     }
-    return observation(returncode, output);
+    return resultObservation;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return observation(-1, "", message);
+    return observation(-1, "", errorText(error));
   }
 }

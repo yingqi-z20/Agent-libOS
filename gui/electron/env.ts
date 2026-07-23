@@ -15,7 +15,14 @@ export function requireLoopbackDevServerUrl(rawUrl: string): string {
   if (!["http:", "https:"].includes(url.protocol) || !isLoopbackHost(url.hostname)) {
     throw new Error("VITE_DEV_SERVER_URL must use a loopback HTTP(S) host.");
   }
+  if (url.username || url.password) {
+    throw new Error("VITE_DEV_SERVER_URL must not include URL credentials.");
+  }
   return url.toString();
+}
+
+export function redactGuiServerOutput(value: string): string {
+  return value.replace(/("token"\s*:\s*)"[^"\r\n]*"/g, '$1"[redacted]"');
 }
 
 export function readDotenv(filePath: string): Record<string, string> {

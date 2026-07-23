@@ -59,6 +59,7 @@ export function RatingPanel({ process, onSave }: RatingPanelProps) {
       <textarea
         value={comment}
         disabled={disabled}
+        aria-label={t("rating.commentPlaceholder")}
         placeholder={t("rating.commentPlaceholder")}
         onChange={(event) => setComment(event.currentTarget.value)}
       />

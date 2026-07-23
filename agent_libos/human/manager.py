@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import contextlib
 import hashlib
+import hmac
 import threading
 from contextvars import ContextVar
 from typing import Any, Iterable, Mapping
@@ -77,6 +78,7 @@ _DATA_RELEASE_REQUEST_KEY = "_agent_libos_data_release_request_id"
 _DATA_RELEASE_REQUESTS_KEY = "_agent_libos_data_release_request_ids"
 _DATA_RELEASE_PRESENTATION_KEY = "_agent_libos_data_release_presentation"
 _DATA_RELEASE_VISIBLE_KEY = "_agent_libos_data_release_visible"
+_OUTPUT_SNAPSHOT_SHA256_KEY = "_agent_libos_output_snapshot_sha256"
 _PRESENTATION_RECEIPT_PER_REQUEST_MULTIPLIER = 4
 
 
@@ -918,6 +920,9 @@ class HumanObjectManager:
                 "type": "output",
                 "message": message,
                 "channel": selected_channel,
+                _OUTPUT_SNAPSHOT_SHA256_KEY: hashlib.sha256(
+                    message.encode("utf-8")
+                ).hexdigest(),
                 _DATA_FLOW_CONTEXT_KEY: flow.to_dict(),
             },
             status=HumanRequestStatus.PENDING,
@@ -1005,6 +1010,7 @@ class HumanObjectManager:
         payload.pop(_DATA_RELEASE_REQUESTS_KEY, None)
         payload.pop(_DATA_RELEASE_PRESENTATION_KEY, None)
         payload.pop(_DATA_RELEASE_VISIBLE_KEY, None)
+        payload.pop(_OUTPUT_SNAPSHOT_SHA256_KEY, None)
         return payload
 
     def list_for_presentation(
@@ -1128,7 +1134,9 @@ class HumanObjectManager:
             if fresh.payload.get("type") == "data_release_approval":
                 return raw
 
-            context = self._request_data_flow_context(fresh)
+            context = self._presentation_data_flow_context(fresh)
+            if context is None:
+                return self._withheld_public_request_view(fresh)
             manager = self.data_flow
             sink = self._presentation_sink(fresh, selected_presentation)
             view_sha256 = hashlib.sha256(
@@ -1200,7 +1208,9 @@ class HumanObjectManager:
         if fresh.payload.get("type") == "data_release_approval":
             return False
 
-        context = self._request_data_flow_context(fresh)
+        context = self._presentation_data_flow_context(fresh)
+        if context is None:
+            return True
         manager = self.data_flow
         sink = self._presentation_sink(fresh, selected_presentation)
         outcome = manager.classify_egress_snapshot(
@@ -1297,10 +1307,11 @@ class HumanObjectManager:
         if not isinstance(resource, str) or not isinstance(constraints, Mapping):
             return False
         binding = constraints.get(manager.RELEASE_BINDING_KEY)
-        if not manager.is_release_binding_current(
+        context = self._presentation_data_flow_context(request)
+        if context is None or not manager.is_release_binding_current(
             pid=request.pid,
             sink=self._presentation_sink(request, presentation),
-            context=self._request_data_flow_context(request),
+            context=context,
             payload_hash=view_sha256,
             operation=f"human.{presentation}.present",
             target_state_version=None,
@@ -3017,6 +3028,56 @@ class HumanObjectManager:
             return DataFlowContext.from_dict(raw)
         except (TypeError, ValueError) as exc:
             raise ValidationError(f"Human request has invalid trusted data-flow context: {exc}") from exc
+
+    def _presentation_data_flow_context(
+        self,
+        request: HumanRequest,
+    ) -> DataFlowContext | None:
+        """Return the context for presenting a frozen Human-request payload.
+
+        A successfully delivered output has already crossed a protected
+        provider boundary while every original source reference was current.
+        Its stored message is therefore a frozen payload snapshot: later
+        updates to a mutable LLM context or another source cannot change those
+        bytes.  Presentation must still enforce the captured labels and the
+        current Sink policy, but rechecking source *freshness* would turn an
+        ordinary post-output process transition into a false denial.
+
+        New requests carry an internal message digest so accidental payload
+        mutation fails closed.  Legacy delivered rows predate that marker and
+        are accepted through the same durable delivered/committed receipt.
+        Pending questions, approvals, and uncertain deliveries retain the
+        ordinary live-source checks.
+        """
+
+        context = self._request_data_flow_context(request)
+        decision = request.decision
+        if not (
+            request.payload.get("type") == "output"
+            and request.status == HumanRequestStatus.DELIVERED
+            and isinstance(decision, Mapping)
+            and decision.get("delivery_committed") is True
+            and decision.get("delivered") is True
+        ):
+            return context
+
+        message = request.payload.get("message")
+        if not isinstance(message, str):
+            return None
+        expected = request.payload.get(_OUTPUT_SNAPSHOT_SHA256_KEY)
+        if expected is not None:
+            actual = hashlib.sha256(message.encode("utf-8")).hexdigest()
+            if (
+                not isinstance(expected, str)
+                or len(expected) != 64
+                or not hmac.compare_digest(expected, actual)
+            ):
+                return None
+
+        return DataFlowContext(
+            labels=context.labels,
+            materialization_id=context.materialization_id,
+        )
 
     def _precheck_human_egress(
         self,

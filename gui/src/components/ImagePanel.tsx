@@ -69,11 +69,11 @@ export function ImagePanel({
       </div>
 
       <div className="imageCommitBox">
-        <input value={imageId} onChange={(event) => setImageId(event.currentTarget.value)} placeholder={t("image.commitIdPlaceholder")} />
-        <input value={name} onChange={(event) => setName(event.currentTarget.value)} placeholder={t("image.commitNamePlaceholder")} />
-        <input value={version} onChange={(event) => setVersion(event.currentTarget.value)} placeholder={t("image.version")} />
+        <input aria-label={t("image.commitIdPlaceholder")} value={imageId} onChange={(event) => setImageId(event.currentTarget.value)} placeholder={t("image.commitIdPlaceholder")} />
+        <input aria-label={t("image.commitNamePlaceholder")} value={name} onChange={(event) => setName(event.currentTarget.value)} placeholder={t("image.commitNamePlaceholder")} />
+        <input aria-label={t("image.version")} value={version} onChange={(event) => setVersion(event.currentTarget.value)} placeholder={t("image.version")} />
         {allowReplace ? (
-          <input value={checkpointId} onChange={(event) => setCheckpointId(event.currentTarget.value)} placeholder={t("image.checkpointPlaceholder")} />
+          <input aria-label={t("image.checkpointPlaceholder")} value={checkpointId} onChange={(event) => setCheckpointId(event.currentTarget.value)} placeholder={t("image.checkpointPlaceholder")} />
         ) : null}
         <button
           className="warning"
@@ -112,7 +112,7 @@ export function ImagePanel({
         ))}
       </div>
 
-      {inspectError ? <div className="toast inlineToast">{inspectError}</div> : null}
+      {inspectError ? <div className="toast inlineToast" role="alert">{inspectError}</div> : null}
       {inspected ? <CollapsibleJson value={inspected} label={t("image.inspectResult")} /> : null}
     </section>
   );

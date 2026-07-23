@@ -45,6 +45,8 @@ class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
     name = "human_output"
     description = (
         "Present a message to the human operator through the configured human provider. "
+        "Use it for the concise final user-facing result before process_exit "
+        "when the image requires interactive reporting. "
         "This is a Skills/Tools Layer wrapper around the libOS HumanObject output primitive; "
         "the primitive enforces human write capability, audit, and events."
     )

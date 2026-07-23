@@ -1245,12 +1245,7 @@ class ImageRegistryPrimitive:
             required_modules=self._module_specs(artifact.get("modules", [])),
             metadata={
                 **(metadata or {}),
-                **(
-                    {"lazy_tool_groups": True}
-                    if source_image is not None
-                    and bool(source_image.metadata.get("lazy_tool_groups"))
-                    else {}
-                ),
+                **self._projection_metadata_for_commit(source_image),
                 "committed_from_checkpoint": checkpoint_id,
                 "committed_from_pid": checkpoint.pid,
                 "artifact_sha256": artifact_sha256,
@@ -1315,6 +1310,23 @@ class ImageRegistryPrimitive:
             },
         )
         return result
+
+    @staticmethod
+    def _projection_metadata_for_commit(
+        source_image: AgentImage | None,
+    ) -> dict[str, Any]:
+        """Preserve source projection policy without changing tool authority."""
+        if source_image is None or source_image.metadata.get("lazy_tool_groups") is not True:
+            return {}
+        initial_groups = source_image.metadata.get("initial_tool_groups")
+        return {
+            "lazy_tool_groups": True,
+            **(
+                {"initial_tool_groups": list(initial_groups)}
+                if isinstance(initial_groups, (list, tuple))
+                else {}
+            ),
+        }
 
     def grant_register(
         self,
@@ -1452,6 +1464,7 @@ class ImageRegistryPrimitive:
             self._validate_capability_spec(spec)
         self._validate_module_specs(image.required_modules)
         self._validate_boot(image.boot)
+        self.tools.initial_tool_projection(image)
 
     def validate_image(
         self,

@@ -237,6 +237,56 @@ class LLMProcessExecutor:
     def client(self, value: Any) -> None:
         self._llms.set_test_client(self.config.llm.default_profile_id, value)
 
+    def _requestable_capabilities_for_prompt(
+        self,
+        pid: str,
+    ) -> list[dict[str, Any]]:
+        manifest = self._authority_manifests.get_for_process(pid)
+        if manifest is None or not isinstance(manifest.approval_policy, Mapping):
+            return []
+        raw_requestable = manifest.approval_policy.get(
+            "requestable_capabilities",
+            [],
+        )
+        if not isinstance(raw_requestable, list):
+            return []
+        return [
+            dict(spec)
+            for spec in raw_requestable
+            if isinstance(spec, Mapping)
+        ]
+
+    def _build_model_messages(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        process: Any,
+        context: Any,
+        events: list[Any],
+        capabilities: list[Any],
+        tools: list[dict[str, Any]],
+        skills: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        return [
+            {"role": "system", "content": build_system_prompt(image)},
+            {
+                "role": "user",
+                "content": build_user_prompt(
+                    process=process,
+                    context=context,
+                    events=events,
+                    capabilities=capabilities,
+                    tools=tools,
+                    skills=skills,
+                    prompt_mode=image.prompt_mode,
+                    requestable_capabilities=(
+                        self._requestable_capabilities_for_prompt(pid)
+                    ),
+                ),
+            },
+        ]
+
     def run_once(self, pid: str) -> dict[str, Any]:
         try:
             asyncio.get_running_loop()
@@ -387,21 +437,16 @@ class LLMProcessExecutor:
         flow_context = self._data_flow.context_from_materialization(pid, context)
         if events:
             self._advance_event_cursor(pid, events[-1].event_id)
-        messages = [
-            {"role": "system", "content": build_system_prompt(image)},
-            {
-                "role": "user",
-                "content": build_user_prompt(
-                    process=prompt_process,
-                    context=context,
-                    events=events,
-                    capabilities=capabilities,
-                    tools=tools,
-                    skills=skills,
-                    prompt_mode=image.prompt_mode,
-                ),
-            },
-        ]
+        messages = self._build_model_messages(
+            pid=pid,
+            image=image,
+            process=prompt_process,
+            context=context,
+            events=events,
+            capabilities=capabilities,
+            tools=tools,
+            skills=skills,
+        )
         self._audit.record(
             actor=pid,
             action="llm.request",

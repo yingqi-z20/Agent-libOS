@@ -435,6 +435,69 @@ class TestPermissionPolicy:
         assert self.runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ASK_EACH_TIME
 
+    def test_ask_each_time_read_prompts_before_observation_and_consumes_one_time_grant(self) -> None:
+        pid = self._spawn_review(goal='ask every read')
+        path = self._path()
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('read once', encoding='utf-8')
+        resource = self.runtime.filesystem.resource_for(path)
+        self.runtime.capability.set_permission_policy(
+            subject=pid,
+            resource=resource,
+            rights=[CapabilityRight.READ],
+            policy=CapabilityManager.ASK_EACH_TIME,
+            issued_by='test',
+        )
+
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(
+                pid,
+                'read_text_file',
+                {'path': path, 'encoding': 'utf-8', 'max_bytes': 64},
+            )
+
+        pending = self.runtime.human.pending()[0]
+        context = pending.payload['context']
+        assert pending.payload['question'] == f'Allow this process to read {path}?'
+        assert context['primitive'] == 'runtime.filesystem.read_text'
+        assert context['path'] == path
+        assert context['resource'] == resource
+        assert context['right'] == CapabilityRight.READ.value
+        assert context['grant_scope'] == 'one_time'
+        assert context['target_state_observation'] == 'deferred_until_authorized'
+        assert 'target' not in context
+        assert 'exists' not in context
+
+        approved = self.runtime.human.drain_terminal_queue(auto_approve=True)
+        result = self.runtime.tools.call(
+            pid,
+            'read_text_file',
+            {'path': path, 'encoding': 'utf-8', 'max_bytes': 64},
+        )
+
+        assert approved[0].status == HumanRequestStatus.APPROVED
+        assert result.ok
+        assert result.payload['content'] == 'read once'
+        assert self.runtime.capability.permission_policy(
+            pid,
+            resource,
+            CapabilityRight.READ,
+        ) == CapabilityManager.ASK_EACH_TIME
+        assert not any(
+            capability.effect.value == 'allow'
+            and capability.resource == resource
+            and CapabilityRight.READ.value in capability.rights
+            and capability.active
+            for capability in self.runtime.capability.list_subject(pid)
+        )
+        with pytest.raises(HumanApprovalRequired):
+            self.runtime.tools.call(
+                pid,
+                'read_text_file',
+                {'path': path, 'encoding': 'utf-8', 'max_bytes': 64},
+            )
+
     def test_per_use_prompt_uses_repr_preview_for_human_safety(self) -> None:
         pid = self._spawn_review(goal='safe preview')
         path = self._path()

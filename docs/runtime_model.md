@@ -101,6 +101,15 @@ context Objects carry the active schema version, and an existing context Object
 with a different schema fails closed before reuse. Event capture consumes the
 same configured, store-bounded window whose cursor the executor advances, so a
 window larger than the default does not silently lose its leading events.
+The rendered append-only context records one initial Capability snapshot and
+then keyed Capability/tool deltas. Repetitive resource-charge and context-object
+bookkeeping events are represented by bounded counts and aggregate usage;
+denied data-flow decisions retain a compact reason/label record while allowed
+decisions are counted. Every event id is still durably captured, and label
+propagation uses the original events, so this prompt projection does not alter
+stored audit evidence or egress classification. Compaction resets the captured
+process/Capability/tool signatures so the next quantum appends a fresh baseline
+before later deltas.
 
 `planner.context_management` controls model-window pressure handling. With no
 entry, the image uses `auto_compact` at 80% projected occupancy and calls
@@ -149,10 +158,28 @@ their syscall session without exposing the corresponding builtin tool to the
 model.
 
 An image with `metadata.lazy_tool_groups=true` initially projects only the
-stable discovery/core subset into LLM schemas. `discover_tool_groups` and
+stable discovery/core subset plus any validated `metadata.initial_tool_groups`
+into LLM schemas. `discover_tool_groups` and
 `activate_tool_group` expand the durable model projection from the already
 authorized image tool table. Host calls and primitive capability enforcement
 continue to use the complete table; activation cannot grant authority.
+
+The current built-in image contracts are:
+
+| Image | Intended work | Initial model projection | Declared requirements |
+| --- | --- | --- | --- |
+| `base-agent:v0` | General runtime work and coordination | Lazy core plus process/context/clock, then selected groups | configured Human write |
+| `coding-agent:v0` | Repository inspection, editing, Git, and verification | Lazy core plus filesystem, then selected groups | configured Human write and workspace read |
+| `review-agent:v0` | Evidence-first review; read-only unless repair is explicitly requested | Lazy core plus read-only filesystem tools, then selected groups | configured Human write and workspace read |
+| `toolmaker-agent:v0` | Import-free Deno/TypeScript JIT proposal, validation, and registration | Narrow explicit table | configured Human write |
+| `context-compressor:v0` | Structured context compaction | `process_exit` only | none |
+
+The lazy core includes group discovery/activation, lifecycle exit, exact
+permission and Human queries, compact Object Memory operations, current time,
+and capability listing. Requirement declarations remain Task Authority
+Manifest inputs, not grants. Configured base/coding ids must also remain
+distinct from the fixed review, toolmaker, and context-compressor ids; a
+collision fails Runtime construction instead of silently replacing an image.
 
 LLM selection is host-controlled and process-local. A process stores only an
 `llm_profile_id`; the host Runtime resolves that id to a configured
@@ -528,6 +555,16 @@ normal progress is possible, `config.scheduler.drain_window_s` gives active
 workers a short chance to finish before unfinished quanta are cancelled or
 detached.
 
+Host-managed incremental runners may set
+`cancel_inflight_on_budget_exhaustion=False` when `max_quanta` is only a
+completed-batch boundary. That setting still prevents admission of another
+ordinary quantum, but waits for an already admitted provider/tool quantum to
+finish. The GUI background controller uses this mode for its one-quantum
+batches so a slow real LLM response is not mistaken for budget cancellation.
+The public default remains `True`; bounded callers therefore keep the normal
+drain-window cancellation behavior unless they opt into this host lifecycle
+contract.
+
 The scheduler serializes top-level `run_until_idle`, `run_pid_until_idle`, and
 single-step invocations for one `Runtime` instance, so two host calls cannot
 re-enter the same runnable process concurrently. Individual process claims are
@@ -752,7 +789,10 @@ Human records; effect and audit metadata remain content-free as described below.
   constraints shown to the human, then returns the final policy decision. Model
   requests cannot ask for broad high-risk grants such as `capability:*`
   privileged rights, `shell:*` execute, or root/global filesystem write such as
-  `filesystem:/:*`; workspace write remains a human-approvable scope.
+  `filesystem:/:*`; workspace write remains a human-approvable scope. The model
+  prompt distinguishes active capabilities from the Task Authority manifest's
+  requestable ceilings so a missing grant can be requested before an effect is
+  attempted.
 - `human_output` writes through the HumanObject primitive and provider. It
   commits the `delivered` request marker and structured pending external-effect
   intent before calling the provider. Event, audit, and effect finalization
@@ -762,6 +802,13 @@ Human records; effect and audit metadata remain content-free as described below.
   pending row remains and the call is not retried. Thus output is at-most-once:
   no post-provider failure can leave a replayable request or restore already
   committed one-shot authority.
+- After successful delivery, the stored output message is an integrity-bound
+  frozen payload for later GUI presentation. The GUI rechecks its captured
+  labels and current Sink clearance, but a subsequent mutable LLM-context or
+  source-object version no longer hides bytes that were already fixed and
+  delivered. A digest mismatch fails closed. Pending questions, approvals, and
+  delivery attempts without a successful receipt continue to require live
+  source-reference validation.
 - Questions, permission context, approval prompts, and output are also
   data-flow checked against `human:<recipient>:<channel>`. A conditional
   release request contains public metadata and hashes only; it never embeds the

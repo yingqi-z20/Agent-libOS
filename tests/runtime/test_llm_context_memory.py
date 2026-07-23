@@ -371,6 +371,222 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    def test_llm_context_records_capability_changes_as_compact_deltas(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'get_current_time'},
+                {'action': 'get_current_time'},
+                {'action': 'get_current_time'},
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='track capability changes')
+
+            assert runtime.run_next_process_once()['ok']
+            added = runtime.capability.grant(
+                pid,
+                'test:context-delta',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            assert runtime.run_next_process_once()['ok']
+            runtime.capability.revoke(
+                added.cap_id,
+                revoked_by='test',
+                require_authority=False,
+            )
+            assert runtime.run_next_process_once()['ok']
+
+            context = runtime.store.get_object_by_name(
+                context_object_name(pid),
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert context is not None
+            snapshots = [
+                entry
+                for entry in context.payload['entries']
+                if entry.get('kind') == 'capabilities_snapshot'
+            ]
+            deltas = [
+                entry
+                for entry in context.payload['entries']
+                if entry.get('kind') == 'capabilities_delta'
+            ]
+
+            assert len(snapshots) == 1
+            assert any(
+                row.get('cap_id') == added.cap_id
+                for entry in deltas
+                for row in entry['upserted']
+            )
+            assert any(added.cap_id in entry['removed_capability_ids'] for entry in deltas)
+        finally:
+            runtime.close()
+
+    def test_llm_prompt_exposes_requestable_manifest_ceiling_without_granting_it(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'get_current_time'},
+            ])
+            resource = 'filesystem:workspace:task-inputs/*'
+            pid = runtime.process.spawn(
+                image='coding-agent:v0',
+                goal='plan scoped reads before acting',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {
+                            'resource': runtime.config.runtime.default_human_resource,
+                            'rights': [CapabilityRight.WRITE.value],
+                        }
+                    ],
+                    'approval_policy': {
+                        'requestable_capabilities': [
+                            {
+                                'resource': resource,
+                                'rights': [CapabilityRight.READ.value],
+                                'delegable': False,
+                            }
+                        ]
+                    },
+                },
+            )
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            prompt = runtime.llm.client.user_prompts[0]
+            assert 'Permission-request ceilings (not capability grants)' in prompt
+            assert resource in prompt
+            assert 'Plan coherent requests' in prompt
+            assert not runtime.capability.check(pid, resource, CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    def test_llm_context_records_tool_projection_changes_as_compact_deltas(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'get_current_time'},
+                {'action': 'get_current_time'},
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='track tool projection changes')
+
+            assert runtime.run_next_process_once()['ok']
+            runtime.tools.activate_tool_group(pid, 'filesystem')
+            assert runtime.run_next_process_once()['ok']
+
+            context = runtime.store.get_object_by_name(
+                context_object_name(pid),
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert context is not None
+            tool_entries = [
+                entry
+                for entry in context.payload['entries']
+                if entry.get('kind') in {'tool_table_snapshot', 'tool_table_delta'}
+            ]
+
+            assert [entry['kind'] for entry in tool_entries] == ['tool_table_delta']
+            assert any(
+                row.get('name') == 'get_working_directory'
+                for row in tool_entries[0]['upserted']
+            )
+        finally:
+            runtime.close()
+
+    def test_llm_context_compacts_repetitive_evidence_events_without_losing_ids(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = RecordingActionClient([
+                {'action': 'get_current_time'},
+                {'action': 'get_current_time'},
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='compact evidence events')
+            assert runtime.run_next_process_once()['ok']
+
+            resource_event = runtime.events.emit(
+                EventType.RESOURCE_CHARGED,
+                source='test',
+                target=pid,
+                payload={'pid': pid, 'usage': {'tool_calls': 3, 'llm_calls': 1}, 'context': {'large': 'x' * 2000}},
+            )
+            context_event = runtime.events.emit(
+                EventType.OBJECT_UPDATED,
+                source=pid,
+                target=pid,
+                payload={'oid': 'oid_context', 'name': context_object_name(pid), 'version': 9},
+            )
+            allowed_flow_event = runtime.events.emit(
+                EventType.DATA_FLOW_DECISION,
+                source=pid,
+                target=pid,
+                payload={'decision_id': 'flow_allow', 'outcome': 'allow', 'source_refs': [{'payload': 'x' * 2000}]},
+            )
+            denied_flow_event = runtime.events.emit(
+                EventType.DATA_FLOW_DECISION,
+                source=pid,
+                target=pid,
+                payload={
+                    'decision_id': 'flow_deny',
+                    'direction': 'egress',
+                    'outcome': 'deny',
+                    'reason': 'sink is not trusted',
+                    'sink': 'llm:test',
+                    'labels': {'sensitivity': 'normal'},
+                    'source_refs': [{'payload': 'DENIED_PAYLOAD_SENTINEL'}],
+                    'payload_sha256': 'f' * 64,
+                },
+            )
+            useful_event = runtime.events.emit(
+                EventType.EXTERNAL_WRITE,
+                source='test',
+                target=pid,
+                payload={'path': 'triage_summary.md', 'bytes_written': 42},
+            )
+
+            assert runtime.run_next_process_once()['ok']
+
+            context = runtime.store.get_object_by_name(
+                context_object_name(pid),
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert context is not None
+            expected_ids = {
+                resource_event.event_id,
+                context_event.event_id,
+                allowed_flow_event.event_id,
+                denied_flow_event.event_id,
+                useful_event.event_id,
+            }
+            assert expected_ids <= set(context.payload['captured']['event_ids'])
+            event_entry = next(
+                entry
+                for entry in reversed(context.payload['entries'])
+                if entry.get('kind') == 'events_delta'
+                and any(event['event_id'] == useful_event.event_id for event in entry['events'])
+            )
+            visible_by_id = {event['event_id']: event for event in event_entry['events']}
+
+            assert resource_event.event_id not in visible_by_id
+            assert context_event.event_id not in visible_by_id
+            assert allowed_flow_event.event_id not in visible_by_id
+            assert visible_by_id[useful_event.event_id]['payload']['path'] == 'triage_summary.md'
+            assert visible_by_id[denied_flow_event.event_id]['payload'] == {
+                'decision_id': 'flow_deny',
+                'direction': 'egress',
+                'outcome': 'deny',
+                'reason': 'sink is not trusted',
+                'sink': 'llm:test',
+                'labels': {'sensitivity': 'normal'},
+            }
+            assert event_entry['omitted_evidence_event_counts']['resource_charged'] >= 1
+            assert event_entry['omitted_evidence_event_counts']['llm_context_object_updated'] >= 1
+            assert event_entry['omitted_evidence_event_counts']['allowed_data_flow_decision'] == 1
+            assert event_entry['resource_usage_delta']['tool_calls'] >= 3
+            assert 'DENIED_PAYLOAD_SENTINEL' not in json.dumps(event_entry)
+        finally:
+            runtime.close()
+
     def test_llm_context_updates_and_compaction_preserve_highest_historical_labels(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -1191,7 +1407,8 @@ class TestLLMContextMemory:
     def test_llm_prompt_lists_only_process_visible_tools(self) -> None:
         runtime = Runtime.open('local')
         try:
-            runtime.llm.client = RecordingActionClient([{'action': 'process_exit', 'payload': {'done': True}}])
+            client = RecordingActionClient([{'action': 'process_exit', 'payload': {'done': True}}])
+            runtime.llm.client = client
             pid = runtime.process.spawn(image='base-agent:v0', goal='exit')
             runtime.run_next_process_once()
             tool_names = {tool['function']['name'] for tool in runtime.llm.client.tool_batches[0]}
@@ -3218,7 +3435,8 @@ class TestLLMContextMemory:
             assert after.payload['entries'][0]['kind'] == 'context_compacted'
             assert after.payload['entries'][0]['summary']['goal'] == 'matching version summary'
             assert after.payload['entries'][-1] == {'kind': 'seed_entry', 'index': 2}
-            runtime.llm.client = RecordingActionClient([{'action': 'process_exit', 'payload': {'done': True}}])
+            client = RecordingActionClient([{'action': 'process_exit', 'payload': {'done': True}}])
+            runtime.llm.client = client
             assert runtime.run_process_once(pid)['ok']
             manifest = runtime.store.list_context_materialization_manifests(pid=pid)[0]
             context_entry = next(item for item in manifest.objects if item['oid'] == after.oid)
@@ -3226,6 +3444,10 @@ class TestLLMContextMemory:
             assert context_entry['version'] > after.version
             assert context_entry['transform'] == 'compacted'
             assert manifest.compaction['transform'] == 'compacted'
+            refreshed_prompt = client.user_prompts[0]
+            assert '"kind": "process_snapshot"' in refreshed_prompt
+            assert '"kind": "capabilities_snapshot"' in refreshed_prompt
+            assert '"kind": "tool_table_snapshot"' in refreshed_prompt
         finally:
             runtime.close()
 
@@ -3286,6 +3508,8 @@ class TestLLMContextMemory:
     def test_compact_process_context_uses_multiple_chunks(self) -> None:
         runtime = Runtime.open('local')
         try:
+            cumulative = _compact_summary('stage one and two')
+            cumulative['completed'] = ['stage one']
             runtime.llm.client = RecordingActionClient([
                 {
                     'action': 'compact_process_context',
@@ -3295,7 +3519,7 @@ class TestLLMContextMemory:
                     'preserve_recent_entries': 0,
                 },
                 {'action': 'process_exit', 'payload': _compact_summary('stage one')},
-                {'action': 'process_exit', 'payload': _compact_summary('stage two')},
+                {'action': 'process_exit', 'payload': cumulative},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='multi chunk context')
             _grant_context_compressor_authority(runtime, pid)
@@ -3310,8 +3534,23 @@ class TestLLMContextMemory:
             context = runtime.store.get_object_by_name(context_object_name(pid), namespace=runtime.memory.resolve_namespace(pid))
             assert context is not None
             summary_goal = context.payload['entries'][0]['summary']['goal']
-            assert summary_goal == ['stage one', 'stage two']
+            assert summary_goal == 'stage one and two'
+            assert context.payload['entries'][0]['summary']['completed'] == ['stage one']
             assert context.payload['entries'][0]['compaction_metadata']['stage_count'] == 2
+
+            second_child = runtime.process.get(output['compressor_pids'][1])
+            assert second_child.goal_oid is not None
+            second_goal = runtime.store.get_object(second_child.goal_oid)
+            assert second_goal is not None
+            assert second_goal.payload['previous_summary']['goal'] == 'stage one'
+
+            job = runtime.store.get_object_by_name(
+                f'context_compaction_job:{pid}',
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert job is not None
+            assert job.payload['stage_index'] == 2
+            assert job.payload['summaries'] == [cumulative]
         finally:
             runtime.close()
 

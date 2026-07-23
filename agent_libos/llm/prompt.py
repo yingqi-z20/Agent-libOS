@@ -34,9 +34,21 @@ The fallback JSON action object uses this shape, where action is the exact Skill
 
 The available library calls and their schemas are listed in the Available tools section.
 Use object ids and process ids exactly as shown in context. Never invent a capability grant.
-If an action is risky or requires unavailable authority, request human_query or choose a lower-risk step.
+If an action is risky or requires unavailable authority, use request_permission
+for an exact resource/right, use ask_human for missing intent, or choose a
+lower-risk step. Never invent a tool name.
+Use the visible Capability table before an external effect. If no active allow
+covers the exact action but permission requests are authorized, request the
+minimum permission directly; do not call the effect merely to elicit a denial.
+When a displayed permission-request ceiling covers the next filesystem effect
+but the Capability table has no active allow, the next call must be
+request_permission, not read_directory, read_text_file, or a mutation tool.
+Filesystem tool path arguments resolve from the process current working
+directory. Do not prepend that working-directory path or the workspace-root
+path to a relative filename.
 If the goal asks you to create or update a workspace file and write_text_file is available, call write_text_file directly.
-If the goal is complete and process_exit is available, call process_exit directly.
+If the goal is complete, follow the AgentImage's final reporting contract first,
+then call process_exit when it is available.
 Prefer producing small typed objects for reasoning artifacts instead of long prose.
 """.strip()
 
@@ -48,7 +60,8 @@ You are an Agent Process executing in a capability-controlled Agent libOS runtim
 Your job is to advance the current process goal by choosing one Skills/Tools Layer library call for this execution quantum.
 
 Runtime model:
-- All durable state is typed Object Memory, not a filesystem namespace.
+- Durable process state and handoffs use typed Object Memory. A workspace
+  filesystem, when present, is a separate mediated external resource.
 - You act through OpenAI tool calls exposed by the Skills/Tools Layer. Free-form text is allowed, but it has no side effect.
 - Those calls are wrappers over libOS services, not direct syscalls.
 - Tools, object reads, object writes, forks, human requests, JIT tools, checkpoints, and exits are mediated by the runtime.
@@ -60,7 +73,8 @@ Execution discipline:
 - Make progress with one concrete library-level action.
 - Use materialized object context as the source of truth.
 - If enough information is available, create a concise object or call the relevant tool.
-- If the process goal is complete, call exit with a compact final payload.
+- If the process goal is complete, follow the AgentImage's final reporting
+  contract and then call process_exit with a compact final payload.
 """.strip()
 
 MINIMAL_RUNTIME_PROMPT = """
@@ -93,6 +107,7 @@ def build_user_prompt(
     tools: list[dict[str, Any]],
     skills: list[dict[str, Any]] | None = None,
     prompt_mode: str = PROMPT_MODE_LIBOS_DEFAULT,
+    requestable_capabilities: list[dict[str, Any]] | None = None,
 ) -> str:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
     if mode == PROMPT_MODE_IMAGE_ONLY:
@@ -100,7 +115,13 @@ def build_user_prompt(
         # Runtime envelope, but explicitly activated Skill instructions remain
         # part of the process contract.  Preserve the historical exact-context
         # behavior when no Skills are loaded.
-        parts = [_skill_section(skills)] if skills else []
+        parts = (
+            [_requestable_capability_section(requestable_capabilities)]
+            if requestable_capabilities
+            else []
+        )
+        if skills:
+            parts.append(_skill_section(skills))
         parts.append(context.text.strip())
         return "\n\n".join(part for part in parts if part.strip())
     if mode == PROMPT_MODE_MINIMAL_RUNTIME:
@@ -111,6 +132,7 @@ def build_user_prompt(
             capabilities=capabilities,
             tools=tools,
             skills=skills or [],
+            requestable_capabilities=requestable_capabilities or [],
         )
     if context.policy_used == "llm_context_object":
         return "\n\n".join(
@@ -118,6 +140,7 @@ def build_user_prompt(
                 "The append-only LLM context object below is the source of truth for this process quantum.",
                 "OpenAI tool schemas are supplied out-of-band; fallback JSON must still use an exact available tool name.",
                 "Choose the next single runtime action after reading the latest appended entries.",
+                _requestable_capability_section(requestable_capabilities or []),
                 _skill_section(skills or []),
                 context.text,
             ]
@@ -127,6 +150,7 @@ def build_user_prompt(
             _process_section(process),
             _skill_section(skills or []),
             _capability_section(capabilities),
+            _requestable_capability_section(requestable_capabilities or []),
             _tool_section(tools),
             _event_section(events),
             _context_section(context),
@@ -148,11 +172,13 @@ def _minimal_runtime_user_prompt(
     capabilities: list[Capability],
     tools: list[dict[str, Any]],
     skills: list[dict[str, Any]],
+    requestable_capabilities: list[dict[str, Any]],
 ) -> str:
     parts = [
         _process_fact_section(process),
         _skill_section(skills),
         _capability_section(capabilities),
+        _requestable_capability_section(requestable_capabilities),
         _tool_section(tools),
         _event_section(events),
         _context_section(context),
@@ -226,6 +252,18 @@ def _capability_policy(cap: Capability) -> str:
     if cap.effect.value == "ask":
         return "ask_each_time"
     return cap.effect.value
+
+
+def _requestable_capability_section(
+    requestable_capabilities: list[dict[str, Any]],
+) -> str:
+    return (
+        "Permission-request ceilings (not capability grants):\n"
+        f"{requestable_capabilities}\n"
+        "request_permission may ask only within these Host-declared ceilings; "
+        "an effect still requires the resulting Human decision. Plan coherent "
+        "requests from this list instead of probing an effect for denial."
+    )
 
 
 def _skill_section(skills: list[dict[str, Any]]) -> str:

@@ -305,9 +305,10 @@ npm --prefix gui run electron:dev
 ```
 
 The GUI starts a local `agent-libos-gui-server`, subscribes to runtime events,
-and provides a process-centered console for concurrent messages, interrupts,
-human approvals, scheduler control, image selection/registration/commit, audit
-inspection, and LLM call visibility.
+and provides responsive user and operator workspaces for concurrent messages,
+interrupts, human approvals, scheduler control, checkpoints, capability and
+Skill administration, Object Tasks, image selection/registration/commit,
+JSON-RPC/MCP registries, audit/Explain inspection, and LLM call visibility.
 
 The demo does not call a real model. It exercises process spawn/fork, Object
 Memory, Deno/TypeScript JIT validation when Deno is available, checkpointing,

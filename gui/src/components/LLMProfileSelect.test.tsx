@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { LLMProfileSummary } from "../api/types";
 import { I18nProvider } from "../i18n";
-import { LLMProfileSelect } from "./LLMProfileSelect";
+import { LLMProfileSelect, parseProfileNumber } from "./LLMProfileSelect";
 
 describe("LLMProfileSelect", () => {
   it("renders profile choices and warns when the selected env var is missing", () => {
@@ -42,8 +42,20 @@ describe("LLMProfileSelect", () => {
     expect(html).toMatch(/Model profiles|模型 Profiles/);
     expect(html).toMatch(/Config profiles are read-only|配置文件中的 profile 只读/);
     expect(html).toMatch(/Context window tokens|上下文窗口 tokens/);
+    expect(html).toMatch(/Reasoning effort|推理强度/);
+    expect(html).toMatch(/Prompt cache retention|Prompt 缓存保留/);
+    expect(html).toMatch(/Reuse Responses chain|复用 Responses 调用链/);
     expect(html).toContain("kimi-k2.7-code");
     expect(html).toContain("disabled=\"\"");
+  });
+
+  it("rejects invalid numeric profile values without truncating them", () => {
+    expect(parseProfileNumber("4", { integer: true, minimum: 0 })).toBe(4);
+    expect(parseProfileNumber("", { integer: true })).toBeNull();
+    expect(() => parseProfileNumber("1.5", { integer: true })).toThrow(/integer/);
+    expect(() => parseProfileNumber("Infinity")).toThrow(/finite/);
+    expect(() => parseProfileNumber("-0.1", { minimum: 0 })).toThrow(/range/);
+    expect(() => parseProfileNumber("0", { minimum: 0, exclusiveMinimum: true })).toThrow(/range/);
   });
 });
 
@@ -65,6 +77,9 @@ function profile(
     store: null,
     reasoning_effort: null,
     verbosity: null,
+    safety_identifier_env: null,
+    prompt_cache_retention: null,
+    responses_previous_response_id: null,
     parallel_tool_calls: null,
     auto_wait_on_empty_tool_calls: null,
     temperature: null,

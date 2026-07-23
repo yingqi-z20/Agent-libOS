@@ -12,11 +12,12 @@ from agent_libos import Runtime
 from agent_libos.models import (
     CapabilityRight,
     JIT_TOOL_EXPOSURE_DIRECT,
+    ProcessStatus,
     ValidationResult,
 )
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.substrate import SubprocessLimits
-from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
+from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
+from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SandboxError
 
 
 PACKAGE_ROOT = Path("images/mini-swe-agent")
@@ -69,6 +70,8 @@ class TestMiniSWEAgentImage:
             "Implement the general solution",
             "Operating loop:",
             "Run focused tests first",
+            "32,768 characters",
+            "10,000-character head/tail contract",
             "`submit: true`",
         ]
 
@@ -131,8 +134,16 @@ class TestMiniSWEAgentImage:
         assert [item["name"] for item in specs] == ["bash"]
         assert spec["input_schema"]["required"] == ["command"]
         assert set(spec["input_schema"]["properties"]) == {"command", "submit"}
+        assert spec["input_schema"]["properties"]["command"]["minLength"] == 1
+        assert spec["input_schema"]["properties"]["command"]["maxLength"] == 32768
         assert spec["input_schema"]["properties"]["submit"]["type"] == "boolean"
         assert spec["input_schema"]["additionalProperties"] is False
+        assert spec["output_schema"]["required"] == ["returncode", "exception_info"]
+        assert spec["output_schema"]["additionalProperties"] is False
+        assert len(spec["tests"]) == 4
+        assert spec["tests"][1]["syscalls"][1]["name"] == "process.exit"
+        assert spec["tests"][2]["syscalls"][0]["ok"] is False
+        assert spec["tests"][3]["syscalls"][1]["ok"] is False
         assert spec["timeout_s"] == 35
 
     def test_package_timeout_reaches_jit_execution_without_raising_global_default(
@@ -228,10 +239,131 @@ class TestMiniSWEAgentImage:
         assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" not in source
         assert "firstLogicalLine" not in source
         assert "const TIMEOUT_SECONDS = 30;" in source
+        assert "const COMMAND_MAX_CHARS = 32768;" in source
         assert "const OUTPUT_LIMIT = 10000;" in source
         assert "const OUTPUT_EDGE = 5000;" in source
         assert 'argv: ["bash", "-lc", `exec 2>&1; ${command}`]' in source
         assert 'libos.syscall("shell.run"' in source
         assert 'libos.syscall("process.exit"' in source
         assert "args.submit === true" in source
+        assert "...resultObservation" in source
+        assert "submission failed:" in source
+        assert "status: \"submitted\",\n          output," not in source
         assert "return observation(-1" in source
+
+    @pytest.mark.real_deno
+    def test_bash_source_rejects_oversized_command_before_any_syscall(self) -> None:
+        source = PACKAGE_ROOT.joinpath("tools/scripts/bash.ts").read_text(encoding="utf-8")
+        observed: list[tuple[str, dict[str, Any]]] = []
+
+        async def handler(name: str, args: dict[str, Any]) -> Any:
+            observed.append((name, args))
+            return {}
+
+        with pytest.raises(SandboxError, match="command exceeds 32768 characters"):
+            asyncio.run(
+                DenoTypescriptSandbox().arun_source(
+                    source,
+                    {"command": "x" * 32769},
+                    syscall_handler=handler,
+                )
+            )
+
+        assert observed == []
+
+    @pytest.mark.real_deno
+    def test_submit_uses_bounded_observation_instead_of_raw_shell_output(self) -> None:
+        source = PACKAGE_ROOT.joinpath("tools/scripts/bash.ts").read_text(encoding="utf-8")
+        exit_payloads: list[dict[str, Any]] = []
+
+        async def handler(name: str, args: dict[str, Any]) -> Any:
+            if name == "shell.run":
+                return {"returncode": 0, "stdout": "x" * 12000, "stderr": ""}
+            if name == "process.exit":
+                exit_payloads.append(dict(args["payload"]))
+                return {"status": "exited"}
+            raise AssertionError(f"unexpected syscall: {name}")
+
+        result = asyncio.run(
+            DenoTypescriptSandbox().arun_source(
+                source,
+                {"command": "printf large", "submit": True},
+                syscall_handler=handler,
+            )
+        )
+
+        assert "output" not in result
+        assert len(result["output_head"]) == 5000
+        assert len(result["output_tail"]) == 5000
+        assert result["elided_chars"] == 2000
+        assert exit_payloads == [{"status": "submitted", **result}]
+
+    @pytest.mark.real_deno
+    def test_submit_failure_preserves_bounded_command_evidence(self) -> None:
+        source = PACKAGE_ROOT.joinpath("tools/scripts/bash.ts").read_text(encoding="utf-8")
+
+        async def handler(name: str, args: dict[str, Any]) -> Any:
+            if name == "shell.run":
+                return {"returncode": 0, "stdout": "x" * 12000, "stderr": ""}
+            if name == "process.exit":
+                raise PermissionError("exit denied")
+            raise AssertionError(f"unexpected syscall: {name}")
+
+        result = asyncio.run(
+            DenoTypescriptSandbox().arun_source(
+                source,
+                {"command": "printf large", "submit": True},
+                syscall_handler=handler,
+            )
+        )
+
+        assert result["returncode"] == -1
+        assert result["exception_info"] == "submission failed: exit denied"
+        assert len(result["output_head"]) == 5000
+        assert len(result["output_tail"]) == 5000
+        assert result["elided_chars"] == 2000
+
+    @pytest.mark.real_llm
+    @pytest.mark.real_deno
+    def test_real_llm_uses_bounded_bash_interface_to_edit_verify_and_submit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        runtime = Runtime.open(
+            "local",
+            substrate=LocalResourceProviderSubstrate(tmp_path),
+        )
+        try:
+            runtime.image_registry.register_from_package_path(PACKAGE_ROOT, actor="test")
+            pid = runtime.process.spawn(
+                image="mini-swe-agent:v0",
+                goal=(
+                    "Create result.txt containing exactly MINI_SWE_OK followed by a newline. "
+                    "Read it back, then use a final concise bash observation with submit true."
+                ),
+            )
+            runtime.filesystem.grant_workspace(
+                pid,
+                [CapabilityRight.READ, CapabilityRight.WRITE],
+                issued_by="real-mini-swe-test",
+            )
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by="real-mini-swe-test",
+            )
+
+            runtime.run_process_until_idle(pid, max_quanta=8)
+            process = runtime.process.get(pid)
+
+            assert process.status == ProcessStatus.EXITED
+            assert set(process.tool_table) == {"bash"}
+            assert process.outcome is not None
+            assert process.outcome.result_oid is not None
+            result_object = runtime.store.get_object(process.outcome.result_oid)
+            assert result_object is not None
+            assert result_object.payload["status"] == "submitted"
+            assert result_object.payload["returncode"] == 0
+            assert tmp_path.joinpath("result.txt").read_text(encoding="utf-8") == "MINI_SWE_OK\n"
+        finally:
+            runtime.close()

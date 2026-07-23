@@ -10,14 +10,14 @@ class TestCodingAgentImage:
     def test_coding_agent_prompt_guides_practical_tool_use(self) -> None:
         image = DEFAULT_IMAGES['coding-agent:v0']
         prompt = build_system_prompt(image)
-        required_phrases = ['practical coding agent', 'Scale the size', 'Adaptive operating loop', 'read_directory', 'create_memory_object', 'create_memory_namespace', 'fork_child_process', 'spawn_child_process', 'list_memory_namespace', 'request_permission', 'load_image_package', 'ask_human', 'parse_pytest_log', 'process_exit', 'Never claim that tests', 'least-privilege permission', 'Do not over-decompose']
+        required_phrases = ['practical coding agent', 'Scale the size', 'Adaptive operating loop', 'read_directory', 'create_memory_object', 'create_memory_namespace', 'fork_child_process', 'spawn_child_process', 'list_memory_namespace', 'request_permission', 'load_image_package', 'ask_human', 'parse_pytest_log', 'process_exit', 'Never claim that tests', 'least-privilege permission', 'smallest coherent permission scope', 'verification readback', 'call must be request_permission', 'Do not over-decompose', 'activate_tool_group', 'fresh repository state token', 'source import-free']
         for phrase in required_phrases:
             assert phrase in prompt
 
     def test_coding_agent_tool_table_covers_repository_workflow(self) -> None:
         image = DEFAULT_IMAGES['coding-agent:v0']
         tools = set(image.default_tools)
-        assert {'read_directory', 'read_text_file', 'write_text_file', 'write_directory', 'delete_file', 'delete_directory', 'create_memory_object', 'create_memory_namespace', 'read_memory_object', 'append_memory_object', 'list_memory_namespace', 'create_object_from_file', 'write_object_to_file', 'fork_child_process', 'spawn_child_process', 'exec_process', 'wait_child_process', 'list_child_processes', 'merge_child_memory', 'signal_child_process', 'get_working_directory', 'set_working_directory', 'request_permission', 'load_image_package', 'ask_human', 'human_output', 'get_current_time', 'sleep', 'parse_pytest_log', 'propose_jit_tool', 'validate_jit_tool', 'register_jit_tool'}.issubset(tools)
+        assert {'activate_tool_group', 'discover_tool_groups', 'read_directory', 'read_text_file', 'write_text_file', 'write_directory', 'delete_file', 'delete_directory', 'create_memory_object', 'create_memory_namespace', 'read_memory_object', 'append_memory_object', 'list_memory_namespace', 'create_object_from_file', 'write_object_to_file', 'fork_child_process', 'spawn_child_process', 'exec_process', 'wait_child_process', 'list_child_processes', 'merge_child_memory', 'signal_child_process', 'get_working_directory', 'set_working_directory', 'request_permission', 'load_image_package', 'ask_human', 'human_output', 'get_current_time', 'sleep', 'parse_pytest_log', 'propose_jit_tool', 'validate_jit_tool', 'register_jit_tool'}.issubset(tools)
 
     def test_coding_agent_defaults_to_read_only_workspace_authority(self) -> None:
         image = DEFAULT_IMAGES['coding-agent:v0']
@@ -33,6 +33,7 @@ class TestCodingAgentImage:
                 'Role:',
                 'Instruction hierarchy:',
                 'Decision loop:',
+                'Tool projection:',
                 'Object Memory',
                 'least-privilege permission',
                 'process_exit',
@@ -43,16 +44,18 @@ class TestCodingAgentImage:
                 'Adaptive operating loop:',
                 'Verification ladder:',
                 'AGENTS-style instructions',
-                'version-pinned',
+                'source import-free',
                 'all libOS access behind libos.syscall',
                 'Tests are evidence',
+                'Tool projection and authority:',
             ],
             'toolmaker-agent:v0': [
                 'When to create a JIT tool:',
                 'JIT design contract:',
                 'Deno/TypeScript JIT tools',
-                'version-pinned allowlisted JSR',
-                'representative tests',
+                'import-free',
+                'ordered "syscalls" array',
+                'parameter identifiers must literally',
                 'libos.syscall',
             ],
             'review-agent:v0': [
@@ -61,8 +64,19 @@ class TestCodingAgentImage:
                 'concrete, actionable findings',
                 'no actionable',
                 'authority escalation',
+                'read-only',
+                'Tool projection:',
+                'Read-only filesystem tools',
                 'Findings first',
                 'Never',
+            ],
+            'context-compressor:v0': [
+                'context-compressor image',
+                'JSON object payload',
+                'Do not reproduce credentials',
+                'cumulative state from earlier chunks',
+                'target_tokens',
+                'exactly these keys',
             ],
         }
 

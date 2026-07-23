@@ -10,7 +10,28 @@ describe("deriveUserConversation", () => {
       expect.objectContaining({
         id: "assistant:hreq_output",
         role: "assistant",
-        text: "Build completed."
+        text: "Build completed.",
+        protected: false
+      })
+    );
+  });
+
+  it("marks redacted delivered output as protected instead of treating it as empty", () => {
+    const redacted = snapshot();
+    redacted.human_requests[0].payload = {
+      type: "output",
+      release_required: true,
+      payload_observation: { redacted: true, metadata_only: true }
+    };
+
+    const items = deriveUserConversation(redacted, "pid_1");
+
+    expect(items).toContainEqual(
+      expect.objectContaining({
+        id: "assistant:hreq_output",
+        role: "assistant",
+        text: "",
+        protected: true
       })
     );
   });
@@ -66,6 +87,30 @@ describe("deriveUserConversation", () => {
     expect(items.some((item) => item.id.includes("audit"))).toBe(false);
     expect(items.some((item) => item.id.includes("event"))).toBe(false);
     expect(items.some((item) => item.id.includes("llm"))).toBe(false);
+  });
+
+  it("adds a terminal status without materializing the result object", () => {
+    const completed = snapshot();
+    const process = completed.processes[0];
+    process.status = "exited";
+    process.terminal = true;
+    process.state_generation = 4;
+    process.updated_at = "2026-06-19T01:00:10.000Z";
+    process.status_message = "result_oid:oid_result";
+    process.outcome = { schema_version: 1, kind: "exited", result_oid: "oid_result" };
+
+    const items = deriveUserConversation(completed, "pid_1");
+
+    expect(items.at(-1)).toEqual(
+      expect.objectContaining({
+        id: "outcome:pid_1:4:exited",
+        role: "terminal",
+        time: "2026-06-19T01:00:10.000Z",
+        text: "",
+        outcome: { schema_version: 1, kind: "exited", result_oid: "oid_result" }
+      })
+    );
+    expect(JSON.stringify(items)).not.toContain("result payload");
   });
 });
 

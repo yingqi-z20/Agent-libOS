@@ -77,9 +77,13 @@ _LAZY_TOOL_CORE = (
     "create_memory_object",
     "append_memory_object",
     "get_current_time",
+    "list_capabilities",
 )
 
 _TOOL_GROUPS: dict[str, tuple[str, ...]] = {
+    "filesystem_read": (
+        "read_text_file", "read_directory", "create_object_from_file",
+    ),
     "filesystem": (
         "read_text_file", "write_text_file", "read_directory", "write_directory",
         "delete_file", "delete_directory", "create_object_from_file", "write_object_to_file",
@@ -794,10 +798,38 @@ class ToolBroker:
         return static_rows
 
     def initial_tool_projection(self, image: Any) -> list[str]:
-        if not bool(getattr(image, "metadata", {}).get("lazy_tool_groups")):
+        metadata = getattr(image, "metadata", {})
+        lazy_groups = metadata.get("lazy_tool_groups", False)
+        if not isinstance(lazy_groups, bool):
+            raise ValidationError("image metadata lazy_tool_groups must be a boolean")
+        if not lazy_groups:
+            if "initial_tool_groups" in metadata:
+                raise ValidationError(
+                    "image metadata initial_tool_groups requires lazy_tool_groups=true"
+                )
             return list(image.default_tools)
         allowed = set(image.default_tools)
-        return [name for name in _LAZY_TOOL_CORE if name in allowed]
+        selected = [name for name in _LAZY_TOOL_CORE if name in allowed]
+        configured_groups = metadata.get("initial_tool_groups", [])
+        if not isinstance(configured_groups, (list, tuple)) or any(
+            not isinstance(group, str) or not group.strip()
+            for group in configured_groups
+        ):
+            raise ValidationError("image metadata initial_tool_groups must be a list of non-empty strings")
+        normalized_groups = [group.strip() for group in configured_groups]
+        if len(normalized_groups) != len(set(normalized_groups)):
+            raise ValidationError("image metadata initial_tool_groups must not contain duplicates")
+        for group in normalized_groups:
+            names = _TOOL_GROUPS.get(group)
+            if names is None:
+                raise ValidationError(f"unknown initial tool group: {group}")
+            authorized = [name for name in names if name in allowed]
+            if not authorized:
+                raise ValidationError(
+                    f"initial tool group is not authorized by image {image.image_id}: {group}"
+                )
+            selected.extend(authorized)
+        return list(dict.fromkeys(selected))
 
     def tool_groups(self, pid: str) -> list[dict[str, Any]]:
         process = self.processes.get_process(pid)

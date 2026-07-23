@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { mergeDotenvIntoEnv, readDotenv, requireLoopbackDevServerUrl, runtimeServerEnv } from "./env.js";
+import { mergeDotenvIntoEnv, readDotenv, redactGuiServerOutput, requireLoopbackDevServerUrl, runtimeServerEnv } from "./env.js";
 
 const roots: string[] = [];
 
@@ -72,5 +72,15 @@ describe("requireLoopbackDevServerUrl", () => {
   it("rejects non-loopback dev server URLs", () => {
     expect(() => requireLoopbackDevServerUrl("http://192.168.1.5:5173")).toThrow(/loopback/);
     expect(() => requireLoopbackDevServerUrl("file:///tmp/index.html")).toThrow(/loopback/);
+    expect(() => requireLoopbackDevServerUrl("http://user:password@127.0.0.1:5173")).toThrow(/credentials/);
+  });
+});
+
+describe("redactGuiServerOutput", () => {
+  it("never writes the session bearer token into Electron smoke logs", () => {
+    const output = '{"url":"http://127.0.0.1:51234","token":"temporary-secret","db":"local"}\n';
+
+    expect(redactGuiServerOutput(output)).toContain('"token":"[redacted]"');
+    expect(redactGuiServerOutput(output)).not.toContain("temporary-secret");
   });
 });

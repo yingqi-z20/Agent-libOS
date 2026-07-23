@@ -1,4 +1,5 @@
-import { renderToStaticMarkup } from "react-dom/server";
+import { renderToReadableStream, renderToStaticMarkup } from "react-dom/server";
+import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RuntimeSnapshot } from "../api/types";
 import { I18nProvider } from "../i18n";
@@ -72,10 +73,10 @@ describe("MarkdownMessage", () => {
     expect(openExternal).toHaveBeenCalledWith("https://example.test/docs");
   });
 
-  it("keeps user messages as plain text while rendering assistant markdown", () => {
+  it("keeps user messages as plain text while rendering assistant markdown", async () => {
     const snapshot = userPageSnapshot();
     const process = snapshot.processes[0];
-    const html = renderToStaticMarkup(
+    const html = await renderWithSuspense(
       <I18nProvider>
         <UserPage
           connection={{ url: "http://127.0.0.1:1", token: "token", db: "local" }}
@@ -87,6 +88,8 @@ describe("MarkdownMessage", () => {
           spawnImage="coding-agent:v0"
           spawnLlmProfile=""
           spawnWorkingDirectory=""
+          spawnWorkspaceAccess="edit"
+          spawnAllowGitRequests={true}
           message=""
           images={[]}
           llmProfiles={[]}
@@ -96,6 +99,8 @@ describe("MarkdownMessage", () => {
           onSpawnImageChange={() => undefined}
           onSpawnLlmProfileChange={() => undefined}
           onSpawnWorkingDirectoryChange={() => undefined}
+          onSpawnWorkspaceAccessChange={() => undefined}
+          onSpawnAllowGitRequestsChange={() => undefined}
           onMessageChange={() => undefined}
           onSpawn={() => undefined}
           onImportImage={() => undefined}
@@ -121,6 +126,12 @@ describe("MarkdownMessage", () => {
     expect(html).toContain("<strong>bold</strong>");
   });
 });
+
+async function renderWithSuspense(node: ReactNode): Promise<string> {
+  const stream = await renderToReadableStream(node);
+  await stream.allReady;
+  return new Response(stream).text();
+}
 
 function userPageSnapshot(): RuntimeSnapshot {
   return {

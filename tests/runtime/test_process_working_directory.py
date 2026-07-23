@@ -207,6 +207,38 @@ class TestProcessWorkingDirectory:
             finally:
                 runtime.close()
 
+    def test_filesystem_tools_accept_redundant_workspace_relative_cwd_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / 'pkg').mkdir()
+            (root / 'pkg' / 'module.py').write_text("print('pkg')\n", encoding='utf-8')
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='accept redundant cwd prefix')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    'pkg',
+                    [CapabilityRight.READ, CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+                assert runtime.tools.call(pid, 'set_working_directory', {'path': 'pkg'}).ok
+
+                read = runtime.tools.call(pid, 'read_text_file', {'path': 'pkg/module.py'})
+                written = runtime.tools.call(
+                    pid,
+                    'write_text_file',
+                    {'path': 'pkg/created.txt', 'content': 'ok'},
+                )
+
+                assert read.ok, read.error
+                assert read.payload['path'] == 'pkg/module.py'
+                assert written.ok, written.error
+                assert written.payload['path'] == 'pkg/created.txt'
+                assert (root / 'pkg' / 'created.txt').read_text(encoding='utf-8') == 'ok'
+                assert not (root / 'pkg' / 'pkg').exists()
+            finally:
+                runtime.close()
+
     def test_children_inherit_parent_working_directory_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

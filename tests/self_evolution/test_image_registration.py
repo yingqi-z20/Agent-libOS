@@ -70,6 +70,41 @@ def _release_fenced_runtime_or_close(runtime: Runtime) -> None:
 
 class TestImageRegistration:
 
+    @pytest.mark.parametrize(
+        'metadata, message',
+        [
+            ({'lazy_tool_groups': 'false'}, 'lazy_tool_groups must be a boolean'),
+            ({'initial_tool_groups': ['filesystem']}, 'requires lazy_tool_groups=true'),
+            (
+                {'lazy_tool_groups': True, 'initial_tool_groups': ['unknown']},
+                'unknown initial tool group',
+            ),
+        ],
+    )
+    def test_invalid_projection_metadata_is_rejected_before_registration(
+        self,
+        metadata: dict[str, object],
+        message: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            image_id = 'invalid-projection:v0'
+            with pytest.raises(ValidationError, match=message):
+                runtime.register_image(
+                    AgentImage(
+                        image_id=image_id,
+                        name='invalid-projection',
+                        default_tools=['process_exit'],
+                        metadata=metadata,
+                    ),
+                    actor='test',
+                )
+
+            assert image_id not in runtime.images
+            assert runtime.store.get_image(image_id) is None
+        finally:
+            runtime.close()
+
     def test_concurrent_register_without_replace_has_single_winner(
         self,
         monkeypatch: pytest.MonkeyPatch,

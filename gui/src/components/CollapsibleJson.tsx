@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { useI18n, type TranslationKey } from "../i18n";
 
 type CollapsibleJsonProps = {
@@ -11,6 +11,7 @@ type CollapsibleJsonProps = {
 export function CollapsibleJson({ value, label, defaultExpanded = false }: CollapsibleJsonProps) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(defaultExpanded);
+  const contentId = useId();
   const pretty = useMemo(() => JSON.stringify(value, null, 2), [value]);
   const preview = useMemo(() => compactPreview(value, t), [value, t]);
   const Icon = expanded ? ChevronDown : ChevronRight;
@@ -18,13 +19,19 @@ export function CollapsibleJson({ value, label, defaultExpanded = false }: Colla
 
   return (
     <div className="collapsibleJson">
-      <button className="collapseToggle" type="button" onClick={() => setExpanded((current) => !current)}>
+      <button
+        className="collapseToggle"
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={contentId}
+        onClick={() => setExpanded((current) => !current)}
+      >
         <Icon size={14} />
         <span>{expanded ? t("json.hide") : t("json.show")} {resolvedLabel}</span>
         <span className="collapseMeta">{metadata(value, pretty, t)}</span>
       </button>
-      {!expanded ? <div className="jsonPreview" title={preview}>{preview}</div> : null}
-      {expanded ? <pre className="jsonBlock">{pretty}</pre> : null}
+      {!expanded ? <div id={contentId} className="jsonPreview" title={preview}>{preview}</div> : null}
+      {expanded ? <pre id={contentId} className="jsonBlock" tabIndex={0}>{pretty}</pre> : null}
     </div>
   );
 }

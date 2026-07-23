@@ -17,6 +17,13 @@ The current built-in tool surface includes tools for:
 - Object Memory: create, append, read, list namespaces, and bridge objects to
   files.
 - Filesystem: read/write text, list/create/delete directories, and delete files.
+  Tool paths resolve from the process's current working directory and must stay
+  contained by the runtime workspace root; they are not implicitly rooted at
+  the workspace when the process uses a nested cwd. Object/file bridge tools
+  use the same resolution rule. For model ergonomics, a redundant
+  workspace-relative cwd prefix on a descendant path is stripped before
+  resolution; this maps to the same contained target and grants no additional
+  authority. A path equal to the cwd is not rewritten.
 - Human I/O: ask questions, output messages, and request permission.
 - Capabilities: list/inspect the current process's authority, delegate an
   attenuated delegable capability to a child, relinquish its own revocable
@@ -52,15 +59,22 @@ Use `uv run agent-libos tools` to inspect registered tools in a runtime.
 
 ## Lazy Tool Groups
 
-An image with `metadata.lazy_tool_groups: true` starts with a small model-tool
+An image with the exact boolean `metadata.lazy_tool_groups: true` starts with a small model-tool
 projection instead of exposing every authorized schema at once. The initial
-projection is the intersection of the image's `default_tools` with:
+core is the intersection of the image's `default_tools` with:
 
 - `discover_tool_groups`, `activate_tool_group`, and `process_exit`;
 - `request_permission`, `ask_human`, and `human_output`;
 - `read_memory_object`, `create_memory_object`, and
   `append_memory_object`; and
-- `get_current_time`.
+- `get_current_time` and `list_capabilities`.
+
+An image may additionally declare `metadata.initial_tool_groups` as a unique
+list of known group names. Their already-authorized tool intersections join the
+core at process creation. A malformed, duplicate, unknown, or empty
+intersection fails boot; it never adds a tool that is absent from
+`default_tools`. String booleans are rejected, and `initial_tool_groups`
+without lazy projection is rejected instead of being silently ignored.
 
 This changes model visibility only. The process tool table remains the
 image-authorized table, and activating a group does not grant capabilities.
@@ -70,10 +84,18 @@ table; its `tool_count` is the number of authorized tools in the group and
 `activate_tool_group` adds the authorized intersection to the model projection
 and records the before/after schema counts and bytes in audit evidence.
 
+The built-in base, coding, and review images use this projection. Base starts
+with the process, context, and clock groups, coding starts with filesystem, and
+review starts with the narrower `filesystem_read` group. Their prompts tell the
+model to activate the smallest additional group and to distinguish a hidden
+schema from missing resource authority. The toolmaker and context-compressor
+images already have narrow explicit tool tables and do not use lazy projection.
+
 The built-in groups are:
 
 | Group | Configured tool names |
 | --- | --- |
+| `filesystem_read` | `read_text_file`, `read_directory`, `create_object_from_file` |
 | `filesystem` | `read_text_file`, `write_text_file`, `read_directory`, `write_directory`, `delete_file`, `delete_directory`, `create_object_from_file`, `write_object_to_file`, `get_working_directory`, `set_working_directory` |
 | `process` | `list_child_processes`, `spawn_child_process`, `fork_child_process`, `wait_child_process`, `signal_child_process`, `merge_child_memory`, `send_process_message`, `read_process_messages`, `receive_process_messages`, `exec_process` |
 | `remote` | `list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, `call_jsonrpc_method`, `list_mcp_servers`, `inspect_mcp_server`, `list_mcp_tools`, `call_mcp_tool` |
@@ -127,6 +149,10 @@ JSON-RPC, MCP, human, Skill, checkpoint, and process-control access remain
 absent unless separately granted by normal primitives. The wrapper is visible
 to the model, but Object Memory and Process primitives still enforce reads,
 writes, child creation, waiting, resource budgets, audit, and lifecycle.
+For multi-chunk work, each stage produces one rolling cumulative summary. The
+next stage receives only that summary, and the durable job replaces it rather
+than retaining and re-merging cumulative intermediates, so summary state does
+not duplicate earlier stages.
 
 Compaction is fail-closed. If the compressor fails or is killed, returns an
 invalid or empty schema, the source context version changes before final
@@ -543,14 +569,17 @@ has them. A sandbox backend that cannot accept limits or return subprocess
 metrics fails closed for budgeted validation or execution.
 Cancelling a Deno execution kills its isolated process group (and any discovered
 descendants) and waits for the syscall-serving and resource-monitor workers to
-settle before returning. Failure to terminate the process group is surfaced as
-a sandbox error rather than silently leaving code running. Deno is started only
-after a dedicated supervisor has established host-lifetime containment: POSIX
-uses an inherited death pipe and an isolated process group, while Windows uses
-a `KILL_ON_JOB_CLOSE` Job Object. If the libOS host is hard-killed, the
-supervisor or operating system terminates the untrusted process tree; if that
-containment cannot be established, JIT execution fails closed before Deno is
-released.
+settle before returning. On POSIX, if the group signal is denied while the
+supervisor is active, cleanup kills the discovered descendants and direct
+supervisor and accepts that fallback only after both have been observed to
+terminate; unavailable tree inspection or surviving processes produce a
+sandbox error. Cleanup of an already-reaped supervisor is an idempotent no-op,
+so a recycled process-group ID is not signalled. Deno is started only after a
+dedicated supervisor has established host-lifetime containment: POSIX uses an
+inherited death pipe and an isolated process group, while Windows uses a
+`KILL_ON_JOB_CLOSE` Job Object. If the libOS host is hard-killed, the supervisor
+or operating system terminates the untrusted process tree; if that containment
+cannot be established, JIT execution fails closed before Deno is released.
 
 If Deno is missing, validation returns a clear error. Python tests marked
 `real_deno` run by default when `deno` is installed, skip with a clear reason

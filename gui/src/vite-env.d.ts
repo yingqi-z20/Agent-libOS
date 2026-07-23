@@ -7,7 +7,6 @@ export type GuiConnection = {
 };
 
 export type ImagePackageFile = {
-  path: string;
   name: string;
   manifest: string;
   files: Record<string, string | { base64: string }>;

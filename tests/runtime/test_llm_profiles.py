@@ -898,7 +898,28 @@ class TestUserLLMProfileStore:
                     {
                         "model": "window-too-small",
                         "api_key_env": "SMALL_API_KEY",
+                        "max_tokens": 32_768,
                         "context_window_tokens": 32_768,
+                    },
+                )
+
+            with pytest.raises(ValidationError, match="temperature must be non-negative"):
+                store.upsert(
+                    "negative-temperature",
+                    {
+                        "model": "negative-temperature",
+                        "api_key_env": "NEGATIVE_API_KEY",
+                        "temperature": -0.1,
+                    },
+                )
+
+            with pytest.raises(ValidationError, match="max_retries must be an integer"):
+                store.upsert(
+                    "fractional-retries",
+                    {
+                        "model": "fractional-retries",
+                        "api_key_env": "FRACTIONAL_API_KEY",
+                        "max_retries": 1.5,
                     },
                 )
 

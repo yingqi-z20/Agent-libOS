@@ -37,6 +37,8 @@ export type RuntimeProcess = {
   wait_state: ProcessWaitState | null;
   outcome: ProcessOutcome | null;
   state_generation: number;
+  created_at?: string;
+  updated_at?: string;
   loaded_skills: Record<string, unknown>;
   tool_table: Record<string, string>;
   capabilities: string[];
@@ -71,6 +73,65 @@ export type CheckpointInspectResult = {
   modules: Record<string, unknown>[];
   counts: Record<string, number>;
   processes: CheckpointProcess[];
+};
+
+export type CheckpointSummary = Record<string, unknown> & {
+  checkpoint_id: string;
+  pid: string;
+  parent_checkpoint_id?: string | null;
+  created_at?: string;
+  reason?: string;
+};
+
+export type CheckpointDiffResult = Record<string, unknown>;
+
+export type CapabilitySummary = Record<string, unknown> & {
+  cap_id: string;
+  subject: string;
+  resource: string;
+  rights: string[];
+  status?: string;
+  effect?: string;
+};
+
+export type CapabilityMutationInput = {
+  subject: string;
+  resource: string;
+  rights: string[];
+  actor?: string;
+};
+
+export type CapabilityDelegationInput = {
+  parent: string;
+  child: string;
+  resource: string;
+  rights: string[];
+  actor?: string;
+};
+
+export type SkillSummary = Record<string, unknown> & {
+  skill_id: string;
+  name?: string;
+  description?: string;
+  source?: string;
+};
+
+export type JsonRpcEndpointSummary = Record<string, unknown> & {
+  endpoint_id: string;
+  name?: string;
+  description?: string;
+};
+
+export type McpServerSummary = Record<string, unknown> & {
+  server_id: string;
+  name?: string;
+  description?: string;
+};
+
+export type ModuleSummary = Record<string, unknown> & {
+  module_id: string;
+  name?: string;
+  version?: string;
 };
 
 export type AgentRating = {
@@ -214,6 +275,9 @@ export type LLMProfileSummary = {
   store: boolean | null;
   reasoning_effort: string | null;
   verbosity: "low" | "medium" | "high" | null;
+  safety_identifier_env: string | null;
+  prompt_cache_retention: "in-memory" | "24h" | null;
+  responses_previous_response_id: boolean | null;
   parallel_tool_calls: boolean | null;
   auto_wait_on_empty_tool_calls: boolean | null;
   temperature: number | null;
@@ -236,6 +300,9 @@ export type LLMProfileInput = {
   store?: boolean | null;
   reasoning_effort?: string | null;
   verbosity?: "low" | "medium" | "high" | null;
+  safety_identifier_env?: string | null;
+  prompt_cache_retention?: "in-memory" | "24h" | null;
+  responses_previous_response_id?: boolean | null;
   parallel_tool_calls?: boolean | null;
   auto_wait_on_empty_tool_calls?: boolean | null;
   temperature?: number | null;
@@ -338,10 +405,10 @@ export type RuntimeSnapshot = {
   tools: ToolSummary[];
   llm_profiles: LLMProfileSummary[];
   images: ImageSummary[];
-  skills: Record<string, unknown>[];
-  jsonrpc_endpoints: Record<string, unknown>[];
-  mcp_servers: Record<string, unknown>[];
-  modules: Record<string, unknown>[];
+  skills: SkillSummary[];
+  jsonrpc_endpoints: JsonRpcEndpointSummary[];
+  mcp_servers: McpServerSummary[];
+  modules: ModuleSummary[];
   _truncated?: Record<string, unknown>;
 };
 
@@ -419,7 +486,6 @@ export type GuiConnection = {
 export type ImagePackageFileValue = string | { base64: string };
 
 export type ImagePackageFile = {
-  path: string;
   name: string;
   manifest: string;
   files: Record<string, ImagePackageFileValue>;
@@ -430,3 +496,67 @@ export type SseMessage = {
   event: string;
   data: unknown;
 };
+
+export type StreamConnectionStatus = "connecting" | "connected" | "reconnecting" | "failed";
+
+export type RuntimeHealth = {
+  ok: boolean;
+  db: string;
+  scheduler: SchedulerStatus;
+  process_count: number | null;
+  runtime_busy: boolean;
+};
+
+const snapshotCollections = [
+  "processes",
+  "human_requests",
+  "events",
+  "audit",
+  "llm_calls",
+  "object_tasks",
+  "tools",
+  "llm_profiles",
+  "images",
+  "skills",
+  "jsonrpc_endpoints",
+  "mcp_servers",
+  "modules"
+] as const;
+
+/** Fail closed on a malformed same-build response before React consumes it. */
+export function assertRuntimeSnapshot(value: unknown): asserts value is RuntimeSnapshot {
+  if (!isRecord(value)) throw new Error("GUI snapshot must be a JSON object.");
+  if (typeof value.db !== "string") throw new Error("GUI snapshot is missing db.");
+  if (!isRecord(value.scheduler)) throw new Error("GUI snapshot is missing scheduler state.");
+  if (
+    typeof value.scheduler.auto_run !== "boolean"
+    || typeof value.scheduler.running !== "boolean"
+    || typeof value.scheduler.paused !== "boolean"
+  ) {
+    throw new Error("GUI snapshot scheduler state is malformed.");
+  }
+  for (const key of snapshotCollections) {
+    if (!Array.isArray(value[key])) throw new Error(`GUI snapshot collection is malformed: ${key}.`);
+  }
+  const processes = value.processes;
+  if (!Array.isArray(processes)) throw new Error("GUI snapshot collection is malformed: processes.");
+  for (const process of processes) {
+    if (!isRecord(process) || typeof process.pid !== "string" || !process.pid) {
+      throw new Error("GUI snapshot contains a process without a valid pid.");
+    }
+  }
+}
+
+/** Validate snapshots delivered inside an SSE event before replacing visible state. */
+export function runtimeSnapshotFromSseData(value: unknown): RuntimeSnapshot {
+  if (!isRecord(value) || !("snapshot" in value)) {
+    throw new Error("GUI snapshot event is missing its snapshot payload.");
+  }
+  const snapshot = value.snapshot;
+  assertRuntimeSnapshot(snapshot);
+  return snapshot;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}

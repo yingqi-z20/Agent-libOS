@@ -15,6 +15,18 @@ from agent_libos.tools.builtin.git import (
     GitTagTool,
     GitWorktreeTool,
 )
+from agent_libos.tools.builtin.filesystem import (
+    DeleteDirectoryTool,
+    DeleteFileTool,
+    ReadDirectoryTool,
+    ReadTextFileTool,
+    WriteDirectoryTool,
+    WriteTextFileTool,
+    normalize_process_path_argument,
+)
+from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
+from agent_libos.tools.builtin.human import HumanOutputTool
+from agent_libos.tools.builtin.process import ProcessExitTool
 
 
 class _RecordingGit:
@@ -30,6 +42,50 @@ class _RecordingGit:
 
 
 class TestToolProtocol:
+
+    @pytest.mark.parametrize(
+        ("path", "cwd", "expected"),
+        [
+            ("pkg/module.py", "pkg", "module.py"),
+            ("pkg", "pkg", "pkg"),
+            ("module.py", "pkg", "module.py"),
+            ("other/module.py", "pkg", "other/module.py"),
+            ("pkg/../secret.txt", "pkg", "pkg/../secret.txt"),
+            ("/pkg/module.py", "pkg", "/pkg/module.py"),
+            ("C:\\pkg\\module.py", "pkg", "C:/pkg/module.py"),
+        ],
+    )
+    def test_process_path_normalization_only_strips_an_exact_safe_cwd_prefix(
+        self,
+        path: str,
+        cwd: str,
+        expected: str,
+    ) -> None:
+        assert normalize_process_path_argument(path, cwd) == expected
+
+    def test_process_exit_schema_distinguishes_result_storage_from_human_output(self) -> None:
+        assert "does not present the result to the human" in ProcessExitTool().description
+        assert "final user-facing result before process_exit" in HumanOutputTool().description
+
+    @pytest.mark.parametrize(
+        "tool_type",
+        [
+            ReadTextFileTool,
+            ReadDirectoryTool,
+            WriteTextFileTool,
+            WriteDirectoryTool,
+            DeleteFileTool,
+            DeleteDirectoryTool,
+            CreateObjectFromFileTool,
+            WriteObjectToFileTool,
+        ],
+    )
+    def test_workspace_path_schema_explains_cwd_relative_resolution(self, tool_type: type[Any]) -> None:
+        description = tool_type().spec().input_schema["properties"]["path"]["description"]
+
+        assert "current working directory" in description
+        assert "runtime workspace" in description
+        assert "do not prepend" in description
 
     def test_tool_name_wins_over_action_argument(self) -> None:
         action = tool_call_to_action({'name': 'read_directory', 'arguments': '{"action": "delete_directory", "path": "."}'})

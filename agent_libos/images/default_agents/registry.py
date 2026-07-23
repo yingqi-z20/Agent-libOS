@@ -13,11 +13,16 @@ def build_default_images(config: AgentLibOSConfig = DEFAULT_CONFIG) -> dict[str,
     images = [
         build_base_agent_image(config),
         build_coding_agent_image(config),
-        build_toolmaker_agent_image(),
-        build_review_agent_image(),
+        build_toolmaker_agent_image(config),
+        build_review_agent_image(config),
         build_context_compressor_image(),
     ]
-    return {image.image_id: image for image in images}
+    by_id: dict[str, AgentImage] = {}
+    for image in images:
+        if image.image_id in by_id:
+            raise ValueError(f"built-in AgentImage ids must be unique: {image.image_id}")
+        by_id[image.image_id] = image
+    return by_id
 
 
 DEFAULT_IMAGES: dict[str, AgentImage] = build_default_images()

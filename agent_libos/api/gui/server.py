@@ -548,6 +548,7 @@ class SchedulerController:
                         else self.service.runtime.run_until_idle(
                             max_quanta=batch_quanta,
                             process_human_queue=False,
+                            cancel_inflight_on_budget_exhaustion=False,
                         )
                     )
                 if not result:

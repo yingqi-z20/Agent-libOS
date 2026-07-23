@@ -50,7 +50,7 @@ from agent_libos.models import (
     process_outcome_to_mapping,
     process_wait_state_to_mapping,
 )
-from agent_libos.models.exceptions import HumanApprovalRequired, ProcessWaitRequired, ValidationError
+from agent_libos.models.exceptions import HumanApprovalRequired, HumanResponseRequired, ProcessWaitRequired, ValidationError
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import to_jsonable
 from agent_libos.runtime.runtime import Runtime
@@ -459,6 +459,153 @@ class TestGuiServer:
         assert len(runtime.events.list()) == events_after_first
         assert len(runtime.audit.trace()) == audit_after_first
         assert len(runtime.store.list_data_flow_decisions(pid=pid)) == decisions_after_first
+
+    def test_delivered_output_snapshot_remains_visible_after_source_mutation_and_exit(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='present a frozen output after the process advances',
+        )
+        runtime.capability.grant(
+            pid,
+            runtime.config.runtime.default_human_resource,
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.PROCESS_STATE,
+            {'step': 1},
+            metadata=ObjectMetadata(sensitivity='normal'),
+            immutable=False,
+        )
+        delivered: list[str] = []
+        runtime.human.provider.output_sink = delivered.append
+        sentinel = 'GUI_DELIVERED_OUTPUT_SNAPSHOT_SENTINEL'
+
+        output = runtime.human.output(
+            pid,
+            sentinel,
+            source_oids=[source.oid],
+        )
+        runtime.memory.update_object(
+            pid,
+            source,
+            ObjectPatch(payload={'step': 2}),
+            expected_version=1,
+        )
+        runtime.process.exit(pid, message='advance after Human output')
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+
+        assert status == 200
+        assert delivered == [sentinel]
+        presented = next(
+            item
+            for item in snapshot['human_requests']
+            if item['request_id'] == output['request_id']
+        )
+        assert presented['payload']['message'] == sentinel
+        assert '_agent_libos_output_snapshot_sha256' not in presented['payload']
+        assert runtime.human.is_request_withheld_for_presentation(
+            output['request_id'],
+            presentation='gui',
+        ) is False
+
+    def test_delivered_output_snapshot_digest_mismatch_fails_closed(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='reject a mutated delivered output snapshot',
+        )
+        runtime.capability.grant(
+            pid,
+            runtime.config.runtime.default_human_resource,
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        runtime.human.provider.output_sink = lambda _message: None
+        output = runtime.human.output(pid, 'ORIGINAL_OUTPUT_SNAPSHOT')
+        request = runtime.human.get(output['request_id'])
+        request.payload = dict(request.payload)
+        request.payload['message'] = 'MUTATED_OUTPUT_SNAPSHOT_SENTINEL'
+        runtime.human.requests.update(request)
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+
+        assert status == 200
+        encoded = json.dumps(snapshot, sort_keys=True)
+        assert 'MUTATED_OUTPUT_SNAPSHOT_SENTINEL' not in encoded
+        presented = next(
+            item
+            for item in snapshot['human_requests']
+            if item['request_id'] == output['request_id']
+        )
+        assert presented['payload']['release_required'] is True
+        assert runtime.human.is_request_withheld_for_presentation(
+            output['request_id'],
+            presentation='gui',
+        ) is True
+
+    def test_delivered_output_snapshot_still_obeys_current_sink_clearance(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='retain labels on a frozen output snapshot',
+        )
+        runtime.capability.grant(
+            pid,
+            runtime.config.runtime.default_human_resource,
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        human = runtime.config.runtime.default_human
+        channel = runtime.config.runtime.terminal_channel
+        pattern = f'human:{human}:{channel}'
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=pattern,
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity='secret',
+            ),
+            actor='test.host',
+            replace=True,
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'value': 'GUI_FROZEN_SECRET_OUTPUT_SENTINEL'},
+            metadata=ObjectMetadata(sensitivity='secret'),
+        )
+        runtime.human.provider.output_sink = lambda _message: None
+        output = runtime.human.output(
+            pid,
+            'GUI_FROZEN_SECRET_OUTPUT_SENTINEL',
+            source_oids=[source.oid],
+        )
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=pattern,
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity='normal',
+            ),
+            actor='test.host',
+            replace=True,
+            require_capability=False,
+        )
+
+        status, snapshot = self.request('GET', '/api/snapshot')
+
+        assert status == 200
+        encoded = json.dumps(snapshot, sort_keys=True)
+        assert 'GUI_FROZEN_SECRET_OUTPUT_SENTINEL' not in encoded
+        presented = next(
+            item
+            for item in snapshot['human_requests']
+            if item['request_id'] == output['request_id']
+        )
+        assert presented['payload']['release_required'] is True
 
     def test_new_gui_presentation_session_does_not_reuse_an_old_receipt(self) -> None:
         service = self.server.service
@@ -1965,6 +2112,9 @@ class TestGuiServer:
         assert created['store'] is False
         assert created['reasoning_effort'] == 'high'
         assert created['verbosity'] == 'low'
+        assert created['safety_identifier_env'] == 'OPENAI_SAFETY_IDENTIFIER'
+        assert created['prompt_cache_retention'] == '24h'
+        assert created['responses_previous_response_id'] is True
         assert created['parallel_tool_calls'] is False
         assert created['auto_wait_on_empty_tool_calls'] is True
         assert created['allow_custom_base_url'] is False
@@ -2005,6 +2155,9 @@ class TestGuiServer:
         assert updated['allow_custom_base_url'] is True
         assert updated['reasoning_effort'] == 'high'
         assert updated['verbosity'] == 'low'
+        assert updated['safety_identifier_env'] == 'OPENAI_SAFETY_IDENTIFIER'
+        assert updated['prompt_cache_retention'] == '24h'
+        assert updated['responses_previous_response_id'] is True
         updated_profile = self.server.service.runtime.llms.profile('kimi-k2.7-code')
         for field, expected in {**omitted_fields, **updates}.items():
             assert getattr(updated_profile, field) == expected, field
@@ -2090,6 +2243,63 @@ class TestGuiServer:
         status, deleted = self.request('DELETE', '/api/llm-profiles/glm-5.2')
         assert status == 409
         assert deleted['error']['profile_id'] == 'glm-5.2'
+
+    def test_process_spawn_authority_manifest_keeps_workspace_access_request_only(self) -> None:
+        runtime = self.server.service.runtime
+        subtree = 'agent_outputs/gui_authority'
+        status, spawned = self.request(
+            'POST',
+            '/api/processes',
+            {
+                'image': 'coding-agent:v0',
+                'goal': 'edit one scoped result',
+                'working_directory': subtree,
+                'auto_run': False,
+                'authority_manifest': {
+                    'authorized_capabilities': [
+                        {
+                            'resource': 'human:owner',
+                            'rights': ['write'],
+                            'delegable': False,
+                        }
+                    ],
+                    'approval_policy': {
+                        'requestable_capabilities': [
+                            {
+                                'resource': f'filesystem:workspace:{subtree}/*',
+                                'rights': ['read', 'write'],
+                                'delegable': False,
+                            }
+                        ]
+                    },
+                },
+            },
+        )
+
+        assert status == 200
+        pid = spawned['pid']
+        inside = f'filesystem:workspace:{subtree}/result.txt'
+        outside = 'filesystem:workspace:agent_outputs/outside.txt'
+        assert runtime.capability.check(pid, 'human:owner', CapabilityRight.WRITE)
+        assert not runtime.capability.check(pid, inside, CapabilityRight.READ)
+        assert not runtime.capability.check(pid, inside, CapabilityRight.WRITE)
+
+        denied = runtime.tools.call(
+            pid,
+            'request_permission',
+            {'resource': outside, 'rights': ['write'], 'reason': 'outside launch scope'},
+        )
+        assert not denied.ok
+        assert runtime.human.pending() == []
+
+        with pytest.raises(HumanResponseRequired):
+            runtime.tools.call(
+                pid,
+                'request_permission',
+                {'resource': inside, 'rights': ['write'], 'reason': 'create scoped result'},
+            )
+        assert [request.pid for request in runtime.human.pending()] == [pid]
+        assert not runtime.capability.check(pid, inside, CapabilityRight.WRITE)
 
     def test_process_rating_endpoint_updates_snapshot_and_audit(self) -> None:
         status, spawned = self.request('POST', '/api/processes', {'goal': 'rate agent', 'auto_run': False})
@@ -2925,7 +3135,9 @@ class TestGuiServer:
             *,
             max_quanta: int | None = None,
             process_human_queue: bool = True,
+            cancel_inflight_on_budget_exhaustion: bool = True,
         ) -> list[dict[str, int]]:
+            assert cancel_inflight_on_budget_exhaustion is False
             calls.append((max_quanta, process_human_queue))
             return [{'call': len(calls)}] if len(calls) == 1 else []
 
@@ -2939,6 +3151,41 @@ class TestGuiServer:
 
         assert calls == [(1, False), (1, False)]
         assert self.server.service.scheduler.status()['last_result'] == [{'call': 1}]
+
+    def test_scheduler_background_completes_slow_inflight_quantum_at_batch_boundary(self) -> None:
+        runtime = self.server.service.runtime
+        runtime.scheduler.poll_interval_s = 0.001
+        runtime.scheduler.drain_window_s = 0.001
+        pid = runtime.process.spawn(image='base-agent:v0', goal='slow GUI quantum')
+        completed = threading.Event()
+
+        async def slow_quantum(selected_pid: str) -> dict[str, str]:
+            assert selected_pid == pid
+            await asyncio.sleep(0.03)
+            runtime.process.pause(selected_pid, 'slow quantum completed')
+            completed.set()
+            return {'pid': selected_pid, 'status': 'completed'}
+
+        runtime.arun_process_once = slow_quantum
+
+        status = self.server.service.scheduler.start(max_quanta=1, reason='slow-batch')
+        assert status['running']
+        thread = self.server.service.scheduler._thread
+        assert thread is not None
+        thread.join(timeout=2)
+
+        assert completed.is_set()
+        assert runtime.process.get(pid).status == ProcessStatus.PAUSED
+        cancellations = [
+            record
+            for record in runtime.audit.trace()
+            if record.action == 'scheduler.process_task_cancelled'
+            and record.target == f'process:{pid}'
+        ]
+        assert cancellations == []
+        assert self.server.service.scheduler.status()['last_result'] == [
+            {'pid': pid, 'status': 'completed'}
+        ]
 
     def test_health_uses_fast_path_when_runtime_lock_is_busy(self) -> None:
         self.server.service.runtime_lock.acquire()

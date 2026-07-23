@@ -375,6 +375,7 @@ class Runtime:
         max_quanta: int | None = None,
         *,
         process_human_queue: bool = True,
+        cancel_inflight_on_budget_exhaustion: bool = True,
         human: str | None = None,
         human_auto_approve: bool | None = None,
         human_auto_policy: str | None = None,
@@ -386,6 +387,7 @@ class Runtime:
             return self._run_until_idle_sync(
                 max_quanta=max_quanta,
                 process_human_queue=process_human_queue,
+                cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
                 human=human,
                 human_auto_approve=human_auto_approve,
                 human_auto_policy=human_auto_policy,
@@ -398,6 +400,7 @@ class Runtime:
         max_quanta: int | None = None,
         *,
         process_human_queue: bool = True,
+        cancel_inflight_on_budget_exhaustion: bool = True,
         human: str | None = None,
         human_auto_approve: bool | None = None,
         human_auto_policy: str | None = None,
@@ -407,6 +410,7 @@ class Runtime:
             self._run_until_idle_sync,
             max_quanta=max_quanta,
             process_human_queue=process_human_queue,
+            cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
             human=human,
             human_auto_approve=human_auto_approve,
             human_auto_policy=human_auto_policy,
@@ -418,6 +422,7 @@ class Runtime:
         max_quanta: int | None = None,
         *,
         process_human_queue: bool = True,
+        cancel_inflight_on_budget_exhaustion: bool = True,
         human: str | None = None,
         human_auto_approve: bool | None = None,
         human_auto_policy: str | None = None,
@@ -436,7 +441,11 @@ class Runtime:
                 # Run all currently runnable processes first. Human queue work below
                 # may wake a process, so this loop intentionally alternates between
                 # process execution and terminal queue draining.
-                batch = self.scheduler.run_until_idle(self.arun_process_once, max_quanta=remaining)
+                batch = self.scheduler.run_until_idle(
+                    self.arun_process_once,
+                    max_quanta=remaining,
+                    cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
+                )
                 results.extend(batch)
                 if remaining is not None:
                     remaining -= len(batch)

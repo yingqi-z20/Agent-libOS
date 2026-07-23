@@ -30,7 +30,8 @@ The package uses `prompt_mode: image_only`, `jit_tool_exposure: direct`, and
 tool named `bash`; it does not expose `process_exit`, Object Memory, or other
 builtin tools to the model. If `submit` is `true` and the shell command exits
 successfully, the JIT wrapper calls the internal `process.exit` syscall with
-the command output as the submitted payload after collecting the tool result.
+the same bounded structured observation returned by the tool. It never copies
+an oversized raw shell result into the final process payload.
 
 The wrapper runs:
 
@@ -38,11 +39,14 @@ The wrapper runs:
 bash -lc "exec 2>&1; <command>"
 ```
 
-with a 30 second shell timeout and a 10000 character observation window. The
-package declares a 35 second outer JIT sandbox timeout so the shell timeout has
-time to return its structured observation. This per-tool timeout is capped by
-the Host's `tools.deno_timeout_hard_limit_s` (60 seconds by default); it does
-not raise the 5 second default used by other JIT tools.
+with a 30 second shell timeout, a 32,768-character command limit, and a 10,000
+character observation window. The package declares a 35 second outer JIT
+sandbox timeout so the shell timeout has time to return its structured
+observation. This per-tool timeout is capped by the Host's
+`tools.deno_timeout_hard_limit_s` (60 seconds by default); it does not raise the
+5 second default used by other JIT tools. Package boot also runs four bundled
+JIT contract tests covering ordinary success, successful submission, a denied
+shell syscall, and a failed final submission before registering the tool.
 
 The package declares required capabilities for workspace filesystem read/write
 and shell execute authority. Those declarations are metadata checked by normal
@@ -54,7 +58,11 @@ Observations longer than the window return `output_head`, `output_tail`, and
 `elided_chars` instead of a full `output` field. Timed-out or permission-denied
 commands return a non-zero observation with `exception_info`; the agent prompt
 treats an unrecoverable permission, dependency, or timeout condition as a
-blocker that can be submitted explicitly.
+blocker that can be submitted explicitly. Oversized commands are rejected by
+both the JSON schema and the JIT wrapper. If the shell command succeeds but the
+final process-exit syscall fails, the tool returns a non-zero observation that
+retains the same bounded command-output evidence and reports the submission
+failure; it does not claim completion.
 
 Known differences from upstream mini-swe-agent remain:
 

@@ -165,13 +165,9 @@ class CompactProcessContextTool(SyncAgentTool[CompactProcessContextArgs]):
                 job["updated_at"] = utc_now()
                 _update_job(runtime, ctx.pid, job_handle, job)
                 continue
-            job.setdefault("summaries", []).append(summary)
-            job["stage_index"] = int(job.get("stage_index", 0)) + 1
-            job["current_child_pid"] = None
-            job["updated_at"] = utc_now()
-            _update_job(runtime, ctx.pid, job_handle, job)
+            _record_stage_summary(runtime, ctx.pid, job_handle, job, summary)
 
-        compact_summary = _merge_stage_summaries(job.get("summaries") or [])
+        compact_summary = _latest_stage_summary(job.get("summaries") or [])
         try:
             result = runtime.llm.context_memory.replace_with_compacted_summary(
                 ctx.pid,
@@ -182,7 +178,7 @@ class CompactProcessContextTool(SyncAgentTool[CompactProcessContextArgs]):
                 compaction_metadata={
                     "tool_name": self.name,
                     "compressor_image_id": CONTEXT_COMPRESSOR_IMAGE_ID,
-                    "stage_count": len(job.get("summaries") or []),
+                    "stage_count": int(job.get("stage_index", 0)),
                     "chunk_count": len(chunks),
                     "requested_max_chunks": int(job["max_chunks"]),
                     "discarded_compressor_pids": [str(pid) for pid in job.get("discarded_compressor_pids", [])],
@@ -338,7 +334,7 @@ def _entry_chunks(payload: dict[str, Any], max_chunks: int) -> list[list[dict[st
 
 
 def _stage_goal(pid: str, job: dict[str, Any], chunks: list[list[dict[str, Any]]], index: int) -> dict[str, Any]:
-    previous_summary = _merge_stage_summaries(job.get("summaries") or []) if job.get("summaries") else {}
+    previous_summary = _latest_stage_summary(job.get("summaries") or []) if job.get("summaries") else {}
     return {
         "kind": "context_compaction_stage",
         "caller_pid": pid,
@@ -389,6 +385,22 @@ def _read_child_summary(runtime: Any, pid: str, handle: Any, *, child_pid: str) 
     return {key: payload.get(key) for key in sorted(_SUMMARY_FIELDS)}
 
 
+def _record_stage_summary(
+    runtime: Any,
+    pid: str,
+    job_handle: Any,
+    job: dict[str, Any],
+    summary: dict[str, Any],
+) -> None:
+    # Each stage is cumulative. Retaining and re-merging every intermediate
+    # would duplicate earlier content and grow quadratically with chunk count.
+    job["summaries"] = [summary]
+    job["stage_index"] = int(job.get("stage_index", 0)) + 1
+    job["current_child_pid"] = None
+    job["updated_at"] = utc_now()
+    _update_job(runtime, pid, job_handle, job)
+
+
 def _read_child_summary_from_llm_calls(runtime: Any, child_pid: str) -> dict[str, Any]:
     calls = runtime.store.list_llm_calls(pid=child_pid, limit=1000)
     for call in reversed(calls):
@@ -417,26 +429,17 @@ def _read_child_summary_from_llm_calls(runtime: Any, child_pid: str) -> dict[str
     )
 
 
-def _merge_stage_summaries(summaries: list[Any]) -> dict[str, Any]:
+def _latest_stage_summary(summaries: list[Any]) -> dict[str, Any]:
+    """Return the latest cumulative summary, including from legacy jobs."""
     if not summaries:
         return {key: [] for key in sorted(_SUMMARY_FIELDS)}
-    merged: dict[str, Any] = {}
-    for field in sorted(_SUMMARY_FIELDS):
-        values = []
-        for summary in summaries:
-            if not isinstance(summary, dict):
-                continue
-            value = summary.get(field)
-            if value in (None, "", [], {}):
-                continue
-            values.append(value)
-        if not values:
-            merged[field] = []
-        elif len(values) == 1:
-            merged[field] = values[0]
-        else:
-            merged[field] = values
-    return merged
+    latest = next(
+        (summary for summary in reversed(summaries) if isinstance(summary, dict)),
+        None,
+    )
+    if latest is None:
+        return {key: [] for key in sorted(_SUMMARY_FIELDS)}
+    return {key: latest.get(key, []) for key in sorted(_SUMMARY_FIELDS)}
 
 
 def _job_name(pid: str) -> str:

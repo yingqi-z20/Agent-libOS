@@ -267,6 +267,8 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
     name = "process_exit"
     description = (
         "Exit the current Agent Process with an optional final result. "
+        "This does not present the result to the human; interactive images "
+        "should call human_output in a prior quantum. "
         "This is a Skills/Tools Layer wrapper over process lifecycle primitives."
     )
     args_schema = ProcessExitArgs

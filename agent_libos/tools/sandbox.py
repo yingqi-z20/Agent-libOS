@@ -51,6 +51,8 @@ _TYPESCRIPT_DEPENDENCY_DIRECTIVE_RE = re.compile(
     r"(?im)^\s*///\s*<\s*(?:reference|amd-dependency)\b"
 )
 _DENO_TYPES_DIRECTIVE_RE = re.compile(r"(?im)^\s*//\s*@deno-types\s*=")
+_PROCESS_CLEANUP_TIMEOUT_S = 1.0
+_PROCESS_CLEANUP_POLL_INTERVAL_S = 0.02
 
 SyscallHandler = Callable[[str, dict[str, Any]], Any | Awaitable[Any]]
 
@@ -1009,29 +1011,75 @@ class DenoTypescriptSandbox(SandboxBackend):
         return {"start_new_session": True}
 
     async def _kill_process(self, proc: asyncio.subprocess.Process) -> None:
+        # Cleanup is intentionally idempotent. Re-signalling a process-group ID
+        # after asyncio has reaped its leader risks targeting a recycled ID.
+        if proc.returncode is not None:
+            return
         descendants: list[psutil.Process] = []
+        tree_available = True
         try:
             descendants = psutil.Process(proc.pid).children(recursive=True)
         except (psutil.Error, OSError):
-            pass
+            tree_available = False
+        group_permission_error: PermissionError | None = None
         if os.name != "nt":
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             except PermissionError as exc:
-                raise SandboxError(f"failed to terminate Deno process group {proc.pid}: {exc}") from exc
+                group_permission_error = exc
         for child in reversed(descendants):
             try:
                 child.kill()
-            except psutil.Error:
+            except (psutil.Error, OSError):
                 continue
         if proc.returncode is None:
             try:
                 proc.kill()
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
-            await proc.wait()
+        root_settled = await self._wait_for_deno_process(proc)
+        if group_permission_error is None:
+            if not root_settled:
+                raise SandboxError(f"Deno supervisor {proc.pid} did not terminate during cleanup")
+            return
+        descendants_settled = await self._wait_for_deno_descendants(descendants)
+        if tree_available and root_settled and descendants_settled:
+            return
+        raise SandboxError(
+            f"failed to terminate Deno process group {proc.pid} and could not verify process-tree fallback"
+        ) from group_permission_error
+
+    @staticmethod
+    async def _wait_for_deno_process(proc: asyncio.subprocess.Process) -> bool:
+        if proc.returncode is not None:
+            return True
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_PROCESS_CLEANUP_TIMEOUT_S)
+        except (TimeoutError, ProcessLookupError, PermissionError):
+            return proc.returncode is not None
+        return proc.returncode is not None
+
+    @staticmethod
+    async def _wait_for_deno_descendants(descendants: list[psutil.Process]) -> bool:
+        if not descendants:
+            return True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _PROCESS_CLEANUP_TIMEOUT_S
+        alive = descendants
+        while alive:
+            try:
+                _gone, alive = psutil.wait_procs(alive, timeout=0.0)
+            except (psutil.Error, OSError):
+                return False
+            if not alive:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(_PROCESS_CLEANUP_POLL_INTERVAL_S, remaining))
+        return True
 
     def _test_syscall_handler(self, test: dict[str, Any], index: int) -> tuple[SyscallHandler, Callable[[], None]]:
         expected = list(test.get("syscalls", []))

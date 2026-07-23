@@ -328,9 +328,15 @@ The exact binding hashes the complete public view passed to the GUI provider,
 including payload, status, timestamps, and `decision`; internal release links
 and visibility markers are gate state and are not part of that provider view.
 That visible marker is accepted only while the original binding remains current
-for source versions, Sink trust and registry generation, Task Authority
-manifest, labels, public view, and operation. A later answer or any other
-public-view change redacts the parent again and requires a new exact release.
+for Sink trust and registry generation, Task Authority manifest, labels, public
+view, and operation. Pending questions and approvals also require current source
+versions. A successfully delivered `human_output` is the narrow exception: its
+stored message is a private-digest-bound frozen snapshot whose original source
+references were validated at delivery. GUI presentation therefore rechecks its
+captured labels and current Sink policy without requiring mutable source objects
+to remain at the old version; a digest mismatch is denied. A later answer or any
+other public-view change redacts the parent again and requires a new exact
+release.
 The freshness check is read-only: it does not record a data-flow decision,
 consume authority, or create a release.
 For GUI responses, that check runs inside the same Human-decision transaction
@@ -340,8 +346,9 @@ row; a pending metadata release is paired immediately before its still-redacted
 parent without moving completed release history ahead of pending work. An
 unchanged unrestricted view already handed to the same authenticated GUI
 provider session may reuse a bounded in-memory receipt, but only after its exact
-view hash and current source/Sink policy are checked under the Store lock. A
-new provider session cannot inherit the receipt. Presentation evidence remains
+view hash and current Sink policy are checked under the Store lock; non-output
+requests additionally revalidate current source state. A new provider session
+cannot inherit the receipt. Presentation evidence remains
 available in the full ledgers while bounded GUI causal windows exclude those
 internally generated rows so polling cannot displace unrelated recent events or
 audits.

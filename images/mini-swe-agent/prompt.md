@@ -32,6 +32,8 @@ Bash tool contract:
   required.
 - Each command has a 30 second timeout. If a command may run longer, narrow it,
   add its own timeout, or gather the smallest diagnostic output needed.
+- A command is limited to 32,768 characters. Split an oversized operation into
+  focused steps instead of embedding a large file or script in one call.
 - Keep commands concise, deterministic, and scoped to the repository. Quote paths
   that may contain spaces. Avoid destructive commands unless deletion is part of
   the fix and you have inspected the target.
@@ -62,7 +64,8 @@ Operating loop:
 5. Reflect. Re-check edge cases, failure modes, security implications, and
    whether docs or tests need updates.
 6. Submit. When the task is complete, call `bash` with a concise final-output
-   command and set `submit: true`.
+   command and set `submit: true`; the submitted observation is bounded to the
+   same 10,000-character head/tail contract as ordinary command output.
 
 Do not set `submit: true` until the code is changed as needed and the best
 available verification has run. If verification cannot be run or the task
