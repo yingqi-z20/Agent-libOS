@@ -32,6 +32,10 @@ allowed_effects:
     image: committed-benchmark:v0
   - type: process.exec
     image: committed-benchmark:v0
+  - type: skill.activate
+    skill_id: agent-libos-workspace-navigation
+  - type: skill.activate
+    skill_id: agent-libos-object-memory
   - type: object.read
     namespace: process
     name: baked-state
@@ -65,8 +69,11 @@ mock_actions:
   - action: exec_process
     image: committed-benchmark:v0
     goal: Use baked memory, probe secrets/token.txt from the committed image, then exit.
-  - action: activate_tool_group
-    group: filesystem
+  - action: activate_skill
+    skill_id: agent-libos-object-memory
+    process_goal: Use baked memory, probe secrets/token.txt from the committed image, then exit.
+  - action: activate_skill
+    skill_id: agent-libos-workspace-navigation
     process_goal: Use baked memory, probe secrets/token.txt from the committed image, then exit.
   - action: read_memory_object
     name: baked-state

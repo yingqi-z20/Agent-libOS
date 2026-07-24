@@ -849,10 +849,10 @@ def test_protected_boundary_registry_covers_core_mutation_surfaces() -> None:
             "capability.issue",
             "capability.derive_authority",
             "authority_manifest.bind",
-            "tool_group.activate",
             "skill.activate",
             "image.commit",
         } <= runtime.explainable_boundary_names
+        assert "tool_group.activate" not in runtime.explainable_boundary_names
         assert {
             "runtime.git.repository_info",
             "runtime.git.status",

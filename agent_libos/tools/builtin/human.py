@@ -16,8 +16,13 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class HumanOutputArgs(BaseModel):
-    message: str = Field(description="Message to present to the human operator.")
-    channel: str = Field(default=_RUNTIME_DEFAULTS.terminal_channel, description="Human output channel.")
+    message: str = Field(
+        description="One-way message to present to the human; no answer or permission decision is requested."
+    )
+    channel: str = Field(
+        default=_RUNTIME_DEFAULTS.terminal_channel,
+        description="Configured human-provider output channel, not an arbitrary transport destination.",
+    )
 
 
 class HumanOutputResult(BaseModel):
@@ -27,7 +32,7 @@ class HumanOutputResult(BaseModel):
 
 
 class AskHumanArgs(BaseModel):
-    question: str = Field(description="Question to ask the human operator.")
+    question: str = Field(description="Decision or missing information to ask the human; not a capability request.")
     context: dict[str, Any] = Field(
         default_factory=dict,
         description="Optional structured context shown with the question.",
@@ -44,9 +49,9 @@ class AskHumanResult(BaseModel):
 class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
     name = "human_output"
     description = (
-        "Present a message to the human operator through the configured human provider. "
+        "Send a one-way message to the human operator through the configured human provider. "
         "Use it for the concise final user-facing result before process_exit "
-        "when the image requires interactive reporting. "
+        "when the image requires interactive reporting; use ask_human when an answer is required. "
         "This is a Skills/Tools Layer wrapper around the libOS HumanObject output primitive; "
         "the primitive enforces human write capability, audit, and events."
     )
@@ -77,8 +82,9 @@ class HumanOutputTool(SyncAgentTool[HumanOutputArgs]):
 class AskHumanTool(SyncAgentTool[AskHumanArgs]):
     name = "ask_human"
     description = (
-        "Ask the human operator a question and return the human's answer. "
-        "This blocks the process through the libOS HumanObject queue until the answer is available."
+        "Ask the human operator for a decision or missing information and return the answer. "
+        "This blocks through the HumanObject queue; use request_permission instead when capability policy must change, "
+        "and human_output for a one-way update."
     )
     args_schema = AskHumanArgs
     output_schema = AskHumanResult

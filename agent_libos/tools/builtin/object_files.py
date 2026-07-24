@@ -68,7 +68,8 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
         "Create a named Object Memory object from a text file path relative to "
         "the process's current working directory; do not prepend that directory. "
         "The resolved path must remain under the runtime workspace root. "
-        "The file content is stored inside Object Memory but is not returned in the tool result."
+        "The file content is stored inside Object Memory but is not returned in the tool result. "
+        "Use read_text_file instead when the text itself must be returned without creating a durable Object."
     )
     args_schema = CreateObjectFromFileArgs
     output_schema = CreateObjectFromFileOutput
@@ -210,7 +211,8 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
         "Write a named Object Memory object's text to a path relative to the "
         "process's current working directory; do not prepend that directory. "
         "The resolved path must remain under the runtime workspace root. "
-        "The object content is not returned in the tool result."
+        "The object content is not returned in the tool result. "
+        "Use write_text_file instead when text is already available directly rather than in Object Memory."
     )
     args_schema = WriteObjectToFileArgs
     output_schema = WriteObjectToFileOutput

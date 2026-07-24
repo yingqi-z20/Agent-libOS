@@ -75,7 +75,12 @@ class ReadProcessMessagesArgs(BaseModel):
         le=_TOOL_DEFAULTS.message_read_hard_limit,
         description="Maximum number of messages to return.",
     )
-    ack: bool = Field(default=True, description="Acknowledge returned unread messages after reading.")
+    ack: bool = Field(
+        default=True,
+        description=(
+            "Acknowledge each returned unread message after reading; set false to leave it unread for a later receive."
+        ),
+    )
 
 
 class ReadProcessMessagesOutput(BaseModel):
@@ -139,7 +144,11 @@ class SendProcessMessageTool(SyncAgentTool[SendProcessMessageArgs]):
 
 class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
     name = "read_process_messages"
-    description = "Read this process message queue. By default, returned unread messages are acknowledged."
+    description = (
+        "Take an immediate, non-blocking snapshot of this process mailbox using optional filters. "
+        "Use receive_process_messages when the process should suspend until a match; returned unread messages "
+        "are acknowledged by default."
+    )
     args_schema = ReadProcessMessagesArgs
     output_schema = ReadProcessMessagesOutput
     policy = ToolPolicy(
@@ -190,14 +199,20 @@ class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
 
 
 class ReceiveProcessMessagesArgs(ReadProcessMessagesArgs):
-    block: bool = Field(default=True, description="If true, suspend the process until a matching unread message arrives.")
+    block: bool = Field(
+        default=True,
+        description=(
+            "Suspend until a matching unread message arrives; false returns ready=false immediately when none match."
+        ),
+    )
 
 
 class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
     name = "receive_process_messages"
     description = (
-        "Receive unread process messages with optional selective filters. "
-        "With block=true, the process waits in WAITING_EVENT until a matching message arrives."
+        "Receive unread process messages using optional selective filters. "
+        "Unlike read_process_messages, block=true suspends in WAITING_EVENT until a match; "
+        "block=false returns immediately."
     )
     args_schema = ReceiveProcessMessagesArgs
     output_schema = ReadProcessMessagesOutput

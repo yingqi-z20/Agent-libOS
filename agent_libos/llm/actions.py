@@ -10,8 +10,11 @@ from agent_libos.models.exceptions import ResourceLimitExceeded
 from agent_libos.storage.repositories import ProcessRepository
 
 
+_AUTO_WAIT_MESSAGE_TOOL = "receive_process_messages"
+
+
 class LLMActionService:
-    """Parse, validate, and dispatch model-selected actions."""
+    """Parse, validate, and dispatch model actions and narrow Host fallbacks."""
 
     def __init__(
         self,
@@ -20,7 +23,7 @@ class LLMActionService:
         tools: Any,
         resources: Any | None,
         content_preview_chars: int,
-        pre_tool_notice: Callable[[str, str], dict[str, Any] | None],
+        pre_tool_notice: Callable[[str, str, dict[str, Any]], dict[str, Any] | None],
         post_tool_notice: Callable[[str], dict[str, Any] | None],
         publish_result: Callable[[str, Any], None],
     ) -> None:
@@ -102,6 +105,33 @@ class LLMActionService:
         if name not in process.model_tool_table:
             raise ValueError(f"selected action is not in this process model tool projection: {name}")
 
+    def validate_host_auto_wait(self, pid: str, action: dict[str, Any]) -> None:
+        """Validate the one host-generated fallback against the full image table."""
+
+        name, args = split_action(action)
+        if name != _AUTO_WAIT_MESSAGE_TOOL or args:
+            raise ValueError(
+                "invalid host-generated empty-tool-call auto-wait action"
+            )
+        process = self._processes.get_process(pid)
+        if process is None:
+            raise ValueError(f"host-generated action process does not exist: {pid}")
+        expected_tool_id = process.tool_table.get(name)
+        if expected_tool_id is None:
+            raise ValueError(
+                f"host-generated action is not in this process tool table: {name}"
+            )
+        try:
+            handle = self._tools.resolve(name, pid=pid)
+        except Exception as exc:
+            raise ValueError(
+                f"host-generated action cannot resolve its process tool binding: {name}"
+            ) from exc
+        if handle.tool_id != expected_tool_id:
+            raise ValueError(
+                f"host-generated action process tool binding changed: {name}"
+            )
+
     def preflight_parallel(self, pid: str, actions: list[dict[str, Any]]) -> None:
         if self._resources is None:
             return
@@ -128,13 +158,16 @@ class LLMActionService:
         context_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         name, args = split_action(action)
-        if notice := self._pre_tool_notice(pid, name):
+        if notice := self._pre_tool_notice(pid, name, args):
             return notice
         result = self._tools.call(pid, name, args, context_metadata=context_metadata)
         return self._result(
             pid,
             result,
-            publish_result=name not in {"process_exit", "exec_process"},
+            publish_result=(
+                name not in {"process_exit", "exec_process"}
+                or _is_completion_review_result(name, result)
+            ),
         )
 
     async def adispatch(
@@ -145,13 +178,32 @@ class LLMActionService:
         context_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         name, args = split_action(action)
-        if notice := self._pre_tool_notice(pid, name):
+        if notice := self._pre_tool_notice(pid, name, args):
             return notice
         result = await self._tools.acall(pid, name, args, context_metadata=context_metadata)
         return self._result(
             pid,
             result,
-            publish_result=name not in {"process_exit", "exec_process"},
+            publish_result=(
+                name not in {"process_exit", "exec_process"}
+                or _is_completion_review_result(name, result)
+            ),
+        )
+
+    async def adispatch_host_auto_wait(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch only the executor's verified empty-response wait fallback."""
+
+        self.validate_host_auto_wait(pid, action)
+        return await self.adispatch(
+            pid,
+            action,
+            context_metadata=context_metadata,
         )
 
     def _result(
@@ -175,7 +227,13 @@ class LLMActionService:
 
 
 def auto_wait_message_action() -> dict[str, Any]:
-    return {"action": "receive_process_messages"}
+    return {"action": _AUTO_WAIT_MESSAGE_TOOL}
+
+
+def _is_completion_review_result(name: str, result: ToolCallResult) -> bool:
+    if name != "process_exit" or not result.ok or not isinstance(result.payload, dict):
+        return False
+    return result.payload.get("status") == "completion_review_required"
 
 
 def split_action(action: dict[str, Any]) -> tuple[str, dict[str, Any]]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from agent_libos.models import (
@@ -7,6 +8,7 @@ from agent_libos.models import (
     AgentProcess,
     Capability,
     Event,
+    EventType,
     MaterializedContext,
     PROMPT_MODE_IMAGE_ONLY,
     PROMPT_MODE_LIBOS_DEFAULT,
@@ -50,6 +52,26 @@ If the goal asks you to create or update a workspace file and write_text_file is
 If the goal is complete, follow the AgentImage's final reporting contract first,
 then call process_exit when it is available.
 Prefer producing small typed objects for reasoning artifacts instead of long prose.
+""".strip()
+
+
+COMPLETION_CONTRACT = """
+Cumulative completion contract:
+- The original process goal remains authoritative. Later explicit human input
+  adds requirements or changes only what it states; it does not erase
+  unmentioned requirements unless it explicitly replaces or cancels them.
+- Keep one cumulative acceptance checklist across tool calls, restarts, and
+  context compaction. A runtime-only goal Object may be released after reopen;
+  when exact wording is no longer visible, use the image's nonterminal
+  process_exit completion review rather than guessing a memory name or broader
+  namespace. Re-read relevant acknowledged messages before final reporting.
+- Before human_output as a final report or confirming a terminal process_exit,
+  verify every requested deliverable and evidence step. A passing test proves
+  only the requirement it covers; it is not by itself proof that the whole
+  goal is complete.
+- Treat verification, diffs, checkpoints, and final reports as stale after any
+  later mutation. Once final reporting starts, do not intentionally mutate;
+  if correction is unavoidable, reverify and issue a corrected report.
 """.strip()
 
 
@@ -106,8 +128,10 @@ def build_user_prompt(
     capabilities: list[Capability],
     tools: list[dict[str, Any]],
     skills: list[dict[str, Any]] | None = None,
+    available_skills: list[dict[str, Any]] | None = None,
     prompt_mode: str = PROMPT_MODE_LIBOS_DEFAULT,
     requestable_capabilities: list[dict[str, Any]] | None = None,
+    original_goal_context: str | None = None,
 ) -> str:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
     if mode == PROMPT_MODE_IMAGE_ONLY:
@@ -122,6 +146,8 @@ def build_user_prompt(
         )
         if skills:
             parts.append(_skill_section(skills))
+        if available_skills:
+            parts.append(_available_skill_section(available_skills))
         parts.append(context.text.strip())
         return "\n\n".join(part for part in parts if part.strip())
     if mode == PROMPT_MODE_MINIMAL_RUNTIME:
@@ -132,7 +158,9 @@ def build_user_prompt(
             capabilities=capabilities,
             tools=tools,
             skills=skills or [],
+            available_skills=available_skills or [],
             requestable_capabilities=requestable_capabilities or [],
+            original_goal_context=original_goal_context,
         )
     if context.policy_used == "llm_context_object":
         return "\n\n".join(
@@ -142,19 +170,27 @@ def build_user_prompt(
                 "Choose the next single runtime action after reading the latest appended entries.",
                 _requestable_capability_section(requestable_capabilities or []),
                 _skill_section(skills or []),
+                _available_skill_section(available_skills or []),
+                _original_goal_section(original_goal_context),
+                COMPLETION_CONTRACT,
                 context.text,
+                _process_message_directive(process, events),
             ]
         )
     return "\n\n".join(
         [
             _process_section(process),
+            _original_goal_section(original_goal_context),
             _skill_section(skills or []),
+            _available_skill_section(available_skills or []),
             _capability_section(capabilities),
             _requestable_capability_section(requestable_capabilities or []),
             _tool_section(tools),
             _event_section(events),
             _context_section(context),
+            COMPLETION_CONTRACT,
             "Choose the next single runtime action. Prefer an OpenAI tool call; otherwise put a fallback JSON action object at the end.",
+            _process_message_directive(process, events),
         ]
     )
 
@@ -172,18 +208,149 @@ def _minimal_runtime_user_prompt(
     capabilities: list[Capability],
     tools: list[dict[str, Any]],
     skills: list[dict[str, Any]],
+    available_skills: list[dict[str, Any]],
     requestable_capabilities: list[dict[str, Any]],
+    original_goal_context: str | None,
 ) -> str:
     parts = [
         _process_fact_section(process),
+        _original_goal_section(original_goal_context),
         _skill_section(skills),
+        _available_skill_section(available_skills),
         _capability_section(capabilities),
         _requestable_capability_section(requestable_capabilities),
         _tool_section(tools),
         _event_section(events),
+        COMPLETION_CONTRACT,
         _context_section(context),
+        _process_message_directive(process, events),
     ]
     return "\n\n".join(part for part in parts if part.strip())
+
+
+def recover_initial_goal_context(
+    calls: list[Any],
+    goal_oid: str,
+    *,
+    max_chars: int = 32_000,
+) -> str | None:
+    """Recover the exact initial goal section from retained full-I/O evidence."""
+
+    for call in calls:
+        messages = getattr(call, "messages", None)
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            selected = _goal_context_from_persisted_prompt(content, goal_oid)
+            if selected is None:
+                continue
+            if len(selected) > max_chars:
+                raise ValueError(
+                    f"retained goal context exceeds recovery limit: {len(selected)} > {max_chars}"
+                )
+            return selected
+    return None
+
+
+def _goal_context_from_persisted_prompt(
+    content: str,
+    goal_oid: str,
+) -> str | None:
+    source_marker = f"[{goal_oid}] "
+    source_start = 0 if content.startswith(source_marker) else -1
+    if source_start < 0:
+        line_start = content.find(f"\n{source_marker}")
+        source_start = line_start + 1 if line_start >= 0 else -1
+    if source_start >= 0:
+        boundaries = [
+            content.find(marker, source_start + len(source_marker))
+            for marker in (
+                "\n\n[",
+                "\n\nCumulative completion contract:",
+                "\n\nChoose the next single runtime action.",
+            )
+        ]
+        source_end = min(
+            (boundary for boundary in boundaries if boundary >= 0),
+            default=len(content),
+        )
+        return content[source_start:source_end]
+
+    decoder = json.JSONDecoder()
+    for section in content.split("\n---\n"):
+        candidate = section.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            payload, _end = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("kind") != "memory_delta":
+            continue
+        objects = payload.get("objects")
+        if not isinstance(objects, list):
+            continue
+        for obj in objects:
+            if isinstance(obj, dict) and obj.get("oid") == goal_oid:
+                return json.dumps(
+                    {"oid": goal_oid, "payload": obj.get("payload")},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+    return None
+
+
+def _original_goal_section(original_goal_context: str | None) -> str:
+    if not original_goal_context:
+        return ""
+    return (
+        "Retained original goal contract (authoritative across restarts):\n"
+        f"{original_goal_context}\n"
+        "Preserve every explicit requirement until the human explicitly replaces or cancels it."
+    )
+
+
+def _process_message_directive(
+    process: AgentProcess,
+    events: list[Event],
+) -> str:
+    """Keep explicit queued input actionable without copying its body into context."""
+
+    notices = [
+        event
+        for event in events
+        if event.type == EventType.PROCESS_MESSAGE_NOTICE
+    ]
+    if not notices:
+        return ""
+    message_tools = {"read_process_messages", "receive_process_messages"}
+    visible_tools = set(process.model_tool_table)
+    if message_tools & visible_tools:
+        next_action = (
+            "Your next action must be read_process_messages with exactly an empty "
+            "argument object ({}). Do not add filters or stringify null, list, or "
+            "integer values. The default call reads and acknowledges all queued input."
+        )
+    else:
+        next_action = (
+            "Your next action must be activate_skill with skill_id "
+            "agent-libos-child-processes. On the following quantum, call "
+            "read_process_messages or receive_process_messages."
+        )
+    return (
+        "Pending explicit process input (mandatory control action):\n"
+        f"- {next_action}\n"
+        "Pause work and do not exit until the queued input has been read and "
+        "acknowledged. Then merge it into the cumulative acceptance checklist: "
+        "it changes only the requirements it states unless it explicitly replaces "
+        "or cancels the original goal. The message body remains behind the mediated "
+        "message-read boundary and is not copied into prompt context."
+    )
 
 
 def _process_fact_section(process: AgentProcess) -> str:
@@ -194,7 +361,8 @@ def _process_fact_section(process: AgentProcess) -> str:
         f"- image_id: {process.image_id}\n"
         f"- status: {process.status.value}\n"
         f"- working_directory: {process.working_directory}\n"
-        f"- goal_oid: {process.goal_oid}\n"
+        f"- goal_oid: {process.goal_oid} (identity anchor only; not an Object name or read capability)\n"
+        "- goal_recovery: use materialized context; after reopen, a cumulative-review image uses nonterminal process_exit\n"
         f"- checkpoint_head: {process.checkpoint_head}\n"
         f"- wait_state: {process_wait_state_to_mapping(process.wait_state)}\n"
         f"- outcome: {process_outcome_to_mapping(process.outcome)}\n"
@@ -211,8 +379,8 @@ def _process_section(process: AgentProcess) -> str:
         f"- image_id: {process.image_id}\n"
         f"- status: {process.status.value}\n"
         f"- working_directory: {process.working_directory}\n"
-        f"- goal_oid: {process.goal_oid}\n"
-        f"- loaded_skills: {process.loaded_skills}\n"
+        f"- goal_oid: {process.goal_oid} (identity anchor only; not an Object name or read capability)\n"
+        "- goal_recovery: use materialized context; after reopen, a cumulative-review image uses nonterminal process_exit\n"
         f"- tool_table: {process.model_tool_table}\n"
         f"- checkpoint_head: {process.checkpoint_head}\n"
         f"- wait_state: {process_wait_state_to_mapping(process.wait_state)}\n"
@@ -267,22 +435,51 @@ def _requestable_capability_section(
 
 
 def _skill_section(skills: list[dict[str, Any]]) -> str:
+    visible: list[dict[str, Any]] = []
+    for skill in skills:
+        if skill.get("invalid_snapshot"):
+            visible.append(
+                {
+                    "skill_id": skill.get("skill_id"),
+                    "invalid_snapshot": True,
+                    "error": "loaded Skill snapshot failed validation",
+                }
+            )
+            continue
+        visible.append(
+            {
+                "skill_id": skill.get("skill_id"),
+                "name": skill.get("name"),
+                "version": skill.get("version"),
+                "description": skill.get("description", ""),
+                "instructions": skill.get("instructions", ""),
+                "allowed_tools": skill.get("allowed_tools", []),
+                "actions": skill.get("actions", []),
+                "jit_tools": skill.get("jit_tools", []),
+                "required_capabilities": skill.get("required_capabilities", []),
+                "resources": skill.get("resources", []),
+            }
+        )
+    return f"Loaded skills:\n{visible}"
+
+
+def _available_skill_section(skills: list[dict[str, Any]]) -> str:
     visible = [
         {
             "skill_id": skill.get("skill_id"),
-            "name": skill.get("name"),
-            "version": skill.get("version"),
             "description": skill.get("description", ""),
-            "instructions": skill.get("instructions", ""),
-            "allowed_tools": skill.get("allowed_tools", []),
-            "actions": skill.get("actions", []),
-            "jit_tools": skill.get("jit_tools", []),
-            "required_capabilities": skill.get("required_capabilities", []),
-            "resources": skill.get("resources", []),
+            "active": bool(skill.get("active")),
         }
         for skill in skills
     ]
-    return f"Loaded skills:\n{visible}"
+    if not visible:
+        return ""
+    return (
+        "Available built-in Skills (metadata only):\n"
+        f"{visible}\n"
+        "Activate the smallest matching Skill to load its instructions and "
+        "image-authorized tool schemas. Activation does not grant capability authority."
+    )
 
 
 def _tool_section(tools: list[dict[str, Any]]) -> str:

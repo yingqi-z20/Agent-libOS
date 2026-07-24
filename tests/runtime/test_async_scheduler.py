@@ -81,7 +81,11 @@ class TestAsyncScheduler:
             resource = runtime.filesystem.resource_for(path)
             runtime.llm.client = PlannedActionClient([{'action': 'write_text_file', 'path': path, 'content': 'approved through async queue'}, {'action': 'process_exit', 'payload': {'written': True}}])
             pid = runtime.process.spawn(image='review-agent:v0', goal='write with per-use human approval')
-            runtime.tools.activate_tool_group(pid, 'filesystem')
+            runtime.skills.activate_skill(
+                pid,
+                'agent-libos-workspace-editing',
+                actor=pid,
+            )
             runtime.capability.set_permission_policy(subject=pid, resource=resource, rights=[CapabilityRight.WRITE], policy='ask_each_time', issued_by='test')
             results = asyncio.run(runtime.arun_until_idle(max_quanta=4, human_auto_approve=True))
             assert runtime.process.get(pid).status == ProcessStatus.EXITED

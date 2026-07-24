@@ -296,6 +296,9 @@ class TestCheckpointJit:
                 fork_process.loaded_skills['skill:test-jit']['jit_tool_ids']['isolated_echo']
                 == fork_handle.tool_id
             )
+            assert fork_process.tool_table['isolated_echo'] == fork_handle.tool_id
+            assert fork_process.model_tool_table['isolated_echo'] == fork_handle.tool_id
+            assert source_handle.tool_id not in fork_process.model_tool_table.values()
             fork_candidates = runtime.store.select_table_rows(
                 'tool_candidates',
                 'pid = ?',

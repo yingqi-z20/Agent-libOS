@@ -821,7 +821,7 @@ class ToolExecutionService:
         ) as result_scope:
             flow = self._data_flow.current_context()
             parent_oids, durable_source_refs = self._data_flow.provenance_sources(flow)
-            with self._result_process_mutation_scope(invocation):
+            with self._result_process_mutation_scope(invocation, output):
                 result_handle = result_scope.create_object(
                     pid=invocation.pid,
                     object_type=ObjectType.TOOL_RESULT,
@@ -880,7 +880,11 @@ class ToolExecutionService:
             ok=True,
         )
 
-    def _result_process_mutation_scope(self, invocation: _Invocation) -> Any:
+    def _result_process_mutation_scope(
+        self,
+        invocation: _Invocation,
+        output: _InvocationOutput,
+    ) -> Any:
         if invocation.handle.name == "exec_process":
             return self._post_exec_result_scope(invocation)
         if invocation.handle.name != "process_exit":
@@ -890,6 +894,16 @@ class ToolExecutionService:
             raise ProcessRevisionConflict(
                 f"process disappeared before terminal tool-result persistence: {invocation.pid}"
             )
+        if (
+            process.status in _TOOL_CALLABLE_PROCESS_STATUSES
+            and isinstance(output.payload, dict)
+            and output.payload.get("status") == "completion_review_required"
+        ):
+            # Cumulative completion review is the sole nonterminal
+            # ``process_exit`` result. It must persist like an ordinary tool
+            # result so the next quantum can inspect it, without borrowing the
+            # terminal mutation exception reserved for a committed exit.
+            return nullcontext()
         return trusted_terminal_process_mutation(
             invocation.pid,
             expected_revision=process.revision,

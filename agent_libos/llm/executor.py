@@ -19,7 +19,11 @@ from agent_libos.models.exceptions import (
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.llm.client import LLMClient
-from agent_libos.llm.context_memory import LLMContextMemory
+from agent_libos.llm.context_memory import (
+    LLM_CONTEXT_MAINTENANCE_RESOURCE,
+    LLMContextMemory,
+    LLMContextStoragePressure,
+)
 from agent_libos.llm.context_management import (
     ContextManagementPolicy,
     ContextPressureAssessment,
@@ -28,7 +32,11 @@ from agent_libos.llm.context_management import (
     context_pressure_prompt,
     provider_usage_lower_bound,
 )
-from agent_libos.llm.prompt import build_system_prompt, build_user_prompt
+from agent_libos.llm.prompt import (
+    build_system_prompt,
+    build_user_prompt,
+    recover_initial_goal_context,
+)
 from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.llm.pending import (
@@ -53,7 +61,9 @@ from agent_libos.ports import (
 from agent_libos.storage import UnitOfWork
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.models import (
+    CapabilityRight,
     DataFlowContext,
+    DataLabels,
     DataSink,
     EventType,
     ExternalEffectClassification,
@@ -62,6 +72,7 @@ from agent_libos.models import (
     FailedProcessOutcome,
     HumanRequestStatus,
     LLMCallRecord,
+    MaterializedContext,
     ObjectHandle,
     ObjectRight,
     ProcessMessageKind,
@@ -84,6 +95,15 @@ if TYPE_CHECKING:
     from agent_libos.sdk import ProtectedOperationSDK
     from agent_libos.skills.manager import SkillManager
     from agent_libos.tools.broker import ToolBroker
+
+
+_HOST_AUTO_WAIT_METADATA = {
+    "kind": "host_generated_action",
+    "schema_version": 1,
+    "source": "llm.empty_tool_calls_auto_wait",
+    "tool_name": "receive_process_messages",
+}
+
 
 class _LLMProviderChainScopeChanged(ProviderEffectNotStarted):
     """The selected provider-side state no longer matches the dispatch scope."""
@@ -256,6 +276,45 @@ class LLMProcessExecutor:
             if isinstance(spec, Mapping)
         ]
 
+    def _retained_original_goal_context(
+        self,
+        *,
+        process: Any,
+        image: Any,
+    ) -> str | None:
+        if image.metadata.get("completion_gate") != "cumulative_review":
+            return None
+        goal_oid = str(process.goal_oid or "")
+        if not goal_oid:
+            return None
+        calls = self._processes.list_llm_calls(
+            pid=process.pid,
+            limit=self.config.llm.call_record_hard_limit,
+        )
+        try:
+            return recover_initial_goal_context(calls, goal_oid)
+        except ValueError:
+            # The completion gate owns the fail-closed user-facing recovery
+            # path for an oversized or unavailable retained goal.
+            return None
+
+    def _include_retained_goal_labels(
+        self,
+        flow_context: DataFlowContext,
+        goal_oid: str | None,
+    ) -> DataFlowContext:
+        if not goal_oid:
+            return flow_context
+        metadata = self._objects.get_persisted_object_metadata(goal_oid)
+        if metadata is None:
+            return flow_context
+        return DataFlowContext.aggregate(
+            (
+                flow_context,
+                DataFlowContext(labels=DataLabels.from_object_metadata(metadata)),
+            )
+        )
+
     def _build_model_messages(
         self,
         *,
@@ -267,6 +326,8 @@ class LLMProcessExecutor:
         capabilities: list[Any],
         tools: list[dict[str, Any]],
         skills: list[dict[str, Any]],
+        available_skills: list[dict[str, Any]] | None = None,
+        original_goal_context: str | None = None,
     ) -> list[dict[str, str]]:
         return [
             {"role": "system", "content": build_system_prompt(image)},
@@ -279,13 +340,68 @@ class LLMProcessExecutor:
                     capabilities=capabilities,
                     tools=tools,
                     skills=skills,
+                    available_skills=available_skills or [],
                     prompt_mode=image.prompt_mode,
                     requestable_capabilities=(
                         self._requestable_capabilities_for_prompt(pid)
                     ),
+                    original_goal_context=original_goal_context,
                 ),
             },
         ]
+
+    def _assemble_llm_request(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        process: Any,
+        context: MaterializedContext,
+        events: list[Any],
+        capabilities: list[Any],
+        tools: list[dict[str, Any]],
+        skills: list[dict[str, Any]],
+        available_skills: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, str]], DataFlowContext]:
+        original_goal_context = self._retained_original_goal_context(
+            process=process,
+            image=image,
+        )
+        flow_context = self._data_flow.context_from_materialization(pid, context)
+        if original_goal_context is not None:
+            flow_context = self._include_retained_goal_labels(
+                flow_context,
+                process.goal_oid,
+            )
+        if events:
+            self._advance_event_cursor(pid, events[-1].event_id)
+        messages = self._build_model_messages(
+            pid=pid,
+            image=image,
+            process=process,
+            context=context,
+            events=events,
+            capabilities=capabilities,
+            tools=tools,
+            skills=skills,
+            available_skills=available_skills,
+            original_goal_context=original_goal_context,
+        )
+        input_refs = list(context.object_refs)
+        if (
+            original_goal_context is not None
+            and process.goal_oid is not None
+            and process.goal_oid not in input_refs
+        ):
+            input_refs.append(process.goal_oid)
+        self._audit.record(
+            actor=pid,
+            action="llm.request",
+            target=f"image:{image.image_id}",
+            input_refs=input_refs,
+            decision={"messages": len(messages), "policy": image.context_policy},
+        )
+        return messages, flow_context
 
     def run_once(self, pid: str) -> dict[str, Any]:
         try:
@@ -372,14 +488,7 @@ class LLMProcessExecutor:
                 decision={"error": error},
             )
             return {"ok": False, "error": error}
-        if process.memory_view is None:
-            process.memory_view = self._memory.create_view(pid, [], mode=ViewMode.READ_ONLY)
-            process.updated_at = utc_now()
-            process = self._processes.patch_process(
-                pid,
-                {"memory_view": process.memory_view, "updated_at": process.updated_at},
-                expected_revision=process.revision,
-            )
+        process = self._ensure_process_memory_view(pid, process)
 
         self._notify_interrupt_messages(pid)
         source_view = self.context_memory.view_without_context(pid, process.memory_view)
@@ -415,29 +524,20 @@ class LLMProcessExecutor:
             loaded_skills=self._tools.model_loaded_skills(pid),
         )
         skills = self._skills.prompt_context(pid)
-        try:
-            context = self.context_memory.prepare(
-                pid=pid,
-                image=image,
-                process=prompt_process,
-                source_context=source_context,
-                events=events,
-                capabilities=capabilities,
-                tools=tools,
-            )
-        except ResourceLimitExceeded as exc:
-            self._resources.kill_if_exceeded(pid, reason=str(exc))
-            self._audit.record(
-                actor=pid,
-                action="llm.resource_limit_exceeded",
-                target=f"process:{pid}",
-                decision={"error": str(exc)},
-            )
-            return {"ok": False, "resource_limit_exceeded": True, "error": str(exc)}
-        flow_context = self._data_flow.context_from_materialization(pid, context)
-        if events:
-            self._advance_event_cursor(pid, events[-1].event_id)
-        messages = self._build_model_messages(
+        available_skills = self._skills.available_builtin_prompt_context(pid)
+        prepared_context = await self._prepare_llm_context(
+            pid=pid,
+            image=image,
+            process=prompt_process,
+            source_context=source_context,
+            events=events,
+            capabilities=capabilities,
+            tools=tools,
+        )
+        if isinstance(prepared_context, dict):
+            return prepared_context
+        context = prepared_context
+        messages, flow_context = self._assemble_llm_request(
             pid=pid,
             image=image,
             process=prompt_process,
@@ -446,13 +546,7 @@ class LLMProcessExecutor:
             capabilities=capabilities,
             tools=tools,
             skills=skills,
-        )
-        self._audit.record(
-            actor=pid,
-            action="llm.request",
-            target=f"image:{image.image_id}",
-            input_refs=context.object_refs,
-            decision={"messages": len(messages), "policy": image.context_policy},
+            available_skills=available_skills,
         )
         flow_token = self._data_flow.push(flow_context)
         try:
@@ -462,8 +556,14 @@ class LLMProcessExecutor:
                 process=prompt_process,
                 context=context,
                 tools=openai_tools,
+                available_skills=available_skills,
             )
-            completion, actions, parallel_tool_calls = await self._complete_valid_action(
+            (
+                completion,
+                actions,
+                parallel_tool_calls,
+                host_auto_wait,
+            ) = await self._complete_valid_action(
                 pid,
                 messages,
                 openai_tools,
@@ -474,6 +574,7 @@ class LLMProcessExecutor:
                 completion=completion,
                 actions=actions,
                 parallel_tool_calls=parallel_tool_calls,
+                host_auto_wait=host_auto_wait,
             )
         except _ContextManagementHandled as handled:
             return handled.result
@@ -517,6 +618,58 @@ class LLMProcessExecutor:
         finally:
             self._data_flow.reset(flow_token)
 
+    async def _prepare_llm_context(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        process: Any,
+        source_context: MaterializedContext,
+        events: list[Any],
+        capabilities: list[Any],
+        tools: list[dict[str, Any]],
+    ) -> MaterializedContext | dict[str, Any]:
+        try:
+            return self.context_memory.prepare(
+                pid=pid,
+                image=image,
+                process=process,
+                source_context=source_context,
+                events=events,
+                capabilities=capabilities,
+                tools=tools,
+            )
+        except LLMContextStoragePressure as pressure:
+            return await self._handle_context_storage_pressure(
+                pid,
+                image=image,
+                pressure=pressure,
+            )
+        except ResourceLimitExceeded as exc:
+            self._resources.kill_if_exceeded(pid, reason=str(exc))
+            self._audit.record(
+                actor=pid,
+                action="llm.resource_limit_exceeded",
+                target=f"process:{pid}",
+                decision={"error": str(exc)},
+            )
+            return {
+                "ok": False,
+                "resource_limit_exceeded": True,
+                "error": str(exc),
+            }
+
+    def _ensure_process_memory_view(self, pid: str, process: Any) -> Any:
+        if process.memory_view is not None:
+            return process
+        memory_view = self._memory.create_view(pid, [], mode=ViewMode.READ_ONLY)
+        updated_at = utc_now()
+        return self._processes.patch_process(
+            pid,
+            {"memory_view": memory_view, "updated_at": updated_at},
+            expected_revision=process.revision,
+        )
+
     def _fail_llm_quantum(self, pid: str, error: Exception) -> dict[str, Any]:
         durable_error = self._durable_llm_error(error)
         self._process.exit(
@@ -531,6 +684,252 @@ class LLMProcessExecutor:
             decision={"error": durable_error},
         )
         return {"ok": False, "error": durable_error}
+
+    async def _handle_context_storage_pressure(
+        self,
+        pid: str,
+        *,
+        image: Any,
+        pressure: LLMContextStoragePressure,
+    ) -> dict[str, Any]:
+        policy = context_management_policy(image.planner)
+        episode_id = new_id("ctxpressure")
+        action, pending_context, common = self._storage_context_attempt_inputs(
+            pressure,
+            policy=policy,
+            episode_id=episode_id,
+        )
+        prior = self.pending.get(pid) or {}
+        prior_metadata = self._context_management_pending_metadata(prior)
+        if self._storage_context_attempt_already_recorded(
+            prior,
+            prior_metadata,
+            context_generation=pressure.context_generation,
+        ):
+            reason = "storage_compaction_attempt_already_recorded"
+            return self._fail_storage_context_attempt(
+                pid,
+                common={
+                    **common,
+                    "episode_id": prior_metadata.get("episode_id"),
+                },
+                reason=reason,
+                error=RuntimeError(reason),
+                include_error=False,
+            )
+        self._audit.record(
+            actor=pid,
+            action="llm.context_pressure_detected",
+            target=f"process:{pid}",
+            decision=common,
+        )
+        marker_failure = self._record_storage_context_attempt(
+            pid,
+            action=action,
+            pending_context=pending_context,
+            common=common,
+        )
+        if marker_failure is not None:
+            return marker_failure
+        self._audit.record(
+            actor=pid,
+            action="llm.context_pressure_auto_attempted",
+            target=f"process:{pid}",
+            decision=common,
+        )
+        try:
+            result = await self._dispatch_auto_context_action(
+                pid,
+                action=action,
+                pending_context=pending_context,
+            )
+        except _ContextManagementHandled as handled:
+            return handled.result
+        except Exception as exc:
+            return self._fail_storage_context_attempt(
+                pid,
+                common=common,
+                reason=type(exc).__name__,
+                error=exc,
+            )
+        return self._finish_storage_context_attempt(
+            pid,
+            pressure=pressure,
+            action=action,
+            pending_context=pending_context,
+            common=common,
+            result=result,
+            episode_id=episode_id,
+        )
+
+    def _storage_context_attempt_inputs(
+        self,
+        pressure: LLMContextStoragePressure,
+        *,
+        policy: ContextManagementPolicy,
+        episode_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        assessment = pressure.to_dict()
+        action = policy.tool_action()
+        if policy.tool_name == "compact_process_context":
+            action["force"] = True
+            action.setdefault(
+                "max_chunks",
+                self.config.llm_context.storage_compaction_max_chunks,
+            )
+            action.setdefault(
+                "preserve_recent_entries",
+                self.config.llm_context.storage_compaction_preserve_recent_entries,
+            )
+        common = {
+            **assessment,
+            "episode_id": episode_id,
+            "policy_fingerprint": policy.fingerprint,
+            "mode": policy.mode,
+            "tool_name": policy.tool_name,
+        }
+        pending_context = {
+            "kind": "context_management_auto",
+            "schema_version": 1,
+            "source": "runtime_context_management",
+            "episode_id": episode_id,
+            "policy_fingerprint": policy.fingerprint,
+            "mode": policy.mode,
+            "tool_name": policy.tool_name,
+            "context_generation": pressure.context_generation,
+            "assessment": assessment,
+        }
+        return action, pending_context, common
+
+    @staticmethod
+    def _storage_context_attempt_already_recorded(
+        prior: dict[str, Any],
+        prior_metadata: dict[str, Any],
+        *,
+        context_generation: str,
+    ) -> bool:
+        assessment = prior_metadata.get("assessment")
+        return (
+            prior.get("status") == "completed"
+            and isinstance(assessment, dict)
+            and assessment.get("trigger") == "storage_payload"
+            and prior_metadata.get("context_generation") == context_generation
+            and prior_metadata.get("outcome") == "attempted"
+        )
+
+    def _record_storage_context_attempt(
+        self,
+        pid: str,
+        *,
+        action: dict[str, Any],
+        pending_context: dict[str, Any],
+        common: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            self._persist_completed_context_management_marker(
+                pid,
+                action=action,
+                metadata={**pending_context, "outcome": "attempted"},
+            )
+        except Exception as exc:
+            return self._fail_storage_context_attempt(
+                pid,
+                common=common,
+                reason="attempt_marker_persistence_failed",
+                error=exc,
+                include_error_type=True,
+            )
+        return None
+
+    def _finish_storage_context_attempt(
+        self,
+        pid: str,
+        *,
+        pressure: LLMContextStoragePressure,
+        action: dict[str, Any],
+        pending_context: dict[str, Any],
+        common: dict[str, Any],
+        result: dict[str, Any],
+        episode_id: str,
+    ) -> dict[str, Any]:
+        generation_after = self._processes.get_llm_context_generation(pid)
+        if self._context_compaction_succeeded(
+            result,
+            generation_before=pressure.context_generation,
+            generation_after=generation_after,
+        ):
+            self._persist_completed_context_management_marker(
+                pid,
+                action=action,
+                metadata={
+                    **pending_context,
+                    "context_generation_after": generation_after,
+                    "outcome": "compacted",
+                },
+            )
+            self._audit.record(
+                actor=pid,
+                action="llm.context_pressure_compacted",
+                target=f"process:{pid}",
+                decision={
+                    **common,
+                    "context_generation_after": generation_after,
+                },
+            )
+            return {
+                "ok": True,
+                "context_compacted": True,
+                "context_storage_pressure": True,
+                "context_pressure_episode_id": episode_id,
+                "context_generation": generation_after,
+            }
+
+        reason = self._context_management_failure_reason(
+            result,
+            generation_before=pressure.context_generation,
+            generation_after=generation_after,
+        )
+        return self._fail_storage_context_attempt(
+            pid,
+            common=common,
+            reason=reason,
+            error=RuntimeError(
+                f"LLM context storage compaction failed: {reason}"
+            ),
+            extra={
+                "result": sanitize_for_observability(result),
+                "context_generation_after": generation_after,
+            },
+            include_error=False,
+        )
+
+    def _fail_storage_context_attempt(
+        self,
+        pid: str,
+        *,
+        common: dict[str, Any],
+        reason: str,
+        error: Exception,
+        extra: dict[str, Any] | None = None,
+        include_error: bool = True,
+        include_error_type: bool = False,
+    ) -> dict[str, Any]:
+        decision = {
+            **common,
+            "reason": reason,
+            **(extra or {}),
+        }
+        if include_error_type:
+            decision["error_type"] = type(error).__name__
+        if include_error:
+            decision["error"] = str(error)
+        self._audit.record(
+            actor=pid,
+            action="llm.context_pressure_failed",
+            target=f"process:{pid}",
+            decision=decision,
+        )
+        return self._fail_llm_quantum(pid, error)
 
     def _durable_llm_error(self, error: BaseException) -> str:
         detail = str(error)
@@ -576,19 +975,23 @@ class LLMProcessExecutor:
         tool_call_count: int,
         resumed_after_human: bool = False,
         resumed_after_message: bool = False,
+        action_source: str | None = None,
     ) -> dict[str, Any]:
+        decision = {
+            "action": sanitize_for_observability(action),
+            "result": sanitize_for_observability(result),
+            "content_preview": content_preview,
+            "tool_call_count": tool_call_count,
+            "resumed_after_human": resumed_after_human,
+            "resumed_after_message": resumed_after_message,
+        }
+        if action_source is not None:
+            decision["action_source"] = action_source
         self._audit.record(
             actor=pid,
             action="llm.action",
             target=action.get("action"),
-            decision={
-                "action": sanitize_for_observability(action),
-                "result": sanitize_for_observability(result),
-                "content_preview": content_preview,
-                "tool_call_count": tool_call_count,
-                "resumed_after_human": resumed_after_human,
-                "resumed_after_message": resumed_after_message,
-            },
+            decision=decision,
         )
         payload = {"ok": True, "action": action, "result": result}
         if resumed_after_human:
@@ -604,8 +1007,11 @@ class LLMProcessExecutor:
         completion: Any,
         actions: list[dict[str, Any]],
         parallel_tool_calls: bool,
+        host_auto_wait: bool = False,
         resumed_after_human: bool = False,
     ) -> dict[str, Any]:
+        if host_auto_wait and len(actions) != 1:
+            raise ValueError("host-generated auto-wait must contain exactly one action")
         if parallel_tool_calls and len(actions) > 1:
             return await self._dispatch_action_batch(
                 pid=pid,
@@ -616,8 +1022,15 @@ class LLMProcessExecutor:
         tool_call_context = self._selected_completion_tool_call_context(completion)
         content_preview = self._completion_content_preview(completion.content)
         tool_call_count = len(completion.tool_calls)
+        host_pending_metadata = (
+            self._host_auto_wait_metadata() if host_auto_wait else None
+        )
         try:
-            result = await self.adispatch(pid, action)
+            result = await self._adispatch_selected_action(
+                pid,
+                action,
+                host_auto_wait=host_auto_wait,
+            )
         except HumanApprovalRequired as exc:
             return self._wait_for_human_action(
                 pid=pid,
@@ -626,6 +1039,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=content_preview,
                 tool_call_count=tool_call_count,
+                pending_metadata=host_pending_metadata,
                 **tool_call_context,
             )
         except ProcessWaitRequired as exc:
@@ -636,6 +1050,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=content_preview,
                 tool_call_count=tool_call_count,
+                pending_metadata=host_pending_metadata,
                 **tool_call_context,
             )
         except ProcessMessageWaitRequired as exc:
@@ -646,6 +1061,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=content_preview,
                 tool_call_count=tool_call_count,
+                pending_metadata=host_pending_metadata,
                 **tool_call_context,
             )
         self._persist_response_tool_output(
@@ -660,6 +1076,9 @@ class LLMProcessExecutor:
             content_preview=content_preview,
             tool_call_count=tool_call_count,
             resumed_after_human=resumed_after_human,
+            action_source=(
+                "host_empty_tool_calls_auto_wait" if host_auto_wait else None
+            ),
         )
 
     async def _dispatch_action_batch(
@@ -1392,7 +1811,7 @@ class LLMProcessExecutor:
         flow_token = self._data_flow.push(flow_context)
         try:
             try:
-                completion, actions, parallel_tool_calls = await self._complete_valid_action(
+                completed_action = await self._complete_valid_action(
                     pid,
                     list(prepared.get("base_messages") or []),
                     list(prepared.get("tools") or []),
@@ -1406,16 +1825,30 @@ class LLMProcessExecutor:
                 )
             except _LLMReleaseApprovalRequired as exc:
                 return self._wait_for_llm_release(pid, exc)
-            self._clear_pending_action(pid, self._pending_resume_token(claimed))
-            return await self._dispatch_completed_llm_action(
-                pid=pid,
-                completion=completion,
-                actions=actions,
-                parallel_tool_calls=parallel_tool_calls,
-                resumed_after_human=True,
+            return await self._dispatch_resumed_llm_release_completion(
+                pid,
+                claimed,
+                completed_action,
             )
         finally:
             self._data_flow.reset(flow_token)
+
+    async def _dispatch_resumed_llm_release_completion(
+        self,
+        pid: str,
+        claimed: dict[str, Any],
+        completed_action: tuple[Any, list[dict[str, Any]], bool, bool],
+    ) -> dict[str, Any]:
+        completion, actions, parallel_tool_calls, host_auto_wait = completed_action
+        self._clear_pending_action(pid, self._pending_resume_token(claimed))
+        return await self._dispatch_completed_llm_action(
+            pid=pid,
+            completion=completion,
+            actions=actions,
+            parallel_tool_calls=parallel_tool_calls,
+            host_auto_wait=host_auto_wait,
+            resumed_after_human=True,
+        )
 
     def _action_name(self, action: dict[str, Any]) -> str:
         return str(action.get("action") or action.get("tool") or action.get("name") or "")
@@ -1527,6 +1960,24 @@ class LLMProcessExecutor:
         }
 
     @staticmethod
+    def _host_auto_wait_metadata() -> dict[str, Any]:
+        return dict(_HOST_AUTO_WAIT_METADATA)
+
+    @classmethod
+    def _host_auto_wait_pending_metadata(
+        cls,
+        pending: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata = pending_metadata(pending)
+        if metadata.get("kind") != _HOST_AUTO_WAIT_METADATA["kind"]:
+            return {}
+        if metadata != _HOST_AUTO_WAIT_METADATA:
+            raise RuntimeError(
+                "durable host-generated auto-wait metadata is invalid"
+            )
+        return cls._host_auto_wait_metadata()
+
+    @staticmethod
     def _context_management_pending_metadata(
         pending: dict[str, Any],
     ) -> dict[str, Any]:
@@ -1585,9 +2036,14 @@ class LLMProcessExecutor:
                 target=f"process:{pid}",
                 decision=common,
             )
+            storage_pressure = (
+                dict(metadata.get("assessment") or {}).get("trigger")
+                == "storage_payload"
+            )
             return {
                 "ok": True,
                 "context_compacted": True,
+                "context_storage_pressure": storage_pressure,
                 "context_pressure_episode_id": metadata.get("episode_id"),
                 "context_generation": generation_after,
                 "resumed_context_management": True,
@@ -1608,6 +2064,11 @@ class LLMProcessExecutor:
                 "result": sanitize_for_observability(result),
             },
         )
+        if dict(metadata.get("assessment") or {}).get("trigger") == "storage_payload":
+            return self._fail_llm_quantum(
+                pid,
+                RuntimeError(f"LLM context storage compaction failed: {reason}"),
+            )
         # The failed maintenance action is deliberately not represented as a
         # model tool result. Continue by rebuilding the ordinary Provider
         # request; the completed pending marker deduplicates this episode.
@@ -1822,12 +2283,17 @@ class LLMProcessExecutor:
         context_management_metadata = self._context_management_pending_metadata(
             pending
         )
+        host_auto_wait_metadata = self._host_auto_wait_pending_metadata(pending)
+        pending_action_metadata = (
+            context_management_metadata or host_auto_wait_metadata
+        )
         self.pending.forget_generation(pid, "message", resume_token)
         try:
             with self._data_flow.recovered_source_snapshot_access():
-                result = await self.adispatch(
+                result = await self._adispatch_selected_action(
                     pid,
                     action,
+                    host_auto_wait=bool(host_auto_wait_metadata),
                     context_metadata={
                         **self._pending_data_flow_metadata(pending),
                         "operation_id": pending.get("tool_operation_id"),
@@ -1842,7 +2308,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
-                pending_metadata=context_management_metadata or None,
+                pending_metadata=pending_action_metadata or None,
                 **self._pending_tool_call_context(pending),
             )
         except ProcessWaitRequired as exc:
@@ -1853,7 +2319,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
-                pending_metadata=context_management_metadata or None,
+                pending_metadata=pending_action_metadata or None,
                 **self._pending_tool_call_context(pending),
             )
         except HumanApprovalRequired as exc:
@@ -1864,7 +2330,7 @@ class LLMProcessExecutor:
                 message=str(exc),
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
-                pending_metadata=context_management_metadata or None,
+                pending_metadata=pending_action_metadata or None,
                 **self._pending_tool_call_context(pending),
             )
         except Exception as exc:
@@ -1892,6 +2358,11 @@ class LLMProcessExecutor:
             content_preview=str(pending.get("content_preview", "")),
             tool_call_count=int(pending.get("tool_call_count", 0)),
             resumed_after_message=True,
+            action_source=(
+                "host_empty_tool_calls_auto_wait"
+                if host_auto_wait_metadata
+                else None
+            ),
         )
         return completed
 
@@ -1958,7 +2429,7 @@ class LLMProcessExecutor:
         max_attempts: int | None = None,
         response_scope_fingerprint: str | None = None,
         _prepared_request: dict[str, Any] | None = None,
-    ) -> tuple[Any, list[dict[str, Any]], bool]:
+    ) -> tuple[Any, list[dict[str, Any]], bool, bool]:
         attempt_messages = list(
             (_prepared_request or {}).get("attempt_messages") or messages
         )
@@ -2004,15 +2475,23 @@ class LLMProcessExecutor:
                             "tool_call_count": len(completion.tool_calls),
                         },
                     )
-                actions = [
-                    self._tools.normalize_model_action(pid, action)
-                    for action in raw_actions
-                ]
-                for action in actions:
-                    self._validate_dispatchable_action(pid, action)
+                if auto_wait_used:
+                    if len(raw_actions) != 1:
+                        raise ValueError(
+                            "host-generated auto-wait must contain exactly one action"
+                        )
+                    actions = [dict(raw_actions[0])]
+                    self.actions.validate_host_auto_wait(pid, actions[0])
+                else:
+                    actions = [
+                        self._tools.normalize_model_action(pid, action)
+                        for action in raw_actions
+                    ]
+                    for action in actions:
+                        self._validate_dispatchable_action(pid, action)
                 if parallel_tool_calls and len(actions) > 1:
                     self._preflight_parallel_tool_batch(pid, actions)
-                return completion, actions, parallel_tool_calls
+                return completion, actions, parallel_tool_calls, auto_wait_used
             except ValueError as exc:
                 last_error = exc
                 self._audit.record(
@@ -2450,6 +2929,28 @@ class LLMProcessExecutor:
                 provider_lower_bound_tokens=lower_bound,
                 episode_id=episode_id,
                 observation=observation,
+            )
+            return
+        persistent_context_enabled = self.context_memory.persistent_context_enabled(
+            state.pid
+        )
+        maintenance_authorized = self._capabilities.check(
+            state.pid,
+            LLM_CONTEXT_MAINTENANCE_RESOURCE,
+            CapabilityRight.EXECUTE,
+        )
+        if not persistent_context_enabled or not maintenance_authorized:
+            observation["action"] = "not_authorized"
+            self._audit_context_pressure(
+                state.pid,
+                "llm.context_pressure_maintenance_not_authorized",
+                assessment,
+                policy,
+                episode_id=episode_id,
+                extra={
+                    "persistent_context_enabled": persistent_context_enabled,
+                    "maintenance_authorized": maintenance_authorized,
+                },
             )
             return
         if attempted:
@@ -3742,6 +4243,7 @@ class LLMProcessExecutor:
         process: Any,
         context: Any,
         tools: list[dict[str, Any]],
+        available_skills: list[dict[str, Any]] | None = None,
     ) -> str:
         context_scope = self._context_scope_for_previous_response(pid)
         material = {
@@ -3751,6 +4253,7 @@ class LLMProcessExecutor:
             "loaded_skills": getattr(process, "loaded_skills", {}),
             "context_scope": context_scope,
             "tools": to_jsonable(tools),
+            "available_builtin_skills": to_jsonable(available_skills or []),
         }
         return hashlib.sha256(dumps(material).encode("utf-8")).hexdigest()
 
@@ -3820,22 +4323,61 @@ class LLMProcessExecutor:
             context_metadata=context_metadata,
         )
 
+    async def _adispatch_selected_action(
+        self,
+        pid: str,
+        action: dict[str, Any],
+        *,
+        host_auto_wait: bool,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not host_auto_wait:
+            return await self.adispatch(
+                pid,
+                action,
+                context_metadata=context_metadata,
+            )
+        return await self.actions.adispatch_host_auto_wait(
+            pid,
+            action,
+            context_metadata={
+                **(context_metadata or {}),
+                "llm_action_source": "host_empty_tool_calls_auto_wait",
+            },
+        )
+
     def _notify_interrupt_messages(self, pid: str) -> dict[str, Any] | None:
         return self._messages.notice(
             pid,
             kind=ProcessMessageKind.INTERRUPT,
             phase="before_llm_tool_selection",
             source="llm.executor",
+            instruction=self._process_message_instruction(pid),
         )
 
-    def _pre_tool_interrupt_notice(self, pid: str, tool_name: str) -> dict[str, Any] | None:
+    def _pre_tool_interrupt_notice(
+        self,
+        pid: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> dict[str, Any] | None:
         if tool_name in {"read_process_messages", "receive_process_messages"}:
             return None
+        if (
+            tool_name == "activate_skill"
+            and tool_args.get("skill_id") == "agent-libos-child-processes"
+        ):
+            # This built-in activation only projects tools already present in
+            # the image. It is the minimal no-authority bridge needed to make
+            # the interrupt-handling tools visible under Skills projection.
+            return None
+        instruction = self._process_message_instruction(pid)
         notice = self._messages.notice(
             pid,
             kind=ProcessMessageKind.INTERRUPT,
             phase="before_tool_call",
             source="llm.executor",
+            instruction=instruction,
         )
         if notice is None:
             return None
@@ -3844,7 +4386,7 @@ class LLMProcessExecutor:
             "tool_id": None,
             "result_oid": None,
             "payload": {"message_notice": notice},
-            "error": "unread interrupt process messages are waiting; call read_process_messages or receive_process_messages first",
+            "error": f"unread interrupt process messages are waiting; {instruction}",
             "interrupted_by_message": True,
             "message_notice": notice,
         }
@@ -3855,6 +4397,21 @@ class LLMProcessExecutor:
             kind=ProcessMessageKind.NORMAL,
             phase="after_tool_call",
             source="llm.executor",
+            instruction=self._process_message_instruction(pid),
+        )
+
+    def _process_message_instruction(self, pid: str) -> str:
+        process = self._process.get(pid)
+        message_tools = {"read_process_messages", "receive_process_messages"}
+        if message_tools.isdisjoint(process.model_tool_table):
+            return (
+                "Call activate_skill with skill_id agent-libos-child-processes, then call "
+                "read_process_messages or receive_process_messages to inspect and acknowledge "
+                "unread process messages."
+            )
+        return (
+            "Call read_process_messages or receive_process_messages to inspect and acknowledge "
+            "unread process messages."
         )
 
     def _handles_for_oids(self, pid: str, oids: list[str]) -> list[ObjectHandle]:

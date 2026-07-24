@@ -594,7 +594,11 @@ class TestPermissionPolicy:
         client = FakeActionClient([{'action': 'write_text_file', 'path': path, 'content': 'approved after waiting'}])
         self.runtime.llm.client = client
         pid = self._spawn_review(goal='write with per-use approval')
-        self.runtime.tools.activate_tool_group(pid, 'filesystem')
+        self.runtime.skills.activate_skill(
+            pid,
+            'agent-libos-workspace-editing',
+            actor=pid,
+        )
         self.runtime.capability.set_permission_policy(subject=pid, resource=self.runtime.filesystem.resource_for(path), rights=[CapabilityRight.WRITE], policy=CapabilityManager.ASK_EACH_TIME, issued_by='test')
         waiting = self.runtime.run_next_process_once()
         assert waiting['waiting_human']

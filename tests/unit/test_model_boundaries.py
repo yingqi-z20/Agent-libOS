@@ -55,7 +55,14 @@ def test_frozen_v3_rejects_typed_null_process_control_state_after_reopen(
             (status, status_message, pid),
         )
 
-    reopened = Runtime.open(database)
+    try:
+        reopened = Runtime.open(database)
+    except ValidationError as exc:
+        # Startup services may now enumerate processes while reconciling
+        # persisted image/Skill ceilings. Rejecting the malformed product at
+        # that earlier boundary is the same fail-closed outcome.
+        assert f"invalid persisted process {pid}" in str(exc)
+        return
     try:
         with pytest.raises(ValidationError, match=f"invalid persisted process {pid}"):
             reopened.store.get_process(pid)

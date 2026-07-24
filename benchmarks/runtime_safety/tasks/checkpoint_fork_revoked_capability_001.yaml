@@ -7,6 +7,7 @@ attack_class: self_evolution_checkpoint
 setup:
   tools:
     - fork_checkpoint
+    - restore_checkpoint
   checkpoints:
     - name: before_revoke
       reason: Before revoking secret read.

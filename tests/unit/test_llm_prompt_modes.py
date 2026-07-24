@@ -101,6 +101,7 @@ class TestLLMPromptModes:
             assert "Available tools:" not in user_prompt
             assert "Capabilities:" not in user_prompt
             assert "Choose the next single runtime action" not in user_prompt
+            assert "Cumulative completion contract:" not in user_prompt
         finally:
             runtime.close()
 
@@ -171,11 +172,91 @@ class TestLLMPromptModes:
         finally:
             runtime.close()
 
+    @pytest.mark.parametrize(
+        "prompt_mode",
+        [PROMPT_MODE_LIBOS_DEFAULT, PROMPT_MODE_MINIMAL_RUNTIME],
+    )
+    def test_cumulative_completion_contract_survives_runtime_reopen(
+        self,
+        tmp_path: Any,
+        prompt_mode: str,
+    ) -> None:
+        database = tmp_path / f"completion-contract-{prompt_mode}.sqlite"
+        image_id = f"completion-contract-{prompt_mode}:v0"
+        runtime = Runtime.open(database)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id=image_id,
+                    name=f"completion-contract-{prompt_mode}",
+                    system_prompt="Complete the whole durable task.",
+                    prompt_mode=prompt_mode,
+                    default_tools=["echo", "process_exit"],
+                    context_policy="recency_first",
+                    metadata={"completion_gate": "cumulative_review"},
+                ),
+                actor="test",
+            )
+            pid = runtime.process.spawn(
+                image=image_id,
+                goal="finish original requirement and final evidence step",
+            )
+            runtime.llm.client = PromptRecordingClient(
+                tool_name="echo",
+                arguments={"milestone": "phase one"},
+            )
+
+            first = runtime.run_process_once(pid)
+
+            assert first["action"]["action"] == "echo"
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            client = PromptRecordingClient()
+            reopened.llm.client = client
+
+            completed = reopened.run_process_once(pid)
+
+            assert completed["action"]["action"] == "process_exit"
+            user_prompt = client.user_prompts[0]
+            assert "Cumulative completion contract:" in user_prompt
+            assert "original process goal remains authoritative" in user_prompt
+            assert "does not erase unmentioned requirements" in user_prompt
+            assert "passing test proves" in user_prompt
+            assert "whole goal is complete" in user_prompt
+            assert "identity anchor only; not an Object name or read capability" in user_prompt
+            assert "cumulative-review image uses nonterminal process_exit" in user_prompt
+            assert "Retained original goal contract" in user_prompt
+            assert "finish original requirement and final evidence step" in user_prompt
+            goal_oid = reopened.process.get(pid).goal_oid
+            request_record = [
+                record
+                for record in reopened.audit.trace(actor=pid)
+                if record.action == "llm.request"
+            ][-1]
+            assert goal_oid is not None
+            assert goal_oid in request_record.input_refs
+        finally:
+            reopened.close()
+
 
 class PromptRecordingClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        tool_name: str = "process_exit",
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
         self.system_prompts: list[str] = []
         self.user_prompts: list[str] = []
+        self.tool_name = tool_name
+        self.arguments = (
+            {"payload": {"done": True}}
+            if arguments is None
+            else dict(arguments)
+        )
 
     def complete_action(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMCompletion:
         self.system_prompts.append(str(messages[0]["content"]))
@@ -185,8 +266,8 @@ class PromptRecordingClient:
             tool_calls=[
                 {
                     "id": "prompt_mode_exit",
-                    "name": "process_exit",
-                    "arguments": json.dumps({"payload": {"done": True}}),
+                    "name": self.tool_name,
+                    "arguments": json.dumps(self.arguments),
                 }
             ],
             raw=SimpleNamespace(id="prompt_mode_raw"),

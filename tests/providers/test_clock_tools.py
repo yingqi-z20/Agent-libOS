@@ -308,6 +308,17 @@ class TestClockTool:
     def test_clock_tools_are_in_process_tool_table(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='time tools')
         names = {schema['function']['name'] for schema in self.runtime.tools.openai_tool_schemas(pid)}
+        assert 'get_current_time' not in names
+        assert 'sleep' not in names
+
+        result = self.runtime.skills.activate_skill(
+            pid,
+            'agent-libos-runtime-session',
+            actor=pid,
+        )
+
+        assert result['authority_changed'] is False
+        names = {schema['function']['name'] for schema in self.runtime.tools.openai_tool_schemas(pid)}
         assert 'get_current_time' in names
         assert 'sleep' in names
 

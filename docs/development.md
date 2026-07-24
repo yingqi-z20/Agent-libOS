@@ -458,8 +458,9 @@ memory, while `max_runtime_seconds`, `max_subprocess_wall_seconds`, and
 Booleans are not accepted as numbers.
 
 Event limits are storage-selection bounds, not only renderer truncation. Each
-LLM context preparation reads at most `llm_context.recent_event_limit` rows
-newer than the process cursor. GUI snapshots read only the newest
+explicitly enriched LLM context preparation reads at most
+`llm_context.recent_event_limit` rows newer than the process cursor; the
+default source-only path does not capture event deltas. GUI snapshots read only the newest
 `gui.snapshot_event_limit` rows, and process-event pagination uses the same
 maximum with a `before` cursor. Durable event rows remain in the store.
 

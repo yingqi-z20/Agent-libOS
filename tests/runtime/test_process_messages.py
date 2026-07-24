@@ -561,6 +561,7 @@ class TestProcessMessage:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
             _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'wait for control message')
+            runtime.activate_skill(child, 'agent-libos-child-processes')
             waiting = runtime.run_process_once(child)
             assert waiting['waiting_message']
             assert waiting['filters']['channel'] == 'control'
@@ -685,6 +686,8 @@ class TestProcessMessage:
         runtime.llm.client = client
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='handle interrupts')
+            runtime.activate_skill(pid, 'agent-libos-runtime-session')
+            runtime.activate_skill(pid, 'agent-libos-child-processes')
             runtime.messages.post(sender='test', recipient_pid=pid, kind=ProcessMessageKind.INTERRUPT, subject='urgent', body='inspect this before other work')
             interrupted = runtime.run_process_once(pid)
             assert interrupted['result']['interrupted_by_message']
@@ -698,12 +701,84 @@ class TestProcessMessage:
         finally:
             runtime.close()
 
+    @pytest.mark.parametrize('message_action', ['read_process_messages', 'receive_process_messages'])
+    def test_interrupt_allows_message_skill_activation_before_ack(self, message_action: str) -> None:
+        client = PlannedActionClient([
+            {'action': 'activate_skill', 'skill_id': 'agent-libos-child-processes'},
+            {'action': message_action},
+        ])
+        runtime = Runtime.open('local')
+        runtime.llm.client = client
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='activate interrupt handling')
+            before = runtime.process.get(pid)
+            assert 'activate_skill' in before.model_tool_table
+            assert 'read_process_messages' not in before.model_tool_table
+            assert 'receive_process_messages' not in before.model_tool_table
+
+            message = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                kind=ProcessMessageKind.INTERRUPT,
+                subject='urgent',
+                body='activate message handling before acknowledging this',
+            )
+
+            activated = runtime.run_process_once(pid)
+            assert activated['action'] == {
+                'action': 'activate_skill',
+                'skill_id': 'agent-libos-child-processes',
+            }
+            assert activated['result']['ok']
+            assert not activated['result'].get('interrupted_by_message', False)
+            assert message.message_id in {
+                item.message_id
+                for item in runtime.messages.unread(pid, kind=ProcessMessageKind.INTERRUPT)
+            }
+            after_activation = runtime.process.get(pid)
+            assert 'read_process_messages' in after_activation.model_tool_table
+            assert 'receive_process_messages' in after_activation.model_tool_table
+            assert 'agent-libos-child-processes' in client.user_prompts[0]
+
+            handled = runtime.run_process_once(pid)
+            assert handled['action']['action'] == message_action
+            assert handled['result']['ok']
+            assert handled['result']['payload']['messages'][0]['message_id'] == message.message_id
+            assert handled['result']['payload']['acked_message_ids'] == [message.message_id]
+            assert runtime.messages.unread(pid, kind=ProcessMessageKind.INTERRUPT) == []
+        finally:
+            runtime.close()
+
+    def test_interrupt_keeps_unrelated_skill_activation_blocked(self) -> None:
+        client = PlannedActionClient([
+            {'action': 'activate_skill', 'skill_id': 'agent-libos-runtime-session'},
+        ])
+        runtime = Runtime.open('local')
+        runtime.llm.client = client
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='do not bypass interrupt handling')
+            runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                kind=ProcessMessageKind.INTERRUPT,
+                subject='urgent',
+            )
+
+            blocked = runtime.run_process_once(pid)
+            assert blocked['result']['interrupted_by_message']
+            assert 'agent-libos-child-processes' in blocked['result']['error']
+            assert 'agent-libos-runtime-session' not in runtime.process.get(pid).loaded_skills
+            assert len(runtime.messages.unread(pid, kind=ProcessMessageKind.INTERRUPT)) == 1
+        finally:
+            runtime.close()
+
     def test_normal_message_notifies_after_tool_call_without_preempting(self) -> None:
         client = PlannedActionClient([{'action': 'get_current_time', 'timezone': 'UTC'}])
         runtime = Runtime.open('local')
         runtime.llm.client = client
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='handle normal messages')
+            runtime.activate_skill(pid, 'agent-libos-runtime-session')
             runtime.capability.grant(pid, 'clock:now', [CapabilityRight.READ], issued_by='test')
             runtime.messages.post(sender='test', recipient_pid=pid, kind=ProcessMessageKind.NORMAL, subject='later', body='read after current tool')
             result = runtime.run_process_once(pid)
@@ -712,6 +787,108 @@ class TestProcessMessage:
             assert result['result']['message_notice']['phase'] == 'after_tool_call'
             assert result['result']['message_notice']['kind'] == 'normal'
             assert len(runtime.messages.unread(pid, kind=ProcessMessageKind.NORMAL)) == 1
+        finally:
+            runtime.close()
+
+    def test_normal_message_notice_requires_mediated_read_without_copying_body_to_prompt(self) -> None:
+        client = PlannedActionClient([
+            {'action': 'get_current_time', 'timezone': 'UTC'},
+            {'action': 'activate_skill', 'skill_id': 'agent-libos-child-processes'},
+            {'action': 'read_process_messages'},
+        ])
+        runtime = Runtime.open('local')
+        runtime.llm.client = client
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='apply queued user update')
+            runtime.activate_skill(pid, 'agent-libos-runtime-session')
+            runtime.capability.grant(pid, 'clock:now', [CapabilityRight.READ], issued_by='test')
+            message = runtime.human.send_process_message(
+                pid,
+                'explicit user acceptance criterion that must not leak before read',
+            )
+
+            first = runtime.run_process_once(pid)
+            assert first['action']['action'] == 'get_current_time'
+            assert first['result']['message_notice']['message_ids'] == [message.message_id]
+
+            activated = runtime.run_process_once(pid)
+            assert activated['action'] == {
+                'action': 'activate_skill',
+                'skill_id': 'agent-libos-child-processes',
+            }
+            activation_prompt = client.user_prompts[1]
+            assert message.body not in activation_prompt
+            assert message.message_id in activation_prompt
+            directive = activation_prompt.rsplit(
+                'Pending explicit process input (mandatory control action):',
+                maxsplit=1,
+            )[1]
+            assert message.message_id not in directive
+            assert 'cumulative acceptance checklist' in directive
+            assert 'older goal' not in activation_prompt
+            assert 'it changes only the requirements it states' in directive
+            assert activation_prompt.rstrip().endswith(
+                'The message body remains behind the mediated message-read boundary '
+                'and is not copied into prompt context.'
+            )
+
+            handled = runtime.run_process_once(pid)
+            assert handled['action']['action'] == 'read_process_messages'
+            assert handled['result']['payload']['messages'][0]['body'] == message.body
+            assert handled['result']['payload']['acked_message_ids'] == [message.message_id]
+            assert runtime.messages.unread(pid) == []
+        finally:
+            runtime.close()
+
+    def test_model_message_read_normalizes_reversibly_stringified_json_arguments(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='read explicit input')
+            runtime.activate_skill(pid, 'agent-libos-child-processes')
+            message = runtime.human.send_process_message(
+                pid,
+                'handle this exact interrupt',
+                kind=ProcessMessageKind.INTERRUPT,
+            )
+            runtime.llm.client = PlannedActionClient([
+                {
+                    'action': 'read_process_messages',
+                    'include_acked': 'false',
+                    'kind': 'None',
+                    'sender': 'null',
+                    'channel': 'None',
+                    'correlation_id': 'null',
+                    'reply_to': 'None',
+                    'message_ids': f'["{message.message_id}"]',
+                    'limit': '100',
+                    'ack': 'true',
+                }
+            ])
+
+            result = runtime.run_process_once(pid)
+
+            assert result['ok']
+            assert result['action']['message_ids'] == [message.message_id]
+            assert result['action']['limit'] == 100
+            assert result['action']['kind'] is None
+            assert result['result']['payload']['messages'][0]['body'] == message.body
+            assert result['result']['payload']['acked_message_ids'] == [message.message_id]
+            normalized = next(
+                record
+                for record in runtime.audit.trace(actor=pid)
+                if record.action == 'llm.process_message_arguments_normalized'
+            )
+            assert normalized.decision['normalized_fields'] == [
+                'ack',
+                'channel',
+                'correlation_id',
+                'include_acked',
+                'kind',
+                'limit',
+                'message_ids',
+                'reply_to',
+                'sender',
+            ]
         finally:
             runtime.close()
 

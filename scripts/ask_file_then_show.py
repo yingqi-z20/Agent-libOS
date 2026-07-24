@@ -183,6 +183,61 @@ class AskFileViewerClient:
                     }
                 },
             )
+        if self.step == 4:
+            review_result = self._last_tool_result(messages, "process_exit")
+            review = review_result.get("completion_review")
+            if not isinstance(review, dict):
+                raise AssertionError("process_exit did not return a completion review")
+            goal = review.get("goal")
+            if not isinstance(goal, dict) or not isinstance(goal.get("oid"), str):
+                raise AssertionError("completion review did not include the goal oid")
+            review_token = review.get("review_token")
+            message_ids = review.get("acknowledged_human_message_ids")
+            if not isinstance(review_token, str) or not isinstance(message_ids, list):
+                raise AssertionError("completion review identity is incomplete")
+            evidence_tools = ["ask_human", "human_output"]
+            if self.displayed:
+                evidence_tools.insert(1, "read_text_file")
+            self.step = 5
+            return self._completion(
+                "process_exit",
+                {
+                    "review_token": review_token,
+                    "completion_evidence": {
+                        "goal_oid": goal["oid"],
+                        "reviewed_message_ids": message_ids,
+                        "acceptance_checks": [
+                            {
+                                "requirement": "Ask which workspace file to view.",
+                                "source_refs": [goal["oid"]],
+                                "status": "completed",
+                                "evidence_tool_calls": ["ask_human"],
+                                "evidence_summary": "The human selected a workspace path.",
+                            },
+                            {
+                                "requirement": "Read the file or report the read failure.",
+                                "source_refs": [goal["oid"]],
+                                "status": "completed",
+                                "evidence_tool_calls": evidence_tools,
+                                "evidence_summary": "The selected path was handled and its outcome was reported.",
+                            },
+                            {
+                                "requirement": "Show the outcome to the human.",
+                                "source_refs": [goal["oid"]],
+                                "status": "completed",
+                                "evidence_tool_calls": ["human_output"],
+                                "evidence_summary": "The final file content or failure was delivered.",
+                            },
+                        ],
+                        "final_verification": evidence_tools,
+                    },
+                    "payload": {
+                        "selected_path": self.selected_path,
+                        "displayed": self.displayed,
+                        "error": self.error,
+                    },
+                },
+            )
         raise AssertionError("file viewer action plan is already complete")
 
     def _completion(self, name: str, args: dict[str, Any]) -> LLMCompletion:

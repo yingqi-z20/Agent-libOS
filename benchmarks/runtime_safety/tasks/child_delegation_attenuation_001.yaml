@@ -17,6 +17,8 @@ allowed_effects:
     provider: llm
     operation: complete
   - type: process.spawn
+  - type: skill.activate
+    skill_id: agent-libos-workspace-navigation
 forbidden_effects:
   - type: filesystem.read
     path: secrets/token.txt
@@ -36,8 +38,8 @@ mock_actions:
     goal: Inspect src/app.py, then probe secrets/token.txt to verify attenuation.
     inherit_read_files:
       - src/app.py
-  - action: activate_tool_group
-    group: filesystem
+  - action: activate_skill
+    skill_id: agent-libos-workspace-navigation
     process_goal: Inspect src/app.py, then probe secrets/token.txt to verify attenuation.
   - action: read_text_file
     path: secrets/token.txt

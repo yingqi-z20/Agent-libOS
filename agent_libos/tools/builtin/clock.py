@@ -25,7 +25,10 @@ class SleepArgs(BaseModel):
     seconds: float = Field(
         ge=0,
         le=_TOOL_DEFAULTS.max_sleep_seconds,
-        description=f"Seconds to sleep. Maximum is {_TOOL_DEFAULTS.max_sleep_seconds:g} seconds.",
+        description=(
+            f"Bounded timer delay in seconds; maximum is {_TOOL_DEFAULTS.max_sleep_seconds:g}. "
+            "Do not use it to wait for a child process, object task, or process message."
+        ),
     )
 
 
@@ -56,7 +59,11 @@ class GetCurrentTimeTool(BaseAgentTool[GetCurrentTimeArgs]):
 
 class SleepTool(BaseAgentTool[SleepArgs]):
     name = "sleep"
-    description = "Sleep for a bounded duration using the libOS clock primitive."
+    description = (
+        "Delay for a known bounded duration using the libOS clock primitive. "
+        "This is not an event wait or polling primitive; use the matching child-process, object-task, "
+        "or message wait tool."
+    )
     args_schema = SleepArgs
     output_schema = SleepOutput
     policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=_TOOL_DEFAULTS.sleep_tool_timeout_s)

@@ -72,7 +72,69 @@ class _PostgresCleanupConnection:
         self.closed = True
 
 
+class _EmptyPostgresMigrationConnection:
+    def __init__(self) -> None:
+        self.closed = False
+        self.events: list[str] = []
+
+    def execute(self, sql: str, params: object = ()) -> object:
+        if "current_database()" in sql:
+            self.events.append("identity")
+            return _PostgresCleanupResult(
+                {"database_name": "runtime", "schema_name": "agent_libos"}
+            )
+        if "pg_try_advisory_lock" in sql:
+            self.events.append("lock")
+            return _PostgresCleanupResult({"acquired": True})
+        if "SELECT schema_version FROM runtime_schema" in sql:
+            self.events.append("schema-marker")
+            raise RuntimeError("runtime_schema does not exist")
+        if "FROM pg_catalog.pg_class" in sql:
+            self.events.append("schema-objects")
+            return []
+        raise AssertionError(f"unexpected PostgreSQL migration SQL: {sql}")
+
+    def rollback(self) -> None:
+        self.events.append("rollback-probe")
+
+    def commit(self) -> None:
+        raise AssertionError("empty PostgreSQL migration target was committed")
+
+    def close(self) -> None:
+        self.events.append("close")
+        self.closed = True
+
+
 class TestStorageBackendBoundaries:
+    def test_postgres_migration_open_rejects_empty_schema_without_initializing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        connection = _EmptyPostgresMigrationConnection()
+        monkeypatch.setattr(
+            postgres_backend,
+            "_PostgresConnection",
+            lambda _dsn: connection,
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match="requires an existing initialized Agent libOS store",
+        ):
+            PostgresStore(
+                "postgresql://runtime",
+                initialize_schema=False,
+            )
+
+        assert connection.events == [
+            "identity",
+            "lock",
+            "schema-marker",
+            "rollback-probe",
+            "schema-objects",
+            "close",
+        ]
+
     def test_sqlite_database_lease_and_wal_sidecars_are_owner_only(self, tmp_path: Path) -> None:
         if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "fchmod"):
             pytest.skip("POSIX owner-only file modes are unavailable")

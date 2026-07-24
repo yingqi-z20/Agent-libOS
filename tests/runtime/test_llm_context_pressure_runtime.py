@@ -3,22 +3,36 @@ from __future__ import annotations
 import math
 import tempfile
 from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
 import pytest
 
 from agent_libos import AgentImage, Runtime
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.llm.context_management import (
     DEFAULT_CONTEXT_PRESSURE_PROMPT,
     ContextPressureAssessment,
     assess_context_pressure,
 )
+from agent_libos.llm.context_memory import (
+    LLM_CONTEXT_ENRICHMENT_RESOURCE,
+    LLM_CONTEXT_MAINTENANCE_RESOURCE,
+    context_object_name,
+)
 from agent_libos.llm.pending import pending_metadata
 from agent_libos.models import (
     CapabilityRight,
+    ObjectPatch,
+    ObjectRight,
+    ObjectType,
     PROMPT_MODE_IMAGE_ONLY,
     PROMPT_MODE_LIBOS_DEFAULT,
     PROMPT_MODE_MINIMAL_RUNTIME,
+    ProcessStatus,
+    ResourceBudget,
+    ViewMode,
 )
 from agent_libos.models.exceptions import ProcessMessageWaitRequired
 from agent_libos.storage import SQLiteStore
@@ -76,13 +90,676 @@ def _runtime_with_image(
     image: AgentImage,
     *,
     actions: list[dict[str, Any]] | None = None,
+    config: AgentLibOSConfig | None = None,
 ) -> tuple[Runtime, RecordingActionClient, str]:
-    runtime = Runtime(SQLiteStore(":memory:"))
+    runtime = Runtime(SQLiteStore(":memory:"), config=config)
     runtime.register_image(image, actor="test")
     client = RecordingActionClient(actions or [{"action": "process_exit", "payload": {"done": True}}])
     runtime.llm.client = client
     pid = runtime.process.spawn(image=image.image_id, goal="finish under context pressure")
+    _grant_persistent_context(runtime, pid)
     return runtime, client, pid
+
+
+def _grant_persistent_context(runtime: Runtime, pid: str) -> None:
+    runtime.capability.grant(
+        pid,
+        LLM_CONTEXT_ENRICHMENT_RESOURCE,
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+    )
+    runtime.capability.grant(
+        pid,
+        LLM_CONTEXT_MAINTENANCE_RESOURCE,
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+    )
+
+
+def test_default_context_uses_only_materialized_source_without_delta_object() -> None:
+    image = AgentImage(
+        image_id="source-only-context:v0",
+        name="source-only-context",
+        default_tools=["get_current_time"],
+    )
+    runtime = Runtime(SQLiteStore(":memory:"))
+    runtime.register_image(image, actor="test")
+    client = RecordingActionClient([{"action": "get_current_time"}])
+    runtime.llm.client = client
+    pid = runtime.process.spawn(
+        image=image.image_id,
+        goal="use only the already materialized source context",
+    )
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["action"]["action"] == "get_current_time"
+        assert DEFAULT_CONFIG.llm_context.policy == "source_only"
+        assert "LLM context object:" not in client.user_prompts[0]
+        assert "capabilities_delta" not in client.user_prompts[0]
+        assert runtime.store.get_object_by_name(
+            context_object_name(pid),
+            namespace=runtime.memory.resolve_namespace(pid),
+        ) is None
+        manifest = runtime.store.list_context_materialization_manifests(pid=pid)[0]
+        assert manifest.context_oid is None
+        assert manifest.context_version is None
+        assert manifest.compaction["mode"] == "source_only"
+    finally:
+        runtime.close()
+
+
+def test_default_source_only_context_is_charged_to_cumulative_budget() -> None:
+    image = AgentImage(
+        image_id="source-only-budget:v0",
+        name="source-only-budget",
+        default_tools=["process_exit"],
+    )
+    runtime = Runtime(SQLiteStore(":memory:"))
+    runtime.register_image(image, actor="test")
+    client = RecordingActionClient(
+        [{"action": "process_exit", "payload": {"must_not_run": True}}]
+    )
+    runtime.llm.client = client
+    pid = runtime.process.spawn(
+        image=image.image_id,
+        goal="charge this selected source context before calling the provider",
+        resource_budget=ResourceBudget(
+            max_context_materialization_tokens=100_000,
+            max_context_materialization_total_tokens=100_000,
+        ),
+    )
+    source = runtime.memory.create_object(
+        pid,
+        ObjectType.EVIDENCE,
+        {"text": "selected source content " * 32},
+        name="source-only-budget-evidence",
+    )
+    process = runtime.process.get(pid)
+    process.memory_view = runtime.memory.create_view(
+        pid,
+        [source],
+        mode=ViewMode.READ_ONLY,
+    )
+    runtime.store.update_process(process)
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["ok"] is True, result
+        assert len(client.user_prompts) == 1
+        process = runtime.process.get(pid)
+        manifest = runtime.store.list_context_materialization_manifests(pid=pid)[0]
+        assert manifest.rendered_tokens > 0
+        assert (
+            process.resource_usage.context_materialized_tokens
+            == manifest.rendered_tokens
+        )
+        assert process.status == ProcessStatus.EXITED
+        assert runtime.store.get_object_by_name(
+            context_object_name(pid),
+            namespace=runtime.memory.resolve_namespace(pid),
+        ) is None
+    finally:
+        runtime.close()
+
+
+def test_default_source_only_pressure_does_not_inject_or_run_context_management(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="source-only-pressure:v0",
+        name="source-only-pressure",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime = Runtime(SQLiteStore(":memory:"))
+    runtime.register_image(image, actor="test")
+    client = RecordingActionClient(
+        [{"action": "process_exit", "payload": {"done": True}}]
+    )
+    runtime.llm.client = client
+    pid = runtime.process.spawn(
+        image=image.image_id,
+        goal="keep source-only context under pressure",
+    )
+    monkeypatch.setattr(
+        "agent_libos.llm.executor.assess_context_pressure",
+        _forced_pressure,
+    )
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["action"]["action"] == "process_exit"
+        assert DEFAULT_CONTEXT_PRESSURE_PROMPT not in client.user_prompts[0]
+        assert runtime.store.get_object_by_name(
+            context_object_name(pid),
+            namespace=runtime.memory.resolve_namespace(pid),
+        ) is None
+        call = runtime.store.get_latest_llm_call(
+            pid=pid,
+            purpose="action_selection",
+        )
+        assert call is not None
+        assert call.request_options["context_pressure"]["action"] == "not_authorized"
+        audit_actions = {
+            record.action for record in runtime.audit.trace(actor=pid)
+        }
+        assert "llm.context_pressure_maintenance_not_authorized" in audit_actions
+        assert "llm.context_pressure_auto_attempted" not in audit_actions
+        assert "llm.context_pressure_prompted" not in audit_actions
+    finally:
+        runtime.close()
+
+
+def test_explicit_context_enrichment_authority_enables_delta_object() -> None:
+    image = AgentImage(
+        image_id="explicit-context-enrichment:v0",
+        name="explicit-context-enrichment",
+        default_tools=["get_current_time"],
+    )
+    runtime = Runtime(SQLiteStore(":memory:"))
+    runtime.register_image(image, actor="test")
+    client = RecordingActionClient([{"action": "get_current_time"}])
+    runtime.llm.client = client
+    pid = runtime.process.spawn(
+        image=image.image_id,
+        goal="explicitly enable persistent context enrichment",
+    )
+    runtime.capability.grant(
+        pid,
+        LLM_CONTEXT_ENRICHMENT_RESOURCE,
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+    )
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["action"]["action"] == "get_current_time"
+        assert "LLM context object:" in client.user_prompts[0]
+        context = runtime.store.get_object_by_name(
+            context_object_name(pid),
+            namespace=runtime.memory.resolve_namespace(pid),
+        )
+        assert context is not None
+        assert any(
+            entry.get("kind") == "capabilities_snapshot"
+            for entry in context.payload["entries"]
+        )
+    finally:
+        runtime.close()
+
+
+def _storage_pressure_config(threshold_bytes: int = 5_000) -> AgentLibOSConfig:
+    return replace(
+        DEFAULT_CONFIG,
+        llm_context=replace(
+            DEFAULT_CONFIG.llm_context,
+            storage_compaction_threshold_bytes=threshold_bytes,
+        ),
+    )
+
+
+def test_storage_pressure_compacts_before_provider_or_object_hard_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    threshold_bytes = 8_000
+    image = AgentImage(
+        image_id="storage-pressure:v0",
+        name="storage-pressure",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime, client, pid = _runtime_with_image(
+        image,
+        config=_storage_pressure_config(threshold_bytes),
+    )
+    original_dispatch = runtime.llm.adispatch
+    calls: list[dict[str, Any]] = []
+
+    async def dispatch(
+        selected_pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if action.get("action") != "compact_process_context":
+            return await original_dispatch(
+                selected_pid,
+                action,
+                context_metadata=context_metadata,
+            )
+        calls.append(dict(action))
+        runtime.store.set_llm_context_generation(
+            selected_pid,
+            "storage-compacted-generation",
+        )
+        return {
+            "ok": True,
+            "tool_id": "tool_context",
+            "result_oid": None,
+            "payload": {"compacted": True},
+            "error": None,
+        }
+
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["context_compacted"] is True
+        assert result["context_storage_pressure"] is True
+        assert calls == [
+            {
+                "action": "compact_process_context",
+                "force": True,
+                "max_chunks": 4,
+                "preserve_recent_entries": 0,
+            }
+        ]
+        assert client.user_prompts == []
+        assert runtime.store.list_llm_calls(pid=pid) == []
+        detected = next(
+            record
+            for record in runtime.audit.trace(actor=pid)
+            if record.action == "llm.context_pressure_detected"
+        )
+        assert detected.decision["trigger"] == "storage_payload"
+        assert detected.decision["payload_bytes"] >= threshold_bytes
+        assert detected.decision["projected_payload_bytes"] >= threshold_bytes
+        assert detected.decision["persisted_payload_bytes"] < threshold_bytes
+        assert detected.decision["threshold_bytes"] == threshold_bytes
+        assert (
+            detected.decision["hard_limit_bytes"]
+            == DEFAULT_CONFIG.tools.memory_payload_hard_limit_bytes
+        )
+    finally:
+        runtime.close()
+
+
+def test_storage_pressure_compaction_failure_fails_without_provider_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="storage-pressure-failure:v0",
+        name="storage-pressure-failure",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime, client, pid = _runtime_with_image(
+        image,
+        config=_storage_pressure_config(),
+    )
+    compact_calls = 0
+
+    async def dispatch(
+        _selected_pid: str,
+        _action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal compact_calls
+        compact_calls += 1
+        return {
+            "ok": False,
+            "tool_id": "tool_context",
+            "result_oid": None,
+            "payload": None,
+            "error": "compaction refused",
+        }
+
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        failed = runtime.run_next_process_once()
+
+        assert failed["ok"] is False
+        assert "storage compaction failed" in failed["error"]
+        assert runtime.process.get(pid).status.value == "failed"
+        assert compact_calls == 1
+        assert client.user_prompts == []
+        assert runtime.store.list_llm_calls(pid=pid) == []
+
+        skipped = runtime.run_next_process_once()
+        assert skipped is None
+        assert compact_calls == 1
+    finally:
+        runtime.close()
+
+
+def test_storage_pressure_requires_explicit_context_maintenance_authority() -> None:
+    image = AgentImage(
+        image_id="storage-pressure-not-authorized:v0",
+        name="storage-pressure-not-authorized",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime = Runtime(
+        SQLiteStore(":memory:"),
+        config=_storage_pressure_config(),
+    )
+    runtime.register_image(image, actor="test")
+    client = RecordingActionClient(
+        [{"action": "process_exit", "payload": {"done": True}}]
+    )
+    runtime.llm.client = client
+    pid = runtime.process.spawn(
+        image=image.image_id,
+        goal="do not auto-compact without explicit authority",
+    )
+    runtime.capability.grant(
+        pid,
+        LLM_CONTEXT_ENRICHMENT_RESOURCE,
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+    )
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["action"]["action"] == "process_exit"
+        assert runtime.process.get(pid).status.value == "exited"
+        assert len(runtime.store.list_llm_calls(pid=pid)) == 1
+        assert not any(
+            record.action.startswith("llm.context_pressure_")
+            for record in runtime.audit.trace(actor=pid)
+        )
+    finally:
+        runtime.close()
+
+
+def test_storage_pressure_rearms_above_post_compaction_artifact_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="storage-pressure-hysteresis:v0",
+        name="storage-pressure-hysteresis",
+        default_tools=[
+            "compact_process_context",
+            "get_current_time",
+            "process_exit",
+        ],
+    )
+    runtime, client, pid = _runtime_with_image(
+        image,
+        actions=[
+            {"action": "get_current_time"},
+            {"action": "process_exit", "payload": {"unexpected": True}},
+        ],
+        config=_storage_pressure_config(),
+    )
+    process = runtime.process.get(pid)
+    context_handle = runtime.llm.context_memory.ensure(
+        pid,
+        runtime.images[process.image_id],
+        process,
+        runtime.tools.model_visible_tools(pid),
+    )
+    context = runtime.memory.get_object(pid, context_handle)
+    compacted_payload = deepcopy(context.payload)
+    compacted_payload["cache_strategy"] = {
+        **dict(compacted_payload["cache_strategy"]),
+        "mode": "compacted_stable_prefix",
+        "compacted_at": "test-compaction-generation",
+        "storage_compaction_rearm_pending": True,
+        "storage_compaction_baseline_bytes": None,
+        "storage_compaction_rearm_at_bytes": None,
+    }
+    runtime.memory.update_object(
+        pid,
+        runtime.memory.handle_for_name(
+            pid,
+            context_object_name(pid),
+            rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+        ),
+        ObjectPatch(payload=compacted_payload),
+    )
+    compact_calls: list[dict[str, Any]] = []
+    original_dispatch = runtime.llm.adispatch
+
+    async def dispatch(
+        selected_pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if action.get("action") != "compact_process_context":
+            return await original_dispatch(
+                selected_pid,
+                action,
+                context_metadata=context_metadata,
+            )
+        compact_calls.append(dict(action))
+        runtime.store.set_llm_context_generation(
+            selected_pid,
+            "hysteresis-compacted-generation",
+        )
+        return {
+            "ok": True,
+            "tool_id": "tool_context",
+            "result_oid": None,
+            "payload": {"compacted": True},
+            "error": None,
+        }
+
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        first = runtime.run_next_process_once()
+
+        assert first["action"]["action"] == "get_current_time"
+        assert compact_calls == []
+        assert len(client.user_prompts) == 1
+        armed = runtime.store.get_object_by_name(
+            context_object_name(pid),
+            namespace=runtime.memory.resolve_namespace(pid),
+        )
+        assert armed is not None
+        cache_strategy = armed.payload["cache_strategy"]
+        baseline = cache_strategy["storage_compaction_baseline_bytes"]
+        rearm_at = cache_strategy["storage_compaction_rearm_at_bytes"]
+        assert cache_strategy["storage_compaction_rearm_pending"] is False
+        assert baseline >= 5_000
+        assert rearm_at == baseline + 5_000
+
+        oversized = deepcopy(armed.payload)
+        oversized["entries"].append(
+            {
+                "kind": "growth_after_compaction",
+                "content": "x" * (rearm_at - baseline + 2_000),
+            }
+        )
+        runtime.memory.update_object(
+            pid,
+            runtime.memory.handle_for_name(
+                pid,
+                context_object_name(pid),
+                rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+            ),
+            ObjectPatch(payload=oversized),
+        )
+
+        second = runtime.run_next_process_once()
+
+        assert second["context_storage_pressure"] is True
+        assert len(compact_calls) == 1
+        assert len(client.user_prompts) == 1
+        detected = next(
+            record
+            for record in reversed(runtime.audit.trace(actor=pid))
+            if record.action == "llm.context_pressure_detected"
+        )
+        assert detected.decision["compaction_baseline_bytes"] == baseline
+        assert detected.decision["rearm_at_bytes"] == rearm_at
+        assert detected.decision["effective_threshold_bytes"] == rearm_at
+    finally:
+        runtime.close()
+
+
+def test_storage_pressure_resume_failure_fails_closed_without_recursion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="storage-pressure-resume-failure:v0",
+        name="storage-pressure-resume-failure",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime, client, pid = _runtime_with_image(
+        image,
+        config=_storage_pressure_config(),
+    )
+    compact_calls = 0
+
+    async def dispatch(
+        selected_pid: str,
+        _action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal compact_calls
+        compact_calls += 1
+        if compact_calls == 1:
+            raise ProcessMessageWaitRequired(
+                selected_pid,
+                {"channel": "resume-storage-compaction"},
+                "wait for storage compaction input",
+            )
+        raise RuntimeError("resumed storage compaction failed")
+
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        waiting = runtime.run_next_process_once()
+        assert waiting["waiting_message"] is True
+
+        runtime.messages.post(
+            sender="test",
+            recipient_pid=pid,
+            channel="resume-storage-compaction",
+            subject="resume",
+        )
+        failed = runtime.run_next_process_once()
+
+        assert failed["ok"] is False
+        assert "storage compaction failed" in failed["error"]
+        assert runtime.process.get(pid).status.value == "failed"
+        assert compact_calls == 2
+        assert client.user_prompts == []
+        assert runtime.store.list_llm_calls(pid=pid) == []
+    finally:
+        runtime.close()
+
+
+def test_storage_pressure_builtin_compactor_uses_image_bound_spawn_authority() -> None:
+    image = AgentImage(
+        image_id="storage-pressure-builtin:v0",
+        name="storage-pressure-builtin",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime = Runtime(
+        SQLiteStore(":memory:"),
+        config=_storage_pressure_config(30_000),
+    )
+    runtime.register_image(image, actor="test")
+    summary_action = {
+        "action": "process_exit",
+        "payload": {
+            "goal": "finish after bounded compaction",
+            "constraints": [],
+            "user_preferences": [],
+            "completed": [],
+            "pending": ["continue parent task"],
+            "key_references": {},
+            "recent_decisions": [],
+            "risks": [],
+            "uncertainties": [],
+            "next_steps": ["resume parent"],
+        },
+    }
+    client = RecordingActionClient([summary_action for _ in range(3)])
+    runtime.llm.client = client
+    pid = runtime.process.spawn(
+        image=image.image_id,
+        goal="compact through a bounded child",
+        authority_manifest={
+            "authorized_capabilities": [
+                {
+                    "resource": LLM_CONTEXT_ENRICHMENT_RESOURCE,
+                    "rights": ["execute"],
+                },
+                {
+                    "resource": LLM_CONTEXT_MAINTENANCE_RESOURCE,
+                    "rights": ["execute"],
+                },
+                {
+                    "resource": "process:spawn",
+                    "rights": ["write"],
+                    "constraints": {
+                        "authority_rules": [
+                            {
+                                "rule_id": "test.context-maintenance.spawn",
+                                "operation": "process.spawn_child",
+                                "effect": "allow",
+                                "risk": "low",
+                                "conditions": {
+                                    "image_id": "context-compressor:v0"
+                                },
+                            }
+                        ]
+                    },
+                },
+                {
+                    "resource": "image:context-compressor:v0",
+                    "rights": ["read"],
+                },
+            ]
+        },
+    )
+    try:
+        process = runtime.process.get(pid)
+        context_handle = runtime.llm.context_memory.ensure(
+            pid,
+            runtime.images[process.image_id],
+            process,
+            runtime.tools.model_visible_tools(pid),
+        )
+        context = runtime.memory.get_object(pid, context_handle)
+        payload = deepcopy(context.payload)
+        payload["entries"].extend(
+            {
+                "kind": "seed_entry",
+                "index": index,
+                "content": "x" * 7_000,
+            }
+            for index in range(4)
+        )
+        write_handle = runtime.memory.handle_for_name(
+            pid,
+            context_object_name(pid),
+            rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+        )
+        runtime.memory.update_object(
+            pid,
+            write_handle,
+            ObjectPatch(payload=payload),
+        )
+
+        results = runtime.run_until_idle(max_quanta=7)
+
+        assert any(result.get("waiting_event") for result in results)
+        compacted_results = [
+            result
+            for result in results
+            if result.get("context_storage_pressure") is True
+        ]
+        assert compacted_results, results
+        compacted = compacted_results[0]
+        assert compacted["context_compacted"] is True
+        children = runtime.process.list_children(pid)
+        assert len(children) == 3
+        assert all(child.image_id == "context-compressor:v0" for child in children)
+        assert runtime.store.list_llm_calls(pid=pid) == []
+        assert all(
+            len(runtime.store.list_llm_calls(pid=child.pid)) == 1
+            for child in children
+        )
+        assert any(
+            record.action == "llm.context_pressure_compacted"
+            and record.decision["trigger"] == "storage_payload"
+            for record in runtime.audit.trace(actor=pid)
+        )
+    finally:
+        runtime.close()
 
 
 def test_auto_compaction_ends_quantum_and_deduplicates_pressure_episode(
@@ -366,6 +1043,7 @@ def test_auto_attempt_marker_prevents_replay_after_interrupted_reopen(
         )
         runtime.llm.client = initial_client
         pid = runtime.process.spawn(image=image.image_id, goal="survive interruption")
+        _grant_persistent_context(runtime, pid)
         compact_calls = 0
         original_dispatch = runtime.llm.adispatch
 
@@ -707,6 +1385,7 @@ def test_auto_context_approval_reopens_and_failure_continues_model_call(
         )
         runtime.llm.client = initial_client
         pid = runtime.process.spawn(image=image.image_id, goal="resume approval")
+        _grant_persistent_context(runtime, pid)
         runtime.capability.set_permission_policy(
             subject=pid,
             resource=runtime.filesystem.resource_for(path),

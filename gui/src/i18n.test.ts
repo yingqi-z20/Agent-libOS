@@ -18,7 +18,7 @@ describe("i18n", () => {
   });
 
   it("falls back to English or the key for missing translations", () => {
-    expect(translate("zh-CN", "top.spawn")).toBe("启动");
+    expect(translate("zh-CN", "top.spawn")).toBe("新进程");
     expect(translate("zh-CN", "missing.translation.key")).toBe("missing.translation.key");
   });
 });

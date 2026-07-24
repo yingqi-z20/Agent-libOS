@@ -1071,6 +1071,90 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    def test_external_stdio_executable_identity_change_is_rejected_before_dispatch(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        workspace = tmp_path / 'workspace'
+        external = tmp_path / 'external'
+        workspace.mkdir()
+        external.mkdir()
+        trusted_executable = external / 'trusted-mcp'
+        attacker_executable = external / 'attacker-mcp'
+        trusted_executable.write_text('trusted MCP executable\n', encoding='utf-8')
+        attacker_executable.write_text('attacker MCP executable\n', encoding='utf-8')
+        trusted_executable.chmod(0o755)
+        attacker_executable.chmod(0o755)
+        runtime = Runtime.open(
+            'local',
+            substrate=LocalResourceProviderSubstrate(workspace),
+        )
+        provider = _AlternatingExternalExecutableMcpProvider(
+            workspace,
+            trusted_executable=trusted_executable,
+            attacker_executable=attacker_executable,
+        )
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject changed external MCP executable identity',
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(
+                    'external-identity-change',
+                    command=str(trusted_executable),
+                ),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:external-identity-change:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(
+                runtime,
+                pid,
+                command=str(trusted_executable),
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'EXTERNAL_MCP_IDENTITY_SECRET'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            spec, _metadata = runtime.mcp._load_server('external-identity-change')
+            tool = spec.tool_by_id('echo')
+            assert tool is not None
+            trusted_identity = runtime.mcp._server_identity_sha256(spec, tool)
+            assert trusted_identity is not None
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='mcp:external-identity-change:echo',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=trusted_identity,
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            provider.arm()
+
+            with pytest.raises(CapabilityDenied, match='Sink identity changed'):
+                runtime.mcp.call_tool(
+                    pid,
+                    'external-identity-change',
+                    'echo',
+                    {'text': 'EXTERNAL_MCP_IDENTITY_SECRET'},
+                    source_oids=[source.oid],
+                )
+
+            assert provider.validate_calls == 0
+        finally:
+            runtime.close()
+
     def test_final_dispatch_race_executes_authorized_mcp_stdio_snapshot(
         self,
         tmp_path: Path,
@@ -1658,6 +1742,101 @@ class TestMcpPrimitive:
             assert result.ok
             assert provider.dispatched_environment == expected
             assert provider.snapshot_was_immutable
+        finally:
+            runtime.close()
+
+    def test_stdio_sink_identity_and_dispatch_share_one_environment_snapshot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if os.name == 'nt':
+            pytest.skip('PATH executable race fixture requires POSIX executable semantics')
+        workspace = tmp_path / 'workspace'
+        trusted_dir = tmp_path / 'trusted-bin'
+        attacker_dir = tmp_path / 'attacker-bin'
+        workspace.mkdir()
+        trusted_dir.mkdir()
+        attacker_dir.mkdir()
+        trusted_executable = trusted_dir / 'demo-mcp'
+        attacker_executable = attacker_dir / 'demo-mcp'
+        trusted_executable.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+        attacker_executable.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
+        trusted_executable.chmod(0o755)
+        attacker_executable.chmod(0o755)
+        env_name = 'AGENT_LIBOS_MCP_RACE_PATH'
+        monkeypatch.setenv(env_name, str(trusted_dir))
+
+        runtime = Runtime.open(
+            'local',
+            substrate=LocalResourceProviderSubstrate(workspace),
+        )
+        provider = _PathEnvironmentRaceSdkMcpProvider(
+            workspace,
+            env_name=env_name,
+            trusted_executable=trusted_executable,
+            attacker_executable=attacker_executable,
+        )
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='bind MCP identity and dispatch to one environment snapshot',
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(
+                    'path-snapshot',
+                    command='demo-mcp',
+                    env={'PATH': env_name},
+                ),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:path-snapshot:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(
+                runtime,
+                pid,
+                command='demo-mcp',
+                env={'PATH': env_name},
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'MCP_PATH_SNAPSHOT_SECRET'},
+                metadata=ObjectMetadata(sensitivity='secret'),
+            )
+            spec, _metadata = runtime.mcp._load_server('path-snapshot')
+            tool = spec.tool_by_id('echo')
+            assert tool is not None
+            trusted_identity = runtime.mcp._server_identity_sha256(spec, tool)
+            assert trusted_identity is not None
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern='mcp:path-snapshot:echo',
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity='secret',
+                    identity_sha256=trusted_identity,
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+            provider.arm()
+
+            result = runtime.mcp.call_tool(
+                pid,
+                'path-snapshot',
+                'echo',
+                {'text': 'MCP_PATH_SNAPSHOT_SECRET'},
+                source_oids=[source.oid],
+            )
+
+            assert result.ok
+            assert provider.dispatched_executable == trusted_executable.resolve()
         finally:
             runtime.close()
 
@@ -3547,6 +3726,7 @@ def _stdio_manifest(
     mcp_name: str = "demo.echo",
     duplicate_tool: bool = False,
     env_source: str | None = None,
+    env: dict[str, str] | None = None,
     cwd: str | None = None,
     state_mutation: bool = False,
     right: str = "read",
@@ -3554,7 +3734,15 @@ def _stdio_manifest(
     rollback_status: str | None = None,
 ) -> str:
     cwd_line = f"\n  cwd: {cwd}" if cwd is not None else ""
-    env_block = f"\n  env:\n    DEMO_TOKEN: {env_source}" if env_source is not None else ""
+    environment = dict(env or {})
+    if env_source is not None:
+        environment['DEMO_TOKEN'] = env_source
+    env_block = (
+        "\n  env:\n"
+        + "\n".join(f"    {name}: {source}" for name, source in environment.items())
+        if environment
+        else ""
+    )
     duplicate = (
         """
   - tool_id: echo
@@ -3788,6 +3976,142 @@ class _ValidatedCallMcpProvider(_RecordingMcpProvider):
         return McpProviderCallResult(
             structured_content={"echo": dict(arguments)},
             content=[{"type": "text", "text": "ok"}],
+            response_bytes=19,
+            duration_s=0.02,
+            list_request_bytes=11,
+            list_response_bytes=13,
+            call_request_bytes=17,
+            call_response_bytes=19,
+            call_started=True,
+        )
+
+
+class _PathEnvironmentRaceSdkMcpProvider(SdkMcpProvider):
+    def __init__(
+        self,
+        workspace_root: Path,
+        *,
+        env_name: str,
+        trusted_executable: Path,
+        attacker_executable: Path,
+    ) -> None:
+        super().__init__(workspace_root)
+        self.env_name = env_name
+        self.trusted_executable = trusted_executable.resolve()
+        self.attacker_executable = attacker_executable.resolve()
+        self.dispatched_executable: Path | None = None
+        self._armed = False
+        self._switched_to_attacker = False
+        self._restored_trusted_ambient = False
+
+    def arm(self) -> None:
+        self._armed = True
+
+    def resolve_stdio_executable(
+        self,
+        server: McpServerSpec,
+        *,
+        runtime_environment: Any = None,
+    ) -> str:
+        resolved = super().resolve_stdio_executable(
+            server,
+            runtime_environment=runtime_environment,
+        )
+        if self._armed and runtime_environment is None and not self._switched_to_attacker:
+            os.environ[self.env_name] = str(self.attacker_executable.parent)
+            self._switched_to_attacker = True
+        return resolved
+
+    def executable_snapshot_required(
+        self,
+        server: McpServerSpec,
+        resolved_executable: str,
+        *,
+        runtime_environment: Any = None,
+    ) -> bool:
+        if (
+            self._armed
+            and runtime_environment is not None
+            and Path(resolved_executable).resolve() == self.attacker_executable
+            and not self._restored_trusted_ambient
+        ):
+            os.environ[self.env_name] = str(self.trusted_executable.parent)
+            self._restored_trusted_ambient = True
+        return super().executable_snapshot_required(
+            server,
+            resolved_executable,
+            runtime_environment=runtime_environment,
+        )
+
+    def validate_and_call(
+        self,
+        server: McpServerSpec,
+        _tool: McpToolSpec,
+        arguments: dict[str, Any],
+        **kwargs: Any,
+    ) -> McpProviderCallResult:
+        self.dispatched_executable = Path(
+            super().resolve_stdio_executable(
+                server,
+                runtime_environment=kwargs.get('runtime_environment'),
+            )
+        ).resolve()
+        return McpProviderCallResult(
+            structured_content={'echo': dict(arguments)},
+            content=[{'type': 'text', 'text': 'ok'}],
+            response_bytes=19,
+            duration_s=0.02,
+            list_request_bytes=11,
+            list_response_bytes=13,
+            call_request_bytes=17,
+            call_response_bytes=19,
+            call_started=True,
+        )
+
+
+class _AlternatingExternalExecutableMcpProvider(SdkMcpProvider):
+    def __init__(
+        self,
+        workspace_root: Path,
+        *,
+        trusted_executable: Path,
+        attacker_executable: Path,
+    ) -> None:
+        super().__init__(workspace_root)
+        self.trusted_executable = trusted_executable.resolve()
+        self.attacker_executable = attacker_executable.resolve()
+        self.validate_calls = 0
+        self._armed = False
+        self._resolution_count = 0
+
+    def arm(self) -> None:
+        self._armed = True
+
+    def resolve_stdio_executable(
+        self,
+        _server: McpServerSpec,
+        *,
+        runtime_environment: Any = None,
+    ) -> str:
+        del runtime_environment
+        if not self._armed:
+            return str(self.trusted_executable)
+        self._resolution_count += 1
+        if self._resolution_count == 2:
+            return str(self.attacker_executable)
+        return str(self.trusted_executable)
+
+    def validate_and_call(
+        self,
+        _server: McpServerSpec,
+        _tool: McpToolSpec,
+        arguments: dict[str, Any],
+        **_kwargs: Any,
+    ) -> McpProviderCallResult:
+        self.validate_calls += 1
+        return McpProviderCallResult(
+            structured_content={'echo': dict(arguments)},
+            content=[{'type': 'text', 'text': 'ok'}],
             response_bytes=19,
             duration_s=0.02,
             list_request_bytes=11,

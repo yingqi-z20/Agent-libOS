@@ -18,6 +18,7 @@ from agent_libos.config import (
     load_config_from_cwd,
 )
 from agent_libos.tools.builtin.jsonrpc import ListJsonRpcEndpointsArgs, ListJsonRpcEndpointsTool
+from agent_libos.tools.builtin.memory import ListMemoryNamespaceTool
 from agent_libos.tools.builtin.mcp import ListMcpServersArgs, ListMcpServersTool
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models.exceptions import HumanResponseRequired, ValidationError
@@ -38,10 +39,12 @@ class TestConfigDefaults:
             DEFAULT_CONFIG,
             jsonrpc=replace(DEFAULT_CONFIG.jsonrpc, list_limit=173),
             mcp=replace(DEFAULT_CONFIG.mcp, list_limit=181),
+            memory=replace(DEFAULT_CONFIG.memory, query_limit=191),
         )
 
         assert ListJsonRpcEndpointsTool().spec(config=config).input_schema["properties"]["limit"]["maximum"] == 173
         assert ListMcpServersTool().spec(config=config).input_schema["properties"]["limit"]["maximum"] == 181
+        assert ListMemoryNamespaceTool().spec(config=config).input_schema["properties"]["limit"]["maximum"] == 191
         assert ListJsonRpcEndpointsArgs.model_validate({"limit": 150}).limit == 150
         assert ListMcpServersArgs.model_validate({"limit": 150}).limit == 150
 
@@ -165,6 +168,68 @@ class TestConfigDefaults:
         assert DEFAULT_CONFIG.llm.context_window_tokens == 131_072
         assert DEFAULT_CONFIG.llm.max_tokens == 16_384
         assert DEFAULT_CONFIG.llm.max_tokens < DEFAULT_CONFIG.llm.context_window_tokens
+
+    def test_llm_context_storage_compaction_threshold_has_hard_limit_headroom(
+        self,
+    ) -> None:
+        assert DEFAULT_CONFIG.llm_context.policy == "source_only"
+        assert DEFAULT_CONFIG.llm_context.storage_compaction_threshold_bytes == 96_000
+        assert DEFAULT_CONFIG.llm_context.storage_compaction_max_chunks == 4
+        assert DEFAULT_CONFIG.llm_context.storage_compaction_preserve_recent_entries == 0
+        assert (
+            DEFAULT_CONFIG.llm_context.storage_compaction_threshold_bytes
+            < DEFAULT_CONFIG.tools.memory_payload_hard_limit_bytes
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="llm_context.policy must be source_only or llm_context_object",
+        ):
+            replace(
+                DEFAULT_CONFIG,
+                llm_context=replace(
+                    DEFAULT_CONFIG.llm_context,
+                    policy="unexpected",
+                ),
+            )
+
+        with pytest.raises(
+            ValueError,
+            match="storage_compaction_threshold_bytes must be less",
+        ):
+            replace(
+                DEFAULT_CONFIG,
+                llm_context=replace(
+                    DEFAULT_CONFIG.llm_context,
+                    storage_compaction_threshold_bytes=(
+                        DEFAULT_CONFIG.tools.memory_payload_hard_limit_bytes
+                    ),
+                ),
+            )
+
+        with pytest.raises(
+            ValueError,
+            match="storage_compaction_max_chunks must not exceed 64",
+        ):
+            replace(
+                DEFAULT_CONFIG,
+                llm_context=replace(
+                    DEFAULT_CONFIG.llm_context,
+                    storage_compaction_max_chunks=65,
+                ),
+            )
+
+        with pytest.raises(
+            ValueError,
+            match="storage_compaction_preserve_recent_entries must not exceed 128",
+        ):
+            replace(
+                DEFAULT_CONFIG,
+                llm_context=replace(
+                    DEFAULT_CONFIG.llm_context,
+                    storage_compaction_preserve_recent_entries=129,
+                ),
+            )
 
     def test_llm_context_window_requires_effective_output_reservation_to_fit(self) -> None:
         config = AgentLibOSConfig(

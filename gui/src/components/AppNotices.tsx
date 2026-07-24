@@ -1,6 +1,17 @@
 import { AlertCircle, AlertTriangle, LoaderCircle, RefreshCw, WifiOff, X } from "lucide-react";
+import { useState } from "react";
 import type { RuntimeSnapshot, StreamConnectionStatus } from "../api/types";
 import { useI18n } from "../i18n";
+
+const MAX_VISIBLE_TRUNCATED_SECTIONS = 3;
+
+export function summarizeTruncatedSections(sections: string[]): string {
+  const visible = sections.slice(0, MAX_VISIBLE_TRUNCATED_SECTIONS);
+  const remaining = sections.length - visible.length;
+  return remaining > 0
+    ? `${visible.join(", ")} … (+${remaining})`
+    : visible.join(", ");
+}
 
 export function LoadingScreen({ error, onRetry }: { error: string | null; onRetry(): void }) {
   const { t } = useI18n();
@@ -32,12 +43,16 @@ export function AppNotices({
   onRetry(): void;
 }) {
   const { t } = useI18n();
-  const truncatedSections = snapshot?._truncated ? Object.keys(snapshot._truncated) : [];
+  const [dismissedTruncationKey, setDismissedTruncationKey] = useState<string | null>(null);
+  const truncatedSections = snapshot?._truncated ? Object.keys(snapshot._truncated).sort() : [];
   const truncatedCount = truncatedSections.length;
+  const truncatedSummary = summarizeTruncatedSections(truncatedSections);
+  const truncationKey = truncatedSections.join("\n");
+  const showTruncation = truncatedCount > 0 && dismissedTruncationKey !== truncationKey;
   const schedulerError = snapshot?.scheduler.last_error;
   const streamUnavailable = streamStatus === "reconnecting" || streamStatus === "failed";
 
-  if (!error && !schedulerError && !truncatedCount && !streamUnavailable && !refreshing) return null;
+  if (!error && !schedulerError && !showTruncation && !streamUnavailable && !refreshing) return null;
   return (
     <section className="appNotices" aria-label={t("app.notices")} aria-live="polite">
       {error ? (
@@ -49,7 +64,7 @@ export function AppNotices({
         </div>
       ) : null}
       {schedulerError ? (
-        <div className="appNotice error" role="alert">
+        <div className="appNotice error passive" role="alert">
           <AlertCircle size={16} aria-hidden="true" />
           <span>{t("app.schedulerError", { message: schedulerError })}</span>
         </div>
@@ -61,14 +76,24 @@ export function AppNotices({
           <button className="noticeAction" onClick={onRetry}><RefreshCw size={14} />{t("app.refreshNow")}</button>
         </div>
       ) : null}
-      {truncatedCount ? (
-        <div className="appNotice warning" role="status">
+      {showTruncation ? (
+        <div className="appNotice warning snapshotWarning" role="status">
           <AlertTriangle size={16} aria-hidden="true" />
-          <span>{t("app.snapshotTruncated", { count: truncatedCount, sections: truncatedSections.join(", ") })}</span>
+          <span title={t("app.snapshotTruncated", { count: truncatedCount, sections: truncatedSummary })}>
+            {t("app.snapshotTruncated", { count: truncatedCount, sections: truncatedSummary })}
+          </span>
+          <button
+            type="button"
+            className="iconOnly noticeDismiss"
+            aria-label={t("app.dismiss")}
+            onClick={() => setDismissedTruncationKey(truncationKey)}
+          >
+            <X size={14} />
+          </button>
         </div>
       ) : null}
       {refreshing && !error ? (
-        <div className="appNotice progress" role="status">
+        <div className="appNotice progress passive" role="status">
           <LoaderCircle className="spin" size={15} aria-hidden="true" />
           <span>{t("app.refreshing")}</span>
         </div>

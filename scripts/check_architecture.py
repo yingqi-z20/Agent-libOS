@@ -115,6 +115,10 @@ _JIT_PROJECTION_SQL_TRUSTED_PATHS = frozenset(
     {
         "agent_libos/storage/sql.py",
         "agent_libos/storage/migrations.py",
+        # Explicit offline content migration. It rebuilds the derived process
+        # binding projection in the same transaction as the authoritative
+        # process/tool rows and is never imported by runtime startup.
+        "agent_libos/storage/tool_skill_migration.py",
     }
 )
 _JIT_PROJECTION_SQL_TRUSTED_PREFIXES = (

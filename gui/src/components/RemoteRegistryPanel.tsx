@@ -42,8 +42,8 @@ export function RemoteRegistryPanel({
   }, [ids.join("\n"), selectedId]);
 
   useEffect(() => {
-    if (!operationId && operationIds.length) setOperationId(operationIds[0]);
-  }, [operationId, operationIds.join("\n")]);
+    setOperationId((current) => reconcileRemoteOperationId(current, operationIds));
+  }, [selectedId, operationIds.join("\n")]);
 
   async function inspect() {
     if (!selectedId) return;
@@ -211,6 +211,10 @@ export function remoteOperationIds(kind: RemoteKind, entry: RemoteSummary | unde
     const id = (item as Record<string, unknown>)[key];
     return typeof id === "string" && id ? [id] : [];
   });
+}
+
+export function reconcileRemoteOperationId(current: string, operationIds: string[]): string {
+  return operationIds.includes(current) ? current : (operationIds[0] ?? "");
 }
 
 function entryId(kind: RemoteKind, entry: RemoteSummary | undefined): string | null {

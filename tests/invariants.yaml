@@ -321,6 +321,7 @@
       "node_ids": [
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_creates_fresh_child_without_parent_memory_or_default_caps",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_requires_process_spawn_authority",
+        "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_spawn_child_process_rule_can_bind_authority_to_one_image",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_fork_syscall_requires_process_spawn_authority",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_cross_image_spawn_and_exec_require_image_read_authority",
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_interrupt_signal_is_rejected_and_durable_interrupt_message_remains_supported",
@@ -329,6 +330,7 @@
         "tests/runtime/test_child_process_tools.py::TestChildProcessTool::test_exec_process_swaps_image_without_granting_target_image_capabilities",
         "tests/runtime/test_process_messages.py::TestProcessMessage::test_terminated_process_syscall_session_cannot_send_messages",
         "tests/runtime/test_process_working_directory.py::TestProcessWorkingDirectory::test_shell_tool_runs_from_process_working_directory",
+        "tests/runtime/test_process_working_directory.py::TestProcessWorkingDirectory::test_filesystem_tools_preserve_cwd_relative_same_name_descendant_paths",
         "tests/runtime/test_process_working_directory.py::TestProcessWorkingDirectory::test_set_working_directory_requires_filesystem_read_before_state_probe",
         "tests/providers/test_gui_server.py::TestGuiServer::test_actor_is_rejected_on_routes_that_do_not_apply_actor_authority",
         "tests/unit/test_gui_api_schema.py::test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path",
@@ -375,6 +377,7 @@
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_materialization_budget_uses_rendered_text_not_stale_metadata_estimate",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_memory_view_filters_apply_before_context_materialization",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_context_rendered_prompt_is_charged_to_materialization_budget_before_model_call",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_default_source_only_context_is_charged_to_cumulative_budget",
         "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_file_object_token_estimate_limits_prompt_materialization",
         "tests/runtime/test_object_file_tools.py::TestObjectFileTool::test_create_object_from_file_enforces_memory_payload_limit_before_create_and_can_truncate"
       ],
@@ -398,6 +401,15 @@
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_reopen_after_compressor_exit_reruns_missing_result_stage",
         "tests/runtime/test_llm_context_pressure_runtime.py::test_auto_compaction_generation_change_rebuilds_before_model_call[result]",
         "tests/runtime/test_llm_context_pressure_runtime.py::test_auto_compaction_generation_change_rebuilds_before_model_call[exception]",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_default_context_uses_only_materialized_source_without_delta_object",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_default_source_only_pressure_does_not_inject_or_run_context_management",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_explicit_context_enrichment_authority_enables_delta_object",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_storage_pressure_compacts_before_provider_or_object_hard_limit",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_storage_pressure_compaction_failure_fails_without_provider_retry",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_storage_pressure_requires_explicit_context_maintenance_authority",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_storage_pressure_rearms_above_post_compaction_artifact_baseline",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_storage_pressure_resume_failure_fails_closed_without_recursion",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_storage_pressure_builtin_compactor_uses_image_bound_spawn_authority",
         "tests/unit/test_llm_context_management.py::test_provider_usage_is_ignored_without_an_active_responses_chain",
         "tests/unit/test_llm_context_management.py::test_responses_chain_uses_previous_total_usage_as_lower_bound",
         "tests/unit/test_llm_context_management.py::test_responses_chain_adds_retained_history_to_new_request"
@@ -913,6 +925,16 @@
       "node_ids": [
         "tests/runtime/test_process_messages.py::TestProcessMessage::test_post_racing_empty_receive_cannot_be_lost_before_wait_registration",
         "tests/runtime/test_process_messages.py::TestProcessMessage::test_post_event_failure_rolls_back_message_and_waiter_wakeup"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "process-message-input-remains-mediated-and-actionable",
+      "title": "Queued process input is prioritized without copying message bodies across the mediated read boundary, and reversible provider encodings are normalized with audit evidence.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_process_messages.py::TestProcessMessage::test_normal_message_notice_requires_mediated_read_without_copying_body_to_prompt",
+        "tests/runtime/test_process_messages.py::TestProcessMessage::test_model_message_read_normalizes_reversibly_stringified_json_arguments"
       ],
       "benchmark_attack_classes": []
     },
@@ -2169,6 +2191,8 @@
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_manifest_validation_rejects_unknown_fields[non-string-unknown MCP server fields]",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_runtime_environment_is_snapshotted_before_provider_dispatch[streamable_http]",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_runtime_environment_is_snapshotted_before_provider_dispatch[stdio]",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_stdio_sink_identity_and_dispatch_share_one_environment_snapshot",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_external_stdio_executable_identity_change_is_rejected_before_dispatch",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_sdk_validate_and_call_uses_one_absolute_deadline",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_sdk_list_and_call_forward_snapshot_to_session[list_tools]",
@@ -2257,6 +2281,7 @@
         "tests/unit/test_resource_manager.py::TestResourceManager::test_child_process_creation_is_hierarchical_usage",
         "tests/unit/test_resource_manager.py::TestResourceManager::test_parent_budget_exceedance_kills_parent_subtree",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_context_rendered_prompt_is_charged_to_materialization_budget_before_model_call",
+        "tests/runtime/test_llm_context_pressure_runtime.py::test_default_source_only_context_is_charged_to_cumulative_budget",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_tool_call_budget_is_consumed_and_denies_next_tool_before_execution",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_parallel_tool_batch_budget_denial_leaves_no_partial_tool_execution",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_child_llm_usage_counts_against_parent_budget",
@@ -2503,6 +2528,7 @@
         "tests/runtime/test_authority_manifest.py::test_model_permission_request_outside_manifest_is_denied_before_human_request",
         "tests/runtime/test_authority_manifest.py::test_requestable_manifest_authority_allows_prompt_without_pregranting_capability",
         "tests/providers/test_gui_server.py::TestGuiServer::test_process_spawn_authority_manifest_keeps_workspace_access_request_only",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_process_spawn_reviewed_shell_policy_requires_exact_command_approval",
         "tests/runtime/test_authority_manifest.py::test_implicit_manifest_denies_model_requests_but_preserves_host_transition_authority",
         "tests/runtime/test_authority_manifest.py::test_implicit_manifest_records_host_launch_capabilities",
         "tests/runtime/test_authority_manifest.py::test_explicit_empty_object_keeps_host_launch_capabilities_as_ceiling",
@@ -3027,13 +3053,34 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "model-tool-projection-does-not-change-authority",
-      "title": "Lazy tool groups reduce model schemas through a durable projection without changing callable tools or capabilities.",
+      "id": "builtin-tool-skills-do-not-expand-image-authority",
+      "title": "Built-in tool Skills reveal image-owned schemas without expanding callable tools, capabilities, or primitive authority.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_builtin_tool_skills_security.py::test_builtin_activation_without_skill_capability_preserves_image_authority",
+        "tests/security/test_builtin_tool_skills_security.py::test_builtin_editing_projection_cannot_bypass_filesystem_write_capability",
+        "tests/security/test_builtin_tool_skills_security.py::test_registered_skill_cannot_claim_reserved_builtin_identity",
+        "tests/security/test_builtin_tool_skills_security.py::test_forged_builtin_activation_kind_cannot_bypass_registered_skill_authority",
+        "tests/security/test_builtin_tool_skills_security.py::test_incomplete_builtin_projection_is_rejected_atomically",
+        "tests/security/test_builtin_tool_skills_security.py::test_registered_skill_cannot_expand_builtin_projection_past_image_ceiling"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "cumulative-completion-review-is-fresh-and-authority-neutral",
+      "title": "Coding completion review re-surfaces bounded cumulative goal evidence without expanding effective ambient authority beyond its own evidence object, linearizes final exit against human follow-ups, rejects stale tokens, and fails closed when durable goal evidence is unavailable.",
       "lane": "runtime",
       "node_ids": [
-        "tests/runtime/test_tool_projection.py::test_review_image_projects_small_model_schema_without_removing_callable_tools",
-        "tests/runtime/test_tool_projection.py::test_model_tool_projection_survives_runtime_reopen",
-        "tests/runtime/test_tool_projection.py::test_all_lazy_builtin_images_start_small_without_changing_authority"
+        "tests/runtime/test_process_completion_review.py::test_coding_exit_review_is_nonterminal_published_and_audited",
+        "tests/runtime/test_process_completion_review.py::test_final_exit_linearizes_against_concurrent_human_followup",
+        "tests/runtime/test_process_completion_review.py::test_exit_review_rejects_stale_token_after_human_followup",
+        "tests/runtime/test_process_completion_review.py::test_final_exit_rejects_missing_sources_and_unobserved_tool_claims",
+        "tests/runtime/test_process_completion_review.py::test_exit_review_bounds_message_bodies_without_omitting_source_ids",
+        "tests/runtime/test_process_completion_review.py::test_exit_review_fails_closed_when_human_message_set_exceeds_bound",
+        "tests/runtime/test_process_completion_review.py::test_exit_review_survives_runtime_reopen",
+        "tests/runtime/test_process_completion_review.py::test_exit_review_recovers_goal_from_persistent_context_prompt",
+        "tests/runtime/test_process_completion_review.py::test_exit_review_fails_closed_after_reopen_without_full_io_retention",
+        "tests/runtime/test_process_completion_review.py::test_non_gated_image_keeps_single_phase_process_exit"
       ],
       "benchmark_attack_classes": []
     },

@@ -32,7 +32,7 @@ class ListCheckpointsOutput(BaseModel):
 
 
 class InspectCheckpointArgs(BaseModel):
-    checkpoint_id: str
+    checkpoint_id: str = Field(description="Checkpoint id returned by create_checkpoint or list_checkpoints.")
 
 
 class CheckpointProcessInfo(BaseModel):
@@ -57,7 +57,9 @@ class InspectCheckpointOutput(BaseModel):
 
 
 class DiffCheckpointArgs(BaseModel):
-    checkpoint_id: str
+    checkpoint_id: str = Field(
+        description="Checkpoint id whose snapshot is compared with current reconstructable state."
+    )
 
 
 class DiffCheckpointOutput(BaseModel):
@@ -68,7 +70,7 @@ class DiffCheckpointOutput(BaseModel):
 
 
 class RestoreCheckpointArgs(BaseModel):
-    checkpoint_id: str
+    checkpoint_id: str = Field(description="Checkpoint id whose saved subtree will replace the live subtree.")
 
 
 class RestoreCheckpointOutput(BaseModel):
@@ -93,8 +95,13 @@ class RestoreCheckpointOutput(BaseModel):
 
 
 class ForkCheckpointArgs(BaseModel):
-    checkpoint_id: str
-    parent_pid: str | None = Field(default=None, description="Optional parent pid for the fork root.")
+    checkpoint_id: str = Field(
+        description="Checkpoint id to copy into a new subtree without changing the source subtree."
+    )
+    parent_pid: str | None = Field(
+        default=None,
+        description="Optional existing process that will own the new fork root; defaults to the caller.",
+    )
 
 
 class ForkCheckpointOutput(BaseModel):
@@ -107,7 +114,11 @@ class ForkCheckpointOutput(BaseModel):
 
 class CreateCheckpointTool(SyncAgentTool[CreateCheckpointArgs]):
     name = "create_checkpoint"
-    description = "Create a durable checkpoint for this process subtree."
+    description = (
+        "Snapshot reconstructable internal state for a process subtree. "
+        "External provider state and already completed external effects are recorded as evidence but are not "
+        "rolled back."
+    )
     args_schema = CreateCheckpointArgs
     output_schema = CreateCheckpointOutput
     policy = ToolPolicy(
@@ -142,7 +153,10 @@ class ListCheckpointsTool(SyncAgentTool[ListCheckpointsArgs]):
 
 class InspectCheckpointTool(SyncAgentTool[InspectCheckpointArgs]):
     name = "inspect_checkpoint"
-    description = "Inspect checkpoint metadata without restoring it."
+    description = (
+        "Inspect a checkpoint's saved processes, modules, and counts without changing live state. "
+        "Use this before a restore or fork when the snapshot contents are uncertain."
+    )
     args_schema = InspectCheckpointArgs
     output_schema = InspectCheckpointOutput
     policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
@@ -155,7 +169,10 @@ class InspectCheckpointTool(SyncAgentTool[InspectCheckpointArgs]):
 
 class DiffCheckpointTool(SyncAgentTool[DiffCheckpointArgs]):
     name = "diff_checkpoint"
-    description = "Compare current reconstructable process state against a checkpoint."
+    description = (
+        "Compare current reconstructable process state with a checkpoint and list external effects since capture. "
+        "The comparison is read-only and does not imply those external effects can be reversed."
+    )
     args_schema = DiffCheckpointArgs
     output_schema = DiffCheckpointOutput
     policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
@@ -168,8 +185,10 @@ class DiffCheckpointTool(SyncAgentTool[DiffCheckpointArgs]):
 class RestoreCheckpointTool(SyncAgentTool[RestoreCheckpointArgs]):
     name = "restore_checkpoint"
     description = (
-        "Restore this checkpoint's process subtree. Requires checkpoint admin capability plus exact image admin "
-        "authority for each existing image changed by the snapshot, or exact image write authority for each missing image."
+        "Replace the live process subtree with this checkpoint's reconstructable internal state, superseding "
+        "pending messages, object tasks, and human requests as reported in the result. This does not roll back external provider "
+        "state. It requires checkpoint admin capability plus exact image admin authority for changed existing images, "
+        "or exact image write authority for missing images."
     )
     args_schema = RestoreCheckpointArgs
     output_schema = RestoreCheckpointOutput
@@ -194,7 +213,10 @@ class RestoreCheckpointTool(SyncAgentTool[RestoreCheckpointArgs]):
 
 class ForkCheckpointTool(SyncAgentTool[ForkCheckpointArgs]):
     name = "fork_checkpoint"
-    description = "Fork a new isolated process subtree from a checkpoint. Requires checkpoint execute capability."
+    description = (
+        "Create a new isolated process subtree and remapped Objects from a checkpoint without replacing live state. "
+        "The result returns pid/object maps; external provider state is not cloned or isolated."
+    )
     args_schema = ForkCheckpointArgs
     output_schema = ForkCheckpointOutput
     policy = ToolPolicy(

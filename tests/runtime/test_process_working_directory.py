@@ -207,14 +207,15 @@ class TestProcessWorkingDirectory:
             finally:
                 runtime.close()
 
-    def test_filesystem_tools_accept_redundant_workspace_relative_cwd_prefix(self) -> None:
+    def test_filesystem_tools_preserve_cwd_relative_same_name_descendant_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            (root / 'pkg').mkdir()
-            (root / 'pkg' / 'module.py').write_text("print('pkg')\n", encoding='utf-8')
+            (root / 'pkg' / 'pkg').mkdir(parents=True)
+            (root / 'pkg' / 'module.py').write_text("print('outer')\n", encoding='utf-8')
+            (root / 'pkg' / 'pkg' / 'module.py').write_text("print('nested')\n", encoding='utf-8')
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
             try:
-                pid = runtime.process.spawn(image='review-agent:v0', goal='accept redundant cwd prefix')
+                pid = runtime.process.spawn(image='review-agent:v0', goal='preserve cwd-relative path')
                 runtime.filesystem.grant_directory(
                     pid,
                     'pkg',
@@ -231,11 +232,12 @@ class TestProcessWorkingDirectory:
                 )
 
                 assert read.ok, read.error
-                assert read.payload['path'] == 'pkg/module.py'
+                assert read.payload['path'] == 'pkg/pkg/module.py'
+                assert read.payload['content'] == "print('nested')\n"
                 assert written.ok, written.error
-                assert written.payload['path'] == 'pkg/created.txt'
-                assert (root / 'pkg' / 'created.txt').read_text(encoding='utf-8') == 'ok'
-                assert not (root / 'pkg' / 'pkg').exists()
+                assert written.payload['path'] == 'pkg/pkg/created.txt'
+                assert (root / 'pkg' / 'pkg' / 'created.txt').read_text(encoding='utf-8') == 'ok'
+                assert not (root / 'pkg' / 'created.txt').exists()
             finally:
                 runtime.close()
 

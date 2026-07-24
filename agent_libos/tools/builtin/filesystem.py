@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import PurePosixPath, PureWindowsPath
-
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
@@ -21,19 +19,10 @@ _DIRECTORY_PATH_DESCRIPTION = (
 
 
 def normalize_process_path_argument(path: str, cwd: str) -> str:
-    """Accept an explicit workspace-relative cwd prefix without duplicating it."""
+    """Normalize separators without stripping cwd-relative path segments."""
 
-    raw = str(path).replace("\\", "/")
-    if PurePosixPath(raw).is_absolute() or PureWindowsPath(raw).is_absolute():
-        return raw
-    cwd_parts = [part for part in str(cwd).replace("\\", "/").split("/") if part not in {"", "."}]
-    path_parts = [part for part in raw.split("/") if part not in {"", "."}]
-    if not cwd_parts or ".." in path_parts:
-        return raw
-    if path_parts[:len(cwd_parts)] != cwd_parts:
-        return raw
-    remaining = path_parts[len(cwd_parts):]
-    return "/".join(remaining) if remaining else raw
+    del cwd
+    return str(path).replace("\\", "/")
 
 
 class WriteTextFileArgs(BaseModel):

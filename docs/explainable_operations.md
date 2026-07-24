@@ -144,12 +144,13 @@ reports waiting, interruption, unknown outcome, or a pending provider effect.
 Each LLM action-selection records one metadata-only manifest containing:
 
 - process/view id, policy, effective token budget, and context generation;
-- final LLM-context Object id/version, final rendered token count, and final
-  rendered SHA-256;
+- optional final LLM-context Object id/version, final rendered token count, and
+  final rendered SHA-256 (the default source-only path records null Object
+  identity because it does not create one);
 - each source-view candidate's Object id/version/type;
 - included/omitted disposition and reason (`selected`, `filter_mismatch`,
-  `capability_denied`, `token_budget`, or `missing`), plus the appended final
-  context entry with reason `llm_context`;
+  `capability_denied`, `token_budget`, or `missing`), plus the optional appended
+  final context entry with reason `llm_context`;
 - per-entry security `labels` (`sensitivity`, `trust_level`, `integrity`,
   `origin`, `tenant`, `principal`, and `declassification_authority`) when the
   source was readable;
@@ -157,10 +158,13 @@ Each LLM action-selection records one metadata-only manifest containing:
   rendered token/hash metadata; and
 - final-context compaction mode, timestamp, and transformation.
 
-The source entries and final-context entry have different roles. Source entries
-describe the Object snapshots considered by `memory.materialize_context`; their
-per-entry token/hash values describe those rendered source chunks. The Runtime
-then updates or creates the process's append-only LLM-context Object and appends
+The default source-only path records the caller-selected source entries without
+an appended final-context entry. When persistent context enrichment is
+explicitly enabled, the source entries and final-context entry have different
+roles. Source entries describe the Object snapshots considered by
+`memory.materialize_context`; their per-entry token/hash values describe those
+rendered source chunks. The Runtime then updates or creates the process's
+append-only LLM-context Object and appends
 a separate included entry whose reason is `llm_context`. Top-level
 `context_oid`, `context_version`, `rendered_tokens`, and `rendered_sha256`
 identify that final Object snapshot and the LLM-context text prepared for the

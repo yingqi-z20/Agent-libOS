@@ -17,7 +17,7 @@ class ListMcpServersOutput(BaseModel):
 
 
 class InspectMcpServerArgs(BaseModel):
-    server_id: str
+    server_id: str = Field(description="Registered MCP server id returned by list_mcp_servers.")
 
 
 class InspectMcpServerOutput(BaseModel):
@@ -25,8 +25,14 @@ class InspectMcpServerOutput(BaseModel):
 
 
 class ListMcpToolsArgs(BaseModel):
-    server_id: str
-    refresh: bool = Field(default=False, description="If true, query the MCP server for live tool metadata.")
+    server_id: str = Field(description="Registered MCP server id; transport commands and ad hoc URLs are not accepted.")
+    refresh: bool = Field(
+        default=False,
+        description=(
+            "False returns the registered allowlist without contacting the server. True performs a live tools/list external "
+            "read and requires execute authority, provider policy, approval when configured, and resource budget."
+        ),
+    )
 
 
 class ListMcpToolsOutput(BaseModel):
@@ -38,8 +44,12 @@ class ListMcpToolsOutput(BaseModel):
 
 
 class CallMcpToolArgs(BaseModel):
-    server_id: str
-    tool_id: str
+    server_id: str = Field(
+        description="Pre-registered MCP server id; callers cannot supply a transport command or URL."
+    )
+    tool_id: str = Field(
+        description="Allowed logical tool id returned by list_mcp_tools, not an arbitrary MCP tool name."
+    )
     arguments: dict[str, Any] = Field(default_factory=dict, description="MCP tool arguments object.")
 
 
@@ -57,7 +67,10 @@ class CallMcpToolOutput(BaseModel):
 
 class ListMcpServersTool(BaseAgentTool[ListMcpServersArgs]):
     name = "list_mcp_servers"
-    description = "List registered MCP server metadata through the libOS MCP primitive."
+    description = (
+        "List Host-registered MCP server metadata without starting or contacting a server. "
+        "Use JSON-RPC discovery tools instead for a plain JSON-RPC endpoint."
+    )
     args_schema = ListMcpServersArgs
     output_schema = ListMcpServersOutput
     policy = ToolPolicy(side_effects=False, idempotent=True, declared_permissions={"mcp_server.read"})
@@ -73,7 +86,7 @@ class ListMcpServersTool(BaseAgentTool[ListMcpServersArgs]):
 
 class InspectMcpServerTool(BaseAgentTool[InspectMcpServerArgs]):
     name = "inspect_mcp_server"
-    description = "Inspect one registered MCP server without exposing resolved secrets."
+    description = "Inspect one Host-registered MCP server without contacting it or exposing resolved secrets."
     args_schema = InspectMcpServerArgs
     output_schema = InspectMcpServerOutput
     policy = ToolPolicy(side_effects=False, idempotent=True, declared_permissions={"mcp_server.read"})
@@ -88,7 +101,10 @@ class InspectMcpServerTool(BaseAgentTool[InspectMcpServerArgs]):
 
 class ListMcpToolsTool(BaseAgentTool[ListMcpToolsArgs]):
     name = "list_mcp_tools"
-    description = "List allowed tools for a registered MCP server."
+    description = (
+        "List allowed tools for a registered MCP server. By default this reads cached registry metadata only; "
+        "refresh=true makes a governed external tools/list call and may require approval."
+    )
     args_schema = ListMcpToolsArgs
     output_schema = ListMcpToolsOutput
     policy = ToolPolicy(
@@ -113,7 +129,9 @@ class ListMcpToolsTool(BaseAgentTool[ListMcpToolsArgs]):
 class CallMcpToolTool(BaseAgentTool[CallMcpToolArgs]):
     name = "call_mcp_tool"
     description = (
-        "Call a tool on a pre-registered MCP server. The primitive enforces server registration, "
+        "Call one allowed logical tool on a pre-registered MCP server; ad hoc servers and transport commands "
+        "are unavailable. "
+        "The primitive enforces server registration, "
         "tool capability, human approval, audit, resource limits, and external-effect classification."
     )
     args_schema = CallMcpToolArgs

@@ -8,6 +8,7 @@ from typing import Any, TYPE_CHECKING
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.llm.context_management import context_management_policy
 from agent_libos.memory.object_memory import ObjectVersionConflict
 from agent_libos.models.exceptions import NotFound, ResourceLimitExceeded, ValidationError
 from agent_libos.utils.ids import estimate_tokens, new_id, utc_now
@@ -16,6 +17,7 @@ from agent_libos.models import (
     AgentObject,
     AgentProcess,
     Capability,
+    CapabilityRight,
     ContextMaterializationManifest,
     DataLabels,
     Event,
@@ -39,15 +41,74 @@ from agent_libos.memory.data_labels import (
 )
 from agent_libos.ports import OperationPort, ResourcePort
 from agent_libos.storage import EvidenceRepository, ObjectRepository, ProcessRepository
+from agent_libos.tools.observability import json_size_bytes
 
 if TYPE_CHECKING:
     from agent_libos.memory.object_memory import ObjectMemoryManager
 
 _LLM_CONTEXT_DEFAULTS = DEFAULT_CONFIG.llm_context
+LLM_CONTEXT_ENRICHMENT_RESOURCE = "context:enrichment"
+LLM_CONTEXT_MAINTENANCE_RESOURCE = "context:maintenance"
+LLM_CONTEXT_OBJECT_POLICY = "llm_context_object"
+
+
+class LLMContextStoragePressure(Exception):
+    """Ask the executor to compact before Object Memory reaches its hard limit."""
+
+    def __init__(
+        self,
+        *,
+        context_oid: str,
+        context_version: int,
+        context_generation: str,
+        payload_bytes: int,
+        persisted_payload_bytes: int,
+        threshold_bytes: int,
+        effective_threshold_bytes: int,
+        hard_limit_bytes: int,
+        entry_count: int,
+        compaction_baseline_bytes: int | None = None,
+        rearm_at_bytes: int | None = None,
+    ) -> None:
+        self.context_oid = context_oid
+        self.context_version = context_version
+        self.context_generation = context_generation
+        self.payload_bytes = payload_bytes
+        self.persisted_payload_bytes = persisted_payload_bytes
+        self.threshold_bytes = threshold_bytes
+        self.effective_threshold_bytes = effective_threshold_bytes
+        self.hard_limit_bytes = hard_limit_bytes
+        self.entry_count = entry_count
+        self.compaction_baseline_bytes = compaction_baseline_bytes
+        self.rearm_at_bytes = rearm_at_bytes
+        super().__init__(
+            "LLM context storage pressure requires compaction: "
+            f"payload_bytes={payload_bytes}, threshold_bytes={threshold_bytes}, "
+            f"hard_limit_bytes={hard_limit_bytes}"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "trigger": "storage_payload",
+            "triggered": True,
+            "context_oid": self.context_oid,
+            "context_version": self.context_version,
+            "context_generation": self.context_generation,
+            "payload_bytes": self.payload_bytes,
+            "persisted_payload_bytes": self.persisted_payload_bytes,
+            "projected_payload_bytes": self.payload_bytes,
+            "threshold_bytes": self.threshold_bytes,
+            "effective_threshold_bytes": self.effective_threshold_bytes,
+            "hard_limit_bytes": self.hard_limit_bytes,
+            "entry_count": self.entry_count,
+            "compaction_baseline_bytes": self.compaction_baseline_bytes,
+            "rearm_at_bytes": self.rearm_at_bytes,
+        }
 
 
 class LLMContextMemory:
-    """Maintains the prompt context as a mutable, append-only Object Memory object."""
+    """Materialize source context and optionally maintain an enriched context object."""
 
     def __init__(
         self,
@@ -83,9 +144,12 @@ class LLMContextMemory:
         capabilities: list[Capability],
         tools: list[dict[str, Any]],
     ) -> MaterializedContext:
+        if not self.persistent_context_enabled(pid):
+            return self._record_source_only_context(pid, process, source_context)
         handle = self.ensure(pid, image, process, tools)
         obj = self._memory.get_object(pid, handle)
         payload = self._payload(obj)
+        persisted_payload_bytes = json_size_bytes(payload)
         changed = self._append_deltas(
             payload=payload,
             process=process,
@@ -95,6 +159,14 @@ class LLMContextMemory:
             capabilities=capabilities,
             tools=tools,
         )
+        storage_metadata_changed = self._check_storage_pressure(
+            pid,
+            image,
+            obj,
+            payload,
+            persisted_payload_bytes=persisted_payload_bytes,
+        )
+        changed = storage_metadata_changed or changed
         metadata = self._context_metadata(
             pid=pid,
             title=f"LLM context for {pid}",
@@ -171,14 +243,221 @@ class LLMContextMemory:
             object_refs=[obj.oid, *source_context.object_refs],
             token_count=token_count,
             omitted_objects=source_context.omitted_objects,
-            policy_used=self._config.llm_context.policy,
+            policy_used=LLM_CONTEXT_OBJECT_POLICY,
             materialization_id=materialization_id,
             view_id=source_context.view_id,
             budget_tokens=source_context.budget_tokens,
             object_manifest=object_manifest,
         )
 
-    def _charge_rendered_context(self, pid: str, process: AgentProcess, context_oid: str, token_count: int) -> None:
+    def _record_source_only_context(
+        self,
+        pid: str,
+        process: AgentProcess,
+        source_context: MaterializedContext,
+    ) -> MaterializedContext:
+        """Record evidence for the selected context without changing its content."""
+
+        self._charge_rendered_context(
+            pid,
+            process,
+            None,
+            source_context.token_count,
+            policy="source_only",
+        )
+        materialization_id = source_context.materialization_id or new_id("ctxmat")
+        manifest = ContextMaterializationManifest(
+            materialization_id=materialization_id,
+            pid=pid,
+            view_id=source_context.view_id
+            or (process.memory_view.view_id if process.memory_view is not None else ""),
+            policy=source_context.policy_used,
+            budget_tokens=int(
+                source_context.budget_tokens
+                or process.resource_budget.max_context_materialization_tokens
+            ),
+            rendered_tokens=source_context.token_count,
+            rendered_sha256=hashlib.sha256(
+                source_context.text.encode("utf-8")
+            ).hexdigest(),
+            context_generation=self._processes.get_llm_context_generation(pid),
+            context_oid=None,
+            context_version=None,
+            objects=list(source_context.object_manifest),
+            compaction={
+                "mode": "source_only",
+                "compacted_at": None,
+                "transform": "verbatim",
+            },
+            created_at=utc_now(),
+        )
+        self._evidence.insert_context_materialization_manifest(manifest)
+        self._operations.link_evidence(
+            "context_manifest",
+            manifest.materialization_id,
+            "context",
+            metadata={
+                "rendered_tokens": source_context.token_count,
+                "object_count": len(source_context.object_manifest),
+                "source_only": True,
+            },
+        )
+        self._operations.expect("context")
+        return replace(source_context, materialization_id=materialization_id)
+
+    def _check_storage_pressure(
+        self,
+        pid: str,
+        image: AgentImage,
+        obj: AgentObject,
+        payload: dict[str, Any],
+        *,
+        persisted_payload_bytes: int,
+    ) -> bool:
+        threshold = self._config.llm_context.storage_compaction_threshold_bytes
+        payload_bytes = json_size_bytes(payload)
+        if context_management_policy(image.planner).mode != "auto_compact":
+            return False
+        if not self._capabilities.check(
+            pid,
+            LLM_CONTEXT_MAINTENANCE_RESOURCE,
+            CapabilityRight.EXECUTE,
+        ):
+            return False
+        hard_limit = self._config.tools.memory_payload_hard_limit_bytes
+        cache_strategy = self._storage_cache_strategy(payload)
+        compacted_mode = str(cache_strategy.get("mode") or "").startswith("compacted")
+        baseline = self._storage_watermark(
+            cache_strategy,
+            "storage_compaction_baseline_bytes",
+        )
+        rearm_at = self._storage_watermark(
+            cache_strategy,
+            "storage_compaction_rearm_at_bytes",
+        )
+        if self._storage_compaction_needs_rearm(
+            cache_strategy,
+            compacted_mode=compacted_mode,
+            baseline=baseline,
+            rearm_at=rearm_at,
+        ):
+            self._arm_storage_compaction(
+                payload,
+                cache_strategy,
+                payload_bytes=payload_bytes,
+                threshold=threshold,
+                hard_limit=hard_limit,
+            )
+            return True
+        effective_threshold = (
+            max(threshold, rearm_at)
+            if compacted_mode and rearm_at is not None
+            else threshold
+        )
+        if payload_bytes < effective_threshold:
+            return False
+        entries = payload.get("entries")
+        raise LLMContextStoragePressure(
+            context_oid=obj.oid,
+            context_version=obj.version,
+            context_generation=self._processes.get_llm_context_generation(pid),
+            payload_bytes=payload_bytes,
+            persisted_payload_bytes=persisted_payload_bytes,
+            threshold_bytes=threshold,
+            effective_threshold_bytes=effective_threshold,
+            hard_limit_bytes=hard_limit,
+            entry_count=len(entries) if isinstance(entries, list) else 0,
+            compaction_baseline_bytes=baseline,
+            rearm_at_bytes=rearm_at,
+        )
+
+    @staticmethod
+    def _storage_cache_strategy(payload: dict[str, Any]) -> dict[str, Any]:
+        raw = payload.get("cache_strategy")
+        if raw is None:
+            cache_strategy: dict[str, Any] = {}
+            payload["cache_strategy"] = cache_strategy
+            return cache_strategy
+        if not isinstance(raw, dict):
+            raise ValidationError("LLM context cache_strategy must be a JSON object")
+        return raw
+
+    @staticmethod
+    def _storage_watermark(
+        cache_strategy: dict[str, Any],
+        field: str,
+    ) -> int | None:
+        value = cache_strategy.get(field)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @staticmethod
+    def _storage_compaction_needs_rearm(
+        cache_strategy: dict[str, Any],
+        *,
+        compacted_mode: bool,
+        baseline: int | None,
+        rearm_at: int | None,
+    ) -> bool:
+        if not compacted_mode:
+            return False
+        return (
+            cache_strategy.get("storage_compaction_rearm_pending") is True
+            or baseline is None
+            or rearm_at is None
+        )
+
+    @staticmethod
+    def _arm_storage_compaction(
+        payload: dict[str, Any],
+        cache_strategy: dict[str, Any],
+        *,
+        payload_bytes: int,
+        threshold: int,
+        hard_limit: int,
+    ) -> None:
+        if payload_bytes >= hard_limit:
+            raise ResourceLimitExceeded(
+                "post-compaction LLM context deltas cannot fit within the "
+                f"Object Memory hard limit: projected_bytes={payload_bytes}, "
+                f"hard_limit_bytes={hard_limit}"
+            )
+        cache_strategy["storage_compaction_rearm_pending"] = False
+        baseline = payload_bytes
+        # The byte-width of the metadata values can change the payload size.
+        # Iterate to a small fixed point so the durable baseline describes the
+        # actual post-arm artifact rather than an approximation.
+        for _ in range(4):
+            cache_strategy["storage_compaction_baseline_bytes"] = baseline
+            cache_strategy["storage_compaction_rearm_at_bytes"] = min(
+                hard_limit - 1,
+                baseline + threshold,
+            )
+            measured = json_size_bytes(payload)
+            if measured == baseline:
+                return
+            baseline = measured
+
+    def persistent_context_enabled(self, pid: str) -> bool:
+        """Return whether the Host explicitly enabled persistent enrichment."""
+
+        return (
+            self._config.llm_context.policy == LLM_CONTEXT_OBJECT_POLICY
+            or self._capabilities.check(
+                pid,
+                LLM_CONTEXT_ENRICHMENT_RESOURCE,
+                CapabilityRight.EXECUTE,
+            )
+        )
+
+    def _charge_rendered_context(
+        self,
+        pid: str,
+        process: AgentProcess,
+        context_oid: str | None,
+        token_count: int,
+        *,
+        policy: str = LLM_CONTEXT_OBJECT_POLICY,
+    ) -> None:
         resources = self._resources
         if resources is None:
             return
@@ -195,7 +474,7 @@ class LLMContextMemory:
             context={
                 "view_id": process.memory_view.view_id if process.memory_view is not None else None,
                 "object_oid": context_oid,
-                "policy": self._config.llm_context.policy,
+                "policy": policy,
             },
             allow_overage=False,
             kill_on_exceed=False,
@@ -465,6 +744,9 @@ class LLMContextMemory:
                 "recent entries remain verbatim."
             ),
             "compacted_at": compact_entry["at"],
+            "storage_compaction_rearm_pending": True,
+            "storage_compaction_baseline_bytes": None,
+            "storage_compaction_rearm_at_bytes": None,
         }
         rendered = self.render(compacted_payload)
         compacted_tokens = estimate_tokens(rendered)

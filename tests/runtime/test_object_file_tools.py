@@ -28,7 +28,7 @@ class TestObjectFileTool:
         client = GuardedActionClient(actions=[{'action': 'create_object_from_file', 'name': object_name, 'path': source}, {'action': 'write_object_to_file', 'name': object_name, 'path': target}, {'action': 'process_exit', 'payload': {'copied': True, 'object_name': object_name}}], forbidden_text=sentinel)
         self.runtime.llm.client = client
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='copy a file through Object Memory')
-        self.runtime.tools.activate_tool_group(pid, 'filesystem')
+        self.runtime.skills.activate_skill(pid, 'agent-libos-object-file-transfer', actor=pid)
         self.runtime.filesystem.grant_path(pid, source, [CapabilityRight.READ], issued_by='test')
         self.runtime.filesystem.grant_path(pid, target, [CapabilityRight.WRITE], issued_by='test')
         results = []
@@ -106,6 +106,10 @@ class TestObjectFileTool:
                 memory_payload_hard_limit_bytes=limit,
                 object_file_max_bytes=2_000,
                 object_file_hard_limit_bytes=2_000,
+            ),
+            llm_context=replace(
+                DEFAULT_CONFIG.llm_context,
+                storage_compaction_threshold_bytes=limit - 1,
             ),
         )
         self.runtime = Runtime.open('local', config=config)

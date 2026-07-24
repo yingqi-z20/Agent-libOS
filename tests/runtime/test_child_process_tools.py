@@ -2,6 +2,7 @@ from __future__ import annotations
 import pytest
 import asyncio
 import json
+import re
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
@@ -520,6 +521,66 @@ class TestChildProcessTool:
         finally:
             runtime.close()
 
+    def test_spawn_child_process_rule_can_bind_authority_to_one_image(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='bounded maintenance parent',
+                authority_manifest={
+                    'authorized_capabilities': [
+                        {
+                            'resource': 'process:spawn',
+                            'rights': ['write'],
+                            'constraints': {
+                                'authority_rules': [
+                                    {
+                                        'rule_id': 'test.context-maintenance.spawn',
+                                        'operation': 'process.spawn_child',
+                                        'effect': 'allow',
+                                        'risk': 'low',
+                                        'conditions': {
+                                            'image_id': 'context-compressor:v0',
+                                        },
+                                    }
+                                ]
+                            },
+                        },
+                        {
+                            'resource': 'image:context-compressor:v0',
+                            'rights': ['read'],
+                        },
+                    ],
+                },
+            )
+
+            child = runtime.spawn_child_process(
+                parent,
+                'compact bounded context',
+                image='context-compressor:v0',
+            )
+            assert runtime.process.get(child).image_id == 'context-compressor:v0'
+            assert any(
+                record.action == 'process.spawn_child'
+                and record.actor == parent
+                and record.target == f'process:{child}'
+                for record in runtime.audit.trace(actor=parent)
+            )
+            assert any(
+                event.type == EventType.PROCESS_CREATED
+                and event.source == parent
+                and event.target == child
+                for event in runtime.events.list()
+            )
+
+            with pytest.raises(CapabilityDenied, match='constraints rejected'):
+                runtime.spawn_child_process(parent, 'forbidden same-image child')
+            with pytest.raises(CapabilityDenied, match='constraints rejected'):
+                runtime.fork_child_process(parent, 'forbidden fork')
+            assert [process.pid for process in runtime.process.list_children(parent)] == [child]
+        finally:
+            runtime.close()
+
     def test_fork_syscall_requires_process_spawn_authority(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -638,6 +699,7 @@ class TestChildProcessTool:
                 assigned_by: str,
                 *,
                 publication_id: str | None = None,
+                **_boot_context: object,
             ) -> None:
                 other_process = runtime.process.get(other)
                 runtime.store.patch_process_control(
@@ -955,14 +1017,17 @@ class ParentChildClient:
         self.parent_pid = pid
         if self.parent_step == 0:
             self.parent_step = 1
-            return self._completion('fork_child_process', {'goal': 'return value 42', 'mode': 'worker', 'include_parent_roots': False})
+            return self._completion('activate_skill', {'skill_id': 'agent-libos-child-processes'})
         if self.parent_step == 1:
-            self.child_pid = _last_tool_result(messages, 'fork_child_process')['child_pid']
             self.parent_step = 2
-            return self._completion('wait_child_process', {'child_pid': self.child_pid})
+            return self._completion('fork_child_process', {'goal': 'return value 42', 'mode': 'worker', 'include_parent_roots': False})
         if self.parent_step == 2:
-            wait_result = _last_tool_result(messages, 'wait_child_process')
+            self.child_pid = _last_tool_result(messages, 'fork_child_process')['child_pid']
             self.parent_step = 3
+            return self._completion('wait_child_process', {'child_pid': self.child_pid})
+        if self.parent_step == 3:
+            wait_result = _last_tool_result(messages, 'wait_child_process')
+            self.parent_step = 4
             return self._completion('process_exit', {'payload': {'waited': wait_result['ready'], 'child_pid': wait_result['child_pid']}})
         raise AssertionError('parent action plan is complete')
 
@@ -972,14 +1037,29 @@ class ParentChildClient:
 def _pid_from_messages(messages: list[dict[str, str]]) -> str:
     pid = static_prefix(messages).get('pid')
     if not isinstance(pid, str) or not pid:
+        pid, _ = _source_only_process_identity(messages)
+    if not isinstance(pid, str) or not pid:
         raise AssertionError('prompt did not include process pid')
     return pid
 
 def _parent_pid_from_messages(messages: list[dict[str, str]]) -> str | None:
     value = static_prefix(messages).get('parent_pid')
+    if value is None and not static_prefix(messages):
+        _, value = _source_only_process_identity(messages)
     if value is None or isinstance(value, str):
         return value
     raise AssertionError('prompt parent pid had an unexpected shape')
+
+def _source_only_process_identity(messages: list[dict[str, str]]) -> tuple[str | None, str | None]:
+    text = '\n'.join(str(message.get('content', '')) for message in messages)
+    match = re.search(
+        r'(?m)^(?:Process|Process facts):\n- pid: (?P<pid>\S+)\n- parent_pid: (?P<parent_pid>\S+)$',
+        text,
+    )
+    if match is None:
+        return None, None
+    parent_pid = match.group('parent_pid')
+    return match.group('pid'), None if parent_pid == 'None' else parent_pid
 
 def _last_tool_result(messages: list[dict[str, str]], tool_name: str) -> dict[str, Any]:
     result = last_tool_result(messages, tool_name)

@@ -18,7 +18,30 @@ _LIBPQ_DSN_FIELD = re.compile(
 )
 
 
-def open_store(target: str | Path | None = None, *, config: AgentLibOSConfig | None = None) -> RuntimeStore:
+def open_store(
+    target: str | Path | None = None,
+    *,
+    config: AgentLibOSConfig | None = None,
+) -> RuntimeStore:
+    return _open_store(target, config=config, initialize_schema=True)
+
+
+def open_store_for_migration(
+    target: str | Path | None = None,
+    *,
+    config: AgentLibOSConfig | None = None,
+) -> RuntimeStore:
+    """Open an existing canonical store without running schema initialization."""
+
+    return _open_store(target, config=config, initialize_schema=False)
+
+
+def _open_store(
+    target: str | Path | None,
+    *,
+    config: AgentLibOSConfig | None,
+    initialize_schema: bool,
+) -> RuntimeStore:
     selected_config = config or DEFAULT_CONFIG
     selected_target = _selected_target(target, selected_config)
     backend = _backend_for(selected_target, selected_config, explicit=target is not None)
@@ -26,9 +49,17 @@ def open_store(target: str | Path | None = None, *, config: AgentLibOSConfig | N
         from agent_libos.storage.postgres import PostgresStore
 
         dsn = _postgres_dsn(selected_target, selected_config)
-        return PostgresStore(dsn, config=selected_config)
+        return PostgresStore(
+            dsn,
+            config=selected_config,
+            initialize_schema=initialize_schema,
+        )
     if backend == "sqlite":
-        return SQLiteStore(_sqlite_target(selected_target), config=selected_config)
+        return SQLiteStore(
+            _sqlite_target(selected_target),
+            config=selected_config,
+            initialize_schema=initialize_schema,
+        )
     raise ValidationError(f"unsupported runtime store backend: {backend}")
 
 

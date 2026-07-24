@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Send } from "lucide-react";
+import { Activity, AlertTriangle, ChevronDown, CirclePlus, PanelRight, Send, Settings } from "lucide-react";
 import { LibOSClient } from "./api/client";
 import { runtimeSnapshotFromSseData } from "./api/types";
-import type { GuiConnection, HumanRequest, HumanResponseInput, RuntimeSnapshot, StreamConnectionStatus } from "./api/types";
+import type { GuiConnection, HumanRequest, HumanResponseInput, RuntimeProcess, RuntimeSnapshot, StreamConnectionStatus } from "./api/types";
 import { AppNotices, LoadingScreen } from "./components/AppNotices";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DetailTabs } from "./components/DetailTabs";
@@ -12,17 +12,27 @@ import { LLMProfileSelect } from "./components/LLMProfileSelect";
 import { ProcessTree } from "./components/ProcessTree";
 import { Timeline } from "./components/Timeline";
 import { TopBar } from "./components/TopBar";
-import { UserPage } from "./components/UserPage";
+import { processStatusLabel, processStatusTone, UserPage } from "./components/UserPage";
 import { previewImageManifest } from "./imagePreview";
 import { useI18n } from "./i18n";
 import type { OptionalQuanta } from "./quanta";
-import { reconcileSelectedPid } from "./selection";
+import { processFromMutationResult, reconcileSelectedPid, upsertRuntimeProcess } from "./selection";
+import { runOrResumeProcess } from "./runControl";
 import type { LLMProfileInput } from "./api/types";
 import type { ConfirmationRequest } from "./adminTypes";
 import { developmentConnection } from "./developmentConnection";
-import { buildGuiTaskAuthorityManifest, type WorkspaceAccess } from "./taskAuthority";
+import { buildGuiTaskAuthorityManifest, DEFAULT_CONTEXT_MAINTENANCE, type CommandAccess, type WorkspaceAccess } from "./taskAuthority";
+import {
+  shortProcessId,
+  taskDisplayLabel,
+  taskLabelFromGoal,
+  taskLabelsForStorage,
+  taskLabelsFromStorage
+} from "./taskPresentation";
 
 type PendingConfirm = ConfirmationRequest;
+const TASK_LABELS_STORAGE_KEY = "agent-libos.gui.task-labels";
+const SELECTED_PID_STORAGE_KEY = "agent-libos.gui.selected-pid";
 
 export function App() {
   const { t } = useI18n();
@@ -30,14 +40,18 @@ export function App() {
   const [connection, setConnection] = useState<GuiConnection | null>(null);
   const [client, setClient] = useState<LibOSClient | null>(null);
   const [snapshot, setSnapshot] = useState<RuntimeSnapshot | null>(null);
-  const [selectedPid, setSelectedPid] = useState<string | null>(null);
+  const [selectedPid, setSelectedPid] = useState<string | null>(readStoredSelectedPid);
   const [maxQuanta, setMaxQuanta] = useState<OptionalQuanta>(null);
-  const [spawnGoal, setSpawnGoal] = useState("Summarize the current project state.");
+  const [spawnGoal, setSpawnGoal] = useState("");
   const [spawnImage, setSpawnImage] = useState("coding-agent:v0");
   const [spawnLlmProfile, setSpawnLlmProfile] = useState("");
   const [spawnWorkingDirectory, setSpawnWorkingDirectory] = useState("");
   const [spawnWorkspaceAccess, setSpawnWorkspaceAccess] = useState<WorkspaceAccess>("edit");
   const [spawnAllowGitRequests, setSpawnAllowGitRequests] = useState(true);
+  const [spawnCommandAccess, setSpawnCommandAccess] = useState<CommandAccess>("none");
+  const [spawnContextMaintenance, setSpawnContextMaintenance] = useState(DEFAULT_CONTEXT_MAINTENANCE);
+  const [spawnPanelOpen, setSpawnPanelOpen] = useState(false);
+  const [taskLabels, setTaskLabels] = useState<Record<string, string>>(readStoredTaskLabels);
   const [messageDrafts, setMessageDrafts] = useState<Record<string, string>>({});
   const [cwdDrafts, setCwdDrafts] = useState<Record<string, string>>({});
   const [execImage, setExecImage] = useState("base-agent:v0");
@@ -63,6 +77,23 @@ export function App() {
     void initialize();
     return () => abortRef.current?.abort();
   }, []);
+
+  useEffect(() => {
+    try {
+      globalThis.sessionStorage?.setItem(TASK_LABELS_STORAGE_KEY, taskLabelsForStorage(taskLabels));
+    } catch {
+      // Task labels are an optional session-only convenience in restricted renderers.
+    }
+  }, [taskLabels]);
+
+  useEffect(() => {
+    try {
+      if (selectedPid) globalThis.sessionStorage?.setItem(SELECTED_PID_STORAGE_KEY, selectedPid);
+      else globalThis.sessionStorage?.removeItem(SELECTED_PID_STORAGE_KEY);
+    } catch {
+      // Selection persistence is optional in restricted renderer environments.
+    }
+  }, [selectedPid]);
 
   useEffect(() => {
     if (!client) return;
@@ -141,7 +172,7 @@ export function App() {
       setConnection(conn);
       setClient(nextClient);
       setSnapshot(nextSnapshot);
-      setSelectedPid(reconcileSelectedPid(nextSnapshot, null));
+      setSelectedPid((current) => reconcileSelectedPid(nextSnapshot, current));
       setMaxQuanta(nextSnapshot.scheduler.default_max_quanta ?? null);
       setLastUpdatedAt(new Date());
     } catch (reason) {
@@ -213,15 +244,19 @@ export function App() {
     }
   }
 
-  async function safe(action: () => Promise<void>, label = "action"): Promise<boolean> {
+  async function safe(
+    action: () => Promise<void>,
+    label = "action",
+    refreshAfter = true
+  ): Promise<boolean> {
     if (actionGuardRef.current) return false;
     actionGuardRef.current = true;
     setActiveAction(label);
     try {
       setError(null);
-      if (refreshInFlightRef.current) await refreshInFlightRef.current;
+      if (refreshAfter && refreshInFlightRef.current) await refreshInFlightRef.current;
       await action();
-      return await refresh();
+      return refreshAfter ? await refresh() : true;
     } catch (reason) {
       setError(describeError(reason, t("app.confirmationRequiredSuffix")));
       return false;
@@ -233,36 +268,92 @@ export function App() {
 
   async function spawnProcess() {
     if (!client) return;
+    let spawnedPid: string | null = null;
+    let submittedLabel = "";
+    let spawnedProcess: RuntimeProcess | null = null;
     await safe(async () => {
+      const submittedGoal = spawnGoal.trim();
+      submittedLabel = taskLabelFromGoal(submittedGoal);
       const authorityManifest = buildGuiTaskAuthorityManifest({
         workingDirectory: spawnWorkingDirectory,
         workspaceAccess: spawnWorkspaceAccess,
-        allowGitRequests: spawnAllowGitRequests
+        allowGitRequests: spawnAllowGitRequests,
+        commandAccess: spawnCommandAccess,
+        contextMaintenance: spawnContextMaintenance
       });
-      const result = await client.spawn(spawnGoal, spawnImage, maxQuanta, Boolean(snapshot?.scheduler.auto_run), {
+      const result = await client.spawn(submittedGoal, spawnImage, maxQuanta, Boolean(snapshot?.scheduler.auto_run), {
         authorityManifest,
         workingDirectory: spawnWorkingDirectory,
         llmProfile: spawnLlmProfile || undefined
       });
       const pid = (result as { pid?: string }).pid;
-      if (pid) setSelectedPid(pid);
-    });
+      if (pid) spawnedPid = pid;
+      spawnedProcess = processFromMutationResult(result);
+    }, "process.spawn", false);
+    const pid = spawnedPid as string | null;
+    if (!pid) return;
+    if (spawnedProcess) {
+      setSnapshot((current) => current ? upsertRuntimeProcess(current, spawnedProcess!) : current);
+    }
+    setTaskLabels((current) => ({ ...current, [pid]: submittedLabel }));
+    setSelectedPid(pid);
+    setSpawnGoal("");
+    setSpawnPanelOpen(false);
   }
 
   async function send(kind: "message" | "interrupt"): Promise<boolean> {
     if (!client || !selectedProcess || !message.trim()) return false;
     const pid = selectedProcess.pid;
     return safe(async () => {
-      await client.sendMessage(pid, message.trim(), kind, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
+      const result = await client.sendMessage(pid, message.trim(), kind, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
+      mergeProcessResult(result);
       setMessageDrafts((current) => ({ ...current, [pid]: "" }));
-    });
+    }, `process.${kind}`, false);
+  }
+
+  async function runSelectedProcess(): Promise<boolean> {
+    if (!client || !selectedProcess) return false;
+    const pid = selectedProcess.pid;
+    return safe(async () => {
+      await runOrResumeProcess(client, selectedProcess, maxQuanta);
+    }, "process.run", false);
+  }
+
+  async function pauseSelectedProcess(): Promise<boolean> {
+    if (!client || !selectedProcess) return false;
+    return safe(async () => {
+      mergeProcessResult(await client.pauseProcess(selectedProcess.pid));
+    }, "process.pause", false);
+  }
+
+  async function resumeSelectedProcess(): Promise<boolean> {
+    if (!client || !selectedProcess) return false;
+    return safe(async () => {
+      mergeProcessResult(await client.resumeProcess(selectedProcess.pid, Boolean(snapshot?.scheduler.auto_run)));
+    }, "process.resume", false);
+  }
+
+  function mergeProcessResult(result: unknown): RuntimeProcess | null {
+    const process = processFromMutationResult(result);
+    if (process) setSnapshot((current) => current ? upsertRuntimeProcess(current, process) : current);
+    return process;
   }
 
   async function respond(request: HumanRequest, response: HumanResponseInput): Promise<boolean> {
     if (!client) return false;
-    return safe(async () => {
+    // A message/interrupt request with auto-run may remain in flight while the
+    // scheduler is waiting for this exact Human decision. Do not route Human
+    // responses through the global action guard or the GUI deadlocks: the
+    // pending run waits for approval while approval is discarded as "busy".
+    // HumanRequestCard owns per-request duplicate-submission protection.
+    try {
+      setError(null);
       await client.respondHumanRequest(request.request_id, response, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
-    });
+      return true;
+    } catch (reason) {
+      setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+      return false;
+    }
   }
 
   async function rateProcess(pid: string, score: number, comment: string): Promise<boolean> {
@@ -437,12 +528,28 @@ export function App() {
     return <LoadingScreen error={error} onRetry={() => void initialize()} />;
   }
 
-  const interactionBusy = Boolean(activeAction) || refreshing;
+  // A bounded snapshot refresh may wait behind an in-flight LLM quantum. Keep
+  // that passive synchronization visible without disabling message, approval,
+  // pause, or interrupt controls that are needed to steer the running process.
+  const interactionBusy = Boolean(activeAction);
+  const appBusy = interactionBusy || refreshing;
+  const selectedStatusTone = selectedProcess
+    ? processStatusTone(selectedProcess.status)
+    : "idle";
+  const selectedTaskLabel = selectedProcess
+    ? taskDisplayLabel(selectedProcess, taskLabels)
+    : null;
+  const selectedProcessTerminal = Boolean(
+    selectedProcess?.terminal || (selectedProcess && ["exited", "failed", "killed"].includes(selectedProcess.status))
+  );
+  const selectedPendingRequests = (snapshot?.human_requests ?? []).filter(
+    (request) => request.status === "pending" && request.pid === selectedProcess?.pid
+  );
 
   return (
     <div
       className={view === "user" ? "userAppShell" : "appShell"}
-      aria-busy={interactionBusy || undefined}
+      aria-busy={appBusy || undefined}
     >
       <AppNotices
         error={error}
@@ -459,6 +566,7 @@ export function App() {
           snapshot={snapshot}
           selectedPid={selectedPid}
           selectedProcess={selectedProcess}
+          taskLabels={taskLabels}
           maxQuanta={maxQuanta}
           spawnGoal={spawnGoal}
           spawnImage={spawnImage}
@@ -466,6 +574,8 @@ export function App() {
           spawnWorkingDirectory={spawnWorkingDirectory}
           spawnWorkspaceAccess={spawnWorkspaceAccess}
           spawnAllowGitRequests={spawnAllowGitRequests}
+          spawnCommandAccess={spawnCommandAccess}
+          spawnContextMaintenance={spawnContextMaintenance}
           message={message}
           images={snapshot?.images ?? []}
           llmProfiles={snapshot?.llm_profiles ?? []}
@@ -477,6 +587,8 @@ export function App() {
           onSpawnWorkingDirectoryChange={setSpawnWorkingDirectory}
           onSpawnWorkspaceAccessChange={setSpawnWorkspaceAccess}
           onSpawnAllowGitRequestsChange={setSpawnAllowGitRequests}
+          onSpawnCommandAccessChange={setSpawnCommandAccess}
+          onSpawnContextMaintenanceChange={setSpawnContextMaintenance}
           onMessageChange={setMessage}
           onSpawn={() => void spawnProcess()}
           onImportImage={() => void chooseAndConfirmImageImport(false)}
@@ -487,8 +599,8 @@ export function App() {
           onCreateLlmProfile={createLlmProfile}
           onUpdateLlmProfile={updateLlmProfile}
           onDeleteLlmProfile={deleteLlmProfile}
-          onRun={() => selectedProcess && client && void safe(() => client.run(selectedProcess.pid, maxQuanta).then(() => undefined))}
-          onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined))}
+          onRun={() => void runSelectedProcess()}
+          onPause={() => void pauseSelectedProcess()}
           onRefresh={() => void refreshAndClearError()}
           onOpenDb={() => void openDatabase()}
           onShowOperator={() => setView("operator")}
@@ -503,14 +615,14 @@ export function App() {
             db={connection?.db ?? t("app.defaultDb")}
             scheduler={snapshot?.scheduler ?? null}
             maxQuanta={maxQuanta}
-            selectedPid={selectedProcess?.pid ?? null}
+            selectedPid={selectedProcess && !selectedProcessTerminal ? selectedProcess.pid : null}
             onMaxQuantaChange={setMaxQuanta}
             onOpenDb={() => void openDatabase()}
-            onSpawn={() => void spawnProcess()}
-            onRun={() => selectedProcess && client && void safe(() => client.run(selectedProcess.pid, maxQuanta).then(() => undefined))}
+            onSpawn={() => setSpawnPanelOpen(true)}
+            onRun={() => void runSelectedProcess()}
             onStep={() => selectedProcess && client && void safe(() => client.step(selectedProcess.pid).then(() => undefined))}
-            onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined))}
-            onAutoRunChange={(value) => client && void safe(() => client.setAutoRun(value).then(() => undefined))}
+            onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined), "scheduler.pause", false)}
+            onAutoRunChange={(value) => client && void safe(() => client.setAutoRun(value).then(() => undefined), "scheduler.auto", false)}
             onRefresh={() => void refreshAndClearError()}
             onShowUser={() => setView("user")}
             busy={interactionBusy}
@@ -519,72 +631,126 @@ export function App() {
           />
 
           <main className="workspace">
-            <section className="leftPane">
-              <div className="paneHeader">
-                <h1>{t("operator.processes.title")}</h1>
-                <span>{snapshot?.processes.length ?? 0}</span>
-              </div>
-              <div className="spawnBox">
-                <ImageSelect images={snapshot?.images ?? []} value={spawnImage} label={t("operator.spawnImage")} disabled={interactionBusy} onChange={setSpawnImage} />
-                <LLMProfileSelect
-                  profiles={snapshot?.llm_profiles ?? []}
-                  value={spawnLlmProfile}
-                  label={t("llmProfile.spawnLabel")}
-                  disabled={interactionBusy}
-                  onChange={setSpawnLlmProfile}
-                  onCreate={createLlmProfile}
-                  onUpdate={updateLlmProfile}
-                  onDelete={deleteLlmProfile}
-                />
-                <input
-                  value={spawnWorkingDirectory}
-                  disabled={interactionBusy}
-                  onChange={(event) => setSpawnWorkingDirectory(event.currentTarget.value)}
-                  placeholder={t("operator.initialCwdPlaceholder")}
-                  aria-label={t("operator.initialCwd")}
-                />
-                <label className="taskAuthorityField">
-                  <span>{t("taskAuthority.workspaceAccess")}</span>
-                  <select
-                    value={spawnWorkspaceAccess}
+            <section className="leftPane operatorPane" aria-label={t("operator.processes.title")}>
+              <header className="paneHeader operatorPaneHeader">
+                <div className="paneTitle">
+                  <span className="eyebrow">{t("operator.processes.title")}</span>
+                  <h1>{t("operator.processes.title")}</h1>
+                  <p>{t("operator.processes.subtitle")}</p>
+                </div>
+                <span className="countPill">{snapshot?.processes.length ?? 0}</span>
+              </header>
+              <details
+                className="spawnBox operatorDisclosure"
+                open={spawnPanelOpen}
+                onToggle={(event) => setSpawnPanelOpen(event.currentTarget.open)}
+              >
+                <summary>
+                  <span className="operatorDisclosureIcon"><CirclePlus size={15} /></span>
+                  <span><strong>{t("operator.launchConfiguration")}</strong><small>{t("operator.launchConfigurationHint")}</small></span>
+                  <ChevronDown size={15} className="disclosureChevron" />
+                </summary>
+                <div className="operatorDisclosureBody">
+                  <ImageSelect images={snapshot?.images ?? []} value={spawnImage} label={t("operator.spawnImage")} disabled={interactionBusy} onChange={setSpawnImage} />
+                  <LLMProfileSelect
+                    profiles={snapshot?.llm_profiles ?? []}
+                    value={spawnLlmProfile}
+                    label={t("llmProfile.spawnLabel")}
                     disabled={interactionBusy}
-                    onChange={(event) => setSpawnWorkspaceAccess(event.currentTarget.value as WorkspaceAccess)}
-                  >
-                    <option value="none">{t("taskAuthority.none")}</option>
-                    <option value="read">{t("taskAuthority.read")}</option>
-                    <option value="edit">{t("taskAuthority.edit")}</option>
-                    <option value="manage">{t("taskAuthority.manage")}</option>
-                  </select>
-                </label>
-                <label className="taskAuthorityToggle">
-                  <input
-                    type="checkbox"
-                    checked={spawnAllowGitRequests}
-                    disabled={interactionBusy}
-                    onChange={(event) => setSpawnAllowGitRequests(event.currentTarget.checked)}
+                    onChange={setSpawnLlmProfile}
+                    onCreate={createLlmProfile}
+                    onUpdate={updateLlmProfile}
+                    onDelete={deleteLlmProfile}
                   />
-                  <span>{t("taskAuthority.git")}</span>
-                </label>
-                <p className="taskAuthorityHint">{t("taskAuthority.hint")}</p>
-                <textarea value={spawnGoal} disabled={interactionBusy} onChange={(event) => setSpawnGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} />
-              </div>
-              <ProcessTree processes={snapshot?.processes ?? []} selectedPid={selectedPid} disabled={interactionBusy} onSelect={setSelectedPid} />
+                  <label className="fieldStack">
+                    <span>{t("operator.initialCwd")}</span>
+                    <input
+                      value={spawnWorkingDirectory}
+                      disabled={interactionBusy}
+                      onChange={(event) => setSpawnWorkingDirectory(event.currentTarget.value)}
+                      placeholder={t("operator.initialCwdPlaceholder")}
+                    />
+                  </label>
+                  <label className="taskAuthorityField">
+                    <span>{t("taskAuthority.workspaceAccess")}</span>
+                    <select
+                      value={spawnWorkspaceAccess}
+                      disabled={interactionBusy}
+                      onChange={(event) => setSpawnWorkspaceAccess(event.currentTarget.value as WorkspaceAccess)}
+                    >
+                      <option value="none">{t("taskAuthority.none")}</option>
+                      <option value="read">{t("taskAuthority.read")}</option>
+                      <option value="edit">{t("taskAuthority.edit")}</option>
+                      <option value="manage">{t("taskAuthority.manage")}</option>
+                    </select>
+                  </label>
+                  <label className="taskAuthorityToggle operatorAuthorityToggle">
+                    <input
+                      type="checkbox"
+                      checked={spawnContextMaintenance}
+                      disabled={interactionBusy}
+                      onChange={(event) => setSpawnContextMaintenance(event.currentTarget.checked)}
+                    />
+                    <span>{t("taskAuthority.contextMaintenance")}</span>
+                  </label>
+                  <label className="taskAuthorityToggle operatorAuthorityToggle">
+                    <input
+                      type="checkbox"
+                      checked={spawnAllowGitRequests}
+                      disabled={interactionBusy}
+                      onChange={(event) => setSpawnAllowGitRequests(event.currentTarget.checked)}
+                    />
+                    <span>{t("taskAuthority.git")}</span>
+                  </label>
+                  <label className="taskAuthorityField">
+                    <span>{t("taskAuthority.commandAccess")}</span>
+                    <select
+                      value={spawnCommandAccess}
+                      disabled={interactionBusy}
+                      onChange={(event) => setSpawnCommandAccess(event.currentTarget.value as CommandAccess)}
+                    >
+                      <option value="none">{t("taskAuthority.commandNone")}</option>
+                      <option value="reviewed">{t("taskAuthority.commandReviewed")}</option>
+                    </select>
+                  </label>
+                  <label className="fieldStack">
+                    <span>{t("operator.spawnGoal")}</span>
+                    <textarea value={spawnGoal} disabled={interactionBusy} onChange={(event) => setSpawnGoal(event.currentTarget.value)} />
+                  </label>
+                  <p className="taskAuthorityHint">{t("taskAuthority.hint")}</p>
+                  <button type="button" className="primary launchProcessButton" disabled={interactionBusy || !spawnGoal.trim()} onClick={() => void spawnProcess()}>
+                    <CirclePlus size={15} />{t("operator.launchProcess")}
+                  </button>
+                </div>
+              </details>
+              <ProcessTree
+                processes={snapshot?.processes ?? []}
+                selectedPid={selectedPid}
+                taskLabels={taskLabels}
+                disabled={interactionBusy}
+                onSelect={setSelectedPid}
+              />
             </section>
 
-            <section className="centerPane">
-              <div className="paneHeader">
-                <div>
-                  <h1>{selectedProcess?.pid ?? t("operator.noProcessSelected")}</h1>
-                  {selectedProcess ? <span>{selectedProcess.image_id} · {selectedProcess.status} · {selectedProcess.llm_profile_id} · {t("operator.cwd")} {selectedProcess.working_directory}</span> : null}
+            <section className="centerPane operatorPane" aria-label={t("operator.activity")}>
+              <header className="paneHeader activityPaneHeader">
+                <div className="paneTitle">
+                  <span className="eyebrow"><Activity size={12} />{t("operator.activity")}</span>
+                  <h1 title={selectedProcess?.pid}>{selectedTaskLabel ?? t("operator.noProcessSelected")}</h1>
+                  {selectedProcess ? <p>{shortProcessId(selectedProcess.pid)} · {selectedProcess.image_id} · {selectedProcess.llm_profile_id} · {t("operator.cwd")} {selectedProcess.working_directory}</p> : <p>{t("operator.activityHint")}</p>}
                 </div>
-                {selectedProcess?.interrupt_count ? <span className="interruptBanner"><AlertTriangle size={16} /> {t("operator.interruptPending")}</span> : null}
-              </div>
+                <div className="paneHeaderMeta">
+                  {selectedProcess?.interrupt_count ? <span className="interruptBanner"><AlertTriangle size={15} />{t("operator.interruptPending")}</span> : null}
+                  {selectedProcess ? <span className={`statusPill ${selectedStatusTone}`}><span className="statusDot" />{processStatusLabel(selectedProcess.status, t)}</span> : null}
+                </div>
+              </header>
 
-              <div className="humanRequests">
-                {(snapshot?.human_requests ?? []).filter((request) => request.status === "pending" && request.pid === selectedProcess?.pid).map((request) => (
+              {selectedPendingRequests.length ? <section className="humanRequests" aria-label={t("user.pendingRequests")}>
+                <div className="pendingRequestsHeading"><AlertTriangle size={15} /><strong>{t("user.pendingRequests")}</strong><span>{selectedPendingRequests.length}</span></div>
+                {selectedPendingRequests.map((request) => (
                   <HumanRequestCard key={request.request_id} request={request} onRespond={respond} />
                 ))}
-              </div>
+              </section> : null}
 
               <Timeline
                 pid={selectedProcess?.pid ?? null}
@@ -597,57 +763,96 @@ export function App() {
               />
 
               <div className="composer">
-                <input
-                  value={message}
-                  disabled={!selectedProcess || interactionBusy}
-                  aria-label={t("operator.messagePlaceholder")}
-                  onChange={(event) => setMessage(event.currentTarget.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.nativeEvent.isComposing && message.trim()) void send("message");
-                  }}
-                  placeholder={t("operator.messagePlaceholder")}
-                />
-                <button disabled={interactionBusy || !selectedProcess || !message.trim()} onClick={() => void send("message")}><Send size={16} />{t("operator.message")}</button>
-                <button disabled={interactionBusy || !selectedProcess || !message.trim()} className="warning" onClick={() => void send("interrupt")}>{t("operator.interrupt")}</button>
+                <div className="composerField operatorComposerField">
+                  <textarea
+                    rows={1}
+                    value={message}
+                    disabled={!selectedProcess || selectedProcessTerminal || interactionBusy}
+                    aria-label={t("operator.messagePlaceholder")}
+                    onChange={(event) => setMessage(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                        event.preventDefault();
+                        if (message.trim()) void send("message");
+                      }
+                    }}
+                    placeholder={t("operator.messagePlaceholder")}
+                  />
+                  <span>{t("user.sendHint")}</span>
+                </div>
+                <button type="button" className="primary" disabled={interactionBusy || !selectedProcess || selectedProcessTerminal || !message.trim()} onClick={() => void send("message")}><Send size={15} />{t("operator.message")}</button>
+                <button type="button" disabled={interactionBusy || !selectedProcess || selectedProcessTerminal || !message.trim()} className="iconOnly warning" aria-label={t("operator.interrupt")} title={t("operator.interrupt")} onClick={() => void send("interrupt")}><AlertTriangle size={15} /></button>
               </div>
             </section>
 
-            <section className="rightPane">
-              <div className="quickActions">
-                <input
-                  value={cwd}
-                  disabled={interactionBusy}
-                  aria-label={t("operator.newCwdPlaceholder")}
-                  placeholder={t("operator.newCwdPlaceholder")}
-                  onChange={(event) => setCwd(event.currentTarget.value)}
-                />
-                <button disabled={interactionBusy || !client || !selectedProcess || !cwd.trim()} onClick={() => selectedProcess && void safe(async () => {
-                  await client!.changeDirectory(selectedProcess.pid, cwd.trim());
-                  setCwd("");
-                }, "process.cd")}>cd</button>
-                <ImageSelect images={snapshot?.images ?? []} value={execImage} label={t("operator.exec")} disabled={interactionBusy} onChange={setExecImage} />
-                <LLMProfileSelect
-                  profiles={snapshot?.llm_profiles ?? []}
-                  value={execLlmProfile}
-                  label={t("llmProfile.execLabel")}
-                  disabled={interactionBusy || !selectedProcess}
-                  onChange={setExecLlmProfile}
-                  onCreate={createLlmProfile}
-                  onUpdate={updateLlmProfile}
-                  onDelete={deleteLlmProfile}
-                />
-                <input value={execGoal} disabled={interactionBusy} onChange={(event) => setExecGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} />
-                <button disabled={interactionBusy || !selectedProcess} className="warning" onClick={confirmExec}>{t("operator.exec")}</button>
-                <button
-                  disabled={interactionBusy || !selectedProcess || selectedProcess.terminal || selectedProcess.status === "paused"}
-                  onClick={() => selectedProcess && client && void safe(() => client.pauseProcess(selectedProcess.pid).then(() => undefined), "process.pause")}
-                >{t("operator.pauseProcess")}</button>
-                <button
-                  disabled={interactionBusy || !selectedProcess || selectedProcess.status !== "paused"}
-                  onClick={() => selectedProcess && client && void safe(() => client.resumeProcess(selectedProcess.pid, Boolean(snapshot?.scheduler.auto_run)).then(() => undefined), "process.resume")}
-                >{t("operator.resumeProcess")}</button>
-                <button disabled={interactionBusy || !selectedProcess} className="danger" onClick={confirmExit}>{t("operator.exit")}</button>
-              </div>
+            <section className="rightPane operatorPane" aria-label={t("operator.inspector")}>
+              <header className="inspectorHeader">
+                <div className="paneTitle">
+                  <span className="eyebrow"><PanelRight size={12} />{t("operator.inspector")}</span>
+                  <h2>{t("operator.inspector")}</h2>
+                  <p title={selectedProcess?.pid}>{selectedTaskLabel ?? t("operator.noSelectionHint")}</p>
+                </div>
+              </header>
+              <details className="quickActions operatorDisclosure">
+                <summary>
+                  <span className="operatorDisclosureIcon"><Settings size={15} /></span>
+                  <span><strong>{t("operator.processControls")}</strong><small>{t("operator.processControlsHint")}</small></span>
+                  <ChevronDown size={15} className="disclosureChevron" />
+                </summary>
+                <div className="operatorDisclosureBody processActionBody">
+                  <section className="processActionGroup">
+                    <span className="actionGroupLabel">{t("operator.workingDirectory")}</span>
+                    <div className="inlineAction">
+                      <input
+                        value={cwd}
+                        disabled={interactionBusy}
+                        aria-label={t("operator.newCwdPlaceholder")}
+                        placeholder={t("operator.newCwdPlaceholder")}
+                        onChange={(event) => setCwd(event.currentTarget.value)}
+                      />
+                      <button type="button" disabled={interactionBusy || !client || !selectedProcess || !cwd.trim()} onClick={() => selectedProcess && void safe(async () => {
+                        await client!.changeDirectory(selectedProcess.pid, cwd.trim());
+                        setCwd("");
+                      }, "process.cd")}>cd</button>
+                    </div>
+                  </section>
+                  <section className="processActionGroup">
+                    <span className="actionGroupLabel">{t("operator.exec")}</span>
+                    <ImageSelect images={snapshot?.images ?? []} value={execImage} label={t("operator.exec")} disabled={interactionBusy} onChange={setExecImage} />
+                    <LLMProfileSelect
+                      profiles={snapshot?.llm_profiles ?? []}
+                      value={execLlmProfile}
+                      label={t("llmProfile.execLabel")}
+                      disabled={interactionBusy || !selectedProcess}
+                      onChange={setExecLlmProfile}
+                      onCreate={createLlmProfile}
+                      onUpdate={updateLlmProfile}
+                      onDelete={deleteLlmProfile}
+                    />
+                    <input value={execGoal} disabled={interactionBusy} onChange={(event) => setExecGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} placeholder={t("operator.execGoalPlaceholder")} />
+                    <button type="button" disabled={interactionBusy || !selectedProcess} className="warning fullWidthButton" onClick={confirmExec}>{t("operator.exec")}</button>
+                  </section>
+                  <section className="processActionGroup">
+                    <span className="actionGroupLabel">{t("operator.lifecycle")}</span>
+                    <div className="lifecycleActions">
+                      <button
+                        type="button"
+                        disabled={interactionBusy || !selectedProcess || selectedProcess.terminal || selectedProcess.status === "paused"}
+                        onClick={() => void pauseSelectedProcess()}
+                      >{t("operator.pauseProcess")}</button>
+                      <button
+                        type="button"
+                        disabled={interactionBusy || !selectedProcess || selectedProcess.status !== "paused"}
+                        onClick={() => void resumeSelectedProcess()}
+                      >{t("operator.resumeProcess")}</button>
+                    </div>
+                  </section>
+                  <section className="dangerZone">
+                    <div><strong>{t("operator.dangerZone")}</strong><span>{t("operator.dangerZoneHint")}</span></div>
+                    <button type="button" disabled={interactionBusy || !selectedProcess} className="danger" onClick={confirmExit}>{t("operator.exit")}</button>
+                  </section>
+                </div>
+              </details>
               <DetailTabs
                 process={selectedProcess}
                 snapshot={snapshot}
@@ -701,6 +906,23 @@ function readStoredView(): "user" | "operator" {
     return globalThis.localStorage?.getItem("agent-libos.gui.view") === "operator" ? "operator" : "user";
   } catch {
     return "user";
+  }
+}
+
+function readStoredTaskLabels(): Record<string, string> {
+  try {
+    return taskLabelsFromStorage(globalThis.sessionStorage?.getItem(TASK_LABELS_STORAGE_KEY) ?? null);
+  } catch {
+    return {};
+  }
+}
+
+function readStoredSelectedPid(): string | null {
+  try {
+    const pid = globalThis.sessionStorage?.getItem(SELECTED_PID_STORAGE_KEY) ?? "";
+    return /^pid_[A-Za-z0-9_-]{1,156}$/.test(pid) ? pid : null;
+  } catch {
+    return null;
   }
 }
 

@@ -73,12 +73,9 @@ class TestImageRegistration:
     @pytest.mark.parametrize(
         'metadata, message',
         [
-            ({'lazy_tool_groups': 'false'}, 'lazy_tool_groups must be a boolean'),
-            ({'initial_tool_groups': ['filesystem']}, 'requires lazy_tool_groups=true'),
-            (
-                {'lazy_tool_groups': True, 'initial_tool_groups': ['unknown']},
-                'unknown initial tool group',
-            ),
+            ({'tool_projection': False}, "tool_projection must be 'skills'"),
+            ({'tool_projection': 'groups'}, "tool_projection must be 'skills'"),
+            ({'tool_projection': ['skills']}, "tool_projection must be 'skills'"),
         ],
     )
     def test_invalid_projection_metadata_is_rejected_before_registration(
@@ -102,6 +99,80 @@ class TestImageRegistration:
 
             assert image_id not in runtime.images
             assert runtime.store.get_image(image_id) is None
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("legacy_key", ["lazy_tool_groups", "initial_tool_groups"])
+    def test_removed_tool_group_metadata_is_rejected_before_registration(
+        self,
+        legacy_key: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            image_id = f'removed-{legacy_key}:v0'
+            with pytest.raises(
+                ValidationError,
+                match=rf'removed tool-group fields: {legacy_key}',
+            ):
+                runtime.register_image(
+                    AgentImage(
+                        image_id=image_id,
+                        name=f'removed-{legacy_key}',
+                        default_tools=['process_exit'],
+                        metadata={
+                            legacy_key: (
+                                True
+                                if legacy_key == 'lazy_tool_groups'
+                                else ['filesystem']
+                            ),
+                        },
+                    ),
+                    actor='test',
+                )
+
+            assert image_id not in runtime.images
+            assert runtime.store.get_image(image_id) is None
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("legacy_key", ["lazy_tool_groups", "initial_tool_groups"])
+    def test_removed_tool_group_metadata_is_rejected_when_persisted_image_is_loaded(
+        self,
+        legacy_key: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            image_id = f'persisted-{legacy_key}:v0'
+            runtime.register_image(
+                AgentImage(image_id=image_id, name=f'persisted-{legacy_key}'),
+                actor='test',
+            )
+            runtime.store.conn.execute(
+                "UPDATE images SET manifest_json = ? WHERE image_id = ?",
+                (
+                    json.dumps(
+                        {
+                            'image_id': image_id,
+                            'name': f'persisted-{legacy_key}',
+                            'metadata': {
+                                legacy_key: (
+                                    True
+                                    if legacy_key == 'lazy_tool_groups'
+                                    else ['filesystem']
+                                ),
+                            },
+                        },
+                    ),
+                    image_id,
+                ),
+            )
+            runtime.store.conn.commit()
+
+            with pytest.raises(
+                ValidationError,
+                match=rf'removed tool-group fields: {legacy_key}',
+            ):
+                runtime.image_registry.load_persisted_images()
         finally:
             runtime.close()
 

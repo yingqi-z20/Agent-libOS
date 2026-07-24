@@ -31,7 +31,7 @@ class TestSkillCli:
             loaded = self._cli_json(['--db', db_path, 'skills', 'activate', spawned['pid'], 'cli-skill'])
             assert validated['skill_id'] == 'cli-skill'
             assert registered['skill_id'] == 'cli-skill'
-            assert discovered[0]['skill_id'] == 'cli-skill'
+            assert any(item['skill_id'] == 'cli-skill' for item in discovered)
             assert loaded['skill_id'] == 'cli-skill'
             assert 'echo' in loaded['tool_names']
 

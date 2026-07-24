@@ -180,7 +180,6 @@ AUTHORITY_BOUNDARIES = (
 )
 
 EXTENSION_BOUNDARIES = (
-    boundary("tools", "activate_tool_group", "runtime", "tool_group.activate", "pid", "pid"),
     boundary("skills", "register_skill_package", "runtime", "skill.register", "actor", "actor"),
     boundary(
         "skills",

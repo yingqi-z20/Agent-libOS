@@ -44,8 +44,24 @@ class ProcessLaunchService:
             raise NotFound(f"agent image not found: {image_id}")
         return image
 
-    def require_spawn_authority(self, pid: str) -> None:
-        self._capabilities.require(pid, "process:spawn", CapabilityRight.WRITE)
+    def require_spawn_authority(
+        self,
+        pid: str,
+        *,
+        image_id: str | None = None,
+        operation: str = "process.spawn",
+    ) -> None:
+        self._capabilities.require(
+            pid,
+            "process:spawn",
+            CapabilityRight.WRITE,
+            {
+                "primitive": "runtime.process_launch",
+                "operation": operation,
+                "authority_operation": operation,
+                **({"image_id": image_id} if image_id is not None else {}),
+            },
+        )
 
     def require_image_boot_authority(self, pid: str, image_id: str) -> None:
         self._capabilities.require(pid, self._image_resource(image_id), CapabilityRight.READ)
@@ -91,6 +107,7 @@ class ProcessLaunchService:
             parent,
             image=image,
             working_directory=working_directory,
+            operation="process.spawn_child",
         )
         return self._process.spawn_child(
             parent=parent,
@@ -126,6 +143,7 @@ class ProcessLaunchService:
             parent,
             image=image,
             working_directory=working_directory,
+            operation="process.fork",
         )
         return self._process.fork(
             parent=parent,
@@ -149,10 +167,15 @@ class ProcessLaunchService:
         *,
         image: str | None,
         working_directory: str | None,
+        operation: str,
     ) -> tuple[str, str | None]:
         parent_process = self._process.get(parent)
         selected_image = image or parent_process.image_id
-        self.require_spawn_authority(parent)
+        self.require_spawn_authority(
+            parent,
+            image_id=selected_image,
+            operation=operation,
+        )
         if selected_image != parent_process.image_id:
             self.require_image_boot_authority(parent, selected_image)
         self.require_image(selected_image)

@@ -24,9 +24,10 @@ from agent_libos.models import (
     JsonRpcMethodSpec,
     LLMCallRecord,
 )
-from agent_libos.models.exceptions import CapabilityDenied
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import StoreCloseClaimOutcome, open_store
+from agent_libos.storage.factory import open_store_for_migration
 from agent_libos.storage.postgres import PostgresStore
 from agent_libos.storage.sql import STORE_SCHEMA_VERSION
 from agent_libos.utils.ids import utc_now
@@ -68,6 +69,29 @@ def _dsn_with_search_path(dsn: str, schema: str) -> str:
 
 @pytest.mark.postgres
 class TestPostgresStore:
+    def test_offline_migration_open_does_not_initialize_empty_schema(self) -> None:
+        import psycopg
+
+        with _postgres_schema_dsn() as dsn:
+            with pytest.raises(
+                ValidationError,
+                match="requires an existing initialized Agent libOS store",
+            ):
+                open_store_for_migration(dsn)
+
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT relation.relname
+                    FROM pg_catalog.pg_class AS relation
+                    JOIN pg_catalog.pg_namespace AS namespace
+                      ON namespace.oid = relation.relnamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND relation.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+                    """
+                ).fetchall()
+            assert rows == []
+
     def test_fresh_schema_rejects_a_second_schema_marker(self) -> None:
         from psycopg.errors import CheckViolation
 

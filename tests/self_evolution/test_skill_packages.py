@@ -14,6 +14,7 @@ from agent_libos.config import AgentLibOSConfig, SkillDefaults, ToolDefaults
 from agent_libos.models import AgentImage, CapabilityRight
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
+from agent_libos.skills.builtin_catalog import BUILTIN_SKILL_IDS
 from agent_libos.skills.schema import JitToolSpec, SkillPackage
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from tests.support.skills import write_raw_skill, write_skill_package
@@ -31,19 +32,39 @@ class TestSkillPackageLoading:
                     runtime.skills.register_skill_package(package, actor='cli', require_capability=False)
 
                 bounded, has_more = runtime.skills.discover_skills_window(
+                    text='window-skill',
                     actor='test',
                     require_capability=False,
                     limit=2,
                 )
                 complete, complete_has_more = runtime.skills.discover_skills_window(
+                    text='window-skill',
                     actor='test',
                     require_capability=False,
                     limit=3,
                 )
 
-                assert len(bounded) == 2
+                assert tuple(
+                    item['skill_id']
+                    for item in bounded
+                    if item['source_type'] == 'builtin'
+                ) == BUILTIN_SKILL_IDS
+                assert {
+                    item['skill_id']
+                    for item in bounded
+                    if item['source_type'] != 'builtin'
+                } == {'window-skill-0', 'window-skill-1'}
                 assert has_more is True
-                assert len(complete) == 3
+                assert tuple(
+                    item['skill_id']
+                    for item in complete
+                    if item['source_type'] == 'builtin'
+                ) == BUILTIN_SKILL_IDS
+                assert {
+                    item['skill_id']
+                    for item in complete
+                    if item['source_type'] != 'builtin'
+                } == {'window-skill-0', 'window-skill-1', 'window-skill-2'}
                 assert complete_has_more is False
             finally:
                 runtime.close()
@@ -91,9 +112,21 @@ class TestSkillPackageLoading:
                     return original_load(path)
 
                 monkeypatch.setattr(runtime.skills, '_load_package_from_host_path', record_load)
-                discovered = runtime.skills.discover_skills(require_capability=False)
+                discovered = runtime.skills.discover_skills(
+                    text='configured-skill',
+                    require_capability=False,
+                )
 
-                assert [item['skill_id'] for item in discovered] == ['configured-skill']
+                assert tuple(
+                    item['skill_id']
+                    for item in discovered
+                    if item['source_type'] == 'builtin'
+                ) == BUILTIN_SKILL_IDS
+                assert [
+                    item['skill_id']
+                    for item in discovered
+                    if item['source_type'] != 'builtin'
+                ] == ['configured-skill']
                 assert loaded_paths == [(root / 'custom-catalog' / 'configured-skill').resolve()]
             finally:
                 runtime.close()
@@ -107,6 +140,20 @@ class TestSkillPackageLoading:
             config = AgentLibOSConfig(skills=replace(SkillDefaults(), global_dirs=(str(global_dir),)))
             runtime = Runtime.open('local', config=config)
             try:
+                parsed = runtime.skills.validate_package_path(skill_dir)
+                assert parsed['allowed_tools'] == ['echo']
+                assert 'allowed-tools: echo' in (skill_dir / 'SKILL.md').read_text(encoding='utf-8')
+
+                legacy_list_dir = write_raw_skill(
+                    root,
+                    'legacy-list-skill',
+                    'name: legacy-list-skill\n'
+                    'description: Retains compatibility with YAML-list allowed tools.\n'
+                    'allowed-tools:\n'
+                    '  - echo\n',
+                )
+                assert runtime.skills.validate_package_path(legacy_list_dir)['allowed_tools'] == ['echo']
+
                 with pytest.raises(CapabilityDenied):
                     runtime.skills.register_global_skill_from_path(skill_dir, actor='cli', require_capability=False)
                 trust = runtime.skills.global_package_info(skill_dir)
@@ -119,6 +166,19 @@ class TestSkillPackageLoading:
                     runtime.skills.validate_package_path(write_raw_skill(root, 'bad', 'name: bad\ndescription: Bad\nunknown: nope\n'))
                 with pytest.raises(ValidationError):
                     runtime.skills.validate_package_path(write_raw_skill(root, 'BadName', 'name: BadName\ndescription: Bad\n'))
+                with pytest.raises(ValidationError):
+                    runtime.skills.validate_package_path(write_raw_skill(root, 'bad-', 'name: bad-\ndescription: Bad\n'))
+                with pytest.raises(ValidationError):
+                    runtime.skills.validate_package_path(write_raw_skill(root, 'bad--name', 'name: bad--name\ndescription: Bad\n'))
+                overlong_name = 'a' * 65
+                with pytest.raises(ValidationError):
+                    runtime.skills.validate_package_path(
+                        write_raw_skill(
+                            root,
+                            overlong_name,
+                            f'name: {overlong_name}\ndescription: Bad\n',
+                        )
+                    )
                 with pytest.raises(ValidationError):
                     runtime.skills.validate_package_path(write_raw_skill(root, 'bad-metadata', 'name: bad-metadata\ndescription: Bad\nmetadata: {agent-libos.version: 1}\n'))
                 old_yaml = root / 'legacy.yaml'
@@ -1035,7 +1095,11 @@ class TestSkillPackageLoading:
                 )
                 runtime.skills.register_skill_from_path(skill_dir, actor='cli', replace=True, require_capability=False)
 
-                context = runtime.skills.prompt_context(pid)[0]
+                context = next(
+                    item
+                    for item in runtime.skills.prompt_context(pid)
+                    if item['skill_id'] == 'snapshot-skill'
+                )
                 resource = runtime.skills.read_skill_resource(pid, 'snapshot-skill', 'references/guide.md')
 
                 assert 'original-instruction-token' in context['instructions']

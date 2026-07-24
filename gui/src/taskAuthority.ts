@@ -1,15 +1,20 @@
 export type WorkspaceAccess = "none" | "read" | "edit" | "manage";
+export type CommandAccess = "none" | "reviewed";
+export const DEFAULT_CONTEXT_MAINTENANCE = false;
 
 type CapabilitySpec = {
   resource: string;
   rights: string[];
   delegable: false;
+  constraints?: Record<string, unknown>;
 };
 
 export type GuiTaskAuthorityOptions = {
   workingDirectory: string;
   workspaceAccess: WorkspaceAccess;
   allowGitRequests: boolean;
+  commandAccess: CommandAccess;
+  contextMaintenance: boolean;
 };
 
 const WORKSPACE_RIGHTS: Record<Exclude<WorkspaceAccess, "none">, string[]> = {
@@ -50,8 +55,57 @@ export function workspaceResourceForDirectory(path: string): string {
 export function buildGuiTaskAuthorityManifest({
   workingDirectory,
   workspaceAccess,
-  allowGitRequests
+  allowGitRequests,
+  commandAccess,
+  contextMaintenance
 }: GuiTaskAuthorityOptions): Record<string, unknown> {
+  const authorizedCapabilities: CapabilitySpec[] = [
+    { resource: "human:owner", rights: ["write"], delegable: false }
+  ];
+  if (commandAccess === "reviewed") {
+    authorizedCapabilities.push({
+      resource: "shell:*",
+      rights: ["execute"],
+      delegable: false,
+      constraints: { shell_policy_level: "allowlist_auto_else_ask" }
+    });
+  }
+  if (contextMaintenance) {
+    authorizedCapabilities.push(
+      {
+        resource: "context:enrichment",
+        rights: ["execute"],
+        delegable: false
+      },
+      {
+        resource: "context:maintenance",
+        rights: ["execute"],
+        delegable: false
+      },
+      {
+        resource: "process:spawn",
+        rights: ["write"],
+        delegable: false,
+        constraints: {
+          authority_rules: [
+            {
+              rule_id: "gui.context-maintenance.spawn",
+              operation: "process.spawn_child",
+              effect: "allow",
+              risk: "low",
+              conditions: { image_id: "context-compressor:v0" },
+              description: "allow only the built-in context compressor child"
+            }
+          ]
+        }
+      },
+      {
+        resource: "image:context-compressor:v0",
+        rights: ["read"],
+        delegable: false
+      }
+    );
+  }
   const requestableCapabilities: CapabilitySpec[] = [];
   if (workspaceAccess !== "none") {
     requestableCapabilities.push({
@@ -68,16 +122,16 @@ export function buildGuiTaskAuthorityManifest({
   }
 
   return {
-    authorized_capabilities: [
-      { resource: "human:owner", rights: ["write"], delegable: false }
-    ],
+    authorized_capabilities: authorizedCapabilities,
     approval_policy: {
       requestable_capabilities: requestableCapabilities
     },
     metadata: {
-      policy: "gui-task-v1",
+      policy: "gui-task-v2",
       workspace_access: workspaceAccess,
-      git_requests: allowGitRequests
+      git_requests: allowGitRequests,
+      command_access: commandAccess,
+      context_maintenance: contextMaintenance
     }
   };
 }

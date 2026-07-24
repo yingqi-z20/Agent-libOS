@@ -85,6 +85,11 @@ async def run_interleaved_clock_demo(
         )
         for pid in (pid_a, pid_b):
             runtime.capability.grant(pid, "clock:*", [CapabilityRight.READ], issued_by="script")
+            runtime.skills.activate_skill(
+                pid,
+                "agent-libos-runtime-session",
+                actor=pid,
+            )
         client.configure(
             pid_a,
             label="A",
@@ -184,6 +189,18 @@ class InterleavingClockClient:
 
     def _pid_from_messages(self, messages: list[dict[str, str]]) -> str:
         pid = static_prefix(messages).get("pid")
+        if not isinstance(pid, str) or not pid:
+            for message in messages:
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                match = re.search(
+                    r"(?m)^(?:Process|Process facts):\n- pid: (?P<pid>\S+)$",
+                    content,
+                )
+                if match is not None:
+                    pid = match.group("pid")
+                    break
         if not isinstance(pid, str) or not pid:
             raise AssertionError("prompt did not include process pid")
         return pid

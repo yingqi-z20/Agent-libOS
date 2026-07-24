@@ -11,10 +11,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from agent_libos import Runtime
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import DEFAULT_CONFIG as SYSTEM_DEFAULT_CONFIG
 from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.llm.context_memory import context_object_name
 from agent_libos.llm.executor import LLMProcessExecutor
+from agent_libos.llm.pending import pending_metadata
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.models import (
     AgentImage,
@@ -40,6 +41,28 @@ from agent_libos.models import (
 from tests.support.deno import COUNT_CHARS_SOURCE
 from tests.support.fakes import RecordingActionClient
 from tests.support.skills import write_skill_package
+
+
+RUNTIME_SESSION_SKILL = 'agent-libos-runtime-session'
+CHILD_PROCESSES_SKILL = 'agent-libos-child-processes'
+DEFAULT_CONFIG = replace(
+    SYSTEM_DEFAULT_CONFIG,
+    llm_context=replace(
+        SYSTEM_DEFAULT_CONFIG.llm_context,
+        policy='llm_context_object',
+    ),
+)
+
+
+@pytest.fixture(autouse=True)
+def _enable_persistent_context_for_context_memory_suite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This module tests the explicitly enabled persistent-context subsystem.
+    # Product defaults remain source-only and are covered in the pressure suite.
+    import agent_libos.runtime.builder as runtime_builder
+
+    monkeypatch.setattr(runtime_builder, 'DEFAULT_CONFIG', DEFAULT_CONFIG)
 
 
 def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
@@ -266,7 +289,7 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
-    def test_llm_context_policy_and_schema_version_use_active_runtime_config(
+    def test_llm_context_object_policy_and_schema_version_use_active_runtime_config(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -274,7 +297,7 @@ class TestLLMContextMemory:
             DEFAULT_CONFIG,
             llm_context=replace(
                 DEFAULT_CONFIG.llm_context,
-                policy='configured_llm_context_policy',
+                policy='llm_context_object',
                 schema_version=7,
                 object_name_prefix='configured_llm_context',
             ),
@@ -304,7 +327,7 @@ class TestLLMContextMemory:
             )
             assert context is not None
             assert context.payload['schema_version'] == 7
-            assert materialized_policies == ['configured_llm_context_policy']
+            assert materialized_policies == ['llm_context_object']
         finally:
             runtime.close()
 
@@ -380,6 +403,7 @@ class TestLLMContextMemory:
                 {'action': 'get_current_time'},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='track capability changes')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
 
             assert runtime.run_next_process_once()['ok']
             added = runtime.capability.grant(
@@ -450,6 +474,7 @@ class TestLLMContextMemory:
                     },
                 },
             )
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
 
             result = runtime.run_next_process_once()
 
@@ -466,13 +491,17 @@ class TestLLMContextMemory:
         runtime = Runtime.open('local')
         try:
             runtime.llm.client = RecordingActionClient([
-                {'action': 'get_current_time'},
-                {'action': 'get_current_time'},
+                {'action': 'list_capabilities'},
+                {'action': 'list_capabilities'},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='track tool projection changes')
 
             assert runtime.run_next_process_once()['ok']
-            runtime.tools.activate_tool_group(pid, 'filesystem')
+            runtime.skills.activate_skill(
+                pid,
+                'agent-libos-runtime-session',
+                actor=pid,
+            )
             assert runtime.run_next_process_once()['ok']
 
             context = runtime.store.get_object_by_name(
@@ -488,7 +517,7 @@ class TestLLMContextMemory:
 
             assert [entry['kind'] for entry in tool_entries] == ['tool_table_delta']
             assert any(
-                row.get('name') == 'get_working_directory'
+                row.get('name') == 'get_current_time'
                 for row in tool_entries[0]['upserted']
             )
         finally:
@@ -502,6 +531,7 @@ class TestLLMContextMemory:
                 {'action': 'get_current_time'},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='compact evidence events')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
             assert runtime.run_next_process_once()['ok']
 
             resource_event = runtime.events.emit(
@@ -1727,6 +1757,7 @@ class TestLLMContextMemory:
                 ]
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='parallel interrupt')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
             runtime.messages.post(
                 sender='test',
                 recipient_pid=pid,
@@ -1765,6 +1796,7 @@ class TestLLMContextMemory:
                 ]
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='parallel tool failure')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
 
             result = runtime.run_process_once(pid)
 
@@ -1797,6 +1829,7 @@ class TestLLMContextMemory:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
             _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'parallel message wait')
+            runtime.skills.activate_skill(child, CHILD_PROCESSES_SKILL, actor=child)
 
             waiting = runtime.run_process_once(child)
 
@@ -1852,6 +1885,7 @@ class TestLLMContextMemory:
             parent = runtime.process.spawn(image='base-agent:v0', goal='parallel child wait')
             _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'still running')
+            runtime.skills.activate_skill(parent, CHILD_PROCESSES_SKILL, actor=parent)
             runtime.llm.client = MultiToolActionClient([
                 [
                     {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 'before-wait'}},
@@ -2376,6 +2410,7 @@ class TestLLMContextMemory:
         try:
             runtime.llm.client = client
             pid = runtime.process.spawn(image='base-agent:v0', goal='persist every parallel output')
+            runtime.skills.activate_skill(pid, CHILD_PROCESSES_SKILL, actor=pid)
 
             first = runtime.run_next_process_once()
             second = runtime.run_next_process_once()
@@ -2531,6 +2566,7 @@ class TestLLMContextMemory:
         try:
             runtime.llm.client = client
             pid = runtime.process.spawn(image='base-agent:v0', goal='reset incomplete parallel response chain')
+            runtime.skills.activate_skill(pid, CHILD_PROCESSES_SKILL, actor=pid)
 
             first = runtime.run_next_process_once()
             second = runtime.run_next_process_once()
@@ -2581,6 +2617,7 @@ class TestLLMContextMemory:
         try:
             runtime.llm.client = client
             pid = runtime.process.spawn(image='base-agent:v0', goal='do not persist output in redacted mode')
+            runtime.skills.activate_skill(pid, CHILD_PROCESSES_SKILL, actor=pid)
 
             first = runtime.run_next_process_once()
             second = runtime.run_next_process_once()
@@ -2694,6 +2731,7 @@ class TestLLMContextMemory:
             try:
                 runtime.llm.client = first_client
                 pid = runtime.process.spawn(image='base-agent:v0', goal='resume response chain after reopen')
+                runtime.skills.activate_skill(pid, CHILD_PROCESSES_SKILL, actor=pid)
                 waiting = runtime.run_next_process_once()
                 assert waiting['waiting_message']
             finally:
@@ -2714,6 +2752,9 @@ class TestLLMContextMemory:
             reopened = Runtime.open(db, config=config)
             try:
                 reopened.llm.client = second_client
+                reopened_process = reopened.process.get(pid)
+                assert CHILD_PROCESSES_SKILL in reopened_process.loaded_skills
+                assert 'receive_process_messages' in reopened_process.model_tool_table
                 message = reopened.human.send_process_message(
                     pid,
                     'resume response chain',
@@ -2823,6 +2864,7 @@ class TestLLMContextMemory:
                 [{'action': 'receive_process_messages', 'channel': 'restore-pending'}]
             )
             pid = runtime.process.spawn(image='base-agent:v0', goal='restore pending LLM action')
+            runtime.skills.activate_skill(pid, CHILD_PROCESSES_SKILL, actor=pid)
             waiting = runtime.run_next_process_once()
             assert waiting['waiting_message']
             checkpoint_id = runtime.checkpoint.create(pid, 'pending message action', actor=pid)
@@ -2838,6 +2880,9 @@ class TestLLMContextMemory:
             assert runtime.store.get_llm_pending_action(pid)['status'] == 'completed'
 
             runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+            restored_process = runtime.process.get(pid)
+            assert CHILD_PROCESSES_SKILL in restored_process.loaded_skills
+            assert 'receive_process_messages' in restored_process.model_tool_table
             runtime.human.send_process_message(
                 pid,
                 'delivery after restore',
@@ -2894,6 +2939,7 @@ class TestLLMContextMemory:
                     [{'action': 'receive_process_messages', 'channel': 'crash-window'}]
                 )
                 pid = runtime.process.spawn(image='base-agent:v0', goal='close replay crash window')
+                runtime.skills.activate_skill(pid, CHILD_PROCESSES_SKILL, actor=pid)
                 waiting = runtime.run_next_process_once()
                 assert waiting['waiting_message']
                 message = runtime.human.send_process_message(
@@ -2924,7 +2970,10 @@ class TestLLMContextMemory:
 
             reopened = Runtime.open(db)
             try:
-                assert reopened.process.get(pid).status == ProcessStatus.FAILED
+                reopened_process = reopened.process.get(pid)
+                assert reopened_process.status == ProcessStatus.FAILED
+                assert CHILD_PROCESSES_SKILL in reopened_process.loaded_skills
+                assert 'receive_process_messages' in reopened_process.model_tool_table
                 assert reopened.store.get_llm_pending_action(pid)['status'] == 'resuming'
                 assert not reopened.llm.pending.has_memory(pid, "message")
             finally:
@@ -3022,6 +3071,16 @@ class TestLLMContextMemory:
         try:
             runtime.llm.client = TextOnlyActionClient(['Waiting for the next message.'])
             pid = runtime.process.spawn(image='base-agent:v0', goal='empty tool calls auto wait')
+            process_before = runtime.process.get(pid)
+            full_tool_table_before = dict(process_before.tool_table)
+            model_tool_table_before = dict(process_before.model_tool_table)
+            non_object_authority_before = {
+                capability.cap_id
+                for capability in runtime.capability.capabilities_for(pid)
+                if not capability.resource.startswith('object:')
+            }
+            assert 'receive_process_messages' in full_tool_table_before
+            assert 'receive_process_messages' not in model_tool_table_before
 
             result = runtime.run_next_process_once()
 
@@ -3038,6 +3097,20 @@ class TestLLMContextMemory:
             pending = runtime.store.get_llm_pending_action(pid)
             assert pending['wait_type'] == 'message'
             assert pending['action'] == {'action': 'receive_process_messages'}
+            assert pending_metadata(pending) == {
+                'kind': 'host_generated_action',
+                'schema_version': 1,
+                'source': 'llm.empty_tool_calls_auto_wait',
+                'tool_name': 'receive_process_messages',
+            }
+            process_after = runtime.process.get(pid)
+            assert process_after.tool_table == full_tool_table_before
+            assert process_after.model_tool_table == model_tool_table_before
+            assert {
+                capability.cap_id
+                for capability in runtime.capability.capabilities_for(pid)
+                if not capability.resource.startswith('object:')
+            } == non_object_authority_before
             call = runtime.store.list_llm_calls(pid)[0]
             assert call.tool_calls == []
             assert call.request_options['agent_libos_auto_wait_on_empty_tool_calls_enabled'] is True
@@ -3087,6 +3160,41 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    def test_empty_tool_calls_auto_wait_does_not_internalize_model_json_action(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = TextOnlyActionClient([
+                '{"action":"receive_process_messages"}',
+            ])
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject a model-selected hidden wait tool',
+            )
+            process = runtime.process.get(pid)
+            assert 'receive_process_messages' in process.tool_table
+            assert 'receive_process_messages' not in process.model_tool_table
+
+            result = runtime.run_next_process_once()
+
+            assert not result['ok']
+            assert 'model tool projection' in result['error']
+            assert runtime.process.get(pid).status == ProcessStatus.FAILED
+            assert not any(
+                record.action == 'llm.empty_tool_calls_auto_wait'
+                for record in runtime.audit.trace(actor=pid)
+            )
+            assert not any(
+                record.action == 'tool.call'
+                and record.decision.get('tool') == 'receive_process_messages'
+                for record in runtime.audit.trace(actor=pid)
+            )
+        finally:
+            runtime.close()
+
     def test_empty_tool_calls_auto_wait_does_not_bypass_tool_table(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
@@ -3130,15 +3238,28 @@ class TestLLMContextMemory:
             try:
                 runtime.llm.client = TextOnlyActionClient(['Waiting across restart.'])
                 pid = runtime.process.spawn(image='base-agent:v0', goal='persist auto wait')
+                process = runtime.process.get(pid)
+                assert 'receive_process_messages' in process.tool_table
+                assert 'receive_process_messages' not in process.model_tool_table
                 waiting = runtime.run_next_process_once()
                 assert waiting['waiting_message']
-                assert runtime.store.get_llm_pending_action(pid)['wait_type'] == 'message'
+                durable_pending = runtime.store.get_llm_pending_action(pid)
+                assert durable_pending['wait_type'] == 'message'
+                assert pending_metadata(durable_pending)['source'] == (
+                    'llm.empty_tool_calls_auto_wait'
+                )
             finally:
                 runtime.close()
 
             reopened = Runtime.open(db, config=config)
             try:
                 reopened.llm.client = ExplodingClient()
+                reopened_process = reopened.process.get(pid)
+                assert 'receive_process_messages' in reopened_process.tool_table
+                assert (
+                    'receive_process_messages'
+                    not in reopened_process.model_tool_table
+                )
                 message = reopened.human.send_process_message(pid, 'resume now', subject='resume')
                 resumed = reopened.run_next_process_once()
 
@@ -3146,6 +3267,18 @@ class TestLLMContextMemory:
                 assert resumed['action']['action'] == 'receive_process_messages'
                 assert resumed['result']['payload']['messages'][0]['message_id'] == message.message_id
                 assert reopened.store.get_llm_pending_action(pid)['status'] == 'completed'
+                assert (
+                    'receive_process_messages'
+                    not in reopened.process.get(pid).model_tool_table
+                )
+                completed_action = next(
+                    record
+                    for record in reversed(reopened.audit.trace(actor=pid))
+                    if record.action == 'llm.action'
+                )
+                assert completed_action.decision['action_source'] == (
+                    'host_empty_tool_calls_auto_wait'
+                )
             finally:
                 reopened.close()
 
@@ -3159,7 +3292,11 @@ class TestLLMContextMemory:
                     {'action': 'write_text_file', 'path': path, 'content': 'persisted approval action'},
                 ])
                 pid = runtime.process.spawn(image='review-agent:v0', goal='write after approval')
-                runtime.tools.activate_tool_group(pid, 'filesystem')
+                runtime.skills.activate_skill(
+                    pid,
+                    'agent-libos-workspace-editing',
+                    actor=pid,
+                )
                 runtime.capability.set_permission_policy(
                     subject=pid,
                     resource=runtime.filesystem.resource_for(path),
@@ -3201,6 +3338,7 @@ class TestLLMContextMemory:
                 {'action': 'process_exit', 'payload': _compact_summary('compressed state')},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='compact current context')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
             _grant_context_compressor_authority(runtime, pid)
 
             results = runtime.run_until_idle(max_quanta=3)
@@ -3242,6 +3380,7 @@ class TestLLMContextMemory:
                 }
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='small context')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
 
             result = runtime.run_next_process_once()
 
@@ -3270,6 +3409,7 @@ class TestLLMContextMemory:
                 {'action': 'process_exit', 'payload': {'goal': 'missing required fields'}},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='invalid compressor output')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
             _grant_context_compressor_authority(runtime, pid)
 
             waiting = runtime.run_next_process_once()
@@ -3342,6 +3482,7 @@ class TestLLMContextMemory:
                 ],
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='fail exhausted compaction')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
             _grant_context_compressor_authority(runtime, pid)
             _seed_context_entries(runtime, pid, count=40)
 
@@ -3382,6 +3523,7 @@ class TestLLMContextMemory:
                 {'action': 'process_exit', 'payload': _compact_summary('stale summary')},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='race context')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
             _grant_context_compressor_authority(runtime, pid)
 
             waiting = runtime.run_next_process_once()
@@ -3522,6 +3664,7 @@ class TestLLMContextMemory:
                 {'action': 'process_exit', 'payload': cumulative},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='multi chunk context')
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
             _grant_context_compressor_authority(runtime, pid)
 
             results = runtime.run_until_idle(max_quanta=5)
@@ -3568,6 +3711,7 @@ class TestLLMContextMemory:
                     }
                 ])
                 pid = runtime.process.spawn(image='base-agent:v0', goal='reopen compaction')
+                runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
                 _grant_context_compressor_authority(runtime, pid)
                 waiting = runtime.run_next_process_once()
                 assert waiting['waiting_event']
@@ -3580,6 +3724,9 @@ class TestLLMContextMemory:
                 reopened.llm.client = RecordingActionClient([
                     {'action': 'process_exit', 'payload': _compact_summary('reopened state')},
                 ])
+                reopened_process = reopened.process.get(pid)
+                assert RUNTIME_SESSION_SKILL in reopened_process.loaded_skills
+                assert 'compact_process_context' in reopened_process.model_tool_table
                 results = reopened.run_until_idle(max_quanta=2)
                 completed = _last_action_result(results, 'compact_process_context')
                 assert completed['result']['ok']
@@ -3606,6 +3753,7 @@ class TestLLMContextMemory:
                     {'action': 'process_exit', 'payload': _compact_summary('lost result')},
                 ])
                 pid = runtime.process.spawn(image='base-agent:v0', goal='rerun missing child result')
+                runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
                 _grant_context_compressor_authority(runtime, pid)
                 waiting = runtime.run_next_process_once()
                 child_pid = waiting['child_pid']
@@ -3631,6 +3779,9 @@ class TestLLMContextMemory:
                 reopened.llm.client = RecordingActionClient([
                     {'action': 'process_exit', 'payload': _compact_summary('rerun result')},
                 ])
+                reopened_process = reopened.process.get(pid)
+                assert RUNTIME_SESSION_SKILL in reopened_process.loaded_skills
+                assert 'compact_process_context' in reopened_process.model_tool_table
                 results = reopened.run_until_idle(max_quanta=3)
                 completed = _last_action_result(results, 'compact_process_context')
                 assert completed['result']['ok']

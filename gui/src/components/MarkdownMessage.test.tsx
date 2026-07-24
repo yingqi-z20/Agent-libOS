@@ -83,6 +83,7 @@ describe("MarkdownMessage", () => {
           snapshot={snapshot}
           selectedPid="pid_1"
           selectedProcess={process}
+          taskLabels={{ pid_1: "Render markdown" }}
           maxQuanta={null}
           spawnGoal="goal"
           spawnImage="coding-agent:v0"
@@ -90,6 +91,8 @@ describe("MarkdownMessage", () => {
           spawnWorkingDirectory=""
           spawnWorkspaceAccess="edit"
           spawnAllowGitRequests={true}
+          spawnCommandAccess="none"
+          spawnContextMaintenance
           message=""
           images={[]}
           llmProfiles={[]}
@@ -101,6 +104,8 @@ describe("MarkdownMessage", () => {
           onSpawnWorkingDirectoryChange={() => undefined}
           onSpawnWorkspaceAccessChange={() => undefined}
           onSpawnAllowGitRequestsChange={() => undefined}
+          onSpawnCommandAccessChange={() => undefined}
+          onSpawnContextMaintenanceChange={() => undefined}
           onMessageChange={() => undefined}
           onSpawn={() => undefined}
           onImportImage={() => undefined}

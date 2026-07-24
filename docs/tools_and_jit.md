@@ -20,10 +20,10 @@ The current built-in tool surface includes tools for:
   Tool paths resolve from the process's current working directory and must stay
   contained by the runtime workspace root; they are not implicitly rooted at
   the workspace when the process uses a nested cwd. Object/file bridge tools
-  use the same resolution rule. For model ergonomics, a redundant
-  workspace-relative cwd prefix on a descendant path is stripped before
-  resolution; this maps to the same contained target and grants no additional
-  authority. A path equal to the cwd is not rewritten.
+  use the same resolution rule. A leading segment matching the cwd is not
+  treated as redundant: for a process whose cwd is `pkg`, `pkg/module.py`
+  resolves to `pkg/pkg/module.py`. Callers that intend `pkg/module.py` must
+  pass `module.py` from that cwd.
 - Human I/O: ask questions, output messages, and request permission.
 - Capabilities: list/inspect the current process's authority, delegate an
   attenuated delegable capability to a child, relinquish its own revocable
@@ -51,73 +51,117 @@ The current built-in tool surface includes tools for:
 - Checkpoint: create, list, inspect, diff, restore, and fork.
 - Skills: discover, activate, read bundled resources, and unload.
 - JIT: propose, validate, and register Deno/TypeScript tools.
-- Lazy tool projection: discover and activate image-authorized tool groups
-  without changing the underlying process tool table or resource authority.
+- Built-in tool Skills: discover intent-focused guidance and project only the
+  image-authorized tool schemas needed for the current task.
 - Utility actions such as `echo` and `parse_pytest_log`.
 
 Use `uv run agent-libos tools` to inspect registered tools in a runtime.
 
-## Lazy Tool Groups
+## Built-In Tool Skills
 
-An image with the exact boolean `metadata.lazy_tool_groups: true` starts with a small model-tool
-projection instead of exposing every authorized schema at once. The initial
-core is the intersection of the image's `default_tools` with:
+An image with `metadata.tool_projection: skills` starts with a small
+model-facing projection instead of exposing every image tool schema at once.
+The fixed bootstrap requires the complete image-authorized set of
+`discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill`, and
+`process_exit`; a Skills-projection image missing any member is rejected. The
+image's full process tool table is unchanged.
 
-- `discover_tool_groups`, `activate_tool_group`, and `process_exit`;
-- `request_permission`, `ask_human`, and `human_output`;
-- `read_memory_object`, `create_memory_object`, and
-  `append_memory_object`; and
-- `get_current_time` and `list_capabilities`.
+The prompt contains a compact catalog of applicable built-in Skill IDs,
+descriptions, and active state. It does not contain every Skill body or tool
+schema. `discover_skills` returns the same applicable built-ins even when the
+caller has no registered-Skill catalog read capability. `activate_skill` then
+loads the selected instructions and atomically copies all of that Skill's exact
+bindings from the full process tool table into the model projection. An image
+may select initially active instruction sets with `default_skills`.
 
-An image may additionally declare `metadata.initial_tool_groups` as a unique
-list of known group names. Their already-authorized tool intersections join the
-core at process creation. A malformed, duplicate, unknown, or empty
-intersection fails boot; it never adds a tool that is absent from
-`default_tools`. String booleans are rejected, and `initial_tool_groups`
-without lazy projection is rejected instead of being silently ignored.
+Applicability is all-or-nothing: a built-in Skill is hidden and cannot activate
+unless every declared tool already exists in the image-authorized process tool
+table. Activation never resolves a missing binding from the global registry,
+adds to the full table, grants Capability, or approves a primitive effect. It
+records `authority_changed: false`; filesystem, shell, Git, remote, checkpoint,
+human, and other effects still pass through their normal authority and approval
+boundaries. Same-process activation and unload of an immutable built-in Skill
+need no `skill:*` Capability because they only change model visibility.
+Cross-process operations still require `process:<pid>` `admin`.
 
-This changes model visibility only. The process tool table remains the
-image-authorized table, and activating a group does not grant capabilities.
-`discover_tool_groups` reports only groups with at least one tool in that
-table; its `tool_count` is the number of authorized tools in the group and
-`active` means all of those tools are already in the model projection.
-`activate_tool_group` adds the authorized intersection to the model projection
-and records the before/after schema counts and bytes in audit evidence.
+The catalog gives each of the 99 built-in static tools one intent-focused owner
+across 26 Skills, with at most nine tools per Skill. The owner is available
+through `SkillManager.builtin_skill_for_tool()`. This keeps automatic routing
+deterministic and prevents overlapping Skills from making unload provenance
+ambiguous:
 
-The built-in base, coding, and review images use this projection. Base starts
-with the process, context, and clock groups, coding starts with filesystem, and
-review starts with the narrower `filesystem_read` group. Their prompts tell the
-model to activate the smallest additional group and to distinguish a hidden
-schema from missing resource authority. The toolmaker and context-compressor
-images already have narrow explicit tool tables and do not use lazy projection.
-
-The built-in groups are:
-
-| Group | Configured tool names |
+| Built-in Skill | Guidance scope |
 | --- | --- |
-| `filesystem_read` | `read_text_file`, `read_directory`, `create_object_from_file` |
-| `filesystem` | `read_text_file`, `write_text_file`, `read_directory`, `write_directory`, `delete_file`, `delete_directory`, `create_object_from_file`, `write_object_to_file`, `get_working_directory`, `set_working_directory` |
-| `process` | `list_child_processes`, `spawn_child_process`, `fork_child_process`, `wait_child_process`, `signal_child_process`, `merge_child_memory`, `send_process_message`, `read_process_messages`, `receive_process_messages`, `exec_process` |
-| `remote` | `list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, `call_jsonrpc_method`, `list_mcp_servers`, `inspect_mcp_server`, `list_mcp_tools`, `call_mcp_tool` |
-| `git` | `git_repository_info`, `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_list_refs`, `git_list_remotes`, `git_list_worktrees`, `git_stage`, `git_unstage`, `git_commit`, `git_restore`, `git_branch`, `git_switch`, `git_tag`, `git_integrate`, `git_stash`, `git_reset`, `git_clean`, `git_worktree`, `git_create_patch`, `git_apply_patch`, `git_fetch`, `git_pull`, `git_push`, `git_create_pull_request`, `git_list_pull_requests`, `git_inspect_pull_request`, `git_review_pull_request`, `git_merge_pull_request`, `git_close_pull_request` |
-| `checkpoint` | `create_checkpoint`, `list_checkpoints`, `inspect_checkpoint`, `diff_checkpoint`, `fork_checkpoint`, `restore_checkpoint`, `commit_checkpoint_to_image` |
-| `memory` | `create_memory_namespace`, `list_memory_namespace`, `create_memory_object`, `append_memory_object`, `read_memory_object`, `create_object_from_file`, `write_object_to_file` |
-| `skills` | `discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill` |
-| `object_tasks` | `start_object_task`, `get_object_task`, `list_object_tasks`, `wait_object_task`, `watch_object_task_owner`, `cancel_object_task` |
-| `self_evolution` | `load_image_package`, `propose_jit_tool`, `validate_jit_tool`, `register_jit_tool` |
-| `authority` | `list_capabilities`, `inspect_capability`, `delegate_capability`, `revoke_capability` |
-| `shell` | `run_shell_command`, `parse_pytest_log` |
-| `context` | `compact_process_context` |
-| `clock` | `sleep` |
+| `agent-libos-skill-navigation` | Discover, activate, inspect resources from, and unload Skills |
+| `agent-libos-authority-basics` | Inspect authority and request missing permission |
+| `agent-libos-capability-delegation` | Delegate or revoke Capability |
+| `agent-libos-human-collaboration` | Ask a human question or emit user-facing output |
+| `agent-libos-runtime-session` | Exit, compact context, read time, or sleep |
+| `agent-libos-workspace-navigation` | Inspect files/directories and manage cwd |
+| `agent-libos-workspace-editing` | Create, write, or delete workspace paths |
+| `agent-libos-command-execution` | Run policy-governed argv-only commands |
+| `agent-libos-test-log-analysis` | Parse pytest output |
+| `agent-libos-tool-protocol-diagnostics` | Exercise the tool protocol with `echo` |
+| `agent-libos-object-memory` | Manage Object Memory namespaces and objects |
+| `agent-libos-object-file-transfer` | Transfer data between Objects and files |
+| `agent-libos-object-tasks` | Start, observe, wait for, or cancel Object tasks |
+| `agent-libos-child-processes` | Create, coordinate, and message child processes |
+| `agent-libos-checkpoints` | Create, inspect, fork, restore, or diff checkpoints |
+| `agent-libos-agent-images` | Load images, commit checkpoint-derived images, or exec |
+| `agent-libos-jit-tool-authoring` | Propose, validate, and register JIT tools |
+| `agent-libos-jsonrpc` | Inspect and call registered JSON-RPC endpoints |
+| `agent-libos-mcp` | Inspect registered MCP servers and call allowed tools |
+| `agent-libos-git-inspection` | Inspect repository state and history |
+| `agent-libos-git-change-recording` | Stage, unstage, and commit changes |
+| `agent-libos-git-branches-worktrees` | Manage branches, tags, switches, and worktrees |
+| `agent-libos-git-integration-recovery` | Integrate or recover local Git state |
+| `agent-libos-git-patch-objects` | Create or apply immutable patch Objects |
+| `agent-libos-git-remotes` | Fetch, pull, or push configured remotes |
+| `agent-libos-git-pull-requests` | Manage repository-local simulated pull requests |
 
-A tool may appear in more than one group. Group membership is a fixed model
-projection convenience, not an authority declaration.
+The built-in base image initially exposes 15 schemas by loading navigation,
+authority, human-collaboration, and Object Memory guidance. Coding and review
+each expose 14 by loading navigation, authority, human-collaboration, and
+workspace-navigation guidance; editing, Git, shell, and other schemas remain
+on demand. Toolmaker keeps its narrow full projection and loads the JIT
+authoring guide. Context-compressor remains a single-tool image.
+
+The former `lazy_tool_groups`/`initial_tool_groups` image metadata and
+`discover_tool_groups`/`activate_tool_group` tools are removed rather than
+aliased. The storage migration converts old custom lazy images to full
+projection after replacing the obsolete lifecycle tools, so an upgrade does
+not silently hide an authorized tool. Unknown or malformed legacy group data
+aborts migration instead of guessing; old tool calls fail as unknown tools.
+
+Run the one-time migration while the runtime is stopped. It is a content-only,
+atomic offline migration and is never run during startup. The default command
+performs the complete validation and rewrite in a transaction, prints the
+report, and rolls the transaction back:
+
+```bash
+agent-libos-migrate-tool-groups /path/to/runtime.sqlite
+```
+
+Source checkouts may equivalently run
+`uv run python scripts/migrate_tool_groups_to_skills.py`. Pass `--config` when
+the store uses a non-default config overlay; otherwise the command loads the
+project-root `config.yaml`, matching the main CLI. After reviewing that report,
+repeat with `--apply` to commit it. A migrated
+custom lazy image intentionally omits `tool_projection` and therefore falls
+back to full schema projection; the report includes this warning. Immutable
+checkpoint-commit artifacts are replaced by new content-addressed artifact
+rows while old rows remain intact. Raw image-package files likewise remain
+unchanged and are called out in the report.
 
 ## Context Compaction
 
 Images may invoke compaction automatically before an LLM request by setting
-`planner.context_management.mode: auto_compact` (the default). The attempt is
-made only once per pressure episode and policy fingerprint. It counts as
+`planner.context_management.mode: auto_compact` (the default policy choice),
+but only for a process with explicitly enabled persistent context and
+`context:maintenance/execute` authority. Default source-only execution records
+the pressure decision as not authorized and neither injects context nor invokes
+the tool. An authorized attempt is made only once per pressure episode and
+policy fingerprint. It counts as
 successful only when the tool reports `compacted: true` and advances the
 durable LLM-context generation; the current quantum then ends so the next one
 re-materializes context. An unavailable, denied, invalid, resource-exhausted,

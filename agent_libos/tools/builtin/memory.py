@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, WithJsonSchema, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.memory.data_labels import propagate_object_labels
@@ -11,18 +12,68 @@ from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, To
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
+_DIRECT_JSON_SCHEMA = {
+    "anyOf": [
+        {"type": "object", "additionalProperties": True},
+        {"type": "array", "items": {}},
+        {"type": "string"},
+        {"type": "number"},
+        {"type": "boolean"},
+        {"type": "null"},
+    ]
+}
+DirectJsonValue = Annotated[Any, WithJsonSchema(_DIRECT_JSON_SCHEMA)]
+
+
+def _decode_stringified_json_container(value: Any) -> Any:
+    """Normalize provider-stringified objects/arrays without changing scalar strings."""
+
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        decoded = json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+    return decoded if isinstance(decoded, (dict, list)) else value
+
+
+def _empty_optional_text_is_none(value: Any) -> Any:
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
 
 class CreateMemoryObjectArgs(BaseModel):
     name: str | None = Field(default=None, description="Optional namespace-local object name.")
     namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     type: str = Field(description="Agent libOS object type, for example summary, plan, observation, or artifact.")
-    payload: Any = Field(description="Structured payload to store.")
+    payload: DirectJsonValue = Field(
+        description=(
+            "Direct JSON value to store. Pass objects/arrays as JSON values, not as a JSON-encoded string."
+        )
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)
     parent_oids: list[str] = Field(
         default_factory=list,
-        description="Optional Object Memory source ids used for conservative data-label propagation.",
+        description=(
+            "Optional confirmed Object Memory OIDs returned by memory tools. "
+            "Do not pass filesystem or generic tool-result object IDs."
+        ),
     )
     immutable: bool = True
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def decode_stringified_payload_container(cls, value: Any) -> Any:
+        return _decode_stringified_json_container(value)
+
+    @field_validator("namespace", mode="before")
+    @classmethod
+    def normalize_empty_namespace(cls, value: Any) -> Any:
+        return _empty_optional_text_is_none(value)
 
 
 class CreateMemoryObjectOutput(BaseModel):
@@ -33,7 +84,13 @@ class CreateMemoryObjectOutput(BaseModel):
 
 
 class ReadMemoryObjectArgs(BaseModel):
-    name: str = Field(description="Namespace-local Object Memory name to read.")
+    name: str = Field(
+        description=(
+            "Exact namespace-local name returned by list_memory_namespace. "
+            "There is no bare `goal` alias, and a runtime-only goal object may "
+            "be unavailable after reopen; use cumulative process_exit review then."
+        )
+    )
     namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     max_payload_chars: int = Field(
         default=_TOOL_DEFAULTS.memory_payload_chars,
@@ -41,6 +98,11 @@ class ReadMemoryObjectArgs(BaseModel):
         le=_TOOL_DEFAULTS.memory_payload_hard_limit_chars,
         description="Maximum rendered payload chars.",
     )
+
+    @field_validator("namespace", mode="before")
+    @classmethod
+    def normalize_empty_namespace(cls, value: Any) -> Any:
+        return _empty_optional_text_is_none(value)
 
 
 class ReadMemoryObjectOutput(BaseModel):
@@ -56,11 +118,25 @@ class ReadMemoryObjectOutput(BaseModel):
 class AppendMemoryObjectArgs(BaseModel):
     name: str = Field(description="Namespace-local mutable Object Memory name to append to.")
     namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
-    entry: Any = Field(description="Structured entry to append.")
+    entry: DirectJsonValue = Field(
+        description=(
+            "Direct JSON entry to append. Pass an object/array directly, not as a JSON-encoded string."
+        )
+    )
     list_field: str = Field(
         default="entries",
         description="Payload list field to append into when the object payload is a JSON object.",
     )
+
+    @field_validator("entry", mode="before")
+    @classmethod
+    def decode_stringified_entry_container(cls, value: Any) -> Any:
+        return _decode_stringified_json_container(value)
+
+    @field_validator("namespace", mode="before")
+    @classmethod
+    def normalize_empty_namespace(cls, value: Any) -> Any:
+        return _empty_optional_text_is_none(value)
 
 
 class AppendMemoryObjectOutput(BaseModel):
@@ -81,6 +157,11 @@ class CreateMemoryNamespaceArgs(BaseModel):
     )
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("parent_namespace", mode="before")
+    @classmethod
+    def normalize_empty_parent_namespace(cls, value: Any) -> Any:
+        return _empty_optional_text_is_none(value)
+
 
 class CreateMemoryNamespaceOutput(BaseModel):
     namespace: str
@@ -89,12 +170,23 @@ class CreateMemoryNamespaceOutput(BaseModel):
 
 
 class ListMemoryNamespaceArgs(BaseModel):
-    namespace: str | None = Field(default=None, description="Namespace to list. Defaults to this process namespace.")
+    namespace: str | None = Field(
+        default=None,
+        description=(
+            "Exact namespace to list; null defaults to this process namespace. "
+            "Do not broaden to the parent `process` namespace as a fallback."
+        ),
+    )
     limit: int | None = Field(
         default=None,
         ge=1,
         description="Maximum number of visible namespace entries to return. Defaults to the runtime memory query limit.",
     )
+
+    @field_validator("namespace", mode="before")
+    @classmethod
+    def normalize_empty_namespace(cls, value: Any) -> Any:
+        return _empty_optional_text_is_none(value)
 
 
 class MemoryNamespaceObjectEntry(BaseModel):

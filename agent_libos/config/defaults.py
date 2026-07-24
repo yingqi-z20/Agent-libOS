@@ -653,10 +653,13 @@ class ObjectTaskDefaults:
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LLMContextDefaults:
-    policy: str = "llm_context_object"
+    policy: str = "source_only"
     schema_version: int = 1
     object_name_prefix: str = "llm_context"
     recent_event_limit: int = 20
+    storage_compaction_threshold_bytes: int = 96_000
+    storage_compaction_max_chunks: int = 4
+    storage_compaction_preserve_recent_entries: int = 0
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -869,8 +872,45 @@ def _validate_deno_timeout_config(tools: ToolDefaults) -> None:
     )
 
 
-def _validate_config(config: AgentLibOSConfig) -> None:
-    runtime = config.runtime
+def _validate_llm_context_config(
+    llm_context: LLMContextDefaults,
+    tools: ToolDefaults,
+) -> None:
+    if llm_context.policy not in {"source_only", "llm_context_object"}:
+        raise ValueError(
+            "llm_context.policy must be source_only or llm_context_object"
+        )
+    _positive(
+        "llm_context.storage_compaction_threshold_bytes",
+        llm_context.storage_compaction_threshold_bytes,
+    )
+    _positive(
+        "llm_context.storage_compaction_max_chunks",
+        llm_context.storage_compaction_max_chunks,
+    )
+    _nonnegative(
+        "llm_context.storage_compaction_preserve_recent_entries",
+        llm_context.storage_compaction_preserve_recent_entries,
+    )
+    if llm_context.storage_compaction_max_chunks > 64:
+        raise ValueError(
+            "llm_context.storage_compaction_max_chunks must not exceed 64"
+        )
+    if llm_context.storage_compaction_preserve_recent_entries > 128:
+        raise ValueError(
+            "llm_context.storage_compaction_preserve_recent_entries must not exceed 128"
+        )
+    if (
+        llm_context.storage_compaction_threshold_bytes
+        >= tools.memory_payload_hard_limit_bytes
+    ):
+        raise ValueError(
+            "llm_context.storage_compaction_threshold_bytes must be less than "
+            "tools.memory_payload_hard_limit_bytes"
+        )
+
+
+def _validate_runtime_config(runtime: RuntimeDefaults) -> None:
     for name in (
         "local_store_target",
         "runtime_db_filename",
@@ -910,6 +950,10 @@ def _validate_config(config: AgentLibOSConfig) -> None:
             )
     _positive_optional("runtime.run_until_idle_max_quanta", runtime.run_until_idle_max_quanta)
     _positive("runtime.launcher_max_quanta", runtime.launcher_max_quanta)
+
+
+def _validate_config(config: AgentLibOSConfig) -> None:
+    _validate_runtime_config(config.runtime)
     data_flow = config.data_flow
     if data_flow.default_trust_level is not SinkTrustLevel.UNTRUSTED:
         raise ValueError("data_flow.default_trust_level must remain untrusted")
@@ -1075,6 +1119,8 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _require_at_least("tools.memory_payload_hard_limit_chars", tools.memory_payload_hard_limit_chars, "tools.memory_payload_chars", tools.memory_payload_chars)
     _require_at_least("tools.message_read_hard_limit", tools.message_read_hard_limit, "tools.message_read_limit", tools.message_read_limit)
     _require_at_least("tools.object_file_hard_limit_bytes", tools.object_file_hard_limit_bytes, "tools.object_file_max_bytes", tools.object_file_max_bytes)
+
+    _validate_llm_context_config(config.llm_context, tools)
 
     _validate_shell_config(config.shell, tools)
     _validate_git_config(config.git)

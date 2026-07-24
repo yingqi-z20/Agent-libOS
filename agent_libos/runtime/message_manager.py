@@ -402,6 +402,7 @@ class ProcessMessageManager:
         kind: ProcessMessageKind | str,
         phase: str,
         source: str = "runtime",
+        instruction: str | None = None,
     ) -> dict[str, Any] | None:
         messages = self.unread(pid, kind=kind)
         if not messages:
@@ -414,7 +415,8 @@ class ProcessMessageManager:
             "message_ids": [message.message_id for message in messages],
             "channels": sorted({message.channel for message in messages}),
             "correlation_ids": sorted({message.correlation_id for message in messages if message.correlation_id}),
-            "instruction": "Call read_process_messages or receive_process_messages to inspect and acknowledge unread process messages.",
+            "instruction": instruction
+            or "Call read_process_messages or receive_process_messages to inspect and acknowledge unread process messages.",
         }
         self.events.emit(
             EventType.PROCESS_MESSAGE_NOTICE,

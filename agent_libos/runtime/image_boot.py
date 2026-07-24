@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any
@@ -236,7 +236,11 @@ class ImageBootService:
             )
             self._advance_publication(publication_id, "process_exec_applied")
             assigned_by = f"publication:{publication_id}"
-            self._configure_tools(pid, image, assigned_by)
+            initial_tool_table, initial_model_tool_table = self._configure_tools(
+                pid,
+                image,
+                assigned_by,
+            )
             self._advance_publication(publication_id, "tools_configured")
             self._instantiate_boot(
                 pid,
@@ -251,6 +255,8 @@ class ImageBootService:
                 image,
                 assigned_by,
                 publication_id=publication_id,
+                initial_tool_table=initial_tool_table,
+                initial_model_tool_table=initial_model_tool_table,
             )
             self._advance_publication(publication_id, "skills_configured")
             self._commit_exec_publication(
@@ -2012,7 +2018,11 @@ class ImageBootService:
                     f"process launch publication changed before image boot: {publication_id}"
                 )
             assigned_by = f"publication:{publication_id}"
-            self._configure_tools(pid, image, assigned_by)
+            initial_tool_table, initial_model_tool_table = self._configure_tools(
+                pid,
+                image,
+                assigned_by,
+            )
             self._instantiate_boot(
                 pid,
                 image,
@@ -2030,6 +2040,8 @@ class ImageBootService:
                 image,
                 assigned_by,
                 publication_id=publication_id,
+                initial_tool_table=initial_tool_table,
+                initial_model_tool_table=initial_model_tool_table,
             )
         except Exception as exc:
             if boot_kind == "image_package":
@@ -2053,18 +2065,18 @@ class ImageBootService:
         pid: str,
         image: AgentImage,
         assigned_by: str,
-    ) -> dict[str, str]:
+    ) -> tuple[dict[str, str], dict[str, str]]:
         full_table = self._tools.configure_process_tools(
             pid,
             sorted(image.default_tools),
             assigned_by=assigned_by,
         )
-        self._tools.configure_model_tool_projection(
+        model_table = self._tools.configure_model_tool_projection(
             pid,
             sorted(self._tools.initial_tool_projection(image)),
             assigned_by=f"{assigned_by}:model_projection",
         )
-        return full_table
+        return full_table, model_table
 
     def _configure_skills(
         self,
@@ -2073,11 +2085,17 @@ class ImageBootService:
         assigned_by: str,
         *,
         publication_id: str | None = None,
+        initial_tool_table: Mapping[str, str],
+        initial_model_tool_table: Mapping[str, str],
     ) -> None:
         process = self._processes.get_process(pid)
         if process is None:
             return
-        self._apply_loaded_skill_tool_table(process)
+        self._apply_loaded_skill_tool_table(
+            process,
+            initial_tool_table=initial_tool_table,
+            initial_model_tool_table=initial_model_tool_table,
+        )
         for skill_id in image.default_skills:
             current = self._processes.get_process(pid)
             if current is not None and skill_id in current.loaded_skills:
@@ -2090,34 +2108,160 @@ class ImageBootService:
                 publication_id=publication_id,
             )
 
-    def _apply_loaded_skill_tool_table(self, process: Any) -> None:
+    def _apply_loaded_skill_tool_table(
+        self,
+        process: Any,
+        *,
+        initial_tool_table: Mapping[str, str],
+        initial_model_tool_table: Mapping[str, str],
+    ) -> None:
         if not process.loaded_skills:
             return
         updated = dict(process.tool_table)
         updated_model = dict(process.model_tool_table)
-        for loaded in process.loaded_skills.values():
+        updated_loaded = dict(process.loaded_skills)
+        for skill_id, loaded in list(process.loaded_skills.items()):
             if not isinstance(loaded, dict):
                 continue
-            for mapping_key in ("tool_ids", "jit_tool_ids"):
-                mapping = loaded.get(mapping_key)
-                if not isinstance(mapping, dict):
+            activation_kind = loaded.get("activation_kind", "registered")
+            if activation_kind == "builtin_projection":
+                if not self._skills.builtin_projection_supported_by_process(
+                    process,
+                    str(skill_id),
+                    loaded,
+                ):
+                    # Fork/exec may target a narrower image. Built-in Skills
+                    # are visibility-only and must never carry parent bindings
+                    # into the target image's complete tool table.
+                    updated_loaded.pop(skill_id, None)
+                    self._audit.record(
+                        actor="runtime",
+                        action="skill.builtin_projection_dropped",
+                        target=f"process:{process.pid}",
+                        decision={
+                            "skill_id": skill_id,
+                            "image_id": process.image_id,
+                            "authority_changed": False,
+                            "reason": "target image does not contain the complete built-in Skill tool set",
+                        },
+                    )
                     continue
-                for name, tool_id in mapping.items():
-                    if isinstance(name, str) and isinstance(tool_id, str):
-                        updated[name] = tool_id
-                        updated_model[name] = tool_id
+                rebased = self._rebase_builtin_loaded_skill(
+                    loaded,
+                    initial_model_tool_table=initial_model_tool_table,
+                )
+                updated_loaded[skill_id] = rebased
+                updated_model.update(
+                    self._loaded_string_bindings(rebased, ("tool_ids",))
+                )
+                continue
+            if activation_kind != "registered":
+                raise ValidationError(
+                    f"unknown loaded Skill activation_kind during image boot: {activation_kind}"
+                )
+            rebased = self._rebase_registered_loaded_skill(
+                str(skill_id),
+                loaded,
+                initial_tool_table=initial_tool_table,
+                initial_model_tool_table=initial_model_tool_table,
+            )
+            updated_loaded[skill_id] = rebased
+            bindings = self._loaded_string_bindings(
+                rebased,
+                ("tool_ids", "jit_tool_ids"),
+            )
+            updated.update(bindings)
+            updated_model.update(bindings)
         process.tool_table = updated
         process.model_tool_table = updated_model
+        process.loaded_skills = updated_loaded
         process.updated_at = utc_now()
         self._processes.patch_process(
             process.pid,
             {
                 "tool_table": process.tool_table,
                 "model_tool_table": process.model_tool_table,
+                "loaded_skills": process.loaded_skills,
                 "updated_at": process.updated_at,
             },
             expected_revision=process.revision,
         )
+
+    def _rebase_builtin_loaded_skill(
+        self,
+        loaded: dict[str, Any],
+        *,
+        initial_model_tool_table: Mapping[str, str],
+    ) -> dict[str, Any]:
+        bindings = self._loaded_string_bindings(loaded, ("tool_ids",))
+        rebased = dict(loaded)
+        rebased["base_tool_ids"] = dict(bindings)
+        rebased["base_model_tool_ids"] = {
+            name: str(initial_model_tool_table[name])
+            for name in bindings
+            if name in initial_model_tool_table
+        }
+        return rebased
+
+    def _rebase_registered_loaded_skill(
+        self,
+        skill_id: str,
+        loaded: dict[str, Any],
+        *,
+        initial_tool_table: Mapping[str, str],
+        initial_model_tool_table: Mapping[str, str],
+    ) -> dict[str, Any]:
+        if not all(
+            isinstance(loaded.get(field), dict)
+            for field in ("base_tool_ids", "base_model_tool_ids")
+        ):
+            raise ValidationError(
+                "loaded Skill state is missing canonical tool provenance "
+                f"during image boot: {skill_id}"
+            )
+        published_names = set(
+            self._loaded_string_bindings(
+                loaded,
+                ("tool_ids", "jit_tool_ids"),
+            )
+        )
+        # A fork or checkpoint-backed exec can carry ordinary loaded Skills
+        # across images. Their saved base bindings describe the source image,
+        # so retaining them would let a later unload resurrect a source-only
+        # tool after the target image has been configured. Rebase only to the
+        # exact target image tables captured before inherited Skills were
+        # applied.
+        rebased = dict(loaded)
+        rebased["base_tool_ids"] = {
+            name: str(initial_tool_table[name])
+            for name in published_names
+            if name in initial_tool_table
+        }
+        rebased["base_model_tool_ids"] = {
+            name: str(initial_model_tool_table[name])
+            for name in published_names
+            if name in initial_model_tool_table
+        }
+        return rebased
+
+    @staticmethod
+    def _loaded_string_bindings(
+        loaded: Mapping[str, Any],
+        fields: Iterable[str],
+    ) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for field in fields:
+            mapping = loaded.get(field)
+            if not isinstance(mapping, dict):
+                continue
+            result.update(
+                {
+                    name: tool_id
+                    for name, tool_id in mapping.items()
+                    if isinstance(name, str) and isinstance(tool_id, str)
+                }
+            )
+        return result
 
     def _instantiate_boot(
         self,

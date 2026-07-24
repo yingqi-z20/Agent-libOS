@@ -36,9 +36,9 @@ def write_skill_package(
         metadata["agent-libos.jit-tools"] = "references/agent-libos/jit-tools.json"
 
     skill_dir.mkdir(parents=True, exist_ok=True)
-    frontmatter_lines = ["---", f"name: {name}", f"description: Adds tools for {name}.", "allowed-tools:"]
-    for tool in allowed_tools or []:
-        frontmatter_lines.append(f"  - {tool}")
+    frontmatter_lines = ["---", f"name: {name}", f"description: Adds tools for {name}."]
+    if allowed_tools:
+        frontmatter_lines.append(f"allowed-tools: {' '.join(allowed_tools)}")
     frontmatter_lines.append("metadata:")
     for key, value in metadata.items():
         frontmatter_lines.append(f"  {key}: {value}")

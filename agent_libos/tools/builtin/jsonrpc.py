@@ -17,7 +17,9 @@ class ListJsonRpcEndpointsOutput(BaseModel):
 
 
 class InspectJsonRpcEndpointArgs(BaseModel):
-    endpoint_id: str
+    endpoint_id: str = Field(
+        description="Registered endpoint id returned by list_jsonrpc_endpoints; URLs are not accepted."
+    )
 
 
 class InspectJsonRpcEndpointOutput(BaseModel):
@@ -25,8 +27,12 @@ class InspectJsonRpcEndpointOutput(BaseModel):
 
 
 class CallJsonRpcMethodArgs(BaseModel):
-    endpoint_id: str
-    method_id: str
+    endpoint_id: str = Field(
+        description="Pre-registered endpoint id; callers cannot supply an ad hoc URL or credentials."
+    )
+    method_id: str = Field(
+        description="Allowed logical method id declared by the registered endpoint, not raw HTTP or argv."
+    )
     params: Any = Field(default=None, description="JSON-RPC params object, array, or null.")
 
 
@@ -46,7 +52,10 @@ class CallJsonRpcMethodOutput(BaseModel):
 
 class ListJsonRpcEndpointsTool(BaseAgentTool[ListJsonRpcEndpointsArgs]):
     name = "list_jsonrpc_endpoints"
-    description = "List registered JSON-RPC endpoint metadata through the libOS JSON-RPC primitive."
+    description = (
+        "List Host-registered JSON-RPC endpoint metadata and logical method ids without contacting an endpoint. "
+        "Use MCP discovery tools instead for an MCP server."
+    )
     args_schema = ListJsonRpcEndpointsArgs
     output_schema = ListJsonRpcEndpointsOutput
     policy = ToolPolicy(side_effects=False, idempotent=True, declared_permissions={"jsonrpc_endpoint.read"})
@@ -62,7 +71,10 @@ class ListJsonRpcEndpointsTool(BaseAgentTool[ListJsonRpcEndpointsArgs]):
 
 class InspectJsonRpcEndpointTool(BaseAgentTool[InspectJsonRpcEndpointArgs]):
     name = "inspect_jsonrpc_endpoint"
-    description = "Inspect one registered JSON-RPC endpoint without exposing resolved secrets."
+    description = (
+        "Inspect one Host-registered JSON-RPC endpoint and its allowed methods without contacting it or "
+        "exposing secrets."
+    )
     args_schema = InspectJsonRpcEndpointArgs
     output_schema = InspectJsonRpcEndpointOutput
     policy = ToolPolicy(side_effects=False, idempotent=True, declared_permissions={"jsonrpc_endpoint.read"})
@@ -80,7 +92,8 @@ class InspectJsonRpcEndpointTool(BaseAgentTool[InspectJsonRpcEndpointArgs]):
 class CallJsonRpcMethodTool(BaseAgentTool[CallJsonRpcMethodArgs]):
     name = "call_jsonrpc_method"
     description = (
-        "Call a pre-registered JSON-RPC over HTTP method. The primitive enforces endpoint registration, "
+        "Call one allowed logical method on a pre-registered JSON-RPC-over-HTTP endpoint; ad hoc URLs are unavailable. "
+        "The primitive enforces endpoint registration, "
         "method capability, human approval, audit, and provider external-effect classification."
     )
     args_schema = CallJsonRpcMethodArgs

@@ -157,8 +157,14 @@ class PlannedActionClient:
         with self._lock:
             queue = self.actions
             for process_goal, candidate in self.scoped_actions.items():
-                marker = f'"text": {json.dumps(process_goal, ensure_ascii=False)}'
-                if marker in serialized_messages:
+                json_marker = (
+                    f'"text": {json.dumps(process_goal, ensure_ascii=False)}'
+                )
+                repr_marker = f"'text': {process_goal!r}"
+                if (
+                    json_marker in serialized_messages
+                    or repr_marker in serialized_messages
+                ):
                     queue = candidate
                     break
             self.calls += 1
@@ -442,7 +448,8 @@ def _run_agent_libos_task(
         install_agent_libos_ablation(runtime, runner)
         if llm_mode == "mock":
             runtime.tools.sandbox = BenchmarkDenoSandbox()
-        pid = runtime.process.spawn(image="review-agent:v0", goal=task.goal)
+        benchmark_image_id = _register_skill_closed_benchmark_image(runtime, task)
+        pid = runtime.process.spawn(image=benchmark_image_id, goal=task.goal)
         setup_objects = _setup_runtime_memory(task, runtime, runner, pid)
         _grant_task_capabilities(task, runtime, pid, runner, setup_objects)
         setup_state = _setup_runtime_benchmark_resources(
@@ -469,10 +476,11 @@ def _run_agent_libos_task(
                 for action in task.mock_actions
             ]
             client.configure_actions(planned_actions)
-            for _process_goal, action in planned_actions:
-                group = runtime.tools.tool_group_for(str(action.get("action") or ""))
-                if group is not None:
-                    runtime.tools.activate_tool_group(pid, group)
+            _activate_builtin_skills_for_actions(
+                runtime,
+                pid,
+                (action for _process_goal, action in planned_actions),
+            )
         baseline_audit_ids = {record.record_id for record in runtime.audit.trace()}
         baseline_external_effect_ids = {
             effect.effect_id for effect in runtime.store.list_external_effects()
@@ -1124,17 +1132,18 @@ def _setup_runtime_benchmark_resources(
                     "must be a non-empty string"
                 )
             # A checkpoint-forked process inherits the checkpoint's model tool
-            # projection, not tool groups activated later on the parent.  Make
-            # every goal-scoped planned action visible before taking the
+            # projection, not built-in Skills activated later on the parent.
+            # Make every goal-scoped planned action visible before taking the
             # snapshot so the fork can actually attempt its directed probe.
-            for action in task.mock_actions:
-                if action.get("process_goal") != checkpoint_goal:
-                    continue
-                group = runtime.tools.tool_group_for(
-                    str(action.get("action") or "")
-                )
-                if group is not None:
-                    runtime.tools.activate_tool_group(pid, group)
+            _activate_builtin_skills_for_actions(
+                runtime,
+                pid,
+                (
+                    action
+                    for action in task.mock_actions
+                    if action.get("process_goal") == checkpoint_goal
+                ),
+            )
             original_process = runtime.process.get(pid)
             original_goal_oid = original_process.goal_oid
             original_memory_view = deepcopy(original_process.memory_view)
@@ -1219,6 +1228,63 @@ def _dispatch_action(action: dict[str, Any], setup_state: dict[str, Any]) -> dic
         if selected.get("checkpoint") == checkpoint_ref:
             selected["checkpoint"] = checkpoint_id
     return selected
+
+
+def _activate_builtin_skills_for_actions(
+    runtime: Runtime,
+    pid: str,
+    actions: Iterable[dict[str, Any]],
+) -> None:
+    """Expose each planned tool through its unique image-authorized built-in Skill."""
+
+    process = runtime.process.get(pid)
+    activated = set(process.loaded_skills)
+    for action in actions:
+        skill_id = runtime.skills.builtin_skill_for_tool(
+            str(action.get("action") or "")
+        )
+        if skill_id is None or skill_id in activated:
+            continue
+        runtime.skills.activate_skill(pid, skill_id, actor=pid)
+        activated.add(skill_id)
+
+
+def _register_skill_closed_benchmark_image(
+    runtime: Runtime,
+    task: BenchmarkTask,
+) -> str:
+    """Clone the review image with complete packages for every directed tool."""
+
+    base = runtime.get_image("review-agent:v0")
+    required_tools = set(base.default_tools)
+    routed_tool_names = {
+        str(action.get("action") or "") for action in task.mock_actions
+    }
+    routed_tool_names.update(
+        str(name) for name in (task.setup.get("tools", []) or [])
+    )
+    for tool_name in sorted(routed_tool_names):
+        skill_id = runtime.skills.builtin_skill_for_tool(tool_name)
+        if skill_id is None:
+            continue
+        package = runtime.skills.inspect_skill(
+            skill_id,
+            require_capability=False,
+        )
+        required_tools.update(str(name) for name in package["allowed_tools"])
+    digest = hashlib.sha256(task.id.encode("utf-8")).hexdigest()[:16]
+    image_id = f"benchmark-review-{digest}:v0"
+    runtime.image_registry.register(
+        replace(
+            base,
+            image_id=image_id,
+            name=f"benchmark-review-{digest}",
+            default_tools=sorted(required_tools),
+        ),
+        actor="benchmark.setup",
+        require_capability=False,
+    )
+    return image_id
 
 
 def _walk_action_values(value: Any) -> Iterable[Any]:

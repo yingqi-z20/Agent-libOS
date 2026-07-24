@@ -431,13 +431,17 @@ revalidate source versions before dispatch. See [Data Flow](data_flow.md).
 
 ## Context Materialization
 
-The LLM executor materializes prompt context from process state, event facts,
-capability snapshots, object summaries, loaded Skills, and visible tool schemas.
-Each process also has a mutable context object named
-`<llm_context.object_name_prefix>:<pid>`. The prefix is configurable; its
-default is `llm_context`, so the default name is `llm_context:<pid>`.
+The LLM executor materializes prompt context from the process Memory View.
+By default it uses that selected materialization unchanged: it does not create
+or append an additional context Object. A metadata-only manifest still records
+the exact selection and rendered hash for evidence.
 
-The runtime appends new process facts and summaries to the end of that object so
+Persistent context enrichment is an explicit Host/process opt-in. In that mode
+the process has a mutable context object named
+`<llm_context.object_name_prefix>:<pid>`. The prefix is configurable; its
+default is `llm_context`, so the conventional name is `llm_context:<pid>`.
+
+The runtime then appends new process facts and summaries to the end of that object so
 repeated prompt prefixes remain stable for prompt caching.
 
 Context state has two persistence planes. The live context Object plane
@@ -465,6 +469,22 @@ rebuild that Object.
 The `compact_process_context` tool is the explicit exception to the append-only
 shape: after validation it atomically replaces older entries with one
 `context_compacted` summary plus the configured recent verbatim entries.
+For an explicitly enriched process whose Image selects `auto_compact`, context
+preparation also measures the persisted JSON payload when the process holds
+`context:maintenance/execute`. At the configured storage-compaction waterline
+it ends the current quantum and dispatches this same tool through the normal
+Capability, approval, child-wait, event, and audit path before appending more
+facts. The default source-only path performs neither that measurement nor that
+dispatch. This waterline is intentionally below the generic Object Memory
+payload hard limit; it prevents an opted-in long session from failing in
+context preparation before model-window pressure can be assessed. After a successful compaction,
+the first safe post-maintenance projection becomes a persisted byte baseline;
+automatic storage compaction is re-armed only after another configured
+waterline of growth, capped immediately below the hard limit. This hysteresis
+prevents compressor children and their summaries from immediately retriggering
+the maintenance they just completed. The projection is still checked before
+persistence, and a first post-compaction projection that already reaches the
+hard limit fails instead of entering an ineffective retry loop.
 
 Materialization budgets use the final rendered object text, not stored
 `metadata.token_estimate`. Object creation, payload updates, file imports, and
@@ -472,9 +492,10 @@ append-style writes still refresh that estimate as advisory metadata, but stale
 or attacker-supplied estimates cannot make enlarged rendered content fit under
 the prompt budget.
 
-For LLM execution, the append-only configured context Object render is the
-charged context. Source object materialization selects and records deltas
-without double-charging the same quantum. The rendered context must fit both
+For explicitly enriched LLM execution, the append-only configured context
+Object render is the charged context. Source Object materialization selects the
+input Objects, while only this opted-in path records runtime deltas; neither is
+double-charged in the same quantum. The rendered context must fit both
 the per-call materialization window and the cumulative materialization budget
 before the model is called.
 

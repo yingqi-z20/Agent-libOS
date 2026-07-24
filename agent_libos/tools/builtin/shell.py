@@ -12,7 +12,10 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 class RunShellCommandArgs(BaseModel):
     argv: list[str] = Field(
         min_length=1,
-        description="Command argv array. Shell strings are not accepted.",
+        description=(
+            "Command argv array. Shell strings and git argv are not accepted; "
+            "activate a matching Git Skill and use its typed git_* tool."
+        ),
     )
     timeout_s: float = Field(
         default=_TOOL_DEFAULTS.shell_timeout_s,
@@ -47,6 +50,7 @@ class RunShellCommandTool(BaseAgentTool[RunShellCommandArgs]):
     name = "run_shell_command"
     description = (
         "Run an argv-only command through the libOS shell primitive. "
+        "Git argv, including read-only status/diff, are rejected; use typed git_* tools. "
         "The primitive enforces shell execution policy, configured allow/ask lists, human approval, audit, and events."
     )
     args_schema = RunShellCommandArgs

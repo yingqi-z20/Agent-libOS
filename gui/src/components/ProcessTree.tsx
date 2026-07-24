@@ -2,18 +2,23 @@ import { Circle, Pause, Play, Search, Square, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { RuntimeProcess } from "../api/types";
 import { useI18n } from "../i18n";
+import { shortProcessId, taskDisplayLabel } from "../taskPresentation";
 
 type ProcessTreeProps = {
   processes: RuntimeProcess[];
   selectedPid: string | null;
+  taskLabels?: Readonly<Record<string, string>>;
   disabled?: boolean;
   onSelect(pid: string): void;
 };
 
-export function ProcessTree({ processes, selectedPid, disabled = false, onSelect }: ProcessTreeProps) {
+export function ProcessTree({ processes, selectedPid, taskLabels = {}, disabled = false, onSelect }: ProcessTreeProps) {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
-  const visibleProcesses = useMemo(() => filterProcesses(processes, query), [processes, query]);
+  const visibleProcesses = useMemo(
+    () => filterProcesses(processes, query, taskLabels),
+    [processes, query, taskLabels]
+  );
   const { roots, children } = indexProcessTree(visibleProcesses);
   const focusPid = visibleProcesses.some((process) => process.pid === selectedPid)
     ? selectedPid
@@ -49,6 +54,7 @@ export function ProcessTree({ processes, selectedPid, disabled = false, onSelect
             process={process}
             selectedPid={selectedPid}
             focusPid={focusPid}
+            taskLabels={taskLabels}
             disabled={disabled}
             childrenByPid={children}
             onSelect={onSelect}
@@ -62,7 +68,11 @@ export function ProcessTree({ processes, selectedPid, disabled = false, onSelect
   );
 }
 
-export function filterProcesses(processes: RuntimeProcess[], query: string): RuntimeProcess[] {
+export function filterProcesses(
+  processes: RuntimeProcess[],
+  query: string,
+  taskLabels: Readonly<Record<string, string>> = {}
+): RuntimeProcess[] {
   const selected = query.trim().toLocaleLowerCase();
   if (!selected) return processes;
   const byPid = new Map(processes.map((process) => [process.pid, process]));
@@ -73,7 +83,8 @@ export function filterProcesses(processes: RuntimeProcess[], query: string): Run
       process.image_id,
       process.status,
       process.working_directory,
-      process.llm_profile_id
+      process.llm_profile_id,
+      taskLabels[process.pid] ?? ""
     ].join("\n").toLocaleLowerCase();
     if (!haystack.includes(selected)) continue;
     included.add(process.pid);
@@ -112,6 +123,7 @@ function ProcessNode({
   process,
   selectedPid,
   focusPid,
+  taskLabels,
   disabled,
   childrenByPid,
   onSelect,
@@ -120,6 +132,7 @@ function ProcessNode({
   process: RuntimeProcess;
   selectedPid: string | null;
   focusPid: string | null;
+  taskLabels: Readonly<Record<string, string>>;
   disabled: boolean;
   childrenByPid: Map<string, RuntimeProcess[]>;
   onSelect(pid: string): void;
@@ -127,6 +140,7 @@ function ProcessNode({
 }) {
   const icon = iconForStatus(process.status);
   const childProcesses = childrenByPid.get(process.pid) ?? [];
+  const displayLabel = taskDisplayLabel(process, taskLabels);
   return (
     <div role="none">
       <button
@@ -135,7 +149,7 @@ function ProcessNode({
         aria-level={depth + 1}
         aria-selected={selectedPid === process.pid}
         aria-expanded={childProcesses.length ? true : undefined}
-        aria-label={`${process.pid}, ${process.status}, ${process.image_id}`}
+        aria-label={`${displayLabel}, ${process.pid}, ${process.status}, ${process.image_id}`}
         tabIndex={focusPid === process.pid ? 0 : -1}
         disabled={disabled}
         className={`processNode ${selectedPid === process.pid ? "selected" : ""}`}
@@ -144,8 +158,8 @@ function ProcessNode({
       >
         {icon}
         <span className="processMain">
-          <span className="pid">{process.pid}</span>
-          <span className="subtle">{process.image_id}</span>
+          <span className="pid" title={process.pid}>{displayLabel}</span>
+          <span className="subtle">{shortProcessId(process.pid)} · {process.image_id}</span>
         </span>
         {process.interrupt_count > 0 ? <span className="badge urgent">{process.interrupt_count}</span> : null}
         {process.unread_message_count > 0 ? <span className="badge">{process.unread_message_count}</span> : null}
@@ -158,6 +172,7 @@ function ProcessNode({
               process={child}
               selectedPid={selectedPid}
               focusPid={focusPid}
+              taskLabels={taskLabels}
               disabled={disabled}
               childrenByPid={childrenByPid}
               onSelect={onSelect}

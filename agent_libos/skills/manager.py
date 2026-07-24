@@ -32,13 +32,20 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.ports import AuditPort, EventPort, RuntimePublicationReceiptRecorder
+from agent_libos.skills.builtin_catalog import (
+    BUILTIN_SKILL_CATALOG_SCOPE,
+    BUILTIN_SKILL_PREFIX,
+    BuiltinSkillCatalog,
+    get_builtin_skill_catalog,
+)
 from agent_libos.skills.schema import ActionSchema, JitToolSpec, LoadedSkill, SkillPackage, SkillResource
 from agent_libos.storage import UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import bounded_json_loads, dumps, to_jsonable
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
-_SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SKILL_NAME_MAX_CHARS = 64
 _TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
 _SOURCE_TYPES = {"workspace", "global", "runtime"}
 _FRONTMATTER_FIELDS = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
@@ -48,6 +55,9 @@ _AGENT_LIBOS_METADATA_KEYS = {
     "agent-libos.required-capabilities",
     "agent-libos.jit-tools",
 }
+_BUILTIN_PROJECTION_RECEIPT_ACTION = "skill.builtin_projection.receipt"
+_BUILTIN_PROJECTION_RECEIPT_SCHEMA_VERSION = 1
+_BUILTIN_PROJECTION_RECEIPT_FIELD = "builtin_projection_receipt_id"
 
 
 @dataclass(slots=True)
@@ -112,9 +122,34 @@ class SkillManager:
         self._process = process
         self._images = images
         self._lifecycle_lock = lifecycle_lock
+        self._builtin_catalog: BuiltinSkillCatalog = get_builtin_skill_catalog()
+        self._validate_builtin_registry_boundary()
 
     def resource_for(self, skill_id: str) -> str:
         return f"skill:{skill_id}"
+
+    def builtin_skill_for_tool(self, tool_name: str) -> str | None:
+        """Return the unique built-in guidance Skill for a static tool."""
+
+        return self._builtin_catalog.skill_for_tool(str(tool_name))
+
+    def _validate_builtin_registry_boundary(self) -> None:
+        for package in self._builtin_catalog.list():
+            # Re-validate immutable assets against the active runtime limits,
+            # not only the package-distribution defaults used by the catalog
+            # loader. A stricter Host configuration must fail before any
+            # built-in snapshot can be published.
+            self._validate_package(package)
+        collisions = [
+            package.skill_id
+            for package, _metadata in self.store.list_skills(limit=None)
+            if self._builtin_catalog.is_builtin_id(package.skill_id)
+        ]
+        if collisions:
+            raise ValidationError(
+                "registered Skills collide with reserved built-in ids: "
+                + ", ".join(sorted(collisions))
+            )
 
     def trust_resource(self, package_sha256: str = "*") -> str:
         return self.config.skills.trust_resource if package_sha256 == "*" else f"skill_trust:{package_sha256}"
@@ -153,6 +188,10 @@ class SkillManager:
     ) -> dict[str, Any]:
         spec = self._coerce_package(package)
         self._validate_package(spec)
+        if self._builtin_catalog.is_builtin_id(spec.skill_id):
+            raise ValidationError(
+                f"Skill id uses the reserved built-in prefix {BUILTIN_SKILL_PREFIX!r}: {spec.skill_id}"
+            )
         selected_source_type = self._validate_source_type(source_type)
         selected_source = source or selected_source_type
         selected_sha = package_sha256 or spec.package_sha256 or self._package_hash(spec)
@@ -387,10 +426,60 @@ class SkillManager:
         require_capability: bool = True,
         limit: int | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
-        """Return one bounded catalog page plus an exact next-item signal."""
+        """Return all applicable built-ins plus one bounded registered catalog page.
+
+        ``text`` and ``limit`` apply only to registered and Host-catalog
+        entries. The built-in prefix is always the complete set supported by
+        the actor's current image.
+        """
+
+        skills, has_more, _scope = self._discover_skills_window_with_scope(
+            text,
+            actor=actor,
+            require_capability=require_capability,
+            limit=limit,
+        )
+        return skills, has_more
+
+    def discover_skills_result(
+        self,
+        text: str | None = None,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Return discoverable Skills and the authority-bounded catalog scope."""
+
+        skills, has_more, scope = self._discover_skills_window_with_scope(
+            text,
+            actor=actor,
+            require_capability=require_capability,
+            limit=limit,
+        )
+        return {"skills": skills, "catalog_scope": scope, "has_more": has_more}
+
+    def _discover_skills_window_with_scope(
+        self,
+        text: str | None,
+        *,
+        actor: str | None,
+        require_capability: bool,
+        limit: int | None,
+    ) -> tuple[list[dict[str, Any]], bool, str]:
+        """Merge complete immutable built-ins with a bounded non-built-in page."""
 
         reservations: dict[str, str] = {}
-        if require_capability and actor is not None:
+        include_registered = (
+            actor is None
+            or not require_capability
+            or self.capabilities.check(
+                actor,
+                self.config.skills.registry_resource,
+                CapabilityRight.READ,
+            )
+        )
+        if include_registered and require_capability and actor is not None:
             decision = self.capabilities.require(
                 actor,
                 self.config.skills.registry_resource,
@@ -400,12 +489,21 @@ class SkillManager:
             reservations = self._reserve_skill_rights([decision], used_by="skill")
         try:
             selected_limit = self._bounded_discover_limit(limit)
-            registered = [
-                self._skill_summary(skill, metadata)
-                for skill, metadata in self.store.list_skills(text=text, limit=selected_limit + 1)
-            ]
+            builtins = self._available_builtin_summaries(actor)
+            registered: list[dict[str, Any]] = []
+            if include_registered:
+                registered.extend(
+                    self._skill_summary(skill, metadata)
+                    for skill, metadata in self.store.list_skills(
+                        text=text,
+                        limit=selected_limit + 1,
+                    )
+                )
             if actor is None and len(registered) <= selected_limit:
-                seen = {item["skill_id"] for item in registered}
+                seen = {
+                    item["skill_id"]
+                    for item in (*builtins, *registered)
+                }
                 registered.extend(
                     self._discover_host_skill_catalog(
                         text=text,
@@ -417,7 +515,80 @@ class SkillManager:
             self._restore_skill_rights(reservations)
             raise
         self._commit_skill_rights(reservations)
-        return registered[:selected_limit], len(registered) > selected_limit
+        scope = "builtin_and_registered" if include_registered else "builtin_only"
+        return (
+            [*builtins, *registered[:selected_limit]],
+            len(registered) > selected_limit,
+            scope,
+        )
+
+    def available_builtin_prompt_context(self, pid: str) -> list[dict[str, Any]]:
+        """Return compact metadata for built-ins the current image can fully project."""
+
+        process = self.processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        if "activate_skill" not in process.model_tool_table:
+            return []
+        return [
+            {
+                "skill_id": item["skill_id"],
+                "description": item["description"],
+                "active": item["active"],
+            }
+            for item in self._available_builtin_summaries(pid)
+        ]
+
+    def _available_builtin_summaries(self, actor: str | None) -> list[dict[str, Any]]:
+        process = self.processes.get_process(actor) if actor is not None else None
+        result: list[dict[str, Any]] = []
+        for skill in self._builtin_catalog.list():
+            if process is not None and not self._builtin_supported_by_process(skill, process):
+                continue
+            metadata = self._builtin_catalog.metadata(skill.skill_id)
+            assert metadata is not None
+            active = False
+            if process is not None and skill.skill_id in process.loaded_skills:
+                try:
+                    active = self._loaded_builtin_projection_is_trusted(
+                        skill.skill_id,
+                        process.loaded_skills[skill.skill_id],
+                        process,
+                    )
+                except ValidationError:
+                    # Persisted state is untrusted prompt input.  A malformed
+                    # record must not make a built-in package appear active;
+                    # prompt_context() exposes a bounded invalid-snapshot
+                    # diagnostic without copying the record into the prompt.
+                    active = False
+            result.append(
+                {
+                    **self._skill_summary(skill, metadata),
+                    "active": active,
+                    "available_tools": list(skill.allowed_tools),
+                    "catalog_scope": BUILTIN_SKILL_CATALOG_SCOPE,
+                }
+            )
+        return result
+
+    def _builtin_supported_by_process(self, skill: SkillPackage, process: Any) -> bool:
+        image = self._images.get(process.image_id)
+        if image is None:
+            return False
+        image_default_tools = set(image.default_tools)
+        for name in skill.allowed_tools:
+            if name not in image_default_tools:
+                return False
+            configured_tool_id = process.tool_table.get(name)
+            if configured_tool_id is None:
+                return False
+            try:
+                handle = self._tools.resolve(name)
+            except (NotFound, ValidationError):
+                return False
+            if str(handle.tool_id) != str(configured_tool_id):
+                return False
+        return True
 
     def _bounded_discover_limit(self, limit: int | None) -> int:
         selected = self.config.skills.discover_limit if limit is None else limit
@@ -440,7 +611,11 @@ class SkillManager:
     ) -> dict[str, Any]:
         skill, metadata = self._get_skill(skill_id)
         reservations: dict[str, str] = {}
-        if require_capability and actor is not None:
+        if (
+            require_capability
+            and actor is not None
+            and metadata.get("source_type") != "builtin"
+        ):
             decisions = self._require_skill_right(actor, skill_id, CapabilityRight.READ)
             reservations = self._reserve_skill_rights(decisions, used_by="skill")
         try:
@@ -471,12 +646,43 @@ class SkillManager:
         result: list[dict[str, Any]] = []
         for skill_id, loaded in process.loaded_skills.items():
             try:
-                skill = self._skill_for_loaded_record(skill_id, loaded)
+                activation_kind = (
+                    loaded.get("activation_kind", "registered")
+                    if isinstance(loaded, dict)
+                    else "registered"
+                )
+                if activation_kind == "builtin_projection":
+                    skill, tool_ids = self._validate_loaded_builtin_projection_record(
+                        skill_id,
+                        loaded,
+                    )
+                    if not self.builtin_projection_supported_by_process(
+                        process,
+                        skill_id,
+                        loaded,
+                    ):
+                        raise ValidationError(
+                            "built-in loaded Skill escapes current image default_tools "
+                            f"or tool table: {skill_id}"
+                        )
+                elif activation_kind != "registered":
+                    raise ValidationError(
+                        f"unknown loaded Skill activation_kind: {activation_kind}"
+                    )
+                elif self._builtin_catalog.is_builtin_id(skill_id):
+                    raise ValidationError(
+                        f"built-in loaded Skill is missing trusted projection provenance: {skill_id}"
+                    )
+                else:
+                    skill = self._skill_for_loaded_record(skill_id, loaded)
             except ValidationError as exc:
-                entry = {"skill_id": skill_id, "invalid_snapshot": True, "error": str(exc)}
-                if include_jit_catalog:
-                    entry["loaded"] = loaded
-                result.append(entry)
+                result.append(
+                    {
+                        "skill_id": skill_id,
+                        "invalid_snapshot": True,
+                        "error": str(exc),
+                    }
+                )
                 continue
             entry = {
                 "skill_id": skill.skill_id,
@@ -491,8 +697,6 @@ class SkillManager:
                 "resources": self._prompt_resource_summaries(skill, include_jit_catalog=include_jit_catalog),
                 "metadata": dict(skill.metadata),
             }
-            if include_jit_catalog:
-                entry["loaded"] = loaded
             result.append(entry)
         return result
 
@@ -510,8 +714,46 @@ class SkillManager:
     ) -> dict[str, Any]:
         selected_actor = actor or pid
         skill, metadata = self._get_skill(skill_id)
+        if metadata.get("source_type") == "builtin":
+            return self._activate_builtin_projection(
+                pid,
+                skill,
+                metadata,
+                actor=selected_actor,
+                require_capability=require_capability,
+                publication_id=publication_id,
+                receipt_recorder=receipt_recorder,
+            )
+        return self._activate_registered_skill(
+            pid,
+            skill,
+            metadata,
+            actor=selected_actor,
+            require_capability=require_capability,
+            publication_id=publication_id,
+            receipt_recorder=receipt_recorder,
+            deferred_jit_finalization=_deferred_jit_finalization,
+        )
+
+    def _activate_registered_skill(
+        self,
+        pid: str,
+        skill: SkillPackage,
+        metadata: dict[str, Any],
+        *,
+        actor: str,
+        require_capability: bool,
+        publication_id: str | None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None,
+        deferred_jit_finalization: _DeferredJitRegistryFinalization | None,
+    ) -> dict[str, Any]:
+        selected_actor = actor
         if require_capability:
-            decisions = self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
+            decisions = self._require_skill_right(
+                selected_actor,
+                skill.skill_id,
+                CapabilityRight.EXECUTE,
+            )
             admin_decision = self._require_process_admin_if_cross_actor(selected_actor, pid)
             if admin_decision is not None:
                 decisions.append(admin_decision)
@@ -538,112 +780,24 @@ class SkillManager:
             decisions,
             actor=selected_actor,
             jit_state=lambda: (jit_handles, retired_jit_ids),
-            deferred_jit_finalization=_deferred_jit_finalization,
+            deferred_jit_finalization=deferred_jit_finalization,
         ):
             prepared_jit_tools = self._prepare_jit_tools(
                 pid, skill, publication_id=publication_id, receipt_recorder=receipt_recorder
             )
             # Tool registry lifecycle operations acquire this lock before the store
             # lock; activation must keep that order while its store transaction is open.
-            try:
-                with self.unit_of_work.transaction():
-                    process = self.processes.get_process(pid)
-                    if process is None:
-                        raise NotFound(f"process not found: {pid}")
-                    previous_loaded = process.loaded_skills.get(skill.skill_id)
-                    previous_tool_ids = self._loaded_tool_id_map(previous_loaded, "tool_ids")
-                    previous_jit_ids = self._loaded_tool_id_map(previous_loaded, "jit_tool_ids")
-                    self._validate_loadable(
-                        pid,
-                        skill,
-                        process.tool_table,
-                        replacing_jit_tool_ids=previous_jit_ids,
-                    )
-                    existing_handles = self._resolve_existing_tools(skill.allowed_tools)
-                    base_tool_ids, base_model_tool_ids = self._activation_base_bindings(
-                        process,
-                        skill.skill_id,
-                        set(existing_handles)
-                        | {jit.name for jit, _candidate_id in prepared_jit_tools},
-                    )
-                    jit_handles = self._register_prepared_jit_tools(
-                        pid,
-                        skill,
-                        prepared_jit_tools,
-                        replacing_jit_tool_ids=previous_jit_ids,
-                        approver=selected_actor,
-                        publication_id=publication_id,
-                        receipt_recorder=receipt_recorder,
-                    )
-                    # JIT registration advances process CAS; continue from
-                    # that committed row, not the pre-registration revision.
-                    process = self.processes.get_process(pid)
-                    if process is None:
-                        raise NotFound(f"process not found: {pid}")
-                    tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
-                    jit_tool_ids = {name: handle.tool_id for name, handle in jit_handles.items()}
-                    updated_table = dict(process.tool_table)
-                    updated_model_table = dict(process.model_tool_table)
-                    for name, tool_id in {**previous_tool_ids, **previous_jit_ids}.items():
-                        if updated_table.get(name) == tool_id:
-                            updated_table.pop(name, None)
-                        if updated_model_table.get(name) == tool_id:
-                            updated_model_table.pop(name, None)
-                    for name, handle in {**existing_handles, **jit_handles}.items():
-                        updated_table[name] = handle.tool_id
-                        # Loading a Skill is an explicit tool-visibility action,
-                        # independent of the base image's lazy built-in groups.
-                        updated_model_table[name] = handle.tool_id
-                    loaded = LoadedSkill(
-                        skill_id=skill.skill_id,
-                        version=skill.version,
-                        source=metadata.get("source"),
-                        package_sha256=skill.package_sha256,
-                        loaded_at=utc_now(),
-                        tool_names=sorted([*tool_ids, *jit_tool_ids]),
-                        tool_ids=tool_ids,
-                        jit_tool_ids=jit_tool_ids,
-                        instructions_hash=self._hash_text(skill.instructions),
-                        package_snapshot=self._skill_snapshot(skill),
-                        base_tool_ids=base_tool_ids,
-                        base_model_tool_ids=base_model_tool_ids,
-                    )
-                    process = self._persist_loaded_skill(
-                        process,
-                        loaded=loaded,
-                        tool_table=updated_table,
-                        model_tool_table=updated_model_table,
-                        publication_id=publication_id,
-                        receipt_recorder=receipt_recorder,
-                    )
-                    retired_jit_ids = set(previous_jit_ids.values()) - set(jit_tool_ids.values())
-                    self._delete_jit_rows(pid, retired_jit_ids)
-                    self.events.emit(
-                        EventType.SKILL_LOADED,
-                        source=selected_actor,
-                        target=pid,
-                        payload={"skill_id": skill.skill_id, "tool_names": loaded.tool_names},
-                    )
-                    self.audit.record(
-                        actor=selected_actor,
-                        action="skill.activate",
-                        target=f"process:{pid}",
-                        decision={
-                            "skill_id": skill.skill_id,
-                            "version": skill.version,
-                            "replaced_loaded_version": self._loaded_version(previous_loaded),
-                            "tool_ids": tool_ids,
-                            "jit_tool_ids": jit_tool_ids,
-                            "retired_jit_tool_ids": sorted(retired_jit_ids),
-                            "source": metadata.get("source"),
-                            "package_sha256": skill.package_sha256,
-                        },
-                    )
-            except BaseException:
-                # Do not expose in-memory JIT handles after the outer store
-                # transaction rolled back and before releasing the lock.
-                self._discard_uncommitted_jit_tools(jit_handles)
-                raise
+            loaded, tool_ids, jit_tool_ids = self._publish_registered_skill_activation(
+                pid,
+                skill,
+                metadata,
+                actor=selected_actor,
+                prepared_jit_tools=prepared_jit_tools,
+                jit_handles=jit_handles,
+                retired_jit_ids=retired_jit_ids,
+                publication_id=publication_id,
+                receipt_recorder=receipt_recorder,
+            )
         return {
             "pid": pid,
             "skill_id": skill.skill_id,
@@ -656,6 +810,357 @@ class SkillManager:
             "package_sha256": skill.package_sha256,
         }
 
+    def _publish_registered_skill_activation(
+        self,
+        pid: str,
+        skill: SkillPackage,
+        metadata: dict[str, Any],
+        *,
+        actor: str,
+        prepared_jit_tools: list[tuple[JitToolSpec, str]],
+        jit_handles: dict[str, Any],
+        retired_jit_ids: set[str],
+        publication_id: str | None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None,
+    ) -> tuple[LoadedSkill, dict[str, str], dict[str, str]]:
+        try:
+            with self.unit_of_work.transaction():
+                process = self.processes.get_process(pid)
+                if process is None:
+                    raise NotFound(f"process not found: {pid}")
+                previous_loaded = process.loaded_skills.get(skill.skill_id)
+                previous_tool_ids = self._loaded_tool_id_map(previous_loaded, "tool_ids")
+                previous_jit_ids = self._loaded_tool_id_map(previous_loaded, "jit_tool_ids")
+                self._validate_loadable(
+                    pid,
+                    skill,
+                    process.tool_table,
+                    replacing_jit_tool_ids=previous_jit_ids,
+                )
+                existing_handles = self._resolve_existing_tools(skill.allowed_tools)
+                base_tool_ids, base_model_tool_ids = self._activation_base_bindings(
+                    process,
+                    skill.skill_id,
+                    set(existing_handles)
+                    | {jit.name for jit, _candidate_id in prepared_jit_tools},
+                )
+                jit_handles.update(
+                    self._register_prepared_jit_tools(
+                        pid,
+                        skill,
+                        prepared_jit_tools,
+                        replacing_jit_tool_ids=previous_jit_ids,
+                        approver=actor,
+                        publication_id=publication_id,
+                        receipt_recorder=receipt_recorder,
+                    )
+                )
+                # JIT registration advances process CAS; continue from
+                # that committed row, not the pre-registration revision.
+                process = self.processes.get_process(pid)
+                if process is None:
+                    raise NotFound(f"process not found: {pid}")
+                tool_ids = {
+                    name: handle.tool_id for name, handle in existing_handles.items()
+                }
+                jit_tool_ids = {
+                    name: handle.tool_id for name, handle in jit_handles.items()
+                }
+                updated_table = dict(process.tool_table)
+                updated_model_table = dict(process.model_tool_table)
+                for name, tool_id in {**previous_tool_ids, **previous_jit_ids}.items():
+                    if updated_table.get(name) == tool_id:
+                        updated_table.pop(name, None)
+                    if updated_model_table.get(name) == tool_id:
+                        updated_model_table.pop(name, None)
+                for name, handle in {**existing_handles, **jit_handles}.items():
+                    updated_table[name] = handle.tool_id
+                    updated_model_table[name] = handle.tool_id
+                loaded = LoadedSkill(
+                    skill_id=skill.skill_id,
+                    version=skill.version,
+                    source=metadata.get("source"),
+                    package_sha256=skill.package_sha256,
+                    loaded_at=utc_now(),
+                    tool_names=sorted([*tool_ids, *jit_tool_ids]),
+                    tool_ids=tool_ids,
+                    jit_tool_ids=jit_tool_ids,
+                    instructions_hash=self._hash_text(skill.instructions),
+                    package_snapshot=self._skill_snapshot(skill),
+                    base_tool_ids=base_tool_ids,
+                    base_model_tool_ids=base_model_tool_ids,
+                )
+                self._persist_loaded_skill(
+                    process,
+                    loaded=loaded,
+                    tool_table=updated_table,
+                    model_tool_table=updated_model_table,
+                    publication_id=publication_id,
+                    receipt_recorder=receipt_recorder,
+                )
+                retired_jit_ids.update(
+                    set(previous_jit_ids.values()) - set(jit_tool_ids.values())
+                )
+                self._delete_jit_rows(pid, retired_jit_ids)
+                self.events.emit(
+                    EventType.SKILL_LOADED,
+                    source=actor,
+                    target=pid,
+                    payload={"skill_id": skill.skill_id, "tool_names": loaded.tool_names},
+                )
+                self.audit.record(
+                    actor=actor,
+                    action="skill.activate",
+                    target=f"process:{pid}",
+                    decision={
+                        "skill_id": skill.skill_id,
+                        "version": skill.version,
+                        "replaced_loaded_version": self._loaded_version(previous_loaded),
+                        "tool_ids": tool_ids,
+                        "jit_tool_ids": jit_tool_ids,
+                        "retired_jit_tool_ids": sorted(retired_jit_ids),
+                        "source": metadata.get("source"),
+                        "package_sha256": skill.package_sha256,
+                    },
+                )
+                return loaded, tool_ids, jit_tool_ids
+        except BaseException:
+            # Do not expose in-memory JIT handles after the store transaction
+            # rolled back and before releasing the lifecycle lock.
+            self._discard_uncommitted_jit_tools(jit_handles)
+            raise
+
+    def _activate_builtin_projection(
+        self,
+        pid: str,
+        skill: SkillPackage,
+        metadata: dict[str, Any],
+        *,
+        actor: str,
+        require_capability: bool,
+        publication_id: str | None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None,
+    ) -> dict[str, Any]:
+        """Load trusted guidance while revealing only image-owned bindings."""
+
+        process = self.processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        tool_ids = self._builtin_projection_tool_ids(skill, process)
+        self._validate_existing_builtin_projection(skill.skill_id, process)
+        decisions: list[CapabilityDecision] = []
+        if require_capability:
+            admin_decision = self._require_process_admin_if_cross_actor(actor, pid)
+            if admin_decision is not None:
+                decisions.append(admin_decision)
+        before_schemas = self._tools.openai_tool_schemas(pid)
+        with self.capabilities.authority_transaction(
+            decisions,
+            actor=actor,
+            operation="built-in Skill projection activation",
+        ):
+            with self.unit_of_work.transaction():
+                process = self.processes.get_process(pid)
+                if process is None:
+                    raise NotFound(f"process not found: {pid}")
+                # Repeat the complete-subset check under the publication
+                # transaction so a concurrent image/exec transition cannot
+                # turn validation into a partial projection.
+                tool_ids = self._builtin_projection_tool_ids(skill, process)
+                previous_loaded = process.loaded_skills.get(skill.skill_id)
+                self._validate_existing_builtin_projection(skill.skill_id, process)
+                previous_tool_ids = self._loaded_tool_id_map(previous_loaded, "tool_ids")
+                base_tool_ids, base_model_tool_ids = self._activation_base_bindings(
+                    process,
+                    skill.skill_id,
+                    set(tool_ids),
+                )
+                updated_model_table = dict(process.model_tool_table)
+                for name, tool_id in previous_tool_ids.items():
+                    if updated_model_table.get(name) == tool_id:
+                        updated_model_table.pop(name, None)
+                updated_model_table.update(tool_ids)
+                loaded = self._persist_builtin_projection(
+                    process,
+                    skill=skill,
+                    source=str(metadata.get("source") or f"builtin:{skill.skill_id}"),
+                    actor=actor,
+                    tool_ids=tool_ids,
+                    base_tool_ids=base_tool_ids,
+                    base_model_tool_ids=base_model_tool_ids,
+                    updated_model_table=updated_model_table,
+                    publication_id=publication_id,
+                    receipt_recorder=receipt_recorder,
+                )
+                after_schemas = self._tools.openai_tool_schemas(pid)
+                self.events.emit(
+                    EventType.SKILL_LOADED,
+                    source=actor,
+                    target=pid,
+                    payload={
+                        "skill_id": skill.skill_id,
+                        "tool_names": loaded.tool_names,
+                        "activation_kind": "builtin_projection",
+                    },
+                )
+                self.audit.record(
+                    actor=actor,
+                    action="skill.activate",
+                    target=f"process:{pid}",
+                    decision={
+                        "skill_id": skill.skill_id,
+                        "version": skill.version,
+                        "activation_kind": "builtin_projection",
+                        "replaced_loaded_version": self._loaded_version(previous_loaded),
+                        "tool_ids": tool_ids,
+                        "jit_tool_ids": {},
+                        "source": metadata.get("source"),
+                        "package_sha256": skill.package_sha256,
+                        "authority_changed": False,
+                        "tool_count_before": len(before_schemas),
+                        "tool_count_after": len(after_schemas),
+                        "schema_bytes_before": len(dumps(before_schemas).encode("utf-8")),
+                        "schema_bytes_after": len(dumps(after_schemas).encode("utf-8")),
+                    },
+                )
+        return {
+            "pid": pid,
+            "skill_id": skill.skill_id,
+            "name": skill.name,
+            "version": skill.version,
+            "activation_kind": "builtin_projection",
+            "tool_names": loaded.tool_names,
+            "tool_ids": tool_ids,
+            "jit_tool_ids": {},
+            "instructions_hash": loaded.instructions_hash,
+            "package_sha256": skill.package_sha256,
+            "authority_changed": False,
+        }
+
+    def _builtin_projection_tool_ids(self, skill: SkillPackage, process: Any) -> dict[str, str]:
+        if skill.jit_tools or skill.actions or skill.required_capabilities:
+            raise ValidationError(
+                f"built-in tool Skill must contain guidance and static allowed-tools only: {skill.skill_id}"
+            )
+        image = self._images.get(process.image_id)
+        if image is None:
+            raise ValidationError(
+                f"built-in Skill cannot resolve process image: {process.image_id}"
+            )
+        image_default_tools = set(image.default_tools)
+        selected: dict[str, str] = {}
+        unavailable: list[str] = []
+        for name in skill.allowed_tools:
+            configured_tool_id = process.tool_table.get(name)
+            try:
+                handle = self._tools.resolve(name)
+            except (NotFound, ValidationError):
+                handle = None
+            if (
+                name not in image_default_tools
+                or configured_tool_id is None
+                or handle is None
+                or str(handle.tool_id) != str(configured_tool_id)
+            ):
+                unavailable.append(name)
+                continue
+            selected[name] = str(configured_tool_id)
+        if unavailable:
+            raise ValidationError(
+                f"built-in Skill is not fully authorized by image {process.image_id}: "
+                f"{skill.skill_id} missing={sorted(unavailable)}"
+            )
+        return selected
+
+    def _validate_existing_builtin_projection(self, skill_id: str, process: Any) -> None:
+        """Reject a forged prior record before its bindings influence replacement."""
+
+        previous = process.loaded_skills.get(skill_id)
+        if previous is None:
+            return
+        if not self._loaded_builtin_projection_is_trusted(skill_id, previous, process):
+            raise ValidationError(
+                f"built-in loaded Skill is missing trusted projection provenance: {skill_id}"
+            )
+
+    def _persist_builtin_projection(
+        self,
+        process: Any,
+        *,
+        skill: SkillPackage,
+        source: str,
+        actor: str,
+        tool_ids: dict[str, str],
+        base_tool_ids: dict[str, str],
+        base_model_tool_ids: dict[str, str],
+        updated_model_table: dict[str, str],
+        publication_id: str | None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None,
+    ) -> LoadedSkill:
+        loaded_at = utc_now()
+        receipt_id = self._record_builtin_projection_receipt(
+            pid=process.pid,
+            actor=actor,
+            skill=skill,
+            loaded_at=loaded_at,
+        )
+        loaded = LoadedSkill(
+            skill_id=skill.skill_id,
+            version=skill.version,
+            source=source,
+            package_sha256=skill.package_sha256,
+            loaded_at=loaded_at,
+            tool_names=sorted(tool_ids),
+            tool_ids=dict(tool_ids),
+            jit_tool_ids={},
+            instructions_hash=self._hash_text(skill.instructions),
+            package_snapshot=self._skill_snapshot(skill),
+            activation_kind="builtin_projection",
+            base_tool_ids=base_tool_ids,
+            base_model_tool_ids=base_model_tool_ids,
+        )
+        self._persist_loaded_skill(
+            process,
+            loaded=loaded,
+            tool_table=dict(process.tool_table),
+            model_tool_table=updated_model_table,
+            publication_id=publication_id,
+            receipt_recorder=receipt_recorder,
+            loaded_record_extensions={
+                _BUILTIN_PROJECTION_RECEIPT_FIELD: receipt_id,
+            },
+        )
+        return loaded
+
+    def _record_builtin_projection_receipt(
+        self,
+        *,
+        pid: str,
+        actor: str,
+        skill: SkillPackage,
+        loaded_at: str,
+    ) -> str:
+        """Persist append-only Host evidence for one catalog-authenticated snapshot."""
+
+        receipt = self.audit.record(
+            actor=actor,
+            action=_BUILTIN_PROJECTION_RECEIPT_ACTION,
+            target=self.resource_for(skill.skill_id),
+            decision={
+                "schema_version": _BUILTIN_PROJECTION_RECEIPT_SCHEMA_VERSION,
+                "skill_id": skill.skill_id,
+                "activation_kind": "builtin_projection",
+                "source": f"builtin:{skill.skill_id}",
+                "package_sha256": skill.package_sha256,
+                "instructions_hash": self._hash_text(skill.instructions),
+                "allowed_tools": sorted(skill.allowed_tools),
+                "loaded_at": loaded_at,
+                "source_pid": pid,
+                "authority_changed": False,
+            },
+        )
+        return str(receipt.record_id)
+
     def unload_skill(
         self,
         pid: str,
@@ -665,13 +1170,24 @@ class SkillManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         selected_actor = actor or pid
-        if require_capability:
-            decisions = self._require_skill_right(selected_actor, skill_id, CapabilityRight.EXECUTE)
-            admin_decision = self._require_process_admin_if_cross_actor(selected_actor, pid)
-            if admin_decision is not None:
-                decisions.append(admin_decision)
-        else:
-            decisions = []
+        process = self.processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        loaded_for_auth = process.loaded_skills.get(skill_id)
+        if loaded_for_auth is None:
+            raise NotFound(f"skill is not loaded in process {pid}: {skill_id}")
+        builtin_projection = self._loaded_builtin_projection_is_trusted(
+            skill_id,
+            loaded_for_auth,
+            process,
+        )
+        decisions = self._unload_authority_decisions(
+            actor=selected_actor,
+            pid=pid,
+            skill_id=skill_id,
+            builtin_projection=builtin_projection,
+            require_capability=require_capability,
+        )
         removed: list[str] = []
         jit_tool_ids: dict[str, str] = {}
         retired_jit_ids: set[str] = set()
@@ -688,6 +1204,9 @@ class SkillManager:
                     loaded = process.loaded_skills.get(skill_id)
                     if loaded is None:
                         raise NotFound(f"skill is not loaded in process {pid}: {skill_id}")
+                    self._require_stable_unload_provenance(
+                        skill_id, loaded, process, builtin_projection
+                    )
                     self._require_loaded_skill_provenance(loaded)
                     tool_ids = self._loaded_tool_id_map(loaded, "tool_ids")
                     jit_tool_ids = self._loaded_tool_id_map(loaded, "jit_tool_ids")
@@ -705,9 +1224,12 @@ class SkillManager:
                             else:
                                 process.tool_table[name] = replacement
                         if process.model_tool_table.get(name) == tool_id:
-                            replacement = self._remaining_skill_binding(process.loaded_skills, name)
-                            if replacement is None:
-                                replacement = base_model_tool_ids.get(name)
+                            replacement = self._unload_model_replacement(
+                                process,
+                                name,
+                                base_model_tool_ids,
+                                builtin_projection=builtin_projection,
+                            )
                             if replacement is None:
                                 process.model_tool_table.pop(name, None)
                             else:
@@ -730,27 +1252,286 @@ class SkillManager:
                     }
                     retired_jit_ids = set(jit_tool_ids.values()) - remaining_jit_ids
                     self._delete_jit_rows(pid, retired_jit_ids)
-                    self.events.emit(
-                        EventType.SKILL_UNLOADED,
-                        source=selected_actor,
-                        target=pid,
-                        payload={"skill_id": skill_id, "removed_tools": sorted(removed)},
-                    )
-                    self.audit.record(
+                    self._record_skill_unload(
+                        pid=pid,
                         actor=selected_actor,
-                        action="skill.unload",
-                        target=f"process:{pid}",
-                        decision={
-                            "skill_id": skill_id,
-                            "removed_tools": sorted(removed),
-                            "retired_jit_tool_ids": sorted(retired_jit_ids),
-                        },
+                        skill_id=skill_id,
+                        builtin_projection=builtin_projection,
+                        removed=removed,
+                        retired_jit_ids=retired_jit_ids,
                     )
             # A failed authority settlement rolls back the process/tool rows and
             # their evidence, so retire in-memory implementations only after the
             # enclosing AuthorityTransaction has committed successfully.
             self._forget_jit_tool_ids(retired_jit_ids)
-        return {"pid": pid, "skill_id": skill_id, "removed_tools": sorted(removed)}
+        return {
+            "pid": pid,
+            "skill_id": skill_id,
+            "activation_kind": "builtin_projection" if builtin_projection else "registered",
+            "removed_tools": sorted(removed),
+            "authority_changed": False,
+        }
+
+    def _record_skill_unload(
+        self,
+        *,
+        pid: str,
+        actor: str,
+        skill_id: str,
+        builtin_projection: bool,
+        removed: list[str],
+        retired_jit_ids: set[str],
+    ) -> None:
+        self.events.emit(
+            EventType.SKILL_UNLOADED,
+            source=actor,
+            target=pid,
+            payload={"skill_id": skill_id, "removed_tools": sorted(removed)},
+        )
+        self.audit.record(
+            actor=actor,
+            action="skill.unload",
+            target=f"process:{pid}",
+            decision={
+                "skill_id": skill_id,
+                "activation_kind": (
+                    "builtin_projection" if builtin_projection else "registered"
+                ),
+                "authority_changed": False,
+                "removed_tools": sorted(removed),
+                "retired_jit_tool_ids": sorted(retired_jit_ids),
+            },
+        )
+
+    def _require_stable_unload_provenance(
+        self,
+        skill_id: str,
+        loaded: Any,
+        process: Any,
+        expected_builtin_projection: bool,
+    ) -> None:
+        current = self._loaded_builtin_projection_is_trusted(
+            skill_id,
+            loaded,
+            process,
+        )
+        if current != expected_builtin_projection:
+            raise ValidationError(
+                f"loaded Skill activation provenance changed during unload: {skill_id}"
+            )
+
+    def _unload_authority_decisions(
+        self,
+        *,
+        actor: str,
+        pid: str,
+        skill_id: str,
+        builtin_projection: bool,
+        require_capability: bool,
+    ) -> list[CapabilityDecision]:
+        if not require_capability:
+            return []
+        decisions = (
+            []
+            if builtin_projection
+            else self._require_skill_right(actor, skill_id, CapabilityRight.EXECUTE)
+        )
+        admin_decision = self._require_process_admin_if_cross_actor(actor, pid)
+        if admin_decision is not None:
+            decisions.append(admin_decision)
+        return decisions
+
+    def _loaded_builtin_projection_is_trusted(
+        self,
+        skill_id: str,
+        loaded: Any,
+        process: Any,
+    ) -> bool:
+        activation_kind = (
+            loaded.get("activation_kind", "registered")
+            if isinstance(loaded, dict)
+            else "registered"
+        )
+        if self._builtin_catalog.is_builtin_id(skill_id) and activation_kind != "builtin_projection":
+            raise ValidationError(
+                f"built-in loaded Skill is missing trusted projection provenance: {skill_id}"
+            )
+        if activation_kind != "builtin_projection":
+            return False
+        if not isinstance(loaded, dict):
+            raise ValidationError(f"invalid built-in loaded Skill record: {skill_id}")
+        _skill, tool_ids = self._validate_loaded_builtin_projection_record(skill_id, loaded)
+        if any(process.tool_table.get(name) != tool_id for name, tool_id in tool_ids.items()):
+            raise ValidationError(f"built-in loaded Skill escapes current image tool table: {skill_id}")
+        return True
+
+    def reconcile_builtin_projection_image_ceilings(self) -> None:
+        """Drop trusted projections that no longer fit a replaced image definition."""
+
+        for process in self.processes.list_processes(limit=None):
+            candidates = [
+                str(skill_id)
+                for skill_id, loaded in process.loaded_skills.items()
+                if isinstance(loaded, dict)
+                and loaded.get("activation_kind") == "builtin_projection"
+            ]
+            for skill_id in candidates:
+                current = self.processes.get_process(process.pid)
+                if current is None:
+                    break
+                loaded = current.loaded_skills.get(skill_id)
+                try:
+                    trusted = self._loaded_builtin_projection_is_trusted(
+                        skill_id,
+                        loaded,
+                        current,
+                    )
+                    supported = self.builtin_projection_supported_by_process(
+                        current,
+                        skill_id,
+                        loaded,
+                    )
+                except ValidationError:
+                    # Preserve malformed state for the normal invalid-snapshot
+                    # diagnostics. It must never be trusted as a free unload.
+                    continue
+                if trusted and not supported:
+                    self.unload_skill(
+                        current.pid,
+                        skill_id,
+                        actor="runtime",
+                        require_capability=False,
+                    )
+
+    def _unload_model_replacement(
+        self,
+        process: Any,
+        name: str,
+        base_model_tool_ids: dict[str, str],
+        *,
+        builtin_projection: bool,
+    ) -> str | None:
+        replacement = self._remaining_skill_binding(process.loaded_skills, name)
+        if replacement is None:
+            replacement = base_model_tool_ids.get(name)
+        if (
+            builtin_projection
+            and replacement is not None
+            and not self._builtin_image_allows_model_binding(
+                process,
+                name,
+                replacement,
+            )
+        ):
+            return None
+        return replacement
+
+    def _builtin_image_allows_model_binding(
+        self,
+        process: Any,
+        name: str,
+        tool_id: str,
+    ) -> bool:
+        image = self._images.get(process.image_id)
+        return (
+            image is not None
+            and name in image.default_tools
+            and process.tool_table.get(name) == tool_id
+        )
+
+    def builtin_projection_supported_by_process(
+        self,
+        process: Any,
+        skill_id: str,
+        loaded: Any,
+    ) -> bool:
+        """Validate trusted provenance and test target-image compatibility."""
+
+        if not isinstance(loaded, dict) or loaded.get("activation_kind") != "builtin_projection":
+            return False
+        _skill, tool_ids = self._validate_loaded_builtin_projection_record(skill_id, loaded)
+        image = self._images.get(process.image_id)
+        return (
+            image is not None
+            and set(tool_ids).issubset(image.default_tools)
+            and all(process.tool_table.get(name) == tool_id for name, tool_id in tool_ids.items())
+        )
+
+    def _validate_loaded_builtin_projection_record(
+        self,
+        skill_id: str,
+        loaded: dict[str, Any],
+    ) -> tuple[SkillPackage, dict[str, str]]:
+        catalog_skill = self._builtin_catalog.get(skill_id)
+        if catalog_skill is None:
+            raise ValidationError(f"unknown built-in loaded Skill id: {skill_id}")
+        if loaded.get("activation_kind") != "builtin_projection":
+            raise ValidationError(f"invalid built-in loaded Skill activation kind: {skill_id}")
+        if str(loaded.get("source") or "") != f"builtin:{skill_id}":
+            raise ValidationError(f"invalid built-in loaded Skill source: {skill_id}")
+        if not isinstance(loaded.get("package_snapshot"), dict):
+            raise ValidationError(f"built-in loaded Skill is missing its package snapshot: {skill_id}")
+        if not str(loaded.get("package_sha256") or ""):
+            raise ValidationError(f"built-in loaded Skill is missing its package hash: {skill_id}")
+        skill = self._skill_for_loaded_record(skill_id, loaded)
+        if skill.jit_tools or skill.actions or skill.required_capabilities:
+            raise ValidationError(f"invalid built-in loaded Skill package: {skill_id}")
+        if loaded.get("instructions_hash") != self._hash_text(skill.instructions):
+            raise ValidationError(f"invalid built-in loaded Skill instructions hash: {skill_id}")
+        tool_ids = self._loaded_tool_id_map(loaded, "tool_ids")
+        if set(tool_ids) != set(skill.allowed_tools):
+            raise ValidationError(f"invalid built-in loaded Skill tool provenance: {skill_id}")
+        if loaded.get("tool_names") != sorted(skill.allowed_tools):
+            raise ValidationError(f"invalid built-in loaded Skill tool names: {skill_id}")
+        if self._loaded_tool_id_map(loaded, "jit_tool_ids"):
+            raise ValidationError(f"built-in loaded Skill cannot publish JIT tools: {skill_id}")
+        if self._loaded_tool_id_map(loaded, "base_tool_ids") != tool_ids:
+            raise ValidationError(f"invalid built-in loaded Skill base tool provenance: {skill_id}")
+        base_model_tool_ids = self._loaded_tool_id_map(loaded, "base_model_tool_ids")
+        if any(tool_ids.get(name) != tool_id for name, tool_id in base_model_tool_ids.items()):
+            raise ValidationError(f"invalid built-in loaded Skill model provenance: {skill_id}")
+        self._validate_builtin_projection_receipt(skill_id, skill, loaded)
+        return skill, tool_ids
+
+    def _validate_builtin_projection_receipt(
+        self,
+        skill_id: str,
+        skill: SkillPackage,
+        loaded: dict[str, Any],
+    ) -> None:
+        receipt_id = loaded.get(_BUILTIN_PROJECTION_RECEIPT_FIELD)
+        if not isinstance(receipt_id, str) or not receipt_id:
+            raise ValidationError(
+                f"built-in loaded Skill is missing its activation receipt: {skill_id}"
+            )
+        receipt = self.unit_of_work.evidence.get_audit(receipt_id)
+        decision = receipt.decision if receipt is not None else None
+        expected = {
+            "schema_version": _BUILTIN_PROJECTION_RECEIPT_SCHEMA_VERSION,
+            "skill_id": skill_id,
+            "activation_kind": "builtin_projection",
+            "source": f"builtin:{skill_id}",
+            "package_sha256": skill.package_sha256,
+            "instructions_hash": self._hash_text(skill.instructions),
+            "allowed_tools": sorted(skill.allowed_tools),
+            "loaded_at": str(loaded.get("loaded_at") or ""),
+            "source_pid": (
+                str(decision.get("source_pid") or "")
+                if isinstance(decision, dict)
+                else ""
+            ),
+            "authority_changed": False,
+        }
+        if (
+            receipt is None
+            or receipt.action != _BUILTIN_PROJECTION_RECEIPT_ACTION
+            or receipt.target != self.resource_for(skill_id)
+            or not isinstance(decision, dict)
+            or decision != expected
+        ):
+            raise ValidationError(
+                f"built-in loaded Skill activation receipt does not match its package: {skill_id}"
+            )
 
     def read_skill_resource(
         self,
@@ -770,7 +1551,28 @@ class SkillManager:
         if require_loaded:
             if loaded is None:
                 raise CapabilityDenied(f"skill is not loaded in process {pid}: {skill_id}")
-            skill = self._skill_for_loaded_record(skill_id, loaded)
+            if (
+                isinstance(loaded, dict)
+                and loaded.get("activation_kind") == "builtin_projection"
+            ):
+                if not self._loaded_builtin_projection_is_trusted(
+                    skill_id,
+                    loaded,
+                    process,
+                ):
+                    raise ValidationError(
+                        f"invalid built-in loaded Skill projection: {skill_id}"
+                    )
+                skill, _tool_ids = self._validate_loaded_builtin_projection_record(
+                    skill_id,
+                    loaded,
+                )
+            elif self._builtin_catalog.is_builtin_id(skill_id):
+                raise ValidationError(
+                    f"built-in loaded Skill is missing trusted projection provenance: {skill_id}"
+                )
+            else:
+                skill = self._skill_for_loaded_record(skill_id, loaded)
         else:
             skill, _metadata = self._get_skill(skill_id)
         normalized = self._normalize_relative_resource_path(path)
@@ -1037,10 +1839,7 @@ class SkillManager:
         for key in metadata:
             if key.startswith("agent-libos.") and key not in _AGENT_LIBOS_METADATA_KEYS:
                 raise ValidationError(f"unknown agent-libos skill metadata key: {key}")
-        raw_allowed_tools = data.get("allowed-tools")
-        if raw_allowed_tools == {}:
-            raw_allowed_tools = []
-        allowed_tools = self._string_list(raw_allowed_tools, "allowed-tools")
+        allowed_tools = self._allowed_tools(data.get("allowed-tools"))
         for tool in allowed_tools:
             self._validate_tool_identifier(tool, "allowed-tools[]", self.config.skills.id_max_chars)
         return {
@@ -1195,6 +1994,8 @@ class SkillManager:
                 continue
             for child in sorted(root.iterdir()):
                 if not child.is_dir():
+                    continue
+                if self._builtin_catalog.is_builtin_id(child.name):
                     continue
                 try:
                     package, source = self._load_package_from_host_path(child)
@@ -1422,8 +2223,11 @@ class SkillManager:
         model_tool_table: dict[str, str],
         publication_id: str | None,
         receipt_recorder: RuntimePublicationReceiptRecorder | None,
+        loaded_record_extensions: Mapping[str, Any] | None = None,
     ) -> Any:
         loaded_record = to_jsonable(loaded)
+        if loaded_record_extensions:
+            loaded_record.update(dict(loaded_record_extensions))
         process.tool_table = tool_table
         process.model_tool_table = model_tool_table
         process.loaded_skills[loaded.skill_id] = loaded_record
@@ -1535,6 +2339,9 @@ class SkillManager:
             raise ValidationError(
                 "0.3 loaded Skill state is missing canonical tool provenance"
             )
+        activation_kind = loaded.get("activation_kind", "registered")
+        if activation_kind not in {"registered", "builtin_projection"}:
+            raise ValidationError(f"unknown loaded Skill activation_kind: {activation_kind}")
 
     def _activation_base_bindings(
         self,
@@ -1754,6 +2561,18 @@ class SkillManager:
         raise CapabilityDenied(f"global skill path is outside configured global_dirs: {selected}")
 
     def _get_skill(self, skill_id: str) -> tuple[SkillPackage, dict[str, Any]]:
+        builtin = self._builtin_catalog.get(skill_id)
+        if builtin is not None:
+            metadata = self._builtin_catalog.metadata(skill_id)
+            assert metadata is not None
+            return builtin, {
+                **metadata,
+                "registered_by": None,
+                "created_at": None,
+                "updated_at": None,
+            }
+        if self._builtin_catalog.is_builtin_id(skill_id):
+            raise ValidationError(f"unknown reserved built-in Skill id: {skill_id}")
         found = self.store.get_skill(skill_id)
         if found is None:
             raise NotFound(f"skill not found: {skill_id}")
@@ -2201,6 +3020,15 @@ class SkillManager:
     def _string_list(self, value: Any, field: str) -> list[str]:
         return [self._require_string(item, f"{field}[]") for item in self._list(value, field)]
 
+    def _allowed_tools(self, value: Any) -> list[str]:
+        """Parse canonical Agent Skills syntax while retaining legacy lists."""
+
+        if value is None or value == {}:
+            return []
+        if isinstance(value, str):
+            return self._require_string(value, "allowed-tools").split()
+        return self._string_list(value, "allowed-tools")
+
     def _mapping(self, value: Any, field: str) -> dict[str, Any]:
         if value is None:
             return {}
@@ -2259,9 +3087,16 @@ class SkillManager:
         return self._require_string(value, field)
 
     def _validate_skill_name(self, value: str) -> None:
-        self._validate_string_length(value, "name", self.config.skills.name_max_chars)
+        self._validate_string_length(
+            value,
+            "name",
+            min(self.config.skills.name_max_chars, _SKILL_NAME_MAX_CHARS),
+        )
         if not _SKILL_NAME_PATTERN.match(value):
-            raise ValidationError(f"skill name must use lowercase letters, digits, and hyphens: {value!r}")
+            raise ValidationError(
+                "skill name must use lowercase letters, digits, and single internal hyphens: "
+                f"{value!r}"
+            )
 
     def _validate_tool_identifier(self, value: str, field: str, max_chars: int) -> None:
         self._validate_string_length(value, field, max_chars)

@@ -78,6 +78,11 @@ class LoadedSkill:
     jit_tool_ids: dict[str, str]
     instructions_hash: str
     package_snapshot: dict[str, Any] = field(default_factory=dict)
+    # Built-in projection Skills are trusted runtime assets that may only
+    # reveal bindings already present in the image-owned tool table.  Keep the
+    # activation kind durable so unload can preserve the ordinary registered
+    # Skill authority path after restart/checkpoint restore.
+    activation_kind: str = "registered"
     # Bindings that existed independently of this Skill before activation.
     # They let unload restore image/manual visibility without treating a
     # shared alias as owned by whichever Skill happens to be removed first.

@@ -93,6 +93,9 @@ def test_console_entrypoint_uses_the_domain_error_boundary() -> None:
     assert pyproject["project"]["scripts"] == {
         "agent-libos": "agent_libos.api.cli:cli",
         "agent-libos-gui-server": "agent_libos.api.gui.server:main",
+        "agent-libos-migrate-tool-groups": (
+            "agent_libos.storage.tool_skill_migration:cli"
+        ),
     }
 
 

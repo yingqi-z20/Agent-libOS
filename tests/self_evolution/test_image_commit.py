@@ -67,8 +67,15 @@ class TestImageCommit:
                 name='coding-projection',
             )
 
-            assert result.image.metadata['lazy_tool_groups'] is True
-            assert result.image.metadata['initial_tool_groups'] == ['filesystem']
+            assert result.image.metadata['tool_projection'] == 'skills'
+            assert result.image.default_skills == [
+                'agent-libos-skill-navigation',
+                'agent-libos-authority-basics',
+                'agent-libos-human-collaboration',
+                'agent-libos-workspace-navigation',
+            ]
+            assert 'lazy_tool_groups' not in result.image.metadata
+            assert 'initial_tool_groups' not in result.image.metadata
 
     def test_pre_03_checkpoint_is_rejected_before_image_commit_write(self) -> None:
         with _runtime() as runtime:

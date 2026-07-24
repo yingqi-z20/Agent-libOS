@@ -1,4 +1,4 @@
-import { Database, Pause, Play, RefreshCw, Square, StepForward } from "lucide-react";
+import { Bot, CirclePlus, Database, FolderOpen, Gauge, Pause, Play, RefreshCw, StepForward, UserRound } from "lucide-react";
 import type { SchedulerStatus, StreamConnectionStatus } from "../api/types";
 import { useI18n } from "../i18n";
 import { parseOptionalQuanta } from "../quanta";
@@ -40,50 +40,78 @@ export function TopBar({
   lastUpdatedAt: Date | null;
 }) {
   const { formatTime, t } = useI18n();
+  const schedulerLabel = scheduler?.running ? t("top.running") : scheduler?.paused ? t("top.paused") : t("top.idle");
 
   return (
     <header className="topBar">
-      <div className="dbGroup">
-        <Database size={17} />
-        <input
-          aria-label={t("top.runtimeDatabase")}
-          value={db}
-          readOnly
-        />
-        <button title={t("top.openSqlite")} disabled={busy} onClick={onOpenDb}>{t("top.open")}</button>
+      <div className="operatorBrand">
+        <span className="brandMark" aria-hidden="true"><Bot size={17} /></span>
+        <div>
+          <strong>Agent libOS</strong>
+          <span>{t("top.operatorWorkspace")}</span>
+        </div>
       </div>
-      <button className="primary" disabled={busy} onClick={onSpawn}>{t("top.spawn")}</button>
-      <label className="toggle">
-        <input type="checkbox" disabled={busy} checked={Boolean(scheduler?.auto_run)} onChange={(event) => onAutoRunChange(event.currentTarget.checked)} />
-        {t("top.autoRun")}
-      </label>
-      <label className="quanta">
-        {t("top.quanta")}
-        <input
-          type="number"
-          min={1}
-          step={1}
-          disabled={busy}
-          value={maxQuanta ?? ""}
-          placeholder={t("scheduler.unlimitedPlaceholder")}
-          title={t("scheduler.unlimitedHint")}
-          onChange={(event) => onMaxQuantaChange(parseOptionalQuanta(event.currentTarget.value))}
-        />
-      </label>
-      <button title={t("top.runSelected")} disabled={busy || !selectedPid || scheduler?.running} onClick={onRun}><Play size={16} />{t("user.run")}</button>
-      <button title={t("top.stepSelected")} disabled={busy || !selectedPid || scheduler?.running} onClick={onStep}><StepForward size={16} />{t("top.step")}</button>
-      <button title={t("top.pauseScheduler")} disabled={busy} onClick={onPause}><Pause size={16} />{t("user.pause")}</button>
-      <button aria-label={t("top.refreshSnapshot")} title={t("top.refreshSnapshot")} disabled={busy} onClick={onRefresh}><RefreshCw size={16} /></button>
-      <LanguageSwitch />
-      {onShowUser ? <button className="secondary" onClick={onShowUser}>{t("top.userPage")}</button> : null}
-      <span
-        className={`connectionBadge ${streamStatus}`}
-        role="status"
-        title={lastUpdatedAt ? t("connection.updated", { time: formatTime(lastUpdatedAt.toISOString()) }) : undefined}
-      >
-        <span className="statusDot" />{t(`connection.${streamStatus}`)}
-      </span>
-      <span className={`scheduler ${scheduler?.running ? "running" : ""}`}><Square size={11} />{scheduler?.running ? t("top.running") : scheduler?.paused ? t("top.paused") : t("top.idle")}</span>
+
+      <div className="operatorDbChip" title={db}>
+        <Database size={16} aria-hidden="true" />
+        <div>
+          <span>{t("top.runtimeDatabase")}</span>
+          <strong>{db}</strong>
+        </div>
+        <button type="button" className="iconOnly softButton" aria-label={t("top.openSqlite")} title={t("top.openSqlite")} disabled={busy} onClick={onOpenDb}>
+          <FolderOpen size={14} />
+        </button>
+      </div>
+
+      <div className="operatorCommandBar" role="group" aria-label={t("top.runtimeControls")}>
+        <button type="button" className="primary spawnProcessButton" disabled={busy} onClick={onSpawn}>
+          <CirclePlus size={15} />{t("top.spawn")}
+        </button>
+        <label className="switchControl">
+          <input type="checkbox" disabled={busy} checked={Boolean(scheduler?.auto_run)} onChange={(event) => onAutoRunChange(event.currentTarget.checked)} />
+          <span className="switchVisual" aria-hidden="true"><span /></span>
+          <span>{t("top.autoRun")}</span>
+        </label>
+        <label className="operatorQuanta">
+          <Gauge size={14} aria-hidden="true" />
+          <span>{t("top.quanta")}</span>
+          <input
+            type="number"
+            min={1}
+            step={1}
+            disabled={busy}
+            value={maxQuanta ?? ""}
+            placeholder={t("scheduler.unlimitedPlaceholder")}
+            title={t("scheduler.unlimitedHint")}
+            onChange={(event) => onMaxQuantaChange(parseOptionalQuanta(event.currentTarget.value))}
+          />
+        </label>
+        <div className="operatorRunGroup">
+          <button type="button" title={t("top.runSelected")} disabled={busy || !selectedPid || scheduler?.running} onClick={onRun}><Play size={15} />{t("user.run")}</button>
+          <button type="button" title={t("top.stepSelected")} disabled={busy || !selectedPid || scheduler?.running} onClick={onStep}><StepForward size={15} />{t("top.step")}</button>
+          <button type="button" title={t("top.pauseScheduler")} disabled={busy || !scheduler?.running} onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
+          <button type="button" className="iconOnly softButton" aria-label={t("top.refreshSnapshot")} title={t("top.refreshSnapshot")} disabled={busy} onClick={onRefresh}><RefreshCw size={15} /></button>
+        </div>
+      </div>
+
+      <div className="operatorTopMeta">
+        <span className={`schedulerPill ${scheduler?.running ? "running" : scheduler?.paused ? "paused" : "idle"}`}>
+          <span className="statusDot" />{schedulerLabel}
+        </span>
+        <span
+          className={`connectionBadge ${streamStatus}`}
+          role="status"
+          title={lastUpdatedAt ? t("connection.updated", { time: formatTime(lastUpdatedAt.toISOString()) }) : undefined}
+        >
+          <span className="statusDot" />{t(`connection.${streamStatus}`)}
+        </span>
+        <LanguageSwitch />
+        {onShowUser ? (
+          <button type="button" className="secondary userViewButton" aria-label={t("top.userPage")} title={t("top.userPage")} onClick={onShowUser}>
+            <UserRound size={15} /><span>{t("top.userPage")}</span>
+          </button>
+        ) : null}
+      </div>
     </header>
   );
 }

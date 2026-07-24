@@ -17,7 +17,12 @@ from agent_libos.primitives.git_command_policy import (
     validate_and_normalize_raw_git,
 )
 from agent_libos.substrate import CommandMetrics, GitCommandResult, GitRepositoryLayout, GitRepositoryState
-from agent_libos.tools.builtin.git import GIT_TOOL_NAMES, GitFetchArgs, GitPushArgs
+from agent_libos.tools.builtin.git import (
+    GIT_TOOL_NAMES,
+    GitDiffArgs,
+    GitFetchArgs,
+    GitPushArgs,
+)
 
 
 _SHA1_A = "a" * 40
@@ -116,6 +121,13 @@ def test_git_path_validation_rejects_metadata_and_traversal(value: str) -> None:
 def test_dash_prefixed_path_is_preserved_as_a_literal_pathspec() -> None:
     assert GitPrimitive._decode_path("-option") == b"-option"
     assert GitPrimitive._path_argv((b"-option",)) == ["-option"]
+
+
+def test_git_diff_treats_empty_optional_refs_as_absent() -> None:
+    parsed = GitDiffArgs(scope="worktree", base="", head="   ")
+
+    assert parsed.base is None
+    assert parsed.head is None
 
 
 @pytest.mark.parametrize(

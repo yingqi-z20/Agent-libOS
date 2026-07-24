@@ -6,7 +6,7 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any, Iterable, MutableMapping
+from typing import Any, Iterable, Mapping, MutableMapping
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -3113,6 +3113,16 @@ class CheckpointManager:
             ),
         }
 
+    @staticmethod
+    def _remap_tool_table_json(raw_table: Any, tool_map: Mapping[str, str]) -> str:
+        table = loads(raw_table, {})
+        return dumps(
+            {
+                str(name): tool_map.get(str(tool_id), str(tool_id))
+                for name, tool_id in table.items()
+            }
+        )
+
     def _remap_process_row(
         self,
         row: dict[str, Any],
@@ -3148,12 +3158,13 @@ class CheckpointManager:
             )
         )
         item["capabilities_json"] = dumps([capability_map[cap] for cap in loads(item["capabilities_json"], []) if cap in capability_map])
-        tool_table = loads(item.get("tool_table_json"), {})
-        item["tool_table_json"] = dumps(
-            {
-                str(name): tool_map.get(str(tool_id), str(tool_id))
-                for name, tool_id in tool_table.items()
-            }
+        item["tool_table_json"] = self._remap_tool_table_json(
+            item.get("tool_table_json"),
+            tool_map,
+        )
+        item["model_tool_table_json"] = self._remap_tool_table_json(
+            item.get("model_tool_table_json"),
+            tool_map,
         )
         loaded_skills = loads(item.get("loaded_skills_json"), {})
         for loaded in loaded_skills.values():

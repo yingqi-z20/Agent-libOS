@@ -11,7 +11,11 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class LoadImagePackageArgs(BaseModel):
-    path: str = Field(description="Workspace-relative image package directory containing IMAGE.yaml.")
+    path: str = Field(
+        description=(
+            "Workspace-relative package directory containing IMAGE.yaml; registration does not exec the current process."
+        )
+    )
     replace: bool = Field(
         default=False,
         description="Replace an existing image with the same id; this requires exact image admin authority.",
@@ -34,7 +38,9 @@ class LoadImagePackageOutput(BaseModel):
 
 
 class CommitCheckpointToImageArgs(BaseModel):
-    checkpoint_id: str = Field(description="Checkpoint id to commit into an immutable image artifact.")
+    checkpoint_id: str = Field(
+        description="Checkpoint id whose reconstructable internal state becomes an immutable image artifact."
+    )
     image_id: str = Field(description="Target AgentImage id; a new id requires exact image write authority.")
     name: str = Field(description="Human-readable image name.")
     version: str = Field(default="v0", description="Image version.")
@@ -60,7 +66,8 @@ class CommitCheckpointToImageOutput(BaseModel):
 class LoadImagePackageTool(SyncAgentTool[LoadImagePackageArgs]):
     name = "load_image_package"
     description = (
-        "Read an AgentImage package directory from the workspace and register it with the runtime. "
+        "Read an AgentImage package directory from the workspace and register it for later process launch or exec. "
+        "Registration alone does not change the current process image, tool table, memory, or capabilities. "
         "The filesystem primitive enforces file read authority. Registering a new id requires exact image write authority; "
         "replace=true requires exact image admin authority."
     )
@@ -110,8 +117,9 @@ class LoadImagePackageTool(SyncAgentTool[LoadImagePackageArgs]):
 class CommitCheckpointToImageTool(SyncAgentTool[CommitCheckpointToImageArgs]):
     name = "commit_checkpoint_to_image"
     description = (
-        "Commit a process checkpoint into a new checkpoint-derived AgentImage. "
-        "The image captures reconstructable internal runtime state only and does not grant external capabilities. "
+        "Publish a process checkpoint as a checkpoint-derived AgentImage for later launch or exec. "
+        "This does not restore the checkpoint or change the current process. The image captures reconstructable "
+        "state only; it neither clones external provider state nor grants external capabilities. "
         "A new id requires exact image write authority; replace=true requires exact image admin authority."
     )
     args_schema = CommitCheckpointToImageArgs

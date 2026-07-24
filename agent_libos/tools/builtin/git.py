@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import GitErrorCode
@@ -18,6 +25,14 @@ from agent_libos.utils.serde import to_jsonable
 
 _GIT_DEFAULTS = DEFAULT_CONFIG.git
 _STATE_TOKEN_PATTERN = r"^[0-9a-f]{64}$"
+_EXPECTED_STATE_TOKEN_DESCRIPTION = (
+    "Fresh state_token returned by a Git read for this repository/worktree. "
+    "The mutation uses compare-and-swap and fails as stale if state changed; re-read and reconsider before retrying."
+)
+
+
+def _expected_state_token_field() -> Any:
+    return Field(pattern=_STATE_TOKEN_PATTERN, description=_EXPECTED_STATE_TOKEN_DESCRIPTION)
 
 
 class _StrictArgs(BaseModel):
@@ -51,11 +66,33 @@ class GitStatusArgs(_StrictArgs):
 
 class GitDiffArgs(_StrictArgs):
     scope: Literal["worktree", "staged", "range"] = "worktree"
-    base: str | None = None
-    head: str | None = None
+    base: str | None = Field(
+        default=None,
+        description=(
+            "Exact base ref/OID for range diffs. Set null for worktree or staged diffs; "
+            "an empty string is treated as null."
+        ),
+    )
+    head: str | None = Field(
+        default=None,
+        description=(
+            "Exact head ref/OID for range diffs. Set null for worktree or staged diffs; "
+            "an empty string is treated as null."
+        ),
+    )
     paths: list[GitPathArgument] = Field(default_factory=list)
     worktree_id: str = "main"
     max_bytes: int | None = Field(default=None, gt=0)
+
+    @field_validator("base", "head", mode="before")
+    @classmethod
+    def _empty_ref_is_absent(cls, value: Any) -> Any:
+        # Some structured-output providers populate nullable string fields with
+        # an empty string. For non-range diffs that is unambiguously equivalent
+        # to omission; range validation still rejects the resulting None.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 class GitLogArgs(_StrictArgs):
@@ -93,21 +130,24 @@ class GitListWorktreesArgs(_StrictArgs):
 
 class GitPathsMutationArgs(_StrictArgs):
     paths: list[GitPathArgument] = Field(min_length=1)
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     worktree_id: str = "main"
 
 
 class GitCommitArgs(_StrictArgs):
     message: str = Field(min_length=1, max_length=131_072)
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
-    amend: bool = False
+    expected_state_token: str = _expected_state_token_field()
+    amend: bool = Field(default=False, description="Replace the current tip commit instead of creating a new commit.")
     worktree_id: str = "main"
 
 
 class GitRestoreArgs(GitPathsMutationArgs):
-    staged: bool = False
-    worktree: bool = True
-    source: str | None = None
+    staged: bool = Field(default=False, description="Restore the selected paths in the index.")
+    worktree: bool = Field(
+        default=True,
+        description="Restore the selected paths in the worktree, discarding local content.",
+    )
+    source: str | None = Field(default=None, description="Exact source ref/OID; defaults to the index or HEAD by mode.")
 
 
 class GitBranchArgs(_StrictArgs):
@@ -116,20 +156,26 @@ class GitBranchArgs(_StrictArgs):
         serialization_alias="action",
     )
     name: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     start: str | None = None
     new_name: str | None = None
-    force: bool = False
+    force: bool = Field(
+        default=False,
+        description="Permit the requested create/delete/rename to overwrite safety checks.",
+    )
     worktree_id: str = "main"
 
 
 class GitSwitchArgs(_StrictArgs):
     target: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     create: bool = False
     start: str | None = None
     detach: bool = False
-    force: bool = False
+    force: bool = Field(
+        default=False,
+        description="Discard conflicting local changes when switching; requires destructive approval.",
+    )
     worktree_id: str = "main"
 
 
@@ -139,16 +185,19 @@ class GitTagArgs(_StrictArgs):
         serialization_alias="action",
     )
     name: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     target: str | None = None
     message: str | None = Field(default=None, max_length=131_072)
-    force: bool = False
+    force: bool = Field(
+        default=False,
+        description="Replace an existing tag when creating; deleting is already destructive.",
+    )
     worktree_id: str = "main"
 
 
 class GitIntegrateArgs(_StrictArgs):
     operation: Literal["merge", "rebase", "cherry_pick", "revert", "abort"]
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     ref: str | None = None
     abort_kind: Literal["merge", "rebase", "cherry_pick", "revert"] | None = None
     worktree_id: str = "main"
@@ -159,7 +208,7 @@ class GitStashArgs(_StrictArgs):
         validation_alias=AliasChoices("operation", "action"),
         serialization_alias="action",
     )
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     index: int = Field(default=0, ge=0, le=100_000)
     include_untracked: bool = False
     reinstate_index: bool = False
@@ -167,17 +216,23 @@ class GitStashArgs(_StrictArgs):
 
 
 class GitResetArgs(_StrictArgs):
-    target: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
-    mode: Literal["soft", "mixed", "hard"] = "mixed"
+    target: str = Field(description="Exact validated ref/OID to move HEAD to.")
+    expected_state_token: str = _expected_state_token_field()
+    mode: Literal["soft", "mixed", "hard"] = Field(
+        default="mixed",
+        description="soft moves HEAD; mixed also resets the index; hard also discards worktree changes.",
+    )
     worktree_id: str = "main"
 
 
 class GitCleanArgs(_StrictArgs):
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
-    paths: list[GitPathArgument] = Field(default_factory=list)
-    directories: bool = False
-    ignored: bool = False
+    expected_state_token: str = _expected_state_token_field()
+    paths: list[GitPathArgument] = Field(
+        default_factory=list,
+        description="Optional literal path restriction; empty selects all eligible untracked paths.",
+    )
+    directories: bool = Field(default=False, description="Also remove eligible untracked directories.")
+    ignored: bool = Field(default=False, description="Also remove ignored paths, increasing destructive scope.")
     worktree_id: str = "main"
 
 
@@ -186,10 +241,13 @@ class GitWorktreeArgs(_StrictArgs):
         validation_alias=AliasChoices("operation", "action"),
         serialization_alias="action",
     )
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     ref: str | None = None
     new_branch: str | None = None
-    managed_worktree_id: str | None = None
+    managed_worktree_id: str | None = Field(
+        default=None,
+        description="Existing managed worktree id required for remove; removal may discard that worktree's local state.",
+    )
 
 
 class GitCreatePatchArgs(_StrictArgs):
@@ -202,21 +260,21 @@ class GitCreatePatchArgs(_StrictArgs):
 
 class GitApplyPatchArgs(_StrictArgs):
     patch_oid: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
-    index: bool = False
+    expected_state_token: str = _expected_state_token_field()
+    index: bool = Field(default=False, description="Also apply the patch to the index instead of only the worktree.")
     worktree_id: str = "main"
 
 
 class GitFetchArgs(_StrictArgs):
     remote: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     prune: bool = False
     worktree_id: str = "main"
 
 
 class GitPullArgs(_StrictArgs):
     remote: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     branch: str | None = None
     strategy: Literal["ff_only", "merge", "rebase"] = "ff_only"
     worktree_id: str = "main"
@@ -225,10 +283,16 @@ class GitPullArgs(_StrictArgs):
 class GitPushArgs(_StrictArgs):
     remote: str
     remote_ref: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     local_ref: str | None = None
-    delete: bool = False
-    force_with_lease_oid: str | None = None
+    delete: bool = Field(
+        default=False,
+        description="Delete remote_ref instead of updating it; requires destructive authority.",
+    )
+    force_with_lease_oid: str | None = Field(
+        default=None,
+        description="Exact expected remote OID for a guarded force push; unrestricted force is unavailable.",
+    )
     worktree_id: str = "main"
 
 
@@ -237,7 +301,7 @@ class GitCreatePullRequestArgs(_StrictArgs):
     body: str = Field(default="", max_length=131_072)
     base_ref: str
     head_ref: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
 
 
 class GitListPullRequestsArgs(_StrictArgs):
@@ -253,19 +317,19 @@ class GitReviewPullRequestArgs(_StrictArgs):
     pr_id: str
     decision: Literal["comment", "approve", "request_changes"]
     body: str = Field(default="", max_length=131_072)
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
 
 
 class GitMergePullRequestArgs(_StrictArgs):
     pr_id: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
     strategy: Literal["fast_forward", "merge", "squash"] = "fast_forward"
     worktree_id: str = "main"
 
 
 class GitClosePullRequestArgs(_StrictArgs):
     pr_id: str
-    expected_state_token: str = Field(pattern=_STATE_TOKEN_PATTERN)
+    expected_state_token: str = _expected_state_token_field()
 
 
 _INVALID_CODES = {
@@ -387,7 +451,10 @@ class GitStatusTool(_GitReadTool):
 
 class GitDiffTool(_GitReadTool):
     name = "git_diff"
-    description = "Read a bounded, hardened Git patch for the worktree, index, or an exact commit range."
+    description = (
+        "Read a bounded, hardened Git patch for the worktree, index, or an exact commit range. "
+        "Use null base/head for worktree or staged scope; range requires both exact refs/OIDs."
+    )
     args_schema = GitDiffArgs
     method_name = "diff"
 

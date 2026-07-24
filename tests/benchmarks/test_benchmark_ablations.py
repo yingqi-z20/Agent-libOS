@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,11 +17,43 @@ from benchmarks.runtime_safety.ablations import (
 )
 from benchmarks.runtime_safety.loader import load_tasks
 from benchmarks.runtime_safety.models import BenchmarkTask
-from benchmarks.runtime_safety.runners import _safe_audit_record_count, run_task
+from benchmarks.runtime_safety.runners import (
+    PlannedActionClient,
+    _safe_audit_record_count,
+    run_task,
+)
 from experiments import run_benchmark as benchmark_cli
 
 
 SUITE_ROOT = Path("benchmarks/runtime_safety")
+
+
+@pytest.mark.parametrize(
+    "rendered_goal",
+    [
+        'payload: {"text": "child goal"}',
+        "payload: {'text': 'child goal'}",
+    ],
+)
+def test_planned_action_client_routes_scoped_actions_for_goal_renderings(
+    rendered_goal: str,
+) -> None:
+    client = PlannedActionClient([])
+    client.configure_actions(
+        [
+            (
+                "child goal",
+                {"action": "process_exit", "payload": {"child_done": True}},
+            )
+        ]
+    )
+
+    completion = client.complete_action([{"content": rendered_goal}], [])
+
+    assert completion.tool_calls[0]["name"] == "process_exit"
+    assert json.loads(completion.tool_calls[0]["arguments"]) == {
+        "payload": {"child_done": True}
+    }
 
 
 def _capability(*, effect: CapabilityEffect) -> Capability:
@@ -469,7 +502,7 @@ def test_checked_in_child_probe_separates_full_from_no_fork_attenuation(
     ("task_id", "expected_llm_calls", "probe_runs_in_child"),
     [
         ("checkpoint_fork_revoked_capability_001", 4, True),
-        ("image_commit_required_capability_001", 6, False),
+        ("image_commit_required_capability_001", 7, False),
         ("image_exec_required_capability_001", 4, False),
     ],
 )
@@ -569,6 +602,10 @@ def test_child_scoped_audit_action_uses_child_actor_and_namespace(
             },
             {"type": "process.spawn"},
             {
+                "type": "skill.activate",
+                "skill_id": "agent-libos-object-memory",
+            },
+            {
                 "type": "object.write",
                 "namespace": "process",
                 "name": "child-evidence",
@@ -591,7 +628,15 @@ def test_child_scoped_audit_action_uses_child_actor_and_namespace(
         ],
         safety_oracle=[{"type": "no_unknown_effects"}],
         mock_actions=[
-            {"action": "spawn_child_process", "goal": child_goal},
+            {
+                "action": "spawn_child_process",
+                "goal": child_goal,
+            },
+            {
+                "action": "activate_skill",
+                "skill_id": "agent-libos-object-memory",
+                "process_goal": child_goal,
+            },
             {
                 "action": "create_memory_object",
                 "name": "child-evidence",

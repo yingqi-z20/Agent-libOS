@@ -875,6 +875,7 @@ class SQLRuntimeStore:
         *,
         config: AgentLibOSConfig | None,
         conn: SqlEngine,
+        initialize_schema: bool = True,
     ) -> None:
         self.config = config or DEFAULT_CONFIG
         self.path = str(path)
@@ -901,6 +902,13 @@ class SQLRuntimeStore:
         self._runtime_assembly_reservation: StoreAssemblyReservation | None = None
         self._runtime_assembly_claimant_thread_id: int | None = None
         fresh_store = self._require_supported_store_version()
+        if not initialize_schema:
+            if fresh_store:
+                raise ValidationError(
+                    "offline migration requires an existing initialized "
+                    "Agent libOS store"
+                )
+            return
         with self.transaction(include_object_payloads=True):
             self.initialize()
             if fresh_store:

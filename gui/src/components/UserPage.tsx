@@ -1,12 +1,48 @@
-import { AlertTriangle, Bot, Database, MessageSquare, Pause, Play, RefreshCw, Send, Settings, Square } from "lucide-react";
+import {
+  Activity,
+  AlertTriangle,
+  ArrowDown,
+  Bot,
+  CheckCircle2,
+  ChevronDown,
+  CirclePlus,
+  Cpu,
+  Database,
+  Gauge,
+  Image as ImageIcon,
+  LoaderCircle,
+  ListTree,
+  MessageSquare,
+  Pause,
+  Play,
+  RefreshCw,
+  Send,
+  Settings,
+  ShieldCheck,
+  Sparkles,
+  Square,
+  Star,
+  X
+} from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import type { GuiConnection, HumanRequest, HumanResponseInput, ImageSummary, LLMProfileInput, LLMProfileSummary, RuntimeProcess, RuntimeSnapshot, StreamConnectionStatus } from "../api/types";
-import { useI18n } from "../i18n";
+import type {
+  GuiConnection,
+  HumanRequest,
+  HumanResponseInput,
+  ImageSummary,
+  LLMProfileInput,
+  LLMProfileSummary,
+  RuntimeProcess,
+  RuntimeSnapshot,
+  StreamConnectionStatus
+} from "../api/types";
+import { useI18n, type TranslationKey } from "../i18n";
 import { parseOptionalQuanta } from "../quanta";
-import type { WorkspaceAccess } from "../taskAuthority";
+import type { CommandAccess, WorkspaceAccess } from "../taskAuthority";
+import { shortProcessId, taskDisplayLabel } from "../taskPresentation";
 import { deriveUserConversation, humanRequestPrompt, type UserConversationItem } from "../userConversation";
-import { ImageSelect } from "./ImageSelect";
 import { HumanRequestCard } from "./HumanRequestCard";
+import { ImageSelect } from "./ImageSelect";
 import { LanguageSwitch } from "./LanguageSwitch";
 import { LLMProfileSelect } from "./LLMProfileSelect";
 import { RatingPanel } from "./RatingPanel";
@@ -16,11 +52,28 @@ const MarkdownMessage = lazy(async () => {
   return { default: module.MarkdownMessage };
 });
 
+const starterPromptKeys = [
+  "user.starterPromptReview",
+  "user.starterPromptTests",
+  "user.starterPromptExplain"
+] as const satisfies readonly TranslationKey[];
+
+const processStatusKeys: Partial<Record<string, TranslationKey>> = {
+  created: "process.status.created",
+  runnable: "process.status.runnable",
+  running: "process.status.running",
+  paused: "process.status.paused",
+  exited: "process.status.exited",
+  failed: "process.status.failed",
+  killed: "process.status.killed"
+};
+
 type UserPageProps = {
   connection: GuiConnection | null;
   snapshot: RuntimeSnapshot | null;
   selectedPid: string | null;
   selectedProcess: RuntimeProcess | null;
+  taskLabels: Readonly<Record<string, string>>;
   maxQuanta: number | null;
   spawnGoal: string;
   spawnImage: string;
@@ -28,6 +81,8 @@ type UserPageProps = {
   spawnWorkingDirectory: string;
   spawnWorkspaceAccess: WorkspaceAccess;
   spawnAllowGitRequests: boolean;
+  spawnCommandAccess: CommandAccess;
+  spawnContextMaintenance: boolean;
   message: string;
   images: ImageSummary[];
   llmProfiles: LLMProfileSummary[];
@@ -39,6 +94,8 @@ type UserPageProps = {
   onSpawnWorkingDirectoryChange(value: string): void;
   onSpawnWorkspaceAccessChange(value: WorkspaceAccess): void;
   onSpawnAllowGitRequestsChange(value: boolean): void;
+  onSpawnCommandAccessChange(value: CommandAccess): void;
+  onSpawnContextMaintenanceChange(value: boolean): void;
   onMessageChange(value: string): void;
   onSpawn(): void;
   onImportImage(): void;
@@ -65,6 +122,7 @@ export function UserPage({
   snapshot,
   selectedPid,
   selectedProcess,
+  taskLabels,
   maxQuanta,
   spawnGoal,
   spawnImage,
@@ -72,6 +130,8 @@ export function UserPage({
   spawnWorkingDirectory,
   spawnWorkspaceAccess,
   spawnAllowGitRequests,
+  spawnCommandAccess,
+  spawnContextMaintenance,
   message,
   images,
   llmProfiles,
@@ -83,6 +143,8 @@ export function UserPage({
   onSpawnWorkingDirectoryChange,
   onSpawnWorkspaceAccessChange,
   onSpawnAllowGitRequestsChange,
+  onSpawnCommandAccessChange,
+  onSpawnContextMaintenanceChange,
   onMessageChange,
   onSpawn,
   onImportImage,
@@ -107,30 +169,79 @@ export function UserPage({
   const [commitImageId, setCommitImageId] = useState("");
   const [commitName, setCommitName] = useState("");
   const [commitVersion, setCommitVersion] = useState("v0");
+  const [showNewTask, setShowNewTask] = useState(!selectedProcess);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const conversation = useMemo(() => deriveUserConversation(snapshot, selectedPid), [snapshot, selectedPid]);
   const pendingRequests = conversation.filter((item): item is Extract<UserConversationItem, { role: "request" }> => item.role === "request");
-  const isRunning = Boolean(snapshot?.scheduler.running);
+  const schedulerRunning = Boolean(snapshot?.scheduler.running);
   const hasProcess = Boolean(selectedProcess);
+  const processTerminal = Boolean(
+    selectedProcess?.terminal || (selectedProcess && ["exited", "failed", "killed"].includes(selectedProcess.status))
+  );
+  const showTaskComposer = !hasProcess || showNewTask;
   const commitReady = Boolean(hasProcess && commitImageId.trim() && commitName.trim() && commitVersion.trim());
   const conversationRef = useRef<HTMLElement>(null);
+  const goalInputRef = useRef<HTMLTextAreaElement>(null);
   const followConversationRef = useRef(true);
+  const processRunning = selectedProcess?.status === "running";
+  const statusTone = selectedProcess ? processStatusTone(selectedProcess.status) : "idle";
+  const selectedStatusLabel = selectedProcess
+    ? processStatusLabel(selectedProcess.status, t)
+    : t("process.status.created");
+  const selectedTaskLabel = selectedProcess
+    ? taskLabels[selectedProcess.pid]?.trim() || t("user.untitledTask")
+    : t("user.workspaceLabel");
+  const selectedStatusDetail = selectedProcess ? processStatusDetail(selectedProcess, t) : null;
+
+  useEffect(() => {
+    if (!selectedProcess) setShowNewTask(true);
+  }, [selectedProcess]);
 
   useEffect(() => {
     const container = conversationRef.current;
-    if (container && followConversationRef.current) container.scrollTop = container.scrollHeight;
+    if (!container) return;
+    if (followConversationRef.current) {
+      container.scrollTop = container.scrollHeight;
+      setShowJumpToLatest(false);
+    } else {
+      setShowJumpToLatest(true);
+    }
   }, [conversation.at(-1)?.id, selectedPid]);
+
+  function openNewTask() {
+    setShowNewTask(true);
+    setMobileSidebarOpen(false);
+    globalThis.requestAnimationFrame?.(() => goalInputRef.current?.focus());
+  }
+
+  function scrollConversationToLatest() {
+    const container = conversationRef.current;
+    if (!container) return;
+    const reducedMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    container.scrollTo({ top: container.scrollHeight, behavior: reducedMotion ? "auto" : "smooth" });
+    followConversationRef.current = true;
+    setShowJumpToLatest(false);
+  }
 
   return (
     <main className="userPage">
+      <a className="skipLink" href="#primary-workspace">{t("user.skipToWorkspace")}</a>
+
       <header className="userTopBar">
         <div className="userBrand">
-          <Bot size={18} />
+          <span className="brandMark" aria-hidden="true"><Bot size={18} /></span>
           <div>
             <strong>Agent libOS</strong>
-            <span>{connection?.db ?? t("app.defaultDb")}</span>
+            <span>{t("user.workspaceLabel")} · {connection?.db ?? t("app.defaultDb")}</span>
           </div>
         </div>
         <div className="userTopActions">
+          {busy ? (
+            <span className="globalBusy" role="status">
+              <LoaderCircle className="spin" size={14} aria-hidden="true" />{t("user.working")}
+            </span>
+          ) : null}
           <span className={`connectionBadge ${streamStatus}`} role="status">
             <span className="statusDot" />
             {t(`connection.${streamStatus}`)}
@@ -141,181 +252,434 @@ export function UserPage({
             </time>
           ) : null}
           <LanguageSwitch />
-          <button disabled={busy} title={t("user.openDbTitle")} onClick={onOpenDb}><Database size={15} />{t("user.openDb")}</button>
-          <button disabled={busy} aria-label={t("user.refreshTitle")} title={t("user.refreshTitle")} onClick={onRefresh}><RefreshCw size={15} /></button>
-          <button className="secondary" onClick={onShowOperator}><Settings size={15} />{t("user.operatorConsole")}</button>
+          <button type="button" className="toolbarButton" disabled={busy} title={t("user.openDbTitle")} onClick={onOpenDb}>
+            <Database size={15} /><span>{t("user.openDb")}</span>
+          </button>
+          <button type="button" className="iconOnly softButton" disabled={busy} aria-label={t("user.refreshTitle")} title={t("user.refreshTitle")} onClick={onRefresh}>
+            <RefreshCw size={15} />
+          </button>
+          <button type="button" className="secondary toolbarButton" onClick={onShowOperator}>
+            <Settings size={15} /><span>{t("user.operatorConsole")}</span>
+          </button>
         </div>
       </header>
 
-      <section className="userTaskBar">
-        <div className="userTaskMain">
-          <label>
-            {t("user.process")}
-            <select value={selectedPid ?? ""} disabled={busy} onChange={(event) => onSelectPid(event.currentTarget.value)}>
+      <div className="userWorkspace">
+        <button
+          type="button"
+          className="mobileSidebarToggle"
+          aria-controls="task-sidebar"
+          aria-expanded={mobileSidebarOpen}
+          onClick={() => setMobileSidebarOpen((current) => !current)}
+        >
+          <ListTree size={16} aria-hidden="true" />
+          <span><strong>{selectedTaskLabel}</strong><small>{selectedStatusLabel}</small></span>
+          <ChevronDown size={16} className="disclosureChevron" aria-hidden="true" />
+        </button>
+
+        <aside id="task-sidebar" className={`userSidebar ${mobileSidebarOpen ? "mobileOpen" : ""}`} aria-label={t("user.sidebarLabel")}>
+          <div className="sidebarHeading">
+            <div>
+              <span className="eyebrow">{t("user.tasksLabel")}</span>
+              <strong>{t("user.workspaceLabel")}</strong>
+            </div>
+            <button
+              type="button"
+              className="iconOnly primary"
+              aria-label={t("user.newTask")}
+              title={t("user.newTask")}
+              disabled={busy || showTaskComposer}
+              onClick={openNewTask}
+            >
+              <CirclePlus size={16} />
+            </button>
+          </div>
+
+          <label className="taskPicker">
+            <span>{t("user.process")}</span>
+            <select value={selectedPid ?? ""} disabled={busy} onChange={(event) => {
+              onSelectPid(event.currentTarget.value);
+              setMobileSidebarOpen(false);
+            }}>
               {(snapshot?.processes.length ?? 0) === 0 ? <option value="">{t("user.noProcess")}</option> : null}
               {(snapshot?.processes ?? []).map((process) => (
-                <option key={process.pid} value={process.pid}>{process.pid} · {process.status}</option>
+                <option key={process.pid} value={process.pid}>{taskDisplayLabel(process, taskLabels)} · {processStatusLabel(process.status, t)}</option>
               ))}
             </select>
           </label>
-          <div className="userStatus">
-            <span className={`statusDot ${isRunning ? "running" : ""}`} />
-            {isRunning ? t("user.running") : snapshot?.scheduler.paused ? t("user.paused") : t("user.idle")}
-          </div>
+
           {selectedProcess ? (
-            <div className="userProcessMeta">
-              <span>{selectedProcess.image_id}</span>
-              <span>{selectedProcess.llm_profile_id}</span>
-              <span>{selectedProcess.status}</span>
-              <span>{t("user.llmCalls", { count: selectedProcess.llm_call_count })}</span>
-              <span>{t("user.tokens", { count: selectedProcess.token_total })}</span>
+            <>
+              <section className="taskSummaryCard" aria-label={t("user.processDetails")}>
+                <div className="taskSummaryHeader">
+                  <span className={`statusPill ${statusTone}`}>
+                    <span className="statusDot" />{selectedStatusLabel}
+                  </span>
+                  <span className="taskPid" title={selectedProcess.pid}>{shortProcessId(selectedProcess.pid)}</span>
+                </div>
+                <strong className="taskDisplayLabel" title={selectedProcess.pid}>{selectedTaskLabel}</strong>
+                <div className="taskRuntime">
+                  <Cpu size={15} aria-hidden="true" />
+                  <span>{selectedProcess.image_id}</span>
+                  <small>{selectedProcess.llm_profile_id}</small>
+                </div>
+                {selectedStatusDetail ? <p className="taskStatusDetail">{selectedStatusDetail}</p> : null}
+                <div className="metricGrid">
+                  <div><strong>{selectedProcess.llm_call_count}</strong><span>{t("user.metricCalls")}</span></div>
+                  <div><strong>{selectedProcess.token_total.toLocaleString()}</strong><span>{t("user.metricTokens")}</span></div>
+                </div>
+              </section>
+
+              <section className="taskControlCard" aria-label={t("user.taskControls")}>
+                <div className="sidebarSectionTitle">
+                  <span><Gauge size={14} />{t("user.taskControls")}</span>
+                  <span className={`statusDot ${processRunning ? "running" : ""}`} />
+                </div>
+                <label className="quanta sidebarQuanta">
+                  <span>{t("user.quanta")}</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    disabled={busy}
+                    value={maxQuanta ?? ""}
+                    placeholder={t("scheduler.unlimitedPlaceholder")}
+                    title={t("scheduler.unlimitedHint")}
+                    onChange={(event) => onMaxQuantaChange(parseOptionalQuanta(event.currentTarget.value))}
+                  />
+                </label>
+                <div className="sidebarRunControls">
+                  <button type="button" className="primary" disabled={busy || schedulerRunning || processRunning || processTerminal} onClick={onRun}><Play size={15} />{t("user.run")}</button>
+                  <button type="button" disabled={busy || !processRunning} onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
+                  <button type="button" className="dangerGhost" disabled={busy || processTerminal} onClick={onStop}><Square size={13} />{t("user.stop")}</button>
+                </div>
+              </section>
+
+              <details className="sidebarDisclosure">
+                <summary>
+                  <span><ImageIcon size={15} />{t("user.imageTools")}</span>
+                  <ChevronDown size={15} className="disclosureChevron" />
+                </summary>
+                <div className="sidebarDisclosureBody">
+                  <p>{t("user.imageToolsHint")}</p>
+                  <ImageSelect images={images} value={spawnImage} disabled={busy} onChange={onSpawnImageChange} />
+                  <button type="button" className="fullWidthButton" disabled={busy} onClick={onImportImage}>{t("image.import")}</button>
+                  <div className="sidebarImageForm">
+                    <input disabled={busy} aria-label={t("image.commitIdPlaceholder")} value={commitImageId} onChange={(event) => setCommitImageId(event.currentTarget.value)} placeholder={t("image.commitIdPlaceholder")} />
+                    <input disabled={busy} aria-label={t("image.commitNamePlaceholder")} value={commitName} onChange={(event) => setCommitName(event.currentTarget.value)} placeholder={t("image.commitNamePlaceholder")} />
+                    <input disabled={busy} aria-label={t("image.version")} value={commitVersion} onChange={(event) => setCommitVersion(event.currentTarget.value)} placeholder={t("image.version")} />
+                    <button
+                      type="button"
+                      className="warning fullWidthButton"
+                      disabled={busy || !commitReady}
+                      onClick={() => onCommitImage({
+                        imageId: commitImageId.trim(),
+                        name: commitName.trim(),
+                        version: commitVersion.trim(),
+                        replace: false
+                      })}
+                    >
+                      {t("image.save")}
+                    </button>
+                  </div>
+                </div>
+              </details>
+
+              <details className="sidebarDisclosure">
+                <summary>
+                  <span><Star size={15} />{t("rating.title")}</span>
+                  <ChevronDown size={15} className="disclosureChevron" />
+                </summary>
+                <div className="sidebarDisclosureBody ratingDisclosureBody">
+                  <RatingPanel process={selectedProcess} onSave={onRate} />
+                </div>
+              </details>
+            </>
+          ) : (
+            <div className="sidebarEmpty">
+              <Sparkles size={20} aria-hidden="true" />
+              <strong>{t("user.noProcessYet")}</strong>
+              <p>{t("user.noProcessHint")}</p>
             </div>
-          ) : <span className="subtle">{t("user.noProcessYet")}</span>}
-        </div>
-        <div className="userRunControls">
-          <label className="quanta">
-            {t("user.quanta")}
-            <input
-              type="number"
-              min={1}
-              step={1}
-              disabled={busy}
-              value={maxQuanta ?? ""}
-              placeholder={t("scheduler.unlimitedPlaceholder")}
-              title={t("scheduler.unlimitedHint")}
-              onChange={(event) => onMaxQuantaChange(parseOptionalQuanta(event.currentTarget.value))}
-            />
-          </label>
-          <button disabled={busy || !hasProcess || isRunning} onClick={onRun}><Play size={15} />{t("user.run")}</button>
-          <button disabled={busy} onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
-          <button className="danger" disabled={busy || !hasProcess} onClick={onStop}><Square size={13} />{t("user.stop")}</button>
-        </div>
-      </section>
+          )}
 
-      <div className="userNotices">
-        <section className="userImageControls">
-          <ImageSelect images={images} value={spawnImage} disabled={busy} onChange={onSpawnImageChange} />
-          <button disabled={busy} onClick={() => onImportImage()}>{t("image.import")}</button>
-          <input disabled={busy} aria-label={t("image.commitIdPlaceholder")} value={commitImageId} onChange={(event) => setCommitImageId(event.currentTarget.value)} placeholder={t("image.commitIdPlaceholder")} />
-          <input disabled={busy} aria-label={t("image.commitNamePlaceholder")} value={commitName} onChange={(event) => setCommitName(event.currentTarget.value)} placeholder={t("image.commitNamePlaceholder")} />
-          <input disabled={busy} aria-label={t("image.version")} value={commitVersion} onChange={(event) => setCommitVersion(event.currentTarget.value)} placeholder={t("image.version")} />
-          <button
-            className="warning"
-            disabled={busy || !commitReady}
-            onClick={() => onCommitImage({
-              imageId: commitImageId.trim(),
-              name: commitName.trim(),
-              version: commitVersion.trim(),
-              replace: false
-            })}
-          >
-            {t("image.save")}
-          </button>
-        </section>
-
-        {hasProcess ? <RatingPanel process={selectedProcess} onSave={onRate} /> : null}
-
-        {!hasProcess ? (
-          <section className="userStart">
-            <h1>{t("user.startTask")}</h1>
-            <input
-              value={spawnWorkingDirectory}
-              disabled={busy}
-              onChange={(event) => onSpawnWorkingDirectoryChange(event.currentTarget.value)}
-              placeholder={t("user.initialCwdPlaceholder")}
-              aria-label={t("user.initialCwd")}
-            />
-            <LLMProfileSelect
-              profiles={llmProfiles}
-              value={spawnLlmProfile}
-              label={t("llmProfile.spawnLabel")}
-              disabled={busy}
-              onChange={onSpawnLlmProfileChange}
-              onCreate={onCreateLlmProfile}
-              onUpdate={onUpdateLlmProfile}
-              onDelete={onDeleteLlmProfile}
-            />
-            <label className="taskAuthorityField">
-              <span>{t("taskAuthority.workspaceAccess")}</span>
-              <select
-                value={spawnWorkspaceAccess}
-                disabled={busy}
-                onChange={(event) => onSpawnWorkspaceAccessChange(event.currentTarget.value as WorkspaceAccess)}
-              >
-                <option value="none">{t("taskAuthority.none")}</option>
-                <option value="read">{t("taskAuthority.read")}</option>
-                <option value="edit">{t("taskAuthority.edit")}</option>
-                <option value="manage">{t("taskAuthority.manage")}</option>
-              </select>
-            </label>
-            <label className="taskAuthorityToggle">
-              <input
-                type="checkbox"
-                checked={spawnAllowGitRequests}
-                disabled={busy}
-                onChange={(event) => onSpawnAllowGitRequestsChange(event.currentTarget.checked)}
-              />
-              <span>{t("taskAuthority.git")}</span>
-            </label>
-            <p className="taskAuthorityHint">{t("taskAuthority.hint")}</p>
-            <textarea disabled={busy} aria-label={t("user.startTask")} value={spawnGoal} onChange={(event) => onSpawnGoalChange(event.currentTarget.value)} />
-            <button className="primary" disabled={busy || !spawnGoal.trim()} onClick={onSpawn}>{t("user.start")}</button>
-          </section>
-        ) : null}
-
-        {pendingRequests.length > 0 ? (
-          <section className="userPendingRequests" aria-label={t("user.pendingRequests")}>
-            {pendingRequests.map(({ request }) => (
-              <HumanRequestCard
-                className="userRequestCard"
-                key={request.request_id}
-                request={request}
-                onRespond={onRespond}
-              />
-            ))}
-          </section>
-        ) : null}
-      </div>
-
-      <section
-        ref={conversationRef}
-        className="userConversation"
-        aria-label={t("user.conversation")}
-        role="log"
-        aria-live="polite"
-        aria-relevant="additions"
-        onScroll={(event) => {
-          const element = event.currentTarget;
-          followConversationRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
-        }}
-      >
-        {conversation.length === 0 ? (
-          <div className="userEmpty">
-            <MessageSquare size={20} />
-            <span>{t("user.emptyConversation")}</span>
+          <div className="sidebarFooter">
+            <Database size={13} />
+            <span title={connection?.db ?? t("app.defaultDb")}>{connection?.db ?? t("app.defaultDb")}</span>
           </div>
-        ) : conversation.map((item) => <ConversationBubble key={item.id} item={item} />)}
-      </section>
+        </aside>
 
-      <footer className="userComposer">
-        <div className="userComposerStatus">
-          {selectedProcess?.interrupt_count ? <span className="interruptBanner"><AlertTriangle size={15} /> {t("operator.interruptPending")}</span> : null}
-        </div>
-        <input
-          value={message}
-          disabled={busy || !hasProcess}
-          aria-label={t("user.messageAgent")}
-          onChange={(event) => onMessageChange(event.currentTarget.value)}
-          placeholder={t("user.messageAgent")}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.nativeEvent.isComposing && message.trim()) onSend("message");
-          }}
-        />
-        <button disabled={busy || !hasProcess || !message.trim()} onClick={() => onSend("message")}><Send size={15} />{t("user.send")}</button>
-        <button disabled={busy || !hasProcess || !message.trim()} className="warning" onClick={() => onSend("interrupt")}>{t("user.interrupt")}</button>
-      </footer>
+        <section className={`userMainPanel ${showTaskComposer ? "taskComposerMode" : ""}`} id="primary-workspace" aria-label={showTaskComposer ? t("user.startTask") : t("user.conversation")}>
+          {showTaskComposer ? (
+            <div className="newTaskCanvas">
+              <header className="newTaskHero">
+                <span className="heroIcon" aria-hidden="true"><Sparkles size={22} /></span>
+                <div>
+                  <span className="eyebrow">{t("user.newTask")}</span>
+                  <h1>{t("user.startTaskTitle")}</h1>
+                  <p>{t("user.startTaskSubtitle")}</p>
+                </div>
+                {hasProcess ? (
+                  <button type="button" className="iconOnly softButton" aria-label={t("user.cancelNewTask")} title={t("user.cancelNewTask")} onClick={() => setShowNewTask(false)}>
+                    <X size={16} />
+                  </button>
+                ) : null}
+              </header>
+
+              <section className="newTaskCard" aria-label={t("user.startTask")}>
+                <label className="newTaskGoalField">
+                  <span>{t("user.goalLabel")}</span>
+                  <textarea
+                    ref={goalInputRef}
+                    disabled={busy}
+                    value={spawnGoal}
+                    rows={5}
+                    placeholder={t("user.goalPlaceholder")}
+                    onChange={(event) => onSpawnGoalChange(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && spawnGoal.trim() && !busy) {
+                        event.preventDefault();
+                        onSpawn();
+                      }
+                    }}
+                  />
+                </label>
+
+                <div className="starterPrompts" aria-label={t("user.starterPrompts")}>
+                  <span>{t("user.starterPrompts")}</span>
+                  <div>
+                    {starterPromptKeys.map((key) => (
+                      <button type="button" className="promptChip" key={key} disabled={busy} onClick={() => onSpawnGoalChange(t(key))}>
+                        {t(key)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <details className="newTaskSettings">
+                  <summary>
+                    <span className="settingsSummaryIcon"><ShieldCheck size={16} /></span>
+                    <span><strong>{t("user.taskSettings")}</strong><small>{t("user.taskSettingsHint")}</small></span>
+                    <ChevronDown size={16} className="disclosureChevron" />
+                  </summary>
+                  <div className="newTaskSettingsGrid">
+                    <div className="settingsSpan">
+                      <ImageSelect images={images} value={spawnImage} disabled={busy} onChange={onSpawnImageChange} />
+                    </div>
+                    <div className="settingsSpan">
+                      <LLMProfileSelect
+                        profiles={llmProfiles}
+                        value={spawnLlmProfile}
+                        label={t("llmProfile.spawnLabel")}
+                        disabled={busy}
+                        onChange={onSpawnLlmProfileChange}
+                        onCreate={onCreateLlmProfile}
+                        onUpdate={onUpdateLlmProfile}
+                        onDelete={onDeleteLlmProfile}
+                      />
+                    </div>
+                    <label className="fieldStack settingsSpan">
+                      <span>{t("user.initialCwd")}</span>
+                      <input
+                        value={spawnWorkingDirectory}
+                        disabled={busy}
+                        onChange={(event) => onSpawnWorkingDirectoryChange(event.currentTarget.value)}
+                        placeholder={t("user.initialCwdPlaceholder")}
+                      />
+                    </label>
+                    <label className="taskAuthorityField">
+                      <span>{t("taskAuthority.workspaceAccess")}</span>
+                      <select
+                        value={spawnWorkspaceAccess}
+                        disabled={busy}
+                        onChange={(event) => onSpawnWorkspaceAccessChange(event.currentTarget.value as WorkspaceAccess)}
+                      >
+                        <option value="none">{t("taskAuthority.none")}</option>
+                        <option value="read">{t("taskAuthority.read")}</option>
+                        <option value="edit">{t("taskAuthority.edit")}</option>
+                        <option value="manage">{t("taskAuthority.manage")}</option>
+                      </select>
+                    </label>
+                    <label className="taskAuthorityToggle settingsToggle">
+                      <input
+                        type="checkbox"
+                        checked={spawnContextMaintenance}
+                        disabled={busy}
+                        onChange={(event) => onSpawnContextMaintenanceChange(event.currentTarget.checked)}
+                      />
+                      <span>{t("taskAuthority.contextMaintenance")}</span>
+                    </label>
+                    <label className="taskAuthorityToggle settingsToggle">
+                      <input
+                        type="checkbox"
+                        checked={spawnAllowGitRequests}
+                        disabled={busy}
+                        onChange={(event) => onSpawnAllowGitRequestsChange(event.currentTarget.checked)}
+                      />
+                      <span>{t("taskAuthority.git")}</span>
+                    </label>
+                    <label className="taskAuthorityField">
+                      <span>{t("taskAuthority.commandAccess")}</span>
+                      <select
+                        value={spawnCommandAccess}
+                        disabled={busy}
+                        onChange={(event) => onSpawnCommandAccessChange(event.currentTarget.value as CommandAccess)}
+                      >
+                        <option value="none">{t("taskAuthority.commandNone")}</option>
+                        <option value="reviewed">{t("taskAuthority.commandReviewed")}</option>
+                      </select>
+                    </label>
+                    <p className="taskAuthorityHint settingsSpan">{t("taskAuthority.hint")}</p>
+                  </div>
+                </details>
+
+                <footer className="newTaskActions">
+                  <span>{t("user.startTaskHint")} {t("user.startShortcut")}</span>
+                  <button type="button" className="primary startTaskButton" disabled={busy || !spawnGoal.trim()} onClick={onSpawn}>
+                    {busy ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : <Play size={16} />}
+                    {busy ? t("user.working") : t("user.start")}
+                  </button>
+                </footer>
+              </section>
+            </div>
+          ) : (
+            <>
+              <header className="conversationHeader">
+                <div className="conversationTitle">
+                  <span className="eyebrow"><Activity size={12} />{t("user.activity")}</span>
+                  <h1 title={selectedProcess?.pid}>{selectedTaskLabel}</h1>
+                  <p>{selectedProcess ? `${shortProcessId(selectedProcess.pid)} · ${selectedProcess.image_id} · ${selectedProcess.llm_profile_id}` : ""}</p>
+                  {selectedStatusDetail ? <span className="conversationStatusDetail">{selectedStatusDetail}</span> : null}
+                </div>
+                <div className="conversationHeaderMeta">
+                  {selectedProcess?.interrupt_count ? <span className="interruptBanner"><AlertTriangle size={15} />{t("operator.interruptPending")}</span> : null}
+                  <span className={`statusPill ${statusTone}`}><span className="statusDot" />{selectedStatusLabel}</span>
+                </div>
+              </header>
+
+              {pendingRequests.length > 0 ? (
+                <section className="userPendingRequests" aria-label={t("user.pendingRequests")}>
+                  <div className="pendingRequestsHeading"><AlertTriangle size={15} /><strong>{t("user.pendingRequests")}</strong><span>{pendingRequests.length}</span></div>
+                  {pendingRequests.map(({ request }) => (
+                    <HumanRequestCard className="userRequestCard" key={request.request_id} request={request} onRespond={onRespond} />
+                  ))}
+                </section>
+              ) : null}
+
+              <section
+                ref={conversationRef}
+                className="userConversation"
+                aria-label={t("user.conversation")}
+                role="log"
+                tabIndex={0}
+                aria-live="polite"
+                aria-relevant="additions"
+                onScroll={(event) => {
+                  const element = event.currentTarget;
+                  const nearLatest = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+                  followConversationRef.current = nearLatest;
+                  if (nearLatest) setShowJumpToLatest(false);
+                }}
+              >
+                {conversation.length === 0 ? (
+                  <div className="userEmpty">
+                    <span className="emptyIllustration"><MessageSquare size={22} /></span>
+                    <strong>{t("user.readyTitle")}</strong>
+                    <span>{t("user.emptyConversation")}</span>
+                  </div>
+                ) : conversation.map((item) => <ConversationBubble key={item.id} item={item} />)}
+              </section>
+
+              {showJumpToLatest ? (
+                <button type="button" className="jumpToLatest" onClick={scrollConversationToLatest}>
+                  <ArrowDown size={14} aria-hidden="true" />{t("user.jumpToLatest")}
+                </button>
+              ) : null}
+
+              {processTerminal ? (
+                <footer className="terminalNextStep" role="status">
+                  <span><CheckCircle2 size={17} aria-hidden="true" /><span><strong>{t("user.taskClosed")}</strong><small>{t("user.taskClosedHint")}</small></span></span>
+                  <button type="button" className="primary" disabled={busy} onClick={openNewTask}><CirclePlus size={15} />{t("user.startAnotherTask")}</button>
+                </footer>
+              ) : <footer className="userComposer">
+                <div className="composerField">
+                  <textarea
+                    rows={1}
+                    value={message}
+                    disabled={busy || !hasProcess}
+                    aria-label={t("user.messageAgent")}
+                    aria-describedby="composer-hint"
+                    onChange={(event) => onMessageChange(event.currentTarget.value)}
+                    placeholder={t("user.messageAgent")}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                        event.preventDefault();
+                        if (message.trim()) onSend("message");
+                      }
+                    }}
+                  />
+                  <span id="composer-hint">{t("user.sendHint")}</span>
+                </div>
+                <button type="button" className="primary sendButton" disabled={busy || !hasProcess || !message.trim()} onClick={() => onSend("message")}>
+                  <Send size={15} />{t("user.send")}
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || !hasProcess || !message.trim()}
+                  className="iconOnly warning"
+                  aria-label={t("user.interrupt")}
+                  title={t("user.interrupt")}
+                  onClick={() => onSend("interrupt")}
+                >
+                  <AlertTriangle size={15} />
+                </button>
+              </footer>}
+            </>
+          )}
+        </section>
+      </div>
     </main>
   );
+}
+
+export type ProcessStatusTone = "running" | "waiting" | "completed" | "terminal" | "paused" | "idle";
+
+export function processStatusLabel(
+  status: string,
+  t: (key: TranslationKey, vars?: Record<string, string | number>) => string
+): string {
+  if (status.startsWith("waiting")) {
+    return t(status.includes("human") ? "process.status.waitingHuman" : "process.status.waiting");
+  }
+  const key = processStatusKeys[status];
+  return key ? t(key) : status;
+}
+
+export function processStatusTone(status: string, schedulerRunning = false): ProcessStatusTone {
+  if (status === "exited") return "completed";
+  if (["failed", "killed"].includes(status)) return "terminal";
+  if (status === "paused") return "paused";
+  if (status.startsWith("waiting")) return "waiting";
+  if (schedulerRunning || status === "running" || status === "runnable") return "running";
+  return "idle";
+}
+
+export function processStatusDetail(
+  process: RuntimeProcess,
+  t: (key: TranslationKey, vars?: Record<string, string | number>) => string
+): string | null {
+  const wait = process.wait_state;
+  if (wait?.kind === "human") return t("user.statusWaitingHuman");
+  if (wait?.kind === "message") return t("user.statusWaitingMessage");
+  if (wait?.kind === "child") return t("user.statusWaitingChild", { pid: shortProcessId(wait.child_pid) });
+  if (wait?.kind === "tool") return t("user.statusWaitingTool");
+  if (wait?.kind === "paused") return t("user.statusPaused");
+  if (wait?.kind === "host_resume") return t("user.statusWaitingResume");
+  if (process.status.startsWith("waiting_human")) return t("user.statusWaitingHuman");
+  if (process.status.startsWith("waiting_message")) return t("user.statusWaitingMessage");
+  if (process.status === "paused") return t("user.statusPaused");
+  if (process.terminal || ["exited", "failed", "killed"].includes(process.status)) return null;
+  return process.status_message?.trim() || null;
 }
 
 function ConversationBubble({ item }: { item: UserConversationItem }) {
@@ -362,10 +726,7 @@ function ConversationBubble({ item }: { item: UserConversationItem }) {
       <span className="bubbleRole">{item.role === "assistant" ? t("user.agent") : t("user.you")}</span>
       {item.role === "assistant" ? (
         <Suspense fallback={<p>{item.text || (item.protected ? t("user.protectedOutput") : t("user.empty"))}</p>}>
-          <MarkdownMessage
-            text={item.text}
-            fallback={item.protected ? t("user.protectedOutput") : t("user.empty")}
-          />
+          <MarkdownMessage text={item.text} fallback={item.protected ? t("user.protectedOutput") : t("user.empty")} />
         </Suspense>
       ) : (
         <p>{item.text || t("user.empty")}</p>

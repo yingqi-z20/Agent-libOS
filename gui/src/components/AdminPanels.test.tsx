@@ -4,8 +4,8 @@ import { I18nProvider } from "../i18n";
 import { AppNotices, LoadingScreen } from "./AppNotices";
 import { checkpointLabel } from "./CheckpointPanel";
 import { capabilityIdentity } from "./CapabilityPanel";
-import { parseObjectInput } from "./ObjectTasksPanel";
-import { parseJsonInput, remoteOperationIds } from "./RemoteRegistryPanel";
+import { buildObjectTaskStartRequest, isObjectTaskTerminal, parseObjectInput } from "./ObjectTasksPanel";
+import { parseJsonInput, reconcileRemoteOperationId, remoteOperationIds } from "./RemoteRegistryPanel";
 
 describe("GUI administration helpers", () => {
   it("validates structured arguments locally before remote or task calls", () => {
@@ -38,6 +38,46 @@ describe("GUI administration helpers", () => {
       server_id: "tools",
       tools: [{ tool_id: "search" }, { not_a_tool: true }]
     })).toEqual(["search"]);
+  });
+
+  it("uses the backend Object Task terminal statuses", () => {
+    for (const status of [
+      "succeeded",
+      "failed",
+      "cancelled",
+      "abandoned",
+      "superseded_by_restore",
+      "result_unavailable_after_reopen"
+    ]) {
+      expect(isObjectTaskTerminal(status)).toBe(true);
+    }
+    expect(isObjectTaskTerminal("running")).toBe(false);
+    expect(isObjectTaskTerminal("completed")).toBe(false);
+    expect(isObjectTaskTerminal("exited")).toBe(false);
+  });
+
+  it("includes the required owner object in Object Task start requests", () => {
+    expect(buildObjectTaskStartRequest({
+      pid: "pid_1",
+      ownerOid: "  obj_owner  ",
+      tool: "  read_text_file  ",
+      args: { path: "notes.txt" },
+      ownerWatch: true,
+      watchEvents: ["updated"]
+    })).toMatchObject({
+      pid: "pid_1",
+      ownerOid: "obj_owner",
+      tool: "read_text_file",
+      args: { path: "notes.txt" },
+      ownerWatch: true,
+      watchEvents: ["updated"]
+    });
+  });
+
+  it("reconciles the operation id when the selected registry entry changes", () => {
+    expect(reconcileRemoteOperationId("old-operation", ["new-operation"])).toBe("new-operation");
+    expect(reconcileRemoteOperationId("shared", ["shared", "other"])).toBe("shared");
+    expect(reconcileRemoteOperationId("old-operation", [])).toBe("");
   });
 
   it("renders recoverable loading and stale-data notices", () => {

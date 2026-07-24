@@ -37,6 +37,7 @@ describe("indexProcessTree", () => {
     expect(filterProcesses([root, child, unrelated], "REPORTS")).toEqual([root, child]);
     expect(filterProcesses([root, child, unrelated], "missing")).toEqual([]);
     expect(filterProcesses([root, child, unrelated], "")).toEqual([root, child, unrelated]);
+    expect(filterProcesses([root, child, unrelated], "quarterly report", { worker: "Quarterly report audit" })).toEqual([root, child]);
   });
 
   it("uses a single tab stop for tree keyboard navigation", () => {
@@ -45,6 +46,7 @@ describe("indexProcessTree", () => {
         <ProcessTree
           processes={[process("root", null), process("child", "root")]}
           selectedPid="child"
+          taskLabels={{ child: "Audit the GUI" }}
           onSelect={() => undefined}
         />
       </I18nProvider>
@@ -52,6 +54,7 @@ describe("indexProcessTree", () => {
 
     expect(html.match(/tabindex="0"/g)).toHaveLength(1);
     expect(html.match(/tabindex="-1"/g)).toHaveLength(1);
+    expect(html).toContain("Audit the GUI");
   });
 });
 

@@ -3,7 +3,9 @@
 Agent libOS Skills use the standard Agent Skills package shape: a directory
 with a required `SKILL.md` file, optional `scripts/`, `references/`, and
 `assets/` resources, and progressive disclosure from catalog metadata to full
-instructions and bundled resources.
+instructions and bundled resources. Immutable built-in tool Skills ship inside
+the `agent_libos` package; workspace, global, and runtime Skills continue to use
+the registered catalog.
 
 Skills are not a permission mechanism. Activating a Skill changes only one
 process's prompt context and tool visibility. They are part of the
@@ -35,9 +37,7 @@ name: review-helper
 description: Focused code-review workflow helpers.
 license: Apache-2.0
 compatibility: agent-libos>=0.1.0
-allowed-tools:
-  - read_text_file
-  - read_directory
+allowed-tools: read_text_file read_directory
 metadata:
   agent-libos.version: v0
   agent-libos.actions: references/agent-libos/actions.json
@@ -56,10 +56,22 @@ characters, start with a lowercase letter or digit, contain only lowercase
 letters, digits, and hyphens, and match the package directory name. A configured
 `skills.name_max_chars` below 64 imposes the lower limit.
 `metadata` values must be strings.
+Per the Agent Skills specification, `allowed-tools` is a space-separated YAML
+string. Agent libOS still accepts the historical YAML-list spelling for
+registered third-party packages, but emits and ships the canonical scalar form.
 
-Agent libOS reserves the `agent-libos.*` metadata namespace. Complex extension
-data lives in `references/agent-libos/*.json`; metadata only points at those
+Agent libOS reserves the `agent-libos-` Skill-name prefix and the
+`agent-libos.*` metadata namespace. Registered packages cannot claim the name
+of, replace, or shadow an immutable built-in Skill. Complex extension data
+lives in `references/agent-libos/*.json`; metadata only points at those
 relative files.
+
+Built-in tool packages intentionally contain only `SKILL.md`. Their frontmatter
+is limited to `name`, `description`, and `allowed-tools`; each body is at most
+2 KiB and each package owns at most nine static tools. They contain no scripts,
+bundled resources, JIT definitions, actions, or Capability declarations.
+Unlike registered packages, package-owned built-ins fail validation if
+`allowed-tools` uses the legacy YAML-list spelling.
 
 Package validation is bounded by `AgentLibOSConfig.skills`: `SKILL.md` is read
 with `skill_md_max_bytes` for process-driven workspace registration and the
@@ -84,28 +96,48 @@ longer matches its declared size/SHA is rejected.
 
 ## Progressive Disclosure
 
-Discovery returns catalog fields such as `name`, `description`, source, package
-hash, and high-level tool/action names. Activation materializes the full
-`SKILL.md` body into the process prompt and records the exact package snapshot
-on the process. Bundled resources are read explicitly with `read_skill_resource`
-from that activation snapshot, so later registry replacement affects only new
-activations.
+When `activate_skill` is model-visible, the process prompt includes only the
+applicable built-in Skill IDs, descriptions, and active state. Full `SKILL.md`
+instructions and owned tool schemas appear after activation. A built-in is
+applicable only when every declared tool has an exact binding in the
+image-authorized process tool table; unsupported built-ins are omitted rather
+than advertised as unusable.
 
-Successful activation already required `skill:<name>` `execute` and binds the
-snapshot to the process. Reading a bundled resource from that loaded snapshot
-does not perform a second `skill:<name>` `read` check. The response returns text
-as `content` or binary bytes as `content_base64`, together with `kind`,
-`size_bytes`, and `sha256`. The `read` right below governs catalog discovery and
-inspection, not each loaded resource read.
+Process-mediated `discover_skills` always returns the complete set of those
+applicable built-ins with `source_type: builtin`, `active`, and
+`catalog_scope`. The `text` filter, `limit`, and `has_more` window apply only to
+registered or Host-catalog entries; they never filter, count, or truncate the
+built-in prefix. Registered workspace/global/runtime entries are merged only
+when the actor has `skill:*` `read`. Registered catalog results also include
+fields such as package hash and high-level tool/action names.
+
+Activation materializes the full body into the process prompt and records the
+exact package snapshot on the process. Bundled resources are read explicitly
+with `read_skill_resource` from that activation snapshot, so later registry
+replacement affects only new registered-Skill activations.
+
+A successful registered-Skill activation requires `skill:<name>` `execute` and
+binds the snapshot to the process. Reading a bundled resource from that loaded
+snapshot does not perform a second `skill:<name>` `read` check. The response
+returns text as `content` or binary bytes as `content_base64`, together with
+`kind`, `size_bytes`, and `sha256`. The `read` right below governs registered
+catalog discovery and inspection, not each loaded resource read.
 
 This prevents a Skill from keeping ambient read authority to the workspace path
 where it was registered.
 
 ## LibOS Extensions
 
-`allowed-tools` adds existing static tools to the process tool table during
-activation. The tools remain wrappers over primitives; visibility does not imply
-resource authority.
+For a registered Skill, `allowed-tools` adds existing static tools to the full
+process and model tool tables during activation. The tools remain wrappers over
+primitives; visibility does not imply resource authority.
+
+For an immutable built-in Skill, `allowed-tools` has the narrower
+`builtin_projection` meaning. Activation atomically copies every named binding
+from the existing full process tool table into the model projection. It does
+not accept a partial intersection, resolve a missing tool from the registry,
+add to the full table, create JIT code, or grant Capability. The trusted
+in-memory catalog—not user-writable metadata—selects this activation kind.
 
 `references/agent-libos/jit-tools.json` declares TypeScript JIT tools. Each
 entry references a `scripts/*.ts` source file:
@@ -171,6 +203,12 @@ unconsumed expected syscalls fail validation.
 
 ## Sources And Trust
 
+Built-in packages are loaded read-only from `agent_libos` package resources and
+reported with `source_type: builtin`. They are neither durable registry rows nor
+members of any configurable catalog root. Their package snapshots still bind
+loaded prompt instructions and tool ownership across runtime reopen, fork,
+checkpoint, and context compaction.
+
 Host-side catalog discovery searches exactly the roots in
 `skills.workspace_dirs`, followed by `skills.global_dirs`, with equivalent
 paths de-duplicated. Defaults include `skills/`, `.agent_libos/skills/`, and
@@ -222,10 +260,13 @@ the process workspace filesystem boundary.
 
 Capability requirements:
 
-- Discovering registered Skills as a process requires `skill:*` `read`.
+- Discovering applicable built-in Skills requires no Skill Capability;
+  discovering registered Skills as a process requires `skill:*` `read`.
 - Inspecting a registered Skill as a process requires `skill:<name>` `read`.
 - Registering or replacing a Skill requires `skill:<name>` `write`.
-- Activating or unloading a Skill requires `skill:<name>` `execute`.
+- Activating or unloading a registered Skill requires `skill:<name>` `execute`.
+- Same-process activation or unload of a catalog-verified built-in Skill needs
+  no Skill Capability because it only changes prompt and schema visibility.
 - Activating or unloading a Skill for a different process also requires
   `process:<pid>` `admin`.
 - Trusting or untrusting global Skill package hashes requires
@@ -260,6 +301,14 @@ discards its unpublished candidates and executable aliases, including when
 authority settlement fails. Reactivation retires only the superseded JIT ids
 after the replacement and its authority settlement commit.
 
+Each loaded record has `activation_kind: registered | builtin_projection`.
+Built-in activation must preserve the full process tool table and Capability
+set byte-for-byte while updating only the model projection and loaded prompt
+snapshot; its audit evidence records `authority_changed: false`. Permission-free
+unload is accepted only when the runtime can validate both that activation kind
+and its catalog/snapshot provenance. A forged source, hash, ID, or persisted
+activation kind fails closed.
+
 `unload_skill` removes tool visibility and prompt instructions contributed by
 that Skill, along with the loaded Skill's process-local JIT tool and candidate
 rows and executable aliases. It does not revoke capabilities, delete audit
@@ -282,9 +331,14 @@ are rejected before a result set can become unbounded.
 
 ## Process Semantics
 
+- An image with `metadata.tool_projection: skills` begins with
+  `discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill`,
+  and `process_exit`; every bootstrap tool must be authorized by
+  `default_tools`, or image validation fails.
 - Image `default_skills` activate at spawn and exec time; failure fails image
   boot instead of starting with a partial default Skill set.
-- Fork inherits activated Skills and corresponding tool visibility.
+- Fork and checkpoint restore inherit loaded Skill snapshots, activation kind,
+  provenance, and corresponding model-tool visibility.
 - Spawn-child starts without parent-activated Skills.
 - Exec resets activated Skills to the target image defaults.
 - No image or Skill default grants external resource capabilities.

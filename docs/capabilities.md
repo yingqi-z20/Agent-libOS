@@ -147,7 +147,9 @@ Important resource conventions include:
 - `object_namespace:<namespace>` for Object Memory namespace listing and name
   lookup.
 - `process:<pid>` and `process:*` for process operations.
-- `process:spawn` for child process and ObjectTask runner creation.
+- `process:spawn` for child process and ObjectTask runner creation. Child launch
+  checks include the selected `image_id` and operation, so an Authority Rule can
+  bind a grant to one image and to `process.spawn_child` rather than fork.
 - `image:<image_id>` and `image:*` for image registration.
 - `skill:<skill_id>` and `skill:*` for Skill operations.
 - `skill_trust:*` or `skill_trust:<sha256>` for global Skill trust.
@@ -211,7 +213,8 @@ Capabilities can carry deterministic `AuthorityRule` entries. A rule has:
 - `effect`: `allow`, `ask`, or `deny`;
 - `risk`: `harmless`, `low`, `medium`, `high`, or `destructive`;
 - structured `conditions`, such as argv tokens, match mode, path/cwd intent,
-  network intent, and filesystem intent.
+  network intent, filesystem intent, and the target `image_id` for child
+  launch.
 
 Rules are not LLM judgments. They are local, deterministic policy facts. Unknown
 rule shapes, unknown constraint keys, and malformed values for known conditions
@@ -411,6 +414,15 @@ process, image, checkpoint, JSON-RPC, or MCP authority, nor filesystem access or
 global hash trust for another Skill source. JIT
 syscalls bypass the LLM-facing tool table, but they still enter the same
 primitive authorization path as built-in tools.
+
+Persistent LLM-context enrichment is also explicit authority. The default
+source-only path does not create or append an `llm_context` Object.
+`context:enrichment/execute` opts one process into that delta projection;
+`context:maintenance/execute` separately permits the proactive storage
+waterline and model-window pressure handler to invoke the configured compactor.
+Without both explicit enrichment and maintenance authority, the default
+source-only request is left unchanged. Neither capability supplies the required
+child-spawn or compressor-image authority.
 
 The built-in base, coding, review, and toolmaker images expose
 `list_capabilities` and `inspect_capability` so a process can understand its own

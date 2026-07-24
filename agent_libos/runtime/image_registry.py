@@ -1316,17 +1316,9 @@ class ImageRegistryPrimitive:
         source_image: AgentImage | None,
     ) -> dict[str, Any]:
         """Preserve source projection policy without changing tool authority."""
-        if source_image is None or source_image.metadata.get("lazy_tool_groups") is not True:
+        if source_image is None or source_image.metadata.get("tool_projection") != "skills":
             return {}
-        initial_groups = source_image.metadata.get("initial_tool_groups")
-        return {
-            "lazy_tool_groups": True,
-            **(
-                {"initial_tool_groups": list(initial_groups)}
-                if isinstance(initial_groups, (list, tuple))
-                else {}
-            ),
-        }
+        return {"tool_projection": "skills"}
 
     def grant_register(
         self,

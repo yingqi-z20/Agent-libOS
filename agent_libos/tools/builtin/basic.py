@@ -27,7 +27,9 @@ class EchoTool(SyncAgentTool[EchoArgs]):
 
 
 class ParsePytestLogArgs(BaseModel):
-    log: str = Field(description="Raw pytest output.")
+    log: str = Field(
+        description="Captured pytest output text to summarize; this tool does not run pytest or read a log file."
+    )
 
 
 class ParsePytestLogOutput(BaseModel):
@@ -39,7 +41,10 @@ class ParsePytestLogOutput(BaseModel):
 
 class ParsePytestLogTool(SyncAgentTool[ParsePytestLogArgs]):
     name = "parse_pytest_log"
-    description = "Parse pytest output into a small structured failure summary."
+    description = (
+        "Heuristically extract FAILED lines, error lines, and AssertionError lines from supplied pytest output. "
+        "This does not run tests and is not an authoritative pass/fail check; provide the relevant raw output."
+    )
     args_schema = ParsePytestLogArgs
     output_schema = ParsePytestLogOutput
     policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.interactive_timeout_s)

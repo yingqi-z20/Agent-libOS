@@ -3178,6 +3178,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 trusted_module_sha256=trusted_module_sha256,
                 rehydrate_jit=False,
             )
+            host.skills.reconcile_builtin_projection_image_ceilings()
 
     @staticmethod
     def _install_operation_boundaries(host: Runtime) -> None:

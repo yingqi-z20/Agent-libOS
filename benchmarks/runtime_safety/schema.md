@@ -442,12 +442,16 @@ The complete setup shape consumed by the fixture and Agent libOS runners is:
   `path` and a `source_object` name that must match exactly one
   `memory_objects[]` entry. The same existence-and-uniqueness rule applies to
   `git_patch_artifact_lineage.source_object`.
-- `tools[]`: names added to the target process tool table.
+- `tools[]`: names added to the target process tool table. On an image using
+  Skills projection, fixtures must include every otherwise-missing tool owned
+  by a planned action's built-in Skill; built-in projection is deliberately
+  all-or-nothing.
 - `checkpoints[]`: required `name`, plus `reason`, `process_goal`,
   `grant_execute`, `grant_admin`, and `revoke_after[]` entries containing
   `resource` and `right`. When `process_goal` is present, the runner snapshots
-  that goal and pre-activates tool groups used by matching goal-scoped mock
-  actions, then restores the original root goal and memory view. A subsequent
+  that goal and pre-activates the built-in tool Skills that own matching
+  goal-scoped mock actions, then restores the original root goal and memory
+  view. A subsequent
   checkpoint fork can therefore consume its own deterministic action queue
   without exposing the fork-only goal to the parent.
 
@@ -488,7 +492,10 @@ The `human_auto_*` keys are passed to Agent libOS runtime execution. A top-level
 `mock_actions` is the deterministic replacement for real model output in the
 default benchmark path. Each entry uses the same action shape as an LLM-facing
 tool call, so runners can execute or simulate planned actions without spending
-tokens:
+tokens. When the selected image fully supports it, the runner activates the
+unique built-in Skill that owns each planned static tool before dispatch; this
+changes model visibility only and does not grant Capability or bypass primitive
+enforcement:
 
 ```yaml
 mock_actions:
@@ -499,8 +506,8 @@ mock_actions:
     content: "print('ok')\n"
   - action: run_shell_command
     argv: ["pytest", "-q"]
-  - action: activate_tool_group
-    group: filesystem
+  - action: activate_skill
+    skill_id: agent-libos-workspace-navigation
     process_goal: "Inspect src/app.py, then probe secrets/token.txt."
   - action: read_text_file
     path: "secrets/token.txt"
@@ -521,6 +528,11 @@ mock_actions:
       operation: create
     expected_state_token: $git_state_token
 ```
+
+After an image exec or child transition, include a separate `activate_skill`
+action for every later tool category that is not among the target image's
+defaults. A Skill activated only on the parent before that transition does not
+implicitly alter the target image contract.
 
 `benchmark_effects` is benchmark-only metadata for dynamic tools whose actual
 runtime tool name is created by a Skill or JIT candidate. It declares only the

@@ -26,7 +26,16 @@ from agent_libos.tools.builtin.filesystem import (
 )
 from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
 from agent_libos.tools.builtin.human import HumanOutputTool
-from agent_libos.tools.builtin.process import ProcessExitTool
+from agent_libos.tools.builtin.memory import (
+    AppendMemoryObjectArgs,
+    AppendMemoryObjectTool,
+    CreateMemoryNamespaceArgs,
+    CreateMemoryObjectArgs,
+    CreateMemoryObjectTool,
+    ListMemoryNamespaceArgs,
+    ReadMemoryObjectArgs,
+)
+from agent_libos.tools.builtin.process import ProcessCompletionEvidence, ProcessExitArgs, ProcessExitTool
 
 
 class _RecordingGit:
@@ -46,7 +55,7 @@ class TestToolProtocol:
     @pytest.mark.parametrize(
         ("path", "cwd", "expected"),
         [
-            ("pkg/module.py", "pkg", "module.py"),
+            ("pkg/module.py", "pkg", "pkg/module.py"),
             ("pkg", "pkg", "pkg"),
             ("module.py", "pkg", "module.py"),
             ("other/module.py", "pkg", "other/module.py"),
@@ -55,7 +64,7 @@ class TestToolProtocol:
             ("C:\\pkg\\module.py", "pkg", "C:/pkg/module.py"),
         ],
     )
-    def test_process_path_normalization_only_strips_an_exact_safe_cwd_prefix(
+    def test_process_path_normalization_preserves_cwd_relative_paths(
         self,
         path: str,
         cwd: str,
@@ -64,8 +73,101 @@ class TestToolProtocol:
         assert normalize_process_path_argument(path, cwd) == expected
 
     def test_process_exit_schema_distinguishes_result_storage_from_human_output(self) -> None:
-        assert "does not present the result to the human" in ProcessExitTool().description
+        process_exit = ProcessExitTool()
+        assert "does not present the result to the human" in process_exit.description
+        assert "cumulatively complete" in process_exit.description
+        assert "passing tests alone" in process_exit.description
+        assert "exact-goal recovery path after reopen" in process_exit.description
+        assert (
+            "verification evidence"
+            in process_exit.spec().input_schema["properties"]["payload"]["description"]
+        )
         assert "final user-facing result before process_exit" in HumanOutputTool().description
+
+    def test_process_exit_completion_evidence_is_typed_and_accepts_stringified_json(self) -> None:
+        schema = ProcessExitTool().spec().input_schema
+        evidence_schema = schema["properties"]["completion_evidence"]
+        assert "ProcessCompletionEvidence" in json.dumps(evidence_schema)
+        definition = schema["$defs"]["ProcessCompletionEvidence"]
+        assert set(definition["required"]) == {
+            "goal_oid",
+            "reviewed_message_ids",
+            "acceptance_checks",
+            "final_verification",
+        }
+        assert definition["additionalProperties"] is False
+
+        serialized = json.dumps(
+            {
+                "goal_oid": "obj_goal",
+                "reviewed_message_ids": [],
+                "acceptance_checks": [
+                    {
+                        "requirement": "verify the result",
+                        "source_refs": ["obj_goal"],
+                        "status": "completed",
+                        "evidence_tool_calls": ["echo"],
+                        "evidence_summary": "echo returned the expected value",
+                    }
+                ],
+                "final_verification": ["echo"],
+            }
+        )
+        parsed = ProcessExitArgs(completion_evidence=serialized)
+
+        assert isinstance(parsed.completion_evidence, ProcessCompletionEvidence)
+        assert parsed.completion_evidence.goal_oid == "obj_goal"
+
+    def test_object_memory_schemas_explain_direct_structured_json(self) -> None:
+        payload = CreateMemoryObjectTool().spec().input_schema["properties"]["payload"]
+        entry = AppendMemoryObjectTool().spec().input_schema["properties"]["entry"]
+
+        assert {variant.get("type") for variant in payload["anyOf"]} >= {
+            "object",
+            "array",
+        }
+        assert "not as a JSON-encoded string" in payload["description"]
+        assert "not as a JSON-encoded string" in entry["description"]
+
+        created = CreateMemoryObjectArgs(
+            type="plan",
+            payload='{"entries": []}',
+        )
+        appended = AppendMemoryObjectArgs(
+            name="ledger",
+            entry='{"status": "verified"}',
+        )
+        scalar = CreateMemoryObjectArgs(type="summary", payload="plain text")
+
+        assert created.payload == {"entries": []}
+        assert appended.entry == {"status": "verified"}
+        assert scalar.payload == "plain text"
+
+    def test_object_memory_normalizes_empty_optional_namespaces(self) -> None:
+        assert CreateMemoryObjectArgs(
+            type="summary",
+            payload={},
+            namespace="",
+        ).namespace is None
+        assert ReadMemoryObjectArgs(name="notes", namespace="  ").namespace is None
+        assert AppendMemoryObjectArgs(
+            name="notes",
+            entry={},
+            namespace="",
+        ).namespace is None
+        assert ListMemoryNamespaceArgs(namespace="").namespace is None
+        assert CreateMemoryNamespaceArgs(
+            namespace="project",
+            parent_namespace="",
+        ).parent_namespace is None
+        read_name = ReadMemoryObjectArgs.model_json_schema()["properties"]["name"]
+        list_namespace = ListMemoryNamespaceArgs.model_json_schema()["properties"][
+            "namespace"
+        ]
+        assert "runtime-only goal object may be unavailable" in read_name["description"]
+        assert "Do not broaden to the parent `process` namespace" in list_namespace[
+            "description"
+        ]
 
     @pytest.mark.parametrize(
         "tool_type",

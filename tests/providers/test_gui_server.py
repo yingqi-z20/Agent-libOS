@@ -50,7 +50,7 @@ from agent_libos.models import (
     process_outcome_to_mapping,
     process_wait_state_to_mapping,
 )
-from agent_libos.models.exceptions import HumanApprovalRequired, HumanResponseRequired, ProcessWaitRequired, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ProcessWaitRequired, ValidationError
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import to_jsonable
 from agent_libos.runtime.runtime import Runtime
@@ -2284,6 +2284,10 @@ class TestGuiServer:
         assert not runtime.capability.check(pid, inside, CapabilityRight.READ)
         assert not runtime.capability.check(pid, inside, CapabilityRight.WRITE)
 
+        with pytest.raises(CapabilityDenied):
+            runtime.shell.run(pid, ['python', '-m', 'pytest', '-q'])
+        assert runtime.human.pending() == []
+
         denied = runtime.tools.call(
             pid,
             'request_permission',
@@ -2300,6 +2304,64 @@ class TestGuiServer:
             )
         assert [request.pid for request in runtime.human.pending()] == [pid]
         assert not runtime.capability.check(pid, inside, CapabilityRight.WRITE)
+
+    def test_process_spawn_reviewed_shell_policy_requires_exact_command_approval(self) -> None:
+        runtime = self.server.service.runtime
+        status, spawned = self.request(
+            'POST',
+            '/api/processes',
+            {
+                'image': 'coding-agent:v0',
+                'goal': 'run reviewed tests',
+                'auto_run': False,
+                'authority_manifest': {
+                    'authorized_capabilities': [
+                        {
+                            'resource': 'human:owner',
+                            'rights': ['write'],
+                            'delegable': False,
+                        },
+                        {
+                            'resource': 'shell:*',
+                            'rights': ['execute'],
+                            'delegable': False,
+                            'constraints': {
+                                'shell_policy_level': 'allowlist_auto_else_ask',
+                            },
+                        },
+                    ],
+                    'approval_policy': {'requestable_capabilities': []},
+                },
+            },
+        )
+
+        assert status == 200
+        pid = spawned['pid']
+        policy = next(
+            capability
+            for capability in runtime.capability.capabilities_for(pid)
+            if capability.resource == 'shell:*'
+        )
+        assert policy.constraints == {
+            'shell_policy_level': 'allowlist_auto_else_ask'
+        }
+
+        argv = ['python', '-m', 'pytest', '-q']
+        with pytest.raises(HumanApprovalRequired):
+            runtime.shell.run(pid, argv)
+
+        pending = runtime.human.pending()
+        assert len(pending) == 1
+        assert pending[0].pid == pid
+        assert pending[0].payload['context']['argv'] == argv
+        assert any(
+            record.action == 'human.query' and record.actor == pid
+            for record in runtime.audit.trace(actor=pid)
+        )
+        assert any(
+            event.type == EventType.HUMAN_QUERY and event.source == pid
+            for event in runtime.events.list()
+        )
 
     def test_process_rating_endpoint_updates_snapshot_and_audit(self) -> None:
         status, spawned = self.request('POST', '/api/processes', {'goal': 'rate agent', 'auto_run': False})

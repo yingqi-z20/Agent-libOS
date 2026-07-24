@@ -576,6 +576,12 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
             default=tools.memory_payload_chars,
             maximum=tools.memory_payload_hard_limit_chars,
         )
+    elif name == "list_memory_namespace":
+        _set_number_bounds(
+            properties,
+            "limit",
+            maximum=config.memory.query_limit,
+        )
     elif name in {"read_process_messages", "receive_process_messages"}:
         _set_number_bounds(properties, "limit", default=tools.message_read_limit, maximum=tools.message_read_hard_limit)
     elif name == "run_shell_command":

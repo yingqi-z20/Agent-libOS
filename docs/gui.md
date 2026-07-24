@@ -185,15 +185,48 @@ Production Electron always requires the preload-provided connection.
 ## Current Workspace
 
 On first launch the default screen is the streamlined user page; later launches
-restore the last user/operator view when renderer storage is available. It provides task/process
-selection, conversation and pending Human-request cards, task start/message/run
-controls, image import and save-as-image, ratings, LLM profile selection, and a
-button for the operator console. Task-start controls include a workspace access
-scope and a separate local-Git request switch. These controls create an
+restore the last user/operator view when renderer storage is available. The
+default user workspace uses a task sidebar and a dedicated conversation area.
+The first-task state starts with an empty goal instead of silently submitting a
+sample task, offers reusable starter prompts and a Ctrl/Command+Enter shortcut,
+and keeps model, image, working-directory, workspace, and Git settings inside a
+progressively disclosed runtime-and-permissions section. A successful launch
+clears the goal draft and uses a bounded one-line goal summary as the task label
+for the current GUI window. At most 200 bounded labels are retained in
+`sessionStorage`, so reloads remain legible without persisting full goals across
+window closes. The selected pid is retained in the same scope; if it is stale,
+the GUI prefers actionable work over terminal history. Older tasks fall back to
+a compact pid. After
+launch, the sidebar shows localized process state and wait reason, LLM-call and
+token metrics, process-scoped run/pause/stop controls, and collapsed image/rating
+tools. On narrow screens it becomes an explicit task-panel toggle instead of
+forcing the whole control stack above the conversation. The conversation area
+prioritizes pending Human requests, Agent output, terminal outcome, and a
+multiline composer. Terminal processes disable run, stop, message, and interrupt
+actions and replace the disabled composer with a clear Start another task action.
+Message drafts are retained per process so changing
+the selection cannot send a draft to the wrong process, Enter sends, and
+Shift+Enter inserts a line break.
+
+Task-start controls include a workspace access scope, a separate local-Git
+request switch, and a command-execution selector that defaults to disabled.
+Persistent context enrichment and bounded automatic maintenance are disabled by
+default and can be explicitly enabled in the same settings panel.
+These controls create an
 explicit Host-authored launch manifest: Human communication is granted to the
-root process, while filesystem and local-Git entries are only ceilings for
+root process. Explicit persistent context receives non-delegable
+`context:enrichment/execute` and `context:maintenance/execute` markers plus a `process:spawn`
+capability whose Authority Rule matches only `process.spawn_child` with
+`image_id=context-compressor:v0`, plus read authority for that exact built-in
+image. It cannot fork, launch another coding agent, or boot any other image.
+Filesystem and local-Git entries are only ceilings for
 later permission requests. They grant no workspace or Git access by
-themselves; arbitrary Shell commands still require separate Host authority. A
+themselves. Selecting reviewed commands adds only a constrained
+`shell_policy_level=allowlist_auto_else_ask` Host capability: configured
+allowlist diagnostics may run automatically, while every other exact command
+still creates a per-use Human approval request. It never grants the
+`always_allow` policy. With command execution disabled, arbitrary Shell
+commands have no Host authority and fail before prompting. A
 nested initial cwd narrows the filesystem ceiling to that subtree. The
 normalized ceilings are shown to the model as permission-planning facts, clearly
 separate from active capabilities, so an agent can request a coherent task scope
@@ -203,9 +236,9 @@ mode omits delete, and the manage mode adds it. Image import
 and commit both require explicit
 confirmation. Saving as an image creates a checkpoint only after that
 confirmation, then commits the checkpoint into an immutable image artifact.
-Message drafts are retained per process so changing the selection cannot send a
-draft to the wrong process. The conversation follows new output only while the
-reader remains near the bottom; scrolling upward pauses automatic following.
+The conversation follows new output only while the reader remains near the
+bottom; scrolling upward pauses automatic following and exposes a Jump to latest
+control when new output arrives. The log itself is keyboard-focusable.
 Interactive built-in images are instructed to send one concise final
 `human_output` before `process_exit`. The conversation also renders a terminal
 status fallback from the process outcome, including only a result/reason Object
@@ -221,25 +254,35 @@ source-object version change no longer turns the already fixed message into a
 protected-output false positive. Digest mismatch and uncertain delivery remain
 withheld.
 
-The operator console is the three-column process workspace:
+The operator console is a three-column process workspace with a grouped runtime
+toolbar and progressively disclosed configuration:
 
-- the left pane contains spawn controls plus a searchable, keyboard-navigable
-  process tree with pid, image, status, and unread-message indicators;
+- the left pane contains a collapsible launch configuration plus a searchable,
+  keyboard-navigable process tree with session task label, compact pid, image,
+  status, and unread-message
+  indicators; the toolbar's New process action opens this configuration rather than
+  immediately creating a process;
 - the center pane contains the selected process timeline, Human request cards,
-  and message controls;
-- the right pane contains cwd/pause/resume/exec/exit controls and tabs for a
+  localized state, and multiline message controls; the timeline defaults to
+  Human-facing messages, requests, and LLM activity while Events, Audit, and the
+  unfiltered evidence stream remain one click away;
+- the right pane contains a collapsed process-control section with cwd,
+  pause/resume, exec, and a visually isolated confirmed exit action, followed
+  by tabs for a
   structured process/resource overview, ratings, capability administration,
   Skill lifecycle and workspace registration, checkpoint create/inspect/diff/
   fork/restore, Object Tasks, audit, Explain, LLM calls, Images, JSON-RPC, MCP,
   loaded module inspection, and an Object Memory reference showing the goal
   OID and capability-control note;
-- the top bar contains database, spawn, auto-run, quanta, run, step, pause, and
-  refresh controls.
+- the top bar groups database identity, spawn, auto-run, quanta, run, step,
+  pause, refresh, scheduler/stream status, language, and the user-view switch.
 
 The renderer reports initialization failure with an explicit retry surface,
 shows refresh and live-stream connection state, preserves the last valid
 snapshot while reconnecting, surfaces scheduler failures, and warns when the
-bounded snapshot omitted any collection or value. Same-build snapshot responses
+bounded snapshot omitted any collection or value. That warning is a single-line,
+dismissible summary which states that source data remains stored and reappears
+only when the omitted-section set changes. Same-build snapshot responses
 from both HTTP refreshes and SSE events are minimally shape-validated before
 React consumes them. Destructive dialogs
 trap keyboard focus, close with Escape when idle, restore the previous focus,
@@ -289,6 +332,12 @@ away, so disabling custom-base-url use remains stable across GUI restarts.
 
 The scheduler defaults to automatic mode. Users can pause auto-run, step a
 selected process, or run the selected process with an optional quantum budget.
+For a paused process, Run resumes it and re-enables automatic scheduling instead
+of sending a run request that the paused state cannot execute. Human-request
+responses use their own per-request pending guard, so a concurrently running or
+message-triggered task cannot discard an approval or rejection. Passive status
+notices do not intercept controls beneath them, and long snapshot-truncation
+details are bounded and dismissible.
 Leaving the budget blank omits `max_quanta`, so the server uses
 `runtime.run_until_idle_max_quanta`; the run is unbounded only when that
 configured default is `null`. Entering a number explicitly bounds that run.

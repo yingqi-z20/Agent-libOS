@@ -141,7 +141,7 @@ same change.
 | `image_commit` | `artifact_version`, `artifact_hard_limit_bytes`, `payload_capture_limit_bytes`, `max_required_capabilities`, `max_committed_tools`, `max_committed_jit_sources`, `metadata_preview_chars` |
 | `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix` |
 | `object_tasks` | `max_running_global`, `max_running_per_object`, `notification_channel`, `owner_watch_channel`, `owner_watch_events`, `shutdown_join_timeout_s` |
-| `llm_context` | `policy`, `schema_version`, `object_name_prefix`, `recent_event_limit` |
+| `llm_context` | `policy`, `schema_version`, `object_name_prefix`, `recent_event_limit`, `storage_compaction_threshold_bytes`, `storage_compaction_max_chunks`, `storage_compaction_preserve_recent_entries` |
 | `checkpoint` | `list_limit`, `payload_capture_limit_bytes`, `snapshot_hard_limit_bytes`, `diff_preview_items` |
 | `skills` | `schema_version`, `registry_resource`, `trust_resource`, `global_dirs`, `workspace_dirs`, `resource_dirs`, `trusted_global_package_sha256`, `global_requires_trust`, `skill_md_max_bytes`, `skill_md_hard_limit_bytes`, `resource_read_max_bytes`, `package_max_bytes`, `max_package_files`, `max_prompt_instruction_chars`, `max_jit_source_chars`, `discover_limit`, `id_max_chars`, `name_max_chars`, `description_max_chars`, `version_max_chars`, `max_tools`, `max_actions`, `max_jit_tools`, `max_required_capabilities` |
 | `modules` | `schema_version`, `manifest_paths`, `trusted_modules`, `trusted_sha256`, `manifest_max_bytes`, `manifest_hard_limit_bytes`, `source_max_bytes`, `package_max_bytes`, `max_package_files`, `load_policy`, `discover_limit`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `entrypoint_max_chars`, `max_declared_tools`, `max_declared_images`, `max_declared_syscalls`, `max_declared_provider_hooks`, `max_declared_startup_hooks` |
@@ -285,8 +285,32 @@ configurable. A runtime release emits only the snapshot version it can decode.
 GUI and context limits operate at two different layers and must not be treated
 as equivalent:
 
+- `llm_context.policy` accepts `source_only` (the default) or
+  `llm_context_object`. `source_only` leaves the already materialized context
+  unchanged and creates no persistent delta Object. A Host may opt in globally
+  with `llm_context_object`, or opt in one process with explicit
+  `context:enrichment/execute` authority.
 - `llm_context.recent_event_limit` bounds the newest post-cursor event rows
-  loaded from SQL for one LLM context preparation.
+  loaded from SQL for an explicitly enabled persistent-context preparation; it
+  does not activate delta capture by itself.
+- `llm_context.storage_compaction_threshold_bytes` is the persisted-context
+  waterline that starts automatic compaction before the generic Object Memory
+  payload hard limit. It must be positive and strictly less than
+  `tools.memory_payload_hard_limit_bytes`. The process must also have both
+  explicit persistent enrichment and explicit `context:maintenance/execute`
+  authority; otherwise the proactive storage waterline does not elevate its
+  authority or invoke the compactor.
+- `llm_context.storage_compaction_max_chunks` bounds the built-in compressor
+  stages used specifically for storage-waterline maintenance. The default is
+  four; an Image's explicit `planner.context_management.tool.arguments.max_chunks`
+  still takes precedence. Values must be between 1 and the tool-schema hard
+  maximum of 64.
+- `llm_context.storage_compaction_preserve_recent_entries` controls how many
+  verbatim tail entries storage-waterline maintenance retains in addition to
+  the cumulative summary. The default is zero because compressor children and
+  their result objects can otherwise make a newly compacted context cross the
+  waterline again. An Image's explicit tool argument still takes precedence;
+  values must be between 0 and 128.
 - `gui.snapshot_event_limit` bounds snapshot event reads and is also the maximum
   accepted `limit` for the process-events API. Older pages use its `before`
   cursor rather than loading all process events.

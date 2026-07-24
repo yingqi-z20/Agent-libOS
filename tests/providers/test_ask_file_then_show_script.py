@@ -19,4 +19,11 @@ class TestAskFileThenShowScript:
         assert report['displayed']
         assert report['error'] is None
         assert content.strip() in report['outputs'][-1]
-        assert report['actions'] == [None, 'ask_human', 'read_text_file', 'human_output', 'process_exit']
+        assert report['actions'] == [
+            None,
+            'ask_human',
+            'read_text_file',
+            'human_output',
+            'process_exit',
+            'process_exit',
+        ]

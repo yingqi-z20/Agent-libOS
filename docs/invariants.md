@@ -56,7 +56,9 @@ longer defines.
 - `process-authority-is-explicit`: spawn, fork, exec, and cwd behavior do not
   imply broader authority. Cwd selection requires filesystem directory read,
   and explicit child/PTY cwd probes occur only after their higher-level
-  authority gates and under a filesystem effect intent.
+  authority gates and under a filesystem effect intent. A spawn Authority Rule
+  can bind the grant to one `image_id` and `process.spawn_child`; that grant
+  cannot authorize a fork or another child image.
 - `process-message-label-observation-is-linearizable`: observing durable
   message labels preserves a concurrent ACK or terminal process transition and
   creates at most one durable label carrier for a message.
@@ -68,7 +70,10 @@ longer defines.
   Host manifest inputs are closed and strictly typed. Unknown fields, invalid
   scalar types, and malformed provider-effect wildcard forms fail closed before
   launch; valid manifests compile launch grants and bound model requests, child
-  transitions, budgets, approval policy, and provider effect classes.
+  transitions, budgets, approval policy, and provider effect classes. GUI
+  reviewed-command launch policy is explicitly opt-in, carries the constrained
+  `allowlist_auto_else_ask` level, and still requires exact per-use approval for
+  non-allowlisted commands; the disabled default denies before prompting.
 - `effect-ceilings-distinguish-unrestricted-and-deny-all`: omission of a Task
   Authority effect ceiling remains unrestricted, while an explicit empty
   ceiling is a versioned deny-all value that cannot be downgraded after reopen.
@@ -152,9 +157,17 @@ longer defines.
   subtree query. The
   `data_label_exfiltration` benchmark proves that ordinary write capability
   alone cannot export secret context.
-- `model-tool-projection-does-not-change-authority`: lazy model schemas are a
-  durable projection of the complete image tool table and cannot add
-  capabilities.
+- `builtin-tool-skills-do-not-expand-image-authority`: built-in tool Skills
+  reveal only bindings already owned by the image and cannot add callable
+  tools, capabilities, or primitive authority.
+- `cumulative-completion-review-is-fresh-and-authority-neutral`: coding-agent
+  completion review re-surfaces the cumulative goal and acknowledged Human
+  follow-ups without expanding effective ambient authority beyond the exact
+  immutable review evidence it creates. Final review and process exit
+  linearize against concurrent Human follow-ups; message bodies and recovered
+  prompt evidence are bounded to the exact reviewed sources. Review tokens
+  become stale when Human messages change, and restart recovery fails closed
+  when no retained goal evidence is available.
 - `object-memory-names-are-not-capabilities`: Object Memory names and
   namespaces do not bypass object capabilities. Successful namespace listing
   consumes every finite namespace/object visibility decision used in the
@@ -165,7 +178,13 @@ longer defines.
 - `context-compaction-preserves-authority-and-fails-closed`: context compaction
   uses child-process summarizers without granting external authority, validates
   summaries, preserves process authority, and fails closed on races or invalid
-  output.
+  output. The default source-only path creates no persistent delta context;
+  enrichment requires explicit Host configuration or process authority.
+  Explicitly authorized persisted LLM-context storage pressure starts
+  compaction before the Object Memory hard limit; without the independent
+  maintenance authority it cannot elevate the process. Synchronous or resumed
+  failure terminates without recursively retrying the same oversized
+  generation.
 - `child-memory-merge-lifecycle-is-explicit`: terminal child process memory
   remains mergeable, then is adopted or released by the parent lifecycle.
 - `object-memory-lifecycle-is-explicit`: Object Memory ownership, release, and
@@ -323,6 +342,12 @@ longer defines.
   wait registration are atomic with message posting, so a concurrent matching
   post either satisfies the read or wakes the registered process. Message row,
   evidence, terminal recheck, and wake state also roll back together.
+- `process-message-input-remains-mediated-and-actionable`: queued user input
+  remains in the durable process-message subsystem rather than being copied
+  into proactive context deltas. The prompt directs a capable process to read
+  the queue without embedding the message body, and narrowly normalizes
+  reversible string encodings emitted by real providers before schema
+  validation; neither path bypasses ToolBroker authority or audit.
 - `runtime-lifecycle-transitions-are-atomic`: capability issuance, the core
   process exec row/capability/evidence transition, process exit, and
   parent/message waiter transitions do not publish partial authoritative state
@@ -584,14 +609,20 @@ longer defines.
 - `automatic-context-management-does-not-grant-authority`: context pressure
   may select an Image-configured tool, but never inserts it into the process
   tool table or bypasses argument validation, Capability, resource, approval,
-  event, audit, and durable-wait enforcement. An initial failure with unchanged
+  event, audit, and durable-wait enforcement. Model-window maintenance is
+  dispatched only when persistent context is explicitly enabled and the
+  process independently holds `context:maintenance/execute`; default
+  source-only pressure leaves the request unchanged and records that maintenance
+  was not authorized. An initial failure with unchanged
   context generation is audited and remains invisible while the original model
   request continues; a changed generation ends that quantum so the next one
   rebuilds context. Human/child/message waits remain durable, and a failed
   resumed attempt terminally completes its pending generation before rebuilding
   the ordinary request from the current generation. Prompt-mode pressure
   accounts for its final numeric notice and fails before provider dispatch if
-  that exact request exceeds the configured context window.
+  that exact request exceeds the configured context window. Storage-triggered
+  maintenance uses the same authority and durable-wait path but fails the
+  process if compaction cannot advance the context generation.
 - `resource-budgets-are-hierarchical`: resource usage is charged to the acting
   process and its parent chain, and visibility/capability mechanisms cannot
   mint additional budget. The complete hierarchy, reservations, event, and

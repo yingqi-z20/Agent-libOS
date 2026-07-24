@@ -49,10 +49,11 @@ unreadable explicit parents reject the creation. ToolBroker carries the
 materialization id, Object id/version/content hash, and aggregate labels in
 runtime-owned context; model arguments cannot replace that context.
 
-Process `llm_context` objects keep a `label_history` high-water mark across
-append, compaction, checkpoint, fork, exec, reopen, retry, and Human/message
-resume. Provider/tool input is never allowed to reset a previously observed
-higher sensitivity. Unclassified external responses are `normal/untrusted`
+When persistent context enrichment is explicitly enabled, process `llm_context`
+objects keep a `label_history` high-water mark across append, compaction,
+checkpoint, fork, exec, reopen, retry, and Human/message resume. The default
+source-only path creates no such Object. Provider/tool input is never allowed
+to reset a previously observed higher sensitivity. Unclassified external responses are `normal/untrusted`
 and are aggregated with, rather than substituted for, the request context.
 Synchronous tool workers merge their final runtime-owned context back before
 output-schema validation; schema failures, exceptions, and JIT timeout/error

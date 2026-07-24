@@ -75,11 +75,9 @@ from agent_libos.tools.builtin.skills import (
     ReadSkillResourceTool,
     UnloadSkillTool,
 )
-from agent_libos.tools.builtin.tool_groups import ActivateToolGroupTool, DiscoverToolGroupsTool
 
 __all__ = [
     "ActivateSkillTool",
-    "ActivateToolGroupTool",
     "CreateMemoryObjectTool",
     "CreateMemoryNamespaceTool",
     "CreateObjectFromFileTool",
@@ -94,7 +92,6 @@ __all__ = [
     "DeleteFileTool",
     "DelegateCapabilityTool",
     "DiscoverSkillsTool",
-    "DiscoverToolGroupsTool",
     "EchoTool",
     "ExecProcessTool",
     "DiffCheckpointTool",

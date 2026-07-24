@@ -527,9 +527,8 @@ class McpPrimitive:
                 resource_context=resource_context,
                 **self._protected_registry_guard(self._registry_binding_for_server_spec(spec), server_id),
                 data_sink=list_sink,
-                data_sink_revalidator=lambda: DataSink(
-                    f"mcp:{server_id}:list_tools",
-                    self._list_tools_identity_sha256(spec),
+                data_sink_revalidator=lambda: self._list_tools_data_sink(
+                    server_id, spec, runtime_environment
                 ),
                 data_flow_context=request_flow,
                 data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
@@ -711,13 +710,13 @@ class McpPrimitive:
             registry_binding=registry_binding,
         )
         flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
-        stdio_executable_identity = self._stdio_executable_identity(spec)
+        host_environment, runtime_environment, stdio_identity = self._capture_stdio_identity_environment(spec)
         sink = DataSink(
             f"mcp:{server_id}:{tool_id}",
             self._server_identity_sha256(
                 spec,
                 tool,
-                stdio_executable=stdio_executable_identity,
+                stdio_executable=stdio_identity,
             ),
         )
         self._data_flow().authorize_egress(
@@ -800,9 +799,8 @@ class McpPrimitive:
             failure_resource=failure_resource,
             failure_evidence=lambda error, phase: self._protected_call_failure_evidence(pid, resource, tool, operation_context, error, phase),
             data_sink=sink,
-            data_sink_revalidator=lambda: DataSink(
-                f"mcp:{server_id}:{tool_id}",
-                self._server_identity_sha256(spec, tool),
+            data_sink_revalidator=lambda: self._tool_data_sink(
+                server_id, spec, tool, runtime_environment
             ),
             data_flow_context=flow_context,
             data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
@@ -815,7 +813,7 @@ class McpPrimitive:
         with self._protected().start("primitive.mcp.call", invocation, provider=self.provider) as protected:
             started = time.monotonic()
             deadline = started + spec.timeout_s
-            runtime_environment = self._require_runtime_environment(spec)
+            runtime_environment = self._require_runtime_environment(spec, host_environment=host_environment)
             if spec.transport == "streamable_http":
                 observes_host = self._runtime_resolution_observes_host(spec)
                 protected.call(
@@ -833,7 +831,7 @@ class McpPrimitive:
                 executable_snapshot = self._stdio_snapshot_for_dispatch(
                     pid=pid,
                     spec=spec,
-                    expected_identity=stdio_executable_identity,
+                    expected_identity=stdio_identity,
                     sink=sink,
                     context=flow_context,
                     payload=selected_args,
@@ -930,7 +928,7 @@ class McpPrimitive:
                     tool,
                     deadline=deadline,
                     pid=pid,
-                    expected_identity=stdio_executable_identity,
+                    expected_identity=stdio_identity,
                     sink=sink,
                     context=flow_context,
                     payload=selected_args,
@@ -1032,7 +1030,7 @@ class McpPrimitive:
             executable_snapshot = self._stdio_snapshot_for_dispatch(
                 pid=pid,
                 spec=spec,
-                expected_identity=stdio_executable_identity,
+                expected_identity=stdio_identity,
                 sink=sink,
                 context=flow_context,
                 payload=selected_args,
@@ -1929,6 +1927,73 @@ class McpPrimitive:
             # unidentified so any Host rule above normal fails closed.
             return None
 
+    def _capture_stdio_identity_environment(
+        self,
+        spec: McpServerSpec,
+    ) -> tuple[
+        Mapping[str, str],
+        Mapping[str, str] | None,
+        dict[str, str] | None,
+    ]:
+        host_environment = MappingProxyType(dict(os.environ))
+        try:
+            runtime_environment: Mapping[str, str] | None = self._runtime_environment_from_host(
+                spec,
+                host_environment,
+            )
+        except ValidationError:
+            # Keep environment validation behind the existing capability and
+            # process-spawn gates.  An unresolved stdio Sink still fails
+            # closed for data above normal sensitivity.
+            runtime_environment = None
+        stdio_identity = (
+            self._stdio_executable_identity(
+                spec,
+                runtime_environment=runtime_environment,
+            )
+            if runtime_environment is not None
+            else None
+        )
+        return host_environment, runtime_environment, stdio_identity
+
+    def _tool_data_sink(
+        self,
+        server_id: str,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+        runtime_environment: Mapping[str, str],
+    ) -> DataSink:
+        stdio_identity = self._stdio_executable_identity(
+            spec,
+            runtime_environment=runtime_environment,
+        )
+        return DataSink(
+            f"mcp:{server_id}:{tool.tool_id}",
+            self._server_identity_sha256(
+                spec,
+                tool,
+                stdio_executable=stdio_identity,
+            ),
+        )
+
+    def _list_tools_data_sink(
+        self,
+        server_id: str,
+        spec: McpServerSpec,
+        runtime_environment: Mapping[str, str],
+    ) -> DataSink:
+        stdio_identity = self._stdio_executable_identity(
+            spec,
+            runtime_environment=runtime_environment,
+        )
+        return DataSink(
+            f"mcp:{server_id}:list_tools",
+            self._list_tools_identity_sha256(
+                spec,
+                stdio_executable=stdio_identity,
+            ),
+        )
+
     def _stdio_snapshot_for_dispatch(
         self,
         *,
@@ -1958,8 +2023,26 @@ class McpPrimitive:
             )
             else {}
         )
-        resolved = str(resolver(spec, **resolver_kwargs))
-        if not bool(checker(spec, resolved, **resolver_kwargs)):
+        resolved = Path(resolver(spec, **resolver_kwargs)).resolve(strict=True)
+        snapshot_required = bool(
+            checker(spec, str(resolved), **resolver_kwargs)
+        )
+        if not snapshot_required:
+            if expected_identity is None:
+                return None
+            actual = {
+                "path": resolved.as_posix(),
+                "content_sha256": executable_content_sha256(resolved),
+            }
+            if actual != expected_identity:
+                self._data_flow().reject_sink_identity_change(
+                    pid=pid,
+                    sink=sink,
+                    context=context,
+                    payload=payload,
+                    reason="MCP stdio Sink identity changed before dispatch",
+                )
+                raise AssertionError("data-flow Sink rejection must raise")
             return None
         if not bool(getattr(self.provider, "supports_executable_snapshots", False)):
             self._data_flow().reject_sink_identity_change(
@@ -2813,9 +2896,25 @@ class McpPrimitive:
     def _require_runtime_environment(
         self,
         server: McpServerSpec,
+        *,
+        host_environment: Mapping[str, str] | None = None,
+    ) -> Mapping[str, str]:
+        selected_host_environment = (
+            dict(os.environ)
+            if host_environment is None
+            else host_environment
+        )
+        return self._runtime_environment_from_host(
+            server,
+            selected_host_environment,
+        )
+
+    def _runtime_environment_from_host(
+        self,
+        server: McpServerSpec,
+        host_environment: Mapping[str, str],
     ) -> Mapping[str, str]:
         resolved_environment: dict[str, str] = {}
-        host_environment = dict(os.environ)
         if server.transport == "stdio" and server.stdio is not None:
             # Windows needs these bootstrap variables to create a child
             # process.  Capture them at the primitive boundary alongside the

@@ -34,12 +34,22 @@ class SQLiteStore(SQLRuntimeStore):
 
     KEYSET_TEXT_COLLATION = "BINARY"
 
-    def __init__(self, path: str | Path = ":memory:", *, config: AgentLibOSConfig | None = None):
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        config: AgentLibOSConfig | None = None,
+        initialize_schema: bool = True,
+    ) -> None:
         selected_path = str(path)
         connection_path = selected_path
         self._lease_handle: Any | None = None
         self._sqlite_connection_closed = False
         use_database_lease = False
+        if selected_path == ":memory:" and not initialize_schema:
+            raise ValidationError(
+                "offline migration requires an existing initialized Agent libOS store"
+            )
         if selected_path != ":memory:":
             db_path = Path(selected_path)
             # Resolve existing symlinks and relative aliases before deriving
@@ -48,8 +58,18 @@ class SQLiteStore(SQLRuntimeStore):
             # independent lease files.
             canonical_path = db_path.resolve()
             if canonical_path.exists():
-                self._preflight_existing_store(canonical_path)
+                fresh_store = self._preflight_existing_store(canonical_path)
+                if not initialize_schema and fresh_store:
+                    raise ValidationError(
+                        "offline migration requires an existing initialized "
+                        "Agent libOS store"
+                    )
             else:
+                if not initialize_schema:
+                    raise ValidationError(
+                        "offline migration requires an existing initialized "
+                        "Agent libOS store"
+                    )
                 db_path.parent.mkdir(parents=True, exist_ok=True)
             connection_path = str(canonical_path)
             self._secure_database_files(canonical_path)
@@ -71,7 +91,12 @@ class SQLiteStore(SQLRuntimeStore):
             conn.execute("PRAGMA foreign_keys = ON")
             if use_database_lease:
                 self._acquire_exclusive_sqlite_lease(conn, Path(connection_path))
-            self._init_store(selected_path, config=config, conn=conn)
+            self._init_store(
+                selected_path,
+                config=config,
+                conn=conn,
+                initialize_schema=initialize_schema,
+            )
         except BaseException:
             if conn is not None:
                 try:
@@ -81,7 +106,7 @@ class SQLiteStore(SQLRuntimeStore):
             self._release_runtime_lease()
             raise
 
-    def _preflight_existing_store(self, db_path: Path) -> None:
+    def _preflight_existing_store(self, db_path: Path) -> bool:
         """Reject an incompatible store through a read-only connection."""
 
         conn: sqlite3.Connection | None = None
@@ -89,7 +114,7 @@ class SQLiteStore(SQLRuntimeStore):
             conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA schema_version").fetchone()
-            self._require_supported_store_version_for(conn)
+            return self._require_supported_store_version_for(conn)
         except sqlite3.Error as exc:
             busy_codes = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
             if getattr(exc, "sqlite_errorcode", None) in busy_codes:

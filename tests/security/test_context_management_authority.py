@@ -6,7 +6,11 @@ import pytest
 
 from agent_libos import AgentImage, Runtime
 from agent_libos.llm.context_management import ContextPressureAssessment
-from agent_libos.models import ResourceBudget
+from agent_libos.llm.context_memory import (
+    LLM_CONTEXT_ENRICHMENT_RESOURCE,
+    LLM_CONTEXT_MAINTENANCE_RESOURCE,
+)
+from agent_libos.models import CapabilityRight, ResourceBudget
 from agent_libos.storage import SQLiteStore
 from tests.support.fakes import RecordingActionClient
 
@@ -27,6 +31,23 @@ def _forced_pressure(**kwargs: Any) -> ContextPressureAssessment:
         triggered=True,
         profile_id=str(kwargs["profile_id"]),
         context_generation=str(kwargs["context_generation"]),
+    )
+
+
+def _enable_persistent_context(runtime: Runtime, pid: str) -> None:
+    """Reach the inner automatic-maintenance boundary under explicit authority."""
+
+    runtime.capability.grant(
+        pid,
+        LLM_CONTEXT_ENRICHMENT_RESOURCE,
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+    )
+    runtime.capability.grant(
+        pid,
+        LLM_CONTEXT_MAINTENANCE_RESOURCE,
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
     )
 
 
@@ -51,6 +72,7 @@ def test_automatic_context_management_does_not_expand_process_tool_authority(
     )
     runtime.llm.client = client
     pid = runtime.process.spawn(image=image.image_id, goal="finish safely")
+    _enable_persistent_context(runtime, pid)
     monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
     try:
         before = runtime.process.get(pid)
@@ -96,6 +118,7 @@ def test_automatic_context_management_cannot_bypass_tool_argument_schema(
     )
     runtime.llm.client = client
     pid = runtime.process.spawn(image=image.image_id, goal="respect schema")
+    _enable_persistent_context(runtime, pid)
     monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
     try:
         result = runtime.run_next_process_once()
@@ -144,6 +167,7 @@ def test_automatic_context_management_cannot_bypass_capability_checks(
     )
     runtime.llm.client = client
     pid = runtime.process.spawn(image=image.image_id, goal="respect capability")
+    _enable_persistent_context(runtime, pid)
     monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
     try:
         result = runtime.run_next_process_once()
@@ -177,6 +201,7 @@ def test_automatic_context_management_cannot_bypass_resource_budget(
         goal="respect resource budget",
         resource_budget=ResourceBudget(max_tool_calls=0),
     )
+    _enable_persistent_context(runtime, pid)
     monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
     try:
         runtime.run_next_process_once()

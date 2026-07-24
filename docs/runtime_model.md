@@ -94,28 +94,35 @@ adds a short factual runtime note and state sections. `libos_default` preserves
 the native Agent libOS planner envelope and fallback JSON instructions used by
 the built-in images.
 
-The context helper uses the active Runtime's `llm_context.policy`,
+The default `llm_context.policy` is `source_only`: context preparation returns
+the caller-selected Object Memory materialization unchanged. It records a
+metadata-only Context Materialization Manifest, but does not create an
+`llm_context` Object and does not append process, Capability, tool, event, or
+memory deltas to the model input. Persistent delta enrichment is opt-in either
+through Host configuration `llm_context.policy: llm_context_object` or a
+Host-issued `context:enrichment/execute` capability for that process.
+
+When explicitly enabled, the context helper uses the active Runtime's
 `llm_context.schema_version`, `llm_context.object_name_prefix`, and
 `llm_context.recent_event_limit`; these are not import-time constants. New
 context Objects carry the active schema version, and an existing context Object
 with a different schema fails closed before reuse. Event capture consumes the
-same configured, store-bounded window whose cursor the executor advances, so a
-window larger than the default does not silently lose its leading events.
-The rendered append-only context records one initial Capability snapshot and
-then keyed Capability/tool deltas. Repetitive resource-charge and context-object
-bookkeeping events are represented by bounded counts and aggregate usage;
-denied data-flow decisions retain a compact reason/label record while allowed
-decisions are counted. Every event id is still durably captured, and label
-propagation uses the original events, so this prompt projection does not alter
-stored audit evidence or egress classification. Compaction resets the captured
-process/Capability/tool signatures so the next quantum appends a fresh baseline
-before later deltas.
+same configured, store-bounded window whose cursor the executor advances. The
+rendered append-only context records one initial Capability snapshot and then
+keyed Capability/tool deltas. Repetitive bookkeeping events are projected as
+bounded counts and aggregate usage. Compaction resets captured signatures so
+the next quantum appends a fresh baseline before later deltas.
 
 `planner.context_management` controls model-window pressure handling. With no
-entry, the image uses `auto_compact` at 80% projected occupancy and calls
-`compact_process_context`. `prompt` appends the image-owned literal reminder
-and numeric pressure facts in every prompt mode, including `image_only`;
-`disabled` records pressure but takes no action. For stateless requests,
+entry, the image selects `auto_compact` at 80% projected occupancy. That mode
+may call `compact_process_context` only when persistent context is explicitly
+enabled for the process and the process independently holds
+`context:maintenance/execute`. The default source-only path records the
+pressure decision as not authorized and leaves the request unchanged: it does
+not inject a notice or dispatch a maintenance tool. `prompt` is an explicit
+Image policy that appends the image-owned literal reminder and numeric pressure
+facts in every prompt mode, including `image_only`; `disabled` records pressure
+but takes no action. For stateless requests,
 projected occupancy is the deterministic conservative estimate of the complete
 assembled input plus the profile's `max_tokens` output reservation. An eligible
 Responses chain additionally adds the provider-reported lower bound for retained
@@ -128,14 +135,47 @@ request would exceed the configured context window, it records
 A configured automatic tool is never added to the process tool table: it must
 already be present and remains subject to its argument schema, Capability,
 resource, approval, event, and audit checks. One attempt is made per pressure
-episode and policy fingerprint. A successful compaction, or an initial failure
+episode and policy fingerprint. Separately, an `auto_compact` image starts the
+same durable maintenance path, only for explicitly enriched and independently
+maintenance-authorized processes, when its persisted LLM-context payload reaches
+`llm_context.storage_compaction_threshold_bytes` (96,000 bytes by default),
+before Object Memory's 200,000-byte default hard limit. This proactive storage
+path is enabled only when the process has explicit
+`context:maintenance/execute` authority; tool, child-spawn, and image-read
+checks still apply independently. The built-in compactor
+is forced for this storage trigger so it cannot skip a payload that is below its
+token target. Unless the Image explicitly selects another value, storage
+maintenance uses at most `llm_context.storage_compaction_max_chunks` stages
+(four by default) to bound latency and model cost, and retains zero verbatim
+tail entries by default via
+`llm_context.storage_compaction_preserve_recent_entries`; the cumulative
+compressor summary remains. This avoids feeding context-maintenance artifacts
+back into an immediate second compaction. After compaction, the first safe
+projected payload becomes a durable baseline and the storage trigger is
+re-armed at one configured waterline of additional growth (capped immediately
+below the hard limit). This hysteresis prevents maintenance events and child
+summaries from causing a compaction loop even when a Host selects a low valid
+waterline. If that first post-compaction projection itself cannot fit below the
+hard limit, the process fails instead of retrying an ineffective compaction.
+The storage check uses the projected
+payload after the current durable deltas are assembled but before that payload
+is written, so one large delta cannot jump directly over Object Memory's hard
+limit. The Runtime ends the quantum before provider dispatch, preserves
+Human/child/message waits, and resumes only after the context generation
+changes. A failed storage-triggered attempt fails the process with audit
+evidence instead of recursively rebuilding the same oversized context. Images
+using `prompt` or `disabled` retain their selected policy and do not receive
+automatic storage compaction.
+
+A successful compaction, or an initial failure
 that nevertheless changes the durable context generation, ends the current
 quantum so the next quantum re-materializes context. An initial failure with no
 generation change is audited and the original model request continues without
 an injected tool result or fallback prompt. Human, child, and message waits are
-durable; after such a wait resumes, failure terminally completes that pending
-generation and immediately rebuilds the ordinary request from the current
-context generation.
+durable. For model-window-triggered maintenance, failure after such a wait
+terminally completes that pending generation and immediately rebuilds the
+ordinary request from the current context generation; storage-triggered failure
+instead terminates as described above.
 
 Root process spawn never grants image `required_capabilities`.
 Requirements are copied into the Host-authored
@@ -157,29 +197,34 @@ runtime paths such as JIT syscalls may still call primitives directly through
 their syscall session without exposing the corresponding builtin tool to the
 model.
 
-An image with `metadata.lazy_tool_groups=true` initially projects only the
-stable discovery/core subset plus any validated `metadata.initial_tool_groups`
-into LLM schemas. `discover_tool_groups` and
-`activate_tool_group` expand the durable model projection from the already
-authorized image tool table. Host calls and primitive capability enforcement
-continue to use the complete table; activation cannot grant authority.
+An image with `metadata.tool_projection: skills` initially projects only
+`discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill`, and
+`process_exit`, all of which must be present in the image's explicit
+`default_tools` or image validation fails.
+`default_skills` load initial built-in instructions and their complete,
+image-authorized tool sets. Later `activate_skill` calls expand the durable
+model projection from that same full process tool table. A built-in Skill is
+hidden unless all its tools are present; activation cannot partially project a
+Skill, resolve absent tools, or grant authority.
 
 The current built-in image contracts are:
 
 | Image | Intended work | Initial model projection | Declared requirements |
 | --- | --- | --- | --- |
-| `base-agent:v0` | General runtime work and coordination | Lazy core plus process/context/clock, then selected groups | configured Human write |
-| `coding-agent:v0` | Repository inspection, editing, Git, and verification | Lazy core plus filesystem, then selected groups | configured Human write and workspace read |
-| `review-agent:v0` | Evidence-first review; read-only unless repair is explicitly requested | Lazy core plus read-only filesystem tools, then selected groups | configured Human write and workspace read |
-| `toolmaker-agent:v0` | Import-free Deno/TypeScript JIT proposal, validation, and registration | Narrow explicit table | configured Human write |
+| `base-agent:v0` | General runtime work and coordination | 15 schemas: bootstrap plus navigation, authority, human, and Object Memory built-ins | configured Human write |
+| `coding-agent:v0` | Repository inspection, editing, Git, and verification | 14 schemas: bootstrap plus navigation, authority, human, and workspace navigation built-ins | configured Human write and workspace read |
+| `review-agent:v0` | Evidence-first review; read-only unless repair is explicitly requested | 14 schemas: bootstrap plus navigation, authority, human, and workspace navigation built-ins | configured Human write and workspace read |
+| `toolmaker-agent:v0` | Import-free Deno/TypeScript JIT proposal, validation, and registration | Narrow explicit table with the JIT authoring guide loaded | configured Human write |
 | `context-compressor:v0` | Structured context compaction | `process_exit` only | none |
 
-The lazy core includes group discovery/activation, lifecycle exit, exact
-permission and Human queries, compact Object Memory operations, current time,
-and capability listing. Requirement declarations remain Task Authority
-Manifest inputs, not grants. Configured base/coding ids must also remain
-distinct from the fixed review, toolmaker, and context-compressor ids; a
-collision fails Runtime construction instead of silently replacing an image.
+The prompt lists only applicable built-in Skill IDs, concise descriptions, and
+active state until a Skill is loaded. Visibility remains separate from
+authority: Host calls and primitives continue to use the complete process tool
+table and Capability set, and built-in activation records no authority change.
+Requirement declarations remain Task Authority Manifest inputs, not grants.
+Configured base/coding ids must also remain distinct from the fixed review,
+toolmaker, and context-compressor ids; a collision fails Runtime construction
+instead of silently replacing an image.
 
 LLM selection is host-controlled and process-local. A process stores only an
 `llm_profile_id`; the host Runtime resolves that id to a configured
@@ -756,10 +801,13 @@ Context materialization has both a per-call cap
 (`max_context_materialization_total_tokens`). The cumulative context token
 budget is charged when Object Memory materializes prompt context and is
 accounted independently from provider-reported LLM tokens. In the LLM executor,
-the final rendered `<config.llm_context.object_name_prefix>:<pid>` prompt
-context is the charged unit (the default prefix is `llm_context`);
-source object materialization for delta capture does not double-charge the same
-quantum, and over-budget rendered context fails closed before the model call.
+the default source-only path charges its selected source render. When persistent
+enrichment is explicitly enabled, the final rendered
+`<config.llm_context.object_name_prefix>:<pid>` Object is charged instead (the
+default prefix is `llm_context`), and its source materialization is not charged
+a second time. Source-only selection omits Objects that do not fit the remaining
+budget; an explicitly enriched final render that still exceeds the applicable
+limit fails closed before the model call.
 
 Shell and Deno subprocesses are run through provider-level monitors. On
 supported POSIX hosts, the default local Shell provider samples the process tree

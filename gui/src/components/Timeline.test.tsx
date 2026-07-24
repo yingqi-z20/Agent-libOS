@@ -68,6 +68,7 @@ describe("Timeline", () => {
       audit: 1
     });
     expect(filterTimelineItems(items, "all")).toBe(items);
+    expect(filterTimelineItems(items, "activity").map((item) => item.kind)).toEqual(["human", "message", "llm"]);
     expect(filterTimelineItems(items, "event").map((item) => item.kind)).toEqual(["event", "event"]);
     expect(filterTimelineItems(items, "audit").map((item) => item.kind)).toEqual(["audit"]);
   });
@@ -91,7 +92,7 @@ describe("Timeline", () => {
     ]);
   });
 
-  it("renders the default all-type filter with type counts", () => {
+  it("renders the default human-facing activity filter with type counts", () => {
     const html = renderToStaticMarkup(
       <I18nProvider>
         <Timeline
@@ -107,6 +108,7 @@ describe("Timeline", () => {
 
     expect(html).toMatch(/Filter timeline by type|按类型筛选时间线/);
     expect(html).toContain("aria-pressed=\"true\"");
+    expect(html).toMatch(/Activity|活动/);
     expect(html).toMatch(/All|全部/);
     expect(html).toMatch(/Messages|消息/);
     expect(html).toMatch(/Human|人类/);

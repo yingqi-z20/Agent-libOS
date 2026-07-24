@@ -60,6 +60,7 @@ _STRING_RULE_CONDITIONS = frozenset(
         "content_sha256",
         "network",
         "filesystem_intent",
+        "image_id",
         "git_remote",
         "git_remote_ref",
         "git_url_fingerprint",

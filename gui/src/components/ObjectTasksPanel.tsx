@@ -6,7 +6,14 @@ import type { ConfirmationRequest, RunGuiAction } from "../adminTypes";
 import { useI18n } from "../i18n";
 import { CollapsibleJson } from "./CollapsibleJson";
 
-const terminalTaskStatuses = new Set(["completed", "failed", "cancelled", "exited"]);
+const terminalTaskStatuses = new Set([
+  "succeeded",
+  "failed",
+  "cancelled",
+  "abandoned",
+  "superseded_by_restore",
+  "result_unavailable_after_reopen"
+]);
 
 export function ObjectTasksPanel({
   process,
@@ -31,6 +38,7 @@ export function ObjectTasksPanel({
   const [selectedId, setSelectedId] = useState(relevantTasks[0]?.task_id ?? "");
   const [tool, setTool] = useState(tools[0]?.name ?? tools[0]?.tool_id ?? "");
   const [argsText, setArgsText] = useState("{}");
+  const [ownerOid, setOwnerOid] = useState(relevantTasks[0]?.owner_oid ?? "");
   const [ownerWatch, setOwnerWatch] = useState(false);
   const [watchEvents, setWatchEvents] = useState("");
   const [result, setResult] = useState<unknown>(null);
@@ -44,6 +52,11 @@ export function ObjectTasksPanel({
   }, [relevantTasks, selectedId]);
 
   function start() {
+    const selectedOwnerOid = ownerOid.trim();
+    if (!selectedOwnerOid) {
+      setLocalError(t("tasks.ownerRequired"));
+      return;
+    }
     let args: Record<string, unknown>;
     try {
       args = parseObjectInput(argsText);
@@ -54,18 +67,20 @@ export function ObjectTasksPanel({
     }
     const selectedTool = tool.trim();
     const selectedEvents = splitCsv(watchEvents);
+    const request = buildObjectTaskStartRequest({
+      pid: process.pid,
+      ownerOid: selectedOwnerOid,
+      tool: selectedTool,
+      args,
+      ownerWatch,
+      watchEvents: selectedEvents
+    });
     confirmAction({
       title: t("tasks.startTitle"),
       message: t("tasks.startMessage"),
-      details: { pid: process.pid, tool: selectedTool, arguments: args, owner_watch: ownerWatch, watch_events: selectedEvents },
+      details: { pid: process.pid, owner_oid: selectedOwnerOid, tool: selectedTool, arguments: args, owner_watch: ownerWatch, watch_events: selectedEvents },
       action: async () => {
-        const task = await client.startObjectTask({
-          pid: process.pid,
-          tool: selectedTool,
-          args,
-          ownerWatch,
-          watchEvents: selectedEvents
-        });
+        const task = await client.startObjectTask(request);
         setSelectedId(task.task_id);
         setResult(task);
       }
@@ -114,7 +129,7 @@ export function ObjectTasksPanel({
     }, "object_task.watch_owner");
   }
 
-  const terminal = selected ? terminalTaskStatuses.has(selected.status) : false;
+  const terminal = selected ? isObjectTaskTerminal(selected.status) : false;
   return (
     <section className="adminPanel objectTasksPanel">
       <header className="adminPanelHeader">
@@ -135,6 +150,10 @@ export function ObjectTasksPanel({
             </datalist>
           </label>
           <label className="fieldStack spanAll">
+            <span>{t("tasks.ownerOid")}</span>
+            <input value={ownerOid} placeholder={t("tasks.ownerOidPlaceholder")} onChange={(event) => setOwnerOid(event.currentTarget.value)} />
+          </label>
+          <label className="fieldStack spanAll">
             <span>{t("tasks.arguments")}</span>
             <textarea className="codeInput" value={argsText} onChange={(event) => setArgsText(event.currentTarget.value)} />
           </label>
@@ -147,7 +166,7 @@ export function ObjectTasksPanel({
             <input value={watchEvents} placeholder={t("tasks.watchEventsPlaceholder")} onChange={(event) => setWatchEvents(event.currentTarget.value)} />
           </label>
         </div>
-        <button className="primary" disabled={!tool.trim()} onClick={start}><Play size={14} />{t("tasks.startAction")}</button>
+        <button className="primary" disabled={!tool.trim() || !ownerOid.trim()} onClick={start}><Play size={14} />{t("tasks.startAction")}</button>
       </details>
 
       <label className="fieldStack">
@@ -176,6 +195,28 @@ export function parseObjectInput(value: string): Record<string, unknown> {
     throw new Error("Arguments must be a JSON object.");
   }
   return parsed as Record<string, unknown>;
+}
+
+export function isObjectTaskTerminal(status: string): boolean {
+  return terminalTaskStatuses.has(status);
+}
+
+export function buildObjectTaskStartRequest(input: {
+  pid: string;
+  ownerOid: string;
+  tool: string;
+  args: Record<string, unknown>;
+  ownerWatch: boolean;
+  watchEvents: string[];
+}): Parameters<LibOSClient["startObjectTask"]>[0] {
+  return {
+    pid: input.pid,
+    ownerOid: input.ownerOid.trim(),
+    tool: input.tool.trim(),
+    args: input.args,
+    ownerWatch: input.ownerWatch,
+    watchEvents: input.watchEvents
+  };
 }
 
 function splitCsv(value: string): string[] {

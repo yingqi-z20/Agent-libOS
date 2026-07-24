@@ -152,7 +152,13 @@ class PostgresStore(SQLRuntimeStore):
 
     KEYSET_TEXT_COLLATION = "C"
 
-    def __init__(self, dsn: str, *, config: AgentLibOSConfig | None = None):
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        config: AgentLibOSConfig | None = None,
+        initialize_schema: bool = True,
+    ) -> None:
         self.config = config or DEFAULT_CONFIG
         self.path = dsn
         self.dsn = dsn
@@ -161,7 +167,12 @@ class PostgresStore(SQLRuntimeStore):
         conn = _PostgresConnection(dsn)
         try:
             self._acquire_runtime_lease(conn)
-            self._init_store(dsn, config=config, conn=conn)
+            self._init_store(
+                dsn,
+                config=config,
+                conn=conn,
+                initialize_schema=initialize_schema,
+            )
         except BaseException as primary_error:
             cleanup_errors = self._close_connection_best_effort(conn)
             if cleanup_errors:

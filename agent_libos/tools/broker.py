@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 import threading
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
@@ -66,68 +67,20 @@ _JIT_DECLARED_PERMISSIONS = (
     "skill.write",
 )
 
-_LAZY_TOOL_CORE = (
-    "discover_tool_groups",
-    "activate_tool_group",
-    "process_exit",
-    "request_permission",
-    "ask_human",
-    "human_output",
-    "read_memory_object",
-    "create_memory_object",
-    "append_memory_object",
-    "get_current_time",
-    "list_capabilities",
+_REMOVED_TOOL_GROUP_METADATA_KEYS = frozenset(
+    {
+        "initial_tool_groups",
+        "lazy_tool_groups",
+    }
 )
 
-_TOOL_GROUPS: dict[str, tuple[str, ...]] = {
-    "filesystem_read": (
-        "read_text_file", "read_directory", "create_object_from_file",
-    ),
-    "filesystem": (
-        "read_text_file", "write_text_file", "read_directory", "write_directory",
-        "delete_file", "delete_directory", "create_object_from_file", "write_object_to_file",
-        "get_working_directory", "set_working_directory",
-    ),
-    "git": (
-        "git_repository_info", "git_status", "git_diff", "git_log", "git_show", "git_blame",
-        "git_list_refs", "git_list_remotes", "git_list_worktrees", "git_stage", "git_unstage",
-        "git_commit", "git_restore", "git_branch", "git_switch", "git_tag", "git_integrate",
-        "git_stash", "git_reset", "git_clean", "git_worktree", "git_create_patch",
-        "git_apply_patch", "git_fetch", "git_pull", "git_push", "git_create_pull_request",
-        "git_list_pull_requests", "git_inspect_pull_request", "git_review_pull_request",
-        "git_merge_pull_request", "git_close_pull_request",
-    ),
-    "process": (
-        "list_child_processes", "spawn_child_process", "fork_child_process", "wait_child_process",
-        "signal_child_process", "merge_child_memory", "send_process_message", "read_process_messages",
-        "receive_process_messages", "exec_process",
-    ),
-    "remote": (
-        "list_jsonrpc_endpoints", "inspect_jsonrpc_endpoint", "call_jsonrpc_method",
-        "list_mcp_servers", "inspect_mcp_server", "list_mcp_tools", "call_mcp_tool",
-    ),
-    "checkpoint": (
-        "create_checkpoint", "list_checkpoints", "inspect_checkpoint", "diff_checkpoint",
-        "fork_checkpoint", "restore_checkpoint", "commit_checkpoint_to_image",
-    ),
-    "memory": (
-        "create_memory_namespace", "list_memory_namespace", "create_memory_object",
-        "append_memory_object", "read_memory_object", "create_object_from_file", "write_object_to_file",
-    ),
-    "skills": ("discover_skills", "activate_skill", "read_skill_resource", "unload_skill"),
-    "object_tasks": (
-        "start_object_task", "get_object_task", "list_object_tasks", "wait_object_task",
-        "watch_object_task_owner", "cancel_object_task",
-    ),
-    "self_evolution": (
-        "load_image_package", "propose_jit_tool", "validate_jit_tool", "register_jit_tool",
-    ),
-    "authority": ("list_capabilities", "inspect_capability", "delegate_capability", "revoke_capability"),
-    "shell": ("run_shell_command", "parse_pytest_log"),
-    "context": ("compact_process_context",),
-    "clock": ("sleep",),
-}
+_SKILL_TOOL_BOOTSTRAP = (
+    "discover_skills",
+    "activate_skill",
+    "read_skill_resource",
+    "unload_skill",
+    "process_exit",
+)
 
 _JIT_MULTIPLEXER_INPUT_SCHEMA = {
     "type": "object",
@@ -799,99 +752,27 @@ class ToolBroker:
 
     def initial_tool_projection(self, image: Any) -> list[str]:
         metadata = getattr(image, "metadata", {})
-        lazy_groups = metadata.get("lazy_tool_groups", False)
-        if not isinstance(lazy_groups, bool):
-            raise ValidationError("image metadata lazy_tool_groups must be a boolean")
-        if not lazy_groups:
-            if "initial_tool_groups" in metadata:
-                raise ValidationError(
-                    "image metadata initial_tool_groups requires lazy_tool_groups=true"
-                )
+        removed_keys = sorted(_REMOVED_TOOL_GROUP_METADATA_KEYS.intersection(metadata))
+        if removed_keys:
+            raise ValidationError(
+                "image metadata contains removed tool-group fields: "
+                f"{', '.join(removed_keys)}; run the offline tool-group migration"
+            )
+        if "tool_projection" not in metadata:
             return list(image.default_tools)
+        projection = metadata["tool_projection"]
+        if projection != "skills":
+            raise ValidationError(
+                "image metadata tool_projection must be 'skills' when present"
+            )
         allowed = set(image.default_tools)
-        selected = [name for name in _LAZY_TOOL_CORE if name in allowed]
-        configured_groups = metadata.get("initial_tool_groups", [])
-        if not isinstance(configured_groups, (list, tuple)) or any(
-            not isinstance(group, str) or not group.strip()
-            for group in configured_groups
-        ):
-            raise ValidationError("image metadata initial_tool_groups must be a list of non-empty strings")
-        normalized_groups = [group.strip() for group in configured_groups]
-        if len(normalized_groups) != len(set(normalized_groups)):
-            raise ValidationError("image metadata initial_tool_groups must not contain duplicates")
-        for group in normalized_groups:
-            names = _TOOL_GROUPS.get(group)
-            if names is None:
-                raise ValidationError(f"unknown initial tool group: {group}")
-            authorized = [name for name in names if name in allowed]
-            if not authorized:
-                raise ValidationError(
-                    f"initial tool group is not authorized by image {image.image_id}: {group}"
-                )
-            selected.extend(authorized)
-        return list(dict.fromkeys(selected))
-
-    def tool_groups(self, pid: str) -> list[dict[str, Any]]:
-        process = self.processes.get_process(pid)
-        if process is None:
-            raise NotFound(f"process not found: {pid}")
-        image = self._images.get(process.image_id)
-        if image is None:
-            raise NotFound(f"agent image not found: {process.image_id}")
-        allowed = set(process.tool_table)
-        active = set(process.model_tool_table)
-        return [
-            {
-                "group": group,
-                "tool_count": len(names),
-                "active": all(name in active for name in names),
-            }
-            for group, configured in sorted(_TOOL_GROUPS.items())
-            if (names := [name for name in configured if name in allowed])
-        ]
-
-    def tool_group_for(self, tool_name: str) -> str | None:
-        selected = str(tool_name).strip()
-        return next(
-            (group for group, names in sorted(_TOOL_GROUPS.items()) if selected in names),
-            None,
-        )
-
-    def activate_tool_group(self, pid: str, group: str) -> dict[str, Any]:
-        selected_group = str(group).strip()
-        configured = _TOOL_GROUPS.get(selected_group)
-        if configured is None:
-            raise ValidationError(f"unknown tool group: {selected_group}")
-        process = self.processes.get_process(pid)
-        if process is None:
-            raise NotFound(f"process not found: {pid}")
-        image = self._images.get(process.image_id)
-        if image is None:
-            raise NotFound(f"agent image not found: {process.image_id}")
-        allowed = set(process.tool_table)
-        selected = [name for name in configured if name in allowed]
-        if not selected:
-            raise ValidationError(f"tool group is not authorized by image {image.image_id}: {selected_group}")
-        before = self.openai_tool_schemas(pid)
-        merged = sorted({*process.model_tool_table, *selected})
-        self.configure_model_tool_projection(pid, merged, assigned_by=f"tool_group:{selected_group}")
-        after = self.openai_tool_schemas(pid)
-        result = {
-            "group": selected_group,
-            "activated_tools": selected,
-            "tool_count_before": len(before),
-            "tool_count_after": len(after),
-            "schema_bytes_before": len(dumps(before).encode("utf-8")),
-            "schema_bytes_after": len(dumps(after).encode("utf-8")),
-            "authority_changed": False,
-        }
-        self.audit.record(
-            actor=pid,
-            action="process.tools.activate_group",
-            target=f"process:{pid}",
-            decision=result,
-        )
-        return result
+        missing = [name for name in _SKILL_TOOL_BOOTSTRAP if name not in allowed]
+        if missing:
+            raise ValidationError(
+                "image metadata tool_projection='skills' requires all bootstrap "
+                f"tools; missing: {', '.join(missing)}"
+            )
+        return list(_SKILL_TOOL_BOOTSTRAP)
 
     def configure_model_tool_projection(
         self,
@@ -1008,6 +889,21 @@ class ToolBroker:
 
     def normalize_model_action(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
         name = str(action.get("action") or "").strip()
+        if name in {"read_process_messages", "receive_process_messages"}:
+            action, normalized_fields = self._normalize_process_message_model_action(
+                action
+            )
+            if normalized_fields:
+                self.audit.record(
+                    actor=pid,
+                    action="llm.process_message_arguments_normalized",
+                    target=name,
+                    decision={
+                        "tool": name,
+                        "normalized_fields": normalized_fields,
+                        "normalization": "reversible_json_string_encoding",
+                    },
+                )
         if name == JIT_MULTIPLEXER_TOOL_NAME:
             if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
                 raise ValueError(f"{JIT_MULTIPLEXER_TOOL_NAME} is not available for this image")
@@ -1019,6 +915,54 @@ class ToolBroker:
             args = {key: value for key, value in action.items() if key != "action"}
             self.execution.validate_jit_arguments(handle, args)
         return action
+
+    @staticmethod
+    def _normalize_process_message_model_action(
+        action: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Undo reversible JSON stringification from non-conforming providers."""
+
+        normalized = dict(action)
+        changed: list[str] = []
+        nullable_fields = {
+            "kind",
+            "sender",
+            "channel",
+            "correlation_id",
+            "reply_to",
+        }
+        for field in nullable_fields:
+            value = normalized.get(field)
+            if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
+                normalized[field] = None
+                changed.append(field)
+        message_ids = normalized.get("message_ids")
+        if isinstance(message_ids, str):
+            stripped = message_ids.strip()
+            if stripped.lower() in {"none", "null"}:
+                normalized["message_ids"] = None
+                changed.append("message_ids")
+            else:
+                try:
+                    decoded_ids = json.loads(stripped)
+                except (TypeError, ValueError):
+                    decoded_ids = None
+                if (
+                    isinstance(decoded_ids, list)
+                    and all(isinstance(item, str) for item in decoded_ids)
+                ):
+                    normalized["message_ids"] = decoded_ids
+                    changed.append("message_ids")
+        limit = normalized.get("limit")
+        if isinstance(limit, str) and limit.strip().isdigit():
+            normalized["limit"] = int(limit.strip())
+            changed.append("limit")
+        for field in ("include_acked", "ack", "block"):
+            value = normalized.get(field)
+            if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+                normalized[field] = value.strip().lower() == "true"
+                changed.append(field)
+        return normalized, sorted(changed)
 
     def _normalize_multiplexed_jit_action(self, pid: str, action: dict[str, Any]) -> dict[str, Any]:
         tool_name = str(action.get("tool_name") or "").strip()

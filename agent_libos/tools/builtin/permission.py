@@ -16,9 +16,11 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class RequestPermissionArgs(BaseModel):
-    resource: str = Field(description="Capability resource to request, such as filesystem:workspace:path.txt.")
-    rights: list[str] = Field(description="Capability rights to request, such as ['write'].")
-    reason: str = Field(description="Brief reason shown to the human.")
+    resource: str = Field(
+        description="Exact canonical capability resource to authorize, such as filesystem:workspace:path.txt."
+    )
+    rights: list[str] = Field(description="Smallest required capability rights, such as ['read'] or ['write'].")
+    reason: str = Field(description="Brief task-specific reason shown with the proposed policy change.")
     human: str = Field(default=_RUNTIME_DEFAULTS.default_human, description="Human recipient name.")
 
 
@@ -32,8 +34,9 @@ class RequestPermissionOutput(BaseModel):
 class RequestPermissionTool(SyncAgentTool[RequestPermissionArgs]):
     name = "request_permission"
     description = (
-        "Ask the human to set a permission policy for a libOS capability resource. "
-        "The human can always allow, always deny, or require per-use approval."
+        "Ask the human to set capability policy for one exact libOS resource and a minimal set of rights. "
+        "Use this only to change authority, not for a general question or confirmation; the human can allow, deny, "
+        "or require per-use approval, and the underlying primitive still enforces the resulting policy."
     )
     args_schema = RequestPermissionArgs
     output_schema = RequestPermissionOutput

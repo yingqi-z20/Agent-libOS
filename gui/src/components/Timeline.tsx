@@ -6,7 +6,7 @@ import { CollapsibleJson } from "./CollapsibleJson";
 import { isHumanOutput } from "../userConversation";
 
 export type TimelineItemKind = "message" | "human" | "llm" | "event" | "audit";
-export type TimelineFilter = "all" | TimelineItemKind;
+export type TimelineFilter = "activity" | "all" | TimelineItemKind;
 
 export type TimelineItem =
   | { kind: "message"; time: string; item: ProcessMessage }
@@ -16,8 +16,9 @@ export type TimelineItem =
   | { kind: "audit"; time: string; item: AuditRecord };
 
 const timelineItemKinds = ["message", "human", "llm", "event", "audit"] as const satisfies readonly TimelineItemKind[];
-const timelineFilters = ["all", ...timelineItemKinds] as const satisfies readonly TimelineFilter[];
+const timelineFilters = ["activity", "all", ...timelineItemKinds] as const satisfies readonly TimelineFilter[];
 const timelineFilterLabels: Record<TimelineFilter, TranslationKey> = {
+  activity: "timeline.filter.activity",
   all: "timeline.filter.all",
   message: "timeline.filter.message",
   human: "timeline.filter.human",
@@ -44,7 +45,7 @@ export function Timeline({
   onExplainEvidence?(kind: string, id: string): void;
 }) {
   const { formatTime, t } = useI18n();
-  const [filter, setFilter] = useState<TimelineFilter>("all");
+  const [filter, setFilter] = useState<TimelineFilter>("activity");
   const items = useMemo(
     () => pid ? buildTimelineItems({ pid, messages, humanRequests, llmCalls, events, audit }) : [],
     [audit, events, humanRequests, llmCalls, messages, pid]
@@ -59,7 +60,11 @@ export function Timeline({
     <section className="timeline" aria-label={t("timeline.label")}>
       <div className="timelineFilter" role="group" aria-label={t("timeline.filterLabel")}>
         {timelineFilters.map((option) => {
-          const count = option === "all" ? items.length : counts[option];
+          const count = option === "all"
+            ? items.length
+            : option === "activity"
+              ? counts.message + counts.human + counts.llm
+              : counts[option];
           const active = filter === option;
           return (
             <button
@@ -153,7 +158,9 @@ export function countTimelineItemsByKind(items: TimelineItem[]): Record<Timeline
 }
 
 export function filterTimelineItems(items: TimelineItem[], filter: TimelineFilter): TimelineItem[] {
-  return filter === "all" ? items : items.filter((item) => item.kind === filter);
+  if (filter === "all") return items;
+  if (filter === "activity") return items.filter((item) => item.kind === "message" || item.kind === "human" || item.kind === "llm");
+  return items.filter((item) => item.kind === filter);
 }
 
 function timelineFilterLabel(filter: TimelineFilter): TranslationKey {

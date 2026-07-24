@@ -1073,7 +1073,7 @@ def test_provider_approval_revalidates_registry_binding_before_first_dispatch(
             monkeypatch.setattr(
                 runtime.mcp,
                 "_require_runtime_environment",
-                lambda _spec: _run_joined_registry_mutation(mutate_registry),
+                lambda _spec, **_kwargs: _run_joined_registry_mutation(mutate_registry),
             )
             monkeypatch.setattr(
                 runtime.mcp,
