@@ -66,8 +66,11 @@ failure; it does not claim completion.
 
 Known differences from upstream mini-swe-agent remain:
 
-- Agent libOS supplies the task through its existing process goal/Object Memory
-  context, not mini-swe-agent's exact `instance_template` user message.
+- Agent libOS sends the process goal directly as the first user message. A
+  string is unchanged and a structured goal is canonical JSON; the Runtime
+  does not wrap it in Object Memory or an `instance_template`.
+- Later turns use the upstream-shaped native assistant/tool transcript, while
+  its durable ledger and all authority enforcement remain Runtime-owned.
 - The local shell is mediated by Agent libOS providers, policies, resource
   budgets, cwd checks, and environment allowlists.
 - The package targets the OpenAI tool-call `mini.yaml` interface, not the

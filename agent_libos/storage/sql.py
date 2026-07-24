@@ -15,7 +15,7 @@ from agent_libos.evidence.payload_retention import (
     PayloadRetentionPage,
     PayloadRetentionTier,
     external_effect_payload_retention_tier,
-    llm_call_payload_can_be_provider_chain_head,
+    llm_call_payload_requires_latest_guard,
     llm_call_payload_retention_tier,
     validate_external_effect_payload_retention_update,
     validate_llm_call_payload_retention_update,
@@ -10157,9 +10157,6 @@ class SQLRuntimeStore:
                    CASE
                      WHEN source.pid IS NOT NULL
                       AND source.status = 'ok'
-                      AND source.api = 'responses'
-                      AND source.response_id IS NOT NULL
-                      AND source.response_id <> ''
                       AND NOT EXISTS (
                        SELECT 1
                          FROM llm_calls AS newer
@@ -10301,7 +10298,7 @@ class SQLRuntimeStore:
                     dumps(current.observability),
                     current.error,
                     current.error,
-                    int(llm_call_payload_can_be_provider_chain_head(current)),
+                    int(llm_call_payload_requires_latest_guard(current)),
                 ),
             )
             return updated.rowcount == 1

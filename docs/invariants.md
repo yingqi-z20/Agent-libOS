@@ -571,6 +571,17 @@ longer defines.
   derived handles. Terminal/cancel reconciliation must not leave active pins
   behind, and owner-watch resumes only replay tools with explicitly safe
   message-receive semantics.
+- `image-only-transcript-is-transparent-and-flow-guarded`: `image_only` sends
+  the exact Image system prompt, the raw or canonical-JSON process goal, and
+  only the cumulative native assistant/tool transcript. Runtime Object Memory,
+  Skill, Capability, fallback, repair, and explanatory prompt text cannot enter
+  the durable conversation. Call ids and model-facing result projections remain
+  paired across parallel stops, waits, and reopen; Image/goal/prompt changes
+  start a new anchor. The active full-I/O head is retention-protected and a
+  configuration that cannot preserve it fails before provider dispatch.
+  Trusted historical labels and goal/result Object references remain outside
+  the model transcript for IFC approval and audit, so sensitive tool output
+  still denies an uncleared later LLM egress.
 - `llm-call-records-opt-out-are-bounded-and-redacted`: when
   `llm.persist_full_io` is false, new LLM call rows store canonical content-free
   summary envelopes containing only schema version, tier, byte count, hash, and

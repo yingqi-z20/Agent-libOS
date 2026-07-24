@@ -758,6 +758,19 @@ def test_live_responses_chain_and_process_exit_fallback_are_runtime_dependencies
         _llm_call("call-ordinary", tool_calls=[]),
         pid="pid-ordinary",
     )
+    transparent_head = replace(
+        _llm_call(
+            "call-transparent-head",
+            tool_calls=[],
+            request_options={
+                "image_only_transcript": {
+                    "schema_version": 1,
+                    "output_key": "call-transparent-head",
+                }
+            },
+        ),
+        pid="pid-transparent-head",
+    )
     truncated_legacy = replace(
         _llm_call("call-truncated-legacy", tool_calls=[]),
         tool_calls={
@@ -771,6 +784,11 @@ def test_live_responses_chain_and_process_exit_fallback_are_runtime_dependencies
     assert llm_call_payload_is_runtime_dependency(live_chain)
     assert llm_call_payload_is_runtime_dependency(exit_fallback)
     assert llm_call_payload_is_runtime_dependency(truncated_legacy)
+    assert llm_call_payload_is_runtime_dependency(transparent_head)
+    assert not llm_call_payload_is_runtime_dependency(
+        transparent_head,
+        provider_chain_head=False,
+    )
     assert not llm_call_payload_is_runtime_dependency(ordinary)
     assert not llm_call_payload_is_runtime_dependency(
         replace(live_chain, call_id="call-pidless-chain", pid=None)
@@ -782,7 +800,9 @@ def test_live_responses_chain_and_process_exit_fallback_are_runtime_dependencies
     with pytest.raises(ValueError, match="runtime-dependent"):
         retain_llm_call_payload(live_chain, PayloadRetentionTier.SUMMARY)
 
-    store = _Store(llm_calls=[live_chain, exit_fallback, ordinary])
+    store = _Store(
+        llm_calls=[live_chain, exit_fallback, transparent_head, ordinary]
+    )
     audit = _Audit()
     result = PayloadRetentionMaintenance(store, audit, _policy()).run(
         PayloadRetentionRequest(
@@ -792,10 +812,11 @@ def test_live_responses_chain_and_process_exit_fallback_are_runtime_dependencies
         now=_NOW,
     )
 
-    assert result.protected_runtime_dependency == 2
+    assert result.protected_runtime_dependency == 3
     assert result.updated == 1
     assert store.llm_calls[live_chain.call_id] == live_chain
     assert store.llm_calls[exit_fallback.call_id] == exit_fallback
+    assert store.llm_calls[transparent_head.call_id] == transparent_head
     assert llm_call_payload_retention_tier(
         store.llm_calls[ordinary.call_id]
     ) is PayloadRetentionTier.SUMMARY

@@ -55,6 +55,10 @@ def tool_result_payloads(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def last_tool_result(messages: list[dict[str, Any]], tool_name: str) -> dict[str, Any] | None:
+    native_result = _native_tool_result(messages, tool_name)
+    if native_result is not None:
+        return native_result
+
     delta_results = _delta_tool_result_payloads(messages)
     for payload in reversed(delta_results):
         if payload.get("tool_name") == tool_name and isinstance(payload.get("result"), dict):
@@ -76,14 +80,33 @@ def last_tool_result(messages: list[dict[str, Any]], tool_name: str) -> dict[str
         ):
             return payload["result"]
 
-    # Minimal image-only prompts intentionally omit event metadata. Object
-    # selection may be recency-first, but rendering preserves the stable
-    # MemoryView root order so successive prompts retain a cacheable prefix.
-    # Select from the end to recover the most recently appended matching
-    # result rather than replaying the oldest answer on every turn.
+    # Runtime-owned prompt modes can omit event metadata. Object selection may
+    # be recency-first, but rendering preserves stable MemoryView root order.
+    # Select from the end instead of replaying an older matching result.
     for _oid, payload in reversed(source_objects):
         if payload.get("tool_name") == tool_name and isinstance(payload.get("result"), dict):
             return payload["result"]
+    return None
+
+
+def _native_tool_result(
+    messages: list[dict[str, Any]],
+    tool_name: str,
+) -> dict[str, Any] | None:
+    for message in reversed(messages):
+        if message.get("role") != "tool" or message.get("name") != tool_name:
+            continue
+        content = message.get("content")
+        if isinstance(content, dict):
+            return content
+        if not isinstance(content, str):
+            continue
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
     return None
 
 

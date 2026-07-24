@@ -211,6 +211,59 @@ def test_postgres_llm_retention_cas_rejects_concurrent_payload_change(
 
 
 @pytest.mark.parametrize("backend", STORE_BACKENDS)
+def test_image_only_retention_protects_only_the_active_transcript_head(
+    backend: str,
+) -> None:
+    with _retention_store(backend) as store:
+        marker = {
+            "image_only_transcript": {
+                "schema_version": 1,
+                "output_key": "transcript-output",
+            }
+        }
+        older = replace(
+            _llm_call("transparent-older", "2026-01-01T00:00:00+00:00"),
+            purpose="action_selection",
+            request_options=marker,
+        )
+        head = replace(
+            _llm_call("transparent-head", "2026-01-01T00:00:01+00:00"),
+            purpose="action_selection",
+            request_options=marker,
+        )
+        store.insert_llm_call(older)
+        store.insert_llm_call(head)
+
+        page = store.scan_llm_call_payloads_for_retention(
+            older_than="2026-02-01T00:00:00+00:00",
+            after=None,
+            limit=10,
+        )
+
+        assert page.latest_llm_call_ids == frozenset({head.call_id})
+        older_summary = retain_llm_call_payload(
+            older,
+            PayloadRetentionTier.SUMMARY,
+            provider_chain_head=False,
+        )
+        assert store.update_llm_call_payload_retention(
+            older_summary,
+            expected_payload_sha256=llm_call_payload_sha256(older),
+            expected_tier=PayloadRetentionTier.FULL,
+        )
+        head_summary = retain_llm_call_payload(
+            head,
+            PayloadRetentionTier.SUMMARY,
+            provider_chain_head=False,
+        )
+        assert not store.update_llm_call_payload_retention(
+            head_summary,
+            expected_payload_sha256=llm_call_payload_sha256(head),
+            expected_tier=PayloadRetentionTier.FULL,
+        )
+
+
+@pytest.mark.parametrize("backend", STORE_BACKENDS)
 def test_payload_retention_store_is_paged_monotonic_and_cas_protected(
     backend: str,
 ) -> None:

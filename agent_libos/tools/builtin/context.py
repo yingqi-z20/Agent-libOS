@@ -581,15 +581,22 @@ def restore_pending_compaction_child_goal(
         immutable=False,
         name=f"context_compaction_stage:{child_pid}",
     )
-    child.goal_oid = handle.oid
-    child.memory_view = memory.create_view(child_pid, [handle])
-    child.updated_at = utc_now()
+    restored_view = memory.create_view(child_pid, [handle])
+    # Object creation grants the child a handle and therefore advances its
+    # process revision. Re-read after that publication instead of applying the
+    # restored goal with the stale pre-create revision.
+    current = processes.get_process(child_pid)
+    if current is None:
+        raise LibOSValidationError(
+            f"context compaction child disappeared during goal restore: {child_pid}"
+        )
+    updated_at = utc_now()
     processes.patch_process(
         child_pid,
         {
-            "goal_oid": child.goal_oid,
-            "memory_view": child.memory_view,
-            "updated_at": child.updated_at,
+            "goal_oid": handle.oid,
+            "memory_view": restored_view,
+            "updated_at": updated_at,
         },
-        expected_revision=child.revision,
+        expected_revision=current.revision,
     )

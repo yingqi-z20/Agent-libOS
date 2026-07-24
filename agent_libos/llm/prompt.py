@@ -118,7 +118,10 @@ def build_system_prompt(image: AgentImage) -> str:
     image_prompt = image.system_prompt.strip() if image.system_prompt else "General purpose process image."
     mode = _prompt_mode(image)
     if mode == PROMPT_MODE_IMAGE_ONLY:
-        return image.system_prompt.strip()
+        # ``image_only`` is an upstream-agent compatibility boundary.  Even
+        # whitespace is Image-owned protocol state and must not be normalized
+        # or supplemented by the runtime.
+        return image.system_prompt
     if mode == PROMPT_MODE_MINIMAL_RUNTIME:
         return "\n\n".join(
             [MINIMAL_RUNTIME_PROMPT, COMPLETION_CONTRACT, image_prompt]
@@ -148,21 +151,9 @@ def build_user_prompt(
 ) -> str:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
     if mode == PROMPT_MODE_IMAGE_ONLY:
-        # image_only keeps the image-owned system prompt and omits the generic
-        # Runtime envelope, but explicitly activated Skill instructions remain
-        # part of the process contract.  Preserve the historical exact-context
-        # behavior when no Skills are loaded.
-        parts: list[str] = []
-        if available_skills:
-            parts.append(_available_skill_section(available_skills))
-        if skills:
-            parts.append(_skill_section(skills))
-        if fallback_json_actions:
-            parts.append(_fallback_tool_section(tools))
-        parts.append(context.text.strip())
-        if requestable_capabilities:
-            parts.append(_requestable_capability_section(requestable_capabilities))
-        return "\n\n".join(part for part in parts if part.strip())
+        raise ValueError(
+            "image_only user messages are built from the process goal and durable native transcript"
+        )
     if context.policy_used == "llm_context_object":
         return "\n\n".join(
             part

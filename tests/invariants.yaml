@@ -1752,6 +1752,21 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "image-only-transcript-is-transparent-and-flow-guarded",
+      "title": "image_only sends only the exact Image prompt, original goal, and durable native tool transcript while preserving out-of-band flow controls.",
+      "lane": "security",
+      "node_ids": [
+        "tests/unit/test_llm_prompt_modes.py::TestLLMPromptModes::test_image_only_runtime_quantum_does_not_inject_runtime_user_instructions",
+        "tests/unit/test_llm_prompt_modes.py::TestLLMPromptModes::test_image_only_runtime_quantum_replays_native_tool_transcript",
+        "tests/unit/test_llm_prompt_modes.py::TestLLMPromptModes::test_image_only_transcript_survives_runtime_reopen",
+        "tests/unit/test_llm_prompt_modes.py::TestLLMPromptModes::test_image_only_fails_before_provider_when_full_io_is_disabled",
+        "tests/unit/test_llm_client.py::TestLLMClient::test_responses_action_request_preserves_native_function_transcript",
+        "tests/security/test_image_only_transcript.py::test_historical_sensitive_tool_output_denies_next_image_only_egress",
+        "tests/runtime/test_payload_retention_store_contract.py::test_image_only_retention_protects_only_the_active_transcript_head[sqlite]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "llm-call-records-opt-out-are-bounded-and-redacted",
       "title": "When llm.persist_full_io is false, LLM calls, pending releases, audits, events, and result Objects store content-free metadata and hashes rather than raw provider I/O, and unrecoverable releases fail closed.",
       "lane": "runtime",

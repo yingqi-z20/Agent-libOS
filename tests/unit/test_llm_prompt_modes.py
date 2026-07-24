@@ -29,6 +29,8 @@ from agent_libos.models import (
     PROMPT_MODE_LIBOS_DEFAULT,
     PROMPT_MODE_MINIMAL_RUNTIME,
     MaterializedContext,
+    ObjectMetadata,
+    ObjectType,
 )
 from agent_libos.models.exceptions import ValidationError
 from tests.support.skills import write_skill_package
@@ -160,13 +162,13 @@ class TestLLMPromptModes:
         image = AgentImage(
             image_id="mini-compatible:v0",
             name="mini-compatible",
-            system_prompt="Use only the bash tool.",
+            system_prompt="  Use only the bash tool.\n",
             prompt_mode=PROMPT_MODE_IMAGE_ONLY,
         )
 
         prompt = build_system_prompt(image)
 
-        assert prompt == "Use only the bash tool."
+        assert prompt == "  Use only the bash tool.\n"
         assert "Agent libOS" not in prompt
         assert "fallback JSON action" not in prompt
 
@@ -236,7 +238,9 @@ class TestLLMPromptModes:
             assert client.system_prompts == ["Use only model-supplied tool schemas."]
             assert len(client.user_prompts) == 1
             user_prompt = client.user_prompts[0]
-            assert "fix the repository" in user_prompt
+            assert user_prompt == "fix the repository"
+            assert "object_memory_object" not in user_prompt
+            assert "content_trust" not in user_prompt
             assert "Available tools:" not in user_prompt
             assert "input_schema" not in user_prompt
             assert "output_schema" not in user_prompt
@@ -244,6 +248,498 @@ class TestLLMPromptModes:
             assert "Capabilities:" not in user_prompt
             assert "Choose the next single runtime action" not in user_prompt
             assert "Cumulative completion contract:" not in user_prompt
+        finally:
+            runtime.close()
+
+    def test_image_only_runtime_quantum_replays_native_tool_transcript(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-transcript:v0",
+                    name="transparent-transcript",
+                    system_prompt="Exact upstream agent prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["echo", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = TranscriptRecordingClient()
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-transcript:v0",
+                goal="perform one upstream tool turn",
+            )
+
+            first = runtime.run_process_once(pid)
+            second = runtime.run_process_once(pid)
+
+            assert first["action"]["action"] == "echo"
+            assert second["action"]["action"] == "process_exit"
+            assert client.message_batches[0] == [
+                {"role": "system", "content": "Exact upstream agent prompt."},
+                {"role": "user", "content": "perform one upstream tool turn"},
+            ]
+            replay = client.message_batches[1]
+            assert [message["role"] for message in replay] == [
+                "system",
+                "user",
+                "assistant",
+                "tool",
+            ]
+            assert replay[2]["tool_calls"] == [
+                {
+                    "id": "transparent_echo",
+                    "type": "function",
+                    "function": {
+                        "name": "echo",
+                        "arguments": '{"value": "upstream-result"}',
+                    },
+                }
+            ]
+            assert replay[3]["tool_call_id"] == "transparent_echo"
+            assert replay[3]["name"] == "echo"
+            assert "upstream-result" in replay[3]["content"]
+            serialized = json.dumps(replay, sort_keys=True)
+            assert "object_memory_object" not in serialized
+            assert "content_trust" not in serialized
+            assert "Agent libOS" not in serialized
+        finally:
+            runtime.close()
+
+    def test_image_only_fails_before_provider_when_full_io_is_disabled(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, persist_full_io=False),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-no-retention:v0",
+                    name="transparent-no-retention",
+                    system_prompt="Exact upstream agent prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = TranscriptRecordingClient()
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-no-retention:v0",
+                goal="must not reach the provider",
+            )
+
+            result = runtime.run_process_once(pid)
+
+            assert not result["ok"]
+            assert result["reason"] == "image_only_full_io_required"
+            assert client.message_batches == []
+            assert any(
+                record.action == "llm.action_failed"
+                and record.decision.get("reason") == "image_only_full_io_required"
+                for record in runtime.audit.trace(actor=pid)
+            )
+        finally:
+            runtime.close()
+
+    def test_image_only_structured_goal_uses_canonical_json(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-structured-goal:v0",
+                    name="transparent-structured-goal",
+                    system_prompt="Exact structured-goal prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptClient(
+                [[_tool_call("structured_exit", "process_exit", {"payload": {"done": True}})]]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-structured-goal:v0",
+                goal={"zeta": [2, 1], "alpha": {"done": False}},
+            )
+
+            result = runtime.run_process_once(pid)
+
+            assert result["ok"], result
+            assert client.message_batches[0][1] == {
+                "role": "user",
+                "content": '{"alpha": {"done": false}, "zeta": [2, 1]}',
+            }
+        finally:
+            runtime.close()
+
+    def test_image_only_transcript_survives_runtime_reopen(self, tmp_path: Any) -> None:
+        database = tmp_path / "transparent-transcript.sqlite"
+        runtime = Runtime.open(database)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-reopen:v0",
+                    name="transparent-reopen",
+                    system_prompt="Exact reopen prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["echo", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            runtime.llm.client = ScriptedTranscriptClient(
+                [[_tool_call("reopen_echo", "echo", {"value": "persisted"})]]
+            )
+            pid = runtime.process.spawn(
+                image="transparent-reopen:v0",
+                goal="continue after reopening",
+            )
+
+            first = runtime.run_process_once(pid)
+
+            assert first["ok"], first
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            client = ScriptedTranscriptClient(
+                [[_tool_call("reopen_exit", "process_exit", {"payload": {"done": True}})]]
+            )
+            reopened.llm.client = client
+
+            second = reopened.run_process_once(pid)
+
+            assert second["ok"], second
+            replay = client.message_batches[0]
+            assert [message["role"] for message in replay] == [
+                "system",
+                "user",
+                "assistant",
+                "tool",
+            ]
+            assert replay[1]["content"] == "continue after reopening"
+            assert replay[2]["tool_calls"][0]["id"] == "reopen_echo"
+            assert replay[3]["tool_call_id"] == "reopen_echo"
+            assert "persisted" in replay[3]["content"]
+            assert "result_oid" not in replay[3]["content"]
+            assert "tool_id" not in replay[3]["content"]
+        finally:
+            reopened.close()
+
+    def test_image_only_action_repair_is_not_retained_in_transcript(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-repair:v0",
+                    name="transparent-repair",
+                    system_prompt="Exact repair prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["echo", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptClient(
+                [
+                    [_tool_call("repair_bad", "not_a_visible_tool", {})],
+                    [_tool_call("repair_echo", "echo", {"value": "repaired"})],
+                    [_tool_call("repair_exit", "process_exit", {"payload": {"done": True}})],
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-repair:v0",
+                goal="repair without transcript pollution",
+            )
+
+            first = runtime.run_process_once(pid)
+            second = runtime.run_process_once(pid)
+
+            assert first["ok"] and second["ok"]
+            assert "could not be dispatched" in client.message_batches[1][-1]["content"]
+            replay = client.message_batches[2]
+            assert [message["role"] for message in replay] == [
+                "system",
+                "user",
+                "assistant",
+                "tool",
+            ]
+            assert all(
+                "could not be dispatched" not in str(message.get("content", ""))
+                for message in replay
+            )
+            assert replay[2]["tool_calls"][0]["id"] == "repair_echo"
+        finally:
+            runtime.close()
+
+    def test_image_only_wait_resume_completes_the_native_tool_pair(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-wait:v0",
+                    name="transparent-wait",
+                    system_prompt="Exact wait prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["receive_process_messages", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptClient(
+                [
+                    [_tool_call("wait_receive", "receive_process_messages", {})],
+                    [_tool_call("wait_exit", "process_exit", {"payload": {"done": True}})],
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-wait:v0",
+                goal="wait for one message",
+            )
+
+            waiting = runtime.run_process_once(pid)
+            runtime.messages.post(
+                sender="human:test",
+                recipient_pid=pid,
+                subject="resume transparent transcript",
+                payload={"ready": True},
+            )
+            resumed = runtime.run_process_once(pid)
+            completed = runtime.run_process_once(pid)
+
+            assert waiting["waiting_message"]
+            assert resumed["ok"] and resumed["resumed_after_message"]
+            assert completed["ok"]
+            assert len(client.message_batches) == 2
+            replay = client.message_batches[1]
+            assert [message["role"] for message in replay] == [
+                "system",
+                "user",
+                "assistant",
+                "tool",
+            ]
+            assert replay[2]["tool_calls"][0]["id"] == "wait_receive"
+            assert replay[3]["tool_call_id"] == "wait_receive"
+            assert "resume transparent transcript" in replay[3]["content"]
+        finally:
+            runtime.close()
+
+    def test_image_only_tool_failure_is_replayed_as_model_projection(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-tool-failure:v0",
+                    name="transparent-tool-failure",
+                    system_prompt="Exact failure prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["read_memory_object", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptClient(
+                [
+                    [_tool_call("missing_read", "read_memory_object", {"name": "missing"})],
+                    [_tool_call("failure_exit", "process_exit", {"payload": {"done": True}})],
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-tool-failure:v0",
+                goal="observe one tool failure",
+            )
+
+            failed_tool = runtime.run_process_once(pid)
+            completed = runtime.run_process_once(pid)
+
+            assert failed_tool["ok"] and not failed_tool["result"]["ok"]
+            assert completed["ok"]
+            tool_message = client.message_batches[1][-1]
+            assert tool_message["role"] == "tool"
+            assert tool_message["tool_call_id"] == "missing_read"
+            projection = json.loads(tool_message["content"])
+            assert projection["ok"] is False
+            assert "error" in projection
+            assert "result_oid" not in projection
+            assert "tool_id" not in projection
+        finally:
+            runtime.close()
+
+    def test_image_only_exec_starts_a_new_transcript_anchor(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            for image_id, prompt in (
+                ("transparent-before-exec:v0", "Before exec."),
+                ("transparent-after-exec:v0", "After exec."),
+            ):
+                runtime.register_image(
+                    AgentImage(
+                        image_id=image_id,
+                        name=image_id.split(":", 1)[0],
+                        system_prompt=prompt,
+                        prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                        default_tools=["echo", "process_exit"],
+                        context_policy="recency_first",
+                    ),
+                    actor="test",
+                )
+            client = ScriptedTranscriptClient(
+                [
+                    [_tool_call("before_exec_echo", "echo", {"value": "old"})],
+                    [_tool_call("after_exec_exit", "process_exit", {"payload": {"done": True}})],
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-before-exec:v0",
+                goal="old goal",
+            )
+            runtime.capability.grant(
+                pid,
+                "image:transparent-after-exec:v0",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+            first = runtime.run_process_once(pid)
+            runtime.exec_process(
+                pid,
+                "transparent-after-exec:v0",
+                goal="new goal",
+                preserve_memory=False,
+            )
+            second = runtime.run_process_once(pid)
+
+            assert first["ok"] and second["ok"]
+            assert client.message_batches[1] == [
+                {"role": "system", "content": "After exec."},
+                {"role": "user", "content": "new goal"},
+            ]
+        finally:
+            runtime.close()
+
+    def test_image_only_parallel_stop_persists_non_effect_cancellations(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-parallel:v0",
+                    name="transparent-parallel",
+                    system_prompt="Exact parallel prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit", "echo"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            runtime.llm.client = ScriptedTranscriptClient(
+                [[
+                    _tool_call("parallel_exit", "process_exit", {"payload": {"done": True}}),
+                    _tool_call("parallel_skipped", "echo", {"value": "must-not-run"}),
+                ]]
+            )
+            pid = runtime.process.spawn(
+                image="transparent-parallel:v0",
+                goal="stop a parallel batch",
+            )
+
+            result = runtime.run_process_once(pid)
+
+            assert result["ok"] and result["executed_count"] == 1
+            call = runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose="action_selection",
+            )
+            assert call is not None
+            marker = call.request_options["image_only_transcript"]
+            rows = runtime.store.list_llm_tool_outputs(
+                pid=pid,
+                response_id=marker["output_key"],
+            )
+            assert {row["call_id"] for row in rows} == {
+                "parallel_exit",
+                "parallel_skipped",
+            }
+            skipped = next(row for row in rows if row["call_id"] == "parallel_skipped")
+            envelope = json.loads(skipped["output_text"])
+            cancellation = json.loads(envelope["content"])
+            assert envelope["synthetic"] is True
+            assert cancellation == {
+                "cancelled": True,
+                "effect_started": False,
+                "ok": False,
+                "reason": "process_terminal",
+            }
+            assert not any(
+                record.action == "tool.call"
+                and record.decision.get("tool") == "echo"
+                for record in runtime.audit.trace(actor=pid)
+            )
+        finally:
+            runtime.close()
+
+    def test_image_only_historical_sensitive_tool_output_gates_next_egress(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-ifc:v0",
+                    name="transparent-ifc",
+                    system_prompt="Exact IFC prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["read_memory_object", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptClient(
+                [[_tool_call("classified_read", "read_memory_object", {"name": "classified"})]]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-ifc:v0",
+                goal="read classified data once",
+            )
+            runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {"secret": "TRANSCRIPT_SECRET_SENTINEL"},
+                metadata=ObjectMetadata(sensitivity="secret"),
+                name="classified",
+            )
+
+            first = runtime.run_process_once(pid)
+            second = runtime.run_process_once(pid)
+
+            assert first["ok"], first
+            assert not second["ok"]
+            assert "data-flow denied egress" in second["error"]
+            assert len(client.message_batches) == 1
+            result_oid = first["result"]["result_oid"]
+            request = [
+                record
+                for record in runtime.audit.trace(actor=pid)
+                if record.action == "llm.request"
+            ][-1]
+            assert runtime.process.get(pid).goal_oid in request.input_refs
+            assert result_oid in request.input_refs
+            decisions = runtime.store.list_data_flow_decisions(pid=pid, outcome="deny")
+            assert decisions[-1].labels.sensitivity.value == "secret"
         finally:
             runtime.close()
 
@@ -685,7 +1181,7 @@ class TestLLMPromptModes:
         finally:
             runtime.close()
 
-    def test_image_only_runtime_quantum_preserves_loaded_skill_instructions(
+    def test_image_only_runtime_quantum_does_not_project_loaded_skill_instructions(
         self,
         tmp_path: Any,
     ) -> None:
@@ -729,15 +1225,16 @@ class TestLLMPromptModes:
             result = runtime.run_next_process_once()
 
             assert result["ok"], result
-            assert "IMAGE_ONLY_SKILL_MARKER" in client.user_prompts[0]
-            assert "Loaded skills:" in client.user_prompts[0]
+            assert client.user_prompts[0] == "review the repository"
+            assert "IMAGE_ONLY_SKILL_MARKER" not in client.user_prompts[0]
+            assert "Loaded skills:" not in client.user_prompts[0]
             assert "Available tools:" not in client.user_prompts[0]
             assert "Capabilities:" not in client.user_prompts[0]
             assert "Choose the next single runtime action" not in client.user_prompts[0]
         finally:
             runtime.close()
 
-    def test_image_only_fallback_opt_in_keeps_exact_system_prompt(self) -> None:
+    def test_image_only_ignores_fallback_prompt_opt_in(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
             llm=replace(DEFAULT_CONFIG.llm, fallback_json_actions=True),
@@ -757,7 +1254,7 @@ class TestLLMPromptModes:
             )
             client = PromptRecordingClient()
             runtime.llm.client = client
-            runtime.process.spawn(
+            pid = runtime.process.spawn(
                 image="image-only-fallback:v0",
                 goal="finish through compatibility mode",
             )
@@ -766,10 +1263,13 @@ class TestLLMPromptModes:
 
             assert result["ok"], result
             assert client.system_prompts == ["Exact image-owned system prompt."]
-            assert client.user_prompts[0].startswith(
-                "Compatibility JSON action protocol"
+            assert client.user_prompts[0] == "finish through compatibility mode"
+            call = runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose="action_selection",
             )
-            assert "finish through compatibility mode" in client.user_prompts[0]
+            assert call is not None
+            assert call.request_options["fallback_json_actions_enabled"] is False
         finally:
             runtime.close()
 
@@ -894,6 +1394,87 @@ class PromptRecordingClient:
             ],
             raw=SimpleNamespace(id="prompt_mode_raw"),
             api="chat",
+            model="fake",
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        )
+
+
+class TranscriptRecordingClient:
+    def __init__(self) -> None:
+        self.message_batches: list[list[dict[str, Any]]] = []
+
+    def complete_action(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> LLMCompletion:
+        del tools
+        self.message_batches.append([dict(message) for message in messages])
+        if len(self.message_batches) == 1:
+            return LLMCompletion(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "transparent_echo",
+                        "name": "echo",
+                        "arguments": '{"value": "upstream-result"}',
+                    }
+                ],
+                raw=SimpleNamespace(id="transparent_chat_1"),
+                api="chat",
+                response_id="transparent_chat_1",
+                model="fake",
+                usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            )
+        return LLMCompletion(
+            content="",
+            tool_calls=[
+                {
+                    "id": "transparent_exit",
+                    "name": "process_exit",
+                    "arguments": '{"payload": {"done": true}}',
+                }
+            ],
+            raw=SimpleNamespace(id="transparent_chat_2"),
+            api="chat",
+            response_id="transparent_chat_2",
+            model="fake",
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        )
+
+
+def _tool_call(
+    call_id: str,
+    name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "name": name,
+        "arguments": json.dumps(arguments, sort_keys=True),
+    }
+
+
+class ScriptedTranscriptClient:
+    def __init__(self, tool_call_batches: list[list[dict[str, Any]]]) -> None:
+        self._tool_call_batches = [list(batch) for batch in tool_call_batches]
+        self.message_batches: list[list[dict[str, Any]]] = []
+
+    def complete_action(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> LLMCompletion:
+        del tools
+        self.message_batches.append(json.loads(json.dumps(messages)))
+        tool_calls = self._tool_call_batches.pop(0)
+        ordinal = len(self.message_batches)
+        return LLMCompletion(
+            content="",
+            tool_calls=tool_calls,
+            raw=SimpleNamespace(id=f"scripted_chat_{ordinal}"),
+            api="chat",
+            response_id=f"scripted_chat_{ordinal}",
             model="fake",
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         )

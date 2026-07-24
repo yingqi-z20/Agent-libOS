@@ -624,6 +624,13 @@ omission uses `tools.deno_timeout_s`, and the configured value may not exceed
 independent, potentially lower bound.
 
 `prompt_mode` is optional and defaults to `image_only` for custom packages.
+In that mode, the Image prompt is the exact system message, the original goal
+is the first user message, and later turns use a durable native tool-call
+transcript. The Runtime does not inject Object Memory, Skill, Capability,
+fallback-protocol, or explanatory prompt sections. String goals are preserved
+exactly and structured goals use canonical JSON. Lossless replay requires
+`llm.persist_full_io: true`; otherwise execution fails before the LLM provider.
+An Image using `image_only` cannot select prompt-mode context management.
 Use `minimal_runtime` for factual runtime state sections, or `libos_default`
 only when the image intentionally wants the native Agent libOS planner prompt.
 
@@ -642,7 +649,8 @@ in the host environment and are not packaged into the image.
 object arguments, and a literal prompt. Other planner keys remain
 image-defined and compatible. Automatic mode does not grant the named tool;
 include it in `default_tools` (or otherwise in the process's complete tool
-table) when the image intends it to run.
+table) when the image intends it to run. The `prompt` mode is invalid with
+`prompt_mode: image_only` because it would add Runtime-authored model input.
 
 `required_modules` is optional. Each entry must contain a `module_id` and the
 64-character lowercase `source_sha256` reported by

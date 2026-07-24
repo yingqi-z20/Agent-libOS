@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -1076,6 +1077,7 @@ def _messages_to_responses_parts(
 ) -> tuple[str | None, list[dict[str, Any]]]:
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
+    represented_call_ids: set[str] = set()
     for message in messages:
         role = str(message.get("role", "user"))
         content = _message_content_for_search(message)
@@ -1085,7 +1087,9 @@ def _messages_to_responses_parts(
             continue
         if role == "tool":
             call_id = message.get("tool_call_id") or message.get("call_id")
-            if call_id and native_tool_outputs:
+            if call_id and (
+                native_tool_outputs or str(call_id) in represented_call_ids
+            ):
                 input_items.append(
                     {
                         "type": "function_call_output",
@@ -1108,6 +1112,15 @@ def _messages_to_responses_parts(
                 }
             )
             continue
+        if role == "assistant":
+            assistant_items, assistant_call_ids = _responses_assistant_items(
+                message,
+                content,
+            )
+            input_items.extend(assistant_items)
+            represented_call_ids.update(assistant_call_ids)
+            if content or message.get("tool_calls"):
+                continue
         input_items.append(
             {
                 "role": "assistant" if role == "assistant" else "user",
@@ -1115,6 +1128,48 @@ def _messages_to_responses_parts(
             }
         )
     return ("\n\n".join(instructions) if instructions else None), input_items
+
+
+def _responses_assistant_items(
+    message: dict[str, Any],
+    content: str,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    items: list[dict[str, Any]] = []
+    call_ids: set[str] = set()
+    if content:
+        items.append({"role": "assistant", "content": content})
+    for tool_call in list(message.get("tool_calls") or []):
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function")
+        name = (
+            function.get("name")
+            if isinstance(function, dict)
+            else tool_call.get("name")
+        )
+        arguments = (
+            function.get("arguments", "{}")
+            if isinstance(function, dict)
+            else tool_call.get("arguments", "{}")
+        )
+        call_id = tool_call.get("id") or tool_call.get("call_id")
+        if not call_id or not name:
+            continue
+        selected_call_id = str(call_id)
+        call_ids.add(selected_call_id)
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": selected_call_id,
+                "name": str(name),
+                "arguments": (
+                    arguments
+                    if isinstance(arguments, str)
+                    else json.dumps(arguments, sort_keys=True)
+                ),
+            }
+        )
+    return items, call_ids
 
 
 def _plain_tool_output_context(message: dict[str, Any], content: str, *, max_chars: int) -> str:

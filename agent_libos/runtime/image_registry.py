@@ -1419,7 +1419,7 @@ class ImageRegistryPrimitive:
         if len(image.system_prompt) > self.config.image.prompt_max_chars:
             raise ValidationError(f"system_prompt exceeds prompt_max_chars={self.config.image.prompt_max_chars}")
         self._validate_mapping_size(image.planner, "planner")
-        context_management_policy(image.planner)
+        self._validate_context_management_policy(image)
         self._validate_mapping_size(image.action_schema, "action_schema")
         self._validate_mapping_size(image.metadata, "metadata")
         self._validate_mapping_size(image.boot, "boot")
@@ -1457,6 +1457,14 @@ class ImageRegistryPrimitive:
         self._validate_module_specs(image.required_modules)
         self._validate_boot(image.boot)
         self.tools.initial_tool_projection(image)
+
+    @staticmethod
+    def _validate_context_management_policy(image: AgentImage) -> None:
+        policy = context_management_policy(image.planner)
+        if image.prompt_mode == PROMPT_MODE_IMAGE_ONLY and policy.mode == "prompt":
+            raise ValidationError(
+                "image_only does not allow prompt-mode context management"
+            )
 
     def validate_image(
         self,

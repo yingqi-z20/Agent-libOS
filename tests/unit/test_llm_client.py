@@ -63,6 +63,74 @@ class TestLLMClient:
         assert completion.usage['total_tokens'] == 14
         assert completion.reasoning[0]['summary'][0]['text'] == 'choose write_text_file'
 
+    def test_responses_action_request_preserves_native_function_transcript(self) -> None:
+        response = SimpleNamespace(
+            id="resp_transcript_2",
+            model="gpt-test",
+            usage=SimpleNamespace(input_tokens=11, output_tokens=3, total_tokens=14),
+            output_text="",
+            output=[],
+        )
+        fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="responses")
+        client._async_client = fake
+
+        asyncio.run(
+            client.acomplete_action(
+                messages=[
+                    {"role": "system", "content": "exact system"},
+                    {"role": "user", "content": "call the tool"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_transcript_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": '{"value":"done"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_transcript_1",
+                        "name": "echo",
+                        "content": '{"value":"done"}',
+                    },
+                ],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "process_exit",
+                            "description": "Exit.",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            )
+        )
+
+        assert fake.responses.payloads[0]["instructions"] == "exact system"
+        assert "previous_response_id" not in fake.responses.payloads[0]
+        assert fake.responses.payloads[0]["input"] == [
+            {"role": "user", "content": "call the tool"},
+            {
+                "type": "function_call",
+                "call_id": "call_transcript_1",
+                "name": "echo",
+                "arguments": '{"value":"done"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_transcript_1",
+                "output": '{"value":"done"}',
+            },
+        ]
+
     def test_action_requests_send_configured_parallel_tool_calls(self) -> None:
         response = SimpleNamespace(id='resp_parallel', model='gpt-test', output_text='', output=[])
         fake = FakeAsyncOpenAI(responses=FakeResponses(response))

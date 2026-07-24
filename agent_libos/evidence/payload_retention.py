@@ -34,6 +34,8 @@ _LLM_PAYLOAD_FIELDS = (
     "raw_response",
     "error",
 )
+_IMAGE_ONLY_TRANSCRIPT_KEY = "image_only_transcript"
+_IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION = 1
 
 
 def _validate_retention_age(name: str, value: int | None) -> None:
@@ -85,11 +87,12 @@ _RecordT = TypeVar("_RecordT", LLMCallRecord, ExternalEffectRecord)
 class PayloadRetentionPage(Generic[_RecordT]):
     records: tuple[_RecordT, ...]
     next_cursor: PayloadRetentionCursor | None = None
-    # LLM scans identify every bounded candidate that could carry Responses
-    # continuation state and is the actual latest call for its (pid, purpose)
-    # chain. External-effect scans leave this as ``None``. Keeping the
-    # classification beside the page prevents an N+1 latest-call lookup in the
-    # maintenance service.
+    # LLM scans identify every bounded candidate that is the actual latest call
+    # for its (pid, purpose) chain. Runtime-dependency predicates then decide
+    # whether that head carries Responses continuation state, an image_only
+    # transcript, or no replay state at all. External-effect scans leave this
+    # as ``None``. Keeping the classification beside the page prevents an N+1
+    # latest-call lookup in the maintenance service.
     latest_llm_call_ids: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
@@ -1035,6 +1038,11 @@ def llm_call_payload_is_runtime_dependency(
 
     if provider_chain_head is not None and not isinstance(provider_chain_head, bool):
         raise ValueError("provider-chain head classification must be a boolean")
+    if llm_call_payload_can_be_image_only_transcript_head(record):
+        # Transparent replay is reconstructed from the latest complete call
+        # and its paired output rows. Older heads may follow ordinary staged
+        # retention after a newer complete head supersedes them.
+        return provider_chain_head is not False
     if llm_call_payload_can_be_provider_chain_head(record):
         # Standalone callers without a typed storage classification remain
         # fail-closed. Maintenance pages always pass the actual latest-call
@@ -1073,6 +1081,25 @@ def llm_call_payload_can_be_provider_chain_head(record: LLMCallRecord) -> bool:
         and record.api == "responses"
         and record.response_id
         and record.request_options.get("openai_provider_chain_eligible") is True
+    )
+
+
+def llm_call_payload_can_be_image_only_transcript_head(
+    record: LLMCallRecord,
+) -> bool:
+    marker = record.request_options.get(_IMAGE_ONLY_TRANSCRIPT_KEY)
+    return bool(
+        record.status == "ok"
+        and record.pid is not None
+        and isinstance(marker, dict)
+        and marker.get("schema_version") == _IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION
+    )
+
+
+def llm_call_payload_requires_latest_guard(record: LLMCallRecord) -> bool:
+    return bool(
+        llm_call_payload_can_be_provider_chain_head(record)
+        or llm_call_payload_can_be_image_only_transcript_head(record)
     )
 
 

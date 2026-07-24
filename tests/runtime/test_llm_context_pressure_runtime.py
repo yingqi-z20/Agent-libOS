@@ -34,7 +34,7 @@ from agent_libos.models import (
     ResourceBudget,
     ViewMode,
 )
-from agent_libos.models.exceptions import ProcessMessageWaitRequired
+from agent_libos.models.exceptions import ProcessMessageWaitRequired, ValidationError
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from tests.support.fakes import RecordingActionClient
@@ -255,6 +255,7 @@ def test_explicit_context_enrichment_authority_enables_delta_object() -> None:
         image_id="explicit-context-enrichment:v0",
         name="explicit-context-enrichment",
         default_tools=["get_current_time"],
+        prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
     )
     runtime = Runtime(SQLiteStore(":memory:"))
     runtime.register_image(image, actor="test")
@@ -1031,6 +1032,7 @@ def test_auto_attempt_marker_prevents_replay_after_interrupted_reopen(
         image = AgentImage(
             image_id="durable-attempt-context:v0",
             name="durable-attempt-context",
+            prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
             default_tools=["compact_process_context", "process_exit"],
         )
         runtime = Runtime.open(
@@ -1365,6 +1367,7 @@ def test_auto_context_approval_reopens_and_failure_continues_model_call(
         image = AgentImage(
             image_id="approval-context:v0",
             name="approval-context",
+            prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
             default_tools=["write_text_file", "process_exit"],
             planner={
                 "context_management": {
@@ -1503,10 +1506,9 @@ def test_pressure_episode_resets_after_occupancy_recovers(
     [
         PROMPT_MODE_LIBOS_DEFAULT,
         PROMPT_MODE_MINIMAL_RUNTIME,
-        PROMPT_MODE_IMAGE_ONLY,
     ],
 )
-def test_prompt_policy_applies_to_every_prompt_mode(
+def test_prompt_policy_applies_to_runtime_owned_prompt_modes(
     monkeypatch: pytest.MonkeyPatch,
     prompt_mode: str,
 ) -> None:
@@ -1541,12 +1543,33 @@ def test_prompt_policy_applies_to_every_prompt_mode(
         runtime.close()
 
 
+def test_image_only_rejects_prompt_context_management() -> None:
+    runtime = Runtime.open("local")
+    try:
+        with pytest.raises(
+            ValidationError,
+            match="image_only does not allow prompt-mode context management",
+        ):
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-no-runtime-prompt:v0",
+                    name="transparent-no-runtime-prompt",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    planner={"context_management": {"mode": "prompt"}},
+                ),
+                actor="test",
+            )
+    finally:
+        runtime.close()
+
+
 def test_prompt_policy_accounts_for_the_exact_notice_bearing_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     image = AgentImage(
         image_id="prompt-context-exact-accounting:v0",
         name="prompt-context-exact-accounting",
+        prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
         default_tools=["process_exit"],
         planner={
             "context_management": {
@@ -1609,6 +1632,7 @@ def test_prompt_policy_does_not_dispatch_when_notice_would_cross_context_window(
     image = AgentImage(
         image_id="prompt-context-overflow:v0",
         name="prompt-context-overflow",
+        prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
         default_tools=["process_exit"],
         planner={"context_management": {"mode": "prompt"}},
     )

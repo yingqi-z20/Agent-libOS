@@ -84,15 +84,39 @@ checkpoint-committed image restores the process's captured
 `loaded_skills.package_snapshot`, but does not replace the current global Skill
 or Image registry with historical nested metadata.
 
-`prompt_mode` controls prompt composition. `image_only` keeps the image prompt
-as the exact system prompt and omits the generic Runtime envelope. Its user
-prompt is exactly the materialized task context when no Skill is active; when
-the process has explicitly activated Skills, their loaded instructions precede
-that context without adding tool, capability, or generic action-protocol text.
-This is the default for custom images and image packages. `minimal_runtime`
-adds a short factual runtime note and state sections. `libos_default` preserves
-the native Agent libOS planner envelope and fallback JSON instructions used by
-the built-in images.
+`prompt_mode` controls prompt composition. `image_only` is a transparent
+upstream-agent boundary: the system message is byte-for-byte the Image prompt,
+and the first user message is the process goal (a string is unchanged; a
+structured goal is canonical JSON). Later quanta send the cumulative native
+`assistant(tool_calls) -> tool` transcript. Tool messages contain the bounded
+model projection, not the Runtime result envelope. Object Memory, Capability,
+Skill, fallback-action, pressure-notice, and Agent libOS explanatory text are
+never injected. This is the default for custom images and image packages.
+`minimal_runtime` adds a short factual runtime note and state sections.
+`libos_default` preserves the native Agent libOS planner envelope and optional
+fallback JSON instructions used by built-in images.
+
+The transparent transcript is reconstructed from the latest complete durable
+LLM call plus its call-id-paired tool outputs, including after Runtime reopen;
+the Responses API receives explicit historical `function_call` and
+`function_call_output` input items and does not rely on `previous_response_id`.
+Repair prompts are request-local. A stopped parallel batch records explicit
+non-effect cancellation outputs for calls that were not dispatched. An Image,
+goal, or exact system-prompt change starts a new transcript anchor. Because a
+lossless head is required to avoid replaying an external effect,
+`image_only` fails before provider dispatch when `llm.persist_full_io` is
+false. Payload retention protects the active head while allowing superseded
+heads to age normally. This is a breaking replacement of the former
+Object-Memory-snapshot behavior: existing Images selecting `image_only` adopt
+these semantics after upgrade; there is no legacy compatibility mode.
+
+Capability, approval, IFC, resource, audit, and guarded external-effect checks
+remain outside the prompt and apply normally. The transcript ledger retains
+trusted high-water labels and Object references for the goal and model-visible
+tool results, so a historical sensitive result still gates the next LLM egress
+and appears in audit `input_refs`. It does not add implicit same-argument
+deduplication; mutating operations remain hard-idempotent only where their
+protected-operation contract supplies an explicit idempotency key.
 
 The default `llm_context.policy` is `source_only`: context preparation returns
 the caller-selected Object Memory materialization unchanged. It records a
@@ -121,8 +145,9 @@ enabled for the process and the process independently holds
 pressure decision as not authorized and leaves the request unchanged: it does
 not inject a notice or dispatch a maintenance tool. `prompt` is an explicit
 Image policy that appends the image-owned literal reminder and numeric pressure
-facts in every prompt mode, including `image_only`; `disabled` records pressure
-but takes no action. For stateless requests,
+facts in Runtime-owned prompt modes. Image registration rejects that policy for
+`image_only`, where Runtime-authored notices would violate transparency.
+`disabled` records pressure but takes no action. For stateless requests,
 projected occupancy is the deterministic conservative estimate of the complete
 assembled input plus the profile's `max_tokens` output reservation. An eligible
 Responses chain additionally adds the provider-reported lower bound for retained

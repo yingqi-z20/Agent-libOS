@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent_libos.models import AgentImage, PROMPT_MODE_IMAGE_ONLY
+from agent_libos.models import AgentImage, PROMPT_MODE_MINIMAL_RUNTIME
 
 
 CONTEXT_COMPRESSOR_PROMPT = """
@@ -58,7 +58,7 @@ def build_context_compressor_image() -> AgentImage:
         name="context-compressor",
         version="v0",
         system_prompt=CONTEXT_COMPRESSOR_PROMPT,
-        prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+        prompt_mode=PROMPT_MODE_MINIMAL_RUNTIME,
         default_tools=["process_exit"],
         context_policy="recency_first",
         safety_profile="context-compressor",

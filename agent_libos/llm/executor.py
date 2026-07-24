@@ -79,6 +79,8 @@ from agent_libos.models import (
     MaterializedContext,
     ObjectHandle,
     ObjectRight,
+    ObjectType,
+    PROMPT_MODE_IMAGE_ONLY,
     ProcessMessageKind,
     ProcessStatus,
     ResourceUsage,
@@ -109,6 +111,9 @@ _HOST_AUTO_WAIT_METADATA = {
 }
 
 _FULL_SNAPSHOT_RESPONSE_CHAIN_DISABLED_REASON = "full_snapshot_executor_replay"
+_IMAGE_ONLY_TRANSCRIPT_KEY = "image_only_transcript"
+_IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION = 1
+_IMAGE_ONLY_TOOL_OUTPUT_SCHEMA_VERSION = 1
 
 
 class _LLMProviderChainScopeChanged(ProviderEffectNotStarted):
@@ -129,6 +134,10 @@ class _LLMReleaseApprovalRequired(HumanApprovalRequired):
 
 class _LLMReleasePayloadUnavailable(RuntimeError):
     """An opt-out release cannot be resumed after its in-memory payload is lost."""
+
+
+class _ImageOnlyFullIORequired(ValidationError):
+    """Transparent replay is impossible without the durable full-I/O ledger."""
 
 
 class _ContextManagementHandled(Exception):
@@ -322,6 +331,420 @@ class LLMProcessExecutor:
             )
         )
 
+    @staticmethod
+    def _image_only_transcript_anchor(image: Any, process: Any) -> dict[str, str]:
+        system_prompt = str(getattr(image, "system_prompt", "") or "")
+        return {
+            "image_id": str(image.image_id),
+            "goal_oid": str(process.goal_oid or ""),
+            "system_prompt_sha256": hashlib.sha256(
+                system_prompt.encode("utf-8")
+            ).hexdigest(),
+        }
+
+    @classmethod
+    def _image_only_marker_for_anchor(
+        cls,
+        call: LLMCallRecord,
+        anchor: Mapping[str, str],
+    ) -> dict[str, Any] | None:
+        marker = call.request_options.get(_IMAGE_ONLY_TRANSCRIPT_KEY)
+        if not isinstance(marker, dict):
+            return None
+        if marker.get("schema_version") != _IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION:
+            raise ValidationError("image_only transcript head has an unsupported schema")
+        for key, expected in anchor.items():
+            value = marker.get(key)
+            if not isinstance(value, str):
+                raise ValidationError(f"image_only transcript head is missing {key}")
+            if value != expected:
+                return None
+        return marker
+
+    def _image_only_goal_content(
+        self,
+        *,
+        process: Any,
+    ) -> str:
+        goal_oid = str(process.goal_oid or "")
+        if not goal_oid:
+            raise ValidationError(
+                "image_only cannot start a transcript without a process goal"
+            )
+        goal = self._objects.get_object(goal_oid)
+        if goal is None or goal.type != ObjectType.GOAL:
+            raise ValidationError("image_only process goal payload is unavailable")
+        payload = goal.payload
+        if (
+            isinstance(payload, dict)
+            and set(payload) == {"text"}
+            and isinstance(payload.get("text"), str)
+        ):
+            return payload["text"]
+        return dumps(to_jsonable(payload))
+
+    def _image_only_source_context(
+        self,
+        *,
+        pid: str,
+        oid: str | None,
+        materialized_oids: set[str],
+        retained_labels: Mapping[str, Any] | None = None,
+    ) -> DataFlowContext:
+        contexts: list[DataFlowContext] = []
+        if retained_labels is not None:
+            try:
+                contexts.append(
+                    DataFlowContext(labels=DataLabels.from_dict(retained_labels))
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    "image_only transcript contains invalid data-flow labels"
+                ) from exc
+        if oid and oid in materialized_oids:
+            contexts.append(
+                self._data_flow.context_from_source_oids(
+                    pid,
+                    [oid],
+                    include_current=False,
+                )
+            )
+        elif oid:
+            metadata = self._objects.get_persisted_object_metadata(oid)
+            if metadata is not None:
+                contexts.append(
+                    DataFlowContext(
+                        labels=DataLabels.from_object_metadata(metadata),
+                    )
+                )
+        return DataFlowContext.aggregate(contexts)
+
+    @staticmethod
+    def _decode_image_only_tool_output(value: Any) -> dict[str, Any]:
+        if not isinstance(value, str):
+            raise ValidationError("image_only transcript tool output is unavailable")
+        try:
+            envelope = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("image_only transcript tool output is corrupt") from exc
+        if (
+            not isinstance(envelope, dict)
+            or envelope.get("schema_version")
+            != _IMAGE_ONLY_TOOL_OUTPUT_SCHEMA_VERSION
+            or not isinstance(envelope.get("content"), str)
+            or type(envelope.get("synthetic")) is not bool
+            or type(envelope.get("ok")) is not bool
+            or not isinstance(envelope.get("labels"), dict)
+        ):
+            raise ValidationError("image_only transcript tool output has an invalid shape")
+        result_oid = envelope.get("result_oid")
+        if result_oid is not None and (not isinstance(result_oid, str) or not result_oid):
+            raise ValidationError("image_only transcript tool output has an invalid result_oid")
+        return envelope
+
+    def _latest_image_only_transcript(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        anchor: Mapping[str, str],
+    ) -> tuple[LLMCallRecord | None, dict[str, Any] | None]:
+        latest = self._processes.get_latest_llm_call(
+            pid=pid,
+            purpose="action_selection",
+        )
+        if latest is None:
+            return None, None
+        marker = self._image_only_marker_for_anchor(latest, anchor)
+        if marker is not None or latest.image_id != image.image_id:
+            return latest, marker
+        if latest.request_options.get(_IMAGE_ONLY_TRANSCRIPT_KEY) is None:
+            raise ValidationError(
+                "image_only legacy prompt history cannot be resumed transparently"
+            )
+        return latest, None
+
+    def _new_image_only_transcript(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        process: Any,
+        context: MaterializedContext,
+    ) -> tuple[list[dict[str, Any]], DataFlowContext, list[str]]:
+        goal_oid = str(process.goal_oid or "") or None
+        goal_content = self._image_only_goal_content(
+            process=process,
+        )
+        goal_flow = self._image_only_source_context(
+            pid=pid,
+            oid=goal_oid,
+            materialized_oids=set(context.object_refs),
+        )
+        return (
+            [
+                {"role": "system", "content": build_system_prompt(image)},
+                {"role": "user", "content": goal_content},
+            ],
+            goal_flow,
+            [goal_oid] if goal_oid else [],
+        )
+
+    @staticmethod
+    def _image_only_replay_tool_call(
+        *,
+        ordinal: int,
+        item: Any,
+        tool_call: Any,
+        seen_call_ids: set[str],
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        if not isinstance(item, dict) or not isinstance(tool_call, dict):
+            raise ValidationError("image_only transcript contains an invalid tool call")
+        call_id = str(item.get("call_id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        stored_call_id = str(
+            tool_call.get("call_id") or tool_call.get("id") or ""
+        ).strip()
+        if item.get("ordinal") != ordinal:
+            raise ValidationError("image_only transcript tool-call manifest is invalid")
+        if not call_id or call_id in seen_call_ids or not name:
+            raise ValidationError("image_only transcript tool-call manifest is invalid")
+        if stored_call_id != call_id:
+            raise ValidationError("image_only transcript tool-call manifest is invalid")
+        if str(tool_call.get("name") or "").strip() != name:
+            raise ValidationError("image_only transcript tool-call manifest is invalid")
+        seen_call_ids.add(call_id)
+        arguments = tool_call.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            arguments = dumps(to_jsonable(arguments))
+        return (
+            {"call_id": call_id, "name": name},
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            },
+        )
+
+    def _image_only_replay_manifest(
+        self,
+        latest: LLMCallRecord,
+        marker: Mapping[str, Any],
+    ) -> tuple[list[dict[str, str]], list[dict[str, Any]], set[str]]:
+        raw_manifest = marker.get("tool_calls")
+        stored_calls = latest.tool_calls
+        if not isinstance(raw_manifest, list) or not isinstance(stored_calls, list):
+            raise ValidationError("image_only transcript tool-call manifest is unavailable")
+        if len(raw_manifest) != len(stored_calls):
+            raise ValidationError(
+                "image_only transcript tool-call manifest disagrees with the response"
+            )
+        manifest: list[dict[str, str]] = []
+        assistant_calls: list[dict[str, Any]] = []
+        seen_call_ids: set[str] = set()
+        for ordinal, (item, tool_call) in enumerate(zip(raw_manifest, stored_calls)):
+            manifest_item, assistant_call = self._image_only_replay_tool_call(
+                ordinal=ordinal,
+                item=item,
+                tool_call=tool_call,
+                seen_call_ids=seen_call_ids,
+            )
+            manifest.append(manifest_item)
+            assistant_calls.append(assistant_call)
+        return manifest, assistant_calls, seen_call_ids
+
+    @staticmethod
+    def _image_only_canonical_messages(
+        image: Any,
+        latest: LLMCallRecord,
+        marker: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        if latest.status != "ok" or not isinstance(latest.messages, list):
+            raise ValidationError("image_only transcript head is incomplete")
+        canonical_count = marker.get("canonical_message_count")
+        if type(canonical_count) is not int:
+            raise ValidationError("image_only transcript head has an invalid message boundary")
+        if canonical_count < 2 or canonical_count > len(latest.messages):
+            raise ValidationError("image_only transcript head has an invalid message boundary")
+        selected = latest.messages[:canonical_count]
+        if any(not isinstance(message, dict) for message in selected):
+            raise ValidationError("image_only transcript head contains an invalid message")
+        messages = [dict(message) for message in selected]
+        expected_system = {"role": "system", "content": build_system_prompt(image)}
+        if messages[0] != expected_system:
+            raise ValidationError("image_only transcript system prompt changed unexpectedly")
+        goal_message = messages[1]
+        if goal_message.get("role") != "user":
+            raise ValidationError("image_only transcript goal message is invalid")
+        if not isinstance(goal_message.get("content"), str):
+            raise ValidationError("image_only transcript goal message is invalid")
+        return messages
+
+    @staticmethod
+    def _append_image_only_assistant_message(
+        messages: list[dict[str, Any]],
+        latest: LLMCallRecord,
+        assistant_calls: list[dict[str, Any]],
+    ) -> None:
+        response_content = latest.response_content
+        if not isinstance(response_content, str):
+            raise ValidationError("image_only transcript assistant content is unavailable")
+        if assistant_calls:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": response_content,
+                    "tool_calls": assistant_calls,
+                }
+            )
+        elif response_content:
+            messages.append({"role": "assistant", "content": response_content})
+
+    def _image_only_replay_sources(
+        self,
+        *,
+        pid: str,
+        goal_oid: str | None,
+        materialized_oids: set[str],
+        marker: Mapping[str, Any],
+    ) -> tuple[list[DataFlowContext], list[str]]:
+        labels = marker.get("labels")
+        if not isinstance(labels, dict):
+            raise ValidationError("image_only transcript head is missing data-flow labels")
+        flow_contexts = [
+            self._image_only_source_context(
+                pid=pid,
+                oid=goal_oid,
+                materialized_oids=materialized_oids,
+                retained_labels=labels,
+            )
+        ]
+        raw_input_oids = marker.get("input_oids")
+        if not isinstance(raw_input_oids, list):
+            raise ValidationError("image_only transcript head has invalid input Objects")
+        if any(not isinstance(oid, str) or not oid for oid in raw_input_oids):
+            raise ValidationError("image_only transcript head has invalid input Objects")
+        input_oids = [*raw_input_oids, *([goal_oid] if goal_oid else [])]
+        return flow_contexts, list(dict.fromkeys(input_oids))
+
+    def _append_image_only_tool_outputs(
+        self,
+        *,
+        pid: str,
+        messages: list[dict[str, Any]],
+        manifest: list[dict[str, str]],
+        seen_call_ids: set[str],
+        marker: Mapping[str, Any],
+        materialized_oids: set[str],
+        flow_contexts: list[DataFlowContext],
+        input_oids: list[str],
+    ) -> None:
+        output_key = marker.get("output_key")
+        if not isinstance(output_key, str) or not output_key:
+            raise ValidationError("image_only transcript head is missing its output key")
+        output_rows = self._processes.list_llm_tool_outputs(
+            pid=pid,
+            response_id=output_key,
+        )
+        outputs_by_call_id = {
+            str(row.get("call_id") or ""): row for row in output_rows
+        }
+        if set(outputs_by_call_id) != seen_call_ids:
+            raise ValidationError("image_only transcript tool outputs are incomplete")
+        for item in manifest:
+            envelope = self._decode_image_only_tool_output(
+                outputs_by_call_id[item["call_id"]].get("output_text")
+            )
+            result_oid = envelope.get("result_oid")
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item["call_id"],
+                    "name": item["name"],
+                    "content": envelope["content"],
+                }
+            )
+            flow_contexts.append(
+                self._image_only_source_context(
+                    pid=pid,
+                    oid=result_oid,
+                    materialized_oids=materialized_oids,
+                    retained_labels=envelope["labels"],
+                )
+            )
+            if result_oid:
+                input_oids.append(result_oid)
+
+    def _replay_image_only_transcript(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        process: Any,
+        context: MaterializedContext,
+        latest: LLMCallRecord,
+        marker: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], DataFlowContext, list[str]]:
+        messages = self._image_only_canonical_messages(image, latest, marker)
+        manifest, assistant_calls, seen_call_ids = self._image_only_replay_manifest(
+            latest,
+            marker,
+        )
+        self._append_image_only_assistant_message(messages, latest, assistant_calls)
+        goal_oid = str(process.goal_oid or "") or None
+        materialized_oids = set(context.object_refs)
+        flow_contexts, input_oids = self._image_only_replay_sources(
+            pid=pid,
+            goal_oid=goal_oid,
+            materialized_oids=materialized_oids,
+            marker=marker,
+        )
+        self._append_image_only_tool_outputs(
+            pid=pid,
+            messages=messages,
+            manifest=manifest,
+            seen_call_ids=seen_call_ids,
+            marker=marker,
+            materialized_oids=materialized_oids,
+            flow_contexts=flow_contexts,
+            input_oids=input_oids,
+        )
+        return (
+            messages,
+            DataFlowContext.aggregate(flow_contexts),
+            list(dict.fromkeys(input_oids)),
+        )
+
+    def _image_only_messages_and_flow(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        process: Any,
+        context: MaterializedContext,
+    ) -> tuple[list[dict[str, Any]], DataFlowContext, list[str]]:
+        anchor = self._image_only_transcript_anchor(image, process)
+        latest, marker = self._latest_image_only_transcript(
+            pid=pid,
+            image=image,
+            anchor=anchor,
+        )
+        if latest is None or marker is None:
+            return self._new_image_only_transcript(
+                pid=pid,
+                image=image,
+                process=process,
+                context=context,
+            )
+        return self._replay_image_only_transcript(
+            pid=pid,
+            image=image,
+            process=process,
+            context=context,
+            latest=latest,
+            marker=marker,
+        )
+
     def _build_model_messages(
         self,
         *,
@@ -378,7 +801,31 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
         skills: list[dict[str, Any]],
         available_skills: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, str]], DataFlowContext, str | None]:
+    ) -> tuple[list[dict[str, Any]], DataFlowContext, str | None]:
+        if image.prompt_mode == PROMPT_MODE_IMAGE_ONLY:
+            if not self.config.llm.persist_full_io:
+                raise _ImageOnlyFullIORequired(
+                    "image_only requires llm.persist_full_io=true for durable transcript replay"
+                )
+            messages, flow_context, input_refs = self._image_only_messages_and_flow(
+                pid=pid,
+                image=image,
+                process=process,
+                context=context,
+            )
+            self._audit.record(
+                actor=pid,
+                action="llm.request",
+                target=f"image:{image.image_id}",
+                input_refs=input_refs,
+                decision={
+                    "messages": len(messages),
+                    "policy": image.context_policy,
+                    "prompt_mode": PROMPT_MODE_IMAGE_ONLY,
+                    "event_projection": {"model_visible": False},
+                },
+            )
+            return messages, flow_context, None
         # The live goal is already part of the authoritative materialized
         # context in the ordinary case.  Replaying the retained copy as well
         # duplicates a potentially large, volatile block on every later
@@ -570,19 +1017,24 @@ class LLMProcessExecutor:
         if isinstance(prepared_context, dict):
             return prepared_context
         context = prepared_context
-        messages, flow_context, represented_through_event_id = (
-            self._assemble_llm_request(
-                pid=pid,
-                image=image,
-                process=prompt_process,
-                context=context,
-                events=events,
-                capabilities=capabilities,
-                tools=tools,
-                skills=skills,
-                available_skills=available_skills,
+        try:
+            messages, flow_context, represented_through_event_id = (
+                self._assemble_llm_request(
+                    pid=pid,
+                    image=image,
+                    process=prompt_process,
+                    context=context,
+                    events=events,
+                    capabilities=capabilities,
+                    tools=tools,
+                    skills=skills,
+                    available_skills=available_skills,
+                )
             )
-        )
+        except Exception as exc:
+            if image.prompt_mode != PROMPT_MODE_IMAGE_ONLY:
+                raise
+            return self._fail_llm_quantum(pid, exc)
         flow_token = self._data_flow.push(flow_context)
         try:
             openai_tools = self._tools.openai_tool_schemas(pid)
@@ -739,18 +1191,29 @@ class LLMProcessExecutor:
 
     def _fail_llm_quantum(self, pid: str, error: Exception) -> dict[str, Any]:
         durable_error = self._durable_llm_error(error)
+        reason = (
+            "image_only_full_io_required"
+            if isinstance(error, _ImageOnlyFullIORequired)
+            else None
+        )
         self._process.exit(
             pid,
             failed=True,
             message=f"LLM quantum failed: {durable_error}",
         )
+        decision: dict[str, Any] = {"error": durable_error}
+        if reason is not None:
+            decision["reason"] = reason
         self._audit.record(
             actor=pid,
             action="llm.action_failed",
             target=f"process:{pid}",
-            decision={"error": durable_error},
+            decision=decision,
         )
-        return {"ok": False, "error": durable_error}
+        result = {"ok": False, "error": durable_error}
+        if reason is not None:
+            result["reason"] = reason
+        return result
 
     async def _handle_context_storage_pressure(
         self,
@@ -1169,6 +1632,12 @@ class LLMProcessExecutor:
                 result = await self.adispatch(pid, action)
             except HumanApprovalRequired as exc:
                 stop_reason = "waiting_human"
+                self._persist_unexecuted_parallel_tool_outputs(
+                    pid=pid,
+                    completion=completion,
+                    start_index=action_index + 1,
+                    reason=stop_reason,
+                )
                 payload = self._wait_for_human_action(
                     pid=pid,
                     action=action,
@@ -1191,6 +1660,12 @@ class LLMProcessExecutor:
                 return self._with_parallel_batch_progress(payload, completed_actions, completed_results)
             except ProcessWaitRequired as exc:
                 stop_reason = "waiting_child"
+                self._persist_unexecuted_parallel_tool_outputs(
+                    pid=pid,
+                    completion=completion,
+                    start_index=action_index + 1,
+                    reason=stop_reason,
+                )
                 pending_action = exc.resume_action or action
                 payload = self._wait_for_child_action(
                     pid=pid,
@@ -1214,6 +1689,12 @@ class LLMProcessExecutor:
                 return self._with_parallel_batch_progress(payload, completed_actions, completed_results)
             except ProcessMessageWaitRequired as exc:
                 stop_reason = "waiting_message"
+                self._persist_unexecuted_parallel_tool_outputs(
+                    pid=pid,
+                    completion=completion,
+                    start_index=action_index + 1,
+                    reason=stop_reason,
+                )
                 payload = self._wait_for_message_action(
                     pid=pid,
                     action=action,
@@ -1235,6 +1716,12 @@ class LLMProcessExecutor:
                 )
                 return self._with_parallel_batch_progress(payload, completed_actions, completed_results)
             except ResourceLimitExceeded:
+                self._persist_unexecuted_parallel_tool_outputs(
+                    pid=pid,
+                    completion=completion,
+                    start_index=action_index,
+                    reason="resource_limit_exceeded",
+                )
                 self._record_action_batch(
                     pid=pid,
                     actions=actions,
@@ -1250,6 +1737,17 @@ class LLMProcessExecutor:
                 stop_reason = "interrupted_by_message"
                 stopped_action = action
                 stopped_result = result
+                self._persist_response_tool_output(
+                    pid=pid,
+                    result=result,
+                    **tool_call_context,
+                )
+                self._persist_unexecuted_parallel_tool_outputs(
+                    pid=pid,
+                    completion=completion,
+                    start_index=action_index + 1,
+                    reason=stop_reason,
+                )
                 break
             self._persist_response_tool_output(pid=pid, result=result, **tool_call_context)
             completed_actions.append(action)
@@ -1270,6 +1768,14 @@ class LLMProcessExecutor:
             if self._process_is_terminal(pid):
                 stop_reason = "process_terminal"
                 break
+
+        if stop_reason != "completed" and stop_reason != "interrupted_by_message":
+            self._persist_unexecuted_parallel_tool_outputs(
+                pid=pid,
+                completion=completion,
+                start_index=len(completed_actions),
+                reason=stop_reason,
+            )
 
         self._record_action_batch(
             pid=pid,
@@ -2189,7 +2695,11 @@ class LLMProcessExecutor:
 
     @staticmethod
     def _completion_tool_call_context(completion: Any, *, index: int) -> dict[str, str | None]:
-        response_id = str(getattr(completion, "response_id", "") or "") or None
+        response_id = str(
+            getattr(completion, "_agent_libos_transcript_output_key", None)
+            or getattr(completion, "response_id", "")
+            or ""
+        ) or None
         tool_calls = list(getattr(completion, "tool_calls", []) or [])
         if not tool_calls:
             return {"response_id": response_id, "tool_call_id": None, "tool_name": None}
@@ -2199,7 +2709,9 @@ class LLMProcessExecutor:
             return {"response_id": response_id, "tool_call_id": None, "tool_name": None}
         if not isinstance(tool_call, dict):
             return {"response_id": response_id, "tool_call_id": None, "tool_name": None}
-        call_id = str(tool_call.get("call_id") or "").strip() or None
+        call_id = str(
+            tool_call.get("call_id") or tool_call.get("id") or ""
+        ).strip() or None
         tool_name = str(tool_call.get("name") or "").strip() or None
         return {"response_id": response_id, "tool_call_id": call_id, "tool_name": tool_name}
 
@@ -2214,8 +2726,90 @@ class LLMProcessExecutor:
             except Exception:
                 continue
             return self._completion_tool_call_context(completion, index=index)
-        response_id = str(getattr(completion, "response_id", "") or "") or None
+        response_id = str(
+            getattr(completion, "_agent_libos_transcript_output_key", None)
+            or getattr(completion, "response_id", "")
+            or ""
+        ) or None
         return {"response_id": response_id, "tool_call_id": None, "tool_name": None}
+
+    @staticmethod
+    def _image_only_expected_tool_outputs(
+        transcript: Mapping[str, Any],
+        response_id: str,
+    ) -> dict[str, str]:
+        if transcript.get("schema_version") != _IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION:
+            raise ValidationError("image_only transcript output key changed")
+        if transcript.get("output_key") != response_id:
+            raise ValidationError("image_only transcript output key changed")
+        manifest = transcript.get("tool_calls")
+        if not isinstance(manifest, list):
+            raise ValidationError("image_only transcript tool-call manifest is unavailable")
+        expected = {
+            str(item.get("call_id") or ""): str(item.get("name") or "")
+            for item in manifest
+            if isinstance(item, dict)
+        }
+        if len(expected) != len(manifest):
+            raise ValidationError("image_only transcript tool output is not paired")
+        return expected
+
+    def _persist_image_only_tool_output(
+        self,
+        *,
+        pid: str,
+        call: LLMCallRecord | None,
+        result: dict[str, Any],
+        response_id: str,
+        tool_call_id: str,
+        tool_name: str | None,
+        synthetic: bool,
+    ) -> bool:
+        transcript = (
+            call.request_options.get(_IMAGE_ONLY_TRANSCRIPT_KEY)
+            if call is not None
+            else None
+        )
+        if not isinstance(transcript, dict):
+            return False
+        expected = self._image_only_expected_tool_outputs(transcript, response_id)
+        if tool_call_id not in expected:
+            raise ValidationError("image_only transcript tool output is not paired")
+        if expected[tool_call_id] != str(tool_name or ""):
+            raise ValidationError("image_only transcript tool output is not paired")
+        payload = result.get("payload")
+        if payload is None:
+            payload = {
+                "ok": bool(result.get("ok")),
+                "error": result.get("error"),
+            }
+        content = payload if isinstance(payload, str) else dumps(to_jsonable(payload))
+        result_oid = str(result.get("result_oid") or "") or None
+        result_flow = (
+            self._data_flow.context_from_source_oids(
+                pid,
+                [result_oid],
+                include_current=False,
+            )
+            if result_oid is not None
+            else self._data_flow.current_context()
+        )
+        envelope = {
+            "schema_version": _IMAGE_ONLY_TOOL_OUTPUT_SCHEMA_VERSION,
+            "content": content,
+            "result_oid": result_oid,
+            "ok": bool(result.get("ok")),
+            "synthetic": bool(synthetic),
+            "labels": result_flow.labels.to_dict(),
+        }
+        self._processes.upsert_llm_tool_output(
+            pid=pid,
+            response_id=response_id,
+            call_id=tool_call_id,
+            tool_name=tool_name,
+            output=dumps(envelope),
+        )
+        return True
 
     def _persist_response_tool_output(
         self,
@@ -2225,10 +2819,21 @@ class LLMProcessExecutor:
         response_id: str | None,
         tool_call_id: str | None,
         tool_name: str | None,
+        synthetic: bool = False,
     ) -> None:
         if not response_id or not tool_call_id or not self.config.llm.persist_full_io:
             return
         call = self._processes.get_latest_llm_call(pid=pid, purpose="action_selection")
+        if self._persist_image_only_tool_output(
+            pid=pid,
+            call=call,
+            result=result,
+            response_id=response_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            synthetic=synthetic,
+        ):
+            return
         if (
             call is None
             or call.api != "responses"
@@ -2258,6 +2863,37 @@ class LLMProcessExecutor:
             tool_name=tool_name,
             output=dumps(result),
         )
+
+    def _persist_unexecuted_parallel_tool_outputs(
+        self,
+        *,
+        pid: str,
+        completion: Any,
+        start_index: int,
+        reason: str,
+    ) -> None:
+        tool_calls = list(getattr(completion, "tool_calls", []) or [])
+        for index in range(max(0, start_index), len(tool_calls)):
+            context = self._completion_tool_call_context(completion, index=index)
+            if not context.get("tool_call_id"):
+                continue
+            self._persist_response_tool_output(
+                pid=pid,
+                result={
+                    "ok": False,
+                    "tool_id": None,
+                    "result_oid": None,
+                    "payload": {
+                        "ok": False,
+                        "cancelled": True,
+                        "effect_started": False,
+                        "reason": reason,
+                    },
+                    "error": None,
+                },
+                synthetic=True,
+                **context,
+            )
 
     async def _resume_pending_wait_action(self, pid: str) -> dict[str, Any]:
         pending = self.pending.require_memory(pid, "child")
@@ -2835,11 +3471,21 @@ class LLMProcessExecutor:
             state.request_messages,
             previous_outputs,
         )
+        image = self._images.get(state.process.image_id)
+        if image is None:
+            raise RuntimeError(
+                f"agent image disappeared while assembling the LLM request: {state.process.image_id}"
+            )
         state.parallel_tool_calls = bool(resolved.parallel_tool_calls)
         state.auto_wait_on_empty_tool_calls = bool(
             resolved.auto_wait_on_empty_tool_calls
         )
-        state.fallback_json_actions = bool(resolved.fallback_json_actions)
+        # A compatibility JSON protocol would be runtime-authored prompt text,
+        # so it is deliberately unavailable at the transparent boundary.
+        state.fallback_json_actions = bool(
+            resolved.fallback_json_actions
+            and image.prompt_mode != PROMPT_MODE_IMAGE_ONLY
+        )
         state.temperature = resolved.temperature
         state.max_tokens = resolved.max_tokens
         self._update_llm_request_options(
@@ -2847,11 +3493,6 @@ class LLMProcessExecutor:
             response_scope_fingerprint=response_scope_fingerprint,
             previous_output_count=len(previous_outputs),
         )
-        image = self._images.get(state.process.image_id)
-        if image is None:
-            raise RuntimeError(
-                f"agent image disappeared while assembling the LLM request: {state.process.image_id}"
-            )
         await self._apply_context_management(state, image=image)
         state.egress_payload = {
             "messages": state.request_messages,
@@ -3888,6 +4529,7 @@ class LLMProcessExecutor:
         state: _LLMCallState,
         completion: Any,
     ) -> tuple[Any, bool, bool, bool, str]:
+        self._prepare_image_only_transcript_record(state, completion)
         usage, invalid_usage_fields = self._canonical_llm_usage(completion)
         self._record_effective_provider_request_options(state, completion)
         if invalid_usage_fields:
@@ -3974,6 +4616,108 @@ class LLMProcessExecutor:
             state.fallback_json_actions,
             str(state.request_options["llm_profile_id"]),
         )
+
+    @staticmethod
+    def _normalize_image_only_completion_tool_calls(
+        state: _LLMCallState,
+        completion: Any,
+    ) -> None:
+        tool_calls = list(getattr(completion, "tool_calls", []) or [])
+        seen: set[str] = set()
+        for ordinal, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                continue
+            candidate = str(
+                tool_call.get("call_id") or tool_call.get("id") or ""
+            ).strip()
+            if not candidate or candidate in seen:
+                candidate = "call_" + hashlib.sha256(
+                    f"{state.call_id}:{ordinal}".encode("utf-8")
+                ).hexdigest()[:24]
+            seen.add(candidate)
+            tool_call["call_id"] = candidate
+        completion.tool_calls = tool_calls
+
+    def _previous_image_only_input_oids(
+        self,
+        *,
+        state: _LLMCallState,
+        anchor: Mapping[str, str],
+    ) -> set[str]:
+        input_oids: set[str] = set()
+        previous = self._processes.get_latest_llm_call(
+            pid=state.pid,
+            purpose="action_selection",
+        )
+        if previous is None:
+            return input_oids
+        previous_marker = self._image_only_marker_for_anchor(previous, anchor)
+        if previous_marker is None:
+            return input_oids
+        previous_oids = previous_marker.get("input_oids")
+        if isinstance(previous_oids, list):
+            input_oids.update(
+                oid for oid in previous_oids if isinstance(oid, str) and oid
+            )
+        output_key = previous_marker.get("output_key")
+        if not isinstance(output_key, str) or not output_key:
+            return input_oids
+        rows = self._processes.list_llm_tool_outputs(
+            pid=state.pid,
+            response_id=output_key,
+        )
+        for row in rows:
+            envelope = self._decode_image_only_tool_output(row.get("output_text"))
+            result_oid = envelope.get("result_oid")
+            if result_oid:
+                input_oids.add(result_oid)
+        return input_oids
+
+    @staticmethod
+    def _image_only_canonical_message_count(state: _LLMCallState) -> int:
+        canonical_message_count = len(state.request_messages)
+        if state.attempt <= 1:
+            return canonical_message_count
+        if canonical_message_count < 3:
+            raise ValidationError("image_only action-repair request is malformed")
+        if state.request_messages[-1].get("role") != "user":
+            raise ValidationError("image_only action-repair request is malformed")
+        return canonical_message_count - 1
+
+    def _prepare_image_only_transcript_record(
+        self,
+        state: _LLMCallState,
+        completion: Any,
+    ) -> None:
+        image = self._images.get(state.process.image_id)
+        if image is None or image.prompt_mode != PROMPT_MODE_IMAGE_ONLY:
+            return
+        if not self.config.llm.persist_full_io:
+            raise ValidationError(
+                "image_only requires llm.persist_full_io=true for durable transcript replay"
+            )
+        self._normalize_image_only_completion_tool_calls(state, completion)
+        anchor = self._image_only_transcript_anchor(image, state.process)
+        input_oids = {ref.oid for ref in state.flow_context.source_refs}
+        input_oids.update(
+            self._previous_image_only_input_oids(state=state, anchor=anchor)
+        )
+        if state.process.goal_oid:
+            input_oids.add(str(state.process.goal_oid))
+        manifest = self._response_tool_call_manifest(completion)
+        marker: dict[str, Any] = {
+            "schema_version": _IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION,
+            **anchor,
+            "canonical_message_count": self._image_only_canonical_message_count(
+                state
+            ),
+            "output_key": state.call_id,
+            "tool_calls": manifest,
+            "labels": state.flow_context.labels.to_dict(),
+            "input_oids": sorted(input_oids),
+        }
+        state.request_options[_IMAGE_ONLY_TRANSCRIPT_KEY] = marker
+        setattr(completion, "_agent_libos_transcript_output_key", state.call_id)
 
     @staticmethod
     def _record_effective_provider_request_options(
