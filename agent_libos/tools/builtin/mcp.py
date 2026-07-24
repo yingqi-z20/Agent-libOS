@@ -14,6 +14,9 @@ class ListMcpServersArgs(BaseModel):
 
 class ListMcpServersOutput(BaseModel):
     servers: list[dict[str, Any]]
+    has_more: bool = Field(
+        description="Whether another registered server matched beyond this bounded result."
+    )
 
 
 class InspectMcpServerArgs(BaseModel):
@@ -30,7 +33,8 @@ class ListMcpToolsArgs(BaseModel):
         default=False,
         description=(
             "False returns the registered allowlist without contacting the server. True performs a live tools/list external "
-            "read and requires execute authority, provider policy, approval when configured, and resource budget."
+            "read and requires server read+execute authority (plus process spawn and exact stdio execute authority for "
+            "stdio), provider policy, and resource budget. It does not register live-only tools."
         ),
     )
 
@@ -80,8 +84,12 @@ class ListMcpServersTool(BaseAgentTool[ListMcpServersArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        servers = runtime.mcp.list_servers(actor=ctx.pid, text=args.text, limit=args.limit)
-        return ListMcpServersOutput(servers=servers)
+        servers, has_more = runtime.mcp.list_servers_window(
+            actor=ctx.pid,
+            text=args.text,
+            limit=args.limit,
+        )
+        return ListMcpServersOutput(servers=servers, has_more=has_more)
 
 
 class InspectMcpServerTool(BaseAgentTool[InspectMcpServerArgs]):
@@ -103,7 +111,8 @@ class ListMcpToolsTool(BaseAgentTool[ListMcpToolsArgs]):
     name = "list_mcp_tools"
     description = (
         "List allowed tools for a registered MCP server. By default this reads cached registry metadata only; "
-        "refresh=true makes a governed external tools/list call and may require approval."
+        "refresh=true makes a governed live tools/list call and reports manifest/live schema drift without "
+        "changing the registered allowlist or granting authority."
     )
     args_schema = ListMcpToolsArgs
     output_schema = ListMcpToolsOutput

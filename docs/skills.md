@@ -68,7 +68,15 @@ relative files.
 
 Built-in tool packages intentionally contain only `SKILL.md`. Their frontmatter
 is limited to `name`, `description`, and `allowed-tools`; each body is at most
-2 KiB and each package owns at most nine static tools. They contain no scripts,
+16 KiB, the complete `SKILL.md` is at most 24 KiB (leaving 8 KiB for
+frontmatter), and each package owns at most nine static tools. The expanded body
+budget is loaded only after activation and is reserved for exact tool selection,
+parameter combinations, result interpretation, recovery, and completion-evidence
+guidance. The default runtime prompt ceiling is 16,384 characters, which is not
+lower than the 16 KiB body byte cap, so every valid built-in body is fully
+model-visible when activated. If a Host configures a lower prompt ceiling than
+a selected body, activation and prompt projection fail closed instead of
+silently exposing partial instructions. Packages contain no scripts,
 bundled resources, JIT definitions, actions, or Capability declarations.
 Unlike registered packages, package-owned built-ins fail validation if
 `allowed-tools` uses the legacy YAML-list spelling.
@@ -97,8 +105,10 @@ longer matches its declared size/SHA is rejected.
 ## Progressive Disclosure
 
 When `activate_skill` is model-visible, the process prompt includes only the
-applicable built-in Skill IDs, descriptions, and active state. Full `SKILL.md`
-instructions and owned tool schemas appear after activation. A built-in is
+applicable built-in Skill IDs and descriptions. This catalog is deliberately
+stable across activation so a changing `active` flag does not invalidate the
+prompt-cache prefix. Full `SKILL.md` instructions and owned tool schemas appear
+after activation. A built-in is
 applicable only when every declared tool has an exact binding in the
 image-authorized process tool table; unsupported built-ins are omitted rather
 than advertised as unusable.

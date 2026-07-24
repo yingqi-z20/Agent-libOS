@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,9 +23,80 @@ from agent_libos.models import (
     ResourceBudget,
 )
 from agent_libos.models.exceptions import CapabilityDenied, ProcessError, ProcessWaitRequired, ResourceLimitExceeded
+from agent_libos.tools.base import ToolContext
+from agent_libos.tools.builtin.checkpoint import (
+    ForkCheckpointArgs,
+    ForkCheckpointOutput,
+    ForkCheckpointTool,
+)
 
 
 class TestCheckpointFork:
+
+    def test_fork_tool_preserves_runtime_commit_status_maps_and_warnings(self) -> None:
+        payload = {
+            'checkpoint_id': 'ckpt_test',
+            'source_pid': 'pid_source',
+            'fork_root_pid': 'pid_fork',
+            'pid_map': {'pid_source': 'pid_fork'},
+            'object_map': {'oid_source': 'oid_fork'},
+            'tool_map': {'tool_source': 'tool_fork'},
+            'status': 'forked_with_warnings',
+            'main_state_committed': True,
+            'post_commit_failures': [
+                {'phase': 'fork_event_emission', 'error': 'injected failure'},
+            ],
+        }
+
+        def fork_from_checkpoint(
+            actor: str,
+            checkpoint_id: str,
+            parent_pid: str | None,
+        ) -> dict[str, object]:
+            assert actor == 'pid_caller'
+            assert checkpoint_id == 'ckpt_test'
+            assert parent_pid == 'pid_parent'
+            return dict(payload)
+
+        checkpoint = SimpleNamespace(fork_from_checkpoint=fork_from_checkpoint)
+        result = ForkCheckpointTool().run(
+            ForkCheckpointArgs(
+                checkpoint_id='ckpt_test',
+                parent_pid='pid_parent',
+            ),
+            ToolContext(
+                trace_id='trace_test',
+                call_id='call_test',
+                pid='pid_caller',
+                runtime=SimpleNamespace(checkpoint=checkpoint),
+            ),
+        )
+
+        projected = result.model_dump()
+        assert {key: projected[key] for key in payload} == payload
+        assert projected['pid_map_page'] == {
+            'count': 1,
+            'returned_count': 1,
+            'truncated': False,
+            'next_cursor': None,
+        }
+        assert projected['object_map_page']['count'] == 1
+        assert projected['tool_map_page']['count'] == 1
+        assert projected['post_commit_failures_page']['count'] == 1
+
+    def test_fork_output_additions_keep_legacy_construction_compatible(self) -> None:
+        output = ForkCheckpointOutput(
+            checkpoint_id='ckpt_legacy',
+            source_pid='pid_source',
+            fork_root_pid='pid_fork',
+            pid_map={'pid_source': 'pid_fork'},
+            object_map={},
+        )
+
+        assert output.tool_map == {}
+        assert output.status == 'forked'
+        assert output.main_state_committed is True
+        assert output.post_commit_failures == []
 
     @pytest.mark.parametrize(
         ('sink', 'phase'),

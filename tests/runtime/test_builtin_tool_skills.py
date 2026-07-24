@@ -2,28 +2,229 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from importlib import resources
 from pathlib import Path
+import re
 
 import pytest
 
 import agent_libos.skills.builtin_catalog as builtin_catalog_module
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.prompt import build_user_prompt
 from agent_libos.models import MaterializedContext
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.skills.builtin_catalog import (
     BUILTIN_SKILL_CATALOG_METADATA_MAX_BYTES,
     BUILTIN_SKILL_IDS,
+    BUILTIN_SKILL_MAX_FILE_BYTES,
+    BUILTIN_SKILL_MAX_INSTRUCTION_BYTES,
     BUILTIN_SKILL_MAX_TOOLS,
     BuiltinSkillCatalog,
     get_builtin_skill_catalog,
 )
 from agent_libos.skills.schema import SkillPackage
+from agent_libos.tools.builtin.checkpoint import (
+    DiffCheckpointOutput,
+    RestoreCheckpointOutput,
+)
+from agent_libos.tools.builtin.jsonrpc import ListJsonRpcEndpointsTool
+from agent_libos.tools.builtin.mcp import ListMcpServersTool
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 
 WORKSPACE_EDITING_SKILL = "agent-libos-workspace-editing"
+
+_HIGH_RISK_SCHEMA_CONTRACTS: dict[str, dict[str, object]] = {
+    "request_permission": {
+        "required": {"resource", "rights", "reason"},
+        "defaults": {"human": "owner"},
+        "forbidden": {"cap_id", "policy"},
+    },
+    "delegate_capability": {
+        "required": {"child_pid", "resource", "rights"},
+        "defaults": {
+            "delegable": False,
+            "effect": "allow",
+            "expires_at": None,
+            "uses_remaining": None,
+        },
+        "forbidden": {"parent_cap_id", "max_delegation_depth"},
+    },
+    "revoke_capability": {
+        "required": {"cap_id"},
+        "defaults": {"reason": None},
+    },
+    "ask_human": {
+        "required": {"question"},
+        "defaults": {"human": "owner"},
+    },
+    "human_output": {
+        "required": {"message"},
+        "defaults": {"channel": "terminal"},
+        "forbidden": {"human"},
+    },
+    "compact_process_context": {
+        "defaults": {
+            "force": False,
+            "max_chunks": 8,
+            "preserve_recent_entries": 8,
+            "target_tokens": 4000,
+        },
+        "bounds": {
+            "max_chunks": {"minimum": 1, "maximum": 64},
+            "preserve_recent_entries": {"minimum": 0, "maximum": 128},
+            "target_tokens": {"minimum": 256, "maximum": 64000},
+        },
+    },
+    "process_exit": {
+        "fields": {
+            "completion_evidence",
+            "message",
+            "payload",
+            "result_oid",
+            "review_token",
+        },
+    },
+    "get_current_time": {"defaults": {"timezone": "UTC"}},
+    "sleep": {
+        "required": {"seconds"},
+        "bounds": {"seconds": {"minimum": 0, "maximum": 60.0}},
+    },
+    "read_text_file": {
+        "required": {"path"},
+        "defaults": {"encoding": "utf-8", "max_bytes": 65536},
+    },
+    "write_directory": {
+        "required": {"path"},
+        "defaults": {"exist_ok": True, "parents": True},
+    },
+    "write_text_file": {
+        "required": {"path", "content"},
+        "defaults": {"encoding": "utf-8", "overwrite": True},
+    },
+    "delete_directory": {
+        "required": {"path"},
+        "defaults": {"missing_ok": False, "recursive": False},
+    },
+    "run_shell_command": {
+        "required": {"argv"},
+        "defaults": {
+            "max_stderr_chars": 32000,
+            "max_stdout_chars": 32000,
+            "timeout_s": 30.0,
+        },
+        "forbidden": {"cwd", "env", "stdin", "shell"},
+    },
+    "create_memory_object": {
+        "required": {"type", "payload"},
+        "defaults": {"immutable": True, "name": None, "namespace": None},
+    },
+    "read_memory_object": {
+        "required": {"name"},
+        "defaults": {
+            "cursor": 0,
+            "expected_sha256": None,
+            "json_pointer": "",
+            "max_payload_chars": 12000,
+            "namespace": None,
+        },
+    },
+    "append_memory_object": {
+        "required": {"name", "entry"},
+        "defaults": {"list_field": "entries", "namespace": None},
+    },
+    "create_object_from_file": {
+        "required": {"name", "path"},
+        "defaults": {
+            "allow_truncated": False,
+            "encoding": "utf-8",
+            "max_bytes": 1048576,
+            "object_type": "artifact",
+        },
+    },
+    "write_object_to_file": {
+        "required": {"name", "path"},
+        "defaults": {"encoding": "utf-8", "overwrite": True},
+        "forbidden": {"oid"},
+    },
+    "start_object_task": {
+        "required": {"tool"},
+        "defaults": {
+            "grant_result_to_notify": False,
+            "owner_watch": False,
+        },
+        "fields": {"inherit_capabilities", "owner_name", "owner_oid"},
+    },
+    "wait_object_task": {
+        "required": {"task_id"},
+        "defaults": {"timeout_s": None},
+    },
+    "fork_child_process": {
+        "required": {"goal"},
+        "defaults": {"include_parent_roots": True, "mode": "worker"},
+    },
+    "wait_child_process": {
+        "required": {"child_pid"},
+        "defaults": {"block": True},
+    },
+    "read_process_messages": {
+        "defaults": {"ack": True, "include_acked": False, "limit": 100},
+    },
+    "receive_process_messages": {
+        "defaults": {
+            "ack": True,
+            "block": True,
+            "include_acked": False,
+            "limit": 100,
+        },
+    },
+    "merge_child_memory": {
+        "required": {"child_pid"},
+        "defaults": {"include_child_created": True},
+    },
+    "exec_process": {
+        "required": {"image"},
+        "defaults": {"preserve_capabilities": False, "preserve_memory": True},
+    },
+    "list_mcp_tools": {
+        "required": {"server_id"},
+        "defaults": {"refresh": False},
+    },
+    "call_mcp_tool": {
+        "required": {"server_id", "tool_id"},
+        "fields": {"arguments"},
+        "forbidden": {"refresh", "url"},
+    },
+    "git_integrate": {
+        "required": {"operation", "expected_state_token"},
+        "enums": {
+            "operation": {"merge", "rebase", "cherry_pick", "revert", "abort"},
+        },
+    },
+    "git_reset": {
+        "required": {"target", "expected_state_token"},
+        "defaults": {"mode": "mixed"},
+        "enums": {"mode": {"soft", "mixed", "hard"}},
+    },
+    "git_pull": {
+        "required": {"remote", "expected_state_token"},
+        "defaults": {"strategy": "ff_only"},
+        "enums": {"strategy": {"ff_only", "merge", "rebase"}},
+        "forbidden": {"url"},
+    },
+    "git_push": {
+        "required": {"remote", "remote_ref", "expected_state_token"},
+        "defaults": {"delete": False, "force_with_lease_oid": None},
+        "forbidden": {"force", "url"},
+    },
+    "git_merge_pull_request": {
+        "required": {"pr_id", "expected_state_token"},
+        "defaults": {"strategy": "fast_forward"},
+        "enums": {"strategy": {"fast_forward", "merge", "squash"}},
+    },
+}
 
 
 def test_builtin_skill_packages_use_standard_allowed_tools_scalar() -> None:
@@ -92,24 +293,162 @@ def test_builtin_skill_catalog_has_unique_bounded_ownership() -> None:
     assert len(owners) == 99
 
 
-def test_workspace_editing_skill_routes_requested_baseline_before_writes() -> None:
-    instructions = get_builtin_skill_catalog().get(
-        "agent-libos-workspace-editing"
-    ).instructions
+def test_builtin_skill_instructions_route_every_owned_tool() -> None:
+    for package in get_builtin_skill_catalog().list():
+        missing = [
+            tool_name
+            for tool_name in package.allowed_tools
+            if f"`{tool_name}`" not in package.instructions
+        ]
 
-    assert "stop before writing" in instructions
-    assert "command-execution Skill" in instructions
-    assert "later passing run cannot replace this baseline" in instructions
+        assert missing == [], f"{package.skill_id} does not guide {missing}"
 
 
-def test_command_execution_skill_routes_all_git_argv_to_typed_tools() -> None:
-    instructions = get_builtin_skill_catalog().get(
-        "agent-libos-command-execution"
-    ).instructions
+def test_builtin_skill_descriptions_and_bodies_have_progressive_guidance_structure() -> None:
+    trigger_context = re.compile(
+        r"\b(?:after|before|by|during|for|if|not|on|only|rather|use|using|when|while|with|without)\b",
+        re.IGNORECASE,
+    )
+    safety_decision = re.compile(
+        r"\b(?:cannot|deny|denied|do not|must|never|only|permission|requires?|stop)\b",
+        re.IGNORECASE,
+    )
+    verification_decision = re.compile(
+        r"\b(?:confirm|inspect|read back|result|stop|success|verify|verification)\b",
+        re.IGNORECASE,
+    )
 
-    assert "Never pass a `git` argv" in instructions
-    assert "read-only `git status` or `git diff`" in instructions
-    assert "typed tool" in instructions
+    for package in get_builtin_skill_catalog().list():
+        description_words = re.findall(r"[A-Za-z0-9_-]+", package.description)
+        assert len(description_words) >= 12, package.skill_id
+        assert trigger_context.search(package.description), package.skill_id
+
+        sections = list(
+            re.finditer(
+                r"(?ms)^##\s+(.+?)\s*$\n(.*?)(?=^##\s+|\Z)",
+                package.instructions,
+            )
+        )
+        assert len(sections) >= 3, package.skill_id
+        assert safety_decision.search(package.instructions), package.skill_id
+        assert verification_decision.search(package.instructions), package.skill_id
+
+
+def test_builtin_skill_bodies_have_operational_tool_guides() -> None:
+    workflow_heading = re.compile(r"\b(?:guide|sequence|workflow)\b", re.IGNORECASE)
+    settlement_heading = re.compile(
+        r"\b(?:approval|authority|boundary|completion|evidence|failure|"
+        r"recover\w*|stop\w*|uncertain|verif\w*)\b",
+        re.IGNORECASE,
+    )
+
+    for package in get_builtin_skill_catalog().list():
+        sections = {
+            match.group(1).strip(): match.group(2)
+            for match in re.finditer(
+                r"(?ms)^##\s+(.+?)\s*$\n(.*?)(?=^##\s+|\Z)",
+                package.instructions,
+            )
+        }
+        assert any(workflow_heading.search(title) for title in sections), package.skill_id
+        assert any(settlement_heading.search(title) for title in sections), package.skill_id
+
+        missing_tool_guidance = [
+            tool_name
+            for tool_name in package.allowed_tools
+            if f"`{tool_name}`" not in package.instructions
+        ]
+        assert missing_tool_guidance == [], (
+            package.skill_id,
+            missing_tool_guidance,
+        )
+
+        # Combined workflows can guide several closely related tools more
+        # efficiently than repeating one fixed quota per schema. Keep a useful
+        # absolute floor while the semantic and per-tool checks above guard the
+        # actual content.
+        assert len(package.instructions.encode("utf-8")) >= 3_000, package.skill_id
+
+
+def test_effectful_builtin_skills_include_recovery_or_stop_decisions(tmp_path: Path) -> None:
+    recovery_decision = re.compile(
+        r"\b(?:cancel\w*|fail\w*|reconcile\w*|recover\w*|reject\w*|replay|"
+        r"resume|retry|rollback|stop|suspend\w*|uncertain|unknown)\b",
+        re.IGNORECASE,
+    )
+    runtime = Runtime.open(tmp_path / "builtin-skill-recovery-contract.sqlite")
+    try:
+        specs = {
+            str(row["name"]): json.loads(row["spec_json"])
+            for row in runtime.tools.list()
+        }
+        for package in get_builtin_skill_catalog().list():
+            is_effectful = any(
+                specs[tool]["policy"]["side_effects"]
+                and not specs[tool]["policy"]["idempotent"]
+                for tool in package.allowed_tools
+            )
+            if is_effectful:
+                assert recovery_decision.search(package.instructions), package.skill_id
+    finally:
+        runtime.close()
+
+
+def test_high_risk_builtin_tool_schemas_match_guidance_contracts(tmp_path: Path) -> None:
+    runtime = Runtime.open(tmp_path / "builtin-skill-schema-contract.sqlite")
+    try:
+        specs = {
+            str(row["name"]): json.loads(row["spec_json"])
+            for row in runtime.tools.list()
+        }
+        catalog = get_builtin_skill_catalog()
+        assert set(_HIGH_RISK_SCHEMA_CONTRACTS) <= set(specs)
+        for tool_name, contract in _HIGH_RISK_SCHEMA_CONTRACTS.items():
+            schema = specs[tool_name]["input_schema"]
+            properties = schema["properties"]
+            assert catalog.skill_for_tool(tool_name) is not None
+            assert set(contract.get("required", set())) <= set(schema.get("required", []))
+            assert set(contract.get("fields", set())) <= set(properties)
+            assert set(contract.get("forbidden", set())).isdisjoint(properties)
+            for field, expected in dict(contract.get("defaults", {})).items():
+                assert properties[field].get("default") == expected, (tool_name, field)
+                assert "default" in properties[field], (tool_name, field)
+            for field, expected in dict(contract.get("enums", {})).items():
+                assert set(properties[field]["enum"]) == set(expected), (tool_name, field)
+            for field, expected in dict(contract.get("bounds", {})).items():
+                assert {
+                    key: properties[field][key]
+                    for key in expected
+                } == expected, (tool_name, field)
+    finally:
+        runtime.close()
+
+
+def test_builtin_tool_guidance_validation_fails_closed() -> None:
+    with pytest.raises(ValidationError, match="do not guide allowed tools: echo"):
+        builtin_catalog_module._validate_builtin_tool_guidance(
+            "Use the diagnostic tool.",
+            allowed_tools=["echo"],
+            name="agent-libos-example",
+        )
+
+
+@pytest.mark.parametrize(
+    "skill_id",
+    [
+        "agent-libos-workspace-navigation",
+        "agent-libos-workspace-editing",
+        "agent-libos-command-execution",
+        "agent-libos-test-log-analysis",
+        "agent-libos-tool-protocol-diagnostics",
+    ],
+)
+def test_workspace_tool_skill_guidance_fits_progressive_disclosure_budget(
+    skill_id: str,
+) -> None:
+    instructions = get_builtin_skill_catalog().get(skill_id).instructions
+
+    assert len(instructions.encode("utf-8")) <= BUILTIN_SKILL_MAX_INSTRUCTION_BYTES
 
 
 def test_builtin_skill_prompt_catalog_metadata_stays_within_budget() -> None:
@@ -131,6 +470,111 @@ def test_builtin_skill_prompt_catalog_metadata_stays_within_budget() -> None:
 
     assert catalog.prompt_catalog_metadata_size_bytes == len(encoded)
     assert len(encoded) <= BUILTIN_SKILL_CATALOG_METADATA_MAX_BYTES
+
+
+def test_builtin_skill_expanded_body_budget_is_fully_model_visible() -> None:
+    assert BUILTIN_SKILL_MAX_INSTRUCTION_BYTES == 16 * 1_024
+    assert BUILTIN_SKILL_MAX_FILE_BYTES == 24 * 1_024
+    assert BUILTIN_SKILL_MAX_FILE_BYTES > BUILTIN_SKILL_MAX_INSTRUCTION_BYTES
+    assert (
+        DEFAULT_CONFIG.skills.max_prompt_instruction_chars
+        >= BUILTIN_SKILL_MAX_INSTRUCTION_BYTES
+    )
+
+
+def test_long_builtin_skill_body_is_injected_without_tail_truncation(
+    tmp_path: Path,
+) -> None:
+    package = max(
+        get_builtin_skill_catalog().list(),
+        key=lambda item: len(item.instructions.encode("utf-8")),
+    )
+    assert len(package.instructions.encode("utf-8")) > 8_000
+
+    runtime = Runtime.open(tmp_path / "long-builtin-prompt-body.sqlite")
+    try:
+        pid = runtime.process.spawn(
+            image="coding-agent:v0",
+            goal="verify complete long Skill prompt projection",
+        )
+        runtime.skills.activate_skill(pid, package.skill_id, actor=pid)
+
+        prompt = _render_prompt(runtime, pid)
+        assert package.instructions.strip() in prompt
+    finally:
+        runtime.close()
+
+
+def test_runtime_rejects_builtin_prompt_body_truncation_config(tmp_path: Path) -> None:
+    config = replace(
+        DEFAULT_CONFIG,
+        skills=replace(
+            DEFAULT_CONFIG.skills,
+            max_prompt_instruction_chars=64,
+        ),
+    )
+    with pytest.raises(
+        ValidationError,
+        match="instructions exceeds max_prompt_instruction_chars=64",
+    ):
+        Runtime.open(tmp_path / "builtin-prompt-limit.sqlite", config=config)
+
+
+def test_checkpoint_output_models_preserve_external_effect_evidence() -> None:
+    empty_page = {
+        "count": 0,
+        "returned_count": 0,
+        "truncated": False,
+        "next_cursor": None,
+    }
+    diff = DiffCheckpointOutput(
+        checkpoint_id="ckpt_test",
+        pid="pid_test",
+        tables={},
+        external_effects_since_checkpoint=[],
+        external_effects_page=empty_page,
+        external_effect_summary={"total": 0},
+        restore_external_policy="report_only",
+    ).model_dump()
+    restored = RestoreCheckpointOutput(
+        checkpoint_id="ckpt_test",
+        publication_id="pub_test",
+        pid="pid_test",
+        status="restored",
+        main_state_committed=True,
+        reconciliation_pending=False,
+        post_commit_failures=[],
+        restored_pids=["pid_test"],
+        previous_pids=["pid_test"],
+        cancelled_human_requests=["human_test"],
+        superseded_messages=[],
+        superseded_object_tasks=[],
+        external_effects_since_checkpoint=[],
+        restored_pids_page=empty_page,
+        previous_pids_page=empty_page,
+        cancelled_human_requests_page=empty_page,
+        superseded_messages_page=empty_page,
+        superseded_object_tasks_page=empty_page,
+        external_effects_page=empty_page,
+        external_effect_summary={"total": 0},
+        restore_external_policy="report_only",
+        post_commit_failures_page=empty_page,
+    ).model_dump()
+
+    assert diff["external_effect_summary"] == {"total": 0}
+    assert diff["restore_external_policy"] == "report_only"
+    assert restored["cancelled_human_requests"] == ["human_test"]
+    assert "cancelled_human_request_ids" not in restored
+    assert restored["external_effect_summary"] == {"total": 0}
+    assert restored["restore_external_policy"] == "report_only"
+
+
+def test_registered_integration_list_outputs_expose_completeness() -> None:
+    for tool in (ListJsonRpcEndpointsTool(), ListMcpServersTool()):
+        output_schema = tool.spec().output_schema
+        assert output_schema is not None
+        assert "has_more" in output_schema["properties"]
+        assert "has_more" in output_schema["required"]
 
 
 def test_builtin_skill_prompt_catalog_metadata_budget_fails_closed(monkeypatch) -> None:
@@ -552,7 +996,7 @@ def test_prompt_does_not_render_forged_builtin_snapshot_content(
         assert "snapshot hash" in forged["error"]
 
         prompt = _render_prompt(runtime, pid)
-        assert "'invalid_snapshot': True" in prompt
+        assert '"invalid_snapshot":true' in prompt
         assert "loaded Skill snapshot failed validation" in prompt
         assert forged["error"] not in prompt
         assert forged_marker not in prompt

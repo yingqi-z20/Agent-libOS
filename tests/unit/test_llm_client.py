@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any
 from agent_libos.config import AgentLibOSConfig, LLMDefaults
+import agent_libos.llm.client as llm_client_module
 from agent_libos.llm.client import LLMClient, LLMError
 
 class TestLLMClient:
@@ -179,7 +180,7 @@ class TestLLMClient:
         assert response_format['json_schema']['strict'] is True
         assert response_format['json_schema']['schema']['required'] == ['ok']
 
-    def test_openai_responses_options_are_sent_only_to_official_openai_endpoint(self) -> None:
+    def test_explicit_responses_options_are_sent_to_configured_provider(self) -> None:
         response = SimpleNamespace(id='resp_options', model='gpt-test', output_text='', output=[])
         fake = FakeAsyncOpenAI(responses=FakeResponses(response))
         client = LLMClient(
@@ -189,7 +190,7 @@ class TestLLMClient:
             store=True,
             safety_identifier='session-safe',
             prompt_cache_key='cache-key',
-            prompt_cache_retention='24h',
+            prompt_cache_retention='in-memory',
         )
         client._async_client = fake
 
@@ -205,7 +206,8 @@ class TestLLMClient:
         assert payload['previous_response_id'] == 'resp_prev'
         assert payload['safety_identifier'] == 'session-safe'
         assert payload['prompt_cache_key'] == 'cache-key'
-        assert payload['prompt_cache_retention'] == '24h'
+        assert client.prompt_cache_retention == 'in_memory'
+        assert payload['prompt_cache_retention'] == 'in_memory'
 
         no_store_fake = FakeAsyncOpenAI(responses=FakeResponses(response))
         no_store = LLMClient(model='gpt-test', api_key='key', api_mode='responses', store=False)
@@ -241,9 +243,208 @@ class TestLLMClient:
         )
         custom_payload = custom_fake.responses.payloads[0]
         assert 'previous_response_id' not in custom_payload
-        assert 'safety_identifier' not in custom_payload
-        assert 'prompt_cache_key' not in custom_payload
-        assert 'prompt_cache_retention' not in custom_payload
+        assert custom_payload['safety_identifier'] == 'session-safe'
+        assert custom_payload['prompt_cache_key'] == 'cache-key'
+        assert custom_payload['prompt_cache_retention'] == '24h'
+
+    def test_chat_sends_explicit_cache_and_safety_options(self) -> None:
+        chat_completion = SimpleNamespace(
+            id='chatcmpl_options',
+            model='gpt-test',
+            choices=[
+                SimpleNamespace(
+                    finish_reason='stop',
+                    message=SimpleNamespace(content='ok', tool_calls=[]),
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(chat_completion)))
+        client = LLMClient(
+            base_url='https://example.com/compatible/v1',
+            model='compat-model',
+            api_key='key',
+            api_mode='chat',
+            allow_custom_base_url=True,
+            safety_identifier='session-safe',
+            prompt_cache_key='cache-key',
+            prompt_cache_retention='24h',
+        )
+        client._async_client = fake
+
+        completion = asyncio.run(
+            client.acomplete(
+                [{'role': 'user', 'content': 'answer'}],
+                json_mode=False,
+            )
+        )
+
+        payload = fake.chat.completions.payloads[0]
+        assert payload['safety_identifier'] == 'session-safe'
+        assert payload['prompt_cache_key'] == 'cache-key'
+        assert payload['prompt_cache_retention'] == '24h'
+        assert completion == 'ok'
+
+    def test_compatibility_retry_reports_only_cache_options_actually_sent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        chat_completion = SimpleNamespace(
+            id='chatcmpl_compat_options',
+            model='compat-model',
+            choices=[
+                SimpleNamespace(
+                    finish_reason='stop',
+                    message=SimpleNamespace(content='ok', tool_calls=[]),
+                )
+            ],
+        )
+        completions = FakeChatCompletions(
+            [
+                Exception('unknown parameter prompt_cache_key'),
+                Exception('unknown parameter prompt_cache_retention'),
+                Exception('unknown parameter safety_identifier'),
+                chat_completion,
+            ]
+        )
+        fake = FakeAsyncOpenAI(chat=FakeChat(completions))
+        client = LLMClient(
+            base_url='https://example.com/compatible/v1',
+            model='compat-model',
+            api_key='key',
+            api_mode='chat',
+            allow_custom_base_url=True,
+            safety_identifier='session-safe',
+            prompt_cache_key='cache-key',
+            prompt_cache_retention='24h',
+        )
+        client._async_client = fake
+        monkeypatch.setattr(llm_client_module, '_is_openai_sdk_error', lambda _exc: True)
+
+        completion = asyncio.run(
+            client.acomplete_with_metadata(
+                [{'role': 'user', 'content': 'answer'}],
+                json_mode=False,
+            )
+        )
+
+        assert len(completions.payloads) == 4
+        assert 'prompt_cache_key' in completions.payloads[0]
+        assert 'prompt_cache_key' not in completions.payloads[1]
+        assert 'prompt_cache_retention' not in completions.payloads[2]
+        assert 'safety_identifier' not in completions.payloads[3]
+        assert completion.provider_request_options == {
+            'prompt_cache_key_sent': False,
+            'prompt_cache_retention': None,
+            'prompt_cache_options_sent': False,
+            'safety_identifier_sent': False,
+        }
+        assert completion.compatibility_removed_options == [
+            'prompt_cache_key',
+            'prompt_cache_retention',
+            'safety_identifier',
+        ]
+
+    def test_json_instruction_is_independent_of_dynamic_json_text(self) -> None:
+        client = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='chat',
+            defaults=LLMDefaults(json_instruction='Return canonical JSON.'),
+        )
+        without_keyword = client._messages_with_json_instruction(
+            [
+                {'role': 'system', 'content': 'Stable policy.'},
+                {'role': 'user', 'content': 'Answer the request.'},
+            ]
+        )
+        with_keyword = client._messages_with_json_instruction(
+            [
+                {'role': 'system', 'content': 'Stable policy.'},
+                {'role': 'user', 'content': 'The dynamic tool returned JSON.'},
+            ]
+        )
+        tool_keyword = client._messages_with_json_instruction(
+            [
+                {'role': 'system', 'content': 'Stable policy.'},
+                {'role': 'tool', 'content': 'Return canonical JSON.'},
+            ]
+        )
+
+        expected_system = 'Stable policy. Return canonical JSON.'
+        assert without_keyword[0]['content'] == expected_system
+        assert with_keyword[0]['content'] == expected_system
+        assert tool_keyword[0]['content'] == expected_system
+
+        already_static = client._messages_with_json_instruction(
+            [
+                {'role': 'developer', 'content': expected_system},
+                {'role': 'user', 'content': 'anything'},
+            ]
+        )
+        assert already_static == [
+            {'role': 'developer', 'content': expected_system},
+            {'role': 'user', 'content': 'anything'},
+        ]
+
+    def test_responses_bounds_native_and_plain_tool_outputs_with_metadata(self) -> None:
+        response = SimpleNamespace(
+            id='resp_bounded_tool_output',
+            model='gpt-test',
+            output_text='',
+            output=[],
+        )
+        defaults = LLMDefaults(tool_output_prompt_max_chars=128)
+        large_output = 'x' * 1_000
+
+        native_fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        native = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='responses',
+            store=True,
+            defaults=defaults,
+        )
+        native._async_client = native_fake
+        asyncio.run(
+            native.acomplete_action(
+                messages=[
+                    {'role': 'tool', 'tool_call_id': 'call_1', 'content': large_output},
+                    {'role': 'user', 'content': 'continue'},
+                ],
+                tools=[],
+                previous_response_id='resp_previous',
+            )
+        )
+        native_output = native_fake.responses.payloads[0]['input'][0]['output']
+        assert len(native_output) <= 128
+        assert 'tool_output_omitted' in native_output
+        assert 'original_chars=1000' in native_output
+        assert 'omitted_chars=' in native_output
+
+        plain_fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        plain = LLMClient(
+            model='gpt-test',
+            api_key='key',
+            api_mode='responses',
+            store=False,
+            defaults=defaults,
+        )
+        plain._async_client = plain_fake
+        asyncio.run(
+            plain.acomplete_action(
+                messages=[
+                    {'role': 'tool', 'tool_call_id': 'call_1', 'content': large_output},
+                    {'role': 'user', 'content': 'continue'},
+                ],
+                tools=[],
+                previous_response_id='resp_previous',
+            )
+        )
+        plain_output = plain_fake.responses.payloads[0]['input'][0]['content']
+        assert len(plain_output) <= 128
+        assert plain_output.startswith('Tool output (call_id=call_1):\n')
+        assert 'tool_output_omitted' in plain_output
+        assert 'original_chars=1000' in plain_output
 
     def test_openai_responses_payload_preserves_tool_outputs_or_breaks_state_chain(self) -> None:
         response = SimpleNamespace(id='resp_tool_output', model='gpt-test', output_text='', output=[])
@@ -386,6 +587,7 @@ class TestLLMClient:
         monkeypatch.setenv('OPENAI_PROMPT_CACHE_RETENTION', 'in-memory')
         monkeypatch.setenv('OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID', 'true')
         monkeypatch.setenv('OPENAI_PARALLEL_TOOL_CALLS', 'true')
+        monkeypatch.setenv('OPENAI_FALLBACK_JSON_ACTIONS', 'true')
         monkeypatch.setenv('OPENAI_ENABLE_THINKING', 'true')
         monkeypatch.setenv('OPENAI_ORG_ID', 'org-one')
         monkeypatch.setenv('OPENAI_PROJECT_ID', 'project-one')
@@ -394,9 +596,10 @@ class TestLLMClient:
 
         assert client.safety_identifier == 'safe-session'
         assert client.prompt_cache_key == 'cache-key'
-        assert client.prompt_cache_retention == 'in-memory'
+        assert client.prompt_cache_retention == 'in_memory'
         assert client.responses_previous_response_id is True
         assert client.parallel_tool_calls is True
+        assert client.fallback_json_actions is True
         assert client._extra_body() == {'enable_thinking': True}
         assert client.organization == 'org-one'
         assert client.project == 'project-one'
@@ -542,6 +745,19 @@ class TestLLMClient:
         )
         assert retry is None
 
+    def test_new_prompt_cache_options_incompatibility_can_downgrade(self) -> None:
+        client = LLMClient(model='gpt-test', api_key='key', api_mode='responses')
+        retry = client._compatibility_retry_payload(
+            {
+                'model': 'gpt-test',
+                'prompt_cache_options': {'mode': 'implicit', 'ttl': '30m'},
+            },
+            Exception('unknown parameter prompt_cache_options'),
+            api='responses',
+        )
+
+        assert retry == {'model': 'gpt-test'}
+
     def test_strict_tool_incompatibility_retry_removes_strict_fields(self) -> None:
         client = LLMClient(model='gpt-test', api_key='key', api_mode='chat')
         retry = client._compatibility_retry_payload(
@@ -566,6 +782,103 @@ class TestLLMClient:
         assert retry is not None
         assert 'strict' not in retry['tools'][0]['function']
         assert 'strict' not in retry['tools'][1]
+
+    def test_tool_protocol_rejection_fails_when_json_fallback_is_disabled(self) -> None:
+        fake = FakeAsyncOpenAI(
+            chat=FakeChat(
+                FakeChatCompletions(LLMError("provider rejected tools parameter"))
+            )
+        )
+        client = LLMClient(
+            model="gpt-test",
+            api_key="key",
+            api_mode="chat",
+        )
+        client._async_client = fake
+
+        with pytest.raises(LLMError, match="rejected tools"):
+            asyncio.run(
+                client.acomplete_action(
+                    messages=[{"role": "user", "content": "exit"}],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "process_exit",
+                                "description": "Exit.",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                )
+            )
+
+        assert len(fake.chat.completions.payloads) == 1
+
+    def test_tool_protocol_rejection_opt_in_preserves_fallback_metadata(self) -> None:
+        fallback_completion = SimpleNamespace(
+            id="chatcmpl_fallback",
+            _request_id="req_fallback",
+            model="fallback-model",
+            usage=SimpleNamespace(
+                prompt_tokens=21,
+                completion_tokens=4,
+                total_tokens=25,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=13),
+            ),
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content='{"action":"process_exit","payload":{"done":true}}',
+                        tool_calls=[],
+                    ),
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(
+            chat=FakeChat(
+                FakeChatCompletions(
+                    [
+                        LLMError("provider rejected tool_choice and tools"),
+                        fallback_completion,
+                    ]
+                )
+            )
+        )
+        client = LLMClient(
+            model="gpt-test",
+            api_key="key",
+            api_mode="chat",
+            fallback_json_actions=True,
+        )
+        client._async_client = fake
+
+        completion = asyncio.run(
+            client.acomplete_action(
+                messages=[{"role": "user", "content": "exit"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "process_exit",
+                            "description": "Exit.",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            )
+        )
+
+        assert completion.fallback_json_action_used is True
+        assert completion.model == "fallback-model"
+        assert completion.request_id == "req_fallback"
+        assert completion.response_id == "chatcmpl_fallback"
+        assert completion.usage["total_tokens"] == 25
+        assert completion.raw is fallback_completion
+        assert "tools" in fake.chat.completions.payloads[0]
+        assert "tools" not in fake.chat.completions.payloads[1]
+        assert "tool_choice" not in fake.chat.completions.payloads[1]
 
     def test_close_releases_cached_sync_and_async_clients(self) -> None:
         client = LLMClient(model='gpt-test', api_key='key')
@@ -664,7 +977,10 @@ class FakeChatCompletions:
 
     async def create(self, **payload: Any) -> Any:
         self.payloads.append(payload)
-        return self.completions.pop(0)
+        selected = self.completions.pop(0)
+        if isinstance(selected, BaseException):
+            raise selected
+        return selected
 
 
 class ClosableClient:

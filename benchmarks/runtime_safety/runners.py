@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -157,12 +158,13 @@ class PlannedActionClient:
         with self._lock:
             queue = self.actions
             for process_goal, candidate in self.scoped_actions.items():
-                json_marker = (
-                    f'"text": {json.dumps(process_goal, ensure_ascii=False)}'
+                json_value = json.dumps(process_goal, ensure_ascii=False)
+                json_goal_field = re.compile(
+                    rf'"text"\s*:\s*{re.escape(json_value)}(?=\s*[,}}])'
                 )
                 repr_marker = f"'text': {process_goal!r}"
                 if (
-                    json_marker in serialized_messages
+                    json_goal_field.search(serialized_messages) is not None
                     or repr_marker in serialized_messages
                 ):
                     queue = candidate

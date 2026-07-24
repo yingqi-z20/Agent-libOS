@@ -67,6 +67,7 @@ _GUI_BOOL_FIELDS = {
     "allow_custom_base_url",
     "auto_run",
     "auto_wait_on_empty_tool_calls",
+    "fallback_json_actions",
     "confirmed",
     "enabled",
     "failed",
@@ -82,6 +83,7 @@ _GUI_BOOL_FIELDS = {
 _GUI_NULLABLE_BOOL_FIELDS = {
     "allow_custom_base_url",
     "auto_wait_on_empty_tool_calls",
+    "fallback_json_actions",
     "parallel_tool_calls",
     "responses_previous_response_id",
     "store",
@@ -1006,6 +1008,20 @@ class GuiRuntimeService:
                 "messages": [],
             },
         )
+        # Activity rows intentionally read only a bounded recent LLM window.
+        # Use the process' durable, hierarchical resource counters for the
+        # user-facing totals so long-running tasks are not reported as if they
+        # stopped at ``snapshot_process_llm_call_limit``.  The bounded values
+        # remain a compatibility floor for imported/manual call rows that
+        # predate resource accounting.
+        llm_call_count = max(
+            int(process.resource_usage.llm_calls),
+            int(activity_row["llm_call_count"]),
+        )
+        token_total = max(
+            int(process.resource_usage.llm_total_tokens),
+            int(activity_row["token_total"]),
+        )
         return {
             **to_jsonable(process),
             **process_state_to_mapping(
@@ -1018,8 +1034,8 @@ class GuiRuntimeService:
             "unread_message_count": int(activity_row["unread_message_count"]),
             "interrupt_count": int(activity_row["interrupt_count"]),
             "messages": to_jsonable(activity_row["messages"] if include_messages else []),
-            "llm_call_count": int(activity_row["llm_call_count"]),
-            "token_total": int(activity_row["token_total"]),
+            "llm_call_count": llm_call_count,
+            "token_total": token_total,
             "resource_remaining": to_jsonable(
                 resource_remaining
                 if resource_remaining is not None

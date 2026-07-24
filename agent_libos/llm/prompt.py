@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from agent_libos.models import (
@@ -14,27 +15,20 @@ from agent_libos.models import (
     PROMPT_MODE_LIBOS_DEFAULT,
     PROMPT_MODE_MINIMAL_RUNTIME,
     PROMPT_MODES,
-    process_outcome_to_mapping,
-    process_wait_state_to_mapping,
 )
 from agent_libos.utils.serde import loads
 
 
+PromptEvent = Event | Mapping[str, Any]
+
+
 ACTION_PROTOCOL = """
 You may write ordinary assistant text when it helps your local reasoning.
-The runtime will only execute a valid OpenAI tool call into the Skills/Tools Layer.
+The runtime will only execute a valid native model tool call into the Skills/Tools Layer.
 These tool calls are library/runtime wrapper calls, like libc or a language standard library.
 They are not kernel syscalls; the runtime may validate, attenuate, checkpoint, ask a human, sandbox, audit, or decompose them into lower-level libOS primitives.
-Prefer using a tool call for the final action.
-If the model/provider cannot emit tool calls, put the final JSON action object at the end of the response.
-
-The fallback JSON action object uses this shape, where action is the exact Skills/Tools Layer tool name:
-{
-  "action": "<tool_name>",
-  "...": "tool argument fields"
-}
-
-The available library calls and their schemas are listed in the Available tools section.
+Use a native tool call for the final action. Ordinary assistant text has no side effect.
+The available library calls and their input schemas are supplied through the model tool schema for this turn.
 Use object ids and process ids exactly as shown in context. Never invent a capability grant.
 If an action is risky or requires unavailable authority, use request_permission
 for an exact resource/right, use ask_human for missing intent, or choose a
@@ -52,6 +46,21 @@ If the goal asks you to create or update a workspace file and write_text_file is
 If the goal is complete, follow the AgentImage's final reporting contract first,
 then call process_exit when it is available.
 Prefer producing small typed objects for reasoning artifacts instead of long prose.
+""".strip()
+
+
+FALLBACK_JSON_PROTOCOL = """
+Compatibility JSON action protocol (explicitly enabled by the Host):
+- Prefer a native model tool call whenever the provider supports it.
+- Otherwise put one final JSON action object at the end of the response.
+- `action` must be an exact tool name from the compatibility tool schemas below;
+  all other fields are arguments for that tool.
+
+Fallback JSON shape:
+{
+  "action": "<tool_name>",
+  "...": "tool argument fields"
+}
 """.strip()
 
 
@@ -84,7 +93,7 @@ Your job is to advance the current process goal by choosing one Skills/Tools Lay
 Runtime model:
 - Durable process state and handoffs use typed Object Memory. A workspace
   filesystem, when present, is a separate mediated external resource.
-- You act through OpenAI tool calls exposed by the Skills/Tools Layer. Free-form text is allowed, but it has no side effect.
+- You act through native model tool calls exposed by the Skills/Tools Layer. Free-form text is allowed, but it has no side effect.
 - Those calls are wrappers over libOS services, not direct syscalls.
 - Tools, object reads, object writes, forks, human requests, JIT tools, checkpoints, and exits are mediated by the runtime.
 - The runtime will enforce capabilities, human approval, sandboxing, audit logging, and checkpoint rules.
@@ -111,12 +120,15 @@ def build_system_prompt(image: AgentImage) -> str:
     if mode == PROMPT_MODE_IMAGE_ONLY:
         return image.system_prompt.strip()
     if mode == PROMPT_MODE_MINIMAL_RUNTIME:
-        return "\n\n".join([image_prompt, MINIMAL_RUNTIME_PROMPT])
+        return "\n\n".join(
+            [MINIMAL_RUNTIME_PROMPT, COMPLETION_CONTRACT, image_prompt]
+        )
     return "\n\n".join(
         [
             BASE_SYSTEM_PROMPT,
-            f"Current AgentImage: {image.image_id}\nSafety profile: {image.safety_profile}\nImage instruction: {image_prompt}",
             ACTION_PROTOCOL,
+            COMPLETION_CONTRACT,
+            f"Current AgentImage: {image.image_id}\nSafety profile: {image.safety_profile}\nImage instruction: {image_prompt}",
         ]
     )
 
@@ -124,7 +136,7 @@ def build_system_prompt(image: AgentImage) -> str:
 def build_user_prompt(
     process: AgentProcess,
     context: MaterializedContext,
-    events: list[Event],
+    events: list[PromptEvent],
     capabilities: list[Capability],
     tools: list[dict[str, Any]],
     skills: list[dict[str, Any]] | None = None,
@@ -132,6 +144,7 @@ def build_user_prompt(
     prompt_mode: str = PROMPT_MODE_LIBOS_DEFAULT,
     requestable_capabilities: list[dict[str, Any]] | None = None,
     original_goal_context: str | None = None,
+    fallback_json_actions: bool = False,
 ) -> str:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
     if mode == PROMPT_MODE_IMAGE_ONLY:
@@ -139,59 +152,44 @@ def build_user_prompt(
         # Runtime envelope, but explicitly activated Skill instructions remain
         # part of the process contract.  Preserve the historical exact-context
         # behavior when no Skills are loaded.
-        parts = (
-            [_requestable_capability_section(requestable_capabilities)]
-            if requestable_capabilities
-            else []
-        )
-        if skills:
-            parts.append(_skill_section(skills))
+        parts: list[str] = []
         if available_skills:
             parts.append(_available_skill_section(available_skills))
+        if skills:
+            parts.append(_skill_section(skills))
+        if fallback_json_actions:
+            parts.append(_fallback_tool_section(tools))
         parts.append(context.text.strip())
+        if requestable_capabilities:
+            parts.append(_requestable_capability_section(requestable_capabilities))
         return "\n\n".join(part for part in parts if part.strip())
-    if mode == PROMPT_MODE_MINIMAL_RUNTIME:
-        return _minimal_runtime_user_prompt(
-            process=process,
-            context=context,
-            events=events,
-            capabilities=capabilities,
-            tools=tools,
-            skills=skills or [],
-            available_skills=available_skills or [],
-            requestable_capabilities=requestable_capabilities or [],
-            original_goal_context=original_goal_context,
-        )
     if context.policy_used == "llm_context_object":
         return "\n\n".join(
-            [
+            part
+            for part in [
                 "The append-only LLM context object below is the source of truth for this process quantum.",
-                "OpenAI tool schemas are supplied out-of-band; fallback JSON must still use an exact available tool name.",
-                "Choose the next single runtime action after reading the latest appended entries.",
-                _requestable_capability_section(requestable_capabilities or []),
-                _skill_section(skills or []),
+                "Native model tool schemas are supplied out-of-band.",
                 _available_skill_section(available_skills or []),
                 _original_goal_section(original_goal_context),
-                COMPLETION_CONTRACT,
+                _skill_section(skills or []),
+                _fallback_tool_section(tools) if fallback_json_actions else "",
                 context.text,
+                _requestable_capability_section(requestable_capabilities or []),
                 _process_message_directive(process, events),
             ]
+            if part.strip()
         )
-    return "\n\n".join(
-        [
-            _process_section(process),
-            _original_goal_section(original_goal_context),
-            _skill_section(skills or []),
-            _available_skill_section(available_skills or []),
-            _capability_section(capabilities),
-            _requestable_capability_section(requestable_capabilities or []),
-            _tool_section(tools),
-            _event_section(events),
-            _context_section(context),
-            COMPLETION_CONTRACT,
-            "Choose the next single runtime action. Prefer an OpenAI tool call; otherwise put a fallback JSON action object at the end.",
-            _process_message_directive(process, events),
-        ]
+    return _runtime_user_prompt(
+        process=process,
+        context=context,
+        events=events,
+        capabilities=capabilities,
+        tools=tools,
+        skills=skills or [],
+        available_skills=available_skills or [],
+        requestable_capabilities=requestable_capabilities or [],
+        original_goal_context=original_goal_context,
+        fallback_json_actions=fallback_json_actions,
     )
 
 
@@ -200,30 +198,32 @@ def _prompt_mode(image: AgentImage) -> str:
     return mode if mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
 
 
-def _minimal_runtime_user_prompt(
+def _runtime_user_prompt(
     *,
     process: AgentProcess,
     context: MaterializedContext,
-    events: list[Event],
+    events: list[PromptEvent],
     capabilities: list[Capability],
     tools: list[dict[str, Any]],
     skills: list[dict[str, Any]],
     available_skills: list[dict[str, Any]],
     requestable_capabilities: list[dict[str, Any]],
     original_goal_context: str | None,
+    fallback_json_actions: bool,
 ) -> str:
     parts = [
-        _process_fact_section(process),
+        _available_skill_section(available_skills),
         _original_goal_section(original_goal_context),
         _skill_section(skills),
-        _available_skill_section(available_skills),
-        _capability_section(capabilities),
-        _requestable_capability_section(requestable_capabilities),
-        _tool_section(tools),
-        _event_section(events),
-        COMPLETION_CONTRACT,
-        _context_section(context),
-        _process_message_directive(process, events),
+        _fallback_tool_section(tools) if fallback_json_actions else "",
+        _context_body_section(context),
+        _volatile_runtime_section(
+            process=process,
+            context=context,
+            events=events,
+            capabilities=capabilities,
+            requestable_capabilities=requestable_capabilities,
+        ),
     ]
     return "\n\n".join(part for part in parts if part.strip())
 
@@ -261,36 +261,65 @@ def _goal_context_from_persisted_prompt(
     content: str,
     goal_oid: str,
 ) -> str | None:
+    for extractor in (
+        _legacy_tagged_goal_context,
+        _canonical_object_goal_context,
+        _memory_delta_goal_context,
+    ):
+        selected = extractor(content, goal_oid)
+        if selected is not None:
+            return selected
+    return None
+
+
+def _legacy_tagged_goal_context(content: str, goal_oid: str) -> str | None:
     source_marker = f"[{goal_oid}] "
     source_start = 0 if content.startswith(source_marker) else -1
     if source_start < 0:
         line_start = content.find(f"\n{source_marker}")
         source_start = line_start + 1 if line_start >= 0 else -1
-    if source_start >= 0:
-        boundaries = [
-            content.find(marker, source_start + len(source_marker))
-            for marker in (
-                "\n\n[",
-                "\n\nCumulative completion contract:",
-                "\n\nChoose the next single runtime action.",
-            )
-        ]
-        source_end = min(
-            (boundary for boundary in boundaries if boundary >= 0),
-            default=len(content),
+    if source_start < 0:
+        return None
+    boundaries = [
+        content.find(marker, source_start + len(source_marker))
+        for marker in (
+            "\n\n[",
+            "\n\nCumulative completion contract:",
+            "\n\nLoaded skills:",
+            "\n\nMaterialized context:",
+            "\n\nCurrent runtime state (volatile",
+            "\n\nChoose the next single runtime action.",
         )
-        return content[source_start:source_end]
+    ]
+    source_end = min(
+        (boundary for boundary in boundaries if boundary >= 0),
+        default=len(content),
+    )
+    return content[source_start:source_end]
 
+
+def _canonical_object_goal_context(content: str, goal_oid: str) -> str | None:
+    decoder = json.JSONDecoder()
+    for line in content.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        payload = _decode_json_object(decoder, candidate, require_complete=True)
+        if payload is None:
+            continue
+        if _is_goal_object_record(payload, goal_oid):
+            return candidate
+    return None
+
+
+def _memory_delta_goal_context(content: str, goal_oid: str) -> str | None:
     decoder = json.JSONDecoder()
     for section in content.split("\n---\n"):
         candidate = section.strip()
         if not candidate.startswith("{"):
             continue
-        try:
-            payload, _end = decoder.raw_decode(candidate)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict) or payload.get("kind") != "memory_delta":
+        payload = _decode_json_object(decoder, candidate)
+        if payload is None or payload.get("kind") != "memory_delta":
             continue
         objects = payload.get("objects")
         if not isinstance(objects, list):
@@ -305,6 +334,32 @@ def _goal_context_from_persisted_prompt(
     return None
 
 
+def _decode_json_object(
+    decoder: json.JSONDecoder,
+    candidate: str,
+    *,
+    require_complete: bool = False,
+) -> dict[str, Any] | None:
+    try:
+        payload, end = decoder.raw_decode(candidate)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or (require_complete and end != len(candidate)):
+        return None
+    return payload
+
+
+def _is_goal_object_record(payload: dict[str, Any], goal_oid: str) -> bool:
+    return (
+        payload.get("record_type") == "object_memory_object"
+        and "payload" in payload
+        and (
+            payload.get("object_oid") == goal_oid
+            or payload.get("oid") == goal_oid
+        )
+    )
+
+
 def _original_goal_section(original_goal_context: str | None) -> str:
     if not original_goal_context:
         return ""
@@ -317,14 +372,14 @@ def _original_goal_section(original_goal_context: str | None) -> str:
 
 def _process_message_directive(
     process: AgentProcess,
-    events: list[Event],
+    events: list[PromptEvent],
 ) -> str:
     """Keep explicit queued input actionable without copying its body into context."""
 
     notices = [
         event
         for event in events
-        if event.type == EventType.PROCESS_MESSAGE_NOTICE
+        if _event_type_value(event) == EventType.PROCESS_MESSAGE_NOTICE.value
     ]
     if not notices:
         return ""
@@ -358,34 +413,10 @@ def _process_fact_section(process: AgentProcess) -> str:
         "Process facts:\n"
         f"- pid: {process.pid}\n"
         f"- parent_pid: {process.parent_pid}\n"
-        f"- image_id: {process.image_id}\n"
-        f"- status: {process.status.value}\n"
         f"- working_directory: {process.working_directory}\n"
         f"- goal_oid: {process.goal_oid} (identity anchor only; not an Object name or read capability)\n"
         "- goal_recovery: use materialized context; after reopen, a cumulative-review image uses nonterminal process_exit\n"
         f"- checkpoint_head: {process.checkpoint_head}\n"
-        f"- wait_state: {process_wait_state_to_mapping(process.wait_state)}\n"
-        f"- outcome: {process_outcome_to_mapping(process.outcome)}\n"
-        f"- state_generation: {process.state_generation}\n"
-        f"- status_message: {process.status_message}"
-    )
-
-
-def _process_section(process: AgentProcess) -> str:
-    return (
-        "Process:\n"
-        f"- pid: {process.pid}\n"
-        f"- parent_pid: {process.parent_pid}\n"
-        f"- image_id: {process.image_id}\n"
-        f"- status: {process.status.value}\n"
-        f"- working_directory: {process.working_directory}\n"
-        f"- goal_oid: {process.goal_oid} (identity anchor only; not an Object name or read capability)\n"
-        "- goal_recovery: use materialized context; after reopen, a cumulative-review image uses nonterminal process_exit\n"
-        f"- tool_table: {process.model_tool_table}\n"
-        f"- checkpoint_head: {process.checkpoint_head}\n"
-        f"- wait_state: {process_wait_state_to_mapping(process.wait_state)}\n"
-        f"- outcome: {process_outcome_to_mapping(process.outcome)}\n"
-        f"- state_generation: {process.state_generation}\n"
         f"- status_message: {process.status_message}"
     )
 
@@ -409,7 +440,8 @@ def _capability_section(capabilities: list[Capability]) -> str:
         for cap in capabilities
         if cap.active
     ]
-    return f"Capabilities:\n{visible}"
+    visible.sort(key=_prompt_json)
+    return f"Capabilities:\n{_prompt_json(visible)}"
 
 
 def _capability_policy(cap: Capability) -> str:
@@ -425,9 +457,12 @@ def _capability_policy(cap: Capability) -> str:
 def _requestable_capability_section(
     requestable_capabilities: list[dict[str, Any]],
 ) -> str:
+    if not requestable_capabilities:
+        return ""
+    visible = _sorted_capability_mappings(requestable_capabilities)
     return (
         "Permission-request ceilings (not capability grants):\n"
-        f"{requestable_capabilities}\n"
+        f"{_prompt_json(visible)}\n"
         "request_permission may ask only within these Host-declared ceilings; "
         "an effect still requires the resulting Human decision. Plan coherent "
         "requests from this list instead of probing an effect for denial."
@@ -435,94 +470,235 @@ def _requestable_capability_section(
 
 
 def _skill_section(skills: list[dict[str, Any]]) -> str:
-    visible: list[dict[str, Any]] = []
-    for skill in skills:
+    rendered: list[str] = []
+    for skill in sorted(skills, key=_skill_sort_key):
         if skill.get("invalid_snapshot"):
-            visible.append(
-                {
-                    "skill_id": skill.get("skill_id"),
-                    "invalid_snapshot": True,
-                    "error": "loaded Skill snapshot failed validation",
-                }
+            rendered.append(
+                f"## {skill.get('skill_id') or 'unknown Skill'}\n\n"
+                "Compact metadata: "
+                f"{_prompt_json({'invalid_snapshot': True, 'error': 'loaded Skill snapshot failed validation'})}"
             )
             continue
-        visible.append(
+        skill_id = str(skill.get("skill_id") or "").strip()
+        instructions = str(skill.get("instructions") or "").strip()
+        metadata = _skill_prompt_metadata(skill)
+        if not skill_id and not instructions and not metadata:
+            continue
+        parts = [f"## {skill_id or 'Loaded Skill'}"]
+        if instructions:
+            parts.append(instructions)
+        if metadata:
+            parts.append(f"Compact metadata: {_prompt_json(metadata)}")
+        rendered.append("\n\n".join(parts))
+    if not rendered:
+        return ""
+    return "Loaded skills:\n\n" + "\n\n---\n\n".join(rendered)
+
+
+def _skill_sort_key(skill: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(skill.get("skill_id") or ""),
+        str(skill.get("name") or ""),
+    )
+
+
+def _skill_prompt_metadata(skill: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+
+    allowed_tools = sorted(
+        {
+            name
+            for item in skill.get("allowed_tools", [])
+            if (name := _named_prompt_item(item))
+        }
+    )
+    if allowed_tools:
+        metadata["allowed_tools"] = allowed_tools
+
+    actions: list[dict[str, Any]] = []
+    for item in skill.get("actions", []):
+        name = _named_prompt_item(item)
+        if not name:
+            continue
+        use_cases = (
+            sorted(str(value) for value in item.get("use_cases", []))
+            if isinstance(item, dict)
+            else []
+        )
+        actions.append({"name": name, "use_cases": use_cases})
+    if actions:
+        metadata["actions"] = sorted(actions, key=_prompt_json)
+
+    jit_tools = sorted(
+        {
+            name
+            for item in skill.get("jit_tools", [])
+            if (name := _named_prompt_item(item))
+        }
+    )
+    if jit_tools:
+        metadata["jit_tools"] = jit_tools
+
+    resources: list[dict[str, Any]] = []
+    for item in skill.get("resources", []):
+        if isinstance(item, str):
+            resources.append({"path": item})
+            continue
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        resources.append(
             {
-                "skill_id": skill.get("skill_id"),
-                "name": skill.get("name"),
-                "version": skill.get("version"),
-                "description": skill.get("description", ""),
-                "instructions": skill.get("instructions", ""),
-                "allowed_tools": skill.get("allowed_tools", []),
-                "actions": skill.get("actions", []),
-                "jit_tools": skill.get("jit_tools", []),
-                "required_capabilities": skill.get("required_capabilities", []),
-                "resources": skill.get("resources", []),
+                "path": item.get("path"),
+                "kind": item.get("kind"),
+                "size_bytes": item.get("size_bytes"),
             }
         )
-    return f"Loaded skills:\n{visible}"
+    if resources:
+        metadata["resources"] = sorted(resources, key=_prompt_json)
+
+    required_capabilities = _sorted_capability_mappings(
+        skill.get("required_capabilities", [])
+    )
+    if required_capabilities:
+        metadata["required_capabilities"] = required_capabilities
+    return metadata
+
+
+def _named_prompt_item(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return str(item.get("name") or "")
+    return ""
 
 
 def _available_skill_section(skills: list[dict[str, Any]]) -> str:
-    visible = [
-        {
-            "skill_id": skill.get("skill_id"),
-            "description": skill.get("description", ""),
-            "active": bool(skill.get("active")),
-        }
-        for skill in skills
-    ]
+    visible = sorted(
+        [
+            {
+                "skill_id": skill.get("skill_id"),
+                "description": skill.get("description", ""),
+            }
+            for skill in skills
+        ],
+        key=_prompt_json,
+    )
     if not visible:
         return ""
     return (
         "Available built-in Skills (metadata only):\n"
-        f"{visible}\n"
+        f"{_prompt_json(visible)}\n"
         "Activate the smallest matching Skill to load its instructions and "
         "image-authorized tool schemas. Activation does not grant capability authority."
     )
 
 
-def _tool_section(tools: list[dict[str, Any]]) -> str:
+def _fallback_tool_section(tools: list[dict[str, Any]]) -> str:
     visible = []
     for row in tools:
         spec = loads(row.get("spec_json"), {})
         visible.append(
             {
-                "tool_id": row.get("tool_id"),
                 "name": row.get("name"),
-                "scope": row.get("scope"),
                 "description": spec.get("description", ""),
-                "version": spec.get("version", "1.0.0"),
-                "policy": spec.get("policy", {}),
-                "tags": spec.get("tags", []),
-                "side_effects": spec.get("side_effects", []),
                 "input_schema": spec.get("input_schema", {}),
-                "output_schema": spec.get("output_schema", {}),
             }
         )
-    return f"Available tools:\n{visible}"
-
-
-def _event_section(events: list[Event]) -> str:
-    visible = [
-        {
-            "event_id": event.event_id,
-            "type": event.type.value,
-            "source": event.source,
-            "target": event.target,
-            "payload": event.payload,
-        }
-        for event in events[-10:]
-    ]
-    return f"Recent events:\n{visible}"
-
-
-def _context_section(context: MaterializedContext) -> str:
+    visible.sort(key=_prompt_json)
     return (
-        "Materialized context:\n"
+        f"{FALLBACK_JSON_PROTOCOL}\n\n"
+        "Compatibility tool schemas:\n"
+        f"{_prompt_json(visible)}"
+    )
+
+
+def _event_section(events: list[PromptEvent]) -> str:
+    visible = [_event_prompt_record(event) for event in events]
+    if not visible:
+        return ""
+    return f"Recent events:\n{_prompt_json(visible)}"
+
+
+def _context_body_section(context: MaterializedContext) -> str:
+    return f"Materialized context:\n{context.text}"
+
+
+def _context_metadata_section(context: MaterializedContext) -> str:
+    return (
+        "Materialized context metadata (volatile):\n"
         f"- policy: {context.policy_used}\n"
         f"- token_estimate: {context.token_count}\n"
-        f"- object_refs: {context.object_refs}\n"
-        f"- omitted_objects: {context.omitted_objects}\n\n"
-        f"{context.text}"
+        f"- object_refs: {_prompt_json(context.object_refs)}\n"
+        f"- omitted_objects: {_prompt_json(context.omitted_objects)}"
     )
+
+
+def _volatile_runtime_section(
+    *,
+    process: AgentProcess,
+    context: MaterializedContext,
+    events: list[PromptEvent],
+    capabilities: list[Capability],
+    requestable_capabilities: list[dict[str, Any]],
+) -> str:
+    parts = [
+        "Current runtime state (volatile; applies only to this quantum):",
+        _process_fact_section(process),
+        _context_metadata_section(context),
+        _capability_section(capabilities),
+        _requestable_capability_section(requestable_capabilities),
+        _event_section(events),
+        _process_message_directive(process, events),
+    ]
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _prompt_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _event_type_value(event: PromptEvent) -> str:
+    if isinstance(event, Mapping):
+        event_type = event.get("type")
+    else:
+        event_type = event.type
+    if isinstance(event_type, EventType):
+        return event_type.value
+    return str(event_type or "")
+
+
+def _event_prompt_record(event: PromptEvent) -> dict[str, Any]:
+    if isinstance(event, Mapping):
+        return {
+            key: event[key]
+            for key in ("event_id", "type", "source", "target", "payload")
+            if key in event
+        }
+    return {
+        "event_id": event.event_id,
+        "type": event.type.value,
+        "source": event.source,
+        "target": event.target,
+        "payload": event.payload,
+    }
+
+
+def _sorted_capability_mappings(
+    capabilities: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    visible: list[dict[str, Any]] = []
+    for capability in capabilities:
+        if not isinstance(capability, dict):
+            continue
+        projected = dict(capability)
+        rights = projected.get("rights")
+        if isinstance(rights, (list, tuple, set)):
+            projected["rights"] = sorted(str(right) for right in rights)
+        visible.append(projected)
+    return sorted(visible, key=_prompt_json)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import ctypes
 import errno
@@ -2254,14 +2256,17 @@ class SdkMcpProvider:
         ) as session:
             result = await asyncio.wait_for(session.call_tool(tool.mcp_name, arguments), timeout=timeout_s)
         content = _jsonable_mcp_value(getattr(result, "content", None))
-        structured = _jsonable_mcp_value(
-            getattr(result, "structuredContent", None) or getattr(result, "structured_content", None)
-        )
-        payload = {"content": _bounded_mcp_content(content), "structured_content": structured}
-        encoded = dumps(payload).encode("utf-8")
+        structured = _jsonable_mcp_value(_mcp_structured_content(result))
+        raw_payload = {"content": content, "structured_content": structured}
+        encoded = dumps(raw_payload).encode("utf-8")
         too_large = len(encoded) > max_response_bytes
         if too_large:
             payload = {"content": _mcp_oversize_observation(encoded), "structured_content": None}
+        else:
+            payload = {
+                "content": _bounded_mcp_content(content),
+                "structured_content": _bounded_mcp_content(structured),
+            }
         return McpProviderCallResult(
             content=payload["content"],
             structured_content=payload["structured_content"],
@@ -2338,15 +2343,17 @@ class SdkMcpProvider:
                 )
             result = await session.call_tool(tool.mcp_name, arguments)
         content = _jsonable_mcp_value(getattr(result, "content", None))
-        structured = _jsonable_mcp_value(
-            getattr(result, "structuredContent", None)
-            or getattr(result, "structured_content", None)
-        )
-        payload = {"content": _bounded_mcp_content(content), "structured_content": structured}
-        encoded = dumps(payload).encode("utf-8")
+        structured = _jsonable_mcp_value(_mcp_structured_content(result))
+        raw_payload = {"content": content, "structured_content": structured}
+        encoded = dumps(raw_payload).encode("utf-8")
         too_large = len(encoded) > max_response_bytes
         if too_large:
             payload = {"content": _mcp_oversize_observation(encoded), "structured_content": None}
+        else:
+            payload = {
+                "content": _bounded_mcp_content(content),
+                "structured_content": _bounded_mcp_content(structured),
+            }
         call_response_bytes = min(len(encoded), max_response_bytes)
         return McpProviderCallResult(
             content=payload["content"],
@@ -3096,6 +3103,13 @@ def _jsonable_mcp_value(value: Any) -> Any:
     return to_jsonable(value)
 
 
+def _mcp_structured_content(result: Any) -> Any:
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        return structured
+    return getattr(result, "structured_content", None)
+
+
 def _mcp_metadata(item: Any) -> dict[str, Any]:
     raw = _jsonable_mcp_value(item)
     if not isinstance(raw, dict):
@@ -3108,28 +3122,136 @@ def _mcp_metadata(item: Any) -> dict[str, Any]:
 
 
 def _bounded_mcp_content(value: Any) -> Any:
-    if not isinstance(value, list):
+    """Project MCP binary blocks without placing their base64 in later prompts.
+
+    This is intentionally recursive because embedded resources and provider
+    extensions may nest content blocks.  ``response_bytes`` is measured from
+    the unprojected JSON payload before this helper runs, so transport/resource
+    evidence does not mistake this compact view for the raw response size.
+    """
+
+    if isinstance(value, list):
+        return [_bounded_mcp_content(item) for item in value]
+    if not isinstance(value, dict):
         return value
-    bounded: list[Any] = []
-    for item in value:
-        if not isinstance(item, dict):
-            bounded.append(item)
+
+    item_type = value.get("type")
+    is_binary_block = item_type in {"image", "audio"}
+    is_resource_block = item_type == "resource"
+    projected: dict[str, Any] = {}
+    payload_key = "data" if is_binary_block and "data" in value else None
+    if is_resource_block and "blob" in value:
+        payload_key = "blob"
+
+    for key, item in value.items():
+        if key == payload_key:
             continue
-        item_type = item.get("type")
-        if item_type in {"image", "audio", "resource"}:
-            raw_data = item.get("data") or item.get("blob") or item.get("text") or ""
-            raw_text = str(raw_data)
-            bounded.append(
-                {
-                    "type": item_type,
-                    "mimeType": item.get("mimeType") or item.get("mime_type"),
-                    "bytes": len(raw_text.encode("utf-8")),
-                    "sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
-                }
+        if key == "resource" and is_resource_block and isinstance(item, dict):
+            projected[key] = _bounded_mcp_embedded_resource(item)
+        else:
+            projected[key] = _bounded_mcp_content(item)
+
+    if payload_key is not None:
+        _merge_mcp_content_observation(
+            projected,
+            _mcp_base64_observation(value[payload_key]),
+        )
+    elif (is_binary_block or is_resource_block) and value.get("content_omitted") is True:
+        # Preserve an already-projected provider receipt idempotently.
+        projected["raw_content_retained"] = False
+    if is_binary_block or is_resource_block:
+        return _canonical_mcp_media_metadata(projected, value)
+    return projected
+
+
+def _bounded_mcp_embedded_resource(value: dict[str, Any]) -> dict[str, Any]:
+    projected: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "blob":
+            continue
+        projected[key] = _bounded_mcp_content(item)
+    if "blob" in value:
+        _merge_mcp_content_observation(
+            projected,
+            _mcp_base64_observation(value["blob"]),
+        )
+    elif value.get("content_omitted") is True:
+        projected["raw_content_retained"] = False
+    return _canonical_mcp_media_metadata(projected, value)
+
+
+def _canonical_mcp_media_metadata(
+    projected: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    if "mimeType" not in projected and source.get("mime_type") is not None:
+        projected["mimeType"] = source["mime_type"]
+        projected.pop("mime_type", None)
+    return projected
+
+
+def _merge_mcp_content_observation(
+    projected: dict[str, Any],
+    observation: dict[str, Any],
+) -> None:
+    """Prefer computed receipts while retaining conflicting provider claims."""
+
+    conflicts = {
+        key: projected[key]
+        for key, value in observation.items()
+        if key in projected and projected[key] != value
+    }
+    if conflicts:
+        provider_reported = projected.get("provider_reported_content_metadata")
+        retained = (
+            dict(provider_reported)
+            if isinstance(provider_reported, dict)
+            else (
+                {"original_value": provider_reported}
+                if provider_reported is not None
+                else {}
             )
-            continue
-        bounded.append(item)
-    return bounded
+        )
+        retained.update(conflicts)
+        projected["provider_reported_content_metadata"] = retained
+    projected.update(observation)
+
+
+def _mcp_base64_observation(value: Any) -> dict[str, Any]:
+    """Return an explicit receipt for valid or malformed base64 content."""
+
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (binascii.Error, UnicodeEncodeError, ValueError):
+            return {
+                "content_omitted": True,
+                "raw_content_retained": False,
+                "content_encoding": "base64",
+                "base64_valid": False,
+                "encoded_bytes": len(encoded),
+                "encoded_sha256": hashlib.sha256(encoded).hexdigest(),
+            }
+        return {
+            "content_omitted": True,
+            "raw_content_retained": False,
+            "content_encoding": "base64",
+            "base64_valid": True,
+            "bytes": len(decoded),
+            "sha256": hashlib.sha256(decoded).hexdigest(),
+            "sha256_basis": "decoded_bytes",
+        }
+
+    encoded = dumps(value).encode("utf-8")
+    return {
+        "content_omitted": True,
+        "raw_content_retained": False,
+        "content_encoding": "base64",
+        "base64_valid": False,
+        "encoded_bytes": len(encoded),
+        "encoded_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
 
 
 def _mcp_oversize_observation(encoded: bytes) -> dict[str, Any]:
@@ -3137,6 +3259,9 @@ def _mcp_oversize_observation(encoded: bytes) -> dict[str, Any]:
         "type": "oversize",
         "bytes": len(encoded),
         "sha256": hashlib.sha256(encoded).hexdigest(),
+        "sha256_basis": "normalized_raw_payload",
+        "content_omitted": True,
+        "raw_content_retained": False,
     }
 
 

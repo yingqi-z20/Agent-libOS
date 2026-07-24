@@ -56,6 +56,11 @@ def test_aggregate_runs_records_routing_invalid_calls_and_overhead() -> None:
             "prompt_tokens": 200,
             "cumulative_prompt_bytes": 700,
             "initial_projection_reduction_rate": 0.9,
+            "cache_read_tokens": 120,
+            "cache_write_tokens": 10,
+            "cache_reported_calls": 2,
+            "cache_metric_input_tokens": 200,
+            "uncached_input_tokens": 80,
         },
         {
             "scenario_id": "a",
@@ -76,6 +81,11 @@ def test_aggregate_runs_records_routing_invalid_calls_and_overhead() -> None:
             "prompt_tokens": 300,
             "cumulative_prompt_bytes": 900,
             "initial_projection_reduction_rate": 0.9,
+            "cache_read_tokens": 30,
+            "cache_write_tokens": 20,
+            "cache_reported_calls": 3,
+            "cache_metric_input_tokens": 300,
+            "uncached_input_tokens": 270,
         },
     ]
 
@@ -97,6 +107,13 @@ def test_aggregate_runs_records_routing_invalid_calls_and_overhead() -> None:
     assert metrics["mean_cumulative_schema_token_estimate"] == 100.5
     assert metrics["mean_prompt_tokens"] == 250.0
     assert metrics["mean_cumulative_prompt_bytes"] == 800.0
+    assert metrics["cache_read_tokens"] == 150
+    assert metrics["cache_write_tokens"] == 30
+    assert metrics["cache_reported_calls"] == 5
+    assert metrics["cache_metric_input_tokens"] == 500
+    assert metrics["uncached_input_tokens"] == 350
+    assert metrics["cache_hit_rate"] == 0.3
+    assert metrics["by_variant"][WITH_SKILLS]["cache_hit_rate"] == 0.6
     assert metrics["by_scenario"]["a"]["correct_route_rate"] == 0.5
     assert metrics["by_variant"][WITH_SKILLS]["task_outcome_success_rate"] == 1.0
     assert (
@@ -494,3 +511,25 @@ def test_real_llm_builtin_tool_skill_routing_is_three_pair_evaluation(
         isinstance(run["task_outcome_oracle"]["passed"], bool)
         for run in report["runs"]
     )
+    failed_runs = [
+        {
+            "scenario_id": run["scenario_id"],
+            "repetition": run["repetition"],
+            "variant": run["variant"],
+            "correct_skill_activation": run["correct_skill_activation"],
+            "correct_route": run["correct_route"],
+            "task_outcome_success": run["task_outcome_success"],
+            "completed": run["completed"],
+        }
+        for run in report["runs"]
+        if not (
+            run["correct_route"]
+            and run["task_outcome_success"]
+            and run["completed"]
+            and (
+                run["variant"] == WITHOUT_SKILLS
+                or run["correct_skill_activation"]
+            )
+        )
+    ]
+    assert report_all_correct(report), failed_runs

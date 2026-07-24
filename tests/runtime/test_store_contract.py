@@ -4268,6 +4268,45 @@ def test_llm_call_limit_selects_latest_window_then_returns_chronologically(
         ]
 
 
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+def test_llm_cache_usage_counters_survive_backend_reopen(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _persistent_target(kind, tmp_path) as (target, config):
+        runtime = Runtime.open(target, config=config)
+        try:
+            pid = runtime.process.spawn(goal="cache usage persistence")
+            runtime.store.insert_llm_call(
+                LLMCallRecord(
+                    call_id="cache-usage-call",
+                    pid=pid,
+                    image_id="base-agent:v0",
+                    purpose="cache-usage-contract",
+                    status="ok",
+                    usage={
+                        "prompt_tokens": 64,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 32,
+                    },
+                    created_at=utc_now(),
+                )
+            )
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(target, config=config)
+        try:
+            call = reopened.store.list_llm_calls(pid=pid)[0]
+            assert call.usage == {
+                "prompt_tokens": 64,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 32,
+            }
+        finally:
+            reopened.close()
+
+
 @contextlib.contextmanager
 def _runtime_for_backend(kind: str, tmp_path: Path) -> Iterator[Runtime]:
     target: str | Path | None

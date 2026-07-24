@@ -6,6 +6,7 @@ from email import policy
 from email.parser import BytesParser
 import json
 from pathlib import Path, PurePosixPath
+import re
 import stat
 import tarfile
 import tomllib
@@ -15,6 +16,44 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT_NAME = "agent-libos"
 ARCHIVE_NAME = "agent_libos"
+BUILTIN_SKILL_IDS = (
+    "agent-libos-skill-navigation",
+    "agent-libos-authority-basics",
+    "agent-libos-capability-delegation",
+    "agent-libos-human-collaboration",
+    "agent-libos-runtime-session",
+    "agent-libos-workspace-navigation",
+    "agent-libos-workspace-editing",
+    "agent-libos-command-execution",
+    "agent-libos-test-log-analysis",
+    "agent-libos-tool-protocol-diagnostics",
+    "agent-libos-object-memory",
+    "agent-libos-object-file-transfer",
+    "agent-libos-object-tasks",
+    "agent-libos-child-processes",
+    "agent-libos-checkpoints",
+    "agent-libos-agent-images",
+    "agent-libos-jit-tool-authoring",
+    "agent-libos-jsonrpc",
+    "agent-libos-mcp",
+    "agent-libos-git-inspection",
+    "agent-libos-git-change-recording",
+    "agent-libos-git-branches-worktrees",
+    "agent-libos-git-integration-recovery",
+    "agent-libos-git-patch-objects",
+    "agent-libos-git-remotes",
+    "agent-libos-git-pull-requests",
+)
+BUILTIN_SKILL_ARCHIVE_PATHS = frozenset(
+    f"agent_libos/skills/builtin/{skill_id}/SKILL.md"
+    for skill_id in BUILTIN_SKILL_IDS
+)
+_BUILTIN_SKILL_MAX_FILE_BYTES = 24 * 1_024
+_BUILTIN_SKILL_MAX_INSTRUCTION_BYTES = 16 * 1_024
+_BUILTIN_SKILL_FRONTMATTER_FIELDS = frozenset(
+    {"name", "description", "allowed-tools"}
+)
+_BUILTIN_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
 WHEEL_REQUIRED_FILES = frozenset(
     {
         "agent_libos/__init__.py",
@@ -22,7 +61,7 @@ WHEEL_REQUIRED_FILES = frozenset(
         "agent_libos/api/cli.py",
         "agent_libos/api/gui/server.py",
     }
-)
+) | BUILTIN_SKILL_ARCHIVE_PATHS
 SDIST_REQUIRED_FILES = frozenset(
     {
         "LICENSE",
@@ -39,7 +78,7 @@ SDIST_REQUIRED_FILES = frozenset(
         "tests/invariants.yaml",
         "scripts/check_release_artifacts.py",
     }
-)
+) | BUILTIN_SKILL_ARCHIVE_PATHS
 SDIST_FORBIDDEN_PARTS = frozenset(
     {
         ".benchmark_runs",
@@ -137,6 +176,124 @@ def _single_artifact(artifact_dir: Path, pattern: str, kind: str) -> Path:
     return matches[0]
 
 
+def _decode_builtin_frontmatter_scalar(raw: str, *, field: str) -> str:
+    value = raw.strip()
+    if not value:
+        raise ValueError(f"built-in Skill {field} must be non-empty")
+    if value.startswith('"'):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid quoted built-in Skill {field}") from exc
+        if not isinstance(decoded, str) or not decoded.strip():
+            raise ValueError(f"built-in Skill {field} must be a non-empty string")
+        return decoded.strip()
+    if value.startswith("'"):
+        if len(value) < 2 or not value.endswith("'"):
+            raise ValueError(f"invalid quoted built-in Skill {field}")
+        decoded = value[1:-1].replace("''", "'")
+        if not decoded.strip():
+            raise ValueError(f"built-in Skill {field} must be a non-empty string")
+        return decoded.strip()
+    if re.search(r":(?:\s|$)", value):
+        raise ValueError(
+            f"plain built-in Skill {field} contains a YAML mapping delimiter"
+        )
+    return value
+
+
+def _parse_builtin_skill_archive_entry(raw: bytes, *, expected_id: str) -> tuple[str, ...]:
+    """Parse the dependency-free built-in Skill subset used during release validation."""
+
+    if len(raw) > _BUILTIN_SKILL_MAX_FILE_BYTES:
+        raise ValueError(f"built-in Skill {expected_id} exceeds archive size limit")
+    try:
+        text = raw.decode("utf-8").replace("\r\n", "\n")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"built-in Skill {expected_id} is not UTF-8") from exc
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        raise ValueError(f"built-in Skill {expected_id} lacks YAML frontmatter")
+    end_index = next(
+        (index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
+        None,
+    )
+    if end_index is None:
+        raise ValueError(f"built-in Skill {expected_id} has unterminated frontmatter")
+
+    fields: dict[str, str] = {}
+    for line in lines[1:end_index]:
+        if not line.strip() or line[:1].isspace():
+            raise ValueError(
+                f"built-in Skill {expected_id} frontmatter must use scalar fields"
+            )
+        key, separator, value = line.partition(":")
+        key = key.strip()
+        if not separator or key not in _BUILTIN_SKILL_FRONTMATTER_FIELDS:
+            raise ValueError(f"built-in Skill {expected_id} has invalid frontmatter")
+        if key in fields:
+            raise ValueError(f"built-in Skill {expected_id} repeats frontmatter field {key}")
+        fields[key] = _decode_builtin_frontmatter_scalar(value, field=key)
+    if set(fields) != _BUILTIN_SKILL_FRONTMATTER_FIELDS:
+        missing = sorted(_BUILTIN_SKILL_FRONTMATTER_FIELDS - set(fields))
+        raise ValueError(f"built-in Skill {expected_id} is missing frontmatter fields: {missing}")
+    if fields["name"] != expected_id:
+        raise ValueError(
+            f"built-in Skill archive directory/name mismatch: {expected_id} != {fields['name']}"
+        )
+
+    allowed_tools = tuple(fields["allowed-tools"].split())
+    if not 1 <= len(allowed_tools) <= 9:
+        raise ValueError(f"built-in Skill {expected_id} has invalid allowed-tools count")
+    if len(set(allowed_tools)) != len(allowed_tools) or any(
+        not _BUILTIN_TOOL_NAME_PATTERN.fullmatch(tool) for tool in allowed_tools
+    ):
+        raise ValueError(f"built-in Skill {expected_id} has invalid allowed-tools")
+    instructions = "\n".join(lines[end_index + 1 :]).lstrip("\n")
+    if not instructions.strip():
+        raise ValueError(f"built-in Skill {expected_id} has no instructions")
+    if len(instructions.encode("utf-8")) > _BUILTIN_SKILL_MAX_INSTRUCTION_BYTES:
+        raise ValueError(
+            f"built-in Skill {expected_id} instructions exceed archive size limit"
+        )
+    missing_guidance = [
+        tool for tool in allowed_tools if f"`{tool}`" not in instructions
+    ]
+    if missing_guidance:
+        raise ValueError(
+            f"built-in Skill {expected_id} does not guide tools: {missing_guidance}"
+        )
+    return allowed_tools
+
+
+def _validate_builtin_skill_archive_payloads(payloads: dict[str, bytes]) -> None:
+    expected_paths = BUILTIN_SKILL_ARCHIVE_PATHS
+    actual_paths = frozenset(payloads)
+    if actual_paths != expected_paths:
+        raise ValueError(
+            "archive built-in Skill catalog mismatch: "
+            f"missing={sorted(expected_paths - actual_paths)}, "
+            f"unexpected={sorted(actual_paths - expected_paths)}"
+        )
+    owner_by_tool: dict[str, str] = {}
+    for skill_id in BUILTIN_SKILL_IDS:
+        path = f"agent_libos/skills/builtin/{skill_id}/SKILL.md"
+        for tool in _parse_builtin_skill_archive_entry(
+            payloads[path],
+            expected_id=skill_id,
+        ):
+            previous = owner_by_tool.get(tool)
+            if previous is not None:
+                raise ValueError(
+                    f"archive built-in tool {tool} is owned by both {previous} and {skill_id}"
+                )
+            owner_by_tool[tool] = skill_id
+    if len(owner_by_tool) != 99:
+        raise ValueError(
+            f"archive built-in Skill catalog must own exactly 99 tools, found {len(owner_by_tool)}"
+        )
+
+
 def _validate_wheel(wheel_path: Path, version: str) -> None:
     dist_info = f"{ARCHIVE_NAME}-{version}.dist-info"
     with zipfile.ZipFile(wheel_path) as archive:
@@ -151,6 +308,15 @@ def _validate_wheel(wheel_path: Path, version: str) -> None:
         missing = sorted(WHEEL_REQUIRED_FILES - names)
         if missing:
             raise ValueError(f"wheel is missing core files: {missing}")
+        builtin_paths = {
+            name
+            for name in names
+            if name.startswith("agent_libos/skills/builtin/")
+            and name.endswith("/SKILL.md")
+        }
+        _validate_builtin_skill_archive_payloads(
+            {path: archive.read(path) for path in builtin_paths}
+        )
         metadata_path = f"{dist_info}/METADATA"
         entry_points_path = f"{dist_info}/entry_points.txt"
         license_path = f"{dist_info}/licenses/LICENSE"
@@ -214,6 +380,19 @@ def _validate_sdist(sdist_path: Path, version: str) -> None:
             raise ValueError(
                 "sdist Requires-Python must remain >=3.11,<3.15"
             )
+        builtin_paths = {
+            path
+            for path in relative_files
+            if path.startswith("agent_libos/skills/builtin/")
+            and path.endswith("/SKILL.md")
+        }
+        builtin_payloads: dict[str, bytes] = {}
+        for path in builtin_paths:
+            member = archive.extractfile(f"{prefix}/{path}")
+            if member is None:
+                raise ValueError(f"sdist built-in Skill cannot be read: {path}")
+            builtin_payloads[path] = member.read()
+        _validate_builtin_skill_archive_payloads(builtin_payloads)
     missing = sorted(SDIST_REQUIRED_FILES - relative_files)
     if missing:
         raise ValueError(f"sdist is missing repository release files: {missing}")

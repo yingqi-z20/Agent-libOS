@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
+import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
@@ -11,7 +14,7 @@ from typing import Any, ClassVar, Generic, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.llm.openai_schema import openai_chat_tool_schema
+from agent_libos.utils.openai_schema import openai_chat_tool_schema
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
@@ -24,6 +27,7 @@ from agent_libos.models.exceptions import (
 from agent_libos.models import DataFlowContext, ToolSpec
 from agent_libos.ports.blocking_work import run_blocking_once
 from agent_libos.utils.public_errors import provider_error_envelope
+from agent_libos.utils.serde import dumps
 
 InputT = TypeVar("InputT", bound=BaseModel)
 
@@ -33,6 +37,32 @@ _DATA_FLOW_WAIT_EXCEPTIONS = (
     HumanApprovalRequired,
     ProcessWaitRequired,
     ProcessMessageWaitRequired,
+)
+_MODEL_ERROR_MESSAGE_MAX_CHARS = _TOOL_DEFAULTS.tool_observability_preview_chars
+_MODEL_ERROR_IDENTIFIER_MAX_CHARS = _TOOL_DEFAULTS.tool_observability_preview_chars
+_MODEL_ERROR_DETAIL_LIMIT = max(
+    1,
+    _TOOL_DEFAULTS.tool_observability_preview_chars // 32,
+)
+_LOCAL_PATH_PATTERNS = (
+    re.compile(r"(?<![:/A-Za-z0-9])/(?:[^/\s,;:]+/)+[^/\s,;:]+"),
+    re.compile(r"(?<![A-Za-z0-9])(?:file://)?/(?:Users|home|private|tmp|var|opt)/[^\s,;:]+"),
+    re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:\\(?:[^\\\s,;:]+\\)*[^\\\s,;:]*"),
+)
+_MODEL_ERROR_SECRET_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|authorization|auth[_-]?token|password|passwd|secret|session[_-]?token|token)\b"
+        r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;\"'}]+)"
+    ),
+)
+_MODEL_ERROR_DYNAMIC_METADATA_KEYS = frozenset(
+    {
+        "call_id",
+        "duration_ms",
+        "materialization_id",
+        "trace_id",
+    }
 )
 
 
@@ -107,6 +137,9 @@ class ToolResult(BaseModel):
     ok: bool
     content: str = ""
     data: Any | None = None
+    # Optional process-facing projection. ToolExecutionService persists
+    # `data`; this excluded field is returned only to the model caller.
+    model_data: Any | None = Field(default=None, exclude=True)
     artifacts: list[ToolArtifact] = Field(default_factory=list)
     error: ToolError | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -117,10 +150,18 @@ class ToolResult(BaseModel):
         *,
         content: str = "",
         data: Any | None = None,
+        model_data: Any | None = None,
         artifacts: list[ToolArtifact] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "ToolResult":
-        return cls(ok=True, content=content, data=data, artifacts=artifacts or [], metadata=metadata or {})
+        return cls(
+            ok=True,
+            content=content,
+            data=data,
+            model_data=model_data,
+            artifacts=artifacts or [],
+            metadata=metadata or {},
+        )
 
     @classmethod
     def failure(
@@ -138,6 +179,373 @@ class ToolResult(BaseModel):
             error=ToolError(code=code, message=message, retryable=retryable, details=details or {}),
             metadata=metadata or {},
         )
+
+    def model_projection(self, *, limit_bytes: int) -> Any:
+        """Return a deterministic, bounded payload suitable for an LLM.
+
+        The full ``ToolResult`` remains available to the broker for durable
+        evidence.  This projection deliberately excludes per-call telemetry
+        and collapses verbose validation failures to bounded, actionable
+        summaries.
+        """
+
+        if self.ok:
+            return _success_model_payload(self)
+        error = self.error or ToolError(
+            code=ToolErrorCode.EXECUTION_ERROR,
+            message=self.content or "Tool execution failed.",
+        )
+        return bounded_failure_model_projection(
+            code=error.code.value,
+            error_type=_failure_error_type(error),
+            message=error.message or self.content,
+            retryable=error.retryable,
+            details=error.details,
+            metadata=self.metadata,
+            limit_bytes=limit_bytes,
+        )
+
+
+def tool_result_content_duplicates_data(content: Any, data: Any) -> bool:
+    """Return whether a text representation is exactly the structured data."""
+
+    if not isinstance(content, str):
+        return False
+    if isinstance(data, str) and content == data:
+        return True
+    try:
+        return json.loads(content) == data
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+
+
+def model_safe_tool_error_message(
+    value: Any,
+    *,
+    max_chars: int | None = None,
+) -> str:
+    """Return the standard redacted, single-preview outward error text."""
+
+    return _model_safe_error_message(value, max_chars=max_chars)[0]
+
+
+def bounded_failure_model_projection(
+    *,
+    code: str,
+    error_type: str,
+    message: str,
+    retryable: bool,
+    details: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any] | None,
+    limit_bytes: int,
+) -> Any:
+    """Build a compact failure carrier without copying raw exception text.
+
+    ``error_hash`` covers the complete pre-projection error so omitted details
+    remain correlatable.  At ordinary configured limits every stable field is
+    retained.  Extremely small custom limits degrade optional fields first and
+    ultimately return ``None`` when no truthful JSON envelope can fit.
+    """
+
+    raw_details = dict(details or {})
+    raw_error = {
+        "code": str(code),
+        "type": str(error_type),
+        "message": str(message),
+        "retryable": bool(retryable),
+        "details": raw_details,
+    }
+    error_hash = hashlib.sha256(_canonical_json_bytes(raw_error)).hexdigest()
+    raw_errors = raw_details.get("errors")
+    error_items = raw_errors if isinstance(raw_errors, list) else []
+    total_errors = len(error_items) if error_items else 1
+    projected_errors = [
+        _project_validation_error(item)
+        for item in error_items[:_MODEL_ERROR_DETAIL_LIMIT]
+        if isinstance(item, Mapping)
+    ]
+    safe_message, message_was_truncated = _model_safe_error_message(message)
+    projected_details = _project_stable_error_details(raw_details)
+    compact_flow = _project_data_flow_context(metadata)
+    error_payload: dict[str, Any] = {
+        "code": _bounded_identifier(code, fallback="execution_error"),
+        "type": _bounded_identifier(error_type, fallback="ToolError"),
+        "retryable": bool(retryable),
+        "safe_message": safe_message,
+        "total_errors": total_errors,
+        "omitted": (
+            max(0, total_errors - len(projected_errors))
+            if error_items
+            else (1 if message_was_truncated else 0)
+        ),
+        "error_hash": error_hash,
+    }
+    if projected_errors:
+        error_payload["errors"] = projected_errors
+    if projected_details:
+        error_payload["details"] = projected_details
+    projection: dict[str, Any] = {"ok": False, "error": error_payload}
+    policy_decision = raw_details.get("policy_decision")
+    if isinstance(policy_decision, str) and policy_decision:
+        projection["policy_decision"] = _bounded_identifier(
+            policy_decision,
+            fallback="failure",
+        )
+    if compact_flow:
+        projection["data_flow_context"] = compact_flow
+
+    return _fit_failure_projection(
+        projection,
+        error_payload=error_payload,
+        total_errors=total_errors,
+        limit_bytes=limit_bytes,
+    )
+
+
+def _fit_failure_projection(
+    projection: dict[str, Any],
+    *,
+    error_payload: dict[str, Any],
+    total_errors: int,
+    limit_bytes: int,
+) -> Any:
+    """Drop optional failure fields until the projection fits its carrier."""
+
+    while _json_size(projection) > limit_bytes and error_payload.get("errors"):
+        selected = error_payload["errors"]
+        if not isinstance(selected, list):
+            break
+        selected.pop()
+        error_payload["omitted"] = max(
+            int(error_payload["omitted"]),
+            total_errors - len(selected),
+        )
+        if not selected:
+            error_payload.pop("errors", None)
+    for optional_key in ("details",):
+        if _json_size(projection) <= limit_bytes:
+            break
+        error_payload.pop(optional_key, None)
+    if _json_size(projection) > limit_bytes:
+        projection.pop("data_flow_context", None)
+    if _json_size(projection) > limit_bytes:
+        projection.pop("policy_decision", None)
+    if _json_size(projection) > limit_bytes:
+        error_payload["omitted"] = max(int(error_payload["omitted"]), total_errors)
+        error_payload["safe_message"] = _fit_text_field(
+            projection,
+            error_payload,
+            "safe_message",
+            limit_bytes,
+        )
+    if _json_size(projection) <= limit_bytes:
+        return projection
+
+    # A caller may configure a carrier too small even for the required stable
+    # schema.  Preserve the fail-closed signal when possible, otherwise no
+    # payload is safer than violating the configured boundary.
+    minimal = {"ok": False, "error": {"omitted": True}}
+    return minimal if _json_size(minimal) <= limit_bytes else None
+
+
+def _success_model_payload(result: ToolResult) -> Any:
+    has_explicit_projection = result.model_data is not None
+    data = result.model_data if has_explicit_projection else result.data
+    # `content` is derived from durable `data` by normal tool validation. It
+    # must not reintroduce that full record beside an explicit compact view.
+    content = "" if has_explicit_projection else result.content
+    artifacts = [artifact.model_dump(mode="json") for artifact in result.artifacts]
+    if data is None:
+        payload: Any = content
+    elif not content or tool_result_content_duplicates_data(content, data):
+        payload = data
+    else:
+        payload = {"result": data, "content": content}
+    if not artifacts:
+        return payload
+    if isinstance(payload, dict):
+        return {**payload, "artifacts": artifacts}
+    return {"result": payload, "artifacts": artifacts}
+
+
+def _failure_error_type(error: ToolError) -> str:
+    selected = error.details.get("error_type")
+    if isinstance(selected, str) and selected:
+        return selected
+    errors = error.details.get("errors")
+    if isinstance(errors, list) and errors:
+        first = errors[0]
+        if isinstance(first, Mapping):
+            value = first.get("type")
+            if isinstance(value, str) and value:
+                return value
+    return "ToolError"
+
+
+def _project_validation_error(value: Mapping[str, Any]) -> dict[str, Any]:
+    projected: dict[str, Any] = {}
+    location = value.get("loc")
+    if isinstance(location, (list, tuple)):
+        projected["loc"] = [
+            _bounded_identifier(item, fallback="field") for item in location
+        ]
+    selected_type = value.get("type")
+    if selected_type is not None:
+        projected["type"] = _bounded_identifier(selected_type, fallback="validation_error")
+    selected_message = value.get("msg") or value.get("message")
+    if selected_message is not None:
+        projected["safe_message"] = _model_safe_error_message(selected_message)[0]
+    return projected
+
+
+def _project_stable_error_details(details: Mapping[str, Any]) -> dict[str, Any]:
+    projected: dict[str, Any] = {}
+    blocked_fragments = (
+        "argument",
+        "call_id",
+        "content",
+        "data",
+        "duration",
+        "input",
+        "materialization",
+        "path",
+        "payload",
+        "result",
+        "source_ref",
+        "stack",
+        "stderr",
+        "stdout",
+        "trace",
+    )
+    for raw_key in sorted(details, key=str):
+        key = str(raw_key)
+        normalized = key.strip().lower().replace("-", "_")
+        if normalized in {
+            "errors",
+            "message",
+            "policy_decision",
+            "safe_message",
+        } or any(
+            fragment in normalized for fragment in blocked_fragments
+        ):
+            continue
+        value = details[raw_key]
+        if isinstance(value, bool) or value is None:
+            projected[key] = value
+        elif isinstance(value, int):
+            projected[key] = value
+        elif isinstance(value, float) and math.isfinite(value):
+            projected[key] = value
+        elif isinstance(value, str) and value:
+            if normalized in {"code", "error_type", "correlation_id"}:
+                projected[key] = _bounded_identifier(value, fallback="unknown")
+            else:
+                projected[key] = _model_safe_error_message(value)[0]
+    return projected
+
+
+def _project_data_flow_context(
+    metadata: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    selected = {
+        key: value
+        for key, value in metadata.items()
+        if key not in _MODEL_ERROR_DYNAMIC_METADATA_KEYS
+    }
+    flow = selected.get("data_flow_context")
+    if isinstance(flow, DataFlowContext):
+        if flow == DataFlowContext():
+            return None
+        flow = flow.to_dict()
+    if not isinstance(flow, Mapping):
+        return None
+    projected: dict[str, Any] = {}
+    labels = flow.get("labels")
+    if isinstance(labels, Mapping):
+        projected["labels"] = dict(labels)
+    source_refs = flow.get("source_refs")
+    if isinstance(source_refs, (list, tuple)):
+        projected["source_ref_count"] = len(source_refs)
+    if (
+        projected.get("source_ref_count", 0) == 0
+        and projected.get("labels") == DataFlowContext().labels.to_dict()
+    ):
+        return None
+    return projected or None
+
+
+def _model_safe_error_message(
+    value: Any,
+    *,
+    max_chars: int | None = None,
+) -> tuple[str, bool]:
+    original = str(value).strip()
+    selected_lines: list[str] = []
+    for line in original.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("traceback (") or lowered.startswith("file \""):
+            continue
+        if re.match(r"^at\s+\S+\s+\(.+\)$", stripped):
+            continue
+        selected_lines.append(stripped)
+        if len(selected_lines) >= 2:
+            break
+    safe = " ".join(selected_lines) if selected_lines else "Tool execution failed."
+    for pattern in _LOCAL_PATH_PATTERNS:
+        safe = pattern.sub("[local-path]", safe)
+    for pattern in _MODEL_ERROR_SECRET_PATTERNS:
+        safe = pattern.sub("[redacted]", safe)
+    selected_max_chars = (
+        _MODEL_ERROR_MESSAGE_MAX_CHARS
+        if max_chars is None
+        else max(0, int(max_chars))
+    )
+    truncated = len(safe) > selected_max_chars or safe != original
+    return safe[:selected_max_chars], truncated
+
+
+def _bounded_identifier(value: Any, *, fallback: str) -> str:
+    selected = str(value).strip()
+    if not selected:
+        return fallback
+    selected = re.sub(r"[^A-Za-z0-9._:-]", "_", selected)
+    return selected[:_MODEL_ERROR_IDENTIFIER_MAX_CHARS] or fallback
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return dumps(value).encode("utf-8")
+
+
+def _json_size(value: Any) -> int:
+    return len(_canonical_json_bytes(value))
+
+
+def _fit_text_field(
+    projection: dict[str, Any],
+    container: dict[str, Any],
+    key: str,
+    limit_bytes: int,
+) -> str:
+    original = str(container.get(key) or "")
+    low = 0
+    high = len(original)
+    best = ""
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = original[:middle]
+        container[key] = candidate
+        if _json_size(projection) <= limit_bytes:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    container[key] = best
+    return best
 
 
 def _merge_result_data_flow_context(
@@ -229,7 +637,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
             return ToolResult.failure(
                 code=ToolErrorCode.VALIDATION_ERROR,
                 message=f"Invalid arguments for tool `{self.name}`.",
-                details={"errors": exc.errors(include_input=False)},
+                details=self._validation_failure_details(exc),
                 metadata=self._base_metadata(ctx, started_at),
             )
         except Exception as exc:
@@ -312,7 +720,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
             return ToolResult.failure(
                 code=ToolErrorCode.VALIDATION_ERROR,
                 message=f"Invalid output for tool `{self.name}`.",
-                details={"errors": exc.errors(include_input=False)},
+                details=self._validation_failure_details(exc),
                 metadata=self._base_metadata(ctx, started_at),
             )
         except ToolExecutionError as exc:
@@ -359,6 +767,16 @@ class BaseAgentTool(ABC, Generic[InputT]):
             )
         except Exception as exc:
             return self._unexpected_failure_result(exc, ctx, started_at)
+
+    @staticmethod
+    def _validation_failure_details(
+        exc: PydanticValidationError,
+    ) -> dict[str, Any]:
+        # Pydantic context may retain the original, non-serializable ValueError.
+        return {
+            "error_type": type(exc).__name__,
+            "errors": exc.errors(include_input=False, include_context=False),
+        }
 
     def _unexpected_failure_result(
         self,
@@ -554,6 +972,9 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
     shell = config.shell
     runtime = config.runtime
 
+    if _apply_checkpoint_schema_overrides(name, properties, config):
+        return
+
     if name in {"read_text_file", "read_file_bytes"}:
         _set_property_default(properties, "encoding", tools.default_text_encoding)
         _set_number_bounds(
@@ -620,6 +1041,24 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
         )
 
 
+def _apply_checkpoint_schema_overrides(
+    name: str,
+    properties: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> bool:
+    fields = {
+        "list_checkpoints": ("limit", config.checkpoint.list_limit),
+        "inspect_checkpoint": ("detail_limit", config.checkpoint.diff_preview_items),
+        "diff_checkpoint": ("external_effect_limit", config.checkpoint.diff_preview_items),
+    }
+    selected = fields.get(name)
+    if selected is None:
+        return False
+    field, value = selected
+    _set_number_bounds(properties, field, default=value, maximum=value)
+    return True
+
+
 def _apply_runtime_arg_defaults(name: str, args: dict[str, Any], config: AgentLibOSConfig) -> dict[str, Any]:
     tools = config.tools
     shell = config.shell
@@ -651,6 +1090,15 @@ def _apply_runtime_arg_defaults(name: str, args: dict[str, Any], config: AgentLi
         args.setdefault("channel", runtime.terminal_channel)
     elif name == "request_permission":
         args.setdefault("human", runtime.default_human)
+    elif name == "list_checkpoints":
+        args.setdefault("limit", config.checkpoint.list_limit)
+    elif name == "inspect_checkpoint":
+        args.setdefault("detail_limit", config.checkpoint.diff_preview_items)
+    elif name == "diff_checkpoint":
+        args.setdefault(
+            "external_effect_limit",
+            config.checkpoint.diff_preview_items,
+        )
     return args
 
 

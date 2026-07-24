@@ -44,6 +44,9 @@ def _complex_function(branch_count: int) -> str:
 
 class TestArchitectureGuardrails:
 
+    def test_default_function_line_limit_is_200(self) -> None:
+        assert checker.MAX_FUNCTION_LINES == 200
+
     def test_checked_in_ratchet_accepts_the_current_tree(self) -> None:
         assert checker.check_architecture(PROJECT_ROOT, PROJECT_ALLOWLIST) == []
 

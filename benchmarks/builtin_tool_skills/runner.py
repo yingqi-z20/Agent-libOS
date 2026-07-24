@@ -10,6 +10,7 @@ from statistics import fmean
 from typing import Any, Iterable
 
 from agent_libos import Runtime
+from agent_libos.llm.usage import aggregate_cache_usage
 from agent_libos.models import CapabilityRight, ProcessStatus
 from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.substrate import LocalResourceProviderSubstrate
@@ -212,6 +213,7 @@ def aggregate_runs(runs: Iterable[dict[str, Any]]) -> dict[str, Any]:
         )
         for variant in EVALUATION_VARIANTS
     }
+    cache_metrics = _aggregate_run_cache_metrics(selected)
     return {
         "runs": total,
         "completed_runs": completed,
@@ -248,6 +250,7 @@ def aggregate_runs(runs: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "mean_initial_projection_reduction_rate": _mean(
             selected, "initial_projection_reduction_rate"
         ),
+        **cache_metrics,
         "by_variant": by_variant,
         "comparison": _comparison(by_variant),
         "by_scenario": by_scenario,
@@ -323,6 +326,7 @@ def _aggregate_variant(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_prompt_tokens": _mean(runs, "prompt_tokens"),
         "mean_cumulative_prompt_bytes": _mean(runs, "cumulative_prompt_bytes"),
         "mean_catalog_metadata_bytes": _mean(runs, "catalog_metadata_bytes"),
+        **_aggregate_run_cache_metrics(runs),
     }
 
 
@@ -451,6 +455,7 @@ def _run_once(
         prompt_tokens = sum(
             _plain_non_negative_int(call.usage.get("prompt_tokens")) for call in calls
         )
+        cache_metrics = aggregate_cache_usage(calls)
         invalid_tool_calls = _invalid_tool_call_count(runtime, pid)
         status = process.status.value
         exited_via_tool = _first_successful_action_index(
@@ -498,6 +503,7 @@ def _run_once(
             ),
             "cumulative_prompt_bytes": cumulative_prompt_bytes,
             "prompt_tokens": prompt_tokens,
+            **cache_metrics,
             "initial_projection_reduction_rate": (
                 1.0 - (initial_schema_bytes / authorized_schema_bytes)
                 if authorized_schema_bytes
@@ -904,3 +910,34 @@ def _mean(runs: list[dict[str, Any]], key: str) -> float:
         and not isinstance(run.get(key), bool)
     ]
     return fmean(values) if values else 0.0
+
+
+def _aggregate_run_cache_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    read_tokens = sum(
+        _plain_non_negative_int(run.get("cache_read_tokens")) for run in runs
+    )
+    write_tokens = sum(
+        _plain_non_negative_int(run.get("cache_write_tokens")) for run in runs
+    )
+    reported_calls = sum(
+        _plain_non_negative_int(run.get("cache_reported_calls")) for run in runs
+    )
+    input_tokens = sum(
+        _plain_non_negative_int(run.get("cache_metric_input_tokens"))
+        for run in runs
+    )
+    uncached_tokens = sum(
+        _plain_non_negative_int(run.get("uncached_input_tokens")) for run in runs
+    )
+    return {
+        "cache_read_tokens": read_tokens,
+        "cache_write_tokens": write_tokens,
+        "cache_reported_calls": reported_calls,
+        "cache_metric_input_tokens": input_tokens,
+        "uncached_input_tokens": uncached_tokens,
+        "cache_hit_rate": (
+            (input_tokens - uncached_tokens) / input_tokens
+            if reported_calls and input_tokens > 0
+            else None
+        ),
+    }

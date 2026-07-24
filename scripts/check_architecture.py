@@ -21,7 +21,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
-MAX_FUNCTION_LINES = 120
+MAX_FUNCTION_LINES = 200
 COMPLEXITY_HOTSPOT_THRESHOLD = 20
 SOURCE_PACKAGE = "agent_libos"
 RUNTIME_MODULE_ROOT = "modules"

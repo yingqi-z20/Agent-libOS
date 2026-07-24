@@ -76,9 +76,12 @@ def last_tool_result(messages: list[dict[str, Any]], tool_name: str) -> dict[str
         ):
             return payload["result"]
 
-    # Minimal image-only prompts intentionally omit event metadata. Their
-    # recency-first source context renders the newest Object first.
-    for _oid, payload in source_objects:
+    # Minimal image-only prompts intentionally omit event metadata. Object
+    # selection may be recency-first, but rendering preserves the stable
+    # MemoryView root order so successive prompts retain a cacheable prefix.
+    # Select from the end to recover the most recently appended matching
+    # result rather than replaying the oldest answer on every turn.
+    for _oid, payload in reversed(source_objects):
         if payload.get("tool_name") == tool_name and isinstance(payload.get("result"), dict):
             return payload["result"]
     return None
@@ -147,10 +150,16 @@ def _source_context_tool_results(messages: list[dict[str, Any]]) -> list[dict[st
 def _source_context_tool_result_objects(
     messages: list[dict[str, Any]],
 ) -> list[tuple[str, dict[str, Any]]]:
+    text = _message_text(messages)
+    canonical = _canonical_source_context_tool_result_objects(text)
+    if canonical:
+        return canonical
+
+    # Compatibility with context captured before canonical Object rendering.
     result: list[tuple[str, dict[str, Any]]] = []
     blocks = re.split(
         r"(?m)(?=^\[[^\]\n]+\] namespace=)",
-        _message_text(messages),
+        text,
     )
     for block in blocks:
         header, separator, remainder = block.partition("\n")
@@ -167,6 +176,37 @@ def _source_context_tool_result_objects(
             oid_match = re.match(r"^\[(?P<oid>[^\]\n]+)\]", header)
             if oid_match is not None:
                 result.append((oid_match.group("oid"), parsed))
+    return result
+
+
+def _canonical_source_context_tool_result_objects(
+    text: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Read canonical JSON Object records while preserving render order."""
+
+    result: list[tuple[str, dict[str, Any]]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            not isinstance(record, dict)
+            or record.get("record_type") != "object_memory_object"
+            or record.get("type") != "tool_result"
+        ):
+            continue
+        oid = record.get("object_oid")
+        payload = record.get("payload")
+        if (
+            isinstance(oid, str)
+            and isinstance(payload, dict)
+            and isinstance(payload.get("tool_name"), str)
+        ):
+            result.append((oid, payload))
     return result
 
 

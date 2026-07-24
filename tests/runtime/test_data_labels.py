@@ -422,8 +422,17 @@ def test_secret_message_read_taints_later_child_goal_and_reply() -> None:
 
         read = runtime.tools.call(child, "read_process_messages", {})
         assert read.ok, read.error
-        assert read.payload["messages"][0]["metadata"]["data_labels"]["sensitivity"] == "secret"
-        assert read.payload["messages"][0]["metadata"]["data_flow_context"]["source_refs"] == persisted_refs
+        # The model-facing message projection carries actionable message
+        # content only. Labels/provenance remain on the durable ToolResult and
+        # the metadata-only carrier instead of duplicating raw message
+        # metadata (including source ids) into the prompt.
+        assert "metadata" not in read.payload["messages"][0]
+        assert read.result_handle is not None
+        stored_read = runtime.store.get_object(read.result_handle.oid)
+        assert stored_read is not None
+        read_flow = stored_read.payload["metadata"]["data_flow_context"]
+        assert read_flow["labels"]["sensitivity"] == "secret"
+        assert all(len(ref["content_sha256"]) == 64 for ref in read_flow["source_refs"])
         child_process = runtime.process.get(child)
         assert child_process.memory_view is not None
         carrier_objects = [runtime.store.get_object(handle.oid) for handle in child_process.memory_view.roots]

@@ -217,9 +217,10 @@ The current built-in image contracts are:
 | `toolmaker-agent:v0` | Import-free Deno/TypeScript JIT proposal, validation, and registration | Narrow explicit table with the JIT authoring guide loaded | configured Human write |
 | `context-compressor:v0` | Structured context compaction | `process_exit` only | none |
 
-The prompt lists only applicable built-in Skill IDs, concise descriptions, and
-active state until a Skill is loaded. Visibility remains separate from
-authority: Host calls and primitives continue to use the complete process tool
+The prompt lists only applicable built-in Skill IDs and concise descriptions;
+the catalog deliberately omits dynamic active state so activation preserves a
+stable prompt-cache prefix. Visibility remains separate from authority: Host
+calls and primitives continue to use the complete process tool
 table and Capability set, and built-in activation records no authority change.
 Requirement declarations remain Task Authority Manifest inputs, not grants.
 Configured base/coding ids must also remain distinct from the fixed review,

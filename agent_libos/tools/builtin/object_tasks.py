@@ -197,7 +197,11 @@ class CancelObjectTaskTool(SyncAgentTool[CancelObjectTaskArgs]):
 
 class WaitObjectTaskTool(SyncAgentTool[WaitObjectTaskArgs]):
     name = "wait_object_task"
-    description = "Wait until an Object task reaches a terminal or explicit waiting state."
+    description = (
+        "Wait for an Object task state change. It may return a terminal state, one of "
+        "waiting_human/waiting_process/waiting_message, or queued/running when timeout_s expires; "
+        "only succeeded is successful completion."
+    )
     args_schema = WaitObjectTaskArgs
     output_schema = WaitObjectTaskOutput
     policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=_TOOL_DEFAULTS.sleep_tool_timeout_s)

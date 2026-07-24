@@ -32,6 +32,8 @@ SUITE_ROOT = Path("benchmarks/runtime_safety")
     "rendered_goal",
     [
         'payload: {"text": "child goal"}',
+        'payload: {"text":"child goal"}',
+        'payload: {"text" :\n "child goal"}',
         "payload: {'text': 'child goal'}",
     ],
 )

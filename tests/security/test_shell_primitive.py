@@ -16,6 +16,7 @@ from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRul
 from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, GitErrorCode, HumanRequestStatus, ObjectMetadata, ObjectType, SinkTrustLevel, SinkTrustRule
 from agent_libos.models.exceptions import CapabilityDenied, GitError, HumanApprovalRequired, HumanResponseRequired, ValidationError
 from agent_libos.primitives.git_command_policy import harden_read_only_git_argv
+from agent_libos.tools.builtin.shell import RunShellCommandArgs
 from agent_libos.substrate import (
     CommandMetrics,
     CommandResult,
@@ -1288,6 +1289,40 @@ class TestShellPrimitive:
             assert result.ok, result.error
             assert result.payload['stdout'] == 'ok\n'
             assert provider.calls == [(_HARDENED_GIT_STATUS_SHORT, runtime.config.tools.shell_timeout_s)]
+        finally:
+            runtime.close()
+
+    def test_shell_tool_is_one_shot_argv_only(self) -> None:
+        assert set(RunShellCommandArgs.model_fields) == {
+            'argv',
+            'timeout_s',
+            'max_stdout_chars',
+            'max_stderr_chars',
+        }
+
+    def test_shell_tool_timeout_returns_no_command_output(self) -> None:
+        provider = TimeoutShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='tool timeout')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+
+            result = runtime.tools.call(
+                pid,
+                'run_shell_command',
+                {'argv': ['tool'], 'timeout_s': 0.01},
+            )
+
+            assert not result.ok
+            assert result.error == 'Shell command timed out.'
+            assert result.payload['error']['code'] == 'timeout'
+            assert 'stdout' not in result.payload
+            assert 'stderr' not in result.payload
+            assert provider.calls == [(['tool'], 0.01)]
         finally:
             runtime.close()
 

@@ -26,7 +26,7 @@ from agent_libos.utils.serde import to_jsonable
 _GIT_DEFAULTS = DEFAULT_CONFIG.git
 _STATE_TOKEN_PATTERN = r"^[0-9a-f]{64}$"
 _EXPECTED_STATE_TOKEN_DESCRIPTION = (
-    "Fresh state_token returned by a Git read for this repository/worktree. "
+    "Fresh token from the nested state.token field returned by a Git read for this repository/worktree. "
     "The mutation uses compare-and-swap and fails as stale if state changed; re-read and reconsider before retrying."
 )
 
@@ -42,8 +42,20 @@ class _StrictArgs(BaseModel):
 class GitPathInput(_StrictArgs):
     """A UTF-8 display path or a byte-preserving token returned by a Git read."""
 
-    path: str | None = Field(default=None, description="Workspace-relative repository path.")
-    path_b64: str | None = Field(default=None, description="Base64 path token returned by a Git tool.")
+    path: str | None = Field(
+        default=None,
+        description=(
+            "Workspace-relative repository path. Set exactly one of path and "
+            "path_b64; never copy both fields from a Git read result."
+        ),
+    )
+    path_b64: str | None = Field(
+        default=None,
+        description=(
+            "Base64 path token returned by a Git tool. Set exactly one of "
+            "path_b64 and path; never copy both fields from a Git read result."
+        ),
+    )
 
     @model_validator(mode="after")
     def _exactly_one_path(self) -> "GitPathInput":
@@ -282,16 +294,24 @@ class GitPullArgs(_StrictArgs):
 
 class GitPushArgs(_StrictArgs):
     remote: str
-    remote_ref: str
+    remote_ref: str = Field(
+        description="Complete remote ref, restricted to refs/heads/... or refs/tags/...."
+    )
     expected_state_token: str = _expected_state_token_field()
     local_ref: str | None = None
     delete: bool = Field(
         default=False,
-        description="Delete remote_ref instead of updating it; requires destructive authority.",
+        description=(
+            "Delete remote_ref instead of updating it; local_ref must be omitted and "
+            "force_with_lease_oid is still required. Requires destructive authority."
+        ),
     )
     force_with_lease_oid: str | None = Field(
         default=None,
-        description="Exact expected remote OID for a guarded force push; unrestricted force is unavailable.",
+        description=(
+            "Exact expected remote OID for a guarded force update or deletion; "
+            "unrestricted force and unguarded deletion are unavailable."
+        ),
     )
     worktree_id: str = "main"
 

@@ -12,6 +12,7 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.llm.context_memory import LLM_CONTEXT_ENRICHMENT_RESOURCE
 from agent_libos.models import CapabilityRight, ObjectType, ProcessStatus
+from agent_libos.tools.builtin.process import _bounded_json_value
 
 
 def _completion_evidence(
@@ -100,7 +101,26 @@ def test_coding_exit_review_is_nonterminal_published_and_audited(tmp_path: Path)
         assert process.status == ProcessStatus.RUNNABLE
         assert process.memory_view is not None
         assert review_result_oid in {handle.oid for handle in process.memory_view.roots}
-        assert review["goal"]["payload"]["text"].startswith("inspect one thing")
+        assert review["schema_version"] == 2
+        assert review["goal"]["source"] == "object_memory"
+        assert review["goal"]["version"] == 1
+        assert len(review["goal"]["payload_sha256"]) == 64
+        assert "payload" not in review["goal"]
+        assert "fallback" not in review["goal"]
+        assert review["goal"]["reference"] == {
+            "kind": "object_memory",
+            "namespace": review["goal"]["reference"]["namespace"],
+            "name": review["goal"]["reference"]["name"],
+            "activate_skill": "agent-libos-object-memory",
+            "tool": "read_memory_object",
+            "arguments": {
+                "namespace": review["goal"]["reference"]["namespace"],
+                "name": review["goal"]["reference"]["name"],
+                "max_payload_chars": (
+                    runtime.config.tools.memory_payload_hard_limit_chars
+                ),
+            },
+        }
         assert review["observed_successful_tool_calls"] == ["list_capabilities"]
         # Publishing the immutable review ToolResult necessarily creates an
         # exact-object handle. Apart from that newly produced evidence object,
@@ -265,7 +285,20 @@ def test_exit_review_rejects_stale_token_after_human_followup(tmp_path: Path) ->
         assert refreshed_review["acknowledged_human_message_ids"] == [
             message.message_id
         ]
-        assert refreshed_review["acknowledged_human_messages"][0]["body"] == message.body
+        assert message.body not in json.dumps(refreshed_review, ensure_ascii=False)
+        assert refreshed_review["acknowledged_human_message_reference"] == {
+            "kind": "process_message_ids",
+            "activate_skill": "agent-libos-child-processes",
+            "tool": "read_process_messages",
+            "fixed_arguments": {
+                "include_acked": True,
+                "ack": False,
+            },
+            "copy_arguments": {
+                "message_ids": "acknowledged_human_message_ids",
+                "limit": "acknowledged_human_message_count",
+            },
+        }
     finally:
         runtime.close()
 
@@ -307,13 +340,13 @@ def test_final_exit_rejects_missing_sources_and_unobserved_tool_claims(
         errors = rejected["payload"]["completion_review"]["validation_errors"]
         assert "acceptance checks do not cover every expected_source_ref" in errors
         assert any("cites unobserved tools" in error for error in errors)
-        assert message.message_id in review["expected_source_refs"]
+        assert message.message_id in review["acknowledged_human_message_ids"]
         assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
     finally:
         runtime.close()
 
 
-def test_exit_review_bounds_message_bodies_without_omitting_source_ids(
+def test_exit_review_references_messages_without_reinlining_bodies(
     tmp_path: Path,
 ) -> None:
     runtime = Runtime.open(tmp_path / "completion-review-message-bounds.sqlite")
@@ -325,7 +358,7 @@ def test_exit_review_bounds_message_bodies_without_omitting_source_ids(
         messages = [
             runtime.human.send_process_message(
                 pid,
-                f"Follow-up requirement {index}",
+                f"FOLLOW_UP_BODY_SENTINEL_{index}_" + ("x" * 4_000),
                 subject=f"Requirement {index}",
             )
             for index in range(9)
@@ -340,18 +373,57 @@ def test_exit_review_bounds_message_bodies_without_omitting_source_ids(
         review, _review_result_oid = _start_review(runtime, pid)
 
         expected_ids = [message.message_id for message in messages]
-        detailed_ids = [
-            item["message_id"]
-            for item in review["acknowledged_human_messages"]
-        ]
         assert review["acknowledged_human_message_ids"] == expected_ids
-        assert review["expected_source_refs"] == [
-            review["goal"]["oid"],
-            *expected_ids,
-        ]
         assert review["acknowledged_human_message_count"] == 9
-        assert review["acknowledged_human_message_detail_count"] == 8
-        assert detailed_ids == expected_ids[-8:]
+        assert len(review["acknowledged_human_messages_sha256"]) == 64
+        assert review["acknowledged_human_message_reference"] == {
+            "kind": "process_message_ids",
+            "activate_skill": "agent-libos-child-processes",
+            "tool": "read_process_messages",
+            "fixed_arguments": {
+                "include_acked": True,
+                "ack": False,
+            },
+            "copy_arguments": {
+                "message_ids": "acknowledged_human_message_ids",
+                "limit": "acknowledged_human_message_count",
+            },
+        }
+        rendered_review = json.dumps(review, ensure_ascii=False)
+        assert "FOLLOW_UP_BODY_SENTINEL" not in rendered_review
+        assert len(rendered_review) < 12_000
+
+        repeated = runtime.llm.dispatch(pid, {"action": "process_exit"})
+        repeated_review = repeated["payload"]["completion_review"]
+        assert repeated_review["review_token"] == review["review_token"]
+        assert (
+            repeated_review["acknowledged_human_messages_sha256"]
+            == review["acknowledged_human_messages_sha256"]
+        )
+        assert (
+            repeated_review["observed_successful_tool_calls"]
+            == review["observed_successful_tool_calls"]
+        )
+    finally:
+        runtime.close()
+
+
+def test_exit_review_references_live_goal_without_reinlining_payload(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(tmp_path / "completion-review-goal-reference.sqlite")
+    try:
+        goal = "LIVE_GOAL_BODY_SENTINEL_" + ("x" * 31_000)
+        pid = runtime.process.spawn(image="coding-agent:v0", goal=goal)
+
+        review, _review_result_oid = _start_review(runtime, pid)
+        rendered_review = json.dumps(review, ensure_ascii=False)
+
+        assert review["goal"]["source"] == "object_memory"
+        assert "payload" not in review["goal"]
+        assert "fallback" not in review["goal"]
+        assert "LIVE_GOAL_BODY_SENTINEL" not in rendered_review
+        assert len(rendered_review) < 8_000
     finally:
         runtime.close()
 
@@ -434,11 +506,16 @@ def test_exit_review_survives_runtime_reopen(tmp_path: Path) -> None:
         refreshed = reopened.llm.dispatch(pid, {"action": "process_exit"})
         refreshed_review = refreshed["payload"]["completion_review"]
         assert refreshed_review["goal"]["source"] == "persisted_initial_llm_context"
-        assert "retain the final review across restart" in str(
-            refreshed_review["goal"]["payload"]
+        assert refreshed_review["goal"]["reference"]["kind"] == "retained_llm_evidence"
+        assert refreshed_review["goal"]["fallback"] == {
+            "text": "retain the final review across restart"
+        }
+        assert (
+            refreshed_review["goal"]["payload_sha256"]
+            == review["goal"]["payload_sha256"]
         )
         assert "UNRELATED_SIBLING_CONTEXT_SENTINEL" not in str(
-            refreshed_review["goal"]["payload"]
+            refreshed_review["goal"]["fallback"]
         )
         assert refreshed_review["review_token"] == review["review_token"]
 
@@ -485,7 +562,7 @@ def test_exit_review_recovers_goal_from_persistent_context_prompt(
 
         assert review["goal"]["source"] == "persisted_initial_llm_context"
         assert "recover this goal from the persistent context prompt" in str(
-            review["goal"]["payload"]
+            review["goal"]["fallback"]
         )
     finally:
         reopened.close()
@@ -546,6 +623,27 @@ def test_exit_review_fails_closed_after_reopen_without_full_io_retention(
 
 def runtime_goal_not_in_payload(result: dict[str, Any]) -> bool:
     return "this goal must not be copied" not in json.dumps(result, default=str)
+
+
+def test_bounded_goal_fallback_truncates_decoded_values_not_serialized_json() -> None:
+    value = {
+        "goal": "quoted \\\"requirement\\\" with slash \\\\ and unicode \u76ee\u6807 " * 200,
+        "nested": [{"requirement": "x" * 800}, {"keep": True}],
+    }
+
+    bounded = _bounded_json_value(value, 512)
+    rendered = json.dumps(
+        bounded,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    assert len(rendered) <= 512
+    assert json.loads(rendered) == bounded
+    assert bounded["truncated"] is True
+    assert isinstance(bounded["preview"], dict)
+    assert bounded["preview"]["goal"].endswith("\u2026")
 
 
 class _SingleActionClient:

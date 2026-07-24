@@ -17,8 +17,8 @@ BUILTIN_SKILL_PREFIX = "agent-libos-"
 BUILTIN_SKILL_SOURCE_TYPE = "builtin"
 BUILTIN_SKILL_CATALOG_SCOPE = "builtin"
 BUILTIN_SKILL_PACKAGE = "agent_libos.skills.builtin"
-BUILTIN_SKILL_MAX_FILE_BYTES = 16_384
-BUILTIN_SKILL_MAX_INSTRUCTION_BYTES = 2_048
+BUILTIN_SKILL_MAX_FILE_BYTES = 24 * 1_024
+BUILTIN_SKILL_MAX_INSTRUCTION_BYTES = 16 * 1_024
 BUILTIN_SKILL_MAX_TOOLS = 9
 BUILTIN_SKILL_MAX_TOOL_NAME_CHARS = 128
 BUILTIN_SKILL_CATALOG_METADATA_MAX_BYTES = 12 * 1_024
@@ -192,6 +192,11 @@ class BuiltinSkillCatalog:
                 f"built-in Skill {expected_name!r} instructions exceed "
                 f"{BUILTIN_SKILL_MAX_INSTRUCTION_BYTES} bytes"
             )
+        _validate_builtin_tool_guidance(
+            instructions,
+            allowed_tools=frontmatter["allowed_tools"],
+            name=expected_name,
+        )
         resource = SkillResource(
             path="SKILL.md",
             size_bytes=len(raw),
@@ -294,6 +299,26 @@ def _validate_builtin_allowed_tools(raw_allowed_tools: Any, *, name: str) -> lis
     if len(set(allowed_tools)) != len(allowed_tools):
         raise ValidationError(f"built-in Skill {name!r} has duplicate allowed-tools entries")
     return allowed_tools
+
+
+def _validate_builtin_tool_guidance(
+    instructions: str,
+    *,
+    allowed_tools: list[str],
+    name: str,
+) -> None:
+    """Require built-in guidance to route every schema it projects."""
+
+    missing = [
+        tool_name
+        for tool_name in allowed_tools
+        if f"`{tool_name}`" not in instructions
+    ]
+    if missing:
+        raise ValidationError(
+            f"built-in Skill {name!r} instructions do not guide allowed tools: "
+            f"{', '.join(missing)}"
+        )
 
 
 def _package_hash(package: SkillPackage) -> str:

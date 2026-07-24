@@ -44,6 +44,8 @@ describe("LLMProfileSelect", () => {
     expect(html).toMatch(/Context window tokens|上下文窗口 tokens/);
     expect(html).toMatch(/Reasoning effort|推理强度/);
     expect(html).toMatch(/Prompt cache retention|Prompt 缓存保留/);
+    expect(html).toContain('<option value="in_memory">in_memory</option>');
+    expect(html).not.toContain('value="in-memory"');
     expect(html).toMatch(/Reuse Responses chain|复用 Responses 调用链/);
     expect(html).toContain("kimi-k2.7-code");
     expect(html).toContain("disabled=\"\"");
@@ -82,6 +84,7 @@ function profile(
     responses_previous_response_id: null,
     parallel_tool_calls: null,
     auto_wait_on_empty_tool_calls: null,
+    fallback_json_actions: null,
     temperature: null,
     max_tokens: null,
     context_window_tokens: null,

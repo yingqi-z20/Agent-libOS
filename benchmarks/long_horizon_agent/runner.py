@@ -10,6 +10,7 @@ from statistics import fmean
 from typing import Any, Iterable
 
 from agent_libos import Runtime
+from agent_libos.llm.usage import aggregate_cache_usage
 from agent_libos.models import CapabilityRight, ProcessStatus
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
@@ -88,6 +89,8 @@ def run_evaluation(
         for index in range(1, repetitions + 1)
     ]
     successful = sum(run["passed"] is True for run in runs)
+    cache_metrics = _aggregate_run_cache_metrics(runs)
+    prompt_prefix_metrics = _aggregate_run_prompt_prefix_metrics(runs)
     return {
         "schema_version": 1,
         "evaluation": "long_horizon_agent",
@@ -120,6 +123,8 @@ def run_evaluation(
             "mean_cumulative_schema_bytes": _mean(
                 runs, "cumulative_schema_bytes"
             ),
+            **prompt_prefix_metrics,
+            **cache_metrics,
         },
     }
 
@@ -458,6 +463,8 @@ def _run_once(
         successful_tool_call_rate = (
             len(successful_actions) / len(actions) if actions else 1.0
         )
+        cache_metrics = aggregate_cache_usage(calls)
+        prompt_prefix_metrics = _adjacent_prompt_prefix_metrics(calls)
         return {
             "scenario_id": SCENARIO_ID,
             "repetition": repetition,
@@ -500,6 +507,8 @@ def _run_once(
             "cumulative_schema_bytes": sum(_json_bytes(call.tools) for call in calls),
             "cumulative_prompt_bytes": sum(_json_bytes(call.messages) for call in calls),
             "invalid_tool_calls": _invalid_tool_call_count(runtime, pid),
+            **prompt_prefix_metrics,
+            **cache_metrics,
             "status_message": process.status_message,
         }
     finally:
@@ -721,3 +730,133 @@ def _mean(runs: list[dict[str, Any]], key: str) -> float:
         and not isinstance(run.get(key), bool)
     ]
     return fmean(values) if values else 0.0
+
+
+def _adjacent_prompt_prefix_metrics(calls: Iterable[Any]) -> dict[str, Any]:
+    """Measure bytewise prefix reuse between adjacent persisted prompts.
+
+    Retention projections and content-free call records replace ``messages``
+    with an envelope mapping.  Those records are deliberately unavailable for
+    this metric rather than being compared as if the envelope were a prompt.
+    """
+
+    selected_calls = list(calls)
+    pair_count = max(len(selected_calls) - 1, 0)
+    comparable_pair_count = 0
+    common_prefix_bytes = 0
+    next_prompt_bytes = 0
+    for previous, current in zip(selected_calls, selected_calls[1:]):
+        previous_messages = getattr(previous, "messages", None)
+        current_messages = getattr(current, "messages", None)
+        if not isinstance(previous_messages, list) or not isinstance(
+            current_messages, list
+        ):
+            continue
+        previous_bytes = _canonical_json_bytes(previous_messages)
+        current_bytes = _canonical_json_bytes(current_messages)
+        if previous_bytes is None or current_bytes is None:
+            continue
+        comparable_pair_count += 1
+        common_prefix_bytes += _common_prefix_byte_count(
+            previous_bytes,
+            current_bytes,
+        )
+        next_prompt_bytes += len(current_bytes)
+    return {
+        "adjacent_prompt_pair_count": pair_count,
+        "adjacent_prompt_comparable_pair_count": comparable_pair_count,
+        "adjacent_prompt_unavailable_pair_count": (
+            pair_count - comparable_pair_count
+        ),
+        "adjacent_prompt_common_prefix_bytes": common_prefix_bytes,
+        "adjacent_prompt_next_bytes": next_prompt_bytes,
+        "adjacent_prompt_common_prefix_ratio": (
+            common_prefix_bytes / next_prompt_bytes
+            if next_prompt_bytes > 0
+            else None
+        ),
+    }
+
+
+def _canonical_json_bytes(value: Any) -> bytes | None:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+
+
+def _common_prefix_byte_count(left: bytes, right: bytes) -> int:
+    return next(
+        (
+            index
+            for index, (left_byte, right_byte) in enumerate(zip(left, right))
+            if left_byte != right_byte
+        ),
+        min(len(left), len(right)),
+    )
+
+
+def _aggregate_run_prompt_prefix_metrics(
+    runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    pair_count = sum(
+        _nonnegative_int(run.get("adjacent_prompt_pair_count")) for run in runs
+    )
+    comparable_pair_count = sum(
+        _nonnegative_int(run.get("adjacent_prompt_comparable_pair_count"))
+        for run in runs
+    )
+    unavailable_pair_count = sum(
+        _nonnegative_int(run.get("adjacent_prompt_unavailable_pair_count"))
+        for run in runs
+    )
+    common_prefix_bytes = sum(
+        _nonnegative_int(run.get("adjacent_prompt_common_prefix_bytes"))
+        for run in runs
+    )
+    next_prompt_bytes = sum(
+        _nonnegative_int(run.get("adjacent_prompt_next_bytes")) for run in runs
+    )
+    return {
+        "adjacent_prompt_pair_count": pair_count,
+        "adjacent_prompt_comparable_pair_count": comparable_pair_count,
+        "adjacent_prompt_unavailable_pair_count": unavailable_pair_count,
+        "adjacent_prompt_common_prefix_bytes": common_prefix_bytes,
+        "adjacent_prompt_next_bytes": next_prompt_bytes,
+        "adjacent_prompt_common_prefix_ratio": (
+            common_prefix_bytes / next_prompt_bytes
+            if next_prompt_bytes > 0
+            else None
+        ),
+    }
+
+
+def _aggregate_run_cache_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    read_tokens = sum(_nonnegative_int(run.get("cache_read_tokens")) for run in runs)
+    write_tokens = sum(_nonnegative_int(run.get("cache_write_tokens")) for run in runs)
+    reported_calls = sum(
+        _nonnegative_int(run.get("cache_reported_calls")) for run in runs
+    )
+    input_tokens = sum(
+        _nonnegative_int(run.get("cache_metric_input_tokens")) for run in runs
+    )
+    uncached_tokens = sum(
+        _nonnegative_int(run.get("uncached_input_tokens")) for run in runs
+    )
+    return {
+        "cache_read_tokens": read_tokens,
+        "cache_write_tokens": write_tokens,
+        "cache_reported_calls": reported_calls,
+        "cache_metric_input_tokens": input_tokens,
+        "uncached_input_tokens": uncached_tokens,
+        "cache_hit_rate": (
+            (input_tokens - uncached_tokens) / input_tokens
+            if reported_calls and input_tokens > 0
+            else None
+        ),
+    }

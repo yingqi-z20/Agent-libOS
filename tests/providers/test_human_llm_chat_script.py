@@ -6,6 +6,7 @@ import json
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
 from scripts.human_llm_chat import CHAT_PROCESS_GOAL, EchoResponder, ModelResponder, run_chat
+from scripts.llm_context_probe import last_tool_result
 
 class TestHumanLLMChatScript:
 
@@ -45,6 +46,45 @@ class TestHumanLLMChatScript:
                 assert 'hello' in json.dumps(calls[0].__dict__, sort_keys=True)
             finally:
                 runtime.close()
+
+    def test_source_context_fallback_uses_latest_result_in_stable_root_order(self) -> None:
+        messages = [
+            {
+                'role': 'user',
+                'content': '\n\n'.join(
+                    [
+                        json.dumps(
+                            {
+                                'record_type': 'object_memory_object',
+                                'render_format': 'canonical_json_v1',
+                                'object_oid': 'obj-old',
+                                'type': 'tool_result',
+                                'payload': {
+                                    'tool_name': 'ask_human',
+                                    'result': {'answer': 'hello'},
+                                },
+                            },
+                            separators=(',', ':'),
+                        ),
+                        json.dumps(
+                            {
+                                'record_type': 'object_memory_object',
+                                'render_format': 'canonical_json_v1',
+                                'object_oid': 'obj-new',
+                                'type': 'tool_result',
+                                'payload': {
+                                    'tool_name': 'ask_human',
+                                    'result': {'answer': '/exit'},
+                                },
+                            },
+                            separators=(',', ':'),
+                        ),
+                    ]
+                ),
+            }
+        ]
+
+        assert last_tool_result(messages, 'ask_human') == {'answer': '/exit'}
 
 class FakeTextLLMClient:
     model = 'fake-text-model'

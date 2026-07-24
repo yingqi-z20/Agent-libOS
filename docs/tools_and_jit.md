@@ -66,10 +66,11 @@ The fixed bootstrap requires the complete image-authorized set of
 `process_exit`; a Skills-projection image missing any member is rejected. The
 image's full process tool table is unchanged.
 
-The prompt contains a compact catalog of applicable built-in Skill IDs,
-descriptions, and active state. It does not contain every Skill body or tool
-schema. `discover_skills` returns the same applicable built-ins even when the
-caller has no registered-Skill catalog read capability. `activate_skill` then
+The prompt contains a compact, activation-stable catalog of applicable built-in
+Skill IDs and descriptions. It does not contain active flags, every Skill body,
+or tool schemas. `discover_skills` returns the same applicable built-ins plus
+their current active metadata even when the caller has no registered-Skill
+catalog read capability. `activate_skill` then
 loads the selected instructions and atomically copies all of that Skill's exact
 bindings from the full process tool table into the model projection. An image
 may select initially active instruction sets with `default_skills`.

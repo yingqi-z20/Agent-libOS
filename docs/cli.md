@@ -49,12 +49,14 @@ runtime:
 llm:
   parallel_tool_calls: false
   auto_wait_on_empty_tool_calls: false
+  fallback_json_actions: false
   default_profile_id: coding
   profiles:
     coding:
       model: gpt-4.1
       parallel_tool_calls: true
       auto_wait_on_empty_tool_calls: true
+      fallback_json_actions: true
 ```
 
 Explicit CLI options still win over config defaults. Passing `--db local`,
@@ -99,10 +101,15 @@ response; Agent libOS dispatches them sequentially in the same quantum rather
 than running tools concurrently.
 `llm.auto_wait_on_empty_tool_calls` is also opt-in and can be overridden per
 profile. It helps weaker tool-calling models by synthesizing
-`receive_process_messages` only when a response has no provider tool calls and
-no valid fallback JSON action. The synthesized wait uses the tool defaults, so
+`receive_process_messages` when a response has no provider tool calls. The
+synthesized wait uses the tool defaults, so
 it waits for any unread process message and does not change the raw stored LLM
 response.
+`llm.fallback_json_actions` is a separate profile-level compatibility opt-in.
+By default, text JSON is never executed and a provider that rejects native
+`tools` fails the request. When enabled, the prompt includes a compact input-only
+compatibility schema and a provider tool-protocol rejection may retry without
+native tools.
 
 Shell policy labels are fixed semantic values:
 `always_deny`, `allowlist_auto_else_ask`, `blocklist_ask_else_auto`, and
@@ -367,7 +374,10 @@ and the immediately preceding function-call manifest has exactly one durable
 output per unique `call_id`. The fingerprint binds model, official endpoint,
 API mode, credential identity, and organization/project without storing the
 credential. Otherwise the next request resets stateless. Request options also
-show whether `parallel_tool_calls` was enabled for the action-selection request.
+show whether `parallel_tool_calls` and JSON action fallback were enabled, and
+whether the fallback was used. Canonical usage preserves provider-reported
+`cache_read_tokens` and `cache_write_tokens`, including an explicit zero, even
+when full-I/O persistence is disabled.
 Full LLM input/output persistence is enabled by default for self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. Set
 `config.llm.persist_full_io=False` when a user or operator opts out of storing

@@ -1829,7 +1829,7 @@ class TestJitSecurity:
 
         assert validation.ok
         assert len(validation.logs) < 256
-        assert 'validation logs truncated' in validation.logs
+        assert 'truncated chars=' in validation.logs
         assert 'sha256=' in validation.logs
 
     @pytest.mark.real_deno
@@ -1842,7 +1842,7 @@ class TestJitSecurity:
 
         assert not validation.ok
         assert len(validation.errors[0]) < 256
-        assert 'truncated validation result repr' in validation.errors[0]
+        assert 'truncated chars=' in validation.errors[0]
         assert 'sha256=' in validation.errors[0]
         assert 'x' * 128 not in validation.errors[0]
 

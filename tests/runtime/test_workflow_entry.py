@@ -45,6 +45,73 @@ class TestWorkflowEntry:
         finally:
             runtime.close()
 
+    def test_parse_pytest_log_failure_count_uses_first_nonempty_bucket(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            mixed = runtime.run_workflow(
+                "parse_pytest_log",
+                {
+                    "log": "\n".join(
+                        [
+                            "FAILED tests/test_a.py::test_a",
+                            "FAILED tests/test_b.py::test_b",
+                            "AssertionError: first",
+                            "AssertionError: second",
+                            "AssertionError: third",
+                            "E first setup error",
+                            "E second setup error",
+                            "E third setup error",
+                            "E fourth setup error",
+                        ]
+                    )
+                },
+                image=runtime.config.runtime.coding_image_id,
+            )
+            assertions_only = runtime.run_workflow(
+                "parse_pytest_log",
+                {
+                    "log": "\n".join(
+                        [
+                            "AssertionError: first",
+                            "AssertionError: second",
+                            "E setup error",
+                        ]
+                    )
+                },
+                image=runtime.config.runtime.coding_image_id,
+            )
+
+            assert mixed.ok, mixed.error
+            assert len(mixed.payload["failed"]) == 2
+            assert len(mixed.payload["assertions"]) == 3
+            assert len(mixed.payload["errors"]) == 4
+            assert mixed.payload["failure_count"] == 2
+            assert assertions_only.ok, assertions_only.error
+            assert len(assertions_only.payload["assertions"]) == 2
+            assert len(assertions_only.payload["errors"]) == 1
+            assert assertions_only.payload["failure_count"] == 2
+        finally:
+            runtime.close()
+
+    def test_parse_pytest_log_error_removes_only_e_and_first_whitespace(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            result = runtime.run_workflow(
+                "parse_pytest_log",
+                {"log": "   E       AssertionError: retained indentation   "},
+                image=runtime.config.runtime.coding_image_id,
+            )
+
+            assert result.ok, result.error
+            assert result.payload["failed"] == []
+            assert result.payload["assertions"] == []
+            assert result.payload["errors"] == [
+                "      AssertionError: retained indentation"
+            ]
+            assert result.payload["failure_count"] == 1
+        finally:
+            runtime.close()
+
     def test_unknown_workflow_tool_returns_failed_result(self) -> None:
         runtime = Runtime.open("local")
         try:

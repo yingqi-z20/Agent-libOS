@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import os
@@ -42,9 +43,13 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProviderHostError, ResourceLimitExceeded, ValidationError
 from agent_libos.substrate import ProviderEffectNotStarted
 from agent_libos.substrate import LocalResourceProviderSubstrate, SdkMcpProvider
+from agent_libos.primitives.mcp import McpPrimitive, _model_facing_mcp_call_payload
 import agent_libos.sdk.protected_operations as protected_operations
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.substrate.local import _allowed_mcp_connect_addresses
+from agent_libos.substrate.local import (
+    _allowed_mcp_connect_addresses,
+    _bounded_mcp_content,
+)
 from agent_libos.utils.serde import dumps, to_jsonable
 
 
@@ -68,6 +73,176 @@ def _grant_stdio_spawn(
 
 
 class TestMcpPrimitive:
+    def test_model_facing_result_prefers_strictly_equivalent_structured_content(
+        self,
+    ) -> None:
+        sentinel = "MCP_DUPLICATE_SENTINEL"
+        structured = {"answer": {"value": sentinel, "count": 1}}
+        projected = _model_facing_mcp_call_payload(
+            [
+                {"type": "text", "text": dumps(structured)},
+                {
+                    "type": "text",
+                    "text": dumps({"answer": {"value": "distinct", "count": 2}}),
+                },
+                {"type": "text", "text": "Useful non-JSON explanation."},
+            ],
+            structured,
+        )
+
+        assert projected["structured_content"] == structured
+        assert projected["content"] == [
+            {
+                "type": "text",
+                "text": dumps({"answer": {"value": "distinct", "count": 2}}),
+            },
+            {"type": "text", "text": "Useful non-JSON explanation."},
+        ]
+        assert dumps(projected).count(sentinel) == 1
+
+    def test_model_facing_result_keeps_annotated_and_non_equivalent_text(self) -> None:
+        structured = {"answer": 1}
+        annotated_copy = {
+            "type": "text",
+            "text": dumps(structured),
+            "annotations": {"audience": ["assistant"]},
+        }
+        plain_text = {"type": "text", "text": "answer=1"}
+        non_equivalent = {"type": "text", "text": dumps({"answer": 2})}
+
+        projected = _model_facing_mcp_call_payload(
+            [annotated_copy, plain_text, non_equivalent],
+            structured,
+        )
+
+        assert projected["content"] == [
+            annotated_copy,
+            plain_text,
+            non_equivalent,
+        ]
+
+    def test_model_facing_equivalence_projects_json_encoded_media_first(self) -> None:
+        raw = b"binary-in-json-text"
+        encoded = base64.b64encode(raw).decode("ascii")
+        structured = {
+            "asset": {
+                "type": "image",
+                "data": encoded,
+                "mimeType": "image/png",
+            }
+        }
+
+        projected = _model_facing_mcp_call_payload(
+            [{"type": "text", "text": dumps(structured)}],
+            structured,
+        )
+
+        assert projected["content"] == []
+        receipt = projected["structured_content"]["asset"]
+        assert receipt["bytes"] == len(raw)
+        assert receipt["sha256"] == hashlib.sha256(raw).hexdigest()
+        assert receipt["raw_content_retained"] is False
+        assert encoded not in dumps(projected)
+
+    def test_mcp_binary_projection_recurses_and_hashes_decoded_bytes(self) -> None:
+        image_bytes = b"\x00image-payload\xff"
+        audio_bytes = b"nested-audio"
+        resource_bytes = b"embedded-resource"
+        projected = _bounded_mcp_content(
+            {
+                "domain": {"mime_type": "not-media", "data": "keep"},
+                "outer": [
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(image_bytes).decode("ascii"),
+                        "mimeType": "image/png",
+                        "name": "preview",
+                        "bytes": 999,
+                        "sha256": "provider-reported-hash",
+                        "receipt_id": "receipt-123",
+                    },
+                    {
+                        "nested": {
+                            "type": "audio",
+                            "data": base64.b64encode(audio_bytes).decode("ascii"),
+                            "mime_type": "audio/wav",
+                        }
+                    },
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": "file:///evidence/report.bin",
+                            "name": "report.bin",
+                            "mimeType": "application/octet-stream",
+                            "blob": base64.b64encode(resource_bytes).decode("ascii"),
+                        },
+                    },
+                ]
+            }
+        )
+
+        assert projected["domain"] == {
+            "mime_type": "not-media",
+            "data": "keep",
+        }
+        image = projected["outer"][0]
+        assert image == {
+            "type": "image",
+            "mimeType": "image/png",
+            "name": "preview",
+            "receipt_id": "receipt-123",
+            "provider_reported_content_metadata": {
+                "bytes": 999,
+                "sha256": "provider-reported-hash",
+            },
+            "content_omitted": True,
+            "raw_content_retained": False,
+            "content_encoding": "base64",
+            "base64_valid": True,
+            "bytes": len(image_bytes),
+            "sha256": hashlib.sha256(image_bytes).hexdigest(),
+            "sha256_basis": "decoded_bytes",
+        }
+        audio = projected["outer"][1]["nested"]
+        assert audio["mimeType"] == "audio/wav"
+        assert "mime_type" not in audio
+        assert audio["bytes"] == len(audio_bytes)
+        assert audio["sha256"] == hashlib.sha256(audio_bytes).hexdigest()
+        resource = projected["outer"][2]["resource"]
+        assert resource["uri"] == "file:///evidence/report.bin"
+        assert resource["name"] == "report.bin"
+        assert resource["mimeType"] == "application/octet-stream"
+        assert resource["bytes"] == len(resource_bytes)
+        assert resource["sha256"] == hashlib.sha256(resource_bytes).hexdigest()
+
+        rendered = dumps(projected)
+        for raw in (image_bytes, audio_bytes, resource_bytes):
+            assert base64.b64encode(raw).decode("ascii") not in rendered
+
+    def test_mcp_binary_projection_marks_invalid_base64_without_miscounting(self) -> None:
+        invalid = "not%base64"
+        projected = _bounded_mcp_content(
+            {
+                "type": "resource",
+                "resource": {
+                    "uri": "memory://broken",
+                    "blob": invalid,
+                },
+            }
+        )
+
+        resource = projected["resource"]
+        assert resource["uri"] == "memory://broken"
+        assert resource["content_omitted"] is True
+        assert resource["raw_content_retained"] is False
+        assert resource["base64_valid"] is False
+        assert resource["encoded_bytes"] == len(invalid.encode("utf-8"))
+        assert resource["encoded_sha256"] == hashlib.sha256(
+            invalid.encode("utf-8")
+        ).hexdigest()
+        assert "bytes" not in resource
+        assert invalid not in dumps(projected)
+
     @pytest.mark.parametrize(
         ('rollback_class', 'rollback_status', 'expected_status'),
         [
@@ -2039,6 +2214,50 @@ class TestMcpPrimitive:
             assert effect.information_flow
         finally:
             runtime.close()
+
+    def test_call_projects_duplicate_provider_content_without_changing_receipt_size(
+        self,
+    ) -> None:
+        sentinel = "MCP_RUNTIME_DUPLICATE_SENTINEL"
+        structured = {"answer": {"value": sentinel}}
+        tool = McpToolSpec(
+            tool_id="echo",
+            mcp_name="demo.echo",
+            right="read",
+            rollback_class="no_rollback_required",
+            state_mutation=False,
+            information_flow=True,
+        )
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="compact-result",
+            transport="stdio",
+            tools=[tool],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=4096,
+            stdio=McpStdioTransportSpec(command="python3"),
+        )
+        provider_result = McpProviderCallResult(
+            content=[{"type": "text", "text": dumps(structured)}],
+            structured_content=structured,
+            response_bytes=777,
+            duration_s=0.02,
+        )
+
+        primitive = object.__new__(McpPrimitive)
+        result = primitive._call_result_from_provider(
+            server,
+            tool,
+            provider_result,
+        )
+
+        assert result.result == {
+            "content": [],
+            "structured_content": structured,
+        }
+        assert dumps(result.result).count(sentinel) == 1
+        assert result.response_bytes == 777
 
     @pytest.mark.parametrize('sink', ['event', 'audit'])
     def test_list_tools_refresh_post_provider_sink_failure_leaves_pending_effect_intent(

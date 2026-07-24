@@ -13,8 +13,10 @@ class RunShellCommandArgs(BaseModel):
     argv: list[str] = Field(
         min_length=1,
         description=(
-            "Command argv array. Shell strings and git argv are not accepted; "
-            "activate a matching Git Skill and use its typed git_* tool."
+            "Command argv array; shell strings are not accepted. Prefer typed "
+            "git_* tools. Direct Git is limited to the Host's finite exact "
+            "legacy read allowlist at the Runtime workspace root; extra flags, "
+            "paths, mutations, remotes, and wrapped Git argv are rejected."
         ),
     )
     timeout_s: float = Field(
@@ -27,13 +29,19 @@ class RunShellCommandArgs(BaseModel):
         default=_SHELL_DEFAULTS.max_stdout_chars,
         ge=0,
         le=_SHELL_DEFAULTS.stdout_hard_limit_chars,
-        description="Maximum stdout characters returned in the tool result.",
+        description=(
+            "Maximum stdout characters retained by this tool after the shell primitive's "
+            "own bounded capture; increasing it cannot recover output already truncated below."
+        ),
     )
     max_stderr_chars: int = Field(
         default=_SHELL_DEFAULTS.max_stderr_chars,
         ge=0,
         le=_SHELL_DEFAULTS.stderr_hard_limit_chars,
-        description="Maximum stderr characters returned in the tool result.",
+        description=(
+            "Maximum stderr characters retained by this tool after the shell primitive's "
+            "own bounded capture; increasing it cannot recover output already truncated below."
+        ),
     )
 
 
@@ -50,7 +58,9 @@ class RunShellCommandTool(BaseAgentTool[RunShellCommandArgs]):
     name = "run_shell_command"
     description = (
         "Run an argv-only command through the libOS shell primitive. "
-        "Git argv, including read-only status/diff, are rejected; use typed git_* tools. "
+        "Prefer typed git_* tools; direct Git is limited to a finite Host-owned "
+        "allowlist of exact legacy read argv at the Runtime workspace root, "
+        "with all other Git argv rejected. "
         "The primitive enforces shell execution policy, configured allow/ask lists, human approval, audit, and events."
     )
     args_schema = RunShellCommandArgs

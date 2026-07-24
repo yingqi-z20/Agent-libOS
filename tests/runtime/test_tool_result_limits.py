@@ -10,8 +10,10 @@ from pydantic import BaseModel
 
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import EventType, ObjectType, ProcessStatus
+from agent_libos.models import EventType, ObjectType, ProcessStatus, ValidationResult
+from agent_libos.models.exceptions import SandboxError
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
+from agent_libos.tools.sandbox import SandboxBackend
 
 
 class EmptyArgs(BaseModel):
@@ -120,6 +122,30 @@ class StaticToolV2(SyncAgentTool[EmptyArgs]):
 
     def run(self, args: EmptyArgs, ctx: ToolContext) -> dict[str, int]:
         return {"version": 2}
+
+
+class LongFailingJitSandbox(SandboxBackend):
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(
+        self,
+        source_code: str,
+        args: dict[str, object],
+        **kwargs: object,
+    ) -> object:
+        raise SandboxError(
+            "JIT stderr at /Users/alice/work/repo/tool.ts: " + ("stderr " * 100_000)
+        )
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, object]],
+        timeout: float | None = None,
+        **kwargs: object,
+    ) -> ValidationResult:
+        return ValidationResult(ok=True)
 
 
 class TestToolResultLimits:
@@ -358,5 +384,80 @@ class TestToolResultLimits:
             assert result.result_handle is None
             assert "tool call arguments exceed" in (result.error or "")
             assert all(event.type.value != "tool_called" for event in runtime.events.list(target=pid))
+        finally:
+            runtime.close()
+
+    def test_echo_result_is_subject_to_global_result_payload_limit(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            tools=replace(
+                DEFAULT_CONFIG.tools,
+                tool_result_payload_hard_limit_bytes=256,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="oversize echo result")
+            runtime.tools.configure_process_tools(pid, ["echo"], assigned_by="test")
+
+            result = runtime.tools.call(pid, "echo", {"blob": "x" * 1000})
+
+            assert not result.ok
+            assert result.result_handle is None
+            assert "tool result payload exceeds" in (result.error or "")
+            assert [
+                obj
+                for obj in runtime.store.list_objects()
+                if obj.type == ObjectType.TOOL_RESULT
+            ] == []
+        finally:
+            runtime.close()
+
+    def test_long_jit_stderr_is_bounded_in_model_facing_failure(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            tools=replace(
+                DEFAULT_CONFIG.tools,
+                tool_result_payload_hard_limit_bytes=1_024,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        runtime.tools.sandbox = LongFailingJitSandbox()
+        try:
+            pid = runtime.process.spawn(
+                image="toolmaker-agent:v0",
+                goal="bound failing JIT stderr",
+            )
+            candidate = runtime.tools.propose(
+                pid,
+                {
+                    "name": "long_failing_jit",
+                    "description": "Raise an intentionally long sandbox error.",
+                    "input_schema": {"type": "object"},
+                    "output_schema": {"type": "object"},
+                },
+                source_code="export function run() { return {}; }",
+            )
+            validation = runtime.tools.validate(candidate)
+            assert validation.ok, validation.errors
+            runtime.tools.register(pid, candidate)
+
+            result = runtime.tools.call(pid, "long_failing_jit", {})
+            encoded = json.dumps(
+                result.payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+            assert not result.ok
+            assert len(encoded) <= 1_024
+            assert result.payload["error"]["type"] == "SandboxError"
+            assert result.payload["error"]["total_errors"] == 1
+            assert result.payload["error"]["omitted"] >= 1
+            assert len(result.payload["error"]["error_hash"]) == 64
+            assert len(result.error or "") <= runtime.config.tools.tool_observability_preview_chars
+            assert b"/Users/alice" not in encoded
+            assert encoded.count(b"stderr") <= 40
         finally:
             runtime.close()

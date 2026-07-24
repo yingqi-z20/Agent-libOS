@@ -17,7 +17,11 @@ class EchoArgs(BaseModel):
 
 class EchoTool(SyncAgentTool[EchoArgs]):
     name = "echo"
-    description = "Return the provided arguments unchanged. Useful for tool plumbing tests."
+    description = (
+        "Return the parsed argument object for tool-plumbing tests. In the LLM function-call "
+        "protocol, the top-level `action` key is reserved routing metadata and is removed before "
+        "this tool receives the remaining arguments."
+    )
     args_schema = EchoArgs
     policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.interactive_timeout_s)
     tags = ["debug", "deterministic"]

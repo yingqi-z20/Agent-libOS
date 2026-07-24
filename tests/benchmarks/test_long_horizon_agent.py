@@ -14,6 +14,7 @@ from benchmarks.long_horizon_agent import (
     evaluate_run,
     prepare_workspace,
     report_all_successful,
+    run_evaluation,
 )
 from benchmarks.long_horizon_agent.runner import (
     REQUIRED_ACTIONS,
@@ -21,6 +22,7 @@ from benchmarks.long_horizon_agent.runner import (
     GOAL,
     MIDFLIGHT_MESSAGE,
     _action_sequence,
+    _adjacent_prompt_prefix_metrics,
     _grant_authority,
     _successful_action_sequence,
     _workflow_order_checks,
@@ -207,7 +209,8 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
         review_result = dispatch({"action": "process_exit"})
         review = review_result["payload"]["completion_review"]
         assert review["goal"]["source"] == "persisted_initial_llm_context"
-        assert "exactly 100.00" in str(review["goal"]["payload"])
+        assert "payload" not in review["goal"]
+        assert "exactly 100.00" in str(review["goal"]["fallback"])
         dispatch(
             {
                 "action": "human_output",
@@ -483,6 +486,134 @@ def test_report_gate_rejects_missing_or_failed_runs(report: dict[str, object]) -
 
 def test_report_gate_accepts_only_all_successful_runs() -> None:
     assert report_all_successful({"runs": [{"passed": True}]}) is True
+
+
+def test_adjacent_prompt_prefix_metrics_use_persisted_list_messages() -> None:
+    first_messages = [{"role": "user", "content": "stable"}]
+    second_messages = [
+        {"role": "user", "content": "stable"},
+        {"role": "assistant", "content": "next"},
+    ]
+    first_bytes = json.dumps(
+        first_messages,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    second_bytes = json.dumps(
+        second_messages,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    metrics = _adjacent_prompt_prefix_metrics(
+        [
+            SimpleNamespace(messages=first_messages),
+            SimpleNamespace(messages=second_messages),
+        ]
+    )
+
+    expected_prefix_bytes = len(first_bytes) - 1
+    assert metrics == {
+        "adjacent_prompt_pair_count": 1,
+        "adjacent_prompt_comparable_pair_count": 1,
+        "adjacent_prompt_unavailable_pair_count": 0,
+        "adjacent_prompt_common_prefix_bytes": expected_prefix_bytes,
+        "adjacent_prompt_next_bytes": len(second_bytes),
+        "adjacent_prompt_common_prefix_ratio": (
+            expected_prefix_bytes / len(second_bytes)
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "calls, expected_pair_count",
+    [
+        ([], 0),
+        ([SimpleNamespace(messages=[])], 0),
+        (
+            [
+                SimpleNamespace(messages=[]),
+                SimpleNamespace(
+                    messages={
+                        "$agent_libos_payload_retention": {
+                            "tier": "summary",
+                            "sha256": "a" * 64,
+                        }
+                    }
+                ),
+            ],
+            1,
+        ),
+        (
+            [
+                SimpleNamespace(messages="not-a-list"),
+                SimpleNamespace(messages=[]),
+            ],
+            1,
+        ),
+    ],
+)
+def test_adjacent_prompt_prefix_metrics_report_unavailable_pairs(
+    calls: list[SimpleNamespace],
+    expected_pair_count: int,
+) -> None:
+    metrics = _adjacent_prompt_prefix_metrics(calls)
+
+    assert metrics["adjacent_prompt_pair_count"] == expected_pair_count
+    assert metrics["adjacent_prompt_comparable_pair_count"] == 0
+    assert metrics["adjacent_prompt_unavailable_pair_count"] == expected_pair_count
+    assert metrics["adjacent_prompt_common_prefix_bytes"] == 0
+    assert metrics["adjacent_prompt_next_bytes"] == 0
+    assert metrics["adjacent_prompt_common_prefix_ratio"] is None
+
+
+def test_report_aggregates_prompt_prefix_metrics_by_next_prompt_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs = iter(
+        [
+            {
+                "passed": True,
+                "checks": {},
+                "adjacent_prompt_pair_count": 2,
+                "adjacent_prompt_comparable_pair_count": 2,
+                "adjacent_prompt_unavailable_pair_count": 0,
+                "adjacent_prompt_common_prefix_bytes": 90,
+                "adjacent_prompt_next_bytes": 100,
+            },
+            {
+                "passed": False,
+                "checks": {},
+                "adjacent_prompt_pair_count": 3,
+                "adjacent_prompt_comparable_pair_count": 1,
+                "adjacent_prompt_unavailable_pair_count": 2,
+                "adjacent_prompt_common_prefix_bytes": 10,
+                "adjacent_prompt_next_bytes": 100,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        "benchmarks.long_horizon_agent.runner._run_once",
+        lambda *_args, **_kwargs: next(runs),
+    )
+
+    report = run_evaluation(
+        tmp_path / "evaluation",
+        repetitions=2,
+        phase_one_quanta=1,
+        max_quanta=2,
+    )
+    metrics = report["metrics"]
+
+    assert metrics["adjacent_prompt_pair_count"] == 5
+    assert metrics["adjacent_prompt_comparable_pair_count"] == 3
+    assert metrics["adjacent_prompt_unavailable_pair_count"] == 2
+    assert metrics["adjacent_prompt_common_prefix_bytes"] == 100
+    assert metrics["adjacent_prompt_next_bytes"] == 200
+    assert metrics["adjacent_prompt_common_prefix_ratio"] == 0.5
 
 
 def _fixed_pricing_source() -> str:

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import secrets
@@ -14,8 +15,8 @@ import sys
 import tempfile
 import textwrap
 import time
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
-from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -32,7 +33,7 @@ from agent_libos.substrate import (
     SubprocessTimeoutExpired,
     WindowsJobObject,
 )
-from agent_libos.tools.observability import ensure_json_size
+from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
 from agent_libos.utils.public_errors import (
     provider_error_envelope,
     provider_error_envelope_from_mapping,
@@ -53,8 +54,333 @@ _TYPESCRIPT_DEPENDENCY_DIRECTIVE_RE = re.compile(
 _DENO_TYPES_DIRECTIVE_RE = re.compile(r"(?im)^\s*//\s*@deno-types\s*=")
 _PROCESS_CLEANUP_TIMEOUT_S = 1.0
 _PROCESS_CLEANUP_POLL_INTERVAL_S = 0.02
+_VALIDATION_SUMMARY_MAX_DEPTH = 64
+_POSIX_HOST_PATH_RE = re.compile(
+    r"(?<![:/A-Za-z0-9._-])(?:file://)?/"
+    r"(?:[^\s/\\\"'<>|,;()[\]{}]+/)+"
+    r"[^\s/\\\"'<>|,;()[\]{}]+"
+)
+_WINDOWS_HOST_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9._-])[A-Z]:\\"
+    r"(?:[^\s/\\\"'<>|,;()[\]{}]+\\)+"
+    r"[^\s/\\\"'<>|,;()[\]{}]+"
+)
+_STACK_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"File\s+[\"']|"
+    r"at\s+(?:async\s+)?(?:.*[/\\].*:\d+(?::\d+)?\)?|.*\([^)]*:\d+(?::\d+)?\))"
+    r").*$"
+)
+_PYTHON_EXCEPTION_LINE_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Interrupt|Warning)?\s*:"
+)
+_VALIDATION_CREDENTIAL_PATTERNS = (
+    re.compile(
+        r"(?is)-----BEGIN [^-]*PRIVATE KEY-----.*?"
+        r"-----END [^-]*PRIVATE KEY-----"
+    ),
+    re.compile(
+        r"(?i)\b[A-Za-z0-9_-]*(?:"
+        r"api[_-]?key|authorization|auth[_-]?token|credential|password|passwd|"
+        r"private[_-]?key|secret|session[_-]?token|token"
+        r")[A-Za-z0-9_-]*\b\s*[:=]\s*"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;\"'}]+)"
+    ),
+    re.compile(r"(?i)\b(?:sk|gh[pousr])[-_][A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"(?i)\bhttps?://[^/\s:@]+:[^/\s@]+@"),
+)
+_SANDBOX_SOURCE_LOCATION_RE = re.compile(
+    r"(?P<name>candidate\.ts|runner\.ts|deno\.json)"
+    r"(?P<location>:\d+(?::\d+)?)?"
+)
 
 SyscallHandler = Callable[[str, dict[str, Any]], Any | Awaitable[Any]]
+
+
+def compact_validation_diagnostic(
+    value: object,
+    *,
+    max_chars: int,
+    head_tail: bool = True,
+) -> str:
+    """Return a credential/path-safe, stack-free validation diagnostic.
+
+    Validation text is model-facing data. It must stay actionable, but must
+    not become an accidental carrier for provider credentials, host paths, or
+    embedded tracebacks. The digest is over the original text so a bounded
+    diagnostic can still be correlated with durable validation evidence.
+    """
+
+    text = str(value)
+    safe = _redact_validation_text(text)
+    safe = _strip_validation_stack(safe)
+    safe = _redact_host_paths(safe)
+    return _bound_validation_text(
+        safe,
+        original=text,
+        max_chars=max(1, max_chars),
+        head_tail=head_tail,
+    )
+
+
+def summarize_validation_value(
+    value: Any,
+    *,
+    preview_chars: int,
+    head_tail: bool = False,
+) -> dict[str, Any]:
+    """Build a deterministic, bounded summary for one candidate test value."""
+
+    canonical, lossy = _canonical_validation_value(value)
+    serialized = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    encoded = serialized.encode("utf-8")
+    safe_serialized = _redact_validation_text(serialized)
+    safe_serialized = _redact_host_paths(safe_serialized)
+    preview = _bound_validation_text(
+        safe_serialized,
+        original=serialized,
+        max_chars=max(1, preview_chars),
+        head_tail=head_tail,
+    )
+    return {
+        "type": _validation_value_type(value),
+        "serialized_size": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "preview": preview,
+        "preview_truncated": len(safe_serialized) > max(1, preview_chars),
+        "lossy": lossy,
+    }
+
+
+def _canonical_validation_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> tuple[Any, bool]:
+    if depth >= _VALIDATION_SUMMARY_MAX_DEPTH:
+        return {"$non_json_type": _qualified_type_name(value), "$depth_limited": True}, True
+    if value is None or isinstance(value, (str, bool, int)):
+        return value, False
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value, False
+        return {"$non_finite_number": str(value)}, True
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        return {
+            "$binary_type": type(value).__name__,
+            "serialized_size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }, True
+
+    selected_seen = seen if seen is not None else set()
+    identity = id(value)
+    if identity in selected_seen:
+        return {"$non_json_type": _qualified_type_name(value), "$cycle": True}, True
+
+    if isinstance(value, Mapping):
+        selected_seen.add(identity)
+        try:
+            result: dict[str, Any] = {}
+            lossy = False
+            for key, item in value.items():
+                key_text, key_lossy = _canonical_validation_key(key)
+                lossy = lossy or key_lossy
+                converted, item_lossy = _canonical_validation_value(
+                    item,
+                    depth=depth + 1,
+                    seen=selected_seen,
+                )
+                if key_text in result:
+                    key_text = f"{key_text}#{len(result)}"
+                    lossy = True
+                result[key_text] = converted
+                lossy = lossy or item_lossy
+            return result, lossy
+        finally:
+            selected_seen.remove(identity)
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        selected_seen.add(identity)
+        try:
+            converted_items: list[Any] = []
+            lossy = not isinstance(value, list)
+            for item in value:
+                converted, item_lossy = _canonical_validation_value(
+                    item,
+                    depth=depth + 1,
+                    seen=selected_seen,
+                )
+                converted_items.append(converted)
+                lossy = lossy or item_lossy
+            if isinstance(value, (set, frozenset)):
+                converted_items.sort(
+                    key=lambda item: json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            return converted_items, lossy
+        finally:
+            selected_seen.remove(identity)
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        selected_seen.add(identity)
+        try:
+            try:
+                dumped = model_dump(mode="json")
+            except TypeError:
+                dumped = model_dump()
+            converted, _lossy = _canonical_validation_value(
+                dumped,
+                depth=depth + 1,
+                seen=selected_seen,
+            )
+            return converted, True
+        finally:
+            selected_seen.remove(identity)
+
+    return {"$non_json_type": _qualified_type_name(value)}, True
+
+
+def _canonical_validation_key(key: Any) -> tuple[str, bool]:
+    if isinstance(key, str):
+        return key, False
+    if key is None or isinstance(key, (bool, int, float)):
+        return json.dumps(key, ensure_ascii=False, sort_keys=True), True
+    return f"<{_qualified_type_name(key)}>", True
+
+
+def _validation_value_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return "array"
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "binary"
+    return f"non-json:{_qualified_type_name(value)}"
+
+
+def _qualified_type_name(value: Any) -> str:
+    value_type = type(value)
+    module = value_type.__module__
+    qualified = value_type.__qualname__
+    return qualified if module == "builtins" else f"{module}.{qualified}"
+
+
+def _redact_validation_text(value: str) -> str:
+    locally_redacted = _redact_additional_credentials(value)
+    encoded = json.dumps(locally_redacted, ensure_ascii=True)
+    envelope = sanitize_for_observability(
+        locally_redacted,
+        preview_chars=len(encoded) + _TOOL_DEFAULTS.tool_observability_preview_chars,
+    )
+    preview = envelope.get("preview")
+    if isinstance(preview, str) and not envelope.get("truncated", False):
+        try:
+            decoded = json.loads(preview)
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, str):
+            return decoded
+    fallback = (
+        "[validation diagnostic redacted "
+        f"sha256={hashlib.sha256(value.encode('utf-8', errors='replace')).hexdigest()}]"
+    )
+    return _redact_additional_credentials(fallback)
+
+
+def _redact_additional_credentials(value: str) -> str:
+    redacted = value
+    for pattern in _VALIDATION_CREDENTIAL_PATTERNS:
+        redacted = pattern.sub("[redacted]", redacted)
+    return redacted
+
+
+def _strip_validation_stack(value: str) -> str:
+    kept: list[str] = []
+    stack_omitted = False
+    python_traceback = False
+    for line in value.splitlines():
+        if line.lstrip().startswith("Traceback ("):
+            if not stack_omitted:
+                kept.append("[stack omitted]")
+                stack_omitted = True
+            python_traceback = True
+            continue
+        if python_traceback:
+            if _PYTHON_EXCEPTION_LINE_RE.match(line):
+                python_traceback = False
+                kept.append(line)
+            continue
+        if _STACK_LINE_RE.match(line):
+            if not stack_omitted:
+                kept.append("[stack omitted]")
+                stack_omitted = True
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _redact_host_paths(value: str) -> str:
+    return _WINDOWS_HOST_PATH_RE.sub(
+        _host_path_replacement,
+        _POSIX_HOST_PATH_RE.sub(_host_path_replacement, value),
+    )
+
+
+def _host_path_replacement(match: re.Match[str]) -> str:
+    source_location = _SANDBOX_SOURCE_LOCATION_RE.search(match.group(0))
+    if source_location is not None:
+        return (
+            source_location.group("name")
+            + (source_location.group("location") or "")
+        )
+    return "<host-path>"
+
+
+def _bound_validation_text(
+    value: str,
+    *,
+    original: str,
+    max_chars: int,
+    head_tail: bool,
+) -> str:
+    if len(value) <= max_chars:
+        return value
+    digest = hashlib.sha256(original.encode("utf-8", errors="replace")).hexdigest()
+    marker = (
+        f"\n[truncated chars={len(original)} sha256={digest}]\n"
+        if head_tail
+        else f"... [truncated chars={len(original)} sha256={digest}]"
+    )
+    remaining = max_chars - len(marker)
+    if remaining <= 0:
+        return marker.strip()
+    if not head_tail:
+        return value[:remaining] + marker
+    head_chars = (remaining + 1) // 2
+    tail_chars = remaining - head_chars
+    return value[:head_chars] + marker + (value[-tail_chars:] if tail_chars else "")
 
 
 @dataclass(frozen=True)
@@ -182,6 +508,10 @@ class DenoTypescriptSandbox(SandboxBackend):
         self.max_tests = max_tests
         self.max_test_case_bytes = max_test_case_bytes
         self.max_validation_log_chars = max_validation_log_chars
+        self.validation_result_preview_chars = min(
+            max_validation_log_chars,
+            _TOOL_DEFAULTS.tool_observability_preview_chars,
+        )
         self.forbidden_executable_roots = tuple(Path(root).resolve() for root in forbidden_executable_roots)
         self.profile_builder = SandboxProfileBuilder()
 
@@ -370,8 +700,11 @@ class DenoTypescriptSandbox(SandboxBackend):
                 raise
             except Exception as exc:
                 errors.append(
-                    "source failed Deno type-check: "
-                    f"{self._bounded_result_repr(exc)}"
+                    self._validation_failure(
+                        status="failed",
+                        reason="Deno type-check failed",
+                        error=exc,
+                    )
                 )
         for index, test in enumerate(tests, start=1):
             syscall_handler, assert_syscalls_consumed = self._test_syscall_handler(test, index)
@@ -394,14 +727,45 @@ class DenoTypescriptSandbox(SandboxBackend):
             except (SubprocessLimitExceeded, SubprocessTimeoutExpired):
                 raise
             except Exception as exc:
-                errors.append(f"test {index} failed to run: {self._bounded_result_repr(exc)}")
-                continue
-            logs.append(f"test {index} result: {self._bounded_result_repr(result_value)}")
-            if "expected" in test and result_value != test["expected"]:
                 errors.append(
-                    "test "
-                    f"{index} expected {self._bounded_result_repr(test['expected'])}, "
-                    f"got {self._bounded_result_repr(result_value)}"
+                    self._validation_failure(
+                        status="failed",
+                        reason="execution_error",
+                        test=index,
+                        error=exc,
+                    )
+                )
+                continue
+            matches = "expected" not in test or result_value == test["expected"]
+            result_summary = summarize_validation_value(
+                result_value,
+                preview_chars=self.validation_result_preview_chars,
+                head_tail=not matches,
+            )
+            logs.append(
+                self._validation_record(
+                    {
+                        "result": result_summary,
+                        "status": "passed" if matches else "failed",
+                        "test": index,
+                    }
+                )
+            )
+            if not matches:
+                errors.append(
+                    self._validation_record(
+                        {
+                            "actual": result_summary,
+                            "expected": summarize_validation_value(
+                                test["expected"],
+                                preview_chars=self.validation_result_preview_chars,
+                                head_tail=True,
+                            ),
+                            "reason": "result_mismatch",
+                            "status": "failed",
+                            "test": index,
+                        }
+                    )
                 )
         metadata = {"metrics": self._aggregate_metrics(metrics)} if return_metrics else {}
         return ValidationResult(ok=not errors, errors=errors, logs=self._bounded_logs(logs), metadata=metadata)
@@ -1132,22 +1496,50 @@ class DenoTypescriptSandbox(SandboxBackend):
             "limit_kind": next((item.limit_kind for item in metrics if item.limit_kind), None),
         }
 
-    def _bounded_result_repr(self, value: Any) -> str:
-        text = repr(value)
-        if len(text) <= self.max_validation_log_chars:
-            return text
-        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-        return (
-            text[: self.max_validation_log_chars]
-            + f"... [truncated validation result repr chars={len(text)} sha256={digest}]"
+    def _validation_record(self, value: Mapping[str, Any]) -> str:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
+        return compact_validation_diagnostic(
+            serialized,
+            max_chars=self.max_validation_log_chars,
+            head_tail=True,
+        )
+
+    def _validation_failure(
+        self,
+        *,
+        status: str,
+        reason: str,
+        error: BaseException,
+        test: int | None = None,
+    ) -> str:
+        record: dict[str, Any] = {
+            "error": {
+                "message": compact_validation_diagnostic(
+                    error,
+                    max_chars=self.validation_result_preview_chars,
+                    head_tail=True,
+                ),
+                "type": type(error).__name__,
+            },
+            "reason": reason,
+            "status": status,
+        }
+        if test is not None:
+            record["test"] = test
+        return self._validation_record(record)
 
     def _bounded_logs(self, logs: list[str]) -> str:
         text = "\n".join(logs)
-        if len(text) <= self.max_validation_log_chars:
-            return text
-        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-        return text[: self.max_validation_log_chars] + f"\n[validation logs truncated chars={len(text)} sha256={digest}]"
+        return compact_validation_diagnostic(
+            text,
+            max_chars=self.max_validation_log_chars,
+            head_tail=True,
+        )
 
     def _contains_dynamic_import(self, source_code: str) -> bool:
         tokens = self._typescript_tokens(source_code)

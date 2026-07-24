@@ -45,6 +45,7 @@ from agent_libos.models import (
     McpToolListResult,
     ProcessSignal,
     ProcessStatus,
+    ResourceUsage,
     SinkTrustLevel,
     SinkTrustRule,
     process_outcome_to_mapping,
@@ -2053,6 +2054,36 @@ class TestGuiServer:
         assert all(process['unread_message_count'] == 1 for process in by_pid.values())
         assert by_pid[pids[0]]['rating']['score'] == 5
 
+    def test_process_summary_uses_cumulative_resource_totals_beyond_recent_call_window(
+        self,
+    ) -> None:
+        service = self.server.service
+        runtime = service.runtime
+        runtime.config = replace(
+            runtime.config,
+            gui=replace(runtime.config.gui, snapshot_process_llm_call_limit=2),
+        )
+        pid = runtime.process.spawn(
+            image='base-agent:v0',
+            goal='show cumulative long-running task usage',
+        )
+        runtime.resources.charge(
+            pid,
+            ResourceUsage(
+                llm_calls=32,
+                llm_prompt_tokens=891_111,
+                llm_completion_tokens=22_133,
+                llm_total_tokens=913_244,
+            ),
+            source='test.gui.cumulative_llm_usage',
+        )
+
+        snapshot = service.snapshot()
+        summary = next(item for item in snapshot['processes'] if item['pid'] == pid)
+
+        assert summary['llm_call_count'] == 32
+        assert summary['token_total'] == 913_244
+
     def test_snapshot_selects_recent_process_messages_at_the_source(self) -> None:
         service = self.server.service
         runtime = service.runtime
@@ -2093,10 +2124,11 @@ class TestGuiServer:
                 'reasoning_effort': 'high',
                 'verbosity': 'low',
                 'safety_identifier_env': 'OPENAI_SAFETY_IDENTIFIER',
-                'prompt_cache_retention': '24h',
+                'prompt_cache_retention': 'in-memory',
                 'responses_previous_response_id': True,
                 'parallel_tool_calls': False,
                 'auto_wait_on_empty_tool_calls': True,
+                'fallback_json_actions': True,
                 'max_tokens': 2048,
                 'context_window_tokens': 100000,
                 'allow_custom_base_url': False,
@@ -2113,10 +2145,11 @@ class TestGuiServer:
         assert created['reasoning_effort'] == 'high'
         assert created['verbosity'] == 'low'
         assert created['safety_identifier_env'] == 'OPENAI_SAFETY_IDENTIFIER'
-        assert created['prompt_cache_retention'] == '24h'
+        assert created['prompt_cache_retention'] == 'in_memory'
         assert created['responses_previous_response_id'] is True
         assert created['parallel_tool_calls'] is False
         assert created['auto_wait_on_empty_tool_calls'] is True
+        assert created['fallback_json_actions'] is True
         assert created['allow_custom_base_url'] is False
 
         omitted_fields = {
@@ -2131,10 +2164,11 @@ class TestGuiServer:
             'reasoning_effort': 'high',
             'verbosity': 'low',
             'safety_identifier_env': 'OPENAI_SAFETY_IDENTIFIER',
-            'prompt_cache_retention': '24h',
+            'prompt_cache_retention': 'in_memory',
             'responses_previous_response_id': True,
             'parallel_tool_calls': False,
             'auto_wait_on_empty_tool_calls': True,
+            'fallback_json_actions': True,
             'temperature': 0.1,
         }
         updates = {
@@ -2156,7 +2190,7 @@ class TestGuiServer:
         assert updated['reasoning_effort'] == 'high'
         assert updated['verbosity'] == 'low'
         assert updated['safety_identifier_env'] == 'OPENAI_SAFETY_IDENTIFIER'
-        assert updated['prompt_cache_retention'] == '24h'
+        assert updated['prompt_cache_retention'] == 'in_memory'
         assert updated['responses_previous_response_id'] is True
         updated_profile = self.server.service.runtime.llms.profile('kimi-k2.7-code')
         for field, expected in {**omitted_fields, **updates}.items():
@@ -2203,6 +2237,7 @@ class TestGuiServer:
             and profile['verbosity'] == 'low'
             and profile['parallel_tool_calls'] is False
             and profile['auto_wait_on_empty_tool_calls'] is True
+            and profile['fallback_json_actions'] is True
             for profile in profiles
         )
         reopened_profile = self.server.service.runtime.llms.profile('kimi-k2.7-code')

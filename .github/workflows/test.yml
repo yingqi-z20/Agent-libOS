@@ -88,7 +88,7 @@ jobs:
           uv pip check --python .release-venv/bin/python
           smoke_root="$(mktemp -d)"
           cd "$smoke_root"
-          "$GITHUB_WORKSPACE/.release-venv/bin/python" -c "import agent_libos, importlib.metadata; assert agent_libos.__version__ == importlib.metadata.version('agent-libos')"
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" -c "import agent_libos, importlib.metadata; from agent_libos.skills import get_builtin_skill_catalog; catalog = get_builtin_skill_catalog(); assert agent_libos.__version__ == importlib.metadata.version('agent-libos'); assert len(catalog.list()) == 26; assert sum(len(skill.allowed_tools) for skill in catalog.list()) == 99"
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos" --help
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos-gui-server" --help
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos" --db local demo > demo.json
@@ -101,7 +101,7 @@ jobs:
           uv pip check --python .release-sdist-venv/bin/python
           sdist_smoke_root="$(mktemp -d)"
           cd "$sdist_smoke_root"
-          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" -c "import agent_libos, importlib.metadata; assert agent_libos.__version__ == importlib.metadata.version('agent-libos')"
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" -c "import agent_libos, importlib.metadata; from agent_libos.skills import get_builtin_skill_catalog; catalog = get_builtin_skill_catalog(); assert agent_libos.__version__ == importlib.metadata.version('agent-libos'); assert len(catalog.list()) == 26; assert sum(len(skill.allowed_tools) for skill in catalog.list()) == 99"
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos" --help
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos-gui-server" --help
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos" --db local demo > demo.json

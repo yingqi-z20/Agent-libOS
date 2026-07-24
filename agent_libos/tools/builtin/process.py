@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -33,10 +35,7 @@ from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, To
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _CUMULATIVE_EXIT_REVIEW = "cumulative_review"
-_COMPLETION_REVIEW_MESSAGE_DETAIL_LIMIT = 8
-_COMPLETION_REVIEW_MESSAGE_BODY_BUDGET_CHARS = 16_000
-_COMPLETION_REVIEW_MESSAGE_BODY_MAX_CHARS = 4_000
-_COMPLETION_REVIEW_MESSAGE_SUBJECT_MAX_CHARS = 256
+_COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS = 32_000
 
 
 class CompletionAcceptanceCheck(BaseModel):
@@ -191,7 +190,12 @@ class ExecProcessOutput(BaseModel):
     goal_oid: str | None
     preserve_memory: bool
     preserve_capabilities: bool
-    active_tools: list[str]
+    active_tools: list[str] = Field(
+        description=(
+            "Complete post-exec process tool-table names. This is an authority/availability inventory, "
+            "not the model-visible schema projection; activate the matching Skill before calling a hidden tool."
+        )
+    )
 
 
 class ForkChildProcessArgs(BaseModel):
@@ -209,11 +213,17 @@ class ForkChildProcessArgs(BaseModel):
     )
     include_parent_roots: bool = Field(
         default=True,
-        description="Include the parent's current MemoryView roots in addition to any explicit root_oids.",
+        description=(
+            "When root_oids is omitted, include all current parent MemoryView roots. "
+            "Ignored when root_oids is provided."
+        ),
     )
     root_oids: list[str] | None = Field(
         default=None,
-        description="Optional explicit Object ids to expose to the child instead of all parent roots.",
+        description=(
+            "Optional exact Object ids that replace parent-root selection. An empty list "
+            "exposes no parent roots; when provided, include_parent_roots is ignored."
+        ),
     )
     inherit_read_files: list[str] = Field(
         default_factory=list,
@@ -530,15 +540,124 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
             code=ToolErrorCode.VALIDATION_ERROR,
         )
     goal_oid = process.goal_oid
-    goal_payload, goal_version, goal_source = _completion_goal_payload(
+    (
+        goal_payload,
+        goal_version,
+        goal_source,
+        goal_reference,
+        goal_fallback_required,
+    ) = _completion_goal_payload(
         runtime,
         pid,
         goal_oid,
     )
-    all_messages = runtime.store.list_process_messages(pid)
+    human_messages, acknowledged, unread = _completion_review_human_messages(runtime, pid)
+    goal_sha256 = _canonical_sha256(goal_payload)
+    acknowledged_messages_sha256 = _canonical_sequence_sha256(
+        _completion_message_identity(message) for message in acknowledged
+    )
+    contract_identity = {
+        "goal_oid": goal_oid,
+        "goal_version": goal_version,
+        "human_messages": [
+            {
+                "message_id": message.message_id,
+                "status": message.status.value,
+            }
+            for message in human_messages
+        ],
+    }
+    acknowledged_message_ids = [message.message_id for message in acknowledged]
+    observed_tools = _successful_tool_calls(runtime, pid)
+    goal_evidence: dict[str, Any] = {
+        "oid": goal_oid,
+        "version": goal_version,
+        "payload_sha256": goal_sha256,
+        "source": goal_source,
+        "reference": goal_reference,
+    }
+    if goal_fallback_required:
+        goal_evidence["fallback"] = _bounded_json_value(
+            goal_payload,
+            _COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS,
+        )
+    return {
+        "schema_version": 2,
+        "review_token": f"exitrev_{_canonical_sha256(contract_identity)}",
+        "goal": goal_evidence,
+        "acknowledged_human_message_count": len(acknowledged),
+        "acknowledged_human_message_ids": acknowledged_message_ids,
+        "acknowledged_human_messages_sha256": acknowledged_messages_sha256,
+        "acknowledged_human_message_reference": {
+            "kind": "process_message_ids",
+            "activate_skill": "agent-libos-child-processes",
+            "tool": "read_process_messages",
+            "fixed_arguments": {
+                "include_acked": True,
+                "ack": False,
+            },
+            "copy_arguments": {
+                "message_ids": "acknowledged_human_message_ids",
+                "limit": "acknowledged_human_message_count",
+            },
+        },
+        "unread_human_message_ids": [message.message_id for message in unread],
+        "observed_successful_tool_calls": observed_tools,
+        "explicit_unobserved_tool_hints": _explicit_unobserved_tool_hints(
+            process,
+            goal_payload,
+            observed_tools,
+        ),
+        "required_evidence_shape": {
+            "goal_oid": goal_oid,
+            "reviewed_message_ids": (
+                "copy acknowledged_human_message_ids exactly"
+            ),
+            "acceptance_checks": [
+                {
+                    "requirement": "one explicit cumulative requirement; do not bundle unrelated deliverables",
+                    "source_refs": ["goal oid or acknowledged human message id"],
+                    "status": "completed | blocked | cancelled",
+                    "evidence_tool_calls": ["successful tool names that prove this status"],
+                    "evidence_summary": "concise concrete evidence or blocker/cancellation reason",
+                }
+            ],
+            "final_verification": ["successful tool names used for final verification"],
+        },
+        "instructions": [
+            "Split every explicit goal and follow-up deliverable into its own acceptance check.",
+            (
+                "Use the goal and acknowledged-message references instead of "
+                "treating this review as another content copy."
+            ),
+            (
+                "If referenced content is absent from the current context, recover "
+                "it with the exact reference before claiming coverage."
+            ),
+            "Compare the checks with observed_successful_tool_calls; complete missing work before retrying.",
+            (
+                "For each explicit_unobserved_tool_hint that the goal still requires, "
+                "activate its Skill and call the tool before retrying."
+            ),
+            (
+                "Cover the goal oid and every acknowledged_human_message_id as "
+                "source_refs, and cite only successful tool calls actually observed."
+            ),
+            (
+                "Send the final human-facing report only after this review is clear, "
+                "then retry process_exit with review_token and completion_evidence."
+            ),
+        ],
+    }
+
+
+def _completion_review_human_messages(
+    runtime: Any,
+    pid: str,
+) -> tuple[list[Any], list[Any], list[Any]]:
     human_messages = [
         message
-        for message in all_messages
+        for message in runtime.store.list_process_messages(pid)
         if message.sender.startswith("human:")
         or message.payload.get("source") == "human_input"
     ]
@@ -565,102 +684,36 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
     ]
     if acknowledged:
         runtime.messages.observe_labels(pid, acknowledged)
-    acknowledged_payload = _acknowledged_message_payload(acknowledged)
-    contract_identity = {
-        "goal_oid": goal_oid,
-        "goal_version": goal_version,
-        "human_messages": [
-            {
-                "message_id": message.message_id,
-                "status": message.status.value,
-            }
-            for message in human_messages
-        ],
-    }
-    expected_sources = [goal_oid, *[message.message_id for message in acknowledged]]
-    observed_tools = _successful_tool_calls(runtime, pid)
+    return human_messages, acknowledged, unread
+
+
+def _completion_message_identity(message: Any) -> dict[str, Any]:
+    """Return the immutable, content-bearing part of a mailbox message.
+
+    ACK timestamps and label-carrier metadata are deliberately excluded: they
+    can change when the same durable message is observed again, while the
+    requirement the model must review does not.
+    """
+
     return {
-        "schema_version": 1,
-        "review_token": f"exitrev_{_canonical_sha256(contract_identity)}",
-        "goal": {
-            "oid": goal_oid,
-            "payload": _bounded_json_value(goal_payload, 32_000),
-            "source": goal_source,
-        },
-        "acknowledged_human_messages": acknowledged_payload,
-        "acknowledged_human_message_detail_count": len(acknowledged_payload),
-        "acknowledged_human_message_count": len(acknowledged),
-        "acknowledged_human_message_ids": [
-            message.message_id for message in acknowledged
-        ],
-        "unread_human_message_ids": [message.message_id for message in unread],
-        "expected_source_refs": expected_sources,
-        "observed_successful_tool_calls": observed_tools,
-        "explicit_unobserved_tool_hints": _explicit_unobserved_tool_hints(
-            process,
-            goal_payload,
-            observed_tools,
-        ),
-        "required_evidence_shape": {
-            "goal_oid": goal_oid,
-            "reviewed_message_ids": [message.message_id for message in acknowledged],
-            "acceptance_checks": [
-                {
-                    "requirement": "one explicit cumulative requirement; do not bundle unrelated deliverables",
-                    "source_refs": ["goal oid or acknowledged human message id"],
-                    "status": "completed | blocked | cancelled",
-                    "evidence_tool_calls": ["successful tool names that prove this status"],
-                    "evidence_summary": "concise concrete evidence or blocker/cancellation reason",
-                }
-            ],
-            "final_verification": ["successful tool names used for final verification"],
-        },
-        "instructions": [
-            "Split every explicit goal and follow-up deliverable into its own acceptance check.",
-            "Compare the checks with observed_successful_tool_calls; complete missing work before retrying.",
-            "For each explicit_unobserved_tool_hint that the goal still requires, activate its Skill and call the tool before retrying.",
-            "If acknowledged_human_message_detail_count is smaller than acknowledged_human_message_count, re-read omitted exact ids with read_process_messages(include_acked=true, message_ids=[...]) before claiming coverage.",
-            "Cover every expected_source_ref and cite only successful tool calls actually observed.",
-            "Send the final human-facing report only after this review is clear, then retry process_exit with review_token and completion_evidence.",
-        ],
+        "message_id": message.message_id,
+        "sender": message.sender,
+        "recipient_pid": message.recipient_pid,
+        "kind": message.kind.value,
+        "channel": message.channel,
+        "correlation_id": message.correlation_id,
+        "reply_to": message.reply_to,
+        "subject": message.subject,
+        "body": message.body,
+        "payload": message.payload,
     }
-
-
-def _acknowledged_message_payload(messages: list[Any]) -> list[dict[str, Any]]:
-    selected = messages[-_COMPLETION_REVIEW_MESSAGE_DETAIL_LIMIT:]
-    if not selected:
-        return []
-    body_limit = min(
-        _COMPLETION_REVIEW_MESSAGE_BODY_MAX_CHARS,
-        max(
-            256,
-            _COMPLETION_REVIEW_MESSAGE_BODY_BUDGET_CHARS // len(selected),
-        ),
-    )
-    return [
-        {
-            "message_id": message.message_id,
-            "subject": _bounded_text(
-                message.subject,
-                _COMPLETION_REVIEW_MESSAGE_SUBJECT_MAX_CHARS,
-            ),
-            "subject_truncated": (
-                len(message.subject)
-                > _COMPLETION_REVIEW_MESSAGE_SUBJECT_MAX_CHARS
-            ),
-            "body": _bounded_text(message.body, body_limit),
-            "body_truncated": len(message.body) > body_limit,
-            "kind": message.kind.value,
-        }
-        for message in selected
-    ]
 
 
 def _completion_goal_payload(
     runtime: Any,
     pid: str,
     goal_oid: str,
-) -> tuple[Any, int, str]:
+) -> tuple[Any, int, str, dict[str, Any], bool]:
     try:
         goal_handle = runtime.memory.handle_for_oid(
             pid,
@@ -669,7 +722,26 @@ def _completion_goal_payload(
             issued_by="process_exit_review",
         )
         goal = runtime.memory.get_object(pid, goal_handle)
-        return goal.payload, goal.version, "object_memory"
+        return (
+            goal.payload,
+            goal.version,
+            "object_memory",
+            {
+                "kind": "object_memory",
+                "namespace": goal.namespace,
+                "name": goal.name,
+                "activate_skill": "agent-libos-object-memory",
+                "tool": "read_memory_object",
+                "arguments": {
+                    "namespace": goal.namespace,
+                    "name": goal.name,
+                    "max_payload_chars": (
+                        runtime.config.tools.memory_payload_hard_limit_chars
+                    ),
+                },
+            },
+            False,
+        )
     except NotFound as exc:
         # Runtime Object payloads are intentionally volatile across a Host
         # reopen. Full-I/O LLM evidence already contains the exact initial
@@ -701,8 +773,14 @@ def _completion_goal_payload(
                     labels=DataLabels.from_object_metadata(persisted_metadata)
                 )
             )
+        recovered_payload = _goal_payload_from_recovered_context(
+            durable_context,
+            goal_oid,
+        )
         return (
-            {
+            recovered_payload
+            if recovered_payload is not None
+            else {
                 "recovered_from": "persisted_initial_llm_context",
                 "initial_user_context": durable_context,
                 "instruction": (
@@ -712,7 +790,47 @@ def _completion_goal_payload(
             },
             version,
             "persisted_initial_llm_context",
+            {
+                "kind": "retained_llm_evidence",
+                "goal_oid": goal_oid,
+                "instruction": (
+                    "Use the bounded fallback because the runtime-local goal "
+                    "Object is unavailable after reopen."
+                ),
+            },
+            True,
         )
+
+
+def _goal_payload_from_recovered_context(
+    recovered_context: str,
+    goal_oid: str,
+) -> Any | None:
+    """Extract the logical goal payload from retained prompt evidence.
+
+    Current source-only and persistent-context renderings are canonical JSON.
+    The literal parser preserves reopen compatibility with earlier source-only
+    evidence without executing input.
+    """
+
+    candidate = recovered_context.strip()
+    try:
+        decoded = json.loads(candidate)
+    except json.JSONDecodeError:
+        decoded = None
+    if isinstance(decoded, dict):
+        referenced_oid = decoded.get("object_oid", decoded.get("oid"))
+        if referenced_oid == goal_oid and "payload" in decoded:
+            return decoded["payload"]
+
+    payload_marker = " payload: "
+    if payload_marker not in candidate:
+        return None
+    legacy_payload = candidate.split(payload_marker, 1)[1].strip()
+    try:
+        return ast.literal_eval(legacy_payload)
+    except (SyntaxError, ValueError):
+        return None
 
 
 def _initial_user_context_from_llm_evidence(
@@ -754,7 +872,13 @@ def _completion_evidence_errors(
         return errors
     errors.extend(_completion_identity_errors(evidence_model, review=review))
     observed_tools = set(review["observed_successful_tool_calls"])
-    expected_sources = set(review["expected_source_refs"])
+    expected_sources = {
+        str(review["goal"]["oid"]),
+        *[
+            str(message_id)
+            for message_id in review["acknowledged_human_message_ids"]
+        ],
+    }
     covered_sources: set[str] = set()
     for index, check in enumerate(evidence_model.acceptance_checks):
         check_errors, covered = _acceptance_check_errors(
@@ -819,6 +943,11 @@ def _successful_tool_calls(runtime: Any, pid: str) -> list[str]:
         if record.action != "tool.call" or record.decision.get("ok") is not True:
             continue
         name = record.decision.get("tool")
+        # A prior nonterminal review is not evidence that any deliverable was
+        # completed. Excluding it also keeps an unchanged review stable across
+        # retries.
+        if name == "process_exit":
+            continue
         if isinstance(name, str) and name and name not in names:
             names.append(name)
     return names
@@ -858,30 +987,145 @@ def _explicit_unobserved_tool_hints(
 
 
 def _bounded_json_value(value: Any, max_chars: int) -> Any:
-    rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    rendered = _canonical_json(value)
+    normalized = json.loads(rendered)
+    if len(rendered) <= max_chars:
+        return normalized
+    envelope: dict[str, Any] = {
+        "truncated": True,
+        "sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        "preview": None,
+        "instruction": (
+            "Use the supplied recovery reference for omitted content before completion."
+        ),
+    }
+    shell_chars = len(_canonical_json(envelope)) - len("null")
+    preview_budget = max_chars - shell_chars
+    if preview_budget < 1:
+        # Completion review uses a much larger bound, but keep this helper
+        # total for focused callers and never return malformed partial JSON.
+        return None if max_chars >= len("null") else 0
+    envelope["preview"] = _project_json_to_limit(normalized, preview_budget)
+    return envelope
+
+
+def _project_json_to_limit(value: Any, max_chars: int) -> Any:
+    """Build a structurally valid JSON projection within ``max_chars``.
+
+    This truncates decoded string values and whole container entries before
+    serializing them.  It never slices serialized JSON, so quotes, escapes,
+    arrays, and objects remain closed and parseable.
+    """
+
+    rendered = _canonical_json(value)
     if len(rendered) <= max_chars:
         return value
-    return {
-        "truncated": True,
-        "preview": rendered[:max_chars],
-        "sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
-        "instruction": "Read the goal object directly before completion.",
-    }
+    item_limits = (64, 32, 16, 8, 4, 2, 1, 0)
+    for item_limit in item_limits:
+        smallest = _project_json_value(
+            value,
+            string_limit=0,
+            item_limit=item_limit,
+            depth=8,
+        )
+        if len(_canonical_json(smallest)) > max_chars:
+            continue
+        low = 0
+        high = max_chars
+        best = smallest
+        while low <= high:
+            candidate_limit = (low + high) // 2
+            candidate = _project_json_value(
+                value,
+                string_limit=candidate_limit,
+                item_limit=item_limit,
+                depth=8,
+            )
+            if len(_canonical_json(candidate)) <= max_chars:
+                best = candidate
+                low = candidate_limit + 1
+            else:
+                high = candidate_limit - 1
+        return best
+    return None if max_chars >= len("null") else 0
 
 
-def _bounded_text(value: str, max_chars: int) -> str:
-    return value if len(value) <= max_chars else value[:max_chars]
+def _project_json_value(
+    value: Any,
+    *,
+    string_limit: int,
+    item_limit: int,
+    depth: int,
+) -> Any:
+    if isinstance(value, str):
+        if len(value) <= string_limit:
+            return value
+        return f"{value[:string_limit]}\u2026"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth <= 0:
+        return {"__agent_libos_truncated__": type(value).__name__}
+    if isinstance(value, list):
+        projected = [
+            _project_json_value(
+                item,
+                string_limit=string_limit,
+                item_limit=item_limit,
+                depth=depth - 1,
+            )
+            for item in value[:item_limit]
+        ]
+        if len(value) > item_limit:
+            projected.append(
+                {"__agent_libos_omitted_items__": len(value) - item_limit}
+            )
+        return projected
+    if isinstance(value, dict):
+        items = list(value.items())
+        projected = {
+            key: _project_json_value(
+                item,
+                string_limit=string_limit,
+                item_limit=item_limit,
+                depth=depth - 1,
+            )
+            for key, item in items[:item_limit]
+        }
+        if len(items) > item_limit:
+            marker = "__agent_libos_omitted_items__"
+            while marker in projected:
+                marker = f"_{marker}"
+            projected[marker] = len(items) - item_limit
+        return projected
+    return str(value)
 
 
-def _canonical_sha256(value: Any) -> str:
-    encoded = json.dumps(
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
         value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         default=str,
-    ).encode("utf-8")
+    )
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = _canonical_json(value).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_sequence_sha256(values: Iterable[Any]) -> str:
+    """Hash a canonical JSON array without constructing a second large list."""
+
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    for index, value in enumerate(values):
+        if index:
+            digest.update(b",")
+        digest.update(_canonical_json(value).encode("utf-8"))
+    digest.update(b"]")
+    return digest.hexdigest()
 
 
 def _parse_json_container(value: Any) -> Any:

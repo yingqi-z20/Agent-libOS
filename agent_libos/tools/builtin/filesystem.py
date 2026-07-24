@@ -16,6 +16,10 @@ _DIRECTORY_PATH_DESCRIPTION = (
     "not prepend that directory or the workspace root. The resolved path must "
     "remain inside the runtime workspace."
 )
+_OUTPUT_PATH_DESCRIPTION = (
+    "Canonical path relative to the runtime workspace root. This is an identity, "
+    "not necessarily a valid input from a non-root process working directory."
+)
 
 
 def normalize_process_path_argument(path: str, cwd: str) -> str:
@@ -27,13 +31,13 @@ def normalize_process_path_argument(path: str, cwd: str) -> str:
 
 class WriteTextFileArgs(BaseModel):
     path: str = Field(description=_FILE_PATH_DESCRIPTION)
-    content: str = Field(description="Exact UTF-8 text content to write.")
+    content: str = Field(description="Exact text content to encode and write using `encoding`.")
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     overwrite: bool = Field(default=True, description="Whether to overwrite an existing file.")
 
 
 class WriteTextFileOutput(BaseModel):
-    path: str
+    path: str = Field(description=_OUTPUT_PATH_DESCRIPTION)
     bytes_written: int
     created: bool
 
@@ -50,15 +54,16 @@ class ReadTextFileArgs(BaseModel):
 
 
 class ReadTextFileOutput(BaseModel):
-    path: str
+    path: str = Field(description=_OUTPUT_PATH_DESCRIPTION)
     content: str
+    encoding: str = Field(description="Encoding that successfully decoded this returned text prefix.")
     bytes_read: int
     truncated: bool
 
 
 class DirectoryEntryOutput(BaseModel):
     name: str
-    path: str
+    path: str = Field(description=_OUTPUT_PATH_DESCRIPTION)
     kind: str
     size_bytes: int | None
     modified_at: str
@@ -75,10 +80,10 @@ class ReadDirectoryArgs(BaseModel):
 
 
 class ReadDirectoryOutput(BaseModel):
-    path: str
+    path: str = Field(description=_OUTPUT_PATH_DESCRIPTION)
     entries: list[DirectoryEntryOutput]
-    count: int
-    truncated: bool
+    count: int = Field(description="Number of entries returned, not the directory's total entry count.")
+    truncated: bool = Field(description="Whether entries were omitted; this tool has no cursor or offset.")
 
 
 class WriteDirectoryArgs(BaseModel):
@@ -88,7 +93,7 @@ class WriteDirectoryArgs(BaseModel):
 
 
 class WriteDirectoryOutput(BaseModel):
-    path: str
+    path: str = Field(description=_OUTPUT_PATH_DESCRIPTION)
     created: bool
 
 
@@ -104,7 +109,7 @@ class DeleteDirectoryArgs(BaseModel):
 
 
 class DeletePathOutput(BaseModel):
-    path: str
+    path: str = Field(description=_OUTPUT_PATH_DESCRIPTION)
     kind: str
     deleted: bool
     recursive: bool = False
@@ -113,7 +118,7 @@ class DeletePathOutput(BaseModel):
 class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
     name = "read_text_file"
     description = (
-        "Read UTF-8 text from a path relative to the process's current working "
+        "Read text using the requested encoding (UTF-8 by default) from a path relative to the process's current working "
         "directory; do not prepend that directory. "
         "The resolved path must remain under the runtime workspace root. "
         "This is a Skills/Tools Layer wrapper around the libOS filesystem primitive; "
@@ -153,6 +158,7 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
         return ReadTextFileOutput(
             path=result.path,
             content=result.content,
+            encoding=args.encoding,
             bytes_read=result.bytes_read,
             truncated=result.truncated,
         )
@@ -199,7 +205,7 @@ class ReadDirectoryTool(SyncAgentTool[ReadDirectoryArgs]):
 class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
     name = "write_text_file"
     description = (
-        "Write UTF-8 text to a path relative to the process's current working "
+        "Encode and write text using the requested encoding (UTF-8 by default) to a path relative to the process's current working "
         "directory; do not prepend that directory. "
         "The resolved path must remain under the runtime workspace root. "
         "This is a Skills/Tools Layer wrapper around the libOS filesystem primitive; "

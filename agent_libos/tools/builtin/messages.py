@@ -15,8 +15,18 @@ from agent_libos.tools.base import (
     ToolPolicy,
     ToolResult,
 )
+from agent_libos.tools.observability import json_size_bytes
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+# One observed labelled message adds a fixed-width Object source reference.
+# The larger aggregate reserve covers four 256-character data-flow identities
+# under worst-case JSON Unicode escaping. These are format bounds, not runtime
+# tuning defaults.
+_MESSAGE_CARRIER_REF_RESERVE_BYTES = 256
+_MESSAGE_FLOW_LABEL_RESERVE_BYTES = 8_192
+_DURABLE_MESSAGE_METADATA_KEYS = frozenset(
+    {"source_oids", "source_refs", "data_labels", "data_flow_context"}
+)
 
 
 class ProcessMessageInfo(BaseModel):
@@ -30,10 +40,27 @@ class ProcessMessageInfo(BaseModel):
     subject: str
     body: str
     payload: dict[str, Any]
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: not value,
+        description="Data-flow provenance attached to the message, when present.",
+    )
     status: str
     created_at: str
     acked_at: str | None = None
+
+
+class ModelProcessMessageInfo(BaseModel):
+    message_id: str
+    sender: str
+    kind: str
+    channel: str
+    correlation_id: str | None = None
+    reply_to: str | None = None
+    subject: str
+    body: str
+    payload: dict[str, Any]
+    status: str
 
 
 class SendProcessMessageArgs(BaseModel):
@@ -87,6 +114,18 @@ class ReadProcessMessagesOutput(BaseModel):
     ready: bool = True
     messages: list[ProcessMessageInfo]
     acked_message_ids: list[str]
+    has_more: bool = False
+    omitted_count: int = 0
+    continuation: dict[str, Any] | None = None
+
+
+class ModelReadProcessMessagesOutput(BaseModel):
+    ready: bool = True
+    messages: list[ModelProcessMessageInfo]
+    acked_message_ids: list[str]
+    has_more: bool = False
+    omitted_count: int = 0
+    continuation: dict[str, Any] | None = None
 
 
 class SendProcessMessageTool(SyncAgentTool[SendProcessMessageArgs]):
@@ -147,7 +186,8 @@ class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
     description = (
         "Take an immediate, non-blocking snapshot of this process mailbox using optional filters. "
         "Use receive_process_messages when the process should suspend until a match; returned unread messages "
-        "are acknowledged by default."
+        "are acknowledged by default. Large matching windows may be split to fit the durable result budget; "
+        "when has_more is true, use the returned continuation with the same filters."
     )
     args_schema = ReadProcessMessagesArgs
     output_schema = ReadProcessMessagesOutput
@@ -182,21 +222,14 @@ class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
             message_ids=args.message_ids,
             limit=args.limit,
         )
-        carrier_oids = runtime.messages.observe_labels(ctx.pid, messages)
-        acked: list[ProcessMessage] = []
-        if args.ack:
-            unread_ids = [message.message_id for message in messages if message.status.value == "unread"]
-            if unread_ids:
-                acked = runtime.messages.ack(ctx.pid, unread_ids)
-                acked_by_id = {message.message_id: message for message in acked}
-                messages = [acked_by_id.get(message.message_id, message) for message in messages]
-        output = ReadProcessMessagesOutput(
+        return _bounded_message_result(
+            runtime,
+            ctx,
+            tool_name=self.name,
+            messages=messages,
             ready=True,
-            messages=[_message_info(message) for message in messages],
-            acked_message_ids=[message.message_id for message in acked],
+            ack=args.ack,
         )
-        return _flow_labeled_result(runtime, ctx.pid, carrier_oids, output)
-
 
 class ReceiveProcessMessagesArgs(ReadProcessMessagesArgs):
     block: bool = Field(
@@ -212,7 +245,8 @@ class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
     description = (
         "Receive unread process messages using optional selective filters. "
         "Unlike read_process_messages, block=true suspends in WAITING_EVENT until a match; "
-        "block=false returns immediately."
+        "block=false returns immediately. Large matching windows may be split to fit the durable result budget; "
+        "when has_more is true, use the returned continuation with the same filters."
     )
     args_schema = ReceiveProcessMessagesArgs
     output_schema = ReadProcessMessagesOutput
@@ -248,23 +282,25 @@ class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
             message_ids=args.message_ids,
             limit=args.limit,
         )
-        carrier_oids = runtime.messages.observe_labels(ctx.pid, messages)
-        acked: list[ProcessMessage] = []
-        if args.ack:
-            unread_ids = [message.message_id for message in messages if message.status.value == "unread"]
-            if unread_ids:
-                acked = runtime.messages.ack(ctx.pid, unread_ids)
-                acked_by_id = {message.message_id: message for message in acked}
-                messages = [acked_by_id.get(message.message_id, message) for message in messages]
-        output = ReadProcessMessagesOutput(
+        return _bounded_message_result(
+            runtime,
+            ctx,
+            tool_name=self.name,
+            messages=messages,
             ready=bool(messages),
-            messages=[_message_info(message) for message in messages],
-            acked_message_ids=[message.message_id for message in acked],
+            ack=args.ack,
         )
-        return _flow_labeled_result(runtime, ctx.pid, carrier_oids, output)
 
-
-def _message_info(message: ProcessMessage) -> ProcessMessageInfo:
+def _message_info(
+    message: ProcessMessage,
+    *,
+    acknowledged: bool = False,
+) -> ProcessMessageInfo:
+    durable_metadata = {
+        key: value
+        for key, value in message.metadata.items()
+        if key in _DURABLE_MESSAGE_METADATA_KEYS
+    }
     return ProcessMessageInfo(
         message_id=message.message_id,
         sender=message.sender,
@@ -276,15 +312,317 @@ def _message_info(message: ProcessMessage) -> ProcessMessageInfo:
         subject=message.subject,
         body=message.body,
         payload=message.payload,
-        metadata={
-            key: value
-            for key, value in message.metadata.items()
-            if key in {"source_oids", "source_refs", "data_labels", "data_flow_context"}
-        },
-        status=message.status.value,
+        metadata=durable_metadata or None,
+        status="acked" if acknowledged and message.status.value == "unread" else message.status.value,
         created_at=message.created_at,
         acked_at=message.acked_at,
     )
+
+
+def _model_message_info(
+    message: ProcessMessage,
+    *,
+    acknowledged: bool = False,
+) -> ModelProcessMessageInfo:
+    return ModelProcessMessageInfo(
+        message_id=message.message_id,
+        sender=message.sender,
+        kind=message.kind.value,
+        channel=message.channel,
+        correlation_id=message.correlation_id,
+        reply_to=message.reply_to,
+        subject=message.subject,
+        body=message.body,
+        payload=message.payload,
+        status="acked" if acknowledged and message.status.value == "unread" else message.status.value,
+    )
+
+
+def _bounded_message_result(
+    runtime: Any,
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    messages: list[ProcessMessage],
+    ready: bool,
+    ack: bool,
+) -> ToolResult:
+    """Select and acknowledge only a page that can be persisted in full.
+
+    Process-message reads are side effects because their default behavior is
+    to acknowledge returned unread messages. ToolExecutionService applies its
+    generic result-size guard only after ``run`` returns, which is too late for
+    this tool: an oversized page used to be acknowledged and then replaced by
+    ``result_omitted``. Size the exact model-facing projection first, retain a
+    conservative allowance for message label carriers, and do the destructive
+    ACK only after the real flow-labelled envelope is known to fit.
+    """
+
+    selected = _select_messages_for_result(
+        runtime,
+        ctx,
+        tool_name=tool_name,
+        messages=messages,
+        ready=ready,
+        ack=ack,
+    )
+    remaining = messages[len(selected) :]
+    predicted_acked_ids = [
+        message.message_id
+        for message in selected
+        if ack and message.status.value == "unread"
+    ]
+    predicted_output = _message_output(
+        tool_name=tool_name,
+        ready=ready,
+        selected=selected,
+        remaining=remaining,
+        acked_message_ids=predicted_acked_ids,
+        acknowledge_selected=ack,
+    )
+    predicted_model_output = _model_message_output(
+        tool_name=tool_name,
+        ready=ready,
+        selected=selected,
+        remaining=remaining,
+        acked_message_ids=predicted_acked_ids,
+        acknowledge_selected=ack,
+    )
+
+    # Label observation is evidence/provenance materialization, so perform it
+    # only for messages whose bodies will actually be returned to the model.
+    carrier_oids = runtime.messages.observe_labels(ctx.pid, selected)
+    predicted_result = _flow_labeled_result(
+        runtime,
+        ctx.pid,
+        carrier_oids,
+        predicted_output,
+        predicted_model_output,
+    )
+    _ensure_message_result_fits(
+        runtime,
+        ctx,
+        tool_name=tool_name,
+        result=predicted_result,
+    )
+
+    acked: list[ProcessMessage] = []
+    if predicted_acked_ids:
+        acked = runtime.messages.ack(ctx.pid, predicted_acked_ids)
+        acked_by_id = {message.message_id: message for message in acked}
+        selected = [
+            acked_by_id.get(message.message_id, message)
+            for message in selected
+        ]
+    output = _message_output(
+        tool_name=tool_name,
+        ready=ready,
+        selected=selected,
+        remaining=remaining,
+        acked_message_ids=[message.message_id for message in acked],
+        acknowledge_selected=False,
+    )
+    model_output = _model_message_output(
+        tool_name=tool_name,
+        ready=ready,
+        selected=selected,
+        remaining=remaining,
+        acked_message_ids=[message.message_id for message in acked],
+        acknowledge_selected=False,
+    )
+    result = _flow_labeled_result(
+        runtime,
+        ctx.pid,
+        carrier_oids,
+        output,
+        model_output,
+    )
+    _ensure_message_result_fits(
+        runtime,
+        ctx,
+        tool_name=tool_name,
+        result=result,
+    )
+    return result
+
+
+def _select_messages_for_result(
+    runtime: Any,
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    messages: list[ProcessMessage],
+    ready: bool,
+    ack: bool,
+) -> list[ProcessMessage]:
+    selected: list[ProcessMessage] = []
+    for message in messages:
+        candidate = [*selected, message]
+        remaining = messages[len(candidate) :]
+        acked_ids = [
+            item.message_id
+            for item in candidate
+            if ack and item.status.value == "unread"
+        ]
+        output = _message_output(
+            tool_name=tool_name,
+            ready=ready,
+            selected=candidate,
+            remaining=remaining,
+            acked_message_ids=acked_ids,
+            acknowledge_selected=ack,
+        )
+        estimate = _result_envelope_size(
+            runtime,
+            ctx,
+            tool_name=tool_name,
+            output=output,
+        )
+        model_output = _model_message_output(
+            tool_name=tool_name,
+            ready=ready,
+            selected=candidate,
+            remaining=remaining,
+            acked_message_ids=acked_ids,
+            acknowledge_selected=ack,
+        )
+        estimate = max(estimate, json_size_bytes(model_output.model_dump()))
+        # A received labelled message creates one metadata-only Object carrier.
+        # Its source ref is small and fixed-width; reserve more than the encoded
+        # ref plus the maximum possible aggregate label identity expansion.
+        carrier_reserve = (
+            len(candidate) * _MESSAGE_CARRIER_REF_RESERVE_BYTES
+            + _MESSAGE_FLOW_LABEL_RESERVE_BYTES
+        )
+        if estimate + carrier_reserve > _message_result_limit(runtime):
+            break
+        selected = candidate
+    return selected
+
+
+def _message_output(
+    *,
+    tool_name: str,
+    ready: bool,
+    selected: list[ProcessMessage],
+    remaining: list[ProcessMessage],
+    acked_message_ids: list[str],
+    acknowledge_selected: bool,
+) -> ReadProcessMessagesOutput:
+    return ReadProcessMessagesOutput(
+        ready=ready,
+        messages=[
+            _message_info(message, acknowledged=acknowledge_selected)
+            for message in selected
+        ],
+        acked_message_ids=acked_message_ids,
+        has_more=bool(remaining),
+        omitted_count=len(remaining),
+        continuation=(
+            {
+                "tool": tool_name,
+                "same_filters": True,
+            }
+            if remaining
+            else None
+        ),
+    )
+
+
+def _model_message_output(
+    *,
+    tool_name: str,
+    ready: bool,
+    selected: list[ProcessMessage],
+    remaining: list[ProcessMessage],
+    acked_message_ids: list[str],
+    acknowledge_selected: bool,
+) -> ModelReadProcessMessagesOutput:
+    return ModelReadProcessMessagesOutput(
+        ready=ready,
+        messages=[
+            _model_message_info(message, acknowledged=acknowledge_selected)
+            for message in selected
+        ],
+        acked_message_ids=acked_message_ids,
+        has_more=bool(remaining),
+        omitted_count=len(remaining),
+        continuation=(
+            {"tool": tool_name, "same_filters": True}
+            if remaining
+            else None
+        ),
+    )
+
+
+def _message_result_limit(runtime: Any) -> int:
+    return min(
+        runtime.config.tools.tool_result_payload_hard_limit_bytes,
+        runtime.config.tools.memory_payload_hard_limit_bytes,
+    )
+
+
+def _result_envelope_size(
+    runtime: Any,
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    output: ReadProcessMessagesOutput,
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    result_metadata = dict(metadata or {})
+    result_metadata.update(
+        {
+            "tool_name": tool_name,
+            "tool_version": _TOOL_DEFAULTS.version,
+            "trace_id": ctx.trace_id,
+            "call_id": ctx.call_id,
+            # Deliberately longer than any ordinary measured duration. This
+            # keeps the pre-ACK estimate conservative without time dependence.
+            "duration_ms": 999_999_999_999.999,
+        }
+    )
+    current_context = runtime.data_flow.current_context()
+    result_metadata.setdefault("data_flow_context", current_context.to_dict())
+    return json_size_bytes(
+        {
+            "tool_id": str(ctx.metadata.get("tool_id") or ("tool_" + "x" * 128)),
+            "tool_name": tool_name,
+            "result": output.model_dump(),
+            "content": "",
+            "artifacts": [],
+            "metadata": result_metadata,
+        }
+    )
+
+
+def _ensure_message_result_fits(
+    runtime: Any,
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    result: ToolResult,
+) -> None:
+    output = ReadProcessMessagesOutput.model_validate(result.data)
+    size = _result_envelope_size(
+        runtime,
+        ctx,
+        tool_name=tool_name,
+        output=output,
+        metadata=result.metadata,
+    )
+    limit = _message_result_limit(runtime)
+    model_size = json_size_bytes(result.model_projection(limit_bytes=limit))
+    if max(size, model_size) > limit:
+        raise ToolExecutionError(
+            "Process message response exceeds the durable result budget; no messages were acknowledged.",
+            code=ToolErrorCode.EXECUTION_ERROR,
+            details={
+                "result_bytes": size,
+                "model_result_bytes": model_size,
+                "limit_bytes": limit,
+            },
+        )
 
 
 def _flow_sources(ctx: ToolContext) -> tuple[list[str] | None, Any | None, DataFlowContext | None]:
@@ -303,6 +641,7 @@ def _flow_labeled_result(
     pid: str,
     carrier_oids: list[str],
     output: ReadProcessMessagesOutput,
+    model_output: ModelReadProcessMessagesOutput,
 ) -> ToolResult:
     context = runtime.data_flow.context_from_source_oids(
         pid,
@@ -311,6 +650,7 @@ def _flow_labeled_result(
     )
     return ToolResult.success(
         data=output.model_dump(),
+        model_data=model_output.model_dump(),
         metadata={
             "data_flow_context": {
                 "labels": context.labels.to_dict(),

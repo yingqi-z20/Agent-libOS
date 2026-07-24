@@ -15,10 +15,12 @@ from agent_libos.models.exceptions import (
     ProcessMessageWaitRequired,
     ProcessWaitRequired,
     ResourceLimitExceeded,
+    ValidationError,
 )
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.llm.client import LLMClient
+from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.context_memory import (
     LLM_CONTEXT_MAINTENANCE_RESOURCE,
     LLMContextMemory,
@@ -32,12 +34,14 @@ from agent_libos.llm.context_management import (
     context_pressure_prompt,
     provider_usage_lower_bound,
 )
+from agent_libos.llm.event_projection import project_prompt_events
 from agent_libos.llm.prompt import (
     build_system_prompt,
     build_user_prompt,
     recover_initial_goal_context,
 )
 from agent_libos.llm.records import observable_llm_call_fields
+from agent_libos.llm.usage import canonicalize_llm_usage
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.llm.pending import (
     LLMPendingActionService,
@@ -104,6 +108,8 @@ _HOST_AUTO_WAIT_METADATA = {
     "tool_name": "receive_process_messages",
 }
 
+_FULL_SNAPSHOT_RESPONSE_CHAIN_DISABLED_REASON = "full_snapshot_executor_replay"
+
 
 class _LLMProviderChainScopeChanged(ProviderEffectNotStarted):
     """The selected provider-side state no longer matches the dispatch scope."""
@@ -155,6 +161,7 @@ class _LLMCallState:
     previous_response_id: str | None = None
     parallel_tool_calls: bool = False
     auto_wait_on_empty_tool_calls: bool = False
+    fallback_json_actions: bool = False
     temperature: float = 0.0
     max_tokens: int = 0
     egress_payload: dict[str, Any] = field(default_factory=dict)
@@ -329,6 +336,14 @@ class LLMProcessExecutor:
         available_skills: list[dict[str, Any]] | None = None,
         original_goal_context: str | None = None,
     ) -> list[dict[str, str]]:
+        try:
+            fallback_json_actions = (
+                self._llms.fallback_json_actions_for_process(pid)
+            )
+        except ValidationError:
+            # Provider resolution owns the durable fail-closed error path for
+            # an unknown profile; prompt construction must not escape it.
+            fallback_json_actions = False
         return [
             {"role": "system", "content": build_system_prompt(image)},
             {
@@ -346,6 +361,7 @@ class LLMProcessExecutor:
                         self._requestable_capabilities_for_prompt(pid)
                     ),
                     original_goal_context=original_goal_context,
+                    fallback_json_actions=fallback_json_actions,
                 ),
             },
         ]
@@ -362,10 +378,24 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
         skills: list[dict[str, Any]],
         available_skills: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, str]], DataFlowContext]:
-        original_goal_context = self._retained_original_goal_context(
-            process=process,
-            image=image,
+    ) -> tuple[list[dict[str, str]], DataFlowContext, str | None]:
+        # The live goal is already part of the authoritative materialized
+        # context in the ordinary case.  Replaying the retained copy as well
+        # duplicates a potentially large, volatile block on every later
+        # quantum and destroys the otherwise stable prompt prefix.  Retained
+        # recovery is only for the exceptional case where compaction, a view
+        # change, or a constrained materialization omitted the goal Object.
+        goal_is_materialized = bool(
+            process.goal_oid is not None
+            and process.goal_oid in context.object_refs
+        )
+        original_goal_context = (
+            None
+            if goal_is_materialized
+            else self._retained_original_goal_context(
+                process=process,
+                image=image,
+            )
         )
         flow_context = self._data_flow.context_from_materialization(pid, context)
         if original_goal_context is not None:
@@ -373,14 +403,17 @@ class LLMProcessExecutor:
                 flow_context,
                 process.goal_oid,
             )
-        if events:
-            self._advance_event_cursor(pid, events[-1].event_id)
+        event_projection = project_prompt_events(
+            events,
+            context_object_name=self.context_memory.object_name(pid),
+            payload_max_chars=self.config.llm_context.prompt_event_payload_max_chars,
+        )
         messages = self._build_model_messages(
             pid=pid,
             image=image,
             process=process,
             context=context,
-            events=events,
+            events=event_projection.model_records,
             capabilities=capabilities,
             tools=tools,
             skills=skills,
@@ -399,9 +432,17 @@ class LLMProcessExecutor:
             action="llm.request",
             target=f"image:{image.image_id}",
             input_refs=input_refs,
-            decision={"messages": len(messages), "policy": image.context_policy},
+            decision={
+                "messages": len(messages),
+                "policy": image.context_policy,
+                "event_projection": event_projection.summary,
+            },
         )
-        return messages, flow_context
+        return (
+            messages,
+            flow_context,
+            event_projection.represented_through_event_id,
+        )
 
     def run_once(self, pid: str) -> dict[str, Any]:
         try:
@@ -460,17 +501,9 @@ class LLMProcessExecutor:
         if process.status not in {ProcessStatus.RUNNING, ProcessStatus.RUNNABLE}:
             return {"ok": False, "skipped": True, "status": process.status.value}
         durable_pending = self._synchronize_pending_action(pid)
-        if self.pending.has_memory(pid, "llm_release"):
-            return await self._resume_pending_action_fail_closed(
-                pid,
-                self._resume_pending_llm_release_action,
-            )
-        if self.pending.has_memory(pid, "human"):
-            return await self._resume_pending_action_fail_closed(pid, self._resume_pending_human_action)
-        if self.pending.has_memory(pid, "child"):
-            return await self._resume_pending_action_fail_closed(pid, self._resume_pending_wait_action)
-        if self.pending.has_memory(pid, "message"):
-            return await self._resume_pending_action_fail_closed(pid, self._resume_pending_message_action)
+        pending_result = await self._resume_pending_quantum_action(pid)
+        if pending_result is not None:
+            return pending_result
         if durable_pending is not None and durable_pending.get("status") == "resuming":
             return {
                 "ok": False,
@@ -537,16 +570,18 @@ class LLMProcessExecutor:
         if isinstance(prepared_context, dict):
             return prepared_context
         context = prepared_context
-        messages, flow_context = self._assemble_llm_request(
-            pid=pid,
-            image=image,
-            process=prompt_process,
-            context=context,
-            events=events,
-            capabilities=capabilities,
-            tools=tools,
-            skills=skills,
-            available_skills=available_skills,
+        messages, flow_context, represented_through_event_id = (
+            self._assemble_llm_request(
+                pid=pid,
+                image=image,
+                process=prompt_process,
+                context=context,
+                events=events,
+                capabilities=capabilities,
+                tools=tools,
+                skills=skills,
+                available_skills=available_skills,
+            )
         )
         flow_token = self._data_flow.push(flow_context)
         try:
@@ -569,6 +604,12 @@ class LLMProcessExecutor:
                 openai_tools,
                 response_scope_fingerprint=response_scope_fingerprint,
             )
+            # Cursor advancement is an acknowledgement that the projected
+            # batch reached a successfully recorded provider completion.  A
+            # precheck, release, or provider failure leaves the cursor in place
+            # so the next quantum cannot silently lose unseen events.
+            if represented_through_event_id is not None:
+                self._advance_event_cursor(pid, represented_through_event_id)
             return await self._dispatch_completed_llm_action(
                 pid=pid,
                 completion=completion,
@@ -617,6 +658,32 @@ class LLMProcessExecutor:
             return self._fail_llm_quantum(pid, exc)
         finally:
             self._data_flow.reset(flow_token)
+
+    async def _resume_pending_quantum_action(
+        self,
+        pid: str,
+    ) -> dict[str, Any] | None:
+        if self.pending.has_memory(pid, "llm_release"):
+            return await self._resume_pending_action_fail_closed(
+                pid,
+                self._resume_pending_llm_release_action,
+            )
+        if self.pending.has_memory(pid, "human"):
+            return await self._resume_pending_action_fail_closed(
+                pid,
+                self._resume_pending_human_action,
+            )
+        if self.pending.has_memory(pid, "child"):
+            return await self._resume_pending_action_fail_closed(
+                pid,
+                self._resume_pending_wait_action,
+            )
+        if self.pending.has_memory(pid, "message"):
+            return await self._resume_pending_action_fail_closed(
+                pid,
+                self._resume_pending_message_action,
+            )
+        return None
 
     async def _prepare_llm_context(
         self,
@@ -1190,6 +1257,13 @@ class LLMProcessExecutor:
             if not result.get("ok"):
                 stop_reason = "tool_failed"
                 break
+            if action.get("action") == "exec_process":
+                # A successful exec rotates the process execution generation
+                # and replaces the active image/tool contract.  Never dispatch
+                # later calls selected under the pre-exec prompt or execution
+                # token; the next quantum must rebuild both from the new image.
+                stop_reason = "process_exec"
+                break
             if result.get("message_notice"):
                 stop_reason = "message_notice"
                 break
@@ -1217,6 +1291,23 @@ class LLMProcessExecutor:
             "executed_count": len(completed_actions),
             "stop_reason": stop_reason,
         }
+        return self._complete_action_batch_payload(
+            payload=payload,
+            completed_actions=completed_actions,
+            completed_results=completed_results,
+            stopped_action=stopped_action,
+            stopped_result=stopped_result,
+        )
+
+    @staticmethod
+    def _complete_action_batch_payload(
+        *,
+        payload: dict[str, Any],
+        completed_actions: list[dict[str, Any]],
+        completed_results: list[dict[str, Any]],
+        stopped_action: dict[str, Any] | None,
+        stopped_result: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         if completed_actions:
             payload["action"] = completed_actions[-1]
             payload["result"] = completed_results[-1]
@@ -2399,6 +2490,7 @@ class LLMProcessExecutor:
             tool_calls,
             parallel_tool_calls=False,
             auto_wait_on_empty_tool_calls=False,
+            fallback_json_actions=False,
         )
         return actions[0]
 
@@ -2409,12 +2501,14 @@ class LLMProcessExecutor:
         *,
         parallel_tool_calls: bool,
         auto_wait_on_empty_tool_calls: bool,
+        fallback_json_actions: bool = False,
     ) -> tuple[list[dict[str, Any]], bool]:
         return self.actions.completion_to_actions(
             content,
             tool_calls,
             parallel_tool_calls=parallel_tool_calls,
             auto_wait_on_empty_tool_calls=auto_wait_on_empty_tool_calls,
+            fallback_json_actions=fallback_json_actions,
         )
 
     @staticmethod
@@ -2439,7 +2533,13 @@ class LLMProcessExecutor:
         prepared_request = _prepared_request
         for attempt_number in range(start_attempt, selected_max_attempts + 1):
             try:
-                completion, parallel_tool_calls, auto_wait_on_empty_tool_calls, profile_id = await self._complete_action_recorded(
+                (
+                    completion,
+                    parallel_tool_calls,
+                    auto_wait_on_empty_tool_calls,
+                    fallback_json_actions,
+                    profile_id,
+                ) = await self._complete_action_recorded(
                     pid=pid,
                     messages=attempt_messages,
                     tools=tools,
@@ -2459,6 +2559,7 @@ class LLMProcessExecutor:
                     completion.tool_calls,
                     parallel_tool_calls=parallel_tool_calls,
                     auto_wait_on_empty_tool_calls=auto_wait_on_empty_tool_calls,
+                    fallback_json_actions=fallback_json_actions,
                 )
                 if auto_wait_used:
                     self._audit.record(
@@ -2510,6 +2611,12 @@ class LLMProcessExecutor:
                 )
                 if attempt_number >= selected_max_attempts:
                     break
+                compatibility_hint = (
+                    " If native tool calls are unavailable, you may instead use the "
+                    "enabled compatibility JSON action protocol."
+                    if fallback_json_actions
+                    else ""
+                )
                 attempt_messages = [
                     *messages,
                     {
@@ -2520,6 +2627,7 @@ class LLMProcessExecutor:
                             f"{'one or more' if parallel_tool_calls else 'exactly one'} "
                             "available OpenAI tool call by its function name. "
                             f"Available tool names: {self._tools.model_tool_names(pid)}"
+                            f"{compatibility_hint}"
                         ),
                     },
                 ]
@@ -2582,7 +2690,7 @@ class LLMProcessExecutor:
         _force_stateless: bool = False,
         _chain_scope_retry: int = 0,
         _prepared_request: dict[str, Any] | None = None,
-    ) -> tuple[Any, bool, bool, str]:
+    ) -> tuple[Any, bool, bool, bool, str]:
         state = self._initialize_llm_call_state(
             pid=pid,
             messages=messages,
@@ -2715,19 +2823,14 @@ class LLMProcessExecutor:
                 "LLM profile Sink changed while assembling the request"
             )
         self._set_llm_provider_scope(state)
-        previous_outputs: list[dict[str, Any]]
-        if force_stateless or not self.config.llm.persist_full_io:
-            state.previous_response_id, previous_outputs = None, []
-        else:
-            state.previous_response_id, previous_outputs = (
-                self._previous_response_state_for_state(
-                    state.pid,
-                    resolved.profile_id,
-                    state.client,
-                    response_scope_fingerprint=response_scope_fingerprint,
-                    provider_chain_fingerprint=state.provider_chain_fingerprint,
-                )
-            )
+        # This executor currently rebuilds and sends the complete cumulative
+        # runtime snapshot for every quantum.  Combining that snapshot with a
+        # provider-side ``previous_response_id`` replays the same history by
+        # two channels, grows requests quadratically, and can duplicate tool
+        # outputs.  Keep the low-level LLMClient chaining capability available
+        # to callers that send deltas, but keep this full-snapshot executor
+        # stateless until it has an explicit delta protocol.
+        state.previous_response_id, previous_outputs = None, []
         state.request_messages = self._messages_with_tool_outputs(
             state.request_messages,
             previous_outputs,
@@ -2736,6 +2839,7 @@ class LLMProcessExecutor:
         state.auto_wait_on_empty_tool_calls = bool(
             resolved.auto_wait_on_empty_tool_calls
         )
+        state.fallback_json_actions = bool(resolved.fallback_json_actions)
         state.temperature = resolved.temperature
         state.max_tokens = resolved.max_tokens
         self._update_llm_request_options(
@@ -2803,7 +2907,7 @@ class LLMProcessExecutor:
         resolved = state.resolved
         client = state.client
         assert resolved is not None
-        provider_eligible = bool(
+        provider_capable = bool(
             self.config.llm.persist_full_io
             and isinstance(client, LLMClient)
             and client.responses_previous_response_id
@@ -2811,6 +2915,10 @@ class LLMProcessExecutor:
             and client._use_responses_api()
             and client._use_openai_request_options()
             and state.provider_chain_fingerprint is not None
+        )
+        response_chain_configured = bool(
+            isinstance(client, LLMClient)
+            and client.responses_previous_response_id
         )
         state.request_options.update(
             {
@@ -2821,12 +2929,17 @@ class LLMProcessExecutor:
                 "client_class": type(client).__name__,
                 "real_llm_client": isinstance(client, LLMClient),
                 "openai_tool_schema": self._tool_schema_observation(state.tools),
-                "openai_responses_previous_response_id_enabled": bool(
-                    self.config.llm.persist_full_io
-                    and isinstance(client, LLMClient)
-                    and client.responses_previous_response_id
+                "openai_responses_previous_response_id_configured": (
+                    response_chain_configured
                 ),
-                "openai_provider_chain_eligible": provider_eligible,
+                "openai_responses_previous_response_id_enabled": False,
+                "openai_responses_previous_response_id_disabled_reason": (
+                    _FULL_SNAPSHOT_RESPONSE_CHAIN_DISABLED_REASON
+                    if response_chain_configured
+                    else None
+                ),
+                "openai_provider_chain_capable": provider_capable,
+                "openai_provider_chain_eligible": False,
                 "openai_previous_response_id": state.previous_response_id,
                 "openai_previous_response_tool_output_count": previous_output_count,
                 "openai_response_scope_fingerprint": response_scope_fingerprint,
@@ -2836,18 +2949,25 @@ class LLMProcessExecutor:
                 "openai_prompt_cache_key_configured": bool(
                     isinstance(client, LLMClient) and client.prompt_cache_key
                 ),
-                "openai_prompt_cache_retention": (
+                "openai_prompt_cache_retention_configured": (
                     client.prompt_cache_retention
                     if isinstance(client, LLMClient)
                     else None
                 ),
+                "openai_prompt_cache_key_sent": None,
+                "openai_prompt_cache_options_sent": None,
+                "openai_prompt_cache_retention": None,
                 "openai_safety_identifier_configured": bool(
                     isinstance(client, LLMClient) and client.safety_identifier
                 ),
+                "openai_safety_identifier_sent": None,
+                "openai_compatibility_removed_options": [],
                 "openai_parallel_tool_calls_enabled": state.parallel_tool_calls,
                 "agent_libos_auto_wait_on_empty_tool_calls_enabled": (
                     state.auto_wait_on_empty_tool_calls
                 ),
+                "fallback_json_actions_enabled": state.fallback_json_actions,
+                "fallback_json_action_used": False,
             }
         )
 
@@ -3503,18 +3623,18 @@ class LLMProcessExecutor:
             str(prepared_provider) if prepared_provider is not None else None
         )
         prepared_previous_response_id = prepared_request.get("previous_response_id")
-        if (
-            not self.config.llm.persist_full_io
-            and prepared_previous_response_id is not None
-        ):
+        if prepared_previous_response_id is not None:
             raise _LLMProviderChainScopeChanged(
-                "provider-side Responses state cannot be resumed when full-I/O "
-                "persistence is disabled"
+                "provider-side Responses state cannot be resumed by the "
+                "full-snapshot executor"
             )
-        state.previous_response_id = prepared_previous_response_id
+        state.previous_response_id = None
         state.parallel_tool_calls = bool(prepared_request["parallel_tool_calls"])
         state.auto_wait_on_empty_tool_calls = bool(
             prepared_request["auto_wait_on_empty_tool_calls"]
+        )
+        state.fallback_json_actions = bool(
+            prepared_request.get("fallback_json_actions", False)
         )
         state.temperature = float(prepared_request["temperature"])
         state.max_tokens = int(prepared_request["max_tokens"])
@@ -3592,13 +3712,10 @@ class LLMProcessExecutor:
 
     def _assert_llm_call_scope(self, state: _LLMCallState) -> None:
         assert state.resolved is not None and state.sink is not None
-        if (
-            not self.config.llm.persist_full_io
-            and state.previous_response_id is not None
-        ):
+        if state.previous_response_id is not None:
             raise _LLMProviderChainScopeChanged(
-                "provider-side Responses state is disabled without full-I/O "
-                "persistence"
+                "provider-side Responses state is disabled for full-snapshot "
+                "executor requests"
             )
         self._assert_llm_provider_chain_scope(
             pid=state.pid,
@@ -3707,6 +3824,7 @@ class LLMProcessExecutor:
                 "previous_response_id": state.previous_response_id,
                 "parallel_tool_calls": state.parallel_tool_calls,
                 "auto_wait_on_empty_tool_calls": state.auto_wait_on_empty_tool_calls,
+                "fallback_json_actions": state.fallback_json_actions,
                 "temperature": state.temperature,
                 "max_tokens": state.max_tokens,
                 "egress_payload": state.egress_payload,
@@ -3769,8 +3887,16 @@ class LLMProcessExecutor:
         self,
         state: _LLMCallState,
         completion: Any,
-    ) -> tuple[Any, bool, bool, str]:
+    ) -> tuple[Any, bool, bool, bool, str]:
         usage, invalid_usage_fields = self._canonical_llm_usage(completion)
+        self._record_effective_provider_request_options(state, completion)
+        if invalid_usage_fields:
+            state.request_options["invalid_usage_fields"] = sorted(
+                invalid_usage_fields
+            )
+        state.request_options["fallback_json_action_used"] = (
+            self._fallback_json_action_was_used(state, completion)
+        )
         self._charge_llm_attempt(
             state.pid,
             source="llm.completion",
@@ -3845,8 +3971,70 @@ class LLMProcessExecutor:
             completion,
             state.parallel_tool_calls,
             state.auto_wait_on_empty_tool_calls,
+            state.fallback_json_actions,
             str(state.request_options["llm_profile_id"]),
         )
+
+    @staticmethod
+    def _record_effective_provider_request_options(
+        state: _LLMCallState,
+        completion: Any,
+    ) -> None:
+        """Persist only non-secret facts about the request that succeeded.
+
+        Compatibility retries may remove provider options after the executor
+        assembled its request.  Configuration telemetry remains useful, but it
+        must not be mistaken for the options the provider actually accepted.
+        ``LLMCompletion`` exposes a deliberately small, secret-free outcome
+        projection for that distinction.
+        """
+
+        effective = getattr(completion, "provider_request_options", None)
+        if isinstance(effective, Mapping):
+            state.request_options["openai_prompt_cache_key_sent"] = (
+                effective.get("prompt_cache_key_sent") is True
+            )
+            state.request_options["openai_prompt_cache_options_sent"] = (
+                effective.get("prompt_cache_options_sent") is True
+            )
+            retention = effective.get("prompt_cache_retention")
+            state.request_options["openai_prompt_cache_retention"] = (
+                retention if retention in {"in_memory", "24h"} else None
+            )
+            state.request_options["openai_safety_identifier_sent"] = (
+                effective.get("safety_identifier_sent") is True
+            )
+
+        removed = getattr(completion, "compatibility_removed_options", None)
+        if isinstance(removed, (list, tuple, set)):
+            state.request_options["openai_compatibility_removed_options"] = sorted(
+                {
+                    item
+                    for item in removed
+                    if isinstance(item, str) and 0 < len(item) <= 64
+                }
+            )[:32]
+
+    @staticmethod
+    def _fallback_json_action_was_used(
+        state: _LLMCallState,
+        completion: Any,
+    ) -> bool:
+        if not state.fallback_json_actions:
+            return False
+        if bool(getattr(completion, "fallback_json_action_used", False)):
+            return True
+        for tool_call in list(getattr(completion, "tool_calls", []) or []):
+            try:
+                tool_call_to_action(tool_call)
+            except Exception:
+                continue
+            return False
+        try:
+            parse_json_action(str(getattr(completion, "content", "")))
+        except Exception:
+            return False
+        return True
 
     def _preflight_llm_call(self, pid: str) -> None:
         resources = self._resources
@@ -3874,27 +4062,10 @@ class LLMProcessExecutor:
 
     @staticmethod
     def _canonical_llm_usage(completion: Any) -> tuple[dict[str, int], set[str]]:
-        raw_usage = getattr(completion, "usage", None)
-        if not isinstance(raw_usage, Mapping):
-            return {}, set()
-        known_fields = (
-            "prompt_tokens",
-            "completion_tokens",
-            "total_tokens",
-            "input_tokens",
-            "output_tokens",
+        return canonicalize_llm_usage(
+            getattr(completion, "usage", None),
+            api=getattr(completion, "api", None),
         )
-        usage: dict[str, int] = {}
-        invalid_fields: set[str] = set()
-        for key in known_fields:
-            if key not in raw_usage or raw_usage[key] is None:
-                continue
-            value = raw_usage[key]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                invalid_fields.add(key)
-                continue
-            usage[key] = value
-        return usage, invalid_fields
 
     def _charge_llm_completion(
         self,

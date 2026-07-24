@@ -69,7 +69,8 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
         "the process's current working directory; do not prepend that directory. "
         "The resolved path must remain under the runtime workspace root. "
         "The file content is stored inside Object Memory but is not returned in the tool result. "
-        "Use read_text_file instead when the text itself must be returned without creating a durable Object."
+        "The created Object is runtime-local; use read_text_file instead when the text itself "
+        "must be returned without creating an Object."
     )
     args_schema = CreateObjectFromFileArgs
     output_schema = CreateObjectFromFileOutput

@@ -228,11 +228,13 @@ uv sync --frozen --all-groups
 
 ### Distribution artifacts
 
-The Python wheel contains the core `agent_libos` package and the
-`agent-libos` and `agent-libos-gui-server` console entrypoints. Repository-level
-assets such as the optional PTY Runtime Module, bundled example Skill and
-Image, benchmarks, tests, and documentation are distributed with the Python
-source archive and source checkout, not installed into the core wheel. The
+The Python wheel contains the core `agent_libos` package, its immutable built-in
+Tool Skills, and the `agent-libos` and `agent-libos-gui-server` console
+entrypoints. Release validation parses all 26 built-in Skill packages and their
+99 uniquely owned tools from both the wheel and source archive. Repository-level
+assets such as the optional PTY Runtime Module, bundled example Skill and Image,
+benchmarks, tests, and documentation are distributed with the Python source
+archive and source checkout, not installed into the core wheel. The
 Electron sources are repository-checkout assets and are validated by their
 separate GUI lane. A wheel installation may load separately supplied modules,
 Skills, Images, and configuration through their normal explicit paths.
@@ -251,12 +253,14 @@ from the source checkout, in a disposable environment:
 uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python dist/*.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
+/tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
 /tmp/agent-libos-wheel-check/bin/agent-libos-gui-server --help
 
 uv venv /tmp/agent-libos-sdist-check
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python dist/*.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
+/tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
 /tmp/agent-libos-sdist-check/bin/agent-libos-gui-server --help
 ```

@@ -51,6 +51,7 @@ def _profile_config() -> AgentLibOSConfig:
                 "override": LLMProfile(model="override-model"),
                 "parallel": LLMProfile(model="parallel-model", parallel_tool_calls=True),
                 "auto-wait": LLMProfile(model="auto-wait-model", auto_wait_on_empty_tool_calls=True),
+                "json-fallback": LLMProfile(model="fallback-model", fallback_json_actions=True),
             },
         )
     )
@@ -83,6 +84,14 @@ class TestLLMProfiles:
                 "prompt_cache_retention",
                 "24h",
                 None,
+            ),
+            (
+                "OPENAI_FALLBACK_JSON_ACTIONS",
+                "false",
+                "true",
+                "fallback_json_actions",
+                True,
+                False,
             ),
         ],
     )
@@ -142,7 +151,14 @@ class TestLLMProfiles:
                 {"prompt_cache_retention": "in-memory"},
                 "24h",
                 "prompt_cache_retention",
-                "in-memory",
+                "in_memory",
+            ),
+            (
+                "OPENAI_FALLBACK_JSON_ACTIONS",
+                {"fallback_json_actions": False},
+                "true",
+                "fallback_json_actions",
+                False,
             ),
         ],
     )
@@ -168,6 +184,25 @@ class TestLLMProfiles:
 
             assert runtime.llms.profile_identity_sha256("default") == baseline
             assert getattr(runtime.llms.resolve("default").client, client_attribute) == expected
+        finally:
+            runtime.close()
+
+    def test_legacy_prompt_cache_retention_env_is_normalized_before_resolution(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENAI_PROMPT_CACHE_RETENTION", "in-memory")
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            legacy_identity = runtime.llms.profile_identity_sha256("default")
+            legacy_client = runtime.llms.resolve("default").client
+
+            assert legacy_client.prompt_cache_retention == "in_memory"
+
+            monkeypatch.setenv("OPENAI_PROMPT_CACHE_RETENTION", "in_memory")
+
+            assert runtime.llms.profile_identity_sha256("default") == legacy_identity
+            assert runtime.llms.resolve("default").client is legacy_client
         finally:
             runtime.close()
 
@@ -258,7 +293,7 @@ class TestLLMProfiles:
             assert strict_client is not permissive_client
             assert strict_client.store is False
             assert strict_client.responses_previous_response_id is False
-            assert strict_client.prompt_cache_retention == "in-memory"
+            assert strict_client.prompt_cache_retention == "in_memory"
             assert runtime.llms.profile_identity_sha256("default") == strict_identity
         finally:
             runtime.close()
@@ -549,6 +584,19 @@ class TestLLMProfiles:
 
             assert default.auto_wait_on_empty_tool_calls is False
             assert auto_wait.auto_wait_on_empty_tool_calls is True
+        finally:
+            runtime.close()
+
+    def test_llm_profile_can_opt_in_to_json_action_fallback(self) -> None:
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            default = runtime.llms.resolve("default")
+            fallback = runtime.llms.resolve("json-fallback")
+
+            assert default.fallback_json_actions is False
+            assert default.client.fallback_json_actions is False
+            assert fallback.fallback_json_actions is True
+            assert fallback.client.fallback_json_actions is True
         finally:
             runtime.close()
 
@@ -845,6 +893,8 @@ class TestUserLLMProfileStore:
                     "max_tokens": 8192,
                     "context_window_tokens": 200000,
                     "auto_wait_on_empty_tool_calls": True,
+                    "fallback_json_actions": True,
+                    "prompt_cache_retention": "in-memory",
                     "allow_custom_base_url": False,
                 },
             )
@@ -865,11 +915,45 @@ class TestUserLLMProfileStore:
             assert loaded["qwen3.7-max"].allow_custom_base_url is False
             assert loaded["compat-without-opt-in"].allow_custom_base_url is False
             assert loaded["qwen3.7-max"].auto_wait_on_empty_tool_calls is True
+            assert loaded["qwen3.7-max"].fallback_json_actions is True
+            assert saved.prompt_cache_retention == "in_memory"
+            assert loaded["qwen3.7-max"].prompt_cache_retention == "in_memory"
             assert loaded["qwen3.7-max"].context_window_tokens == 200000
             persisted = json.loads(path.read_text(encoding="utf-8"))["profiles"]["qwen3.7-max"]
             assert persisted["allow_custom_base_url"] is False
+            assert persisted["prompt_cache_retention"] == "in_memory"
             assert "secret" not in path.read_text(encoding="utf-8")
             assert "api_key" not in persisted
+
+    def test_user_llm_profile_store_normalizes_legacy_retention_on_load_and_save(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "llm-profiles.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "profiles": {
+                            "legacy": {
+                                "model": "legacy-model",
+                                "api_key_env": "LEGACY_API_KEY",
+                                "prompt_cache_retention": "in-memory",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = UserLLMProfileStore(path)
+
+            loaded = store.load()
+
+            assert loaded["legacy"].prompt_cache_retention == "in_memory"
+
+            store.save(loaded)
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            assert persisted["profiles"]["legacy"]["prompt_cache_retention"] == "in_memory"
+            assert "in-memory" not in path.read_text(encoding="utf-8")
 
     def test_user_llm_profile_store_rejects_invalid_json_and_secret_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

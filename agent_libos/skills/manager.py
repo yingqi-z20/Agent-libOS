@@ -943,6 +943,7 @@ class SkillManager:
     ) -> dict[str, Any]:
         """Load trusted guidance while revealing only image-owned bindings."""
 
+        self._prompt_instructions(skill)
         process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
@@ -2684,7 +2685,13 @@ class SkillManager:
         ]
 
     def _prompt_instructions(self, skill: SkillPackage) -> str:
-        return skill.instructions[: self.config.skills.max_prompt_instruction_chars]
+        limit = self.config.skills.max_prompt_instruction_chars
+        if len(skill.instructions) > limit:
+            raise ValidationError(
+                "Skill instructions exceed model-visible prompt limit "
+                f"max_prompt_instruction_chars={limit}: {skill.skill_id}"
+            )
+        return skill.instructions
 
     def _coerce_package(self, skill: SkillPackage) -> SkillPackage:
         if isinstance(skill, SkillPackage):

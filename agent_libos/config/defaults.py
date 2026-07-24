@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import field
 import math
 import re
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from pydantic import ConfigDict, StrictInt
+from pydantic import BeforeValidator, ConfigDict, StrictInt
 from pydantic.dataclasses import dataclass
 
 from agent_libos.models.capability import AuthorityRule
@@ -24,6 +24,18 @@ ShellPolicyLevel = Literal[
     "allowlist_auto_else_ask",
     "blocklist_ask_else_auto",
     "always_allow",
+]
+
+
+def _normalize_prompt_cache_retention(value: object) -> object:
+    if value == "in-memory":
+        return "in_memory"
+    return value
+
+
+PromptCacheRetention = Annotated[
+    Literal["in_memory", "24h"] | None,
+    BeforeValidator(_normalize_prompt_cache_retention),
 ]
 
 
@@ -328,10 +340,11 @@ class LLMProfile:
     safety_identifier: str | None = None
     safety_identifier_env: str | None = None
     prompt_cache_key: str | None = None
-    prompt_cache_retention: Literal["in-memory", "24h"] | None = None
+    prompt_cache_retention: PromptCacheRetention = None
     responses_previous_response_id: bool | None = None
     parallel_tool_calls: bool | None = None
     auto_wait_on_empty_tool_calls: bool | None = None
+    fallback_json_actions: bool | None = None
     temperature: float | None = None
     max_tokens: int | None = None
     context_window_tokens: int | None = None
@@ -351,12 +364,14 @@ class LLMDefaults:
     store: bool = False
     safety_identifier: str | None = None
     prompt_cache_key: str | None = None
-    prompt_cache_retention: Literal["in-memory", "24h"] | None = None
+    prompt_cache_retention: PromptCacheRetention = None
     responses_previous_response_id: bool = False
     parallel_tool_calls: bool = False
     auto_wait_on_empty_tool_calls: bool = False
+    fallback_json_actions: bool = False
     compatibility_retry_attempts: int = 8
     action_repair_attempts: int = 2
+    tool_output_prompt_max_chars: int = 32_768
     content_preview_chars: int = 500
     tool_arguments_preview_chars: int = 500
     call_record_preview_chars: int = 1_000
@@ -657,6 +672,7 @@ class LLMContextDefaults:
     schema_version: int = 1
     object_name_prefix: str = "llm_context"
     recent_event_limit: int = 20
+    prompt_event_payload_max_chars: int = 2_048
     storage_compaction_threshold_bytes: int = 96_000
     storage_compaction_max_chunks: int = 4
     storage_compaction_preserve_recent_entries: int = 0
@@ -693,7 +709,9 @@ class SkillDefaults:
     resource_read_max_bytes: int = 262_144
     package_max_bytes: int = 2_097_152
     max_package_files: int = 256
-    max_prompt_instruction_chars: int = 8_000
+    # Match the built-in 16 KiB instruction-byte cap. A Host may lower this,
+    # but activation then rejects a larger body instead of clipping it.
+    max_prompt_instruction_chars: int = 16 * 1_024
     max_jit_source_chars: int = 64_000
     discover_limit: int = 100
     id_max_chars: int = 128
@@ -879,6 +897,14 @@ def _validate_llm_context_config(
     if llm_context.policy not in {"source_only", "llm_context_object"}:
         raise ValueError(
             "llm_context.policy must be source_only or llm_context_object"
+        )
+    _positive(
+        "llm_context.prompt_event_payload_max_chars",
+        llm_context.prompt_event_payload_max_chars,
+    )
+    if llm_context.prompt_event_payload_max_chars < 512:
+        raise ValueError(
+            "llm_context.prompt_event_payload_max_chars must be at least 512"
         )
     _positive(
         "llm_context.storage_compaction_threshold_bytes",
@@ -1385,6 +1411,9 @@ def _validate_llm_config(llm: LLMDefaults) -> None:
     _nonnegative("llm.max_retries", llm.max_retries)
     _positive("llm.compatibility_retry_attempts", llm.compatibility_retry_attempts)
     _positive("llm.action_repair_attempts", llm.action_repair_attempts)
+    _positive("llm.tool_output_prompt_max_chars", llm.tool_output_prompt_max_chars)
+    if llm.tool_output_prompt_max_chars < 128:
+        raise ValueError("llm.tool_output_prompt_max_chars must be at least 128")
     _nonnegative("llm.content_preview_chars", llm.content_preview_chars)
     _nonnegative("llm.tool_arguments_preview_chars", llm.tool_arguments_preview_chars)
     _nonnegative("llm.call_record_preview_chars", llm.call_record_preview_chars)

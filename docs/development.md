@@ -96,7 +96,9 @@ and never emits test files into the production Electron tree. Install GUI
 dependencies first with `npm --prefix gui install`.
 
 The architecture check covers the core package and repository-level Runtime
-Modules. It rejects new lower-layer Runtime/API imports,
+Modules. Its default function-size ceiling is 200 lines; larger existing
+functions remain pinned to their exact checked-in ratchet budgets. It rejects
+new lower-layer Runtime/API imports,
 Runtime-as-service-locator access (including local aliases), and
 cross-component private access, including dependencies stored in
 underscore-prefixed fields. Literal-name `getattr` access is analyzed as the
@@ -204,9 +206,10 @@ Useful optional variables:
 - `OPENAI_VERBOSITY`
 - `OPENAI_SAFETY_IDENTIFIER`
 - `OPENAI_PROMPT_CACHE_KEY`
-- `OPENAI_PROMPT_CACHE_RETENTION=in-memory|24h`
+- `OPENAI_PROMPT_CACHE_RETENTION=in_memory|24h`
 - `OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID=true|false`
 - `OPENAI_PARALLEL_TOOL_CALLS=true|false`
+- `OPENAI_FALLBACK_JSON_ACTIONS=true|false`
 - provider-specific `OPENAI_ENABLE_THINKING`
 
 `OPENAI_BASE_URL` is optional for the OpenAI API. Custom OpenAI-compatible
@@ -312,11 +315,14 @@ libOS dispatches that batch sequentially in one quantum; it does not run tools
 concurrently.
 Set `llm.auto_wait_on_empty_tool_calls: true` globally or on a specific LLM
 profile only for providers that sometimes answer action-selection requests
-without tool calls. When enabled, Agent libOS first preserves the existing
-fallback JSON action parser; if the response still contains no valid action, it
-synthesizes a `receive_process_messages` action with default arguments. The raw
+without tool calls. When enabled, Agent libOS synthesizes a
+`receive_process_messages` action with default arguments. The raw
 LLM call record still stores the provider response with an empty `tool_calls`
 list, and the synthetic wait listens for any unread process message.
+Set `llm.fallback_json_actions: true` or
+`OPENAI_FALLBACK_JSON_ACTIONS=true` only for a provider that cannot reliably
+accept native `tools`. It opts that profile into the compact text JSON action
+protocol and provider retry; the default is native tool calls only.
 
 Run a script smoke:
 

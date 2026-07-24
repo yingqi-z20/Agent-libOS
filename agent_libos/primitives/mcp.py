@@ -60,6 +60,7 @@ from agent_libos.substrate import (
     ProviderEffectNotStarted,
     snapshot_executable,
 )
+from agent_libos.substrate.local import _bounded_mcp_content
 from agent_libos.sdk import (
     ProviderEffectNotStartedResult,
     ProviderRegistryBinding,
@@ -72,7 +73,7 @@ from agent_libos.sdk import (
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.public_errors import provider_error_envelope_from_mapping
-from agent_libos.utils.serde import dumps, to_jsonable
+from agent_libos.utils.serde import bounded_json_loads, dumps, to_jsonable
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]*$")
@@ -88,6 +89,7 @@ _TRANSPORTS = {"stdio", "streamable_http"}
 _MCP_PLATFORM_ENV_KEYS = ("SYSTEMROOT", "WINDIR") if os.name == "nt" else ()
 _STDIO_EXECUTABLE_IDENTITY_UNSET = object()
 _PROVIDER_RESULT_RETURNED_ATTR = "_agent_libos_provider_result_returned"
+_INVALID_MCP_TEXT_JSON = object()
 _SERVER_FIELDS = {
     "schema_version",
     "server_id",
@@ -206,6 +208,104 @@ def _strict_provider_json_value(
         finally:
             active_containers.remove(identity)
     raise TypeError(f"provider JSON contains a non-JSON value at {path}")
+
+
+def _model_facing_mcp_call_payload(
+    content: Any,
+    structured_content: Any,
+) -> dict[str, Any]:
+    """Build a compact MCP result view without discarding distinct content.
+
+    MCP servers commonly return the same object twice: once in
+    ``structuredContent`` and once as JSON in a text content block.  Only a
+    text-only block whose decoded JSON is exactly equivalent is removed.  All
+    non-equivalent prose, annotations, and structured values remain visible.
+    Binary content is projected to bounded receipts before equivalence checks,
+    so base64 never survives merely because it was nested or JSON-encoded.
+    """
+
+    projected_structured = _project_mcp_model_value(structured_content)
+    projected_content = _project_mcp_model_value(content)
+    if structured_content is not None:
+        projected_content = _drop_equivalent_mcp_content(
+            projected_content,
+            projected_structured,
+        )
+    return {
+        "content": projected_content,
+        "structured_content": projected_structured,
+    }
+
+
+def _project_mcp_model_value(value: Any) -> Any:
+    projected = _bounded_mcp_content(value)
+    if isinstance(projected, list):
+        return [_project_mcp_text_json(item) for item in projected]
+    return _project_mcp_text_json(projected)
+
+
+def _project_mcp_text_json(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_project_mcp_text_json(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    projected = {
+        key: _project_mcp_text_json(item)
+        for key, item in value.items()
+    }
+    if value.get("type") != "text" or not isinstance(value.get("text"), str):
+        return projected
+    decoded = _decode_mcp_text_json(value["text"])
+    if decoded is _INVALID_MCP_TEXT_JSON:
+        return projected
+    decoded_projection = _project_mcp_model_value(decoded)
+    if not _json_values_equivalent(decoded, decoded_projection):
+        projected["text"] = dumps(decoded_projection)
+    return projected
+
+
+def _drop_equivalent_mcp_content(content: Any, structured_content: Any) -> Any:
+    if _json_values_equivalent(content, structured_content):
+        return None
+    if isinstance(content, list):
+        retained = [
+            item
+            for item in content
+            if not _mcp_text_block_duplicates(item, structured_content)
+        ]
+        return retained
+    if _mcp_text_block_duplicates(content, structured_content):
+        return None
+    return content
+
+
+def _mcp_text_block_duplicates(value: Any, structured_content: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"type", "text"}:
+        return False
+    if value.get("type") != "text" or not isinstance(value.get("text"), str):
+        return False
+    decoded = _decode_mcp_text_json(value["text"])
+    if decoded is _INVALID_MCP_TEXT_JSON:
+        return False
+    return _json_values_equivalent(
+        _project_mcp_model_value(decoded),
+        structured_content,
+    )
+
+
+def _decode_mcp_text_json(value: str) -> Any:
+    try:
+        return bounded_json_loads(value)
+    except (TypeError, ValueError, RecursionError):
+        return _INVALID_MCP_TEXT_JSON
+
+
+def _json_values_equivalent(left: Any, right: Any) -> bool:
+    try:
+        return dumps(left) == dumps(right)
+    except (TypeError, ValueError, RecursionError):
+        return False
 
 
 class McpPrimitive:
@@ -1771,24 +1871,35 @@ class McpPrimitive:
                 provider_result,
             )
         if provider_result.is_error:
+            # Project only the returned/model-facing payload.  Provider byte
+            # receipts and settlement fields remain unchanged.
+            projected_error = _model_facing_mcp_call_payload(
+                provider_result.content,
+                provider_result.structured_content,
+            )
             return self._failure(
                 server,
                 tool,
                 McpCallStatus.MCP_ERROR,
                 "MCP tool returned an error result",
                 provider_result,
-                extra={"content": provider_result.content},
+                extra={
+                    key: value
+                    for key, value in projected_error.items()
+                    if value is not None
+                },
             )
+        projected = _model_facing_mcp_call_payload(
+            provider_result.content,
+            provider_result.structured_content,
+        )
         return McpCallResult(
             server_id=server.server_id,
             tool_id=tool.tool_id,
             mcp_name=tool.mcp_name,
             status=McpCallStatus.OK,
             ok=True,
-            result={
-                "content": to_jsonable(provider_result.content),
-                "structured_content": to_jsonable(provider_result.structured_content),
-            },
+            result=to_jsonable(projected),
             response_bytes=provider_result.response_bytes,
             duration_s=provider_result.duration_s,
         )

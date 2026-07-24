@@ -224,16 +224,27 @@ class TestProcessWorkingDirectory:
                 )
                 assert runtime.tools.call(pid, 'set_working_directory', {'path': 'pkg'}).ok
 
-                read = runtime.tools.call(pid, 'read_text_file', {'path': 'pkg/module.py'})
+                listed = runtime.tools.call(pid, 'read_directory', {'path': '.'})
+                outer = runtime.tools.call(pid, 'read_text_file', {'path': 'module.py'})
+                nested = runtime.tools.call(pid, 'read_text_file', {'path': 'pkg/module.py'})
                 written = runtime.tools.call(
                     pid,
                     'write_text_file',
                     {'path': 'pkg/created.txt', 'content': 'ok'},
                 )
 
-                assert read.ok, read.error
-                assert read.payload['path'] == 'pkg/pkg/module.py'
-                assert read.payload['content'] == "print('nested')\n"
+                assert listed.ok, listed.error
+                assert listed.payload['path'] == 'pkg'
+                assert {entry['path'] for entry in listed.payload['entries']} == {
+                    'pkg/module.py',
+                    'pkg/pkg',
+                }
+                assert outer.ok, outer.error
+                assert outer.payload['path'] == 'pkg/module.py'
+                assert outer.payload['content'] == "print('outer')\n"
+                assert nested.ok, nested.error
+                assert nested.payload['path'] == 'pkg/pkg/module.py'
+                assert nested.payload['content'] == "print('nested')\n"
                 assert written.ok, written.error
                 assert written.payload['path'] == 'pkg/pkg/created.txt'
                 assert (root / 'pkg' / 'pkg' / 'created.txt').read_text(encoding='utf-8') == 'ok'

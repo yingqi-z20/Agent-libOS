@@ -8,7 +8,21 @@ import tomllib
 import pytest
 import yaml
 
-from scripts.check_release_artifacts import validate_version_alignment
+from agent_libos.skills.builtin_catalog import (
+    BUILTIN_SKILL_IDS as RUNTIME_BUILTIN_SKILL_IDS,
+    BUILTIN_SKILL_MAX_FILE_BYTES as RUNTIME_BUILTIN_SKILL_MAX_FILE_BYTES,
+    BUILTIN_SKILL_MAX_INSTRUCTION_BYTES as RUNTIME_BUILTIN_SKILL_MAX_INSTRUCTION_BYTES,
+)
+from scripts.check_release_artifacts import (
+    BUILTIN_SKILL_ARCHIVE_PATHS,
+    BUILTIN_SKILL_IDS,
+    SDIST_REQUIRED_FILES,
+    WHEEL_REQUIRED_FILES,
+    _BUILTIN_SKILL_MAX_FILE_BYTES,
+    _BUILTIN_SKILL_MAX_INSTRUCTION_BYTES,
+    _validate_builtin_skill_archive_payloads,
+    validate_version_alignment,
+)
 from tests.conftest import pytest_sessionfinish
 
 
@@ -56,6 +70,59 @@ def test_python_wheel_scope_is_the_core_package() -> None:
     assert pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["agent_libos"]
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "The Python wheel contains the core `agent_libos` package" in readme
+
+
+def test_release_artifacts_require_the_complete_builtin_skill_catalog() -> None:
+    assert BUILTIN_SKILL_IDS == RUNTIME_BUILTIN_SKILL_IDS
+    assert (
+        _BUILTIN_SKILL_MAX_INSTRUCTION_BYTES
+        == RUNTIME_BUILTIN_SKILL_MAX_INSTRUCTION_BYTES
+    )
+    assert _BUILTIN_SKILL_MAX_FILE_BYTES == RUNTIME_BUILTIN_SKILL_MAX_FILE_BYTES
+    assert _BUILTIN_SKILL_MAX_INSTRUCTION_BYTES == 16 * 1_024
+    assert _BUILTIN_SKILL_MAX_FILE_BYTES == 24 * 1_024
+    assert _BUILTIN_SKILL_MAX_FILE_BYTES > _BUILTIN_SKILL_MAX_INSTRUCTION_BYTES
+    assert len(BUILTIN_SKILL_ARCHIVE_PATHS) == 26
+    assert BUILTIN_SKILL_ARCHIVE_PATHS <= WHEEL_REQUIRED_FILES
+    assert BUILTIN_SKILL_ARCHIVE_PATHS <= SDIST_REQUIRED_FILES
+
+    payloads = {
+        path: (ROOT / path).read_bytes()
+        for path in BUILTIN_SKILL_ARCHIVE_PATHS
+    }
+    _validate_builtin_skill_archive_payloads(payloads)
+
+
+def test_release_builtin_skill_validation_rejects_missing_or_unparseable_package() -> None:
+    payloads = {
+        path: (ROOT / path).read_bytes()
+        for path in BUILTIN_SKILL_ARCHIVE_PATHS
+    }
+    missing_path = min(payloads)
+    without_one = dict(payloads)
+    without_one.pop(missing_path)
+    with pytest.raises(ValueError, match="catalog mismatch"):
+        _validate_builtin_skill_archive_payloads(without_one)
+
+    malformed = dict(payloads)
+    malformed[missing_path] = b"---\nname: broken\n---\n"
+    with pytest.raises(ValueError, match="missing frontmatter fields"):
+        _validate_builtin_skill_archive_payloads(malformed)
+
+    oversized = dict(payloads)
+    header, _separator, _body = payloads[missing_path].partition(b"\n---\n")
+    oversized[missing_path] = (
+        header
+        + b"\n---\n"
+        + b"x" * (_BUILTIN_SKILL_MAX_INSTRUCTION_BYTES + 1)
+    )
+    with pytest.raises(ValueError, match="instructions exceed archive size limit"):
+        _validate_builtin_skill_archive_payloads(oversized)
+
+    oversized_file = dict(payloads)
+    oversized_file[missing_path] = b"x" * (_BUILTIN_SKILL_MAX_FILE_BYTES + 1)
+    with pytest.raises(ValueError, match="exceeds archive size limit"):
+        _validate_builtin_skill_archive_payloads(oversized_file)
 
 
 def test_readme_clean_install_smoke_covers_wheel_and_source_distribution() -> None:
@@ -333,6 +400,10 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     for step in (wheel_install_step, sdist_install_step):
         assert "if" not in step
         assert "continue-on-error" not in step
+        command = str(step["run"])
+        assert "get_builtin_skill_catalog" in command
+        assert "len(catalog.list()) == 26" in command
+        assert "sum(len(skill.allowed_tools) for skill in catalog.list()) == 99" in command
     sdist_step = str(sdist_install_step["run"])
     install_index = sdist_step.index(
         "uv pip install --python .release-sdist-venv/bin/python"

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import base64
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import pytest
@@ -98,6 +99,86 @@ def _new_llm_executor(runtime: Runtime) -> LLMProcessExecutor:
 
 
 class TestLLMContextMemory:
+
+    def test_tool_result_prompt_projection_removes_redundant_wire_and_provenance_copies(
+        self,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='project tool evidence')
+            patch = 'diff --git a/file b/file\n' + ('x' * 4_096)
+            result = {
+                'patch': patch,
+                'patch_b64': base64.b64encode(patch.encode('utf-8')).decode('ascii'),
+                'changed_paths': [
+                    {
+                        'display': 'src/file.py',
+                        'path_b64': base64.b64encode(b'src/file.py').decode('ascii'),
+                        'lossy': False,
+                    }
+                ],
+            }
+            source_refs = [
+                {
+                    'oid': f'obj_source_{index:03d}',
+                    'version': 1,
+                    'content_sha256': f'{index:064x}',
+                }
+                for index in range(40)
+            ]
+            payload = {
+                'tool_id': 'tool_git_diff',
+                'tool_name': 'git_diff',
+                'result': result,
+                'content': json.dumps(result, sort_keys=True),
+                'artifacts': [],
+                'metadata': {
+                    'data_flow_context': {
+                        'labels': {
+                            'sensitivity': 'secret',
+                            'trust_level': 'untrusted',
+                        },
+                        'source_refs': source_refs,
+                        'materialization_id': 'ctxmat_source',
+                    },
+                    'call_id': 'call_projection',
+                },
+            }
+            handle = runtime.memory.create_object(
+                pid=pid,
+                object_type=ObjectType.TOOL_RESULT,
+                payload=payload,
+                metadata=ObjectMetadata(title='Projected tool result'),
+            )
+            view = runtime.memory.create_view(pid, [handle], mode=ViewMode.READ_ONLY)
+
+            context = runtime.memory.materialize_context(
+                pid,
+                view,
+                policy='recency_first',
+                budget_tokens=100_000,
+                charge_resources=False,
+            )
+            entry = runtime.llm.context_memory._object_entry(handle.oid)
+            persisted = runtime.store.get_object(handle.oid)
+
+            assert 'diff --git a/file b/file\\n' in context.text
+            assert 'patch_b64' not in context.text
+            assert 'path_b64' not in context.text
+            assert '"content":' not in context.text
+            assert '"artifacts":' not in context.text
+            assert 'obj_source_000' not in context.text
+            assert '"source_ref_count":40' in context.text
+            assert '"sensitivity":"secret"' in context.text
+            assert len(context.text) < len(repr(payload)) // 2
+            assert context.object_manifest[0]['transform'] == 'tool_result_projection_v1'
+            assert entry['transform'] == 'tool_result_projection_v1'
+            assert entry['payload']['result']['patch'] == patch
+            assert 'patch_b64' not in entry['payload']['result']
+            assert persisted is not None
+            assert persisted.payload == payload
+        finally:
+            runtime.close()
 
     def test_event_cursor_update_serializes_with_child_hierarchical_charge(
         self,
@@ -394,6 +475,104 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    def test_process_fencing_churn_does_not_grow_model_context(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='ignore fencing churn')
+            process = runtime.process.get(pid)
+            image = runtime.images[process.image_id]
+            tools = runtime.tools.model_visible_tools(pid)
+            memory = runtime.llm.context_memory
+            payload = memory._initial_payload(pid, image, process, tools)
+            captured = payload['captured']
+            entries = payload['entries']
+
+            assert memory._append_process_delta(captured, entries, process, image)
+            initial_entry_count = len(entries)
+            initial_render = memory.render(payload)
+            snapshot = entries[-1]
+
+            fencing_only = replace(
+                process,
+                state_generation=process.state_generation + 7,
+                updated_at='2099-01-01T00:00:00.123456Z',
+            )
+            assert not memory._append_process_delta(captured, entries, fencing_only, image)
+            assert len(entries) == initial_entry_count
+            assert memory.render(payload) == initial_render
+            assert snapshot['kind'] == 'process_snapshot'
+            assert 'state_generation' not in snapshot
+            assert 'updated_at' not in snapshot
+            assert 'at' in snapshot  # durable evidence envelope
+            assert '"at"' not in initial_render  # omitted from the model projection
+
+            semantic_change = replace(
+                fencing_only,
+                status_message='waiting for user-selected input',
+            )
+            assert memory._append_process_delta(captured, entries, semantic_change, image)
+            delta = entries[-1]
+            updated_render = memory.render(payload)
+            assert delta['kind'] == 'process_delta'
+            assert delta['changed'] == {
+                'status_message': 'waiting for user-selected input',
+            }
+            assert updated_render.startswith(initial_render)
+            assert 'state_generation' not in updated_render
+            assert '2099-01-01' not in updated_render
+        finally:
+            runtime.close()
+
+    def test_native_tool_delta_hashes_large_schema_without_inlining_it(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='compact tool changes')
+            process = runtime.process.get(pid)
+            image = runtime.images[process.image_id]
+            memory = runtime.llm.context_memory
+            payload = memory._initial_payload(pid, image, process, [])
+            baseline = memory.render(payload)
+            schema_sentinel = 'HUGE_NATIVE_SCHEMA_SENTINEL_' * 2_000
+            tools = [
+                {
+                    'name': 'large_native_tool',
+                    'spec_json': json.dumps(
+                        {
+                            'name': 'large_native_tool',
+                            'version': '9.4.1',
+                            'description': schema_sentinel,
+                            'policy': {'raw_policy': schema_sentinel},
+                            'input_schema': {
+                                'type': 'object',
+                                'properties': {
+                                    'value': {
+                                        'type': 'string',
+                                        'description': schema_sentinel,
+                                    }
+                                },
+                            },
+                        }
+                    ),
+                }
+            ]
+
+            assert memory._append_tool_delta(payload['captured'], payload['entries'], tools)
+            delta = payload['entries'][-1]
+            rendered = memory.render(payload)
+            identity = delta['upserted'][0]
+
+            assert delta['kind'] == 'tool_table_delta'
+            assert delta['tool_count'] == 1
+            assert set(identity) == {'name', 'version', 'schema_sha256'}
+            assert identity['name'] == 'large_native_tool'
+            assert identity['version'] == '9.4.1'
+            assert len(identity['schema_sha256']) == 64
+            assert schema_sentinel not in rendered
+            assert rendered.startswith(baseline)
+            assert len(rendered) - len(baseline) < 1_000
+        finally:
+            runtime.close()
+
     def test_llm_context_records_capability_changes_as_compact_deltas(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -518,6 +697,13 @@ class TestLLMContextMemory:
             assert [entry['kind'] for entry in tool_entries] == ['tool_table_delta']
             assert any(
                 row.get('name') == 'get_current_time'
+                for row in tool_entries[0]['upserted']
+            )
+            assert tool_entries[0]['tool_count'] == len(
+                runtime.tools.model_visible_tools(pid)
+            )
+            assert all(
+                set(row) == {'name', 'version', 'schema_sha256'}
                 for row in tool_entries[0]['upserted']
             )
         finally:
@@ -779,7 +965,9 @@ class TestLLMContextMemory:
 
             assert allowed['ok'], allowed
             assert len(client.user_prompts) == 1
-            assert 'MESSAGE_EVENT_SECRET_SENTINEL' in client.user_prompts[0]
+            # Event labels still gate egress, but process-message metadata stays
+            # behind the mediated read boundary even for a trusted provider.
+            assert 'MESSAGE_EVENT_SECRET_SENTINEL' not in client.user_prompts[0]
             context = runtime.store.get_object_by_name(
                 context_object_name(allowed_pid),
                 namespace=runtime.memory.resolve_namespace(allowed_pid),
@@ -787,6 +975,16 @@ class TestLLMContextMemory:
             assert context is not None
             assert context.metadata.sensitivity == 'secret'
             assert context.payload['label_history']['sensitivity'] == 'secret'
+            message_event_entry = next(
+                entry
+                for entry in context.payload['entries']
+                if entry.get('kind') == 'events_delta'
+                and entry.get('omitted_evidence_event_counts', {}).get(
+                    'delegated_process_message_posted'
+                )
+            )
+            assert message_event_entry['projection_summary']['omitted_event_count'] >= 1
+            assert 'MESSAGE_EVENT_SECRET_SENTINEL' not in json.dumps(context.payload)
         finally:
             runtime.close()
 
@@ -1746,6 +1944,74 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    def test_parallel_tool_calls_stop_after_exec_process_contract_change(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True))
+        runtime = Runtime.open('local', config=config)
+        try:
+            source_image_id = 'exec-contract-source:v0'
+            base_image = runtime.images['base-agent:v0']
+            runtime.register_image(
+                replace(
+                    base_image,
+                    image_id=source_image_id,
+                    name='exec-contract-source',
+                    default_tools=[
+                        *base_image.default_tools,
+                        'commit_checkpoint_to_image',
+                    ],
+                ),
+                actor='test',
+            )
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {
+                        'action': 'exec_process',
+                        'image': 'base-agent:v0',
+                        'goal': 'continue under the replacement image contract',
+                    },
+                    {'action': 'get_current_time', 'timezone': 'UTC'},
+                ]
+            ])
+            pid = runtime.process.spawn(image=source_image_id, goal='replace this contract')
+            runtime.capability.grant(
+                pid,
+                'image:base-agent:v0',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            runtime.skills.activate_skill(
+                pid,
+                'agent-libos-agent-images',
+                actor=pid,
+            )
+            runtime.skills.activate_skill(
+                pid,
+                'agent-libos-runtime-session',
+                actor=pid,
+            )
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            assert result['parallel_tool_calls'] is True
+            assert result['executed_count'] == 1
+            assert result['action']['action'] == 'exec_process'
+            assert result['stop_reason'] == 'process_exec'
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+            assert not any(
+                record.action == 'tool.call'
+                and record.decision.get('tool') == 'get_current_time'
+                for record in runtime.audit.trace()
+            )
+            batch = [
+                record
+                for record in runtime.audit.trace()
+                if record.action == 'llm.action_batch'
+            ][0]
+            assert batch.decision['stop_reason'] == 'process_exec'
+        finally:
+            runtime.close()
+
     def test_parallel_tool_calls_interrupt_notice_is_not_counted_as_executed(self) -> None:
         config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True))
         runtime = Runtime.open('local', config=config)
@@ -2029,7 +2295,14 @@ class TestLLMContextMemory:
             db = f'{temp_dir}/runtime.sqlite'
             runtime = Runtime.open(db)
             try:
-                runtime.llm.client = MetadataActionClient()
+                runtime.llm.client = MetadataActionClient(
+                    usage_extra={
+                        'prompt_tokens_details': {
+                            'cached_tokens': 8,
+                            'cache_write_tokens': 3,
+                        }
+                    }
+                )
                 pid = runtime.process.spawn(image='base-agent:v0', goal='persist full llm calls by default')
                 runtime.run_next_process_once()
                 calls = runtime.store.list_llm_calls(pid)
@@ -2044,6 +2317,8 @@ class TestLLMContextMemory:
                 assert call.response_id == 'resp_123'
                 assert call.response_content == 'visible assistant text'
                 assert call.usage['total_tokens'] == 17
+                assert call.usage['cache_read_tokens'] == 8
+                assert call.usage['cache_write_tokens'] == 3
                 assert call.messages[1]['content']
                 assert 'persist full llm calls by default' in call.messages[1]['content']
                 assert any((tool['function']['name'] == 'process_exit' for tool in call.tools))
@@ -2061,6 +2336,8 @@ class TestLLMContextMemory:
                 persisted = reopened.store.list_llm_calls()
                 assert len(persisted) == 1
                 assert persisted[0].usage['prompt_tokens'] == 13
+                assert persisted[0].usage['cache_read_tokens'] == 8
+                assert persisted[0].usage['cache_write_tokens'] == 3
                 assert 'persist full llm calls by default' in persisted[0].messages[1]['content']
                 assert persisted[0].raw_response['provider'] == 'fake'
                 assert persisted[0].observability['messages']['bytes'] > 0
@@ -2081,6 +2358,10 @@ class TestLLMContextMemory:
                         'provider_extra': usage_secret,
                         'input_tokens': True,
                         'output_tokens': -1,
+                        'prompt_tokens_details': {
+                            'cached_tokens': 0,
+                            'cache_write_tokens': 7,
+                        },
                     },
                 )
                 pid = runtime.process.spawn(image='base-agent:v0', goal='do not persist full llm calls')
@@ -2100,7 +2381,13 @@ class TestLLMContextMemory:
                     'prompt_tokens': 13,
                     'completion_tokens': 4,
                     'total_tokens': 17,
+                    'cache_read_tokens': 0,
+                    'cache_write_tokens': 7,
                 }
+                assert call.request_options['invalid_usage_fields'] == [
+                    'input_tokens',
+                    'output_tokens',
+                ]
                 serialized = json.dumps(call.__dict__, sort_keys=True)
                 assert 'do not persist full llm calls' not in serialized
                 assert '"payload": {"done": true}' not in serialized
@@ -2139,10 +2426,14 @@ class TestLLMContextMemory:
                 persisted = reopened.store.list_llm_calls(pid)[0]
                 assert persisted.messages[retention_key]['sha256']
                 assert persisted.raw_response[retention_key]['sha256']
+                assert persisted.usage['cache_read_tokens'] == 0
+                assert persisted.usage['cache_write_tokens'] == 7
             finally:
                 reopened.close()
 
-    def test_openai_responses_state_chaining_is_opt_in_and_observable(self) -> None:
+    def test_full_snapshot_executor_disables_configured_responses_state_chain_observably(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = f'{temp_dir}/runtime.sqlite'
             config = replace(
@@ -2188,25 +2479,59 @@ class TestLLMContextMemory:
                 assert first['action']['action'] == 'create_memory_object'
                 assert second['action']['action'] == 'process_exit'
                 assert 'previous_response_id' not in fake.responses.payloads[0]
-                assert fake.responses.payloads[1]['previous_response_id'] == 'resp_first'
-                chained_output = next(
-                    item for item in fake.responses.payloads[1]['input']
-                    if item.get('type') == 'function_call_output'
+                assert 'previous_response_id' not in fake.responses.payloads[1]
+                assert not any(
+                    item.get('type') == 'function_call_output'
+                    for item in fake.responses.payloads[1]['input']
                 )
-                assert chained_output['call_id'] == 'call_resp_first'
-                assert json.loads(chained_output['output']) == first['result']
                 assert fake.responses.payloads[0]['safety_identifier'] == 'safe-session'
                 assert fake.responses.payloads[0]['prompt_cache_key'] == 'cache-secret'
                 assert fake.responses.payloads[0]['prompt_cache_retention'] == '24h'
 
                 calls = runtime.store.list_llm_calls(pid)
                 assert [call.response_id for call in calls] == ['resp_first', 'resp_second']
-                assert calls[0].request_options['openai_responses_previous_response_id_enabled'] is True
-                assert calls[0].request_options['openai_previous_response_id'] is None
-                assert calls[1].request_options['openai_previous_response_id'] == 'resp_first'
+                assert all(
+                    call.request_options[
+                        'openai_responses_previous_response_id_configured'
+                    ]
+                    is True
+                    for call in calls
+                )
+                assert all(
+                    call.request_options[
+                        'openai_responses_previous_response_id_enabled'
+                    ]
+                    is False
+                    for call in calls
+                )
+                assert all(
+                    call.request_options[
+                        'openai_responses_previous_response_id_disabled_reason'
+                    ]
+                    == 'full_snapshot_executor_replay'
+                    for call in calls
+                )
+                assert all(
+                    call.request_options['openai_provider_chain_capable'] is True
+                    and call.request_options['openai_provider_chain_eligible'] is False
+                    and call.request_options['openai_previous_response_id'] is None
+                    for call in calls
+                )
+                assert runtime.store.list_llm_tool_outputs(
+                    pid=pid,
+                    response_id='resp_first',
+                ) == []
                 assert calls[0].request_options['openai_prompt_cache_key_configured'] is True
                 assert calls[0].request_options['openai_safety_identifier_configured'] is True
+                assert calls[0].request_options['openai_prompt_cache_key_sent'] is True
+                assert calls[0].request_options['openai_safety_identifier_sent'] is True
+                assert calls[0].request_options[
+                    'openai_prompt_cache_retention_configured'
+                ] == '24h'
                 assert calls[0].request_options['openai_prompt_cache_retention'] == '24h'
+                assert calls[0].request_options[
+                    'openai_compatibility_removed_options'
+                ] == []
                 assert calls[0].request_options['openai_tool_schema']['strict'] > 0
                 serialized_options = json.dumps([call.request_options for call in calls], sort_keys=True)
                 assert 'cache-secret' not in serialized_options
@@ -2374,7 +2699,7 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
-    def test_openai_responses_state_chain_persists_parallel_tool_outputs(self) -> None:
+    def test_full_snapshot_executor_does_not_replay_parallel_tool_outputs(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
             llm=replace(
@@ -2418,16 +2743,15 @@ class TestLLMContextMemory:
             assert first['parallel_tool_calls']
             assert first['executed_count'] == 2
             assert second['action']['action'] == 'process_exit'
-            assert fake.responses.payloads[1]['previous_response_id'] == 'resp_parallel'
-            native_outputs = [
-                item for item in fake.responses.payloads[1]['input']
-                if item.get('type') == 'function_call_output'
-            ]
-            assert [item['call_id'] for item in native_outputs] == [
-                'call_resp_parallel_1',
-                'call_resp_parallel_2',
-            ]
-            assert [json.loads(item['output']) for item in native_outputs] == first['results']
+            assert 'previous_response_id' not in fake.responses.payloads[1]
+            assert not any(
+                item.get('type') == 'function_call_output'
+                for item in fake.responses.payloads[1]['input']
+            )
+            assert runtime.store.list_llm_tool_outputs(
+                pid=pid,
+                response_id='resp_parallel',
+            ) == []
         finally:
             runtime.close()
 
@@ -2580,11 +2904,10 @@ class TestLLMContextMemory:
                 item.get('type') == 'function_call_output'
                 for item in fake.responses.payloads[1]['input']
             )
-            outputs = runtime.store.list_llm_tool_outputs(pid=pid, response_id='resp_incomplete')
-            assert [output['call_id'] for output in outputs] == [
-                'call_resp_incomplete_1',
-                'call_resp_incomplete_2',
-            ]
+            assert runtime.store.list_llm_tool_outputs(
+                pid=pid,
+                response_id='resp_incomplete',
+            ) == []
         finally:
             runtime.close()
 
@@ -2648,6 +2971,7 @@ class TestLLMContextMemory:
                 store=True,
                 responses_previous_response_id=True,
                 persist_full_io=False,
+                fallback_json_actions=True,
             ),
         )
         client = LLMClient(
@@ -2708,7 +3032,9 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
-    def test_openai_responses_wait_resume_output_survives_runtime_reopen(self) -> None:
+    def test_full_snapshot_executor_wait_resume_stays_stateless_after_reopen(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = f'{temp_dir}/runtime.sqlite'
             config = replace(
@@ -2767,13 +3093,15 @@ class TestLLMContextMemory:
                 assert resumed['resumed_after_message']
                 assert resumed['result']['payload']['messages'][0]['message_id'] == message.message_id
                 assert completed['action']['action'] == 'process_exit'
-                assert second_fake.responses.payloads[0]['previous_response_id'] == 'resp_wait'
-                output = next(
-                    item for item in second_fake.responses.payloads[0]['input']
-                    if item.get('type') == 'function_call_output'
+                assert 'previous_response_id' not in second_fake.responses.payloads[0]
+                assert not any(
+                    item.get('type') == 'function_call_output'
+                    for item in second_fake.responses.payloads[0]['input']
                 )
-                assert output['call_id'] == 'call_resp_wait'
-                assert json.loads(output['output']) == resumed['result']
+                call = reopened.store.list_llm_calls(pid)[-1]
+                assert call.request_options[
+                    'openai_responses_previous_response_id_disabled_reason'
+                ] == 'full_snapshot_executor_replay'
             finally:
                 reopened.close()
 
@@ -3053,7 +3381,10 @@ class TestLLMContextMemory:
             result = runtime.run_next_process_once()
 
             assert not result['ok']
-            assert 'no valid tool call or fallback JSON action found' in result['error']
+            assert 'no valid native tool call found' in result['error']
+            call = runtime.store.list_llm_calls(pid)[0]
+            assert call.request_options['fallback_json_actions_enabled'] is False
+            assert call.request_options['fallback_json_action_used'] is False
             assert runtime.process.get(pid).status == ProcessStatus.FAILED
             assert not any(record.action == 'llm.empty_tool_calls_auto_wait' for record in runtime.audit.trace())
             call = runtime.store.list_llm_calls(pid)[0]
@@ -3062,10 +3393,40 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    def test_text_json_action_is_not_executed_without_profile_opt_in(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, action_repair_attempts=1),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = TextOnlyActionClient(
+                ['{"action":"process_exit","payload":{"done":true}}']
+            )
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='native tools only',
+            )
+
+            result = runtime.run_next_process_once()
+
+            assert not result['ok']
+            assert 'no valid native tool call found' in result['error']
+            assert runtime.process.get(pid).status == ProcessStatus.FAILED
+            call = runtime.store.list_llm_calls(pid)[0]
+            assert call.request_options['fallback_json_actions_enabled'] is False
+            assert call.request_options['fallback_json_action_used'] is False
+        finally:
+            runtime.close()
+
     def test_empty_tool_calls_auto_waits_for_any_process_message(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
-            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                auto_wait_on_empty_tool_calls=True,
+                action_repair_attempts=1,
+            ),
         )
         runtime = Runtime.open('local', config=config)
         try:
@@ -3122,7 +3483,11 @@ class TestLLMContextMemory:
     def test_empty_tool_calls_auto_wait_reads_existing_unread_message(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
-            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                auto_wait_on_empty_tool_calls=True,
+                action_repair_attempts=1,
+            ),
         )
         runtime = Runtime.open('local', config=config)
         try:
@@ -3144,7 +3509,12 @@ class TestLLMContextMemory:
     def test_empty_tool_calls_auto_wait_preserves_json_action_fallback(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
-            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                auto_wait_on_empty_tool_calls=True,
+                fallback_json_actions=True,
+                action_repair_attempts=1,
+            ),
         )
         runtime = Runtime.open('local', config=config)
         try:
@@ -3157,13 +3527,21 @@ class TestLLMContextMemory:
             assert result['action']['action'] == 'process_exit'
             assert runtime.process.get(pid).status == ProcessStatus.EXITED
             assert not any(record.action == 'llm.empty_tool_calls_auto_wait' for record in runtime.audit.trace())
+            call = runtime.store.list_llm_calls(pid)[0]
+            assert call.request_options['fallback_json_actions_enabled'] is True
+            assert call.request_options['fallback_json_action_used'] is True
         finally:
             runtime.close()
 
     def test_empty_tool_calls_auto_wait_does_not_internalize_model_json_action(self) -> None:
         config = replace(
             DEFAULT_CONFIG,
-            llm=replace(DEFAULT_CONFIG.llm, auto_wait_on_empty_tool_calls=True, action_repair_attempts=1),
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                auto_wait_on_empty_tool_calls=True,
+                fallback_json_actions=True,
+                action_repair_attempts=1,
+            ),
         )
         runtime = Runtime.open('local', config=config)
         try:

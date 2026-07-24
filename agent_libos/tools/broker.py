@@ -11,7 +11,7 @@ from typing import Any
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.human.manager import HumanObjectManager
-from agent_libos.llm.openai_schema import openai_chat_tool_schema
+from agent_libos.utils.openai_schema import openai_chat_tool_schema
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
     AgentObject,

@@ -46,6 +46,7 @@ _USER_PROFILE_FIELDS = (
     "responses_previous_response_id",
     "parallel_tool_calls",
     "auto_wait_on_empty_tool_calls",
+    "fallback_json_actions",
     "temperature",
     "max_tokens",
     "context_window_tokens",
@@ -183,7 +184,9 @@ def validate_user_llm_profile_payload(
     raw["verbosity"] = _optional_choice(raw.get("verbosity"), "verbosity", _VERBOSITY)
     raw["reasoning_effort"] = _optional_string(raw.get("reasoning_effort"), "reasoning_effort")
     raw["safety_identifier_env"] = _optional_env_name(raw.get("safety_identifier_env"), "safety_identifier_env")
-    raw["prompt_cache_retention"] = _optional_choice(raw.get("prompt_cache_retention"), "prompt_cache_retention", {"in-memory", "24h"})
+    raw["prompt_cache_retention"] = _optional_prompt_cache_retention(
+        raw.get("prompt_cache_retention")
+    )
     raw["timeout_s"] = _optional_positive_float(raw.get("timeout_s"), "timeout_s")
     raw["max_retries"] = _optional_nonnegative_int(raw.get("max_retries"), "max_retries")
     raw["max_tokens"] = _optional_positive_int(raw.get("max_tokens"), "max_tokens")
@@ -192,7 +195,14 @@ def validate_user_llm_profile_payload(
         "context_window_tokens",
     )
     raw["temperature"] = _optional_nonnegative_float(raw.get("temperature"), "temperature")
-    for key in ("store", "responses_previous_response_id", "parallel_tool_calls", "auto_wait_on_empty_tool_calls", "allow_custom_base_url"):
+    for key in (
+        "store",
+        "responses_previous_response_id",
+        "parallel_tool_calls",
+        "auto_wait_on_empty_tool_calls",
+        "fallback_json_actions",
+        "allow_custom_base_url",
+    ):
         raw[key] = _optional_bool(raw.get(key), key)
     cleaned = {key: value for key, value in raw.items() if value is not None}
     selected_config = config or DEFAULT_CONFIG
@@ -220,6 +230,8 @@ def serialize_user_llm_profile(profile: LLMProfile) -> dict[str, Any]:
             continue
         if key == "kind" and value == "openai_compatible":
             continue
+        if key == "prompt_cache_retention":
+            value = _optional_prompt_cache_retention(value)
         serialized[key] = value
     return serialized
 
@@ -248,10 +260,13 @@ def summarize_llm_profile(
         "reasoning_effort": profile.reasoning_effort,
         "verbosity": profile.verbosity,
         "safety_identifier_env": profile.safety_identifier_env,
-        "prompt_cache_retention": profile.prompt_cache_retention,
+        "prompt_cache_retention": _optional_prompt_cache_retention(
+            profile.prompt_cache_retention
+        ),
         "responses_previous_response_id": profile.responses_previous_response_id,
         "parallel_tool_calls": profile.parallel_tool_calls,
         "auto_wait_on_empty_tool_calls": profile.auto_wait_on_empty_tool_calls,
+        "fallback_json_actions": profile.fallback_json_actions,
         "temperature": profile.temperature,
         "max_tokens": profile.max_tokens,
         "context_window_tokens": profile.context_window_tokens,
@@ -317,6 +332,21 @@ def _optional_choice(value: Any, label: str, choices: set[str]) -> str | None:
         return None
     if selected not in choices:
         raise ValidationError(f"LLM profile {label} must be one of {sorted(choices)}")
+    return selected
+
+
+def _optional_prompt_cache_retention(value: Any) -> str | None:
+    if value is None:
+        return None
+    selected = str(value).strip().lower()
+    if not selected:
+        return None
+    if selected == "in-memory":
+        return "in_memory"
+    if selected not in {"in_memory", "24h"}:
+        raise ValidationError(
+            "LLM profile prompt_cache_retention must be one of ['24h', 'in_memory']"
+        )
     return selected
 
 

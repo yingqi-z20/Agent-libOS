@@ -30,6 +30,7 @@ from agent_libos.substrate import (
     ProviderEffectNotStarted,
     ResolvedPath,
 )
+from agent_libos.tools.builtin.filesystem import ReadDirectoryArgs, ReadTextFileArgs
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 DEFAULT_FILESYSTEM_READ_HARD_LIMIT = _TOOL_DEFAULTS.filesystem_read_hard_limit_bytes
 DEFAULT_DIRECTORY_ENTRY_HARD_LIMIT = _TOOL_DEFAULTS.directory_entry_hard_limit
@@ -80,6 +81,125 @@ class TestFilesystemDirectoryTool:
             and effect.rollback_status == ExternalEffectRollbackStatus.NOT_SUPPORTED
             for effect in mutation_effects
         )
+
+    def test_read_tools_are_prefix_only_and_directory_count_is_not_a_total(self) -> None:
+        assert set(ReadTextFileArgs.model_fields) == {'path', 'encoding', 'max_bytes'}
+        assert set(ReadDirectoryArgs.model_fields) == {'path', 'limit'}
+
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            target = root / 'items'
+            target.mkdir()
+            (target / 'content.txt').write_text('abcdefghij', encoding='utf-8')
+            (target / 'second.txt').write_text('second', encoding='utf-8')
+            (target / 'third.txt').write_text('third', encoding='utf-8')
+            runtime = self._runtime_with_filesystem_provider(
+                root,
+                LocalFilesystemProvider(root),
+            )
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='bounded reads')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    'items',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                read = runtime.tools.call(
+                    pid,
+                    'read_text_file',
+                    {'path': 'items/content.txt', 'max_bytes': 4},
+                )
+                listed = runtime.tools.call(
+                    pid,
+                    'read_directory',
+                    {'path': 'items', 'limit': 2},
+                )
+
+                assert read.ok, read.error
+                assert read.payload['content'] == 'abcd'
+                assert read.payload['bytes_read'] == 4
+                assert read.payload['truncated'] is True
+                assert listed.ok, listed.error
+                assert len(listed.payload['entries']) == 2
+                assert listed.payload['count'] == 2
+                assert listed.payload['truncated'] is True
+                assert len(list(target.iterdir())) == 3
+            finally:
+                runtime.close()
+
+    def test_write_text_file_creates_missing_parent_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            runtime = self._runtime_with_filesystem_provider(
+                root,
+                LocalFilesystemProvider(root),
+            )
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='write nested file')
+                runtime.filesystem.grant_path(
+                    pid,
+                    'new/deep/output.txt',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+
+                result = runtime.tools.call(
+                    pid,
+                    'write_text_file',
+                    {'path': 'new/deep/output.txt', 'content': 'created'},
+                )
+
+                assert result.ok, result.error
+                assert result.payload['created'] is True
+                assert (root / 'new' / 'deep' / 'output.txt').read_text(
+                    encoding='utf-8'
+                ) == 'created'
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize(
+        ('tool_name', 'args'),
+        [
+            ('read_text_file', {'path': '.git/config'}),
+            ('read_directory', {'path': '.git'}),
+            ('write_text_file', {'path': '.git/config', 'content': 'unsafe'}),
+            ('delete_file', {'path': '.git/config'}),
+            ('delete_directory', {'path': '.git', 'recursive': True}),
+        ],
+    )
+    def test_filesystem_tools_reject_direct_git_metadata_paths(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            metadata = root / '.git'
+            metadata.mkdir()
+            config = metadata / 'config'
+            config.write_text('[core]\n', encoding='utf-8')
+            runtime = self._runtime_with_filesystem_provider(
+                root,
+                LocalFilesystemProvider(root),
+            )
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='protect git metadata')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    '.',
+                    [CapabilityRight.READ, CapabilityRight.WRITE, CapabilityRight.DELETE],
+                    issued_by='test',
+                )
+
+                result = runtime.tools.call(pid, tool_name, args)
+
+                assert not result.ok
+                assert 'Git metadata' in (result.error or '')
+                assert config.read_text(encoding='utf-8') == '[core]\n'
+            finally:
+                runtime.close()
 
     @pytest.mark.parametrize(
         ('metadata_path', 'metadata_kind'),

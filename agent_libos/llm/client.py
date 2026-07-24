@@ -40,6 +40,19 @@ class LLMCompletion:
     model: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
     reasoning: Any | None = None
+    fallback_json_action_used: bool = False
+    # Safe, model-facing provider option telemetry. Cache keys and safety
+    # identifiers are intentionally represented as booleans rather than copied
+    # into durable call records by downstream consumers.
+    provider_request_options: dict[str, Any] = field(default_factory=dict)
+    compatibility_removed_options: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _ProviderCallResult:
+    response: Any
+    request: dict[str, Any]
+    compatibility_removed_options: tuple[str, ...] = ()
 
 
 @dataclass
@@ -56,9 +69,10 @@ class LLMClient:
     verbosity: Literal["low", "medium", "high"] | None = None
     safety_identifier: str | None = None
     prompt_cache_key: str | None = None
-    prompt_cache_retention: Literal["in-memory", "24h"] | None = None
+    prompt_cache_retention: Literal["in_memory", "24h"] | None = None
     responses_previous_response_id: bool | None = None
     parallel_tool_calls: bool | None = None
+    fallback_json_actions: bool | None = None
     enable_thinking: bool | None = None
     organization: str | None = None
     project: str | None = None
@@ -75,10 +89,11 @@ class LLMClient:
         self.store = self.defaults.store if self.store is None else self.store
         self.safety_identifier = self.defaults.safety_identifier if self.safety_identifier is None else self.safety_identifier
         self.prompt_cache_key = self.defaults.prompt_cache_key if self.prompt_cache_key is None else self.prompt_cache_key
-        self.prompt_cache_retention = (
+        self.prompt_cache_retention = _normalize_prompt_cache_retention(
             self.defaults.prompt_cache_retention
             if self.prompt_cache_retention is None
-            else self.prompt_cache_retention
+            else self.prompt_cache_retention,
+            label="prompt_cache_retention",
         )
         self.responses_previous_response_id = (
             self.defaults.responses_previous_response_id
@@ -87,6 +102,11 @@ class LLMClient:
         )
         self.parallel_tool_calls = (
             self.defaults.parallel_tool_calls if self.parallel_tool_calls is None else self.parallel_tool_calls
+        )
+        self.fallback_json_actions = (
+            self.defaults.fallback_json_actions
+            if self.fallback_json_actions is None
+            else self.fallback_json_actions
         )
         self._validate_base_url_policy()
 
@@ -137,6 +157,11 @@ class LLMClient:
                 env,
                 "OPENAI_PARALLEL_TOOL_CALLS",
                 default=defaults.parallel_tool_calls,
+            ),
+            fallback_json_actions=_bool_env_from(
+                env,
+                "OPENAI_FALLBACK_JSON_ACTIONS",
+                default=defaults.fallback_json_actions,
             ),
             enable_thinking=(
                 _bool_env_from(env, "OPENAI_ENABLE_THINKING", default=False)
@@ -312,7 +337,16 @@ class LLMClient:
                     parallel_tool_calls=selected_parallel_tool_calls,
                 )
             except LLMError as exc:
-                if self.api_mode != "auto" or not self._should_fallback_to_chat(exc.__cause__ or exc):
+                cause = exc.__cause__ or exc
+                if self.api_mode == "auto" and self._should_fallback_to_chat(cause):
+                    pass
+                elif self.fallback_json_actions and self._is_tool_protocol_rejection(exc):
+                    return await self._complete_json_action_fallback(
+                        messages,
+                        selected_temperature,
+                        selected_max_tokens,
+                    )
+                else:
                     raise
         return await self._chat_complete_action(
             messages,
@@ -353,8 +387,8 @@ class LLMClient:
             payload["text"] = self._responses_text_config_for_schema(json_schema, schema_name)
         elif json_mode:
             payload["text"] = self._text_config(json_mode=True)
-        response = await self._create_response(payload)
-        return self._completion_from_response(response)
+        provider_call = await self._create_response(payload)
+        return self._completion_from_response(provider_call)
 
     async def _responses_complete_action(
         self,
@@ -379,8 +413,8 @@ class LLMClient:
                 "parallel_tool_calls": parallel_tool_calls,
             }
         )
-        response = await self._create_response(payload)
-        return self._completion_from_response(response)
+        provider_call = await self._create_response(payload)
+        return self._completion_from_response(provider_call)
 
     async def _chat_complete(
         self,
@@ -396,14 +430,19 @@ class LLMClient:
             payload["response_format"] = self._chat_response_format_for_schema(json_schema, schema_name)
         elif json_mode:
             payload["response_format"] = {"type": "json_object"}
-        completion = await self._create_chat_completion(payload)
-        result = self._completion_from_chat(completion)
+        provider_call = await self._create_chat_completion(payload)
+        result = self._completion_from_chat(provider_call)
         if self._needs_non_thinking_retry(result):
-            retry_payload = self._with_enable_thinking(payload, enabled=False)
-            completion = await self._create_chat_completion(retry_payload)
-            result = self._completion_from_chat(completion)
+            previous_removed = provider_call.compatibility_removed_options
+            retry_payload = self._with_enable_thinking(provider_call.request, enabled=False)
+            retry_call = await self._create_chat_completion(retry_payload)
+            result = self._completion_from_chat(
+                retry_call,
+                additional_removed=previous_removed,
+            )
+            provider_call = retry_call
         if not result.content:
-            finish_reason = _first_choice_attr(completion, "finish_reason")
+            finish_reason = _first_choice_attr(provider_call.response, "finish_reason")
             raise LLMError(f"LLM returned empty content; finish_reason={finish_reason!r}")
         return result
 
@@ -419,19 +458,43 @@ class LLMClient:
         payload = self._chat_payload(messages=messages, temperature=temperature, max_tokens=max_tokens)
         payload.update({"tools": _chat_tools(tools), "tool_choice": "auto", "parallel_tool_calls": parallel_tool_calls})
         try:
-            completion = await self._create_chat_completion(payload)
+            provider_call = await self._create_chat_completion(payload)
         except LLMError as exc:
-            # Preserve compatibility with OpenAI-compatible providers that do not
-            # implement tool calling. The executor can still parse fallback JSON.
-            message = str(exc).lower()
-            if "tools" in message or "tool_choice" in message:
-                text = await self.acomplete(messages, temperature=temperature, max_tokens=max_tokens, json_mode=False)
-                return LLMCompletion(content=text, tool_calls=[], api="chat")
+            if self.fallback_json_actions and self._is_tool_protocol_rejection(exc):
+                return await self._complete_json_action_fallback(
+                    messages,
+                    temperature,
+                    max_tokens,
+                )
             raise
-        result = self._completion_from_chat(completion)
+        result = self._completion_from_chat(provider_call)
         if self._needs_non_thinking_retry(result):
-            completion = await self._create_chat_completion(self._with_enable_thinking(payload, enabled=False))
-            result = self._completion_from_chat(completion)
+            retry_call = await self._create_chat_completion(
+                self._with_enable_thinking(provider_call.request, enabled=False)
+            )
+            result = self._completion_from_chat(
+                retry_call,
+                additional_removed=provider_call.compatibility_removed_options,
+            )
+        return result
+
+    async def _complete_json_action_fallback(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+    ) -> LLMCompletion:
+        result = await self._complete_without_tools(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=False,
+            json_schema=None,
+            schema_name="response",
+        )
+        if not result.content:
+            raise LLMError("LLM returned empty content during JSON action fallback")
+        result.fallback_json_action_used = True
         return result
 
     def _client_or_raise(self) -> Any:
@@ -551,7 +614,7 @@ class LLMClient:
         instructions, input_items = _messages_to_responses_parts(
             messages,
             native_tool_outputs=will_use_previous_response_id,
-            tool_output_plain_context_chars=max(1, max_tokens * 4),
+            tool_output_max_chars=self.defaults.tool_output_prompt_max_chars,
         )
         payload: dict[str, Any] = {
             "model": self.model,
@@ -571,7 +634,7 @@ class LLMClient:
         text_config = self._text_config(json_mode=False)
         if text_config:
             payload["text"] = text_config
-        self._add_openai_responses_options(payload)
+        self._add_provider_request_options(payload)
         extra_body = self._extra_body()
         if extra_body:
             payload["extra_body"] = extra_body
@@ -593,25 +656,37 @@ class LLMClient:
             payload["reasoning_effort"] = self.reasoning_effort
         if self.verbosity:
             payload["verbosity"] = self.verbosity
+        self._add_provider_request_options(payload)
         extra_body = self._extra_body()
         if extra_body:
             payload["extra_body"] = extra_body
         return payload
 
-    async def _create_response(self, payload: dict[str, Any]) -> Any:
+    async def _create_response(self, payload: dict[str, Any]) -> _ProviderCallResult:
         async with self._async_client_scope() as client:
             return await self._call_with_compatibility(client.responses.create, payload, api="responses")
 
-    async def _create_chat_completion(self, payload: dict[str, Any]) -> Any:
+    async def _create_chat_completion(self, payload: dict[str, Any]) -> _ProviderCallResult:
         async with self._async_client_scope() as client:
             return await self._call_with_compatibility(client.chat.completions.create, payload, api="chat")
 
-    async def _call_with_compatibility(self, create: Any, payload: dict[str, Any], api: str) -> Any:
+    async def _call_with_compatibility(
+        self,
+        create: Any,
+        payload: dict[str, Any],
+        api: str,
+    ) -> _ProviderCallResult:
         request = dict(payload)
         last_error: Exception | None = None
+        removed_options: set[str] = set()
         for _attempt in range(self.defaults.compatibility_retry_attempts):
             try:
-                return await create(**request)
+                response = await create(**request)
+                return _ProviderCallResult(
+                    response=response,
+                    request=dict(request),
+                    compatibility_removed_options=tuple(sorted(removed_options)),
+                )
             except Exception as exc:
                 if not _is_openai_sdk_error(exc):
                     raise
@@ -623,6 +698,9 @@ class LLMClient:
                     raise LLMError(
                         f"OpenAI SDK {api} request failed: status={status_code!r} request_id={request_id!r} error={exc}"
                     ) from exc
+                removed_options.update(
+                    key for key in request if key not in retry
+                )
                 request = retry
         raise LLMError(f"OpenAI SDK {api} request failed after compatibility retries: {last_error}") from last_error
 
@@ -654,6 +732,10 @@ class LLMClient:
             "previous_response_id",
             "prompt_cache_key",
             "prompt_cache_retention",
+            # GPT-5.6+ uses this newer option instead of retention. Agent
+            # libOS does not emit it until it can also model explicit content
+            # breakpoints, but compatible callers must still downgrade safely.
+            "prompt_cache_options",
             "safety_identifier",
         ):
             if key in message and key in retry:
@@ -677,7 +759,13 @@ class LLMClient:
             return retry
         return None
 
-    def _completion_from_response(self, response: Any) -> LLMCompletion:
+    def _completion_from_response(
+        self,
+        provider_call: _ProviderCallResult,
+        *,
+        additional_removed: tuple[str, ...] = (),
+    ) -> LLMCompletion:
+        response = provider_call.response
         error = getattr(response, "error", None)
         if error is not None:
             raise LLMError(f"OpenAI response failed: {error}")
@@ -703,9 +791,23 @@ class LLMClient:
             model=str(getattr(response, "model", "")) or None,
             usage=_usage_from_response(response),
             reasoning=_reasoning_from_response(response),
+            provider_request_options=_provider_request_option_observation(
+                provider_call.request
+            ),
+            compatibility_removed_options=sorted(
+                set(additional_removed).union(
+                    provider_call.compatibility_removed_options
+                )
+            ),
         )
 
-    def _completion_from_chat(self, completion: Any) -> LLMCompletion:
+    def _completion_from_chat(
+        self,
+        provider_call: _ProviderCallResult,
+        *,
+        additional_removed: tuple[str, ...] = (),
+    ) -> LLMCompletion:
+        completion = provider_call.response
         try:
             message = completion.choices[0].message
         except (AttributeError, IndexError) as exc:
@@ -734,6 +836,14 @@ class LLMClient:
             model=str(getattr(completion, "model", "")) or None,
             usage=_usage_from_response(completion),
             reasoning=_reasoning_from_chat_message(message),
+            provider_request_options=_provider_request_option_observation(
+                provider_call.request
+            ),
+            compatibility_removed_options=sorted(
+                set(additional_removed).union(
+                    provider_call.compatibility_removed_options
+                )
+            ),
         )
 
     def _use_responses_api(self) -> bool:
@@ -791,9 +901,14 @@ class LLMClient:
             raise LLMError("schema_name must be a non-empty string")
         return selected
 
-    def _add_openai_responses_options(self, payload: dict[str, Any]) -> None:
-        if not self._use_openai_request_options():
-            return
+    def _add_provider_request_options(self, payload: dict[str, Any]) -> None:
+        """Add explicitly configured OpenAI-compatible request options.
+
+        A custom base URL is an explicit host-selected provider boundary. When
+        its profile opts into these fields, dispatch them and let the bounded
+        compatibility retry remove only fields the provider rejects. Defaults
+        remain unset, so no option is inferred from an endpoint hostname.
+        """
         if self.safety_identifier:
             if len(self.safety_identifier) > 64:
                 raise LLMError("safety_identifier must be at most 64 characters")
@@ -801,9 +916,15 @@ class LLMClient:
         if self.prompt_cache_key:
             payload["prompt_cache_key"] = self.prompt_cache_key
         if self.prompt_cache_retention:
-            if self.prompt_cache_retention not in {"in-memory", "24h"}:
-                raise LLMError("prompt_cache_retention must be one of in-memory, 24h")
-            payload["prompt_cache_retention"] = self.prompt_cache_retention
+            # Normalize again at the provider boundary so even a caller that
+            # mutates the dataclass after construction can never dispatch the
+            # retired hyphenated spelling.
+            selected_retention = _normalize_prompt_cache_retention(
+                self.prompt_cache_retention,
+                label="prompt_cache_retention",
+            )
+            self.prompt_cache_retention = selected_retention
+            payload["prompt_cache_retention"] = selected_retention
 
     def _use_openai_request_options(self) -> bool:
         return self.base_url is None or _is_openai_base_url(self.base_url)
@@ -861,6 +982,11 @@ class LLMClient:
         )
 
     @staticmethod
+    def _is_tool_protocol_rejection(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "tools" in message or "tool_choice" in message
+
+    @staticmethod
     def _with_enable_thinking(payload: dict[str, Any], enabled: bool) -> dict[str, Any]:
         retry = dict(payload)
         extra_body = dict(retry.get("extra_body") or {})
@@ -894,10 +1020,10 @@ class LLMClient:
         return str(content)
 
     def _messages_with_json_instruction(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if _messages_contain_json_instruction(messages):
+        json_instruction = self.defaults.json_instruction
+        if _static_messages_contain_instruction(messages, json_instruction):
             return messages
         new_messages = [dict(message) for message in messages]
-        json_instruction = self.defaults.json_instruction
         for msg in new_messages:
             if msg.get("role") in {"system", "developer"}:
                 msg["content"] = str(msg.get("content", "")) + f" {json_instruction}"
@@ -946,7 +1072,7 @@ def _messages_to_responses_parts(
     messages: list[dict[str, Any]],
     *,
     native_tool_outputs: bool = False,
-    tool_output_plain_context_chars: int = 0,
+    tool_output_max_chars: int = 0,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
@@ -964,7 +1090,10 @@ def _messages_to_responses_parts(
                     {
                         "type": "function_call_output",
                         "call_id": str(call_id),
-                        "output": content,
+                        "output": _bounded_tool_output(
+                            content,
+                            max_chars=tool_output_max_chars,
+                        ),
                     }
                 )
                 continue
@@ -974,7 +1103,7 @@ def _messages_to_responses_parts(
                     "content": _plain_tool_output_context(
                         message,
                         content,
-                        max_chars=tool_output_plain_context_chars,
+                        max_chars=tool_output_max_chars,
                     ),
                 }
             )
@@ -999,13 +1128,48 @@ def _plain_tool_output_context(message: dict[str, Any], content: str, *, max_cha
     header = "Tool output"
     if labels:
         header += f" ({', '.join(str(label) for label in labels)})"
-    return f"{header}:\n{_bounded_text(content, max_chars=max_chars)}"
+    prefix = f"{header}:\n"
+    if len(prefix) >= max_chars:
+        prefix = "Tool output:\n"
+    if len(prefix) >= max_chars:
+        return prefix[:max_chars]
+    return prefix + _bounded_tool_output(
+        content,
+        max_chars=max(0, max_chars - len(prefix)),
+    )
 
 
-def _bounded_text(value: str, *, max_chars: int) -> str:
+def _bounded_tool_output(value: str, *, max_chars: int) -> str:
     if len(value) <= max_chars:
         return value
-    return f"{value[:max_chars]}\n[truncated: original_chars={len(value)}]"
+    if max_chars <= 0:
+        return ""
+
+    # Recompute once because the omitted count can change the marker width.
+    included_chars = max_chars
+    marker = ""
+    for _ in range(2):
+        omitted_chars = len(value) - included_chars
+        marker = (
+            "[tool_output_omitted: "
+            f"original_chars={len(value)} "
+            f"included_chars={included_chars} "
+            f"omitted_chars={omitted_chars}]"
+        )
+        included_chars = max(0, max_chars - len(marker) - 1)
+    omitted_chars = len(value) - included_chars
+    marker = (
+        "[tool_output_omitted: "
+        f"original_chars={len(value)} "
+        f"included_chars={included_chars} "
+        f"omitted_chars={omitted_chars}]"
+    )
+    if len(marker) >= max_chars:
+        # Configuration validation keeps the normal limit comfortably above
+        # the marker. This branch still enforces the hard model-facing bound
+        # for direct construction with an unusually small custom default.
+        return marker[:max_chars]
+    return f"{value[:included_chars]}\n{marker}"
 
 
 def _messages_have_unrepresentable_tool_output(messages: list[dict[str, Any]]) -> bool:
@@ -1016,6 +1180,19 @@ def _messages_have_unrepresentable_tool_output(messages: list[dict[str, Any]]) -
             continue
         return True
     return False
+
+
+def _provider_request_option_observation(
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    """Return non-secret facts about the request that actually succeeded."""
+
+    return {
+        "prompt_cache_key_sent": "prompt_cache_key" in request,
+        "prompt_cache_retention": request.get("prompt_cache_retention"),
+        "prompt_cache_options_sent": "prompt_cache_options" in request,
+        "safety_identifier_sent": "safety_identifier" in request,
+    }
 
 
 def _is_openai_sdk_error(exc: Exception) -> bool:
@@ -1035,8 +1212,18 @@ def _is_openai_base_url(base_url: str) -> bool:
     return host == "api.openai.com"
 
 
-def _messages_contain_json_instruction(messages: list[dict[str, Any]]) -> bool:
-    return any("json" in _message_content_for_search(message).lower() for message in messages)
+def _static_messages_contain_instruction(
+    messages: list[dict[str, Any]],
+    instruction: str,
+) -> bool:
+    selected = instruction.strip()
+    if not selected:
+        return True
+    return any(
+        str(message.get("role", "user")) in {"system", "developer"}
+        and selected in _message_content_for_search(message)
+        for message in messages
+    )
 
 
 def _message_content_for_search(message: dict[str, Any]) -> str:
@@ -1177,13 +1364,25 @@ def _verbosity_env_from(env: dict[str, str], name: str) -> Literal["low", "mediu
     return normalized  # type: ignore[return-value]
 
 
-def _prompt_cache_retention_env_from(env: dict[str, str], name: str) -> Literal["in-memory", "24h"] | None:
+def _prompt_cache_retention_env_from(env: dict[str, str], name: str) -> Literal["in_memory", "24h"] | None:
     value = _optional_env_from(env, name)
     if value is None:
         return None
-    normalized = value.lower()
-    if normalized not in {"in-memory", "24h"}:
-        raise LLMError(f"{name} must be one of in-memory, 24h; got {value!r}")
+    return _normalize_prompt_cache_retention(value, label=name)
+
+
+def _normalize_prompt_cache_retention(
+    value: str | None,
+    *,
+    label: str,
+) -> Literal["in_memory", "24h"] | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized == "in-memory":
+        normalized = "in_memory"
+    if normalized not in {"in_memory", "24h"}:
+        raise LLMError(f"{label} must be one of in_memory, 24h; got {value!r}")
     return normalized  # type: ignore[return-value]
 
 

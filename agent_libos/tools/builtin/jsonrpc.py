@@ -14,6 +14,9 @@ class ListJsonRpcEndpointsArgs(BaseModel):
 
 class ListJsonRpcEndpointsOutput(BaseModel):
     endpoints: list[dict[str, Any]]
+    has_more: bool = Field(
+        description="Whether another registered endpoint matched beyond this bounded result."
+    )
 
 
 class InspectJsonRpcEndpointArgs(BaseModel):
@@ -65,8 +68,12 @@ class ListJsonRpcEndpointsTool(BaseAgentTool[ListJsonRpcEndpointsArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
-        endpoints = runtime.jsonrpc.list_endpoints(actor=ctx.pid, text=args.text, limit=args.limit)
-        return ListJsonRpcEndpointsOutput(endpoints=endpoints)
+        endpoints, has_more = runtime.jsonrpc.list_endpoints_window(
+            actor=ctx.pid,
+            text=args.text,
+            limit=args.limit,
+        )
+        return ListJsonRpcEndpointsOutput(endpoints=endpoints, has_more=has_more)
 
 
 class InspectJsonRpcEndpointTool(BaseAgentTool[InspectJsonRpcEndpointArgs]):

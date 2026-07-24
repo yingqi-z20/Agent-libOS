@@ -22,6 +22,7 @@ _LEGACY_PROFILE_ENV_KEYS = {
     "OPENAI_API_MODE",
     "OPENAI_BASE_URL",
     "OPENAI_ENABLE_THINKING",
+    "OPENAI_FALLBACK_JSON_ACTIONS",
     "OPENAI_LANGUAGE_MODEL",
     "OPENAI_MAX_RETRIES",
     "OPENAI_MODEL",
@@ -52,6 +53,7 @@ class ResolvedLLMProfile:
     context_window_tokens: int
     parallel_tool_calls: bool
     auto_wait_on_empty_tool_calls: bool
+    fallback_json_actions: bool
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,7 @@ class _ResolvedLLMPolicy:
     store: bool
     prompt_cache_retention: str | None
     responses_previous_response_id: bool
+    fallback_json_actions: bool
 
 
 @dataclass(frozen=True)
@@ -140,6 +143,15 @@ class LLMProfileRegistry:
     def client_for_process(self, pid: str) -> Any:
         return self.resolve_for_process(pid).client
 
+    def fallback_json_actions_for_process(self, pid: str) -> bool:
+        """Resolve compatibility policy without constructing a provider client."""
+
+        process = self._processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        profile_id = process.llm_profile_id or self.config.llm.default_profile_id
+        return self.profile_snapshot(profile_id).policy.fallback_json_actions
+
     def resolve(
         self,
         profile_id: str,
@@ -183,6 +195,7 @@ class LLMProfileRegistry:
                 ),
                 parallel_tool_calls=self._resolved_parallel_tool_calls(profile, client),
                 auto_wait_on_empty_tool_calls=self._resolved_auto_wait_on_empty_tool_calls(profile),
+                fallback_json_actions=snapshot.policy.fallback_json_actions,
             )
 
     @property
@@ -235,6 +248,10 @@ class LLMProfileRegistry:
         )
         policy = self._resolved_policy(profile, legacy_env)
         identity_profile = asdict(profile)
+        identity_profile["prompt_cache_retention"] = _normalize_prompt_cache_retention(
+            profile.prompt_cache_retention,
+            label=f"LLM profile {profile_id} prompt_cache_retention",
+        )
         # Model-window sizing controls only local request scheduling. It does
         # not identify the external Provider/Sink and must not invalidate
         # existing trust rules when hosts adopt this field.
@@ -252,6 +269,7 @@ class LLMProfileRegistry:
                 "store": policy.store,
                 "prompt_cache_retention": policy.prompt_cache_retention,
                 "responses_previous_response_id": policy.responses_previous_response_id,
+                "fallback_json_actions": policy.fallback_json_actions,
                 "api_key_env": profile.api_key_env,
                 "enable_thinking": (
                     _bool_env(legacy_env, "OPENAI_ENABLE_THINKING", False)
@@ -379,6 +397,7 @@ class LLMProfileRegistry:
             ),
             prompt_cache_retention=policy.prompt_cache_retention,  # type: ignore[arg-type]
             responses_previous_response_id=policy.responses_previous_response_id,
+            fallback_json_actions=policy.fallback_json_actions,
             parallel_tool_calls=(
                 profile.parallel_tool_calls
                 if profile.parallel_tool_calls is not None
@@ -429,10 +448,13 @@ class LLMProfileRegistry:
                 else _bool_env(legacy_env, "OPENAI_STORE", self.config.llm.store)
             ),
             prompt_cache_retention=(
-                profile.prompt_cache_retention
-                if profile.prompt_cache_retention is not None
-                else _prompt_cache_retention_env(legacy_env)
-                or self.config.llm.prompt_cache_retention
+                _normalize_prompt_cache_retention(
+                    profile.prompt_cache_retention
+                    if profile.prompt_cache_retention is not None
+                    else _prompt_cache_retention_env(legacy_env)
+                    or self.config.llm.prompt_cache_retention,
+                    label="prompt_cache_retention",
+                )
             ),
             responses_previous_response_id=(
                 profile.responses_previous_response_id
@@ -441,6 +463,15 @@ class LLMProfileRegistry:
                     legacy_env,
                     "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
                     self.config.llm.responses_previous_response_id,
+                )
+            ),
+            fallback_json_actions=(
+                profile.fallback_json_actions
+                if profile.fallback_json_actions is not None
+                else _bool_env(
+                    legacy_env,
+                    "OPENAI_FALLBACK_JSON_ACTIONS",
+                    self.config.llm.fallback_json_actions,
                 )
             ),
         )
@@ -699,11 +730,20 @@ def _verbosity_env(env: Mapping[str, str]) -> str | None:
 
 def _prompt_cache_retention_env(env: Mapping[str, str]) -> str | None:
     value = _optional_env(env, "OPENAI_PROMPT_CACHE_RETENTION")
+    return _normalize_prompt_cache_retention(
+        value,
+        label="OPENAI_PROMPT_CACHE_RETENTION",
+    )
+
+
+def _normalize_prompt_cache_retention(value: str | None, *, label: str) -> str | None:
     if value is None:
         return None
-    selected = value.lower()
-    if selected not in {"in-memory", "24h"}:
-        raise LLMError("OPENAI_PROMPT_CACHE_RETENTION must be one of in-memory, 24h")
+    selected = value.strip().lower()
+    if selected == "in-memory":
+        return "in_memory"
+    if selected not in {"in_memory", "24h"}:
+        raise LLMError(f"{label} must be one of in_memory, 24h")
     return selected
 
 

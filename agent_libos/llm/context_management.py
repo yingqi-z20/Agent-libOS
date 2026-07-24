@@ -9,6 +9,7 @@ from typing import Any
 
 from agent_libos.models import is_openai_tool_name
 from agent_libos.models.exceptions import ValidationError
+from agent_libos.utils.ids import estimate_tokens
 from agent_libos.utils.serde import dumps, to_jsonable
 
 CONTEXT_MANAGEMENT_MODES = frozenset({"auto_compact", "prompt", "disabled"})
@@ -206,18 +207,9 @@ def _context_management_prompt(raw: Mapping[str, Any]) -> str:
 
 
 def estimate_multilingual_tokens(text: str) -> int:
-    """Conservatively estimate tokens without depending on a model tokenizer.
+    """Compatibility alias for the shared Provider-neutral estimator."""
 
-    ASCII is budgeted at three characters per token and every non-ASCII code
-    point at one token. This intentionally overestimates common English and
-    CJK prompts while remaining deterministic across Provider implementations.
-    """
-
-    if not text:
-        return 0
-    ascii_chars = sum(1 for char in text if ord(char) < 128)
-    non_ascii_chars = len(text) - ascii_chars
-    return math.ceil(ascii_chars / 3) + non_ascii_chars
+    return estimate_tokens(text)
 
 
 def estimate_request_input_tokens(
@@ -225,11 +217,11 @@ def estimate_request_input_tokens(
     tools: Sequence[Mapping[str, Any]],
 ) -> int:
     message_tokens = sum(
-        estimate_multilingual_tokens(dumps(to_jsonable(dict(message)))) + 8
+        estimate_tokens(dict(message)) + 8
         for message in messages
     )
     tool_tokens = sum(
-        estimate_multilingual_tokens(dumps(to_jsonable(dict(tool)))) + 12
+        estimate_tokens(dict(tool)) + 12
         for tool in tools
     )
     return max(1, message_tokens + tool_tokens + 16)

@@ -2,7 +2,7 @@ from __future__ import annotations
 import pytest
 import asyncio
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from pydantic import ValidationError as PydanticValidationError
 
@@ -33,6 +33,7 @@ class TestConfigDefaults:
             DEFAULT_CONFIG.llm.profiles["mutated"] = LLMProfile()
 
         assert "mutated" not in AgentLibOSConfig().llm.profiles
+        assert DEFAULT_CONFIG.llm.fallback_json_actions is False
 
     def test_remote_registry_tool_schema_uses_runtime_list_limits(self) -> None:
         config = replace(
@@ -165,6 +166,7 @@ class TestConfigDefaults:
     def test_default_llm_config_persists_full_io(self) -> None:
         assert DEFAULT_CONFIG.llm.persist_full_io is True
         assert DEFAULT_CONFIG.llm.auto_wait_on_empty_tool_calls is False
+        assert DEFAULT_CONFIG.llm.fallback_json_actions is False
         assert DEFAULT_CONFIG.llm.context_window_tokens == 131_072
         assert DEFAULT_CONFIG.llm.max_tokens == 16_384
         assert DEFAULT_CONFIG.llm.max_tokens < DEFAULT_CONFIG.llm.context_window_tokens
@@ -173,6 +175,7 @@ class TestConfigDefaults:
         self,
     ) -> None:
         assert DEFAULT_CONFIG.llm_context.policy == "source_only"
+        assert DEFAULT_CONFIG.llm_context.prompt_event_payload_max_chars == 2_048
         assert DEFAULT_CONFIG.llm_context.storage_compaction_threshold_bytes == 96_000
         assert DEFAULT_CONFIG.llm_context.storage_compaction_max_chunks == 4
         assert DEFAULT_CONFIG.llm_context.storage_compaction_preserve_recent_entries == 0
@@ -204,6 +207,18 @@ class TestConfigDefaults:
                     storage_compaction_threshold_bytes=(
                         DEFAULT_CONFIG.tools.memory_payload_hard_limit_bytes
                     ),
+                ),
+            )
+
+        with pytest.raises(
+            ValueError,
+            match="prompt_event_payload_max_chars must be at least 512",
+        ):
+            replace(
+                DEFAULT_CONFIG,
+                llm_context=replace(
+                    DEFAULT_CONFIG.llm_context,
+                    prompt_event_payload_max_chars=511,
                 ),
             )
 
@@ -465,6 +480,7 @@ class TestConfigDefaults:
                     '  responses_previous_response_id: true',
                     '  parallel_tool_calls: true',
                     '  auto_wait_on_empty_tool_calls: true',
+                    '  fallback_json_actions: true',
                     '  persist_full_io: false',
                     '  profiles:',
                     '    default:',
@@ -472,6 +488,7 @@ class TestConfigDefaults:
                     '      safety_identifier_env: OPENAI_SAFE_ID',
                     '      parallel_tool_calls: false',
                     '      auto_wait_on_empty_tool_calls: false',
+                    '      fallback_json_actions: false',
                 ]
             ),
             encoding='utf-8',
@@ -485,11 +502,42 @@ class TestConfigDefaults:
         assert config.llm.responses_previous_response_id is True
         assert config.llm.parallel_tool_calls is True
         assert config.llm.auto_wait_on_empty_tool_calls is True
+        assert config.llm.fallback_json_actions is True
         assert config.llm.persist_full_io is False
         assert config.llm.profiles['default'].model == 'gpt-test'
         assert config.llm.profiles['default'].safety_identifier_env == 'OPENAI_SAFE_ID'
         assert config.llm.profiles['default'].parallel_tool_calls is False
         assert config.llm.profiles['default'].auto_wait_on_empty_tool_calls is False
+        assert config.llm.profiles['default'].fallback_json_actions is False
+
+    def test_load_config_file_normalizes_legacy_prompt_cache_retention(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / 'legacy-prompt-cache-retention.yaml'
+        path.write_text(
+            '\n'.join(
+                [
+                    'llm:',
+                    '  prompt_cache_retention: in-memory',
+                    '  profiles:',
+                    '    default:',
+                    '      prompt_cache_retention: in-memory',
+                ]
+            ),
+            encoding='utf-8',
+        )
+
+        config = load_config_file(path)
+        serialized = asdict(config)
+
+        assert config.llm.prompt_cache_retention == 'in_memory'
+        assert config.llm.profiles['default'].prompt_cache_retention == 'in_memory'
+        assert serialized['llm']['prompt_cache_retention'] == 'in_memory'
+        assert (
+            serialized['llm']['profiles']['default']['prompt_cache_retention']
+            == 'in_memory'
+        )
 
     def test_load_config_file_rejects_invalid_yaml_shape(self, tmp_path: Path) -> None:
         path = tmp_path / 'config.yaml'
@@ -630,6 +678,25 @@ class TestConfigDefaults:
         bad_auto_wait.write_text('llm:\n  auto_wait_on_empty_tool_calls: []\n', encoding='utf-8')
         with pytest.raises(PydanticValidationError, match='auto_wait_on_empty_tool_calls'):
             load_config_file(bad_auto_wait)
+
+        bad_json_fallback = tmp_path / 'bad-json-fallback.yaml'
+        bad_json_fallback.write_text(
+            'llm:\n  fallback_json_actions: []\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(PydanticValidationError, match='fallback_json_actions'):
+            load_config_file(bad_json_fallback)
+
+        bad_tool_output_prompt_limit = tmp_path / 'bad-tool-output-prompt-limit.yaml'
+        bad_tool_output_prompt_limit.write_text(
+            'llm:\n  tool_output_prompt_max_chars: 0\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(
+            PydanticValidationError,
+            match='tool_output_prompt_max_chars',
+        ):
+            load_config_file(bad_tool_output_prompt_limit)
 
     def test_llm_profiles_validate_default_profile_reference(self) -> None:
         config = AgentLibOSConfig(

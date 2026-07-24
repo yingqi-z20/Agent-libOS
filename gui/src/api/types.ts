@@ -276,10 +276,11 @@ export type LLMProfileSummary = {
   reasoning_effort: string | null;
   verbosity: "low" | "medium" | "high" | null;
   safety_identifier_env: string | null;
-  prompt_cache_retention: "in-memory" | "24h" | null;
+  prompt_cache_retention: "in_memory" | "24h" | null;
   responses_previous_response_id: boolean | null;
   parallel_tool_calls: boolean | null;
   auto_wait_on_empty_tool_calls: boolean | null;
+  fallback_json_actions: boolean | null;
   temperature: number | null;
   max_tokens: number | null;
   context_window_tokens: number | null;
@@ -301,10 +302,11 @@ export type LLMProfileInput = {
   reasoning_effort?: string | null;
   verbosity?: "low" | "medium" | "high" | null;
   safety_identifier_env?: string | null;
-  prompt_cache_retention?: "in-memory" | "24h" | null;
+  prompt_cache_retention?: "in_memory" | "24h" | null;
   responses_previous_response_id?: boolean | null;
   parallel_tool_calls?: boolean | null;
   auto_wait_on_empty_tool_calls?: boolean | null;
+  fallback_json_actions?: boolean | null;
   temperature?: number | null;
   max_tokens?: number | null;
   context_window_tokens?: number | null;

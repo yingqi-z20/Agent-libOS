@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import replace
 import pytest
 import json
 import asyncio
@@ -7,6 +8,7 @@ import threading
 import time
 from typing import Any
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
     CapabilityRight,
@@ -267,6 +269,115 @@ class TestProcessMessage:
             assert result.ok, result.error
             assert len(result.payload['messages']) == count
             assert len(result.payload['acked_message_ids']) == count
+            assert runtime.messages.unread(pid) == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'tool_name',
+        ['read_process_messages', 'receive_process_messages'],
+    )
+    def test_process_message_tool_only_acks_the_budgeted_model_page(
+        self,
+        tool_name: str,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            tools=replace(
+                DEFAULT_CONFIG.tools,
+                tool_result_payload_hard_limit_bytes=30_000,
+            ),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='read a bounded mailbox page')
+            posted = [
+                runtime.messages.post(
+                    sender='test',
+                    recipient_pid=pid,
+                    kind=ProcessMessageKind.INTERRUPT if index == 0 else ProcessMessageKind.NORMAL,
+                    channel='control',
+                    correlation_id='job-1',
+                    subject=f'bounded-{index}',
+                    body=f'body-{index}-' + ('x' * 9_000),
+                    payload={'index': index},
+                    metadata={'durable_only': f'evidence-{index}'},
+                )
+                for index in range(4)
+            ]
+
+            args: dict[str, Any] = {'limit': len(posted)}
+            if tool_name == 'receive_process_messages':
+                args['block'] = False
+            result = runtime.tools.call(pid, tool_name, args)
+
+            assert result.ok, result.error
+            assert 'result_omitted' not in result.payload
+            returned_ids = [message['message_id'] for message in result.payload['messages']]
+            assert 0 < len(returned_ids) < len(posted)
+            assert result.payload['has_more'] is True
+            assert result.payload['omitted_count'] == len(posted) - len(returned_ids)
+            assert result.payload['acked_message_ids'] == returned_ids
+            assert result.payload['continuation']['tool'] == tool_name
+            assert result.payload['continuation']['same_filters'] is True
+            assert 'remaining_message_ids' not in result.payload
+
+            projected = result.payload['messages'][0]
+            assert projected['kind'] == 'interrupt'
+            assert projected['channel'] == 'control'
+            assert projected['correlation_id'] == 'job-1'
+            assert projected['body'].startswith('body-0-')
+            assert projected['payload'] == {'index': 0}
+            assert 'recipient_pid' not in projected
+            assert 'created_at' not in projected
+            assert 'acked_at' not in projected
+            assert 'metadata' not in projected
+
+            persisted_statuses = {
+                message.message_id: runtime.store.get_process_message(message.message_id).status.value
+                for message in posted
+            }
+            remaining_ids = [
+                message.message_id
+                for message in posted
+                if message.message_id not in returned_ids
+            ]
+            assert all(persisted_statuses[message_id] == 'acked' for message_id in returned_ids)
+            assert all(persisted_statuses[message_id] == 'unread' for message_id in remaining_ids)
+            serialized_page = json.dumps(result.payload, sort_keys=True)
+            assert all(message_id not in serialized_page for message_id in remaining_ids)
+            # Projection does not mutate or replace the durable mailbox record.
+            durable = runtime.store.get_process_message(posted[0].message_id)
+            assert durable is not None
+            assert durable.recipient_pid == pid
+            assert durable.created_at
+            assert durable.metadata['durable_only'] == 'evidence-0'
+            assert len(durable.body) > 9_000
+
+            result_object = runtime.store.get_object(result.result_handle.oid)
+            assert result_object is not None
+            assert result_object.payload.get('content', '') == ''
+            durable_result = result_object.payload['result']
+            assert durable_result['messages'][0]['message_id'] == returned_ids[0]
+            assert durable_result['messages'][0]['recipient_pid'] == pid
+            assert durable_result['messages'][0]['created_at']
+            assert 'recipient_pid' not in result.payload['messages'][0]
+            assert result_object.payload['metadata'].get('result_omitted') is not True
+
+            acknowledged = set(returned_ids)
+            page = result
+            while page.payload['has_more']:
+                next_args: dict[str, Any] = {'limit': len(posted)}
+                if tool_name == 'receive_process_messages':
+                    next_args['block'] = False
+                page = runtime.tools.call(pid, tool_name, next_args)
+                assert page.ok, page.error
+                page_ids = [message['message_id'] for message in page.payload['messages']]
+                assert page_ids
+                assert 'result_omitted' not in page.payload
+                acknowledged.update(page_ids)
+
+            assert acknowledged == {message.message_id for message in posted}
             assert runtime.messages.unread(pid) == []
         finally:
             runtime.close()
@@ -818,7 +929,7 @@ class TestProcessMessage:
             }
             activation_prompt = client.user_prompts[1]
             assert message.body not in activation_prompt
-            assert message.message_id in activation_prompt
+            assert message.message_id not in activation_prompt
             directive = activation_prompt.rsplit(
                 'Pending explicit process input (mandatory control action):',
                 maxsplit=1,

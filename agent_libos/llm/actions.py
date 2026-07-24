@@ -8,6 +8,7 @@ from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.models import ResourceUsage, ToolCallResult
 from agent_libos.models.exceptions import ResourceLimitExceeded
 from agent_libos.storage.repositories import ProcessRepository
+from agent_libos.tools.base import model_safe_tool_error_message
 
 
 _AUTO_WAIT_MESSAGE_TOOL = "receive_process_messages"
@@ -42,27 +43,41 @@ class LLMActionService:
         *,
         parallel_tool_calls: bool,
         auto_wait_on_empty_tool_calls: bool,
+        fallback_json_actions: bool = False,
     ) -> tuple[list[dict[str, Any]], bool]:
         if not parallel_tool_calls:
-            if not tool_calls and auto_wait_on_empty_tool_calls:
+            if not tool_calls:
+                if fallback_json_actions:
+                    try:
+                        return [parse_json_action(content)], False
+                    except Exception:
+                        pass
+                if auto_wait_on_empty_tool_calls:
+                    return [auto_wait_message_action()], True
+            return [
+                self._single_action(
+                    content,
+                    tool_calls,
+                    fallback_json_actions=fallback_json_actions,
+                )
+            ], False
+        if not tool_calls:
+            if fallback_json_actions:
                 try:
                     return [parse_json_action(content)], False
                 except Exception:
-                    return [auto_wait_message_action()], True
-            return [self._single_action(content, tool_calls)], False
-        if not tool_calls:
-            try:
-                return [parse_json_action(content)], False
-            except Exception:
-                if auto_wait_on_empty_tool_calls:
-                    return [auto_wait_message_action()], True
-                raise
+                    pass
+            if auto_wait_on_empty_tool_calls:
+                return [auto_wait_message_action()], True
+            raise ValueError("no native tool calls found in model response")
         return self._parallel_actions(tool_calls), False
 
     def _single_action(
         self,
         content: str,
         tool_calls: list[dict[str, Any]],
+        *,
+        fallback_json_actions: bool,
     ) -> dict[str, Any]:
         errors: list[str] = []
         for tool_call in reversed(tool_calls):
@@ -70,15 +85,16 @@ class LLMActionService:
                 return tool_call_to_action(tool_call)
             except Exception as exc:
                 errors.append(str(exc))
-        try:
-            return parse_json_action(content)
-        except Exception as exc:
-            detail = f"; invalid tool calls: {errors}" if errors else ""
-            preview = content[: self._content_preview_chars]
-            raise ValueError(
-                f"no valid tool call or fallback JSON action found: {exc}{detail}; "
-                f"content preview: {preview!r}"
-            ) from exc
+        if fallback_json_actions:
+            try:
+                return parse_json_action(content)
+            except Exception as exc:
+                errors.append(f"fallback JSON: {exc}")
+        detail = f"; validation errors: {errors}" if errors else ""
+        preview = content[: self._content_preview_chars]
+        raise ValueError(
+            f"no valid native tool call found{detail}; content preview: {preview!r}"
+        )
 
     @staticmethod
     def _parallel_actions(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -221,13 +237,25 @@ class LLMActionService:
             "tool_id": result.tool_id,
             "result_oid": result.result_handle.oid if result.result_handle else None,
             "payload": result.payload,
-            "error": result.error,
+            "error": _model_facing_error(result),
             "message_notice": notice,
         }
 
 
 def auto_wait_message_action() -> dict[str, Any]:
     return {"action": _AUTO_WAIT_MESSAGE_TOOL}
+
+
+def _model_facing_error(result: ToolCallResult) -> str | None:
+    if result.ok or result.error is None:
+        return None
+    if isinstance(result.payload, dict):
+        error = result.payload.get("error")
+        if isinstance(error, dict):
+            safe_message = error.get("safe_message")
+            if isinstance(safe_message, str) and safe_message:
+                return safe_message
+    return model_safe_tool_error_message(result.error)
 
 
 def _is_completion_review_result(name: str, result: ToolCallResult) -> bool:

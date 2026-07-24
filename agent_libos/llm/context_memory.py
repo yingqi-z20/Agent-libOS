@@ -9,6 +9,7 @@ from typing import Any, TYPE_CHECKING
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.llm.context_management import context_management_policy
+from agent_libos.llm.event_projection import project_prompt_events
 from agent_libos.memory.object_memory import ObjectVersionConflict
 from agent_libos.models.exceptions import NotFound, ResourceLimitExceeded, ValidationError
 from agent_libos.utils.ids import estimate_tokens, new_id, utc_now
@@ -50,6 +51,21 @@ _LLM_CONTEXT_DEFAULTS = DEFAULT_CONFIG.llm_context
 LLM_CONTEXT_ENRICHMENT_RESOURCE = "context:enrichment"
 LLM_CONTEXT_MAINTENANCE_RESOURCE = "context:maintenance"
 LLM_CONTEXT_OBJECT_POLICY = "llm_context_object"
+_EVIDENCE_TIMESTAMP_ENTRY_KINDS = frozenset(
+    {
+        "process_started",
+        "process_snapshot",
+        "process_delta",
+        "capabilities_snapshot",
+        "capabilities_delta",
+        "tool_table_snapshot",
+        "tool_table_delta",
+        "events_delta",
+        "memory_delta",
+        "context_omissions",
+        "context_compacted",
+    }
+)
 
 
 class LLMContextStoragePressure(Exception):
@@ -544,7 +560,7 @@ class LLMContextMemory:
         for entry in payload.get("entries", []):
             lines.append("")
             lines.append("---")
-            lines.append(_stable_json(entry))
+            lines.append(_stable_json(_model_facing_entry(entry)))
         return "\n".join(lines).rstrip()
 
     def replace_with_compacted_summary(
@@ -862,17 +878,7 @@ class LLMContextMemory:
             snapshot_field="capabilities",
             removed_field="removed_capability_ids",
         ) or changed
-        changed = self._append_signature_change(
-            captured,
-            entries,
-            captured_key="tool_signature",
-            current_signature=_tool_signature(tools),
-            signature_key="name",
-            delta_kind="tool_table_delta",
-            snapshot_kind="tool_table_snapshot",
-            snapshot_field="tools",
-            removed_field="removed_tool_names",
-        ) or changed
+        changed = self._append_tool_delta(captured, entries, tools) or changed
         changed = self._append_event_delta(captured, entries, process, events) or changed
         changed = self._append_memory_delta(captured, entries, source_context) or changed
         return changed
@@ -889,15 +895,71 @@ class LLMContextMemory:
             "status_message": process.status_message,
             "wait_state": process_wait_state_to_mapping(process.wait_state),
             "outcome": process_outcome_to_mapping(process.outcome),
-            "state_generation": process.state_generation,
             "checkpoint_head": process.checkpoint_head,
             "image_id": image.image_id,
             "working_directory": process.working_directory,
         }
-        if captured.get("process_signature") == process_signature:
+        previous_signature = captured.get("process_signature")
+        if previous_signature == process_signature:
             return False
-        entries.append({"kind": "process_snapshot", "at": utc_now(), **process_signature})
+        if isinstance(previous_signature, dict):
+            changed_fields = {
+                key: deepcopy(value)
+                for key, value in process_signature.items()
+                if previous_signature.get(key) != value
+            }
+            if not changed_fields:
+                # Older payloads can carry fencing-only fields such as
+                # ``state_generation``.  Normalize the durable signature
+                # without manufacturing a model-visible process change.
+                captured["process_signature"] = process_signature
+                return True
+            entries.append(
+                {
+                    "kind": "process_delta",
+                    "at": utc_now(),
+                    "changed": changed_fields,
+                }
+            )
+        else:
+            entries.append({"kind": "process_snapshot", "at": utc_now(), **process_signature})
         captured["process_signature"] = process_signature
+        return True
+
+    @staticmethod
+    def _append_tool_delta(
+        captured: dict[str, Any],
+        entries: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> bool:
+        """Record only tool identities; native tool schemas travel out of band."""
+
+        current_signature = _tool_signature(tools)
+        previous_signature = captured.get("tool_signature")
+        if previous_signature == current_signature:
+            return False
+        if isinstance(previous_signature, list):
+            upserted, removed = _signature_delta(
+                previous_signature,
+                current_signature,
+                key="name",
+            )
+            entry = {
+                "kind": "tool_table_delta",
+                "at": utc_now(),
+                "upserted": upserted,
+                "removed_tool_names": removed,
+                "tool_count": len(current_signature),
+            }
+        else:
+            entry = {
+                "kind": "tool_table_snapshot",
+                "at": utc_now(),
+                "tools": current_signature,
+                "tool_count": len(current_signature),
+            }
+        entries.append(entry)
+        captured["tool_signature"] = current_signature
         return True
 
     @staticmethod
@@ -953,19 +1015,21 @@ class LLMContextMemory:
         new_events = [event for event in events if event.event_id not in captured_events]
         if not new_events:
             return False
-        projected_events, omitted_counts, resource_usage_delta = _project_prompt_events(
+        projection = project_prompt_events(
             new_events,
             context_object_name=self.object_name(process.pid),
+            payload_max_chars=self._config.llm_context.prompt_event_payload_max_chars,
         )
         event_entry: dict[str, Any] = {
             "kind": "events_delta",
             "at": utc_now(),
-            "events": projected_events,
+            "events": projection.visible_records,
+            "projection_summary": projection.summary,
         }
-        if omitted_counts:
-            event_entry["omitted_evidence_event_counts"] = omitted_counts
-        if resource_usage_delta:
-            event_entry["resource_usage_delta"] = resource_usage_delta
+        if projection.omitted_counts:
+            event_entry["omitted_evidence_event_counts"] = projection.omitted_counts
+        if projection.resource_usage_delta:
+            event_entry["resource_usage_delta"] = projection.resource_usage_delta
         entries.append(event_entry)
         captured["event_ids"] = sorted(captured_events | {event.event_id for event in new_events})
         return True
@@ -1107,7 +1171,8 @@ class LLMContextMemory:
             "version": obj.version,
             "title": obj.metadata.title,
             "summary": obj.metadata.summary,
-            "payload": obj.payload,
+            "payload": self._memory.prompt_payload(obj),
+            "transform": self._memory.prompt_transform(obj),
         }
 
     def _object_signature(self, oid: str) -> dict[str, Any]:
@@ -1204,13 +1269,19 @@ def _tool_signature(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         name = str(spec.get("name") or tool.get("name") or "")
         if not name:
             continue
+        input_schema = spec.get("input_schema", {})
+        schema_json = json.dumps(
+            input_schema,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
         result.append(
             {
                 "name": name,
-                "description": spec.get("description", ""),
-                "tags": spec.get("tags", []),
-                "policy": spec.get("policy", {}),
-                "input_schema": spec.get("input_schema", {}),
+                "version": str(spec.get("version") or ""),
+                "schema_sha256": hashlib.sha256(schema_json.encode("utf-8")).hexdigest(),
             }
         )
     return sorted(result, key=lambda item: item["name"])
@@ -1276,70 +1347,6 @@ def _signature_delta(
     return upserted, removed
 
 
-def _project_prompt_events(
-    events: list[Event],
-    *,
-    context_object_name: str,
-) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int | float]]:
-    """Keep actionable event evidence while compacting repetitive bookkeeping."""
-
-    projected: list[dict[str, Any]] = []
-    omitted_counts: dict[str, int] = {}
-    resource_usage_delta: dict[str, int | float] = {}
-
-    def omit(kind: str) -> None:
-        omitted_counts[kind] = omitted_counts.get(kind, 0) + 1
-
-    for event in events:
-        if event.type == EventType.RESOURCE_CHARGED:
-            omit(event.type.value)
-            usage = event.payload.get("usage")
-            if isinstance(usage, dict):
-                for name, value in usage.items():
-                    if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        resource_usage_delta[str(name)] = resource_usage_delta.get(str(name), 0) + value
-            continue
-
-        if (
-            event.type in {EventType.OBJECT_CREATED, EventType.OBJECT_UPDATED}
-            and event.payload.get("name") == context_object_name
-        ):
-            omit(f"llm_context_{event.type.value}")
-            continue
-
-        payload = deepcopy(event.payload)
-        if event.type == EventType.DATA_FLOW_DECISION:
-            if payload.get("outcome") == "allow":
-                omit("allowed_data_flow_decision")
-                continue
-            payload = {
-                key: payload[key]
-                for key in (
-                    "decision_id",
-                    "direction",
-                    "outcome",
-                    "reason",
-                    "sink",
-                    "labels",
-                    "trust_id",
-                    "release_capability_id",
-                )
-                if key in payload
-            }
-
-        projected.append(
-            {
-                "event_id": event.event_id,
-                "type": event.type.value,
-                "source": event.source,
-                "target": event.target,
-                "payload": payload,
-            }
-        )
-
-    return projected, dict(sorted(omitted_counts.items())), dict(sorted(resource_usage_delta.items()))
-
-
 def _captured_object_signatures(captured: dict[str, Any]) -> dict[str, dict[str, Any]]:
     objects = captured.get("objects")
     if isinstance(objects, dict):
@@ -1349,3 +1356,14 @@ def _captured_object_signatures(captured: dict[str, Any]) -> dict[str, dict[str,
 
 def _stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, default=str)
+
+
+def _model_facing_entry(entry: Any) -> Any:
+    """Drop evidence-only envelope fields from an append-only prompt entry."""
+
+    if not isinstance(entry, dict):
+        return entry
+    projected = deepcopy(entry)
+    if projected.get("kind") in _EVIDENCE_TIMESTAMP_ENTRY_KINDS:
+        projected.pop("at", None)
+    return projected

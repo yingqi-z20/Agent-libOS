@@ -59,7 +59,12 @@ from agent_libos.substrate import (
 )
 from agent_libos.tools.base import (
     ToolContext,
+    ToolErrorCode,
+    ToolResult,
     attach_wait_data_flow_context,
+    bounded_failure_model_projection,
+    model_safe_tool_error_message,
+    tool_result_content_duplicates_data,
     wait_data_flow_context,
 )
 from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
@@ -112,6 +117,11 @@ class _InvocationOutput:
     result_payload: dict[str, Any]
     jit_session: JITSyscallSession | None = None
     result_was_omitted: bool = False
+    ok: bool = True
+    error: str | None = None
+    host_error: str | None = None
+    policy_decision: str = "allow"
+    structured_failure: bool = False
 
 
 class ToolExecutionService:
@@ -272,17 +282,15 @@ class ToolExecutionService:
             self._record_wait(prepared, exc, started_at)
             raise
         except ValueError as exc:
-            return self._invocation_error_result(
+            output = self._invocation_error_output(
                 prepared,
                 exc,
-                started_at,
                 policy_decision="validation_error",
             )
         except Exception as exc:
-            return self._invocation_error_result(
+            output = self._invocation_error_output(
                 prepared,
                 exc,
-                started_at,
                 policy_decision="allow",
             )
 
@@ -291,6 +299,8 @@ class ToolExecutionService:
         bounded = self._bound_result(prepared, output, started_at)
         if isinstance(bounded, ToolCallResult):
             return bounded
+        if not bounded.ok:
+            return self._persist_failure(prepared, bounded, started_at)
         try:
             return await self._persist_success(prepared, bounded, started_at)
         except ProcessRevisionConflict as exc:
@@ -418,13 +428,19 @@ class ToolExecutionService:
             target=resource,
             decision=decision,
         )
+        projection = self._failure_model_projection(
+            code=ToolErrorCode.PERMISSION_DENIED,
+            error_type="PolicyDenied",
+            message=error,
+            details={"code": reason},
+        )
         return ToolCallResult(
             call_id=call_id,
             tool_id=tool_id,
             result_handle=None,
-            payload=None,
+            payload=projection,
             ok=False,
-            error=error,
+            error=self._projection_safe_message(projection, fallback=error),
         )
 
     def _preflight_error_result(
@@ -458,13 +474,27 @@ class ToolExecutionService:
                 "error": error,
             },
         )
+        projection = self._failure_model_projection(
+            code=(
+                ToolErrorCode.VALIDATION_ERROR
+                if policy_decision == "validation_error"
+                else ToolErrorCode.EXECUTION_ERROR
+            ),
+            error_type=(
+                "ValidationError"
+                if policy_decision == "validation_error"
+                else "ResourceLimitExceeded"
+            ),
+            message=error,
+            details={"code": policy_decision},
+        )
         return ToolCallResult(
             call_id=call_id,
             tool_id=handle.tool_id,
             result_handle=None,
-            payload=None,
+            payload=projection,
             ok=False,
-            error=error,
+            error=self._projection_safe_message(projection, fallback=error),
         )
 
     async def _invoke(
@@ -483,20 +513,30 @@ class ToolExecutionService:
             tool_result.metadata = tool_metadata
             if not tool_result.ok:
                 return self._structured_failure(invocation, tool_result, started_at)
-            payload = tool_result.data
+            payload = tool_result.model_projection(
+                limit_bytes=self._tool_result_persistence_limit()
+            )
+            result_payload: dict[str, Any] = {
+                "tool_id": invocation.handle.tool_id,
+                "tool_name": invocation.handle.name,
+                "result": tool_result.data,
+                "artifacts": [
+                    artifact.model_dump(mode="json")
+                    for artifact in tool_result.artifacts
+                ],
+                "metadata": tool_metadata,
+            }
+            if (
+                tool_result.content
+                and not tool_result_content_duplicates_data(
+                    tool_result.content,
+                    tool_result.data,
+                )
+            ):
+                result_payload["content"] = tool_result.content
             return _InvocationOutput(
                 payload=payload,
-                result_payload={
-                    "tool_id": invocation.handle.tool_id,
-                    "tool_name": invocation.handle.name,
-                    "result": payload,
-                    "content": tool_result.content,
-                    "artifacts": [
-                        artifact.model_dump(mode="json")
-                        for artifact in tool_result.artifacts
-                    ],
-                    "metadata": tool_metadata,
-                },
+                result_payload=result_payload,
             )
         if not self._registry.is_jit(invocation.handle.tool_id):
             raise NotFound(
@@ -568,46 +608,22 @@ class ToolExecutionService:
     def _structured_failure(
         self,
         invocation: _Invocation,
-        tool_result: Any,
+        tool_result: ToolResult,
         started_at: float,
-    ) -> ToolCallResult:
+    ) -> _InvocationOutput:
         error = tool_result.error.message if tool_result.error else tool_result.content
         payload = tool_result.model_dump(mode="json")
-        result_handle = self._persist_labeled_tool_failure(
-            invocation,
-            payload=payload,
+        projection = tool_result.model_projection(
+            limit_bytes=self._tool_result_persistence_limit()
         )
-        self._events.emit(
-            EventType.TOOL_FAILED,
-            source=invocation.resource,
-            target=invocation.pid,
-            payload={
-                "call_id": invocation.call_id,
-                "error": error,
-                "result_oid": result_handle.oid if result_handle else None,
-                "tool_result": sanitize_for_observability(payload),
-            },
-        )
-        self._audit.record(
-            actor=invocation.pid,
-            action="tool.call",
-            target=invocation.resource,
-            output_refs=[result_handle.oid] if result_handle else [],
-            decision={
-                "ok": False,
-                "tool": invocation.handle.name,
-                "policy_decision": "allow",
-                "tool_result": sanitize_for_observability(payload),
-                "tool_wall_seconds": self._elapsed(started_at),
-            },
-        )
-        return ToolCallResult(
-            call_id=invocation.call_id,
-            tool_id=invocation.handle.tool_id,
-            result_handle=result_handle,
-            payload=payload,
+        safe_message = self._projection_safe_message(projection, fallback=error)
+        return _InvocationOutput(
+            payload=projection,
+            result_payload=payload,
             ok=False,
-            error=error,
+            error=safe_message,
+            policy_decision="allow",
+            structured_failure=True,
         )
 
     def _subprocess_limit_result(
@@ -621,13 +637,19 @@ class ToolExecutionService:
             error=exc,
             policy_decision="resource_limit",
         )
+        projection = self._failure_model_projection(
+            code=ToolErrorCode.EXECUTION_ERROR,
+            error_type=type(exc).__name__,
+            message=str(exc),
+            details={"code": "resource_limit"},
+        )
         return ToolCallResult(
             call_id=invocation.call_id,
             tool_id=invocation.handle.tool_id,
             result_handle=result_handle,
-            payload=None,
+            payload=projection,
             ok=False,
-            error=str(exc),
+            error=self._projection_safe_message(projection, fallback=str(exc)),
         )
 
     def _subprocess_timeout_result(
@@ -642,13 +664,20 @@ class ToolExecutionService:
             policy_decision="timeout",
             message=error,
         )
+        projection = self._failure_model_projection(
+            code=ToolErrorCode.TIMEOUT,
+            error_type=type(exc).__name__,
+            message=error,
+            retryable=True,
+            details={"code": "timeout"},
+        )
         return ToolCallResult(
             call_id=invocation.call_id,
             tool_id=invocation.handle.tool_id,
             result_handle=result_handle,
-            payload=None,
+            payload=projection,
             ok=False,
-            error=error,
+            error=self._projection_safe_message(projection, fallback=error),
         )
 
     def _record_wait(
@@ -689,6 +718,57 @@ class ToolExecutionService:
             },
         )
 
+    def _invocation_error_output(
+        self,
+        invocation: _Invocation,
+        exc: Exception,
+        *,
+        policy_decision: str,
+    ) -> _InvocationOutput:
+        error = public_exception_message(exc)
+        public_error = provider_error_envelope(exc)
+        error_payload: dict[str, Any] = {
+            "type": (
+                public_error["error_type"]
+                if public_error is not None
+                else type(exc).__name__
+            ),
+            "message": error,
+        }
+        if public_error is not None:
+            error_payload.update(
+                {
+                    key: public_error[key]
+                    for key in ("code", "error_type", "correlation_id")
+                }
+            )
+        durable_payload = {
+            "ok": False,
+            "error": error_payload,
+            "policy_decision": policy_decision,
+        }
+        projection = bounded_failure_model_projection(
+            code=(
+                ToolErrorCode.VALIDATION_ERROR.value
+                if policy_decision == "validation_error"
+                else ToolErrorCode.EXECUTION_ERROR.value
+            ),
+            error_type=str(error_payload["type"]),
+            message=error,
+            retryable=False,
+            details=public_error,
+            metadata={"data_flow_context": self._data_flow.current_context()},
+            limit_bytes=self._tool_result_persistence_limit(),
+        )
+        return _InvocationOutput(
+            payload=projection,
+            result_payload=durable_payload,
+            ok=False,
+            error=self._projection_safe_message(projection, fallback=error),
+            host_error=self._bounded_host_error(error),
+            policy_decision=policy_decision,
+        )
+
     def _invocation_error_result(
         self,
         invocation: _Invocation,
@@ -697,46 +777,76 @@ class ToolExecutionService:
         *,
         policy_decision: str,
     ) -> ToolCallResult:
-        error = public_exception_message(exc)
-        observed = self._error_observation(error)
-        result_handle = self._persist_exception_tool_failure(
+        output = self._invocation_error_output(
             invocation,
-            error=exc,
+            exc,
             policy_decision=policy_decision,
         )
+        bounded = self._bound_result(invocation, output, started_at)
+        if isinstance(bounded, ToolCallResult):
+            return bounded
+        return self._persist_failure(invocation, bounded, started_at)
+
+    def _persist_failure(
+        self,
+        invocation: _Invocation,
+        output: _InvocationOutput,
+        started_at: float,
+    ) -> ToolCallResult:
+        result_handle = self._persist_labeled_tool_failure(
+            invocation,
+            payload=output.result_payload,
+        )
+        durable_error = output.result_payload.get("error")
+        evidence_message = (
+            durable_error.get("message")
+            if isinstance(durable_error, dict)
+            and isinstance(durable_error.get("message"), str)
+            else output.error or "Tool execution failed."
+        )
+        observed = self._error_observation(evidence_message)
         event_payload: dict[str, Any] = {
             "call_id": invocation.call_id,
             "error": observed,
             "result_oid": result_handle.oid if result_handle else None,
         }
-        if policy_decision == "validation_error":
-            event_payload["policy_decision"] = policy_decision
+        if output.policy_decision != "allow":
+            event_payload["policy_decision"] = output.policy_decision
+        if output.structured_failure:
+            event_payload["tool_result"] = sanitize_for_observability(
+                output.result_payload
+            )
         self._events.emit(
             EventType.TOOL_FAILED,
             source=invocation.resource,
             target=invocation.pid,
             payload=event_payload,
         )
+        decision: dict[str, Any] = {
+            "ok": False,
+            "tool": invocation.handle.name,
+            "policy_decision": output.policy_decision,
+            "error": observed,
+            "tool_wall_seconds": self._elapsed(started_at),
+        }
+        if output.structured_failure:
+            decision["tool_result"] = sanitize_for_observability(
+                output.result_payload
+            )
         self._audit.record(
             actor=invocation.pid,
             action="tool.call",
             target=invocation.resource,
             output_refs=[result_handle.oid] if result_handle else [],
-            decision={
-                "ok": False,
-                "tool": invocation.handle.name,
-                "policy_decision": policy_decision,
-                "error": observed,
-                "tool_wall_seconds": self._elapsed(started_at),
-            },
+            decision=decision,
         )
         return ToolCallResult(
             call_id=invocation.call_id,
             tool_id=invocation.handle.tool_id,
             result_handle=result_handle,
-            payload=None,
+            payload=output.payload,
             ok=False,
-            error=error,
+            error=output.host_error or output.error,
         )
 
     def _bound_result(
@@ -745,11 +855,41 @@ class ToolExecutionService:
         output: _InvocationOutput,
         started_at: float,
     ) -> _InvocationOutput | ToolCallResult:
+        limit = self._tool_result_persistence_limit()
+        if not output.ok:
+            try:
+                ensure_json_size(
+                    output.payload,
+                    limit,
+                    "model-facing tool failure payload",
+                )
+            except ValidationError:
+                output.payload = bounded_failure_model_projection(
+                    code=ToolErrorCode.EXECUTION_ERROR.value,
+                    error_type="ToolError",
+                    message=output.error or "Tool execution failed.",
+                    retryable=False,
+                    details=None,
+                    metadata={
+                        "data_flow_context": self._data_flow.current_context()
+                    },
+                    limit_bytes=limit,
+                )
+            output.error = self._projection_safe_message(
+                output.payload,
+                fallback=output.error or "Tool execution failed.",
+            )
+            return output
         try:
             ensure_json_size(
                 output.result_payload,
-                self._tool_result_persistence_limit(),
+                limit,
                 "tool result payload",
+            )
+            ensure_json_size(
+                output.payload,
+                limit,
+                "model-facing tool result payload",
             )
             return output
         except ValidationError as exc:
@@ -797,13 +937,22 @@ class ToolExecutionService:
                 "tool_wall_seconds": self._elapsed(started_at),
             },
         )
+        projection = bounded_failure_model_projection(
+            code=ToolErrorCode.VALIDATION_ERROR.value,
+            error_type="ValidationError",
+            message=error,
+            retryable=False,
+            details=None,
+            metadata={"data_flow_context": self._data_flow.current_context()},
+            limit_bytes=limit,
+        )
         return ToolCallResult(
             call_id=invocation.call_id,
             tool_id=invocation.handle.tool_id,
             result_handle=None,
-            payload=None,
+            payload=projection,
             ok=False,
-            error=error,
+            error=self._projection_safe_message(projection, fallback=error),
         )
 
     async def _persist_success(
@@ -973,14 +1122,6 @@ class ToolExecutionService:
         started_at: float,
     ) -> ToolCallResult:
         outward_error = "JIT tool failed while applying deferred lifecycle."
-        failure_payload = {
-            "ok": False,
-            "error": {
-                "type": type(error).__name__,
-                "message": outward_error,
-            },
-            "policy_decision": "lifecycle_error",
-        }
         result_handle = self._persist_exception_tool_failure(
             invocation,
             error=error,
@@ -1011,13 +1152,25 @@ class ToolExecutionService:
                 "tool_wall_seconds": self._elapsed(started_at),
             },
         )
+        projection = self._failure_model_projection(
+            code=ToolErrorCode.EXECUTION_ERROR,
+            error_type=type(error).__name__,
+            message=outward_error,
+            details={
+                "code": "lifecycle_error",
+                "policy_decision": "lifecycle_error",
+            },
+        )
         return ToolCallResult(
             call_id=invocation.call_id,
             tool_id=invocation.handle.tool_id,
             result_handle=result_handle,
-            payload=failure_payload,
+            payload=projection,
             ok=False,
-            error=outward_error,
+            error=self._projection_safe_message(
+                projection,
+                fallback=outward_error,
+            ),
         )
 
     def _persist_labeled_tool_failure(
@@ -1045,14 +1198,31 @@ class ToolExecutionService:
                 "tool failure result payload",
             )
         except ValidationError as exc:
+            flow_payload = flow.to_dict()
             carrier_payload = {
                 "tool_id": invocation.handle.tool_id,
                 "tool_name": invocation.handle.name,
                 "ok": False,
                 "failure_omitted": True,
                 "reason": str(exc),
-                "metadata": {"data_flow_context": flow.to_dict()},
+                "metadata": {
+                    "data_flow_context": {
+                        "labels": flow_payload["labels"],
+                        "source_ref_count": len(flow.source_refs),
+                    }
+                },
             }
+            try:
+                ensure_json_size(
+                    carrier_payload,
+                    self._tool_result_persistence_limit(),
+                    "omitted tool failure result payload",
+                )
+            except ValidationError:
+                carrier_payload = {
+                    "ok": False,
+                    "failure_omitted": True,
+                }
         try:
             with self._memory.lifetime_scope(
                 actor=invocation.resource,
@@ -1479,6 +1649,60 @@ class ToolExecutionService:
             self._config.tools.tool_result_payload_hard_limit_bytes,
             self._config.tools.memory_payload_hard_limit_bytes,
         )
+
+    def _failure_model_projection(
+        self,
+        *,
+        code: ToolErrorCode | str,
+        error_type: str,
+        message: str,
+        retryable: bool = False,
+        details: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        return bounded_failure_model_projection(
+            code=code.value if isinstance(code, ToolErrorCode) else str(code),
+            error_type=error_type,
+            message=message,
+            retryable=retryable,
+            details=details,
+            metadata=(
+                metadata
+                if metadata is not None
+                else {"data_flow_context": self._data_flow.current_context()}
+            ),
+            limit_bytes=self._tool_result_persistence_limit(),
+        )
+
+    def _projection_safe_message(self, projection: Any, *, fallback: str) -> str:
+        safe_fallback = model_safe_tool_error_message(
+            fallback,
+            max_chars=self._config.tools.tool_observability_preview_chars,
+        )
+        if isinstance(projection, dict):
+            error = projection.get("error")
+            if isinstance(error, dict):
+                selected = error.get("safe_message")
+                if isinstance(selected, str) and selected:
+                    return (
+                        safe_fallback
+                        if len(safe_fallback) > len(selected)
+                        else selected
+                    )
+        # ``bounded_failure_model_projection`` can only omit its normal schema
+        # for an impossibly small custom carrier.  Keep the outward text short
+        # in that edge case as well.
+        return safe_fallback
+
+    def _bounded_host_error(self, value: str) -> str:
+        """Keep direct-call diagnostics bounded; model dispatch redacts separately."""
+
+        limit = self._config.tools.tool_observability_preview_chars
+        if len(value) <= limit:
+            return value
+        if limit <= 3:
+            return value[:limit]
+        return f"{value[: limit - 3]}..."
 
     def _error_observation(self, text: str) -> dict[str, Any]:
         return sanitize_for_observability(

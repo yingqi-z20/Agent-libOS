@@ -30,11 +30,12 @@ type ProfileFormState = {
   reasoning_effort: string;
   verbosity: "" | "low" | "medium" | "high";
   safety_identifier_env: string;
-  prompt_cache_retention: "" | "in-memory" | "24h";
+  prompt_cache_retention: "" | "in_memory" | "24h";
   responses_previous_response_id: "" | "true" | "false";
   store: "" | "true" | "false";
   parallel_tool_calls: "" | "true" | "false";
   auto_wait_on_empty_tool_calls: "" | "true" | "false";
+  fallback_json_actions: "" | "true" | "false";
   allow_custom_base_url: boolean;
 };
 
@@ -57,6 +58,7 @@ const emptyForm: ProfileFormState = {
   store: "",
   parallel_tool_calls: "",
   auto_wait_on_empty_tool_calls: "",
+  fallback_json_actions: "",
   allow_custom_base_url: false
 };
 
@@ -278,7 +280,7 @@ function LLMProfileManagerDialog({
                 {t("llmProfile.promptCacheRetention")}
                 <select value={form.prompt_cache_retention} onChange={(event) => setForm({ ...form, prompt_cache_retention: event.currentTarget.value as ProfileFormState["prompt_cache_retention"] })}>
                   <option value="">{t("llmProfile.inherit")}</option>
-                  <option value="in-memory">in-memory</option>
+                  <option value="in_memory">in_memory</option>
                   <option value="24h">24h</option>
                 </select>
               </label>
@@ -308,6 +310,7 @@ function LLMProfileManagerDialog({
               <BooleanSelect label={t("llmProfile.previousResponseId")} value={form.responses_previous_response_id} onChange={(responses_previous_response_id) => setForm({ ...form, responses_previous_response_id })} />
               <BooleanSelect label={t("llmProfile.parallelTools")} value={form.parallel_tool_calls} onChange={(parallel_tool_calls) => setForm({ ...form, parallel_tool_calls })} />
               <BooleanSelect label={t("llmProfile.autoWait")} value={form.auto_wait_on_empty_tool_calls} onChange={(auto_wait_on_empty_tool_calls) => setForm({ ...form, auto_wait_on_empty_tool_calls })} />
+              <BooleanSelect label={t("llmProfile.fallbackJsonActions")} value={form.fallback_json_actions} onChange={(fallback_json_actions) => setForm({ ...form, fallback_json_actions })} />
               <label className="toggle">
                 <input type="checkbox" checked={form.allow_custom_base_url} onChange={(event) => setForm({ ...form, allow_custom_base_url: event.currentTarget.checked })} />
                 {t("llmProfile.allowCustomBaseUrl")}
@@ -362,6 +365,7 @@ function formFromProfile(profile: LLMProfileSummary): ProfileFormState {
     store: boolToForm(profile.store),
     parallel_tool_calls: boolToForm(profile.parallel_tool_calls),
     auto_wait_on_empty_tool_calls: boolToForm(profile.auto_wait_on_empty_tool_calls),
+    fallback_json_actions: boolToForm(profile.fallback_json_actions),
     allow_custom_base_url: profile.allow_custom_base_url
   };
 }
@@ -386,6 +390,7 @@ function formToInput(form: ProfileFormState): LLMProfileInput {
     store: formBoolToValue(form.store),
     parallel_tool_calls: formBoolToValue(form.parallel_tool_calls),
     auto_wait_on_empty_tool_calls: formBoolToValue(form.auto_wait_on_empty_tool_calls),
+    fallback_json_actions: formBoolToValue(form.fallback_json_actions),
     allow_custom_base_url: form.allow_custom_base_url
   };
 }
