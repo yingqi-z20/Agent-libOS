@@ -17,7 +17,7 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 - subtree capabilities other than `checkpoint:*` control authority,
 - parent/child resource-budget reservations whose two processes are both in
   the captured subtree,
-- process tool tables,
+- complete callable process tool tables and their separate model projections,
 - JIT candidates and registered process-local JIT tools,
 - compatibility Skill registry rows associated with loaded Skills (never
   applied to the current global Skill registry by restore/fork),
@@ -29,7 +29,8 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
 - image definitions needed by the subtree,
 - embedded boot artifacts needed by those image definitions, for both
   `checkpoint_commit` and `image_package` boot kinds,
-- loaded startup Runtime Module ids and source hashes.
+- loaded startup Runtime Module ids and their lowercase, 64-character SHA-256
+  source digests.
 
 Capabilities whose resource starts with `checkpoint:` control access to a
 checkpoint artifact; they are not reconstructable process state. They are
@@ -77,6 +78,12 @@ Restore itself appends new audit and event records.
 
 Restore and fork require the current Python runtime to have already loaded the
 same startup Runtime Module ids and source hashes captured in the checkpoint.
+Every captured module requirement must contain both fields, duplicate module
+ids are rejected, and a missing or malformed digest fails during strict
+snapshot decoding rather than degrading to an id-only match. The built-in core
+module is fingerprinted from its actual source file. Checkpoints made by an
+older build that recorded a placeholder core digest are intentionally not
+treated as equivalent and must be recreated.
 Checkpoint restore does not import Python modules, change module trust, restore
 global Skill trust rows, replace the global Skill registry, or roll back the
 host module environment. Each restored/forked process continues to use the
@@ -100,11 +107,11 @@ restore provider-side state.
 
 Sink trust is Host-global external policy, not reconstructable subtree state.
 Checkpoint restore neither replaces it nor lowers its active generation. Any
-restored pending LLM action, provider chain, or conditional release is checked
-against the current registry, current Task Authority manifest, and exact source
-versions before use; an old trust record or release cannot authorize a new
-dispatch. File path bindings also remain current because restore cannot rewind
-the external file.
+restored pending LLM action, compatible continuation metadata, or conditional
+release is checked against the current registry, current Task Authority
+manifest, and exact source versions before use; an old trust record or release
+cannot authorize a new dispatch. File path bindings also remain current because
+restore cannot rewind the external file.
 
 Providers classify their successful effects as:
 
@@ -150,6 +157,25 @@ future compensation layer could reason about the effect; restore still does
 not apply external compensation. This contract is independent of the snapshot,
 restore-plan, and image-artifact version numbers described below.
 
+### Diff Scope And Output Bounds
+
+`diff` compares the snapshot and current rows for exactly these reconstructable
+tables: processes, Objects, capabilities, parent/child resource reservations,
+process messages, pending LLM actions, JIT candidates, and compatibility Skill
+rows. It does not claim a field-by-field diff for namespaces, Object links,
+tool rows, payload bodies, images/artifacts, JIT source bodies, Runtime Modules,
+ObjectTasks, human history, or append-only evidence. Inspect the corresponding
+domain when one of those categories matters.
+
+For each compared table, `diff_preview_items` bounds the returned `added`,
+`removed`, and `changed` identity lists; the accompanying counts describe the
+complete comparison. External-effect records are separate: the Python manager,
+CLI, and GUI API materialize and return the complete matching effect set. The
+registered model tool exposes cursor/limit pages, but those pages are
+projections applied after the manager has loaded the set; they are response
+bounding, not storage-query pagination. `diff_preview_items` does not bound the
+external-effect query or its summary.
+
 ## Capability Model
 
 Checkpoint authority uses these resource forms:
@@ -169,9 +195,17 @@ Creating a checkpoint grants the checkpoint owner process `read` on that exact
 new checkpoint. It does not automatically grant `execute` or destructive
 `admin` restore authority.
 
+For exact-id inspect, diff, replay, and checkpoint-to-image reads, the runtime
+first authorizes `read` on `checkpoint:<checkpoint_id>` and, only if that is
+denied, falls back to `read` on the exact owner resource
+`checkpoint:process:<checkpoint-owner-pid>`. The fallback is not a general
+process or checkpoint wildcard. A finite selected grant is reserved for the
+whole operation, restored on failure, and consumed once on success.
+
 ## Public Operations
 
-LLM-facing tools:
+Registered LLM tool interfaces (model-callable only when both bound in the
+complete process table and projected into the model table):
 
 - `create_checkpoint`
 - `list_checkpoints`
@@ -181,10 +215,15 @@ LLM-facing tools:
 - `fork_checkpoint`
 - `commit_checkpoint_to_image` for checkpoint-derived AgentImage commits
 
-The built-in base, coding, and review images expose the low-risk
-create/list/inspect/diff tools; the toolmaker and context-compressor defaults do
-not. Restore and fork tools are registered globally but require explicit tool
-visibility plus checkpoint authority.
+The built-in base, coding, and review static tables bind the low-risk
+create/list/inspect/diff tools, but their initial model projections contain only
+the five Skill bootstrap tools. Coding additionally binds restore/fork and is
+the only shipped Image whose complete table contains all six tools owned by
+`agent-libos-checkpoints`; activating that exact Skill projects the six together.
+Base and review omit restore/fork, so the immutable built-in Skill is hidden and
+cannot partially project their four static bindings. Toolmaker and
+context-compressor bind no checkpoint tools. Global tool registration alone is
+not model visibility, and every invocation still requires checkpoint authority.
 
 Checkpoint inspect process rows expose the snapshot's canonical tagged
 `wait_state` and `outcome` mappings together with `state_generation`. The
@@ -251,17 +290,28 @@ subtree. If the scheduler is actively running a quantum or still has active
 futures, restore is rejected and the caller must retry after the runtime is
 quiescent. Unrelated processes are not restored.
 
-After scheduler quiescence, restore acquires the shared registry lifecycle lock,
-then the Object ownership boundary, then the store mutation lock. It holds the
-ownership/store boundary continuously from the first preflight read through the
-main-state commit, and keeps the registry lock through image/JIT reconciliation.
-That fixed order matches Runtime Module load/unload and prevents registry/store
-lock inversion. Host-side process, capability, Object Memory, mailbox, and
-ObjectTask mutations therefore linearize wholly before or after restore; they
-cannot slip between validation and row replacement. Capability rows are
-filtered inside that boundary against current active/expiry/restrictive policy
-state. A revoke that commits before restore's linearization point wins and is
-not resurrected from the snapshot.
+This means a process cannot synchronously restore itself from its own Tool or
+JIT/syscall invocation: that invocation is part of the active quantum whose
+existence makes restore fail. Self-restore must be initiated later by the Host
+or a trusted broker, after the active quantum and scoped futures have ended.
+Retrying from inside the same quantum cannot succeed and must not be treated as
+an authority failure.
+
+After scheduler quiescence, restore acquires the shared registry lifecycle lock
+and reads and strictly decodes the immutable checkpoint artifact. That initial
+artifact read occurs before the Object ownership and store mutation locks are
+held. Restore then acquires the Object ownership boundary followed by the store
+mutation lock for mutation-dependent preflight, authority revalidation, and the
+main-state commit. It releases those two boundaries after that commit, while
+keeping the registry lock through image/JIT reconciliation. This order matches
+Runtime Module load/unload and prevents registry/store lock inversion.
+Host-side process, capability, Object Memory, mailbox, and ObjectTask mutations
+that use the same ownership/store boundaries therefore cannot slip between the
+mutation-dependent revalidation and row replacement; the earlier read-only
+artifact decode is not part of that atomic section. Capability rows are
+filtered inside the atomic section against current active/expiry/restrictive
+policy state. A revoke that commits before restore's linearization point wins
+and is not resurrected from the snapshot.
 
 Restore has three explicit phases:
 
@@ -476,8 +526,11 @@ the restored row and `resume_token`, so a pre-restore cached generation cannot
 claim or clear it. Restore also assigns every restored process a fresh durable
 LLM context generation inside the main transaction. Provider-side Responses
 state is outside checkpoint rollback and is not rewound by restore, so this
-generation change forces the next LLM request to reset stateless instead of
-chaining to a response made from post-checkpoint local state.
+generation change invalidates any compatible low-level continuation metadata.
+The current full-snapshot AgentProcess executor is already stateless and sends
+no `previous_response_id`; the generation fence prevents a future or alternate
+continuation path from chaining to a response made from post-checkpoint local
+state.
 
 When `llm.persist_full_io=false`, a conditional LLM release row contains only
 hash-bound resume metadata. It can resume only while the matching prepared
@@ -521,9 +574,9 @@ process:
   that process (borrowed roots without captured payloads are excluded),
 - process-local namespace state,
 - loaded Skill records and package rows,
-- visible static tools and process-local JIT tool sources,
+- complete process-bound static tools and process-local JIT tool sources,
 - process cwd and image context settings,
-- model-tool projection mode, default built-in Skills, and loaded Skill
+- model-tool projection mode, the Image default-Skill list, and loaded Skill
   projection/provenance,
 - required startup module summaries.
 
@@ -561,12 +614,17 @@ uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> statef
 uv run agent-libos --db .agent_libos.sqlite spawn --image stateful-agent:v0 --goal "use baked memory"
 ```
 
-The model-visible commit path is the `commit_checkpoint_to_image` tool; the JIT
-syscall path is `image.commit_checkpoint`. Actor-mode commits require `write`
-on the target `image:<image_id>` and read authority on either the checkpoint or
-the checkpointed process. Replacing an existing target image requires `admin`
-instead of `write`. Both finite decisions settle with artifact/manifest/event/
-audit publication, so a failed commit does not burn either one-shot grant.
+The registered model-tool wrapper is `commit_checkpoint_to_image`, owned by the
+`agent-libos-agent-images` Skill, and the JIT syscall path is
+`image.commit_checkpoint`. No shipped built-in Image includes the wrapper in its
+static `default_tools`, so it is not model-visible in a fresh built-in process.
+A custom or committed Image must bind the complete immutable Skill tool set and
+activate that Skill before the model can select it. Actor-mode commits require
+`write` on the target `image:<image_id>` and read authority on either the
+checkpoint or the checkpointed process. Replacing an existing target image
+requires `admin` instead of `write`. Both finite decisions settle with artifact/
+manifest/event/audit publication, so a failed commit does not burn either
+one-shot grant.
 
 ## Fork From Checkpoint
 
@@ -578,12 +636,17 @@ cannot retire the source process's registration. Each forked process starts a
 new concurrency identity with `revision`, `execution_generation`, and
 `state_generation` set to zero and with no copied execution owner or lease.
 
-Executable JIT handles/sources are prepared before publication. The missing
-Image/artifact rows, all fork rows, Object payload cache entries, and any parent
-child-budget reservation/charge then publish in one store transaction. On
-failure the prepared handles and newly introduced images are discarded; the
-scheduler cannot claim a fork root whose process-local JIT assets are only
-partially installed.
+Executable JIT handles/sources are prepared before publication. Fork then uses
+a two-stage store publication while continuously holding the store lock. The
+first transaction publishes missing Image/artifact rows, Object rows, authority,
+parent child-budget accounting, and every non-terminal fork process in a
+durable `created` quarantine state. The runtime next validates every committed
+Object row against the same frozen fork artifact and installs the exact volatile
+payloads. Only then does a second atomic transaction replace the quarantined
+process state with the remapped target state, without advancing the new
+identity's zero revision/generation counters. Terminal snapshot processes are
+already unschedulable and need no activation. The scheduler therefore cannot
+claim a fork with partially installed JIT assets or missing Object payloads.
 
 Fork is non-destructive for the global image registry: it restores only missing
 image definitions, and restores embedded `checkpoint_commit` or `image_package`
@@ -625,7 +688,9 @@ the fork, and finite-use actor authority is consumed only there. A concurrent
 revoke, newly terminal parent, missing image permission, or later transaction
 failure publishes no fork/image/object/process rows and rolls back that
 transaction's one-shot consumption. Only a successful publication spends the
-grant.
+grant. Fork is rejected when invoked inside a caller-owned store transaction;
+a nested savepoint is not a durable publication boundary and can never produce
+a successful fork acknowledgement.
 
 Snapshot capability copying is also revalidated at the publication point, so a
 revoke committed before it wins. Revoked, expired, and finite-use capabilities
@@ -641,13 +706,55 @@ than rollbackable state. Success returns `status: forked` and
 `main_state_committed: true`. If either post-commit sink fails, the fork remains
 published and the result instead uses `status: forked_with_warnings` with
 `post_commit_failures`; retrying it as an uncommitted fork would duplicate the
-subtree.
+subtree. Ordinary `Exception` failures in those sinks are returned this way.
+
+Control-flow interruptions such as `KeyboardInterrupt` and
+`asyncio.CancelledError` are never converted into an ordinary success result.
+When the in-memory commit acknowledgement has not yet been set, the runtime
+checks the unique quarantined fork root in durable storage. Only a confirmed
+absence is treated as pre-commit failure and triggers cleanup of prepared JIT
+handles and newly introduced in-memory image entries. A present root proves the
+first transaction committed. The runtime then reconstructs and validates the
+volatile Object payload cache from the same frozen artifact and atomically
+publishes process target states before acknowledging success. An ordinary
+commit-then-raise error becomes a `forked_with_warnings` result only after both
+checks succeed. A control-flow exception is re-raised with a complete committed
+result attached as its stable
+`checkpoint_fork_receipt` attribute, plus an exception note naming the
+checkpoint and fork root. That receipt has the normal `checkpoint_id`,
+`source_pid`, `fork_root_pid`, identity maps, `main_state_committed: true`,
+status, and failure details. A Python caller interrupted after commit must
+inspect this receipt (and, when needed, the referenced committed root) before
+retrying; a blind retry creates another subtree.
+
+If payload reconstruction or process-state publication fails, the runtime
+keeps the fork unschedulable in quarantine or durably transitions the complete
+fork subtree to `failed` before releasing the store lock. The receipt uses
+`fork_recovery_required` and `reconciliation_pending: true`; the linked
+operation is `unknown`, never a retryable pre-commit failure. A crash that
+leaves the first-stage `created` rows is handled by the existing orphan-created
+startup recovery, which fails those rows before scheduling begins.
+
+If a durable confirmation read also fails, the runtime attempts the same
+whole-subtree terminalization. Only when it cannot confirm either absence or a
+terminal subtree does it retain the prepared assets, persist recovery evidence,
+mark the receipt `fork_outcome_unknown` with `main_state_committed: null`, and
+fence lifecycle mutation admission before releasing the store lock. Callers
+and tools must inspect the bounded structured receipt before any retry.
 
 ## Replay To Event
 
 `replay_to_event` is diagnostic timeline replay. It reports event history from
 a checkpoint to a target event. It does not rerun LLM calls, tools, syscalls, or
-external side effects.
+external side effects. The lower boundary is the exact durable
+`checkpoint_created` event for that checkpoint, not a comparison against the
+checkpoint's wall-clock `created_at`. Replay starts with the checkpoint's
+frozen `subtree_pids` and follows explicit durable parent/child
+`process_created` or `process_forked` events as the timeline advances. It does
+not recompute scope from the current live process tree, so a post-checkpoint
+descendant remains in its historical replay scope even if a later restore
+removes that descendant. Detached checkpoint forks are not inferred to be
+children merely because the checkpoint owner initiated them.
 
 ## Limits
 

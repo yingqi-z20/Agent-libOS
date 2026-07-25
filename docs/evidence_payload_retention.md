@@ -31,10 +31,13 @@ stores an aggregate LLM payload hash. A maintenance pass cannot upgrade a row
 or skip directly from `full` to `hash_only`.
 
 External-effect tier and original payload digest are stored as dedicated
-record-level provenance columns. Provider metadata and receipts never establish
-their own retention tier merely by resembling an internal envelope. New effect
-inserts and provider finalization accept only `full`; the retention CAS is the
-only store operation that can advance those provenance columns.
+record-level provenance columns. At `full`, the digest column is necessarily
+`null`: the first `full -> summary` reduction computes the original canonical
+payload digest and records it alongside the new tier, and later reductions
+preserve it. Provider metadata and receipts never establish their own retention
+tier merely by resembling an internal envelope. New effect inserts and
+provider finalization accept only `full`; the retention CAS is the only store
+operation that can advance the tier or populate the digest column.
 
 For LLM calls the content-bearing payload fields are messages, visible tools,
 response content, tool calls, reasoning, raw provider response, and provider
@@ -77,8 +80,12 @@ LLM calls are eligible only after `status` is `ok` or `error` and
 runtime dependencies until their executable semantics have a separate durable
 projection:
 
-- the unique latest OpenAI Responses call for a `(pid, purpose)` chain, when
-  that call is eligible to supply provider-side continuation state; and
+- the unique latest call for a `(pid, purpose)` stream, when it is a complete
+  `image_only` call whose marker supplies the active native transcript head;
+- the unique latest OpenAI Responses call for a `(pid, purpose)` stream, when
+  that call is eligible to supply low-level provider-side continuation state;
+  the current AgentProcess executor does not create an eligible provider-chain
+  head, but the storage predicate remains fail-closed for compatible rows; and
 - a tool-call record carrying the `process_exit` payload used to recover a
   missing context-compressor result.
 
@@ -91,13 +98,13 @@ The head decision exactly matches runtime lookup ordering: all calls for the
 same `(pid, purpose)` participate, without filtering status first, and the
 greatest `(created_at, call_id)` under the backend's bytewise keyset collation is
 the head. Thus a newer pending or failed attempt prevents an older successful
-Responses call from being treated as resumable, and older eligible Responses
-rows can advance through the configured retention tiers. A row without a
-process id cannot be selected by the runtime lookup and is therefore not a
-chain head. The bounded storage query classifies heads with an indexed
-correlated seek; it does not issue one lookup per candidate. The retention CAS
-repeats the "a newer call exists" fence before reducing any Responses row
-classified as non-head.
+Responses or `image_only` call from being treated as the active head, and older
+eligible rows can advance through the configured retention tiers. A row without
+a process id cannot be selected by the runtime lookup and is therefore not a
+continuation/transcript head. The bounded storage query classifies heads with an
+indexed correlated seek; it does not issue one lookup per candidate. The
+retention CAS repeats the "a newer call exists" fence before reducing any
+guarded row classified as non-head.
 
 ## Explicit maintenance API
 
@@ -183,6 +190,11 @@ retention marker. No prompt, schema, response, tool-call argument, reasoning,
 provider payload, error text, key name, scalar value, or preview is durable in
 that row.
 
+An `image_only` process is not an exception that writes a redacted transcript.
+It requires a lossless native transcript head and fails before provider dispatch
+when `persist_full_io=false`, so no new action-selection call row is produced by
+that attempted quantum. Runtime-owned prompt modes can use the opt-out normally.
+
 Opt-out rows written by earlier releases can contain bounded observation
 previews. The retention service recognizes those legacy rows as the summary
 tier and can normalize them to the canonical content-free summary envelope;
@@ -202,8 +214,8 @@ SQLite and PostgreSQL adapters implement the typed
 
 - keyset scans for LLM calls and external effects accept `older_than`, `after`,
   and `limit` and return at most the requested limit;
-- each LLM page identifies every continuation-capable candidate that is the
-  actual latest call for its `(pid, purpose)` chain;
+- each LLM page identifies every continuation- or transcript-capable candidate
+  that is the actual latest call for its `(pid, purpose)` stream;
 - update methods compare the expected record-level tier and aggregate payload
   hash;
 - the external-effect update also compares `effect_state` and
@@ -225,4 +237,5 @@ this contract by loading all historical rows into Python.
 LLM head classification uses
 `idx_llm_calls_provider_chain_head(pid, purpose, created_at, call_id)` for one
 correlated seek per bounded candidate. The same index backs the atomic update
-fence that rejects reducing a Responses head if no newer chain row exists.
+fence that rejects reducing a Responses continuation or `image_only` transcript
+head if no newer call exists. The historical index name covers both kinds.

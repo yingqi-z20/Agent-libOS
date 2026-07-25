@@ -45,10 +45,11 @@ connection/dialect/lease adapters over the same typed repository
 implementation and canonical 0.3 schema. The shared implementation emits a
 small SQLite-shaped SQL subset. The PostgreSQL dialect translates parameter
 placeholders, `COLLATE BINARY`, `INSERT OR IGNORE`, the one reviewed
-`INSERT OR REPLACE` upsert, `INDEXED BY`, and the table/index metadata probes;
-a syntax-surface test ratchets that set. PostgreSQL therefore does not inherit
-the SQLite store or its connection/locking behavior, but it is also not a
-second, copied repository implementation.
+`INSERT OR REPLACE` upsert, `INDEXED BY`, the Skill-package description
+`json_extract` expression, and the table/index metadata probes; a
+syntax-surface test ratchets that set. PostgreSQL therefore does not inherit the
+SQLite store or its connection/locking behavior, but it is also not a second,
+copied repository implementation.
 
 Library defaults are deliberately ephemeral. `Runtime.open()` and
 `Runtime.aopen()` do not load the repository's `config.yaml`; with neither an
@@ -214,6 +215,15 @@ rows retain metadata and a live-payload marker. A transaction that changes
 Object rows and payloads captures the in-memory payload state and restores both
 layers on rollback. Checkpoints and Image artifacts explicitly serialize only
 their bounded payload set.
+
+The SQL decoder retains a compatibility path for pre-marker rows that contain
+a legacy full JSON payload: while such a row remains in an accepted store, an
+explicit payload lookup can decode it into the volatile cache. New writes use
+only runtime-memory markers, and startup's missing-payload sweep targets those
+markers; it does not prove or rewrite arbitrary legacy full-payload rows. Hosts
+handling a store produced by an older development build should therefore treat
+those rows as durable sensitive data and migrate or recreate the store before
+claiming marker-only historical retention.
 
 If commit, savepoint release, rollback, or rollback cleanup leaves transaction
 state uncertain, the store is poisoned and closed. Later access fails closed;

@@ -420,6 +420,11 @@ def _project_stable_error_details(details: Mapping[str, Any]) -> dict[str, Any]:
     for raw_key in sorted(details, key=str):
         key = str(raw_key)
         normalized = key.strip().lower().replace("-", "_")
+        if normalized == "checkpoint_fork_receipt":
+            receipt = _project_checkpoint_fork_receipt(details[raw_key])
+            if receipt is not None:
+                projected[key] = receipt
+            continue
         if normalized in {
             "errors",
             "message",
@@ -441,6 +446,75 @@ def _project_stable_error_details(details: Mapping[str, Any]) -> dict[str, Any]:
                 projected[key] = _bounded_identifier(value, fallback="unknown")
             else:
                 projected[key] = _model_safe_error_message(value)[0]
+    return projected
+
+
+def _project_checkpoint_fork_identity(
+    value: Mapping[Any, Any],
+) -> dict[str, str] | None:
+    projected: dict[str, str] = {}
+    for key in ("checkpoint_id", "fork_root_pid", "status"):
+        selected = value.get(key)
+        if not isinstance(selected, str) or not selected:
+            return None
+        projected[key] = _bounded_identifier(selected, fallback="unknown")
+    return projected
+
+
+def _project_checkpoint_fork_outcome(
+    value: Mapping[Any, Any],
+) -> tuple[bool | None, bool] | None:
+    if "main_state_committed" not in value:
+        return None
+    committed = value.get("main_state_committed")
+    if committed is not None and not isinstance(committed, bool):
+        return None
+    pending = value.get("reconciliation_pending", False)
+    if not isinstance(pending, bool):
+        return None
+    return committed, pending
+
+
+def _project_checkpoint_fork_failure_phases(
+    value: Mapping[Any, Any],
+) -> list[str]:
+    phases: list[str] = []
+    failures = value.get("post_commit_failures")
+    if isinstance(failures, (list, tuple)):
+        for failure in failures:
+            if not isinstance(failure, Mapping):
+                continue
+            phase = failure.get("phase")
+            if isinstance(phase, str) and phase and phase not in phases:
+                phases.append(_bounded_identifier(phase, fallback="unknown"))
+            if len(phases) >= _MODEL_ERROR_DETAIL_LIMIT:
+                break
+    diagnostic = value.get("outcome_diagnostic")
+    if len(phases) < _MODEL_ERROR_DETAIL_LIMIT and isinstance(diagnostic, Mapping):
+        phase = diagnostic.get("phase")
+        if isinstance(phase, str) and phase and phase not in phases:
+            phases.append(_bounded_identifier(phase, fallback="unknown"))
+    return phases
+
+
+def _project_checkpoint_fork_receipt(value: Any) -> dict[str, Any] | None:
+    """Expose only stable retry-safety facts from a fork failure receipt."""
+
+    if not isinstance(value, Mapping):
+        return None
+    identity = _project_checkpoint_fork_identity(value)
+    if identity is None:
+        return None
+    outcome = _project_checkpoint_fork_outcome(value)
+    if outcome is None:
+        return None
+    committed, pending = outcome
+    projected: dict[str, Any] = dict(identity)
+    projected["main_state_committed"] = committed
+    projected["reconciliation_pending"] = pending
+    phases = _project_checkpoint_fork_failure_phases(value)
+    if phases:
+        projected["failure_phases"] = phases
     return projected
 
 
@@ -987,7 +1061,16 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
         _set_number_bounds(properties, "limit", default=tools.directory_entry_limit, maximum=tools.directory_entry_hard_limit)
     elif name == "create_object_from_file":
         _set_property_default(properties, "encoding", tools.default_text_encoding)
-        _set_number_bounds(properties, "max_bytes", default=tools.object_file_max_bytes, maximum=tools.object_file_hard_limit_bytes)
+        effective_max_bytes = min(
+            tools.object_file_hard_limit_bytes,
+            tools.filesystem_read_hard_limit_bytes,
+        )
+        _set_number_bounds(
+            properties,
+            "max_bytes",
+            default=min(tools.object_file_max_bytes, effective_max_bytes),
+            maximum=effective_max_bytes,
+        )
     elif name == "write_object_to_file":
         _set_property_default(properties, "encoding", tools.default_text_encoding)
     elif name == "read_memory_object":
@@ -1071,7 +1154,14 @@ def _apply_runtime_arg_defaults(name: str, args: dict[str, Any], config: AgentLi
         args.setdefault("limit", tools.directory_entry_limit)
     elif name == "create_object_from_file":
         args.setdefault("encoding", tools.default_text_encoding)
-        args.setdefault("max_bytes", tools.object_file_max_bytes)
+        args.setdefault(
+            "max_bytes",
+            min(
+                tools.object_file_max_bytes,
+                tools.object_file_hard_limit_bytes,
+                tools.filesystem_read_hard_limit_bytes,
+            ),
+        )
     elif name == "write_object_to_file":
         args.setdefault("encoding", tools.default_text_encoding)
     elif name == "read_memory_object":

@@ -807,6 +807,7 @@ class CapabilityManager:
         policy: str,
         issued_by: str | None = None,
         constraints: dict | None = None,
+        expires_at: str | None = None,
     ) -> Capability:
         if policy not in self.POLICY_VALUES:
             raise ValueError(f"unknown permission policy: {policy}")
@@ -819,6 +820,7 @@ class CapabilityManager:
                 issued_by=issued_by or self.config.runtime.default_human_actor,
                 effect=effect,
                 constraints=dict(constraints or {}),
+                expires_at=expires_at,
                 uses_remaining=uses_remaining,
             )
             self.audit.record(
@@ -837,6 +839,7 @@ class CapabilityManager:
         rights: Iterable[str | CapabilityRight],
         issued_by: str | None = None,
         constraints: dict | None = None,
+        expires_at: str | None = None,
     ) -> Capability:
         return self.issue_trusted(
             subject=subject,
@@ -845,6 +848,7 @@ class CapabilityManager:
             issued_by=issued_by or self.config.runtime.default_human_actor,
             effect=CapabilityEffect.ALLOW,
             constraints=dict(constraints or {}),
+            expires_at=expires_at,
             uses_remaining=1,
         )
 
@@ -1193,8 +1197,14 @@ class CapabilityManager:
         self.parse_resource_pattern(resource)
         normalized_rights = self._normalize_rights(rights)
         self._validate_constraints(constraints)
-        if uses_remaining is not None and uses_remaining < 1:
-            raise ValidationError("uses_remaining must be >= 1 when set")
+        if uses_remaining is not None and (
+            isinstance(uses_remaining, bool)
+            or not isinstance(uses_remaining, int)
+            or uses_remaining < 1
+        ):
+            raise ValidationError(
+                "uses_remaining must be a positive integer when set"
+            )
         if max_delegation_depth is not None and max_delegation_depth < delegation_depth:
             raise ValidationError("max_delegation_depth cannot be less than delegation_depth")
         normalized_expires_at = self._normalize_expires_at(expires_at)
@@ -1488,8 +1498,14 @@ class CapabilityManager:
         if not isinstance(value, dict):
             raise ValidationError("capability lease must be a mapping")
         uses_remaining = value.get("uses_remaining")
-        if uses_remaining is not None:
-            uses_remaining = int(uses_remaining)
+        if uses_remaining is not None and (
+            isinstance(uses_remaining, bool)
+            or not isinstance(uses_remaining, int)
+            or uses_remaining < 1
+        ):
+            raise ValidationError(
+                "capability lease uses_remaining must be a positive integer"
+            )
         expires_at = self._normalize_expires_at(value.get("expires_at"))
         return CapabilityLease(
             expires_at=expires_at,

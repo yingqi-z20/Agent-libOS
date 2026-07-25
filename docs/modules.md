@@ -34,6 +34,13 @@ Modules are part of the host trusted computing base:
   must declare a protected-operation direction and use the common SDK gate;
   Host trust in the module is not a substitute for Sink clearance.
 
+The manifest/source SHA-256 values are unkeyed content and identity bindings,
+not signatures, MACs, publisher/source-authentication proofs, or protection
+against a Host or database administrator who can replace trusted configuration
+and bytes together. Module trust comes from how the Host obtains, reviews, and
+pins the exact digest tuple; `modules verify` computes the tuple but does not
+establish its provenance or safety.
+
 Use Skills when the model needs workflow instructions, tool visibility, or JIT
 tool candidates at runtime. Use Runtime Modules when the system owner wants to
 install new host-side runtime surfaces before startup.
@@ -82,8 +89,12 @@ name, so bundled helpers should use package-relative imports such as
 `sys.path`, and local helpers are not imported through their original absolute
 package name.
 
-The package reader rejects symlinks, hard links, non-regular files, path
-escapes, cache or VCS paths, and likely secret material. Run
+The package reader rejects symlinks, hard links, non-regular selected entries,
+path escapes, and likely secret material. During recursive multi-file package
+collection it prunes cache/VCS directories rather than treating their mere
+presence as a package error; those pruned files are not executed or covered by
+the digest. A direct single-file entrypoint is verified as that file and does
+not recursively apply the package-directory pruning rule. Run
 `uv run agent-libos modules verify <module.yaml>` after authoring a module to
 get the current `manifest_sha256`, `source_sha256`, `trust_key`, and the file
 list covered by the source digest.
@@ -247,6 +258,10 @@ terminal sessions. When loaded and trusted, it registers the tools
 `pty_list`, plus the `pty-agent:v0` image. The adapter, local PTY provider,
 reader thread, buffer limits, and timeout/window defaults live inside this
 module, not in the core Runtime or default Resource Provider Substrate.
+The module files are shipped in the repository and Python source distribution,
+not in the core wheel. Installing the wheel's optional `pty` dependency extra
+can provide `pywinpty` on Windows, but does not install `modules/pty`; a
+wheel-only deployment must separately supply and trust the module package.
 The adapter receives the explicit module host services it uses and shares
 Shell launch authorization only through the public `ShellExecutionPolicy`
 surface; it does not retain the concrete Runtime or call `ShellAdapter` private
@@ -266,6 +281,12 @@ The declared data-flow directions are:
 | `pty_resize` / `primitive.pty.resize` | egress | dimensions are a control payload to the pinned session Sink |
 | public `pty_close` / `primitive.pty.close` | egress | force/timeout controls go to the pinned session Sink; lifecycle-only internal close has runtime-internal authority rather than a process payload |
 | `pty_list` | local ingress observation | no provider call/effect is created; labels from all returned readable sessions are aggregated into the caller context |
+
+`pty_list` is provider-side-effect-free and idempotent with respect to PTY
+state, but it is not authority-free: each returned session performs the normal
+Object `read` check, so a finite read grant may be consumed and a later list may
+return fewer sessions. It also records its audit observation and raises the
+caller's ingress context as described above.
 
 The session
 pins the resolved executable identity and Sink trust snapshot established at
@@ -329,17 +350,25 @@ The local PTY backend resolves bare executables on a safe host PATH that
 excludes workspace entries, rejects workspace PATH hijacks, and gives child
 processes a workspace-scoped `HOME`/`USERPROFILE`.
 
-PTY resource accounting runs in a monitor worker independent of the blocking
-output reader, so a provider read cannot suspend wall/CPU/RSS enforcement. Each
-sample covers the complete process tree. CPU is accumulated by `(pid,
-create_time)` and retains each process's maximum observed total, so an exited
+On POSIX, PTY resource accounting runs in a monitor worker independent of the
+blocking output reader, so a provider read cannot suspend wall/CPU/RSS
+enforcement. Each sample covers the complete process tree. CPU is accumulated
+by `(pid, create_time)` and retains each process's maximum observed total, so an exited
 child cannot make aggregate charged CPU decrease; wall time is charged
 cumulatively and RSS records the session peak. If process-tree discovery or
 CPU/RSS inspection is denied, the adapter closes the session and releases its
-Object handle instead of continuing without accounting. On POSIX, cleanup
-signals the process group first; if that is denied it explicitly signals the
+Object handle instead of continuing without accounting. Cleanup signals the
+process group first; if that is denied it explicitly signals the
 discovered descendant tree, and surfaces cleanup failure rather than reporting
 an uncontained session as closed.
+
+The current Windows backend is only the `pywinpty`/ConPTY session adapter. It
+does not install a Job Object, process-tree wall/CPU/RSS supervisor, or
+parent-death containment. `LocalPtyProvider.supports_subprocess_limits` is false
+there, so any process budget that produces `SubprocessLimits` is rejected before
+spawn rather than run without accounting. Unbudgeted PTY use still has the
+module's output/startup bounds and explicit close lifecycle, but deployments
+must not treat it as process-tree resource containment.
 
 Follow-on tools use that `session_oid` as the public handle:
 

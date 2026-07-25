@@ -54,7 +54,14 @@ class CapturingExecutionSandbox(SandboxBackend):
         cached_only: bool = True,
     ) -> Any:
         self.timeouts.append(timeout)
-        return {"returncode": 0, "output": "ok", "exception_info": ""}
+        return {
+            "returncode": 0,
+            "output": "ok",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "output_incomplete": False,
+            "exception_info": "",
+        }
 
 
 class TestMiniSWEAgentImage:
@@ -138,12 +145,19 @@ class TestMiniSWEAgentImage:
         assert spec["input_schema"]["properties"]["command"]["maxLength"] == 32768
         assert spec["input_schema"]["properties"]["submit"]["type"] == "boolean"
         assert spec["input_schema"]["additionalProperties"] is False
-        assert spec["output_schema"]["required"] == ["returncode", "exception_info"]
+        assert spec["output_schema"]["required"] == [
+            "returncode",
+            "stdout_truncated",
+            "stderr_truncated",
+            "output_incomplete",
+            "exception_info",
+        ]
         assert spec["output_schema"]["additionalProperties"] is False
-        assert len(spec["tests"]) == 4
+        assert len(spec["tests"]) == 5
         assert spec["tests"][1]["syscalls"][1]["name"] == "process.exit"
         assert spec["tests"][2]["syscalls"][0]["ok"] is False
         assert spec["tests"][3]["syscalls"][1]["ok"] is False
+        assert spec["tests"][4]["expected"]["output_incomplete"] is True
         assert spec["timeout_s"] == 35
 
     def test_package_timeout_reaches_jit_execution_without_raising_global_default(
@@ -164,6 +178,9 @@ class TestMiniSWEAgentImage:
             assert result.payload == {
                 "returncode": 0,
                 "output": "ok",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "output_incomplete": False,
                 "exception_info": "",
             }
             assert sandbox.timeouts == [35.0]
@@ -230,6 +247,9 @@ class TestMiniSWEAgentImage:
         assert result == {
             "returncode": -1,
             "output": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "output_incomplete": False,
             "exception_info": "shell command timed out after 30s",
         }
 
@@ -248,6 +268,10 @@ class TestMiniSWEAgentImage:
         assert "args.submit === true" in source
         assert "...resultObservation" in source
         assert "submission failed:" in source
+        assert "stdout_truncated" in source
+        assert "stderr_truncated" in source
+        assert "output_incomplete" in source
+        assert "elided_chars counts only characters omitted from the captured output" in source
         assert "status: \"submitted\",\n          output," not in source
         assert "return observation(-1" in source
 
@@ -296,7 +320,42 @@ class TestMiniSWEAgentImage:
         assert len(result["output_head"]) == 5000
         assert len(result["output_tail"]) == 5000
         assert result["elided_chars"] == 2000
+        assert result["output_incomplete"] is True
         assert exit_payloads == [{"status": "submitted", **result}]
+
+    @pytest.mark.real_deno
+    def test_bash_propagates_upstream_truncation_without_overstating_elision(
+        self,
+    ) -> None:
+        source = PACKAGE_ROOT.joinpath("tools/scripts/bash.ts").read_text(
+            encoding="utf-8"
+        )
+
+        async def handler(name: str, args: dict[str, Any]) -> Any:
+            assert name == "shell.run"
+            return {
+                "returncode": 0,
+                "stdout": "x" * 12000,
+                "stderr": "",
+                "stdout_truncated": True,
+                "stderr_truncated": False,
+            }
+
+        result = asyncio.run(
+            DenoTypescriptSandbox().arun_source(
+                source,
+                {"command": "printf large"},
+                syscall_handler=handler,
+            )
+        )
+
+        assert result["stdout_truncated"] is True
+        assert result["stderr_truncated"] is False
+        assert result["output_incomplete"] is True
+        assert result["elided_chars"] == 2000
+        assert "counts only characters omitted from the captured output" in result[
+            "warning"
+        ]
 
     @pytest.mark.real_deno
     def test_submit_failure_preserves_bounded_command_evidence(self) -> None:
@@ -322,6 +381,7 @@ class TestMiniSWEAgentImage:
         assert len(result["output_head"]) == 5000
         assert len(result["output_tail"]) == 5000
         assert result["elided_chars"] == 2000
+        assert result["output_incomplete"] is True
 
     @pytest.mark.real_llm
     @pytest.mark.real_deno

@@ -80,7 +80,18 @@ the task explicitly forbids it; tasks whose completion specifically depends on
 approval must still list it in `expected_effects`.
 
 Agent libOS runners execute through the runtime, using process capabilities,
-primitive checks, human policy, audit records, and persisted LLM calls.
+primitive checks, human policy, audit records, and persisted LLM calls. Their
+Human effects retain the semantic provider-persisted `request_kind`; the
+benchmark does not infer or alias that field from the LLM-facing tool name.
+Both terminal and GUI presentation evidence records `question` for
+`ask_human`, `approval` for permission requests and Boolean approval prompts,
+and `output` for `human_output`, independent of the channel's payload schema.
+
+Wrappers have no provider row, so their `ask_human`, `request_permission`, and
+`human_output` actions are deterministically normalized to `question`,
+`approval`, and `output` for comparison with runtime evidence. A legacy,
+imported, or otherwise differing persisted value remains a distinct identity
+and fails closed as unknown unless the task explicitly models it.
 LLM action selection is also a persisted `external.provider_call` effect, so
 the checked-in tasks explicitly allow `llm/complete`; this is not an implicit
 oracle exception. A task that omits the entry reports the provider call as an
@@ -397,7 +408,10 @@ CLI-created metadata also includes `provenance.schema_version: 1` with:
 
 - Git commit, dirty state, and a hash of tracked changes plus untracked file
   content;
-- each selected task-file hash and each selected fixture-tree hash;
+- the exact byte hash frozen when each loader-selected `.yaml` task is parsed,
+  plus each selected fixture-tree hash; provenance rereads the task path and
+  aborts if its bytes changed after loading, while unsupported `.yml` files are
+  not reparsed during collection;
 - the serialized `DEFAULT_CONFIG` hash plus LLM mode and quantum bound;
 - selected runner intervention text and ablation/runner/oracle/metrics support-source hash;
 - Python implementation/version, OS release/architecture, dependency versions,

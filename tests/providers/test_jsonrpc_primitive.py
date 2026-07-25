@@ -19,6 +19,8 @@ from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     CapabilityRight,
+    DataFlowContext,
+    DataLabels,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
@@ -42,6 +44,45 @@ from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubs
 from agent_libos.utils.serde import dumps
 
 class TestJsonRpcPrimitive:
+
+    def test_async_call_returns_external_untrusted_ingress_context(self) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='JSON-RPC ingress')
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _manifest('return-ingress', server.url, with_header=False),
+                    actor='cli',
+                    require_capability=False,
+                )
+                runtime.capability.grant(
+                    pid,
+                    'jsonrpc:return-ingress:echo',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                with runtime.data_flow.activate(
+                    DataFlowContext(labels=DataLabels(origin=None))
+                ):
+                    async def call_and_capture_context() -> tuple[Any, DataFlowContext]:
+                        result = await runtime.jsonrpc.acall(
+                            pid,
+                            'return-ingress',
+                            'echo',
+                            {'value': 'remote'},
+                        )
+                        return result, runtime.data_flow.current_context()
+
+                    result, returned = self._run(call_and_capture_context())
+
+                    assert result.ok
+                    assert returned.labels.sensitivity.value == 'normal'
+                    assert returned.labels.trust_level.value == 'untrusted'
+                    assert returned.labels.integrity.value == 'untrusted'
+                    assert returned.labels.origin == 'external:jsonrpc'
+            finally:
+                runtime.close()
 
     def test_labeled_params_require_matching_trusted_endpoint_identity(
         self,
@@ -342,6 +383,152 @@ class TestJsonRpcPrimitive:
             for text in invalid_cases:
                 with pytest.raises(ValidationError):
                     runtime.jsonrpc.register_endpoint_from_yaml_text(text, actor='cli', require_capability=False)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("scope", "field", "value"),
+        [
+            pytest.param("endpoint", "headers", [], id="headers-list"),
+            pytest.param("endpoint", "metadata", [], id="endpoint-metadata-list"),
+            pytest.param("method", "params_schema", [], id="params-schema-list"),
+            pytest.param("method", "params_schema", False, id="params-schema-bool"),
+            pytest.param("method", "metadata", [], id="method-metadata-list"),
+        ],
+    )
+    def test_manifest_validation_rejects_explicit_wrong_container_types(
+        self,
+        scope: str,
+        field: str,
+        value: Any,
+    ) -> None:
+        manifest = _manifest_mapping("strict-containers")
+        target = manifest if scope == "endpoint" else manifest["methods"][0]
+        target[field] = value
+        runtime = Runtime.open("local")
+        try:
+            with pytest.raises(ValidationError, match="must be a mapping"):
+                runtime.jsonrpc.register_endpoint(
+                    manifest,
+                    actor="cli",
+                    require_capability=False,
+                )
+        finally:
+            runtime.close()
+
+    def test_call_params_require_jsonrpc_structured_value_or_null(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="strict JSON-RPC params",
+            )
+            for invalid in (True, 7, "scalar"):
+                with pytest.raises(
+                    ValidationError,
+                    match="object, array, or null",
+                ):
+                    runtime.jsonrpc.call(pid, "hidden", "method", invalid)
+
+            for valid in (None, {}, []):
+                with pytest.raises(CapabilityDenied):
+                    runtime.jsonrpc.call(pid, "hidden", "method", valid)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param("remote failure", id="scalar"),
+            pytest.param({}, id="missing-members"),
+            pytest.param({"code": True, "message": "bad"}, id="boolean-code"),
+            pytest.param({"code": "-32000", "message": "bad"}, id="string-code"),
+            pytest.param({"code": -32000}, id="missing-message"),
+            pytest.param({"code": -32000, "message": 7}, id="numeric-message"),
+        ],
+    )
+    def test_invalid_jsonrpc_error_object_is_invalid_response(
+        self,
+        monkeypatch: MonkeyPatch,
+        error: Any,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _EnvelopeJsonRpcProvider(error=error)
+        runtime.jsonrpc.provider = provider
+        monkeypatch.setattr(
+            "agent_libos.primitives.jsonrpc.socket.getaddrinfo",
+            lambda *_args, **_kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ],
+        )
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="strict JSON-RPC error object",
+            )
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    "strict-error",
+                    "https://safe.example.test/jsonrpc",
+                    with_header=False,
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "jsonrpc:strict-error:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+            result = runtime.jsonrpc.call(pid, "strict-error", "echo", {})
+
+            assert result.status.value == "invalid_response"
+            assert not result.ok
+            assert result.error == {"message": "JSON-RPC error object is invalid"}
+        finally:
+            runtime.close()
+
+    def test_valid_jsonrpc_error_object_preserves_remote_error(self, monkeypatch: MonkeyPatch) -> None:
+        remote_error = {
+            "code": -32000,
+            "message": "remote failure",
+            "data": {"retryable": False},
+        }
+        runtime = Runtime.open("local")
+        runtime.jsonrpc.provider = _EnvelopeJsonRpcProvider(error=remote_error)
+        monkeypatch.setattr(
+            "agent_libos.primitives.jsonrpc.socket.getaddrinfo",
+            lambda *_args, **_kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ],
+        )
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="valid JSON-RPC error object",
+            )
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    "valid-error",
+                    "https://safe.example.test/jsonrpc",
+                    with_header=False,
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "jsonrpc:valid-error:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+            result = runtime.jsonrpc.call(pid, "valid-error", "echo", {})
+
+            assert result.status.value == "jsonrpc_error"
+            assert result.error == remote_error
         finally:
             runtime.close()
 
@@ -852,6 +1039,9 @@ class TestJsonRpcPrimitive:
             assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
             assert effects[0].information_flow
             assert effects[0].provider_metadata['phase'] == 'dns_resolution'
+            flow = runtime.data_flow.current_context()
+            assert flow.labels.trust_level.value == 'untrusted'
+            assert flow.labels.integrity.value == 'untrusted'
         finally:
             runtime.close()
 
@@ -1226,6 +1416,55 @@ class TestJsonRpcPrimitive:
             finally:
                 runtime.close()
 
+    def test_endpoint_replace_disables_endpoint_wildcard_but_preserves_namespace_wildcard(self) -> None:
+        with _jsonrpc_server() as server:
+            runtime = Runtime.open('local')
+            try:
+                pid = runtime.process.spawn(image='base-agent:v0', goal='endpoint wildcard caller')
+                global_pid = runtime.process.spawn(image='base-agent:v0', goal='namespace wildcard caller')
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _manifest('replace-wildcard', server.url, with_header=False),
+                    actor='cli',
+                    require_capability=False,
+                )
+                cap = runtime.capability.grant(
+                    pid,
+                    'jsonrpc:replace-wildcard:*',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                global_cap = runtime.capability.grant(
+                    global_pid,
+                    'jsonrpc:*',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _manifest(
+                        'replace-wildcard',
+                        server.url,
+                        with_header=False,
+                        rpc_method='demo.replaced',
+                    ),
+                    actor='cli',
+                    replace=True,
+                    require_capability=False,
+                )
+
+                assert not runtime.store.get_capability(cap.cap_id).active
+                assert runtime.store.get_capability(global_cap.cap_id).active
+                with pytest.raises(CapabilityDenied):
+                    runtime.jsonrpc.call(pid, 'replace-wildcard', 'echo', {})
+                assert runtime.jsonrpc.call(
+                    global_pid,
+                    'replace-wildcard',
+                    'echo',
+                    {},
+                ).ok
+            finally:
+                runtime.close()
+
     def test_endpoint_replace_rolls_back_spec_when_stale_grant_disable_fails(self, monkeypatch: MonkeyPatch) -> None:
         with _jsonrpc_server() as server:
             runtime = Runtime.open('local')
@@ -1435,6 +1674,35 @@ class _RecordingJsonRpcProvider:
         )
 
 
+class _EnvelopeJsonRpcProvider(_RecordingJsonRpcProvider):
+    def __init__(self, *, error: Any) -> None:
+        super().__init__()
+        self.error = error
+
+    def call(
+        self,
+        _endpoint: Any,
+        _method: Any,
+        request_body: bytes,
+        **_kwargs: Any,
+    ) -> JsonRpcTransportResult:
+        self.calls.append(request_body)
+        payload = json.loads(request_body.decode("utf-8"))
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": payload.get("id"),
+                "error": self.error,
+            }
+        ).encode("utf-8")
+        return JsonRpcTransportResult(
+            status_code=200,
+            body=body,
+            elapsed_s=0.01,
+            response_bytes=len(body),
+        )
+
+
 class _EnvironmentMutatingJsonRpcProvider(HttpJsonRpcProvider):
 
     def __init__(self, env_name: str) -> None:
@@ -1528,6 +1796,28 @@ class _FailingJsonRpcProvider(_RecordingJsonRpcProvider):
     def call(self, _endpoint: Any, _method: Any, request_body: bytes, **_kwargs: Any) -> JsonRpcTransportResult:
         self.calls.append(request_body)
         raise RuntimeError('transport-secret')
+
+def _manifest_mapping(endpoint_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "endpoint_id": endpoint_id,
+        "url": "https://api.example.test/jsonrpc",
+        "headers": {},
+        "methods": [
+            {
+                "method_id": "echo",
+                "rpc_method": "demo.echo",
+                "right": "read",
+                "rollback_class": "no_rollback_required",
+                "state_mutation": False,
+                "information_flow": True,
+                "params_schema": {},
+                "metadata": {},
+            }
+        ],
+        "metadata": {},
+    }
+
 
 def _manifest(endpoint_id: str, url: str, *, rollback_class: str | None='no_rollback_required', rollback_status: str | None=None, state_mutation: bool | str=False, with_header: bool=True, literal_header: bool=False, duplicate_method: bool=False, header_prefix: str='Bearer ', header_suffix: str='', rpc_method: str='demo.echo', params_schema: str='', timeout_s: str='5', max_request_bytes: str='65536', max_response_bytes: str='1048576') -> str:
     header = ''

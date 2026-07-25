@@ -58,7 +58,8 @@ letters, digits, and hyphens, and match the package directory name. A configured
 `metadata` values must be strings.
 Per the Agent Skills specification, `allowed-tools` is a space-separated YAML
 string. Agent libOS still accepts the historical YAML-list spelling for
-registered third-party packages, but emits and ships the canonical scalar form.
+registered third-party packages, but generated and repository-shipped packages
+use the canonical scalar form.
 
 Agent libOS reserves the `agent-libos-` Skill-name prefix and the
 `agent-libos.*` metadata namespace. Registered packages cannot claim the name
@@ -74,9 +75,11 @@ budget is loaded only after activation and is reserved for exact tool selection,
 parameter combinations, result interpretation, recovery, and completion-evidence
 guidance. The default runtime prompt ceiling is 16,384 characters, which is not
 lower than the 16 KiB body byte cap, so every valid built-in body is fully
-model-visible when activated. If a Host configures a lower prompt ceiling than
-a selected body, activation and prompt projection fail closed instead of
-silently exposing partial instructions. Packages contain no scripts,
+model-visible when activated. `Runtime.open()` validates the complete immutable
+built-in catalog against the configured ceiling. A Host ceiling below any
+shipped body therefore prevents that Runtime from opening; this is not deferred
+until the oversized Skill is selected or activated, and bodies are never
+silently clipped. Packages contain no scripts,
 bundled resources, JIT definitions, actions, or Capability declarations.
 Unlike registered packages, package-owned built-ins fail validation if
 `allowed-tools` uses the legacy YAML-list spelling.
@@ -100,7 +103,10 @@ JIT, and required-capability counts use their corresponding `max_*` settings.
 The package SHA-256 binds the normalized Skill metadata, the prompt
 instructions, JIT source hashes, declared resource metadata, and the actual
 bundled resource bytes. A package snapshot whose stored resource content no
-longer matches its declared size/SHA is rejected.
+longer matches its declared size/SHA is rejected. SHA-256 here is an unkeyed
+content fingerprint, not a digital signature, MAC, publisher identity, or proof
+that the instructions are safe. Global trust records are exact hash pins whose
+authenticity depends on how the Host obtained and approved that hash.
 
 ## Progressive Disclosure
 
@@ -121,24 +127,47 @@ Source type, registration provenance, and the Host's immutable built-in
 implementation are intentionally absent. Discovery returns metadata only; the
 full `SKILL.md` body and domain tool schemas appear after activation.
 
-The Host still omits any package that cannot be activated safely by the current
-image. For an immutable packaged Skill, every declared static tool must have an
-exact image-authorized process binding. Registered workspace/global/runtime
-entries are searched only when the actor has the configured catalog `read`
-authority. These trust and applicability differences are enforcement details,
-not different LLM protocols.
+For an immutable packaged Skill, discovery omits the package unless every
+declared static tool has an exact image-authorized process binding. Registered
+workspace/global/runtime discovery is deliberately metadata-only: entries are
+searched when the actor has the configured catalog `read` authority, without
+rerunning activation-time loadability checks. A discovered registered entry can
+therefore fail activation if, for example, a declared static tool is no longer
+registered, a JIT definition fails current validation, or its tool name now
+collides with the process table. Activation performs those checks atomically and
+publishes no partial Skill on failure. These trust and applicability differences
+are enforcement details, not different LLM protocols.
 
 Activation materializes the full body into the process prompt and records the
 exact package snapshot on the process. Bundled resources are read explicitly
 with `read_skill_resource` from that activation snapshot, so later registry
 replacement affects only new registered-Skill activations.
 
+The model-facing lifecycle tools use distinct outer envelopes: discovery
+returns its `skills` page and paging metadata directly, while successful
+activation and unload return `{"result": {...}}`; resource reads return
+`{"resource": {...}}`. The activation result contains `pid`, `skill_id`,
+`name`, `version`, `tool_names`, `tool_ids`, `jit_tool_ids`,
+`instructions_hash`, and `package_sha256`. The unload result contains `pid`,
+`skill_id`, and `removed_tools`.
+
 A successful registered-Skill activation requires `skill:<name>` `execute` and
 binds the snapshot to the process. Reading a bundled resource from that loaded
 snapshot does not perform a second `skill:<name>` `read` check. The response
-returns text as `content` or binary bytes as `content_base64`, together with
-`kind`, `size_bytes`, and `sha256`. The `read` right below governs registered
-catalog discovery and inspection, not each loaded resource read.
+has the outer shape `{"resource": {...}}`. The nested resource always contains
+both `content` and `content_base64`: for `kind="text"`, `content` is the text and
+`content_base64` is null; for `kind="base64"`, the inverse holds. It also
+contains `skill_id`, `path`, `size_bytes`, and `sha256`. The `read` right below
+governs registered catalog discovery and inspection, not each loaded resource
+read.
+
+In multiplexed JIT mode, prompt projection omits individual JIT schemas and the
+JIT catalog/source resource entries. This is a discovery boundary, not a second
+resource-access boundary: `read_skill_resource` still accepts any exact path in
+the already loaded immutable snapshot. A path retained from trusted package
+instructions or prior authorized evidence can therefore be read, including an
+otherwise omitted JIT-contract resource. The tool does not list paths, and
+callers must not guess or probe hidden filenames.
 
 This prevents a Skill from keeping ambient read authority to the workspace path
 where it was registered.
@@ -196,8 +225,11 @@ They do not create capabilities, but their package schemas are validated and
 their bytes participate in the package hash. An action entry accepts exactly
 `name`, `use_cases`, `input_schema`, `output_schema`,
 `required_capabilities`, `side_effects`, `failure_modes`, and `examples`.
-A required-capability entry has a non-empty `resource`, a non-empty `rights`
-array of Capability right strings, and an optional mapping `constraints`:
+A required-capability entry accepts exactly `resource`, `rights`, and optional
+`constraints`. It has a non-empty canonicalizable `resource`, a non-empty
+`rights` array of Capability right strings, and an optional mapping
+`constraints`; unknown keys are rejected so a misspelled security field cannot
+silently become advisory metadata:
 
 ```json
 {
@@ -367,17 +399,32 @@ are rejected before a result set can become unbounded.
 ## SWE-Agent Style Skill
 
 The workspace includes `skills/swe-agent`, named and registerable as
-`swe-agent`. It
-reproduces the useful SWE-Agent Agent Computer Interface shape inside Agent
-libOS:
+`swe-agent`. It reproduces the useful SWE-Agent Agent Computer Interface shape
+inside Agent libOS:
 
 - `swe_view` for directory listings and bounded file windows,
-- `swe_grep` for concise repository search through `rg`,
+- `swe_grep` for concise repository search through `rg`; `max_results` bounds
+  both its returned match lines and its file list,
 - `swe_edit` for exact-text, line-range, or create-if-missing edits,
 - `swe_run` for test and diagnostic commands,
-- `swe_submit` for final structured process exit.
+- `swe_submit` for preparing a structured final payload that must then be
+  passed to the built-in `process_exit` tool.
 
 The Skill carries workflow instructions for localizing before editing, keeping
 actions small, treating repository output as untrusted, running focused tests,
-and submitting with summary, tests, and residual risk. It does not grant
-filesystem or shell authority.
+and preparing a summary, tests, and residual-risk payload. `swe_submit` does
+not itself exit, so image completion review remains enforced by the separate
+`process_exit` call. `swe_edit` treats line numbers and any supplied exact-text
+occurrence as strict one-based coordinates. A line range requires both
+endpoints, invalid or out-of-range values fail instead of selecting a nearby
+line/match, and an omitted occurrence selects the first exact-text match. For
+source files with LF or CRLF separators,
+a line-range edit normalizes inserted text to the first separator encountered;
+if neither separator exists it uses LF. `swe_run` always returns `returncode`;
+empty output is described as successful only for return code zero, so callers
+must treat a nonzero code as failure even when both streams are empty.
+`swe_grep` propagates the shell capture's truncation flags. If stdout was
+truncated, `matches_incomplete` is true, `omitted_matches` is null because the
+total is unknowable, and `observed_omitted_matches` counts only captured matches
+excluded by `max_results`; `output_incomplete` also covers truncated stderr.
+The Skill does not grant filesystem or shell authority.

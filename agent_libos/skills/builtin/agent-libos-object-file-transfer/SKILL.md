@@ -17,7 +17,7 @@ Creates one named immutable Object from a governed text file. Required inputs ar
 
 - Omitted `namespace` means the process namespace. It must already be writable, and `name` must be unused there. Creation never overwrites or upserts.
 - `encoding` defaults to the runtime text encoding, normally UTF-8. A wrong codec or undecodable file fails. This tool decodes text; it is not a binary reader.
-- `max_bytes` bounds the read and has a hard maximum. With `allow_truncated=false`, overflow fails before creation; true stores a decoded prefix, possibly omitting an incomplete final multibyte character.
+- `max_bytes` bounds the read. Its exposed default/maximum is the lower of the Object-file settings and the filesystem primitive read hard limit (1 MiB under default configuration), even if the separate Object-file absolute limit is higher. With `allow_truncated=false`, overflow fails before creation; true stores a decoded prefix, possibly omitting an incomplete final multibyte character.
 - A second gate covers the full Object payload. False rejects overflow; true
   shortens `content`, marks `truncated=true`, and adds `stored_bytes`, so source
   `bytes_read` may exceed stored content bytes.

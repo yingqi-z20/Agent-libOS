@@ -45,6 +45,12 @@ OBJECT_MEMORY_TOOLS = {
     "read_memory_object",
 }
 
+JSONRPC_TOOLS = {
+    "call_jsonrpc_method",
+    "inspect_jsonrpc_endpoint",
+    "list_jsonrpc_endpoints",
+}
+
 INITIAL_TOOLS = SKILL_BOOTSTRAP_TOOLS
 
 
@@ -108,6 +114,42 @@ def test_model_tool_projection_survives_runtime_reopen(tmp_path: Path) -> None:
         assert process.loaded_skills["agent-libos-mcp"]["activation_kind"] == "builtin_projection"
     finally:
         reopened.close()
+
+
+def test_jsonrpc_skill_projects_static_bindings_without_granting_authority(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(tmp_path / "jsonrpc-projection.sqlite")
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="project the registered JSON-RPC integration tools",
+        )
+        before = runtime.process.get(pid)
+        full_tool_table = dict(before.tool_table)
+        capabilities_before = {
+            item.cap_id for item in runtime.store.list_capabilities(subject=pid)
+        }
+
+        assert JSONRPC_TOOLS <= set(before.tool_table)
+        assert JSONRPC_TOOLS.isdisjoint(before.model_tool_table)
+
+        activated = runtime.skills.activate_skill(
+            pid,
+            "agent-libos-jsonrpc",
+            actor=pid,
+        )
+        after = runtime.process.get(pid)
+        capabilities_after = {
+            item.cap_id for item in runtime.store.list_capabilities(subject=pid)
+        }
+
+        assert activated["authority_changed"] is False
+        assert after.tool_table == full_tool_table
+        assert JSONRPC_TOOLS <= set(after.model_tool_table)
+        assert capabilities_after == capabilities_before
+    finally:
+        runtime.close()
 
 
 def test_all_skill_projected_builtin_images_start_small_without_changing_authority(

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from types import MappingProxyType, ModuleType
+from types import MappingProxyType, ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -275,6 +275,10 @@ class TestMcpPrimitive:
             assert stored is not None
             server, _metadata = stored
             tool = server.tools[0]
+            inspected = runtime.mcp.inspect_server(
+                server_id,
+                require_capability=False,
+            )
 
             classification = SdkMcpProvider().classify_external_effect(
                 'call_tool',
@@ -291,6 +295,7 @@ class TestMcpPrimitive:
 
             assert classification.rollback_class == ExternalEffectRollbackClass(rollback_class)
             assert classification.rollback_status == expected_status
+            assert inspected["tools"][0]["rollback_status"] == expected_status.value
         finally:
             runtime.close()
 
@@ -650,6 +655,94 @@ class TestMcpPrimitive:
         assert http_environments == [runtime_environment]
         assert http_environments[0] is runtime_environment
 
+    def test_http_environment_snapshot_excludes_stdio_platform_keys(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        header_env = "AGENT_LIBOS_MCP_TEST_TOKEN"
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="http-minimal-snapshot",
+            transport="streamable_http",
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            http=McpHttpTransportSpec(
+                url="https://mcp.example.test/tools",
+                headers={
+                    "Authorization": McpHeaderSpec(
+                        env=header_env,
+                        prefix="Bearer ",
+                    )
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            "agent_libos.primitives.mcp._MCP_PLATFORM_ENV_KEYS",
+            ("SYSTEMROOT", "WINDIR"),
+        )
+        monkeypatch.setenv("SYSTEMROOT", r"C:\\Windows")
+        monkeypatch.setenv("WINDIR", r"C:\\Windows")
+        monkeypatch.setenv(header_env, "approved-token")
+        runtime = Runtime.open("local")
+        try:
+            inputs = runtime.mcp._runtime_environment_input_snapshot(server)
+            resolved = runtime.mcp._require_runtime_environment(server)
+        finally:
+            runtime.close()
+
+        assert dict(inputs) == {header_env: "approved-token"}
+        assert dict(resolved) == {"Authorization": "Bearer approved-token"}
+
+    def test_windows_stdio_target_snapshot_includes_explicit_pathext(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path_host = "AGENT_LIBOS_MCP_WINDOWS_PATH"
+        pathext_host = "AGENT_LIBOS_MCP_WINDOWS_PATHEXT"
+        monkeypatch.setattr("agent_libos.primitives.mcp._MCP_WINDOWS", True)
+        monkeypatch.setenv(path_host, r"C:\\trusted-bin")
+        monkeypatch.setenv(pathext_host, ".EXE;.COM")
+        runtime = Runtime.open("local")
+        try:
+            stdio = McpStdioTransportSpec(
+                command="demo-mcp",
+                env={"PATH": path_host, "PATHEXT": pathext_host},
+            )
+            server = McpServerSpec(
+                schema_version=1,
+                server_id="windows-target-snapshot",
+                transport="stdio",
+                tools=[],
+                timeout_s=1,
+                max_request_bytes=1024,
+                max_response_bytes=1024,
+                stdio=stdio,
+            )
+            runtime.mcp._validate_stdio(stdio)
+
+            assert dict(runtime.mcp._stdio_executable_resolution_environment(server)) == {
+                "PATH": r"C:\\trusted-bin",
+                "PATHEXT": ".EXE;.COM",
+            }
+            with pytest.raises(
+                ValidationError,
+                match="manifest-mapped child PATH and PATHEXT",
+            ):
+                runtime.mcp._validate_stdio(
+                    McpStdioTransportSpec(
+                        command="demo-mcp",
+                        env={"PATH": path_host},
+                    )
+                )
+            with pytest.raises(ValidationError, match="must end in .exe or .com"):
+                runtime.mcp._validate_stdio(
+                    McpStdioTransportSpec(command=r"C:\\tools\\demo.cmd")
+                )
+        finally:
+            runtime.close()
+
     def test_sdk_stdio_session_uses_primitive_snapshot_without_platform_reread(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -773,6 +866,254 @@ class TestMcpPrimitive:
             'WINDIR': r'C:\\Windows-approved',
             'DEMO_TOKEN': 'approved-token',
         }
+
+    def test_windows_stdio_bare_command_uses_only_explicit_target_snapshot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        trusted_dir = tmp_path / "trusted-bin"
+        attacker_dir = tmp_path / "attacker-cwd"
+        workspace.mkdir()
+        trusted_dir.mkdir()
+        attacker_dir.mkdir()
+        trusted = trusted_dir / "demo-mcp.EXE"
+        attacker = attacker_dir / "demo-mcp.EXE"
+        trusted.write_bytes(b"trusted")
+        attacker.write_bytes(b"attacker")
+        trusted.chmod(0o755)
+        attacker.chmod(0o755)
+        provider = SdkMcpProvider(workspace)
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="windows-target-only",
+            transport="stdio",
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            stdio=McpStdioTransportSpec(command="demo-mcp"),
+        )
+        target_environment = MappingProxyType(
+            {
+                "PATH": str(trusted_dir),
+                "PATHEXT": ".EXE",
+            }
+        )
+        monkeypatch.setattr("agent_libos.substrate.local._MCP_WINDOWS", True)
+        monkeypatch.chdir(attacker_dir)
+        monkeypatch.setenv("PATHEXT", ".ATTACKER")
+
+        first = provider.resolve_stdio_executable(
+            server,
+            runtime_environment=target_environment,
+        )
+        monkeypatch.setenv("PATHEXT", ".COM")
+        second = provider.resolve_stdio_executable(
+            server,
+            runtime_environment=target_environment,
+        )
+
+        assert Path(first) == trusted.resolve()
+        assert Path(second) == trusted.resolve()
+        with pytest.raises(ValidationError, match="manifest-mapped child PATH and PATHEXT"):
+            provider.resolve_stdio_executable(
+                server,
+                runtime_environment=MappingProxyType({"PATH": str(trusted_dir)}),
+            )
+
+    def test_windows_strict_stdio_uses_verified_absolute_command_without_second_lookup(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import anyio
+        import agent_libos.substrate.local as local_substrate
+
+        selected = tmp_path / "trusted.exe"
+        selected.write_bytes(b"trusted")
+        captured: list[str] = []
+
+        class FakeReceiveStream:
+            async def receive(self, *_args: Any, **_kwargs: Any) -> bytes:
+                raise anyio.EndOfStream
+
+        class FakeSendStream:
+            async def send(self, _value: bytes) -> None:
+                return None
+
+            async def aclose(self) -> None:
+                return None
+
+        class FakeProcess:
+            stdout = FakeReceiveStream()
+            stdin = FakeSendStream()
+
+            async def __aenter__(self) -> "FakeProcess":
+                return self
+
+            async def __aexit__(self, *_exc: Any) -> None:
+                return None
+
+            async def wait(self) -> int:
+                return 0
+
+        async def create_windows_process(
+            command: str,
+            _args: list[str],
+            _env: dict[str, str],
+            _stderr: Any,
+            _cwd: str,
+        ) -> FakeProcess:
+            captured.append(command)
+            return FakeProcess()
+
+        async def terminate_process(_process: Any) -> None:
+            return None
+
+        mcp_module = ModuleType("mcp")
+        mcp_types_module = ModuleType("mcp.types")
+        mcp_types_module.JSONRPCMessage = object  # type: ignore[attr-defined]
+        mcp_posix_module = ModuleType("mcp.os.posix.utilities")
+        mcp_posix_module.terminate_posix_process_tree = terminate_process  # type: ignore[attr-defined]
+        mcp_windows_module = ModuleType("mcp.os.win32.utilities")
+        mcp_windows_module.create_windows_process = create_windows_process  # type: ignore[attr-defined]
+        mcp_windows_module.terminate_windows_process_tree = terminate_process  # type: ignore[attr-defined]
+        mcp_shared_module = ModuleType("mcp.shared.message")
+        mcp_shared_module.SessionMessage = object  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+        monkeypatch.setitem(sys.modules, "mcp.types", mcp_types_module)
+        monkeypatch.setitem(sys.modules, "mcp.os.posix.utilities", mcp_posix_module)
+        monkeypatch.setitem(sys.modules, "mcp.os.win32.utilities", mcp_windows_module)
+        monkeypatch.setitem(sys.modules, "mcp.shared.message", mcp_shared_module)
+        monkeypatch.setattr(local_substrate, "_MCP_WINDOWS", True)
+        server = SimpleNamespace(
+            command=str(selected.resolve()),
+            args=[],
+            env={},
+            cwd=str(tmp_path),
+            encoding="utf-8",
+            encoding_error_handler="strict",
+        )
+
+        async def exercise() -> None:
+            async with local_substrate._strict_stdio_client(
+                server,
+                max_frame_bytes=1024,
+            ):
+                pass
+
+        asyncio.run(exercise())
+        assert captured == [str(selected.resolve())]
+
+    def test_sdk_snapshots_external_stdio_executable_before_dispatch(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        external = tmp_path / "external"
+        workspace.mkdir()
+        external.mkdir()
+        executable = external / "demo-mcp"
+        executable.write_bytes(b"trusted executable")
+        executable.chmod(0o755)
+        provider = SdkMcpProvider(workspace)
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="external-snapshot",
+            transport="stdio",
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            stdio=McpStdioTransportSpec(command=str(executable)),
+        )
+
+        with provider._stdio_dispatch_snapshot(server, None) as snapshot:
+            assert snapshot is not None
+            assert snapshot.executable_path != executable
+            executable.write_bytes(b"attacker replacement")
+            executable.chmod(0o755)
+            snapshot.verify()
+            assert snapshot.executable_path.read_bytes() == b"trusted executable"
+
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="stable configured cwd dispatch uses Linux /proc/self/fd",
+    )
+    def test_stdio_configured_cwd_handle_survives_symlink_replacement(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        selected = workspace / "selected"
+        moved = workspace / "moved"
+        outside = tmp_path / "outside"
+        selected.mkdir(parents=True)
+        outside.mkdir()
+        (selected / "marker.txt").write_text("trusted", encoding="utf-8")
+        (outside / "marker.txt").write_text("attacker", encoding="utf-8")
+        provider = SdkMcpProvider(workspace)
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="stable-cwd",
+            transport="stdio",
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            stdio=McpStdioTransportSpec(command=sys.executable, cwd="selected"),
+        )
+
+        with provider._stdio_dispatch_cwd(server) as (dispatch_cwd, cwd_fd):
+            assert cwd_fd is not None
+            selected.rename(moved)
+            selected.symlink_to(outside, target_is_directory=True)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; print(Path('marker.txt').read_text())",
+                ],
+                cwd=dispatch_cwd,
+                pass_fds=(cwd_fd,),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        assert completed.stdout.strip() == "trusted"
+
+    def test_stdio_configured_cwd_fails_closed_without_stable_handle_support(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        (workspace / "selected").mkdir(parents=True)
+        provider = SdkMcpProvider(workspace)
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="unsupported-stable-cwd",
+            transport="stdio",
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            stdio=McpStdioTransportSpec(command=sys.executable, cwd="selected"),
+        )
+        monkeypatch.setattr(
+            "agent_libos.substrate.local._MCP_STABLE_CWD_SUPPORTED",
+            False,
+        )
+
+        with pytest.raises(
+            ProviderEffectNotStarted,
+            match="requires stable /proc/self/fd support",
+        ):
+            with provider._stdio_dispatch_cwd(server):
+                pass
 
     def test_sdk_validate_and_call_rejects_missing_live_pinned_schema(
         self,
@@ -1107,6 +1448,448 @@ class TestMcpPrimitive:
             assert result.ok
             assert provider.list_calls == ['labeled-server']
             assert len(provider.call_args) == 1
+        finally:
+            runtime.close()
+
+    def test_denied_stdio_call_does_not_resolve_host_environment_or_executable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        environment_resolutions = 0
+        executable_resolutions = 0
+        original_environment_resolver = runtime.mcp._runtime_environment_from_host
+
+        def observe_environment_resolution(*args: Any, **kwargs: Any) -> Any:
+            nonlocal environment_resolutions
+            environment_resolutions += 1
+            return original_environment_resolver(*args, **kwargs)
+
+        def observe_executable_resolution(
+            _server: McpServerSpec,
+            *,
+            runtime_environment: Any = None,
+        ) -> str:
+            nonlocal executable_resolutions
+            executable_resolutions += 1
+            assert runtime_environment == {"DEMO_TOKEN": "host-secret"}
+            return sys.executable
+
+        monkeypatch.setattr(
+            runtime.mcp,
+            "_runtime_environment_from_host",
+            observe_environment_resolution,
+        )
+        monkeypatch.setattr(
+            provider,
+            "resolve_stdio_executable",
+            observe_executable_resolution,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            provider,
+            "supports_runtime_environment_snapshots",
+            True,
+            raising=False,
+        )
+        monkeypatch.setenv("AGENT_LIBOS_MCP_BOUNDARY_TOKEN", "host-secret")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="deny before MCP Host environment resolution",
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(
+                    "denied-before-env",
+                    env_source="AGENT_LIBOS_MCP_BOUNDARY_TOKEN",
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            # The wrong right is enough for the metadata-free visibility gate,
+            # but must fail the exact manifest-selected READ authorization.
+            runtime.capability.grant(
+                pid,
+                "mcp:denied-before-env:echo",
+                [CapabilityRight.EXECUTE],
+                issued_by="test",
+            )
+
+            with pytest.raises(CapabilityDenied):
+                runtime.mcp.call_tool(
+                    pid,
+                    "denied-before-env",
+                    "echo",
+                    {"text": "hello"},
+                )
+
+            assert environment_resolutions == 0
+            assert executable_resolutions == 0
+            assert provider.list_calls == []
+            assert provider.call_args == []
+        finally:
+            runtime.close()
+
+    def test_clearance_denied_stdio_call_does_not_resolve_host_environment_or_executable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        environment_resolutions = 0
+        executable_resolutions = 0
+        original_environment_resolver = runtime.mcp._runtime_environment_from_host
+
+        def observe_environment_resolution(*args: Any, **kwargs: Any) -> Any:
+            nonlocal environment_resolutions
+            environment_resolutions += 1
+            return original_environment_resolver(*args, **kwargs)
+
+        def observe_executable_resolution(
+            _server: McpServerSpec,
+            *,
+            runtime_environment: Any = None,
+        ) -> str:
+            nonlocal executable_resolutions
+            executable_resolutions += 1
+            assert runtime_environment == {"DEMO_TOKEN": "host-secret"}
+            return sys.executable
+
+        monkeypatch.setattr(
+            runtime.mcp,
+            "_runtime_environment_from_host",
+            observe_environment_resolution,
+        )
+        monkeypatch.setattr(
+            provider,
+            "resolve_stdio_executable",
+            observe_executable_resolution,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            provider,
+            "supports_runtime_environment_snapshots",
+            True,
+            raising=False,
+        )
+        monkeypatch.setenv("AGENT_LIBOS_MCP_BOUNDARY_TOKEN", "host-secret")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="deny MCP clearance before Host environment resolution",
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(
+                    "clearance-before-env",
+                    env_source="AGENT_LIBOS_MCP_BOUNDARY_TOKEN",
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp:clearance-before-env:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(
+                runtime,
+                pid,
+                env={"DEMO_TOKEN": "AGENT_LIBOS_MCP_BOUNDARY_TOKEN"},
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {"secret": "MCP_CLEARANCE_BOUNDARY_SECRET"},
+                metadata=ObjectMetadata(sensitivity="secret"),
+            )
+
+            with pytest.raises(CapabilityDenied, match="data-flow denied egress"):
+                runtime.mcp.call_tool(
+                    pid,
+                    "clearance-before-env",
+                    "echo",
+                    {"text": "MCP_CLEARANCE_BOUNDARY_SECRET"},
+                    source_oids=[source.oid],
+                )
+
+            assert environment_resolutions == 0
+            assert executable_resolutions == 0
+            assert provider.list_calls == []
+            assert provider.call_args == []
+        finally:
+            runtime.close()
+
+    def test_exact_stdio_sink_denial_reads_target_path_but_not_other_credentials(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if os.name == "nt":
+            pytest.skip("fixture uses POSIX executable names")
+        workspace = tmp_path / "workspace"
+        trusted_dir = tmp_path / "trusted-bin"
+        attacker_dir = tmp_path / "attacker-bin"
+        workspace.mkdir()
+        trusted_dir.mkdir()
+        attacker_dir.mkdir()
+        for directory, body in (
+            (trusted_dir, "#!/bin/sh\nexit 0\n"),
+            (attacker_dir, "#!/bin/sh\nexit 1\n"),
+        ):
+            executable = directory / "demo-mcp"
+            executable.write_text(body, encoding="utf-8")
+            executable.chmod(0o755)
+        path_host = "AGENT_LIBOS_MCP_EXACT_PATH"
+        credential_host = "AGENT_LIBOS_MCP_EXACT_CREDENTIAL"
+        mapped_env = {
+            "PATH": path_host,
+            "DEMO_TOKEN": credential_host,
+        }
+        monkeypatch.setenv(path_host, str(trusted_dir))
+        monkeypatch.setenv(credential_host, "must-remain-unread")
+        runtime = Runtime.open(
+            "local",
+            substrate=LocalResourceProviderSubstrate(workspace),
+        )
+        provider = SdkMcpProvider(workspace)
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="deny exact MCP Sink before credential snapshot",
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(
+                    "exact-sink-before-credential",
+                    command="demo-mcp",
+                    env=mapped_env,
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp:exact-sink-before-credential:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(
+                runtime,
+                pid,
+                command="demo-mcp",
+                env=mapped_env,
+            )
+            source = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {"secret": "MCP_EXACT_SINK_SECRET"},
+                metadata=ObjectMetadata(sensitivity="secret"),
+            )
+            spec, _metadata = runtime.mcp._load_server(
+                "exact-sink-before-credential"
+            )
+            tool = spec.tool_by_id("echo")
+            assert tool is not None
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern="mcp:exact-sink-before-credential:echo",
+                    trust_level=SinkTrustLevel.TRUSTED,
+                    max_sensitivity="secret",
+                    identity_sha256=runtime.mcp._server_identity_sha256(spec, tool),
+                ),
+                actor="test.host",
+                require_capability=False,
+            )
+            original_resolver = provider.resolve_stdio_executable
+            target_snapshots: list[dict[str, str]] = []
+
+            def observe_target_snapshot(
+                selected: McpServerSpec,
+                *,
+                runtime_environment: Any = None,
+            ) -> str:
+                target_snapshots.append(dict(runtime_environment or {}))
+                return original_resolver(
+                    selected,
+                    runtime_environment=runtime_environment,
+                )
+
+            monkeypatch.setattr(
+                provider,
+                "resolve_stdio_executable",
+                observe_target_snapshot,
+            )
+            monkeypatch.setattr(
+                runtime.mcp,
+                "_runtime_environment_input_snapshot",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("complete credential snapshot must not run")
+                ),
+            )
+            monkeypatch.setenv(path_host, str(attacker_dir))
+
+            with pytest.raises(CapabilityDenied, match="data-flow denied egress"):
+                runtime.mcp.call_tool(
+                    pid,
+                    "exact-sink-before-credential",
+                    "echo",
+                    {"text": "MCP_EXACT_SINK_SECRET"},
+                    source_oids=[source.oid],
+                )
+
+            assert target_snapshots == [{"PATH": str(attacker_dir)}]
+        finally:
+            runtime.close()
+
+    def test_stdio_missing_complete_environment_after_prepare_restores_all_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        missing = "AGENT_LIBOS_MCP_MISSING_AFTER_PREPARE"
+        monkeypatch.delenv(missing, raising=False)
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        observed_prepared_effects: list[int] = []
+        original_environment_resolver = runtime.mcp._require_runtime_environment
+
+        def observe_after_prepare(*args: Any, **kwargs: Any) -> Any:
+            observed_prepared_effects.append(
+                len(runtime.store.list_external_effects())
+            )
+            return original_environment_resolver(*args, **kwargs)
+
+        monkeypatch.setattr(
+            runtime.mcp,
+            "_require_runtime_environment",
+            observe_after_prepare,
+        )
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="restore MCP authority after environment validation",
+            )
+            mapped_env = {"DEMO_TOKEN": missing}
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(
+                    "missing-after-prepare",
+                    env=mapped_env,
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            capabilities = [
+                runtime.capability.grant_once(
+                    pid,
+                    "mcp:missing-after-prepare:echo",
+                    [CapabilityRight.READ],
+                    issued_by="test",
+                ),
+                runtime.capability.grant_once(
+                    pid,
+                    "process:spawn",
+                    [CapabilityRight.WRITE],
+                    issued_by="test",
+                ),
+                runtime.capability.grant_once(
+                    pid,
+                    runtime.mcp.stdio_resource_for_argv(
+                        "python3",
+                        ["-m", "demo_server"],
+                        env=mapped_env,
+                    ),
+                    [CapabilityRight.EXECUTE],
+                    issued_by="test",
+                ),
+            ]
+
+            with pytest.raises(ValidationError, match="missing environment variable"):
+                runtime.mcp.call_tool(
+                    pid,
+                    "missing-after-prepare",
+                    "echo",
+                    {"text": "hello"},
+                )
+
+            assert observed_prepared_effects == [1]
+            for capability in capabilities:
+                persisted = runtime.store.get_capability(capability.cap_id)
+                assert persisted is not None and persisted.uses_remaining == 1
+            assert runtime.store.list_external_effects(pid=pid) == []
+            assert provider.list_calls == []
+            assert provider.call_args == []
+        finally:
+            runtime.close()
+
+    def test_stdio_call_snapshots_only_manifest_referenced_host_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mapped_name = "AGENT_LIBOS_MCP_ALLOWED_TOKEN"
+        unmapped_name = "AGENT_LIBOS_MCP_UNMAPPED_SECRET"
+        runtime = Runtime.open("local")
+        provider = _EnvironmentRecordingLegacyMcpProvider(mapped_name)
+        runtime.mcp.provider = provider
+        observed_inputs: list[dict[str, str]] = []
+        original_environment_resolver = runtime.mcp._runtime_environment_from_host
+
+        def observe_environment_inputs(
+            server: McpServerSpec,
+            host_environment: Any,
+            **kwargs: Any,
+        ) -> Any:
+            observed_inputs.append(dict(host_environment))
+            return original_environment_resolver(
+                server,
+                host_environment,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(
+            runtime.mcp,
+            "_runtime_environment_from_host",
+            observe_environment_inputs,
+        )
+        monkeypatch.setenv(mapped_name, "approved-token")
+        monkeypatch.setenv(unmapped_name, "must-not-be-copied")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="snapshot only manifest-referenced MCP environment",
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("minimal-env-snapshot", env_source=mapped_name),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp:minimal-env-snapshot:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(
+                runtime,
+                pid,
+                env={"DEMO_TOKEN": mapped_name},
+            )
+
+            result = runtime.mcp.call_tool(
+                pid,
+                "minimal-env-snapshot",
+                "echo",
+                {"text": "hello"},
+            )
+
+            assert result.ok
+            assert len(observed_inputs) == 1
+            assert observed_inputs[0][mapped_name] == "approved-token"
+            assert unmapped_name not in observed_inputs[0]
+            assert provider.environments[0][1] is provider.environments[1][1]
         finally:
             runtime.close()
 
@@ -1853,6 +2636,53 @@ class TestMcpPrimitive:
             for text in invalid_cases:
                 with pytest.raises(ValidationError):
                     runtime.mcp.register_server_from_yaml_text(text, actor="cli", require_capability=False)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("transport", "scope", "field", "value"),
+        [
+            pytest.param("stdio", "server", "metadata", [], id="server-metadata-list"),
+            pytest.param("stdio", "stdio", "command", 7, id="command-number"),
+            pytest.param("stdio", "stdio", "args", "-m", id="args-string"),
+            pytest.param("stdio", "stdio", "args", [7], id="numeric-arg"),
+            pytest.param("stdio", "stdio", "env", [], id="env-list"),
+            pytest.param("stdio", "stdio", "env", {"TOKEN": 7}, id="env-numeric-value"),
+            pytest.param("stdio", "stdio", "cwd", 7, id="cwd-number"),
+            pytest.param("http", "http", "headers", [], id="headers-list"),
+            pytest.param("stdio", "tool", "tool_id", 7, id="tool-id-number"),
+            pytest.param("stdio", "tool", "input_schema", [], id="input-schema-list"),
+            pytest.param("stdio", "tool", "input_schema", False, id="input-schema-bool"),
+            pytest.param("stdio", "tool", "metadata", [], id="tool-metadata-list"),
+        ],
+    )
+    def test_manifest_validation_rejects_explicit_wrong_field_types(
+        self,
+        transport: str,
+        scope: str,
+        field: str,
+        value: Any,
+    ) -> None:
+        manifest = (
+            _stdio_manifest_mapping("strict-containers")
+            if transport == "stdio"
+            else _http_manifest_mapping("strict-containers")
+        )
+        if scope == "server":
+            target = manifest
+        elif scope == "tool":
+            target = manifest["tools"][0]
+        else:
+            target = manifest[scope]
+        target[field] = value
+        runtime = Runtime.open("local")
+        try:
+            with pytest.raises(ValidationError):
+                runtime.mcp.register_server(
+                    manifest,
+                    actor="cli",
+                    require_capability=False,
+                )
         finally:
             runtime.close()
 
@@ -3936,6 +4766,44 @@ export async function run(args, libos) {
                 runtime.mcp.call_tool(pid, "ckpt", "echo", {"text": "again"})
         finally:
             runtime.close()
+
+
+def _stdio_manifest_mapping(server_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "server_id": server_id,
+        "transport": "stdio",
+        "stdio": {
+            "command": "python3",
+            "args": ["-m", "demo_server"],
+            "env": {},
+            "cwd": None,
+        },
+        "tools": [
+            {
+                "tool_id": "echo",
+                "mcp_name": "demo.echo",
+                "right": "read",
+                "rollback_class": "no_rollback_required",
+                "state_mutation": False,
+                "information_flow": True,
+                "input_schema": {},
+                "metadata": {},
+            }
+        ],
+        "metadata": {},
+    }
+
+
+def _http_manifest_mapping(server_id: str) -> dict[str, Any]:
+    manifest = _stdio_manifest_mapping(server_id)
+    manifest["transport"] = "streamable_http"
+    manifest.pop("stdio")
+    manifest["http"] = {
+        "url": "https://api.example.test/mcp",
+        "headers": {},
+    }
+    return manifest
 
 
 def _stdio_manifest(

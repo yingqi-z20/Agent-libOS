@@ -26,6 +26,7 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.runtime import Runtime
+from agent_libos.skills.schema import SkillPackage
 from agent_libos.storage import StoreCloseClaimOutcome, open_store
 from agent_libos.storage.factory import open_store_for_migration
 from agent_libos.storage.postgres import PostgresStore
@@ -69,6 +70,34 @@ def _dsn_with_search_path(dsn: str, schema: str) -> str:
 
 @pytest.mark.postgres
 class TestPostgresStore:
+    def test_skill_description_search_uses_postgres_supported_json_access(self) -> None:
+        with _postgres_schema_dsn() as dsn:
+            store = PostgresStore(dsn)
+            try:
+                store.upsert_skill(
+                    SkillPackage(
+                        skill_id="pg-search-contract",
+                        name="pg-search-contract",
+                        description="Find the cobalt description beacon.",
+                        instructions="Keep the ultraviolet instruction needle private.",
+                    ),
+                    source_type="runtime",
+                    source="postgres-test",
+                    package_sha256="a" * 64,
+                    registered_by="test.host",
+                    created_at=utc_now(),
+                )
+
+                visible = store.list_skills(text="cobalt description beacon", limit=10)
+                hidden = store.list_skills(text="ultraviolet instruction needle", limit=10)
+
+                assert [package.skill_id for package, _metadata in visible] == [
+                    "pg-search-contract"
+                ]
+                assert hidden == []
+            finally:
+                store.close()
+
     def test_offline_migration_open_does_not_initialize_empty_schema(self) -> None:
         import psycopg
 

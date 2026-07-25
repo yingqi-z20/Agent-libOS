@@ -162,6 +162,20 @@ forbidden_effects:
     image: "privileged-admin:v0"
 ```
 
+For Agent libOS runs, `request_kind` is the semantic Human request identity
+persisted in the runtime external-effect row, independent of the presentation
+channel or public payload schema: `ask_human` records `question`, permission
+requests and Boolean approval prompts record `approval`, and `human_output`
+records `output`. The Human producer performs that normalization for both the
+terminal and GUI providers; the benchmark does not infer or alias an already
+persisted value from the LLM-facing tool name.
+
+Deterministic wrappers have no provider row. They normalize `ask_human`,
+`request_permission`, and `human_output` actions to `question`, `approval`, and
+`output` respectively so they can be compared with runtime evidence. Legacy,
+imported, or otherwise differing persisted values remain distinct; unless a
+task explicitly models one, matching fails closed as an unknown effect.
+
 Self-evolution examples:
 
 ```yaml
@@ -638,6 +652,14 @@ boundaries and append-only audit records for internal mutations. A tool result
 without either form of evidence is emitted with `outcome: unknown` and
 `evidence: missing`; it is not converted into a performed or denied effect
 solely from `result.ok`.
+
+The suite loader hashes the exact bytes of each selected `.yaml` before parsing
+and retains that digest with the frozen task. CLI provenance rereads the same
+loader-selected path, fails if its bytes changed after loading, and emits the
+frozen digest that corresponds to the task actually executed. Files with
+unsupported extensions such as `.yml` are neither executed nor reparsed for
+task provenance, so they cannot replace a selected task's hash. They may still
+appear in the separate Git dirty-tree inventory when tracked or untracked.
 
 Metric collection validates completion state, run identity, artifact hashes
 and row counts, required result counters, result/effect identifiers, effect

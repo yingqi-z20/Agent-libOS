@@ -993,7 +993,20 @@ class JsonRpcPrimitive:
                 "response must contain exactly one of result or error",
             )
         if has_error:
-            error = envelope["error"] if isinstance(envelope["error"], dict) else {"message": str(envelope["error"])}
+            error = envelope["error"]
+            if (
+                not isinstance(error, dict)
+                or type(error.get("code")) is not int
+                or type(error.get("message")) is not str
+            ):
+                return self._failure(
+                    endpoint,
+                    method,
+                    request_id,
+                    JsonRpcCallStatus.INVALID_RESPONSE,
+                    transport,
+                    "JSON-RPC error object is invalid",
+                )
             return JsonRpcCallResult(
                 endpoint_id=endpoint.endpoint_id,
                 method_id=method.method_id,
@@ -1275,7 +1288,9 @@ class JsonRpcPrimitive:
             schema_version=self._coerce_positive_int(value.get("schema_version", 1), "schema_version"),
             endpoint_id=self._require_string(value.get("endpoint_id"), "endpoint_id"),
             url=self._require_string(value.get("url"), "url"),
-            headers=self._header_specs(value.get("headers") or {}),
+            headers=self._header_specs(
+                self._mapping_field(value, "headers", "JSON-RPC endpoint")
+            ),
             methods=[self._method_spec(item) for item in methods],
             timeout_s=self._coerce_positive_float(value.get("timeout_s", self.config.jsonrpc.timeout_s), "timeout_s"),
             max_request_bytes=self._coerce_positive_int(
@@ -1286,7 +1301,7 @@ class JsonRpcPrimitive:
                 value.get("max_response_bytes", self.config.jsonrpc.max_response_bytes),
                 "max_response_bytes",
             ),
-            metadata=dict(value.get("metadata") or {}),
+            metadata=self._mapping_field(value, "metadata", "JSON-RPC endpoint"),
         )
         self._validate_endpoint(spec)
         return spec
@@ -1342,8 +1357,8 @@ class JsonRpcPrimitive:
             rollback_status=str(value["rollback_status"]) if value.get("rollback_status") is not None else None,
             state_mutation=self._require_bool(value.get("state_mutation"), "state_mutation"),
             information_flow=self._require_bool(value.get("information_flow"), "information_flow"),
-            params_schema=dict(value.get("params_schema") or {}),
-            metadata=dict(value.get("metadata") or {}),
+            params_schema=self._mapping_field(value, "params_schema", "JSON-RPC method"),
+            metadata=self._mapping_field(value, "metadata", "JSON-RPC method"),
         )
 
     def _validate_method(self, method: JsonRpcMethodSpec) -> None:
@@ -1552,6 +1567,19 @@ class JsonRpcPrimitive:
         if len(value) > max_chars or not _ID_PATTERN.match(value):
             raise ValidationError(f"invalid JSON-RPC {field}: {value!r}")
 
+    @staticmethod
+    def _mapping_field(
+        value: dict[str, Any],
+        field: str,
+        context: str,
+    ) -> dict[str, Any]:
+        if field not in value:
+            return {}
+        selected = value[field]
+        if not isinstance(selected, dict):
+            raise ValidationError(f"{context} {field} must be a mapping")
+        return dict(selected)
+
     def _require_string(self, value: Any, field: str) -> str:
         if not isinstance(value, str) or not value.strip():
             raise ValidationError(f"JSON-RPC {field} must be a non-empty string")
@@ -1595,9 +1623,18 @@ class JsonRpcPrimitive:
             raise ValidationError(f"JSON-RPC {field} must be > 0")
 
     def _validate_json_value(self, value: Any, field: str) -> None:
+        if value is not None and type(value) not in {dict, list}:
+            raise ValidationError(
+                f"JSON-RPC {field} must be an object, array, or null"
+            )
         try:
-            dumps(value)
-        except Exception as exc:
+            json.dumps(
+                value,
+                ensure_ascii=True,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, RecursionError) as exc:
             raise ValidationError(f"JSON-RPC {field} must be JSON-serializable") from exc
 
     def _bounded_list_limit(self, limit: int | None) -> int:

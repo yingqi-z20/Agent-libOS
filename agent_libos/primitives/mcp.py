@@ -51,6 +51,7 @@ from agent_libos.models.exceptions import (
     ProviderHostError,
     ValidationError,
 )
+from agent_libos.models.external_effect import default_external_effect_rollback_status
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.storage import UnitOfWork
 from agent_libos.substrate import (
@@ -86,6 +87,8 @@ _CALL_RIGHTS = {CapabilityRight.READ.value, CapabilityRight.WRITE.value, Capabil
 _ALLOWED_HEADER_PREFIXES = {"", "Bearer ", "Token ", "Basic "}
 _ALLOWED_HEADER_SUFFIXES = {""}
 _TRANSPORTS = {"stdio", "streamable_http"}
+_MCP_WINDOWS = os.name == "nt"
+_MCP_WINDOWS_EXECUTABLE_SUFFIXES = {".com", ".exe"}
 _MCP_PLATFORM_ENV_KEYS = ("SYSTEMROOT", "WINDIR") if os.name == "nt" else ()
 _STDIO_EXECUTABLE_IDENTITY_UNSET = object()
 _PROVIDER_RESULT_RETURNED_ATTR = "_agent_libos_provider_result_returned"
@@ -810,31 +813,23 @@ class McpPrimitive:
             registry_binding=registry_binding,
         )
         flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
-        host_environment, runtime_environment, stdio_identity = self._capture_stdio_identity_environment(spec)
-        sink = DataSink(
-            f"mcp:{server_id}:{tool_id}",
-            self._server_identity_sha256(
-                spec,
-                tool,
-                stdio_executable=stdio_identity,
-            ),
-        )
-        self._data_flow().authorize_egress(
+        (
+            sink,
+            decision,
+            auxiliary_decisions,
+            stdio_identity,
+            stdio_target_environment,
+        ) = self._authorize_and_resolve_call_sink(
             pid=pid,
-            sink=sink,
-            context=flow_context,
-            payload=selected_args,
-            operation="mcp.call_tool",
-        )
-        decision = self._authorize_call(
-            pid,
-            resource,
-            tool.right,
-            operation_context,
+            server_id=server_id,
+            resource=resource,
+            spec=spec,
+            tool=tool,
+            arguments=selected_args,
+            operation_context=operation_context,
+            flow_context=flow_context,
             source_oids=source_oids,
         )
-        auxiliary_decisions = self._require_stdio_process_spawn(pid, spec, consume=False)
-        self._validate_arguments_against_schema(tool, selected_args)
         profile = self.capabilities.profiles.mcp(
             resource=resource,
             effect=decision.effect or CapabilityEffect.DENY,
@@ -873,6 +868,7 @@ class McpPrimitive:
             "list_request_bytes": list_request_bytes,
         }
         resource_progress = {"list_response_bytes": 0}
+        runtime_environment: Mapping[str, str] | None = None
 
         failure_resource = partial(
             self._mcp_call_failure_resource,
@@ -899,8 +895,8 @@ class McpPrimitive:
             failure_resource=failure_resource,
             failure_evidence=lambda error, phase: self._protected_call_failure_evidence(pid, resource, tool, operation_context, error, phase),
             data_sink=sink,
-            data_sink_revalidator=lambda: self._tool_data_sink(
-                server_id, spec, tool, runtime_environment
+            data_sink_revalidator=lambda: self._tool_data_sink_after_runtime_resolution(
+                server_id, spec, tool, runtime_environment, expected=sink
             ),
             data_flow_context=flow_context,
             data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
@@ -913,7 +909,10 @@ class McpPrimitive:
         with self._protected().start("primitive.mcp.call", invocation, provider=self.provider) as protected:
             started = time.monotonic()
             deadline = started + spec.timeout_s
-            runtime_environment = self._require_runtime_environment(spec, host_environment=host_environment)
+            runtime_environment = self._require_runtime_environment(
+                spec,
+                pinned_stdio_environment=stdio_target_environment,
+            )
             if spec.transport == "streamable_http":
                 observes_host = self._runtime_resolution_observes_host(spec)
                 protected.call(
@@ -978,7 +977,7 @@ class McpPrimitive:
                     provider_outcome = protected.call(
                         ProviderPhase(
                             "provider_validate_and_call",
-                            information_flow=True,
+                            state_mutation=tool.state_mutation, information_flow=True,
                         ),
                         invoke_validated_tool,
                     )
@@ -1297,6 +1296,71 @@ class McpPrimitive:
                 message=f"{pid} is waiting for per-use human approval to call {resource}",
             )
         raise CapabilityDenied(decision.reason)
+
+    def _authorize_and_resolve_call_sink(
+        self,
+        *,
+        pid: str,
+        server_id: str,
+        resource: str,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+        operation_context: dict[str, Any],
+        flow_context: DataFlowContext,
+        source_oids: list[str] | tuple[str, ...] | None,
+    ) -> tuple[DataSink, Any, list[Any], dict[str, str] | None, Mapping[str, str]]:
+        precheck_sink = self._tool_data_sink_for_clearance_precheck(
+            server_id,
+            spec,
+            tool,
+        )
+        self._data_flow().precheck_egress_clearance(
+            pid=pid,
+            sink=precheck_sink,
+            context=flow_context,
+            payload=arguments,
+        )
+        # A precheck result is never authority: exact ordinary authority and
+        # executable-bound authorize_egress below always run independently.
+        decision = self._authorize_call(
+            pid,
+            resource,
+            tool.right,
+            operation_context,
+            source_oids=source_oids,
+        )
+        auxiliary_decisions = self._require_stdio_process_spawn(
+            pid,
+            spec,
+            consume=False,
+        )
+        self._validate_arguments_against_schema(tool, arguments)
+        stdio_environment = self._stdio_executable_resolution_environment(spec)
+        stdio_identity = self._stdio_executable_identity(
+            spec,
+            runtime_environment=stdio_environment,
+        )
+        sink = self._tool_data_sink_from_stdio_identity(
+            server_id,
+            spec,
+            tool,
+            stdio_identity,
+        )
+        self._data_flow().authorize_egress(
+            pid=pid,
+            sink=sink,
+            context=flow_context,
+            payload=arguments,
+            operation="mcp.call_tool",
+        )
+        return (
+            sink,
+            decision,
+            auxiliary_decisions,
+            stdio_identity,
+            stdio_environment,
+        )
 
     def _authorize_call_visibility(
         self,
@@ -2038,34 +2102,78 @@ class McpPrimitive:
             # unidentified so any Host rule above normal fails closed.
             return None
 
-    def _capture_stdio_identity_environment(
+    def _tool_data_sink_for_clearance_precheck(
+        self,
+        server_id: str,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+    ) -> DataSink:
+        identity = f"mcp:{server_id}:{tool.tool_id}"
+        if spec.transport != "stdio":
+            return self._tool_data_sink_from_stdio_identity(
+                server_id,
+                spec,
+                tool,
+                None,
+            )
+
+        # Stdio executable identity may depend on a Host-provided PATH. Use
+        # the Host trust record's expected identity only for this negative
+        # precheck; exact authorization below uses the resolved executable.
+        trust = self._data_flow().resolve_sink_trust(DataSink(identity))
+        return DataSink(
+            identity,
+            trust.identity_sha256 if trust is not None else None,
+        )
+
+    def _stdio_executable_resolution_environment(
         self,
         spec: McpServerSpec,
-    ) -> tuple[
-        Mapping[str, str],
-        Mapping[str, str] | None,
-        dict[str, str] | None,
-    ]:
-        host_environment = MappingProxyType(dict(os.environ))
-        try:
-            runtime_environment: Mapping[str, str] | None = self._runtime_environment_from_host(
+    ) -> Mapping[str, str]:
+        if spec.transport != "stdio" or spec.stdio is None:
+            return MappingProxyType({})
+        command = spec.stdio.command
+        if Path(command).is_absolute() or "/" in command or "\\" in command:
+            return MappingProxyType({})
+        child_names = ("PATH", "PATHEXT") if _MCP_WINDOWS else ("PATH",)
+        selected: dict[str, str] = {}
+        for child_name in child_names:
+            host_name = spec.stdio.env.get(child_name)
+            if host_name is None:
+                if _MCP_WINDOWS:
+                    raise ValidationError(
+                        "Windows MCP stdio bare commands require "
+                        "manifest-mapped child PATH and PATHEXT"
+                    )
+                continue
+            resolved = os.environ.get(host_name)
+            if resolved is None:
+                raise ValidationError(
+                    f"missing environment variable for MCP stdio env {child_name}: "
+                    f"{host_name}"
+                )
+            if "\x00" in resolved:
+                raise ValidationError(
+                    f"MCP stdio env {child_name} contains NUL byte"
+                )
+            selected[child_name] = resolved
+        return MappingProxyType(selected)
+
+    def _tool_data_sink_from_stdio_identity(
+        self,
+        server_id: str,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+        stdio_identity: dict[str, str] | None,
+    ) -> DataSink:
+        return DataSink(
+            f"mcp:{server_id}:{tool.tool_id}",
+            self._server_identity_sha256(
                 spec,
-                host_environment,
-            )
-        except ValidationError:
-            # Keep environment validation behind the existing capability and
-            # process-spawn gates.  An unresolved stdio Sink still fails
-            # closed for data above normal sensitivity.
-            runtime_environment = None
-        stdio_identity = (
-            self._stdio_executable_identity(
-                spec,
-                runtime_environment=runtime_environment,
-            )
-            if runtime_environment is not None
-            else None
+                tool,
+                stdio_executable=stdio_identity,
+            ),
         )
-        return host_environment, runtime_environment, stdio_identity
 
     def _tool_data_sink(
         self,
@@ -2078,13 +2186,29 @@ class McpPrimitive:
             spec,
             runtime_environment=runtime_environment,
         )
-        return DataSink(
-            f"mcp:{server_id}:{tool.tool_id}",
-            self._server_identity_sha256(
-                spec,
-                tool,
-                stdio_executable=stdio_identity,
-            ),
+        return self._tool_data_sink_from_stdio_identity(
+            server_id,
+            spec,
+            tool,
+            stdio_identity,
+        )
+
+    def _tool_data_sink_after_runtime_resolution(
+        self,
+        server_id: str,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+        runtime_environment: Mapping[str, str] | None,
+        *,
+        expected: DataSink,
+    ) -> DataSink:
+        if runtime_environment is None:
+            return expected
+        return self._tool_data_sink(
+            server_id,
+            spec,
+            tool,
+            runtime_environment,
         )
 
     def _list_tools_data_sink(
@@ -2167,6 +2291,7 @@ class McpPrimitive:
         snapshot = snapshot_executable(
             resolved,
             sibling_limit=self.config.tools.executable_snapshot_sibling_limit,
+            sibling_policy="scripts",
         )
         actual = {
             "path": snapshot.source_path.as_posix(),
@@ -2785,11 +2910,22 @@ class McpPrimitive:
             value = to_jsonable(value)
         if isinstance(value, dict):
             _reject_unknown_fields(value, _SERVER_FIELDS, context="MCP server")
-            transport = str(value.get("transport", "") or "").strip()
-            server_id = self._required(value, "server_id", "MCP server")
+            transport = self._required_string(
+                value,
+                "transport",
+                "MCP server",
+            ).strip()
+            server_id = self._required_string(
+                value,
+                "server_id",
+                "MCP server",
+            )
             spec = McpServerSpec(
-                schema_version=int(value.get("schema_version", 1)),
-                server_id=str(server_id),
+                schema_version=self._coerce_positive_int(
+                    value.get("schema_version", 1),
+                    "schema_version",
+                ),
+                server_id=server_id,
                 transport=transport,
                 # Preserve every supplied transport block through canonical
                 # coercion. _validate_server owns the strict tagged-union
@@ -2805,7 +2941,10 @@ class McpPrimitive:
                     if value.get("http") is not None
                     else None
                 ),
-                tools=[self._tool_spec(item) for item in list(value.get("tools") or [])],
+                tools=[
+                    self._tool_spec(item)
+                    for item in self._list_field(value, "tools", "MCP server")
+                ],
                 timeout_s=self._coerce_positive_float(value.get("timeout_s", self.config.mcp.timeout_s), "timeout_s"),
                 max_request_bytes=self._coerce_positive_int(
                     value.get("max_request_bytes", self.config.mcp.max_request_bytes),
@@ -2815,7 +2954,7 @@ class McpPrimitive:
                     value.get("max_response_bytes", self.config.mcp.max_response_bytes),
                     "max_response_bytes",
                 ),
-                metadata=dict(value.get("metadata") or {}),
+                metadata=self._mapping_field(value, "metadata", "MCP server"),
             )
         else:
             raise ValidationError("MCP server must be an object")
@@ -2826,11 +2965,23 @@ class McpPrimitive:
         if not isinstance(value, dict):
             raise ValidationError("MCP stdio transport requires stdio object")
         _reject_unknown_fields(value, _STDIO_FIELDS, context="MCP stdio")
+        args = self._list_field(value, "args", "MCP stdio")
+        if any(type(item) is not str for item in args):
+            raise ValidationError("MCP stdio args must be a list of strings")
+        environment = self._mapping_field(value, "env", "MCP stdio")
+        if any(
+            type(name) is not str or type(host_name) is not str
+            for name, host_name in environment.items()
+        ):
+            raise ValidationError("MCP stdio env must map strings to strings")
+        cwd = value.get("cwd")
+        if cwd is not None and type(cwd) is not str:
+            raise ValidationError("MCP stdio cwd must be a string or null")
         return McpStdioTransportSpec(
-            command=str(value.get("command", "")),
-            args=[str(item) for item in list(value.get("args") or [])],
-            env={str(name): str(host_name) for name, host_name in dict(value.get("env") or {}).items()},
-            cwd=str(value["cwd"]) if value.get("cwd") is not None else None,
+            command=self._required_string(value, "command", "MCP stdio"),
+            args=list(args),
+            env=dict(environment),
+            cwd=cwd,
         )
 
     def _http_spec(self, value: Any) -> McpHttpTransportSpec:
@@ -2838,20 +2989,29 @@ class McpPrimitive:
             raise ValidationError("MCP streamable_http transport requires http object")
         _reject_unknown_fields(value, _HTTP_FIELDS, context="MCP HTTP")
         return McpHttpTransportSpec(
-            url=str(value.get("url", "")),
-            headers=self._header_specs(value.get("headers") or {}),
+            url=self._required_string(value, "url", "MCP HTTP"),
+            headers=self._header_specs(
+                self._mapping_field(value, "headers", "MCP HTTP")
+            ),
         )
 
     def _tool_spec(self, value: Any) -> McpToolSpec:
         if not isinstance(value, dict):
             raise ValidationError("MCP tools entries must be objects")
         _reject_unknown_fields(value, _TOOL_FIELDS, context="MCP tool")
+        rollback_status = value.get("rollback_status")
+        if rollback_status is not None and type(rollback_status) is not str:
+            raise ValidationError("MCP tool rollback_status must be a string or null")
         return McpToolSpec(
-            tool_id=str(self._required(value, "tool_id", "MCP tool")),
-            mcp_name=str(self._required(value, "mcp_name", "MCP tool")),
-            right=str(self._required(value, "right", "MCP tool")),
-            rollback_class=str(self._required(value, "rollback_class", "MCP tool")),
-            rollback_status=value.get("rollback_status"),
+            tool_id=self._required_string(value, "tool_id", "MCP tool"),
+            mcp_name=self._required_string(value, "mcp_name", "MCP tool"),
+            right=self._required_string(value, "right", "MCP tool"),
+            rollback_class=self._required_string(
+                value,
+                "rollback_class",
+                "MCP tool",
+            ),
+            rollback_status=rollback_status,
             state_mutation=self._coerce_bool(
                 self._required(value, "state_mutation", "MCP tool"),
                 "state_mutation",
@@ -2860,8 +3020,8 @@ class McpPrimitive:
                 self._required(value, "information_flow", "MCP tool"),
                 "information_flow",
             ),
-            input_schema=dict(value.get("input_schema") or {}),
-            metadata=dict(value.get("metadata") or {}),
+            input_schema=self._mapping_field(value, "input_schema", "MCP tool"),
+            metadata=self._mapping_field(value, "metadata", "MCP tool"),
         )
 
     def _validate_server(self, server: McpServerSpec) -> None:
@@ -2901,19 +3061,61 @@ class McpPrimitive:
     def _validate_stdio(self, stdio: McpStdioTransportSpec | None) -> None:
         if stdio is None:
             raise ValidationError("MCP stdio transport requires stdio configuration")
+        self._validate_stdio_command(stdio)
+        self._validate_stdio_args(stdio)
+        self._validate_stdio_environment(stdio)
+        self._validate_stdio_cwd(stdio)
+
+    @staticmethod
+    def _validate_stdio_command(stdio: McpStdioTransportSpec) -> None:
         command = stdio.command.strip()
         if not command:
             raise ValidationError("MCP stdio command must be non-empty")
-        if command != stdio.command or any(char.isspace() for char in command) or any(char in command for char in "\r\n;&|<>"):
+        if (
+            command != stdio.command
+            or any(char.isspace() for char in command)
+            or any(char in command for char in "\r\n;&|<>")
+        ):
             raise ValidationError("MCP stdio command must be a single argv token, not a shell string")
+        if command.startswith("~"):
+            raise ValidationError(
+                "MCP stdio command must not use Host home-directory expansion"
+            )
+        if not _MCP_WINDOWS:
+            return
+        windows_path = PureWindowsPath(command)
+        path_qualified = (
+            windows_path.is_absolute() or "/" in command or "\\" in command
+        )
+        if (
+            path_qualified
+            and windows_path.suffix.casefold()
+            not in _MCP_WINDOWS_EXECUTABLE_SUFFIXES
+        ):
+            raise ValidationError(
+                "Windows MCP stdio executables must end in .exe or .com"
+            )
+        if not path_qualified and not {"PATH", "PATHEXT"}.issubset(stdio.env):
+            raise ValidationError(
+                "Windows MCP stdio bare commands require manifest-mapped "
+                "child PATH and PATHEXT"
+            )
+
+    @staticmethod
+    def _validate_stdio_args(stdio: McpStdioTransportSpec) -> None:
         for arg in stdio.args:
             if not isinstance(arg, str) or "\x00" in arg:
                 raise ValidationError("MCP stdio args must be strings without NUL bytes")
+
+    def _validate_stdio_environment(self, stdio: McpStdioTransportSpec) -> None:
         for child_name, host_name in stdio.env.items():
             self._validate_env_name(child_name, "stdio env name")
             self._validate_env_name(host_name, "stdio env source")
             if not self._env_allowed(host_name, self.config.mcp.stdio_env_allowlist):
                 raise ValidationError(f"MCP stdio env source is not allowlisted: {host_name}")
+
+    @staticmethod
+    def _validate_stdio_cwd(stdio: McpStdioTransportSpec) -> None:
         if stdio.cwd is not None:
             raw = stdio.cwd.replace("\\", "/").strip()
             if not raw or PurePosixPath(raw).is_absolute() or PureWindowsPath(raw).is_absolute():
@@ -2970,6 +3172,8 @@ class McpPrimitive:
             raise ValidationError("MCP headers must be an object")
         headers: dict[str, McpHeaderSpec] = {}
         for name, spec in value.items():
+            if type(name) is not str:
+                raise ValidationError("MCP header names must be strings")
             if not isinstance(spec, dict):
                 raise ValidationError(f"MCP header {name} must be an object")
             _reject_unknown_fields(
@@ -2977,10 +3181,16 @@ class McpPrimitive:
                 _HEADER_FIELDS,
                 context=f"MCP header {name}",
             )
-            headers[str(name)] = McpHeaderSpec(
-                env=str(self._required(spec, "env", f"MCP header {name}")),
-                prefix=str(spec.get("prefix", "")),
-                suffix=str(spec.get("suffix", "")),
+            prefix = spec.get("prefix", "")
+            suffix = spec.get("suffix", "")
+            if type(prefix) is not str or type(suffix) is not str:
+                raise ValidationError(
+                    f"MCP header {name} prefix and suffix must be strings"
+                )
+            headers[name] = McpHeaderSpec(
+                env=self._required_string(spec, "env", f"MCP header {name}"),
+                prefix=prefix,
+                suffix=suffix,
             )
         return headers
 
@@ -2988,6 +3198,43 @@ class McpPrimitive:
         if key not in value:
             raise ValidationError(f"{context} requires {key}")
         return value[key]
+
+    def _required_string(
+        self,
+        value: dict[str, Any],
+        key: str,
+        context: str,
+    ) -> str:
+        selected = self._required(value, key, context)
+        if type(selected) is not str:
+            raise ValidationError(f"{context} {key} must be a string")
+        return selected
+
+    @staticmethod
+    def _mapping_field(
+        value: dict[str, Any],
+        key: str,
+        context: str,
+    ) -> dict[str, Any]:
+        if key not in value:
+            return {}
+        selected = value[key]
+        if not isinstance(selected, dict):
+            raise ValidationError(f"{context} {key} must be an object")
+        return dict(selected)
+
+    @staticmethod
+    def _list_field(
+        value: dict[str, Any],
+        key: str,
+        context: str,
+    ) -> list[Any]:
+        if key not in value:
+            return []
+        selected = value[key]
+        if not isinstance(selected, list):
+            raise ValidationError(f"{context} {key} must be an array")
+        return list(selected)
 
     def _validate_header_name(self, name: str) -> None:
         lowered = name.lower()
@@ -3009,23 +3256,61 @@ class McpPrimitive:
         server: McpServerSpec,
         *,
         host_environment: Mapping[str, str] | None = None,
+        pinned_stdio_environment: Mapping[str, str] | None = None,
     ) -> Mapping[str, str]:
-        selected_host_environment = (
-            dict(os.environ)
-            if host_environment is None
-            else host_environment
+        selected_host_environment = self._runtime_environment_input_snapshot(
+            server,
+            host_environment=host_environment,
+            pinned_stdio_environment=pinned_stdio_environment,
         )
         return self._runtime_environment_from_host(
             server,
             selected_host_environment,
+            pinned_stdio_environment=pinned_stdio_environment,
         )
+
+    def _runtime_environment_input_snapshot(
+        self,
+        server: McpServerSpec,
+        *,
+        host_environment: Mapping[str, str] | None = None,
+        pinned_stdio_environment: Mapping[str, str] | None = None,
+    ) -> Mapping[str, str]:
+        source = os.environ if host_environment is None else host_environment
+        pinned_stdio = pinned_stdio_environment or {}
+        names: set[str] = set()
+        pinned_host: dict[str, str] = {}
+        if server.transport == "stdio" and server.stdio is not None:
+            names.update(_MCP_PLATFORM_ENV_KEYS)
+            pinned_host = {
+                server.stdio.env[child_name]: value
+                for child_name, value in pinned_stdio.items()
+                if child_name in server.stdio.env
+            }
+            names.update(
+                host_name
+                for host_name in server.stdio.env.values()
+                if host_name not in pinned_host
+            )
+        elif server.transport == "streamable_http" and server.http is not None:
+            names.update(header.env for header in server.http.headers.values())
+        names.difference_update(pinned_host)
+        selected = dict(pinned_host)
+        for name in sorted(names):
+            resolved = source.get(name)
+            if resolved is not None:
+                selected[name] = resolved
+        return MappingProxyType(selected)
 
     def _runtime_environment_from_host(
         self,
         server: McpServerSpec,
         host_environment: Mapping[str, str],
+        *,
+        pinned_stdio_environment: Mapping[str, str] | None = None,
     ) -> Mapping[str, str]:
         resolved_environment: dict[str, str] = {}
+        pinned_stdio = pinned_stdio_environment or {}
         if server.transport == "stdio" and server.stdio is not None:
             # Windows needs these bootstrap variables to create a child
             # process.  Capture them at the primitive boundary alongside the
@@ -3039,7 +3324,9 @@ class McpPrimitive:
                     raise ValidationError(f"MCP stdio env {name} contains NUL byte")
                 resolved_environment[name] = resolved
             for child_name, host_name in server.stdio.env.items():
-                resolved = host_environment.get(host_name)
+                resolved = pinned_stdio.get(child_name)
+                if resolved is None:
+                    resolved = host_environment.get(host_name)
                 if resolved is None:
                     raise ValidationError(f"missing environment variable for MCP stdio env {child_name}: {host_name}")
                 if "\x00" in resolved:
@@ -3138,21 +3425,17 @@ class McpPrimitive:
         return value
 
     def _coerce_positive_float(self, value: Any, field: str) -> float:
-        try:
-            selected = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError(f"MCP {field} must be a number") from exc
+        if type(value) not in {int, float}:
+            raise ValidationError(f"MCP {field} must be a number")
+        selected = float(value)
         if not math.isfinite(selected) or selected <= 0:
             raise ValidationError(f"MCP {field} must be > 0")
         return selected
 
     def _coerce_positive_int(self, value: Any, field: str) -> int:
-        if isinstance(value, bool):
+        if type(value) is not int:
             raise ValidationError(f"MCP {field} must be an integer")
-        try:
-            selected = int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError(f"MCP {field} must be an integer") from exc
+        selected = value
         if selected <= 0:
             raise ValidationError(f"MCP {field} must be > 0")
         return selected
@@ -3253,7 +3536,13 @@ class McpPrimitive:
             "right": tool.right,
             "resource": self.tool_resource(server_id, tool.tool_id),
             "rollback_class": tool.rollback_class,
-            "rollback_status": tool.rollback_status,
+            "rollback_status": (
+                tool.rollback_status
+                if tool.rollback_status is not None
+                else default_external_effect_rollback_status(
+                    ExternalEffectRollbackClass(tool.rollback_class)
+                ).value
+            ),
             "state_mutation": tool.state_mutation,
             "information_flow": tool.information_flow,
             "input_schema": tool.input_schema,

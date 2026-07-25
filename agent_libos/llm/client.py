@@ -566,7 +566,14 @@ class LLMClient:
         self._validate_base_url_policy()
         if not self.model:
             raise LLMError("OPENAI_LANGUAGE_MODEL or OPENAI_MODEL is not configured")
-        api_key = self.api_key or os.getenv(self.api_key_env)
+        # Profile-registry and ``from_env`` callers pass a frozen credential
+        # value together with ``inherit_ambient_openai_sdk_config=False``.  In
+        # that mode a missing/empty value must remain missing: consulting the
+        # environment here would let a credential introduced after profile
+        # authorization change the provider account at lazy SDK construction.
+        api_key = self.api_key
+        if not api_key and self.inherit_ambient_openai_sdk_config:
+            api_key = os.getenv(self.api_key_env)
         if not api_key:
             raise LLMError(f"{self.api_key_env} is not configured")
 

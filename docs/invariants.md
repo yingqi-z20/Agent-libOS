@@ -257,9 +257,11 @@ longer defines.
   authority reservations, operation links, events, and audit commit or roll
   back as one unit, so an evidence-sink failure cannot publish a partial Human
   authority transition.
-- `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
-  including shell policy capability effects and finite-use leases, sandboxed,
-  process-local, cached-only at runtime, and syscall-mediated. JIT lifecycle
+- `shell-and-jit-containment`: native Shell execution is argv-constrained and
+  remains behind Shell policy, capability/effect checks, and finite-use leases;
+  it is a Host subprocess boundary, not the Deno JIT sandbox. Deno JIT
+  candidates are separately sandbox-validated, process-local, cached-only at
+  runtime, and mediated through primitive syscalls. JIT lifecycle
   rows/aliases/handles commit atomically, composite failures discard unpublished
   candidates, and cancellation terminates the isolated Deno process group or a
   verified discovered-tree fallback while incomplete cleanup fails closed;
@@ -321,8 +323,13 @@ longer defines.
   before `LIMIT`; missing or malformed required 0.3 visibility state fails
   closed instead of being repaired during open.
 - `tool-observability-redacts-sensitive-payloads`: tool audit/event
-  observability stores bounded preview, hash, size, and truncation metadata
-  instead of raw sensitive args or results.
+  observability redacts known structured payload/credential keys plus recognized
+  scalar credential forms, URI/DSN userinfo, and HTTP Cookie headers before it
+  stores bounded preview, hash, size, and truncation metadata. The hash covers
+  the redacted projection, not the secret-bearing source. This is a
+  defense-in-depth, syntax-aware filter rather than a claim that arbitrary
+  opaque strings can always be identified as secrets; evidence producers must
+  still use the typed sensitive fields or sanitize provider-specific formats.
 - `jit-security-does-not-rely-on-static-blacklist`: JIT safety is enforced by
   Deno no-permission isolation, libOS syscalls, capabilities, human approval,
   and budgets rather than dangerous API regex blacklists. Unsupported
@@ -336,8 +343,9 @@ longer defines.
   unbounded result persistence while preserving committed side effects as
   explicit omitted-success results instead of retryable failures.
 - `workflow-entry-uses-toolbroker-authority`: user-facing workflow entrypoints
-  run tools through process tool tables, ToolBroker, result objects, and normal
-  wait/exit/exec lifecycle semantics.
+  run tools from complete process tables rather than model projections, while
+  retaining ToolBroker, result-object, and normal wait/exit/exec lifecycle
+  semantics.
 - `process-message-waits-are-race-free`: an empty blocking mailbox read and its
   wait registration are atomic with message posting, so a concurrent matching
   post either satisfies the read or wakes the registered process. Message row,
@@ -556,7 +564,7 @@ longer defines.
   The HTTP endpoint acknowledges success only after completed Runtime teardown,
   while process exit fails visibly if bounded retries still fail.
 - `gui-local-control-surface-is-origin-bound`: browser CORS accepts loopback
-  development origins and exactly `agent-libos://app` for the packaged
+  development origins and exactly `agent-libos://app` for the production
   renderer, while rejecting `null` and every other custom origin.
 - `object-task-entry-uses-toolbroker-and-object-authority`: Object-bound
   background tasks run tools through ToolBroker, process tool tables, Object
@@ -598,19 +606,19 @@ longer defines.
   is explicit, bounded, monotonic, and transactionally audited. It accepts only
   canonical provenance-bound content-free targets and does not erase evidence
   still required by live recovery.
-- `llm-responses-state-chain-is-lossless`: OpenAI Responses state chaining
-  is opt-in and preserves every representable native tool output, including
-  parallel batches and reopened waits. Missing/extra/redacted outputs, changed
-  profile/scope/context generation, or local rollback break the chain rather
-  than continuing against guessed provider state.
+- `llm-responses-state-chain-is-lossless`: the low-level `LLMClient` sends an
+  explicitly supplied `previous_response_id` only for an official, stored
+  Responses request. Paired tool history is represented natively; unpaired or
+  unsupported output becomes bounded plain context and disables the chain. The
+  current full-snapshot AgentProcess executor does not enable this client path.
 - `llm-async-clients-are-event-loop-scoped`: real async SDK clients and their
   keep-alive pools are request-scoped and cannot cross scheduler event loops.
-- `llm-provider-state-is-scope-bound-and-nonreplayable`: provider-chain state
-  is bound to process/context plus a credential-keyed model, endpoint, API-mode,
-  and tenant fingerprint. When a credential-bound fingerprint cannot be
-  derived, requests remain stateless instead of reusing provider state. Durable
-  waits use token-scoped pending/resuming/completed CAS and synchronize restored
-  generations; an ABA
+- `llm-provider-state-is-scope-bound-and-nonreplayable`: the Runtime records
+  scope-sensitive provider fingerprints while the AgentProcess executor remains
+  stateless even when provider continuation policy is configured. The low-level
+  client does not enforce those Runtime fingerprints. Durable waits use
+  token-scoped pending/resuming/completed CAS and
+  synchronize restored generations; an ABA
   claim, post-claim exception, or interrupted reopen fails closed and is never
   auto-replayed.
 - `llm-profile-selection-is-process-local`: host-selected LLM profiles are
@@ -644,16 +652,21 @@ longer defines.
   usage is validated (including type, sign, and component consistency) and
   settled before any model-selected tool call is dispatched.
 - `subprocess-resource-profiles-are-enforced`: shell and Deno subprocess wall,
-  CPU, and RSS limits are enforced by providers and audited on exceedance; PTY
-  supervision runs independently from output reads, accumulates observed CPU by
-  process identity, and fails closed when process-tree accounting is denied.
-  Cleanup falls back to explicit descendant signaling when process-group
-  signaling is denied and serializes concurrent close attempts.
+  CPU, and RSS limits are enforced by supporting providers and audited on
+  exceedance. POSIX PTY supervision runs independently from output reads,
+  accumulates observed CPU by process identity, and fails closed when
+  process-tree accounting is denied. The Windows ConPTY backend advertises no
+  such support and rejects `SubprocessLimits` before spawn. POSIX cleanup falls
+  back to explicit descendant signaling when process-group signaling is denied
+  and serializes concurrent close attempts.
 - `skill-activation-does-not-grant-authority`: Skills change visibility and
-  prompt context without granting resources. Actor-scoped validation,
-  registration, and activation must still honor process authority and Skill
-  capability or human-approval gates; actor mode cannot invoke Host-path
-  validation. Finite-use Skill permissions are
+  prompt context without granting resources. Immutable built-in activation
+  projects an exact Image-bound subset without changing the complete table;
+  registered Skills may expand complete/model tables only through their
+  governed activation path. Actor-scoped validation, registration, and
+  activation must still honor process authority and Skill capability or
+  human-approval gates; actor mode cannot invoke Host-path validation.
+  Finite-use Skill permissions are
   reserved before a registry, trust, activation, or unload mutation and are
   committed only with that mutation. Registry/trust/audit state changes are
   transactional; failed activation cannot leave a visible JIT alias, and
@@ -831,8 +844,9 @@ longer defines.
   profile or provider deployment.
 - GUI CI covers React tests, TypeScript typechecking, production build, and the
   Python HTTP/SSE server on Ubuntu. Accessibility/usability studies, native
-  Electron lifecycle, packaging/signing/notarization, and packaged-window
-  smoke remain environment-gated.
+  Electron lifecycle, and the production-build custom-protocol BrowserWindow
+  smoke remain environment-gated. Installer packaging, signing, and
+  notarization are not configured.
 - Data-flow tests cover runtime-mediated payloads; trusted modules/providers,
   native child I/O, Sink re-forwarding, and direct RuntimeStore administration
   remain operator trust boundaries rather than containment-test guarantees.

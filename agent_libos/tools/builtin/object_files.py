@@ -28,7 +28,6 @@ class CreateObjectFromFileArgs(BaseModel):
     max_bytes: int = Field(
         default=_TOOL_DEFAULTS.object_file_max_bytes,
         ge=1,
-        le=_TOOL_DEFAULTS.object_file_hard_limit_bytes,
         description="Maximum bytes to import.",
     )
     allow_truncated: bool = Field(default=False, description="Whether to create the object if the file is truncated.")
@@ -86,6 +85,19 @@ class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
+        effective_max_bytes = min(
+            runtime.config.tools.object_file_hard_limit_bytes,
+            runtime.config.tools.filesystem_read_hard_limit_bytes,
+        )
+        if args.max_bytes > effective_max_bytes:
+            raise ToolExecutionError(
+                "max_bytes exceeds the effective Object-file read limit.",
+                code=ToolErrorCode.VALIDATION_ERROR,
+                details={
+                    "max_bytes": args.max_bytes,
+                    "effective_max_bytes": effective_max_bytes,
+                },
+            )
         cwd = runtime.process.working_directory(ctx.pid)
         path = normalize_process_path_argument(args.path, cwd)
         try:

@@ -150,8 +150,10 @@ facts in Runtime-owned prompt modes. Image registration rejects that policy for
 `disabled` records pressure but takes no action. For stateless requests,
 projected occupancy is the deterministic conservative estimate of the complete
 assembled input plus the profile's `max_tokens` output reservation. An eligible
-Responses chain additionally adds the provider-reported lower bound for retained
-history; usage from a prior stateless/chat request is not reused. In `prompt`
+Responses continuation supplied by a delta-oriented caller would additionally
+add the provider-reported lower bound for retained history; the current
+full-snapshot AgentProcess executor supplies no such continuation, and usage
+from a prior stateless/chat request is not reused. In `prompt`
 mode the Runtime applies a bounded fixed-point pass to the numeric notice, then
 re-estimates and records the exact notice-inclusive request. If that final
 request would exceed the configured context window, it records
@@ -213,29 +215,38 @@ fail unless each declared module id is already loaded with the declared
 `source_sha256`.
 
 At process creation time, the runtime resolves only the image's explicit
-`default_tools` into the process tool table. No lifecycle, Object Memory, or
-other builtin tool is implicitly added. A process can call only tools in that
-table, but visible tools still fail at primitive use if resource authority is
-missing. If an image wants LLM-facing `process_exit`, Object Memory, filesystem,
-shell, or other builtin access, it must list that tool explicitly. Internal
-runtime paths such as JIT syscalls may still call primitives directly through
-their syscall session without exposing the corresponding builtin tool to the
-model.
+`default_tools` as its initial static tool table. No lifecycle, Object Memory,
+or other builtin tool is implicitly added. Image-package JIT publication and
+later Skill/JIT activation may add process-local registrations through their
+separately validated lifecycle. A registered Skill can add globally registered
+static tools to both the complete and model tables under Skill authority; an
+immutable built-in Skill is stricter and can only project its complete
+`allowed-tools` set when every binding already exists in the Image-authorized
+table. A process can call only tools in its resulting complete table, while the
+LLM receives only the separate model projection. Either path still fails at
+primitive use if resource authority is missing. Internal runtime paths such as
+JIT syscalls may call primitives directly without exposing a corresponding
+builtin tool to the model.
 
 An image with `metadata.tool_projection: skills` initially projects only
 `discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill`, and
 `process_exit`, all of which must be present in the image's explicit
 `default_tools` or image validation fails.
 Shipped images leave `default_skills` empty. All Skill metadata is discovered
-through `discover_skills`, and `activate_skill` expands the durable model
-projection from the full process tool table only after an explicit selection.
-Discovery uses the same bounded metadata-term matching, relevance ordering,
-and `next_step` contract for every visible package source.
-An explicitly configured custom image may still declare generic
-`default_skills`; this is an image requirement, not a built-in LLM protocol.
-An immutable packaged Skill is hidden unless all its tools are present;
-activation cannot partially project a Skill, resolve absent tools, or grant
-authority.
+through `discover_skills`. Activating an immutable built-in Tool Skill copies
+its complete exact Image-owned binding set from the existing full table into the
+durable model projection. It leaves the full table and Capability set unchanged;
+the Skill is hidden and activation fails if any declared Image binding is
+missing, replaced, or absent from the current table. Partial projection is never
+accepted.
+
+A registered Skill follows a different governed path: after its registration,
+trust, and execute checks, activation may add existing static tools and validated
+process-local JIT tools to both tables. Discovery uses the same bounded
+metadata-term matching, relevance ordering, and `next_step` contract for every
+visible package source. An explicitly configured custom Image may list
+`default_skills`; that is a boot-time activation list, and any failed activation
+fails spawn/exec rather than starting a partial Image.
 
 The current built-in image contracts are:
 
@@ -247,10 +258,17 @@ The current built-in image contracts are:
 | `toolmaker-agent:v0` | Import-free Deno/TypeScript JIT proposal, validation, and registration | 5 Skill lifecycle/bootstrap schemas | configured Human write |
 | `context-compressor:v0` | Structured context compaction | `process_exit` only | none |
 
-The prompt lists only activated Skill bodies. Discovery metadata is obtained
-on demand through one source-neutral schema. Visibility remains separate from
-authority: Host calls and primitives continue to use the complete process tool
-table and Capability set, and activation does not grant primitive authority.
+“Initial model projection” is not the complete static/callable table size. In
+particular, review's read-only posture is a prompt and launch-authority contract,
+not an absence of dormant mutation bindings in its static table; those bindings
+still require Skill projection and primitive authority before model use.
+
+The prompt lists only activated Skill bodies. Discovery metadata is obtained on
+demand through one source-neutral schema. Visibility remains separate from
+authority: ToolBroker and direct workflow calls require a complete-table
+binding; model-originated calls additionally require model projection; primitive
+authorization uses Capability and policy and treats neither table as resource
+authority. Skill activation itself grants no primitive authority.
 Requirement declarations remain Task Authority Manifest inputs, not grants.
 Configured base/coding ids must also remain distinct from the fixed review,
 toolmaker, and context-compressor ids; a collision fails Runtime construction
@@ -267,50 +285,49 @@ profile inherits legacy `OPENAI_*` provider and model environment variables;
 other named profiles require explicit host profile fields for non-default
 routing.
 
-The default OpenAI posture is stateless and privacy-preserving:
-`llm.store=false` and `responses_previous_response_id=false`. Opt-in Responses
-chaining additionally requires full local I/O persistence, the official
-Responses request path, the same profile/scope fingerprint, the same non-secret
-provider-chain fingerprint, and a complete one-to-one durable output for every
-unique function `call_id` in the immediately preceding response. The provider
-fingerprint is a credential-keyed HMAC over the model, normalized official
-endpoint, API mode, API-key environment name, and organization/project tenant;
-the credential itself is never persisted. This keeps a same-identity chain
-stable across restarts while a model, credential, endpoint, or tenant change
-forces a reset. Eligible outputs, including completed parallel batches and
-waits resumed after reopen, are sent as native `function_call_output` items.
-Any missing, extra, redacted, conflicting, legacy-ambiguous, or partial output,
-or a changed image/tool/Skill/context generation, resets to stateless/plain
-context instead of guessing provider state. Context compaction advances the
-durable generation before payload replacement; checkpoint restore also advances
-it so a local rollback cannot chain to a response produced from post-checkpoint
-state.
+The default provider posture is stateless: `llm.store=false` and
+`responses_previous_response_id=false`. This limits provider-side retention; it
+is not an end-to-end privacy guarantee. By default `llm.persist_full_io=true`
+also retains full prompts, tool/reasoning records, responses, and provider error
+payloads in the RuntimeStore subject to Host retention policy and database
+access controls. Set it to `false` when that local evidence is not acceptable,
+while accounting for image modes that require durable transcript material.
 
-Provider-side chaining is also bound to the data-flow clearance fingerprint:
-the LLM Sink/profile identity, active Sink-registry generation and trust hash,
-Task Authority manifest hash, and current sensitivity/tenant/principal domain.
-A profile identity includes the effective provider retention/chaining policy,
-and precheck plus client resolution use one frozen Host snapshot; a cached
-client is rebuilt when that identity changes. A change resets to a stateless
-request. Source Object versions and inbound
-trust/integrity can change after each result without changing the provider's
-confidentiality clearance; high-sensitivity history is retained by the LLM
-context label high-water mark. The LLM request is a formal bidirectional
-protected operation, and its unclassified response is aggregated as
-`normal/untrusted` rather than replacing request labels.
+The low-level OpenAI client sends an explicitly supplied
+`previous_response_id` only for an official, stored Responses request whose
+tool history is representable. That client does not receive or enforce Runtime
+process, context, Sink, manifest, or credential fingerprints. The Runtime still
+computes and records scope-sensitive provider and data-flow fingerprints, but
+the current AgentProcess full-snapshot executor deliberately disables provider
+continuation and replays the complete locally materialized context on every
+request. Those fingerprints are observability and future-protocol inputs, not
+an enabled low-level continuation guard. Enabling
+`responses_previous_response_id` or provider storage therefore does not enable
+AgentProcess chaining today; it only changes allowed client/profile policy and
+may increase provider retention. Context compaction and checkpoint restore
+still advance durable generations so a future Runtime continuation mechanism
+can fence those boundaries. The LLM request remains a formal
+bidirectional protected operation, and an unclassified response is aggregated
+as `normal/untrusted` rather than replacing request labels.
 
 ## Data-flow state
 
 Every runtime-mediated payload exit constructs a typed `DataSink` and a
 runtime-owned `DataFlowContext`. The context contains strict labels and exact
 Object id/version/content hashes from materialization, explicit Host
-`source_oids`, and ambient process observations. External LLM, Human,
-JSON-RPC, MCP, Git, filesystem write, Shell, and PTY paths check Host Sink clearance
-before ordinary approval/provider state and revalidate immediately before
-dispatch. Prompt-visible process events contribute their trusted labels to the
-durable LLM context before this check. Process goals/messages/results and
-Object Tasks propagate the same identity domain internally without downgrading
-it.
+`source_oids`, and ambient process observations. Before resolving provider
+state, some paths perform a read-only Sink-clearance precheck that neither
+requests nor consumes a release; paths whose Sink and payload are already fully
+bound may instead request exact release at this early gate, after visibility and
+definite-denial checks. External LLM, Human, JSON-RPC, MCP, Git, filesystem
+write, Shell, and PTY protected operations still authorize or revalidate the
+final payload-bound Sink after ordinary authority decisions and immediately
+before dispatch. Prompt-visible process events contribute their trusted labels
+to that request's data-flow context before these checks, including under the
+default `source_only` policy; only the opt-in persistent LLM context object also
+records them in its durable label high-water. Process goals/messages/results
+and Object Tasks propagate the same identity domain internally without
+downgrading it.
 
 The durable Sink registry is separate from `TaskAuthorityManifest`. The
 manifest can only constrain which tenant/principal data a process may receive;
@@ -408,11 +425,17 @@ updates one process working directory and leaves other processes unchanged.
 ## Object-Bound PTY Sessions
 
 The trusted `modules/pty` runtime module can add an interactive PTY surface.
+It is a repository/source-distribution asset rather than a core-wheel module.
 `pty_create` starts the host PTY through the shell primitive's authorization
 path and returns a mutable Object Memory `EXTERNAL_REF` object id. The object
 payload records descriptive metadata such as argv, cwd, backend, dimensions,
 and creation time, but authorization for later interaction comes only from the
 current Object capability graph and the in-memory PTY registry.
+
+The local POSIX backend supervises the process tree for wall/CPU/RSS usage. The
+current Windows `pywinpty`/ConPTY backend has no Job Object or resource
+supervisor and advertises no `SubprocessLimits` support, so a budgeted PTY spawn
+fails closed before creating the child.
 
 `pty_read` requires object `read`; `pty_write` requires object `write` and the
 original session owner pid; `pty_resize` requires object `write`; `pty_close`
@@ -447,15 +470,17 @@ writes a close intent before reading the exit code and closing the handle. Once
 the exit-code read succeeds, even a later not-started close cannot abandon that
 information-flow intent.
 
-PTY spawn, write, resize, and close are external-effect operations. Each writes
-a structured pending intent before its provider boundary and conditionally
-finalizes the same effect id afterward; event/audit/finalization failure leaves
-the row pending and unknown. A spawned host session whose Object publication
-later fails is cleaned up but remains an `unknown` spawn effect with
-failure-phase and cleanup metadata. Unsupported or failing post-operation
-classification finalizes an unknown fallback rather than erasing the effect.
-The local provider classifies write/close as irreversible and resize as
-rollbackable-but-not-applied; checkpoint restore does not compensate either.
+PTY spawn, read, runtime-internal continuous ingest, write, resize, and close
+are external-effect operations. Each writes a structured pending intent before
+its provider boundary and conditionally finalizes the same effect id afterward;
+event/audit/finalization failure leaves the row pending and unknown. A spawned
+host session whose Object publication later fails is cleaned up but remains an
+`unknown` spawn effect with failure-phase and cleanup metadata. Unsupported or
+failing post-operation classification finalizes an unknown fallback rather
+than erasing the effect. The local provider classifies spawn/write/close as
+irreversible, resize as rollbackable-but-not-applied, and read/ingest as
+information-flow observations for which no rollback is required; checkpoint
+restore does not compensate the mutations.
 
 PTY sessions are not checkpointed or persisted as reconnectable host handles.
 A checkpoint or committed image may contain an `EXTERNAL_REF` row only as
@@ -810,21 +835,29 @@ state, for the restored processes.
 Checkpoint-committed images do not store or restore resource budgets or usage;
 only the caller that starts the process may set launch-time resource limits.
 
-Provider-backed work that cannot know its final byte/token usage before
-dispatch first creates a durable reservation for the maximum envelope. Normal
-settlement is exactly once and charges the measured value within that envelope;
-an unknown provider outcome charges the maximum. On startup, an active
-reservation whose linked effect is absent or still `prepared` is released as
-certified pre-dispatch, while every reservation linked to a later effect state
-is charged maximally. Recovery may take usage over budget and atomically apply
-the corresponding resource-limit termination; it does not discard ambiguous
-provider consumption to make the budget appear valid.
+Provider-backed work whose protected-operation invocation supplies
+`reservation_usage` creates a durable reservation for that maximum envelope.
+Normal settlement is exactly once and charges the measured value within the
+envelope; an unknown provider outcome charges the maximum. On startup, an
+active reservation whose linked effect is absent or still `prepared` is
+released as certified pre-dispatch, while every reservation linked to a later
+effect state is charged maximally. Recovery may take usage over budget and
+atomically apply the corresponding resource-limit termination; it does not
+discard ambiguous provider consumption to make the budget appear valid. This is
+an operation-specific SDK policy, not a guarantee for every provider call.
 
-LLM token usage is charged after provider completion using provider-reported
-usage. If a token budget exists and the provider does not return billable usage,
-returns booleans/strings/negative values, or reports a total smaller than its
-prompt-plus-completion components, the LLM action fails closed. When an LLM
-completion pushes usage over budget, the call record is retained but
+The LLM protected operation declares `ResourcePolicy.NONE`; its executor does
+separate resource accounting rather than SDK reservation/settlement. It
+preflights and later charges one LLM call, and charges token usage after provider
+completion using provider-reported usage. There is no durable call-count or
+maximum-token reservation before dispatch, so the corresponding limits are not
+hard caps on provider work already admitted: an abrupt host failure after
+dispatch but before post-attempt charging can leave the provider's call or token
+usage uncharged. If a
+token budget exists and the provider does not return billable usage, returns
+booleans/strings/negative values, or reports a total smaller than its
+prompt-plus-completion components, the completed LLM action fails closed. When
+an LLM completion pushes usage over budget, the call record is retained but
 model-selected tools are not dispatched.
 Context materialization has both a per-call cap
 (`max_context_materialization_tokens`) and a separate cumulative budget
@@ -1005,7 +1038,8 @@ holds them.
 and goal-only memory. It does not inherit parent-activated Skills or broad
 external authority by default.
 
-`exec_process` replaces the current image and tool table without changing pid.
+`exec_process` replaces the current image, complete tool table, model projection,
+and Image-selected Skill state without changing pid.
 It never grants the target image's declared required capabilities
 automatically. Existing external capabilities are preserved only when explicitly
 requested; otherwise exec shrinks external authority.
@@ -1067,8 +1101,14 @@ erase or cross it, while a Host `ProcessManager.resume` clears it deliberately.
 
 ## Process Exit
 
-`process_exit` marks a process as `exited` or `failed` and can attach a final
-Object Memory result. A root process releases its process-owned memory on exit
+The built-in `process_exit` tool requests the `exited` state and can attach a
+final Object Memory result. For an image with cumulative completion review, an
+attempt can instead return `status="completion_review_required"` without making
+the process terminal; the caller must address the review and retry with its
+fresh token and evidence. The trusted Host API
+`ProcessManager.exit(..., failed=True)` is the separate path that can mark a
+process `failed`; the model-facing tool has no failure-state argument. A root
+process releases its process-owned memory on terminal exit
 except for any retained result. A non-root terminal child's process-owned
 memory remains available for its direct parent to merge or discard, and is
 released if that parent terminates without adopting it. Cleanup follows
@@ -1085,4 +1125,10 @@ audit sink remains available.
 
 When a Deno JIT tool calls `process.exit` or `process.exec`, the syscall records
 a deferred lifecycle change. The runtime applies that change only after the JIT
-tool returns its normal tool result.
+tool returns its normal tool result. An image with cumulative completion review
+rejects the direct `process.exit` syscall; it must exit through the built-in
+`process_exit` tool so review, freshness, and evidence validation cannot be
+bypassed. If one JIT call defers both exec and exit, the runtime checks both the
+active and target images before either lifecycle change. A standalone authorized
+exec still adopts the target image's completion contract for later quanta; the
+source gate is not permanently inherited.

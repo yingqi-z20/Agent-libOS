@@ -57,18 +57,45 @@ Run all deterministic Python lanes:
 uv run python scripts/test_matrix.py --lane all
 ```
 
+### Isolated AgentDojo harness
+
+AgentDojo has a separate dependency environment so its SDK graph does not enter
+the root lock. Run its deterministic harness tests from the subproject:
+
+```bash
+cd experiments/agentdojo
+uv sync --frozen
+uv run --frozen pytest -q
+```
+
+The subproject's `pyproject.toml` and `uv.lock` cover Python 3.11–3.12. CI runs
+the commands above on both versions, and the release-artifact job waits for that
+matrix. The root `scripts/test_matrix.py` lanes do not collect these tests.
+These deterministic tests make no provider calls; follow the explicit
+credential/token gate in the [AgentDojo harness guide](../experiments/agentdojo/README.md)
+for a real-model evaluation.
+
 Optional provider gates are excluded unless selected explicitly:
 
 ```bash
 uv sync --frozen --all-groups --extra mcp
-uv run python scripts/test_matrix.py --lane providers --run-mcp
-uv run python scripts/test_matrix.py --lane all --run-real-llm
+uv run python -m pytest -q tests/providers/test_mcp_sdk_integration.py \
+  --run-mcp --fail-on-skip
+uv run python -m pytest -q \
+  tests/self_evolution/test_builtin_agent_images_real_llm.py \
+  --run-real-llm --fail-on-skip
 uv sync --frozen --all-groups --extra postgres
-uv run python -m pytest -m postgres --run-postgres
+uv run python -m pytest -m postgres --run-postgres --fail-on-skip
 ```
 
 The real-LLM command may consume paid provider tokens and requires the Host
 environment described below. PostgreSQL requires a configured test service.
+`--fail-on-skip` is intentional on these evidence commands: a missing SDK,
+credential, server, or service must not turn an all-skipped provider gate into a
+green release result. Omit it only for exploratory local runs whose skips are
+being reported rather than claimed as validation. `--fail-on-skip` is a pytest
+option, not a `scripts/test_matrix.py` option; use the direct, scoped pytest
+commands above when collecting no-skip evidence.
 
 Use pytest-xdist workers for faster local Python feedback:
 
@@ -149,8 +176,10 @@ uv run python experiments/collect_metrics.py .benchmark_runs/docs-smoke
 
 ## Release Artifacts
 
-The core Python wheel contains only the `agent_libos` package and its two
-console entrypoints. The source distribution additionally contains the
+The core Python wheel contains only the `agent_libos` package and its three
+console entrypoints: `agent-libos`, `agent-libos-gui-server`, and the explicit
+offline `agent-libos-migrate-tool-groups` migration command. The source
+distribution additionally contains the
 repository-level PTY module, example Skill and Image packages, benchmarks,
 tests, and documentation. Electron sources remain repository-checkout assets
 validated by the separate GUI lane. Validate that contract before a release:
@@ -163,8 +192,8 @@ uv run python scripts/check_release_artifacts.py dist
 The artifact checker requires the Python package, project metadata, and
 lockfile versions to agree; when GUI sources are present, both GUI package
 versions must agree as well. CI installs the built wheel and source
-distribution into fresh environments, checks dependency consistency, runs both
-wheel entrypoint help commands from outside the source tree, executes the
+distribution into fresh environments, checks dependency consistency, runs all
+three entrypoint help commands from outside the source tree, executes the
 deterministic demo against an in-memory store, and preserves the validated
 distributions for release use.
 
@@ -233,14 +262,24 @@ it includes real provider latency plus Deno validation and registration; the
 other cases retain the ordinary test timeout. These tests spend provider tokens
 and are not part of the deterministic default matrix.
 
-Official OpenAI Responses requests may also be configured with
-privacy-preserving `safety_identifier`, prompt-cache routing fields, and
-opt-in `previous_response_id` chaining. The runtime keeps `llm.store=False` and
-Responses state chaining disabled by default; enable both only when retaining
-provider-side response state is acceptable. These OpenAI-specific fields are
-not sent to custom OpenAI-compatible endpoints. In the default stateless mode,
-prior tool messages are sent back as ordinary bounded context text and no
-durable provider-chain tool-output row is written.
+OpenAI-compatible Responses and Chat requests may also be configured with a
+`safety_identifier` and prompt-cache routing fields. These options are sent to
+the explicitly selected endpoint, including a custom OpenAI-compatible base
+URL; compatibility retry may remove an option only after that provider rejects
+it. Do not configure an identifier or cache key that the selected provider is
+not trusted to receive. `previous_response_id` is narrower: the low-level
+client sends it only for the official Responses endpoint, with `store=true`,
+and only when the caller explicitly supplies an eligible id.
+
+The AgentProcess executor is stateless even if a profile configures
+`store=true` and `responses_previous_response_id=true`. It rebuilds the complete
+local snapshot, records the configured-but-disabled reason in `llm_calls`, and
+never combines that snapshot with `previous_response_id`. For ordinary Runtime
+prompt modes, prior tool results are represented in the rebuilt bounded local
+context. An `image_only` Image instead replays its paired tool transcript in the
+provider's native form without provider-side chaining: Responses receives
+`function_call`/`function_call_output` input items, while Chat receives
+assistant/tool messages.
 
 Real asynchronous SDK transports are request-scoped. Scheduler quanta and
 parallel process workers may use different short-lived event loops, so a cached
@@ -250,25 +289,13 @@ retained across requests and are closed only when that wrapper, or the profile
 registry that owns it, shuts down. The injector is responsible for using them
 only with a compatible event-loop lifetime.
 
-A provider-side chain is eligible only for the official Responses API with
-`store=true`, `responses_previous_response_id=true`, and
-`persist_full_io=true`. The preceding call must use the same LLM profile and
-response-scope fingerprint (process, image, tool table, loaded Skill snapshot,
-and durable context generation). It must also match a non-secret,
-credential-keyed HMAC over the model, normalized official endpoint, API mode,
-API-key environment name, credential identity, and organization/project tenant.
-The credential is not stored; changing any provider/account identity input
-forces a stateless reset, while an unchanged identity remains comparable after
-restart. The preceding function-call manifest must contain unique non-empty
-`call_id` values, and durable outputs must exist for every call and no extra
-call. Only then does Agent libOS send the outputs as native
-`function_call_output` items and set `previous_response_id`. This includes
-sequentially executed parallel-tool batches and a wait result completed after a
-runtime reopen. Missing/redacted/conflicting/partial output, changed scope or
-provider identity, context compaction/restore, legacy ambiguous rows, or any
-unrepresentable tool message resets unconditionally to a stateless
-request/plain-context fallback; the runtime never continues a guessed provider
-chain.
+The low-level `LLMClient` still supports delta-oriented callers that explicitly
+pass `previous_response_id`. That path is restricted to the official Responses
+API with `store=true`; representable paired tool history can be emitted as
+native `function_call_output` items, while an unpaired or unsupported tool
+message is rendered as bounded plain user context and prevents chaining. This
+client capability is not an AgentProcess continuation contract and does not
+create Runtime `llm_tool_outputs` rows by itself.
 
 Blocking LLM-selected human, child, and message actions are durable. Each wait
 generation has a unique `resume_token`; resume atomically claims
@@ -402,6 +429,13 @@ also applies before dispatch to conditional LLM release rows; `request_messages`
 `egress_payload`, and the rest of the prepared provider request are never
 written to `llm_pending_actions.action_json` in opt-out mode.
 
+This opt-out is intentionally incompatible with `prompt_mode: image_only`.
+Custom Image packages default to `image_only`, whose next quantum must recover
+the exact latest native assistant/tool transcript after a Runtime reopen; such a
+process fails before provider dispatch when full-I/O persistence is disabled.
+Select a Runtime-owned prompt mode instead if content-free LLM-call persistence
+is a deployment requirement.
+
 The default remains `llm.persist_full_io: true` for deployments that use
 complete LLM call records for self-evolution training or fine-tuning.
 
@@ -514,10 +548,11 @@ Current behavior must not claim:
 - provider-level compensation for rollbackable external side effects,
 - Skill activation as a capability grant.
 
-`agent_libos_design_doc.md` remains a historical archive and can be stale.
-`plan.md` is a dated paper roadmap; keep it useful for planning, but do not use
-it as the implementation reference for current command syntax or runtime
-behavior.
+`agent_libos_design_doc.md` and `plan.md` are retained only as historical design
+and planning records. They intentionally contain superseded interfaces and are
+not part of the current user-documentation contract. Do not use either file for
+current command syntax, authorization behavior, security guarantees, runtime
+semantics, or release evidence.
 
 ## Adding Runtime Code
 

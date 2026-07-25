@@ -63,8 +63,14 @@ instead of relying on one-way `ContextVar` copying.
 
 ## Sink trust registry
 
-Unmatched Sinks are `untrusted` with a hard `normal` maximum. Host configuration
-may publish exact or terminal-`*` rules:
+Unmatched Sinks use the configured defaults and are `untrusted`. For every
+`untrusted` Sink, whether unmatched or selected by an explicit rule, the
+effective sensitivity ceiling is `min(selected_max_sensitivity, normal)`, where
+the selected maximum comes from the matched rule or the default. A `public`
+rule/default therefore tightens the ceiling to `public`, while no `untrusted`
+rule can raise it above `normal`. This is a Sink egress ceiling; the
+`normal/untrusted` labels applied to unclassified ingress do not select or
+widen a Sink rule. Host configuration may publish exact or terminal-`*` rules:
 
 ```yaml
 data_flow:
@@ -95,7 +101,7 @@ content changes that hash, so the old rule no longer matches.
 
 | Trust level | Automatic send | One-shot release | Hard maximum |
 | --- | --- | --- | --- |
-| `untrusted` | `public`/`normal` | cannot elevate | `normal` |
+| `untrusted` | within its effective ceiling | cannot elevate | `min(rule/default maximum, normal)` |
 | `conditional` | `public`/`normal` | required above `normal` | rule maximum |
 | `trusted` | within rule clearance | not needed | rule maximum |
 
@@ -129,7 +135,7 @@ and unregister from changing the registry.
 
 | Exit | Sink identity | Additional binding |
 | --- | --- | --- |
-| LLM | `llm:<profile-id>` | profile/model/endpoint/API-mode plus effective store, prompt-cache-retention, and Responses-chaining identity hash |
+| LLM | `llm:<profile-id>` | profile/model/endpoint/API-mode plus effective store, prompt-cache-retention, and Responses-continuation-policy identity hash |
 | Human | `human:<recipient>:<channel>` | exact recipient and channel |
 | Human GUI projection | `human:<recipient>:gui` | complete gate-independent serialized public view (including status and decision) plus GUI presentation operation; trust aliases the configured Human terminal identity |
 | JSON-RPC | `jsonrpc:<endpoint-id>:<method-id>` | endpoint plus method manifest hash |
@@ -138,7 +144,7 @@ and unregister from changing the registry.
 | File | `filesystem:workspace:<normalized-path>` | canonical workspace path |
 | Git local mutation/fetch | configured `git.repository_resource` (default `git:workspace`) | repository/worktree identity plus expected state token; fetch also binds the existing remote fingerprint |
 | Git push | `git_remote:workspace:<remote>` | fetch/push URL hashes, effective config/helper identities, selected refs, and expected old remote OID |
-| Simulated Git PR | `git_pr:workspace:<pr-id>` | repository-local metadata hash plus immutable base/head snapshot OIDs |
+| Simulated Git PR | `git_pr:workspace:<pr-id>` | repository-local metadata hash plus immutable base/head snapshot OIDs; create and merge also authorize the configured `git.repository_resource` as an additional Sink because they mutate repository state |
 | Shell | `shell:<resolved-executable>` | resolved path plus executable content hash; mutable workspace executables dispatch from a Host-owned content snapshot |
 | PTY spawn | `pty:spawn:<resolved-executable>` | resolved path/content hash fixed at session creation; mutable workspace executables dispatch from a Host-owned content snapshot |
 | PTY input/control | `pty:session:<session-id>` | aliases the immutable content-bound spawn trust identity |
@@ -147,6 +153,18 @@ and unregister from changing the registry.
 `context_window_tokens` is a local LLM scheduling bound, not a Provider/Sink
 identity component. Changing only that value therefore does not invalidate an
 otherwise identical trusted LLM Sink rule.
+
+Each live PTY session keeps a monotonic data-flow high-water of labels and
+Object source references, seeded by the spawn request. A successful write or
+resize, and a write, resize, or close whose provider mutation may have started
+but whose outcome is ambiguous, merges the caller's current context into that
+high-water; a provider-certified not-started operation does not. The session
+Object metadata mirrors the conservative labels, while exact source references
+remain in the live session context. Later input/control egress combines the
+caller's context with the session high-water; reads observe that high-water plus
+`normal/untrusted` PTY ingress, and session listing observes the high-water for
+every returned session. Control serialization prevents a read from returning
+output produced by a labeled write before that write publishes its high-water.
 
 MCP metadata-only cached discovery is public. A process-initiated live refresh
 is a bidirectional provider operation: its current flow context is checked as
@@ -159,10 +177,13 @@ same filesystem, shell, Human, JSON-RPC, MCP, and process boundaries.
 
 Git inspection is ingress from `external:git`. Local mutations and fetch are
 bidirectional protected operations, push is egress, and simulated-PR state
-transitions are bidirectional. The ordinary Git/remote/PR capability and Task
-Authority effect ceiling remain independent of Sink clearance. Mutation target
-state is the opaque repository token; remote operations additionally revalidate
-URL/config/ref fingerprints after approval and before dispatch. Patch creation
+transitions are bidirectional. Pull-request creation and merge have two real
+recipients: the PR metadata Sink and the configured repository Sink; both must
+clear the same flow context before either mutation is dispatched. The ordinary
+Git/remote/PR capability and Task Authority effect ceiling remain independent
+of Sink clearance. Mutation target state is the opaque repository token;
+remote operations additionally revalidate URL/config/ref fingerprints after
+approval and before dispatch. Patch creation
 derives the immutable `CODE_PATCH` Object from a conservative lineage: observed
 file bindings plus repository/index carriers and returned commits. Range patches
 include the current index carrier even when unrelated staged content did not
@@ -181,20 +202,30 @@ information.
 
 For egress, the runtime performs this sequence:
 
-1. Check identifier visibility and non-consuming capability policy needed to
-   avoid registry or endpoint enumeration.
-2. Construct the canonical primary Sink and every additional real recipient as
-   one ordered tuple, and require unique identities.
-3. Resolve trusted Object sources into `DataFlowContext` and perform an early
-   clearance/source-version check.
-4. Authorize Sinks in tuple order. The primary captures the Sink-registry
-   generation and every later authorization must use that same generation. A
-   conditional Sink creates only a metadata-only Human release request and
+1. Check identifier visibility and any non-consuming capability policy needed
+   to avoid registry, profile, or endpoint enumeration, and reject ordinary
+   authority that is already definitely denied.
+2. Resolve trusted Object sources into `DataFlowContext`, construct the
+   canonical primary Sink and every additional real recipient as one ordered
+   tuple, and require unique identities.
+3. Before resolving provider state, an adapter may run a read-only clearance
+   precheck; it cannot consume or request a release. Filesystem writes,
+   JSON-RPC calls, and Shell/PTY paths whose exact Sink and payload are already
+   bound instead run an early full authorization, which may request exact
+   release before a still-pending ordinary Human approval. Neither form is the
+   protected-operation dispatch revalidation.
+4. Complete the remaining ordinary capability, Task Authority, policy, and
+   approval checks. The protected-operation SDK validates the resulting
+   decisions and authorizes or revalidates the final payload against Sinks in
+   tuple order. The primary captures the Sink-registry generation and every
+   later authorization must use that same generation. A conditional Sink with
+   no matching release creates only a metadata-only Human release request and
    suspends that attempt, so later Sinks may be checked on a resumed attempt and
    multiple conditional recipients may require sequential approvals.
-5. Complete ordinary capability, Task Authority, policy, approval, and budget
-   checks.
-6. In the protected-operation transaction, revalidate registry generation,
+5. Run the remaining protected-operation preflight, including provider
+   classifier and resource checks required by that contract.
+6. In the protected-operation transaction, revalidate ordinary authority,
+   registry generation,
    Object versions/content hashes, exact payload hash, and release binding.
 7. Atomically reserve ordinary authority and every required per-Sink release
    capability and create the pending external-effect intent.
@@ -205,15 +236,16 @@ For egress, the runtime performs this sequence:
    must remain stable for the invocation, although their trust and authorization
    are still rechecked. A mismatch appends a payload-free denial. A release
    already reserved or committed by an earlier phase remains valid only through
-   that same protected-operation reservation. For Shell, PTY, and MCP stdio
-   executables in the mutable workspace, create and verify a private Host-owned
-   content snapshot before final dispatch. A bounded, all-or-nothing set of
-   direct sibling resources is linked beside that copy for ordinary relative
-   read compatibility, but remains live provider input rather than part of the
-   pinned executable identity.
+   that same protected-operation reservation. For Shell and PTY executables in
+   the mutable workspace, and for every local MCP stdio executable, create and
+   verify a private Host-owned content snapshot before final dispatch. MCP
+   native executables copy only their executable bytes; shebang scripts retain
+   the bounded, all-or-nothing direct-sibling compatibility mirror. Mirrored
+   resources remain live provider input rather than part of the pinned
+   executable identity.
 9. Only then enter DNS, provider state, filesystem state, stdio, subprocess, or
    Human payload delivery. Executable dispatch uses the snapshot rather than
-   reopening the authorized workspace path.
+   reopening the authorized source path.
 
 An early denial does not call the provider, DNS, filesystem `state()`, Human
 payload delivery, or spawn; does not consume an ordinary finite-use capability;
@@ -390,18 +422,29 @@ ceiling:
 Child manifests may inherit or narrow these sets, never widen them. Empty sets
 accept only untagged process data. Goals, messages, results, Object Tasks,
 memory merge, fork, and exec carry trusted labels; reading a secret message
-taints later goals and replies. Prompt-visible process events merge their
-runtime-carried labels into the durable LLM context high-water before provider
-dispatch. This policy cannot make an external Sink trusted and cannot reduce a
-Host rule's clearance.
+taints later goals and replies. Runtime-carried `data_labels` from every
+process event represented in a Prompt batch merge directly into that request's
+egress context before provider dispatch, including under the default
+`source_only` context policy. When the persistent LLM context object is
+enabled, those labels also merge into its durable high-water. This policy
+cannot make an external Sink trusted and cannot reduce a Host rule's clearance.
+An event that carries `data_labels` must carry the complete canonical label
+object; an empty, partial, non-object, or otherwise malformed value fails
+closed before any provider call instead of falling back to `normal` labels.
 
 SQLite and PostgreSQL share durable records for the active/versioned Sink
 registry, append-only decisions, exact release constraints, file-path label
 history/tombstones, pending LLM flow context, and provider-chain clearance
 fingerprints. Successful file writes bind the canonical path, content hash,
-labels, and sources. File ingress projects the current active record through an
-opaque, durable reference to its immutable binding ID, generation, and content
-hash; it does not restore runtime-only Object references as live dependencies.
+labels, and sources. If a file write or directory creation may have crossed its
+provider mutation boundary but returns an ambiguous outcome, the runtime still
+publishes the intended conservative binding for the target and any auto-created
+parents before surfacing the failure; a provider-certified not-started failure
+does not. This can overtaint a path that ultimately remained unchanged, but it
+prevents a later read from washing a source label. File ingress projects the
+current active record through an opaque, durable reference to its immutable
+binding ID, generation, and content hash; it does not restore runtime-only
+Object references as live dependencies.
 That exact historical binding remains valid after reopen or later replacement,
 while a missing binding or mismatched generation/content hash fails source
 revalidation before egress. Derived Object provenance keeps these opaque IDs in
@@ -435,11 +478,14 @@ reopen; a durable pending action may use the Host-written row version and label
 snapshot for domain validation, while materialization still fails and the
 operation must recover or rerun.
 
-LLM Responses chaining is opt-in and is severed when the provider identity,
-Sink/trust generation, clearance sensitivity/identity domain, Task Authority
-manifest, or context epoch changes. Changing mere source versions or
-trust/integrity without changing confidentiality clearance does not retain less
-data at the provider and therefore does not reset an otherwise valid chain.
+The Runtime computes and records continuation-related fingerprints from the
+provider identity, Sink/trust generation, clearance sensitivity/identity
+domain, Task Authority manifest, and context epoch. Changing those inputs
+changes the recorded fingerprint. The current full-snapshot AgentProcess
+executor does not use `previous_response_id` at all; it rechecks the complete
+rebuilt request on every egress. The low-level `LLMClient` does not receive or
+enforce these Runtime fingerprints, so they are observability and
+future-protocol inputs rather than a current low-level isolation boundary.
 
 Data-flow enforcement controls runtime-mediated movement; it does not encrypt
 stored payloads or automatically shorten their lifetime. The Host may

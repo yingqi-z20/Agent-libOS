@@ -797,6 +797,7 @@ class LLMProcessExecutor:
         process: Any,
         context: MaterializedContext,
         events: list[Any],
+        label_events: list[Any],
         capabilities: list[Any],
         tools: list[dict[str, Any]],
         skills: list[dict[str, Any]],
@@ -854,6 +855,14 @@ class LLMProcessExecutor:
             events,
             context_object_name=self.context_memory.object_name(pid),
             payload_max_chars=self.config.llm_context.prompt_event_payload_max_chars,
+        )
+        # Event projection is prompt content independently of the configured
+        # context-memory policy. Merge its trusted labels directly into the
+        # request flow context so source-only mode cannot omit classified
+        # off-view events from provider clearance.
+        flow_context = self.context_memory.include_event_labels(
+            flow_context,
+            label_events,
         )
         messages = self._build_model_messages(
             pid=pid,
@@ -979,6 +988,11 @@ class LLMProcessExecutor:
             budget_tokens=process.resource_budget.max_context_materialization_tokens,
             charge_resources=False,
         )
+        label_events = self._events.list(
+            target=pid,
+            limit=self.config.llm_context.recent_event_limit,
+            after_event_id=process.event_cursor,
+        )
         events = [
             replace(
                 event,
@@ -987,11 +1001,7 @@ class LLMProcessExecutor:
                 correlation_id=self._tools.redact_model_context(pid, event.correlation_id),
                 causality=self._tools.redact_model_context(pid, event.causality),
             )
-            for event in self._events.list(
-                target=pid,
-                limit=self.config.llm_context.recent_event_limit,
-                after_event_id=process.event_cursor,
-            )
+            for event in label_events
         ]
         capabilities = self._capabilities.capabilities_for(pid)
         # The prompt-visible tool list must match the process tool table. The
@@ -1013,6 +1023,7 @@ class LLMProcessExecutor:
             process=prompt_process,
             source_context=source_context,
             events=events,
+            label_events=label_events,
             capabilities=capabilities,
             tools=tools,
         )
@@ -1027,6 +1038,7 @@ class LLMProcessExecutor:
                     process=prompt_process,
                     context=context,
                     events=events,
+                    label_events=label_events,
                     capabilities=capabilities,
                     tools=tools,
                     skills=skills,
@@ -1147,6 +1159,7 @@ class LLMProcessExecutor:
         process: Any,
         source_context: MaterializedContext,
         events: list[Any],
+        label_events: list[Any],
         capabilities: list[Any],
         tools: list[dict[str, Any]],
     ) -> MaterializedContext | dict[str, Any]:
@@ -1157,6 +1170,7 @@ class LLMProcessExecutor:
                 process=process,
                 source_context=source_context,
                 events=events,
+                label_events=label_events,
                 capabilities=capabilities,
                 tools=tools,
             )
@@ -5088,7 +5102,9 @@ class LLMProcessExecutor:
 
         if not isinstance(client, LLMClient):
             return None
-        credential = client.api_key or os.getenv(client.api_key_env)
+        credential = client.api_key
+        if not credential and client.inherit_ambient_openai_sdk_config:
+            credential = os.getenv(client.api_key_env)
         if not credential:
             return None
         # URL paths are case-sensitive even though scheme/host are not.  Keep

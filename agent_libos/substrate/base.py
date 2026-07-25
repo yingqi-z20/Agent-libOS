@@ -367,12 +367,87 @@ class ExecutableSnapshot:
             pass
 
 
+def _copy_executable_snapshot_bytes(
+    source_fd: int,
+    destination_fd: int,
+) -> tuple[str, bytes]:
+    digest = hashlib.sha256()
+    header = bytearray()
+    while True:
+        chunk = os.read(source_fd, 1024 * 1024)
+        if not chunk:
+            break
+        if len(header) < 2:
+            header.extend(chunk[: 2 - len(header)])
+        digest.update(chunk)
+        remaining = memoryview(chunk)
+        while remaining:
+            written = os.write(destination_fd, remaining)
+            if written <= 0:
+                raise OSError("executable snapshot write made no progress")
+            remaining = remaining[written:]
+    return digest.hexdigest(), bytes(header)
+
+
+def _validate_executable_snapshot_source_identity(
+    selected: Path,
+    source_fd: int,
+    before: os.stat_result,
+) -> None:
+    after = os.fstat(source_fd)
+    try:
+        current = os.stat(selected, follow_symlinks=False)
+    except OSError as exc:
+        raise ValidationError(
+            f"executable identity changed while it was snapshotted: {selected}"
+        ) from exc
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+        raise ValidationError(
+            f"executable identity changed to a non-regular file: {selected}"
+        )
+    if (
+        _executable_stat_identity(before) != _executable_stat_identity(after)
+        or _executable_stat_identity(after) != _executable_stat_identity(current)
+    ):
+        raise ValidationError(
+            f"executable identity changed while it was snapshotted: {selected}"
+        )
+
+
+def _mirror_executable_snapshot_siblings(
+    selected: Path,
+    directory: Path,
+    *,
+    sibling_limit: int,
+    sibling_policy: str,
+    header: bytes,
+) -> None:
+    should_mirror = sibling_policy == "all" or (
+        sibling_policy == "scripts" and header == b"#!"
+    )
+    if should_mirror:
+        _mirror_executable_siblings(
+            selected,
+            directory,
+            sibling_limit=sibling_limit,
+        )
+
+
 def snapshot_executable(
     executable: str | Path,
     *,
     sibling_limit: int = _TOOL_DEFAULTS.executable_snapshot_sibling_limit,
+    sibling_policy: str = "all",
 ) -> ExecutableSnapshot:
-    """Copy one stable executable into a private Host-owned dispatch object."""
+    """Copy one stable executable into a private Host-owned dispatch object.
+
+    ``scripts`` mirrors the existing bounded sibling set only for a shebang
+    script.  Native executables do not need their often very large system
+    directory mirrored merely to pin the bytes that the OS will execute.
+    """
+
+    if sibling_policy not in {"all", "scripts", "none"}:
+        raise ValidationError("executable snapshot sibling policy is invalid")
 
     selected = Path(executable)
     source_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
@@ -398,54 +473,31 @@ def snapshot_executable(
         destination_flags |= getattr(os, "O_BINARY", 0)
         destination_flags |= getattr(os, "O_CLOEXEC", 0)
         destination_fd = os.open(destination, destination_flags, 0o700)
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(source_fd, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-            remaining = memoryview(chunk)
-            while remaining:
-                written = os.write(destination_fd, remaining)
-                if written <= 0:
-                    raise OSError("executable snapshot write made no progress")
-                remaining = remaining[written:]
+        digest, header = _copy_executable_snapshot_bytes(
+            source_fd,
+            destination_fd,
+        )
         os.fsync(destination_fd)
         executable_mode = stat.S_IMODE(before.st_mode) & 0o555
         if hasattr(os, "fchmod"):
             os.fchmod(destination_fd, executable_mode)
         else:  # pragma: no cover - Windows has no descriptor chmod.
             os.chmod(destination, executable_mode)
-        after = os.fstat(source_fd)
-        try:
-            current = os.stat(selected, follow_symlinks=False)
-        except OSError as exc:
-            raise ValidationError(
-                f"executable identity changed while it was snapshotted: {selected}"
-            ) from exc
-        if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
-            raise ValidationError(
-                f"executable identity changed to a non-regular file: {selected}"
-            )
-        if (
-            _executable_stat_identity(before) != _executable_stat_identity(after)
-            or _executable_stat_identity(after) != _executable_stat_identity(current)
-        ):
-            raise ValidationError(
-                f"executable identity changed while it was snapshotted: {selected}"
-            )
+        _validate_executable_snapshot_source_identity(selected, source_fd, before)
         os.close(destination_fd)
         destination_fd = None
-        _mirror_executable_siblings(
+        _mirror_executable_snapshot_siblings(
             selected,
             directory,
             sibling_limit=sibling_limit,
+            sibling_policy=sibling_policy,
+            header=header,
         )
         os.chmod(directory, 0o500)
         snapshot = ExecutableSnapshot(
             source_path=selected.resolve(strict=True),
             executable_path=destination,
-            content_sha256=digest.hexdigest(),
+            content_sha256=digest,
             directory=directory,
         )
         snapshot.verify()

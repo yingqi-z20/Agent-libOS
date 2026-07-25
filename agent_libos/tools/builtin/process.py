@@ -203,7 +203,8 @@ class ForkChildProcessArgs(BaseModel):
     mode: str = Field(
         default=ForkMode.WORKER.value,
         description=(
-            "Memory-view mode: copy uses copy-on-write, speculative uses an ephemeral view, "
+            "Memory-view mode: copy may delegate write on the same Object ids (it is not "
+            "copy-on-write isolation), speculative uses read-only ephemeral inherited roots, "
             "and restricted/worker use read-only roots."
         ),
     )

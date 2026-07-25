@@ -106,8 +106,10 @@ prior repository read. The token commits to repository/worktree identity,
 HEAD/ref state, index, effective configuration, refs, worktree registry,
 simulated-PR metadata, and bounded worktree content state. Mutation acquires a
 cross-process repository lock and compares the token again immediately before
-dispatch. Drift returns `stale_state`; success returns a new token in
-`GitOperationResult.after`.
+dispatch. Drift returns `stale_state`; success returns the post-operation
+observation token in `GitOperationResult.after`. It is a deterministic digest,
+not a freshly generated nonce, so a verified no-op or a remote-only mutation
+whose local inputs are unchanged may return the same hex value.
 
 Repository reads as well as mutations acquire the same bounded cross-process
 repository lock, so either kind of operation can fail with `repository_busy`.
@@ -143,6 +145,14 @@ corresponding `filesystem:workspace:<path>` rights. Exact path operations check
 each path. When a safe preflight cannot enumerate the affected set, the
 operation requires read/write/delete authority for the selected worktree
 subtree. Git metadata is never authorized through filesystem capabilities.
+
+Some writes contain a separately protected Git read phase and therefore need
+repository `read` in addition to their mutation right: commit preflight, clean
+candidate capture, pull when it must resolve the current branch, push lineage/
+preflight reads, and simulated-PR create/review/merge/close verification. These
+reads use the ordinary capability transaction; a finite grant can be consumed
+for each distinct protected read phase (push can perform more than one). A
+prior state token is CAS evidence, not a substitute for this read authority.
 
 The following actions require `delete` and `admin` authority plus a mandatory
 one-use Human approval bound to the exact parameters, old state token, and
@@ -339,13 +349,27 @@ runs `git apply --check` as a preview, determines affected/deleted paths, then
 applies through the typed mutation boundary. The source Object's labels flow to
 the result and affected file bindings.
 
+`git_clean` builds a bounded, hashed reconciliation manifest from `git
+ls-files` observations and also hashes Git's dry-run preview before approval,
+then recomputes both before dispatch. The path manifest is intentionally a
+conservative candidate set: for example, without `directories=true`, it may
+list files nested below an untracked directory that Git does not remove. The
+preview hash and drift check bind the decision, but neither `candidate_count`
+nor `changed_paths` certifies that every listed path was actually deleted.
+Post-operation status and literal-path inspection are required for that claim.
+
 Simulated pull requests are repository-local workflow records. Creation accepts
 only `refs/heads/*` refs (or shorthand local branch names), resolves them through
 the main checkout's repository, and requires `write` on both the PR resource and
 configured repository resource. Immutable base and head snapshots live below
 `refs/agent-libos/pull-requests/`; versioned
 metadata and review-body hashes are written atomically below the Git common
-directory. Creation captures base/head OIDs and patch hash. Review supports
+directory. To validate those hashes and preserve the local review record, the
+same metadata file also retains the PR body and each review body as plaintext.
+Inspection returns the PR body but projects review entries as hashes only; this
+output redaction is not encryption or a retention policy, and a Host or
+repository administrator with common-directory access can read the stored
+text. Creation captures base/head OIDs and patch hash. Review supports
 comment, approve, and request-changes. Close retains evidence. Merge supports
 fast-forward, merge commit, and squash. The selected worktree must be clean and
 its live HEAD ref and OID must exactly match the recorded base, while the live

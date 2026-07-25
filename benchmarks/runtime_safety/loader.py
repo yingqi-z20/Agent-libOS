@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -66,7 +67,9 @@ def load_tasks(suite_root: str | Path) -> list[BenchmarkTask]:
 
 def load_task_file(path: str | Path) -> BenchmarkTask:
     source = Path(path)
-    data = load_yaml_mapping(source.read_text(encoding="utf-8"))
+    source_bytes = source.read_bytes()
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    data = load_yaml_mapping(source_bytes.decode("utf-8"))
     _validate_required(data, source)
     schema_version = data.get("schema_version")
     if type(schema_version) is not int or schema_version != 1:
@@ -104,6 +107,7 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
         mock_actions=mock_actions,
         notes=_optional_string(data.get("notes"), source, "notes"),
         source_path=source,
+        source_sha256=source_sha256,
     )
 
 

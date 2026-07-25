@@ -159,29 +159,23 @@ real external-provider configuration has been release-validated.
 
 - Compilation, architecture/blocking-work checks, protected-operation coverage,
   release-contract checks, whitespace checks, and the invariant manifest pass.
-  All 86 declared invariants resolve against 3,762 collected pytest nodes.
+  The checker resolves every declared invariant against the current pytest
+  collection.
 - The per-lane deterministic matrix passes all selected tests. PostgreSQL
   service coverage, real MCP SDK/server integration, and real-LLM coverage
   remain in dedicated or explicit gates; deterministic mocked MCP coverage is
   part of the normal matrix. Platform-specific skips stay documented and real
   Deno runs by default when installed.
 - The PostgreSQL CI job runs the complete `postgres` marker gate against
-  PostgreSQL 17 on Python 3.11 and permits no skips; the current collection
-  selects 261 tests. This is a service-backed CI gate, not evidence that an
-  arbitrary local PostgreSQL configuration has been validated.
-- The GUI lane passes all 25 Vitest files and 100 tests, TypeScript type checking,
+  PostgreSQL 17 on Python 3.11 and permits no skips. This is a service-backed CI
+  gate, not evidence that an arbitrary local PostgreSQL configuration has been
+  validated.
+- The isolated AgentDojo harness is a required CI matrix on Python 3.11 and
+  3.12, using the subproject's own frozen environment; `release-artifacts`
+  waits for both entries. This gate covers deterministic harness behavior only
+  and makes no real-model AgentDojo utility or security claim.
+- The GUI lane passes all 29 Vitest files and 123 tests, TypeScript type checking,
   and the production frontend build.
-- A scoped opt-in local GUI exercise used a configured real custom LLM
-  endpoint to read a policy plus CSV, compute regional revenue, write and
-  re-read a Markdown report, emit `human_output`, and exit. The original serial
-  path completed correctly in 10 LLM calls, 241,038 cumulative provider tokens,
-  and two approvals. Enabling provider parallel-tool mode did not help this
-  sequential authority workflow (11 calls, 304,779 tokens, four approvals), so
-  the default remains off. After exposing requestable ceilings as non-grant
-  model facts and tightening first-action permission planning, the same task
-  completed correctly in seven calls, 138,621 tokens, and one approval; the
-  final output remained visible after process exit. This is one provider- and
-  scenario-specific validation, not a latency SLA or general benchmark claim.
 - The runtime-safety release smoke passes all three selected tasks with complete
   audit evidence, no unauthorized effects, and no false denials. Four focused
   Git tasks additionally pass for managed-checkout containment, malicious
@@ -206,9 +200,21 @@ real external-provider configuration has been release-validated.
   the historical ID set.
 - The Python 3.11 `release-artifacts` CI job builds the 0.3.4 wheel and source
   distribution, checks content and metadata, clean-installs each artifact,
-  checks dependency consistency, exercises both entrypoints plus the
-  deterministic demo, and preserves those exact validated distributions for
-  release use.
+  checks dependency consistency, exercises all three installed console
+  entrypoints plus the deterministic demo, and preserves those exact validated
+  distributions for release use.
+
+## Unarchived real-LLM observation
+
+A local operator reported running a scoped GUI workflow against a custom LLM
+endpoint to read a policy and CSV, compute a report, emit `human_output`, and
+exit. No provenance-bearing report for that run is checked in with the source
+revision, model/profile identity, redacted configuration, environment, and raw
+test outcome needed to reproduce or compare it. It is therefore an unarchived
+observation, not Agent libOS 0.3.4 release evidence, and supports no call-count,
+token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
+future rerun only after using a documented opt-in real-model gate and preserving
+its reproducible report outside this status summary.
 
 ## Supported release scope
 
@@ -218,10 +224,11 @@ real external-provider configuration has been release-validated.
 - SQLite and PostgreSQL implement the covered RuntimeStore contract. A 0.2 store
   or artifact is rejected before mutation and remains readable only with the
   archived 0.2 release.
-- The Python wheel contains the core `agent_libos` package and its two console
-  entrypoints. Repository-level PTY module, example Skill and Image assets,
-  benchmarks, tests, and documentation are source-distribution or checkout
-  assets, as documented in the README.
+- The Python wheel contains the core `agent_libos` package and its three console
+  entrypoints: `agent-libos`, `agent-libos-gui-server`, and the explicit offline
+  `agent-libos-migrate-tool-groups` migration command. Repository-level PTY
+  module, example Skill and Image assets, benchmarks, tests, and documentation
+  are source-distribution or checkout assets, as documented in the README.
 - Git is a Python Runtime/model-tool surface only. It requires an existing
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
@@ -233,8 +240,10 @@ real external-provider configuration has been release-validated.
 - Native macOS and Windows process containment, filesystem locking, and PTY
   behavior require platform runs before those configurations are advertised as
   release-validated.
-- Electron packaging, signing, notarization, and native desktop lifecycle are
-  separate environment gates; the source GUI and Python GUI server are covered.
+- Native Electron desktop lifecycle and the production-build custom-protocol
+  BrowserWindow smoke are separate environment gates; the source GUI and Python
+  GUI server are covered. Installer packaging, signing, and notarization are
+  not configured.
 - Real MCP SDK/server, real LLM, network proxy and TLS topology, and provider
   credentials remain explicit opt-in gates. Deterministic or loopback evidence
   is not presented as real-provider evidence.

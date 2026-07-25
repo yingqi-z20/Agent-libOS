@@ -21,11 +21,15 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
     timeout_s: timeoutSeconds,
   });
   const text = String(result.stdout ?? "");
+  const stderr = String(result.stderr ?? "");
+  const stdoutTruncated = Boolean(result.stdout_truncated);
+  const stderrTruncated = Boolean(result.stderr_truncated);
+  const outputIncomplete = stdoutTruncated || stderrTruncated;
   const rawMatches = text.split(/\r?\n/).filter((line) => line.length > 0);
   const matches = rawMatches.slice(0, maxResults);
-  const files = [];
+  const files: string[] = [];
   const seen = new Set<string>();
-  for (const line of rawMatches) {
+  for (const line of matches) {
     const index = line.indexOf(":");
     const file = index >= 0 ? line.slice(0, index) : line;
     if (!seen.has(file)) {
@@ -33,16 +37,26 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
       files.push(file);
     }
   }
-  const emptyMessage = result.returncode === 0 && text.length === 0
-    ? "Your command ran successfully and did not produce any output."
-    : "";
+  const observedOmittedMatches = Math.max(rawMatches.length - matches.length, 0);
+  const emptyMessage =
+    result.returncode === 0 &&
+      text.length === 0 &&
+      stderr.length === 0 &&
+      !outputIncomplete
+      ? "Your command ran successfully and did not produce any output."
+      : "";
   return {
     argv: result.argv ?? argv,
     returncode: result.returncode,
     files,
     matches,
-    omitted_matches: Math.max(rawMatches.length - matches.length, 0),
-    stderr: result.stderr ?? "",
+    omitted_matches: stdoutTruncated ? null : observedOmittedMatches,
+    observed_omitted_matches: observedOmittedMatches,
+    matches_incomplete: stdoutTruncated,
+    stdout_truncated: stdoutTruncated,
+    stderr_truncated: stderrTruncated,
+    output_incomplete: outputIncomplete,
+    stderr,
     message: emptyMessage,
   };
 }

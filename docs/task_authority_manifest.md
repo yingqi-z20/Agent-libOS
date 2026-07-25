@@ -19,11 +19,19 @@ A manifest records:
 - resource budget, approval policy, and process receive-domain data-flow policy;
 - opaque operator metadata supplied at the Host/admin boundary.
 
+That SHA-256 value is an unkeyed content/identity binding. It is not a digital
+signature, MAC, issuer-authentication proof, or protection against a Host or
+database administrator who can rewrite both the manifest and its hash. Trust in
+the manifest comes from the Host-authenticated launch boundary and the Host's
+control of the store, not from the digest alone.
+
 Root launch compiles only the authorized capability specs. Child launch uses
 the intersection of the parent manifest, current capability policy, and the
 child manifest ceiling. `CapabilityManager.derive_authority()` and
 `transition_allowed_rights()` are the public transition boundaries used by
 process and checkpoint flows; finite-use authority is never duplicated.
+The manifest expiry is a hard upper bound on compiled allow capabilities; an
+individual capability `expires_at` may shorten that lease but cannot extend it.
 Manifest `max_delegation_depth` values are compiled into the durable
 capability and may only stay equal or decrease across a transition.
 
@@ -47,8 +55,13 @@ argument is also empty. Only an explicit Host manifest (and manifests derived
 beneath it) constrains later child/fork authority and manifest budgets. Derived
 manifests inherit the parent approval, effect, expiry, and data-flow ceilings
 unless the Host supplies a narrower child template. Omitted child fields inherit
-those ceilings. An explicit child template cannot add or replace parent
-data-flow or approval policy keys, request authority outside the parent's
+those ceilings. The effective child/fork resource budget is computed before the
+process row and parent reservation are created, as the field-wise intersection
+of the runtime-selected child budget and any manifest budget ceiling. An
+explicit child template may replace `allowed_tenants`, `allowed_principals`, or
+`requestable_capabilities` only with narrower subsets covered by the parent.
+It cannot widen those sets, add new data-flow or approval policy keys, replace
+any other parent approval-policy value, request authority outside the parent's
 authorized/requestable space, extend the parent expiry, or widen a concrete or
 deny-all effect ceiling to unrestricted `null` (or to patterns outside the
 parent's ceiling).
@@ -56,7 +69,11 @@ parent's ceiling).
 Model permission requests are checked against the manifest before a Human
 request is created. `approval_policy.requestable_capabilities` declares
 authority that may be requested but is not granted at launch; a Human decision
-still creates the narrower one-time or policy capability. The normalized
+still creates the narrower one-time or policy capability. Every Human-issued
+allow capability is capped at the manifest expiry, and any approval that would
+issue one after that expiry fails closed. A requestable capability's own
+`expires_at` is carried into the Human request and may shorten, but never
+extend, that top-level lease. The normalized
 requestable list is included in each model turn as an explicitly labeled
 permission-request ceiling, never in the active Capability table. This lets the
 model plan one coherent request before an effect instead of learning the scope
@@ -64,28 +81,39 @@ through a denied probe; the runtime remains the authority and rejects every
 out-of-ceiling request regardless of prompt behavior.
 
 The bundled GUI is one such Host author. Its visible task-access controls create
-an explicit manifest instead of inferring grants from the selected image. The
-root process receives only non-delegable `human:owner` write for communication;
-the selected cwd-scoped filesystem rights and optional restricted
-`shell:git`/typed local-Git entries are requestable ceilings. Therefore selecting
-“edit” or local Git does not pregrant those effects, and a request outside the
-selected scope is rejected before a Human prompt. Arbitrary Shell commands are
-not included in this convenience contract and require separate Host authority.
+an explicit manifest instead of inferring grants from the selected image. Every
+GUI task receives non-delegable `human:owner` write for communication. Selected
+cwd-scoped filesystem rights and optional restricted `shell:git`/typed local-Git
+entries remain requestable ceilings, so choosing “edit” or local Git does not
+pregrant those effects. Two separately visible opt-ins add active,
+non-delegable grants: reviewed commands add `shell:*/execute` constrained by
+`allowlist_auto_else_ask`, and context maintenance adds
+`context:enrichment/execute`, `context:maintenance/execute`, a
+compressor-image-bound `process:spawn/write` rule, and read authority for that
+image. The reviewed-command grant auto-allows only its deterministic allowlist;
+other non-denied commands still require exact per-use Human approval. Both
+opt-ins are disabled by default, and requests outside the selected ceilings are
+rejected before a Human prompt.
 
 `permitted_effects` is an additional provider-boundary ceiling with exact
 entries or terminal wildcards such as `jsonrpc.*`. Omitting the field or using
 JSON `null` preserves capability-only effect gating for compatibility. An
 explicit empty list is deny-all: no provider effect may cross the Task
 Authority boundary even when an ordinary capability would otherwise allow it.
+The manifest expiry is checked independently of this compatibility mode, so an
+expired manifest denies provider effects even when `permitted_effects` is
+omitted or `null`.
 That deny-all ceiling also covers runtime-mediated LLM and Human provider
 effects owned by the process. The explicit `"*"` entry permits every current
 and future effect class and should be used only when that deliberately broad
 ceiling is intended.
 
-Typed Git adds five effect families that must be present when a concrete
-ceiling is used: `git.read`, `git.mutate`, `git.fetch`, `git.push`, and
-`git.pull_request`. The corresponding protected-operation descriptors use the
-`primitive.git.*` namespace. Exact Runtime boundary names such as
+Typed Git defines five effect families: `git.read`, `git.mutate`, `git.fetch`,
+`git.push`, and `git.pull_request`. When a concrete effect ceiling is used, it
+must list each family that the task intends to invoke; listing only `git.read`
+is valid and denies the other four families. The corresponding
+protected-operation descriptors use the `primitive.git.*` namespace. Exact
+Runtime boundary names such as
 `runtime.git.status`, `runtime.git.commit`, and `runtime.git.pull` are linked in
 Explain evidence, while the protected provider descriptor supplies the effect
 class. An existing `shell:git` authorized capability or old image requirement
@@ -119,8 +147,7 @@ timestamps are runtime-owned and cannot be supplied as input. Any unknown
 top-level field fails validation; for example, misspelling `permitted_effects`
 or `expires_at` cannot silently remove an effect or expiry ceiling.
 
-Each entry in `authorized_capabilities` and
-`approval_policy.requestable_capabilities` is also closed. It accepts only:
+Each entry in `authorized_capabilities` is also closed. It accepts only:
 
 - required `resource` and `rights` fields;
 - optional `constraints`, `delegable`, `revocable`, `expires_at`,
@@ -129,7 +156,25 @@ Each entry in `authorized_capabilities` and
 Unknown capability-entry fields fail validation instead of being discarded.
 When present, `delegable` and `revocable` must be JSON booleans (or Python
 `bool` values through the mapping API). Strings such as `"false"`, numbers,
-and `null` are rejected rather than coerced. `permitted_effects` entries must
+and `null` are rejected rather than coerced. Manifest and capability-entry
+`expires_at` values must be non-empty ISO-8601 datetime strings; malformed
+values fail launch validation before a manifest is persisted. `uses_remaining`
+must be a non-boolean positive integer, and `max_delegation_depth` must be a
+non-boolean non-negative integer. Numeric strings and floats are rejected rather
+than converted or truncated.
+
+`approval_policy.requestable_capabilities` is a narrower closed contract. A
+requestable entry requires `resource` and `rights`; `expires_at` is its only
+optional field with grant semantics, and is copied into a matching Human
+permission request. For compatibility with Host clients that reuse the generic
+capability shape, the canonical no-op values `constraints={}`,
+`delegable=false`, and `revocable=true` are accepted. Non-empty constraints,
+`delegable=true`, `revocable=false`, `uses_remaining`, and
+`max_delegation_depth` are rejected because the model permission-request path
+cannot propagate those semantics. A requestable entry is a ceiling, never an
+active or delegable grant.
+
+`permitted_effects` entries must
 be non-empty strings; a wildcard must be exactly `"*"` or a single terminal
 `.*`, such as `jsonrpc.*`. `resource_budget` is validated against
 `ResourceBudget`, while

@@ -169,6 +169,17 @@ class LibOSSyscallSession:
         )
 
     async def apply_deferred_lifecycle(self, tool_result: ObjectHandle | None = None) -> None:
+        if self._deferred_exit is not None:
+            # A JIT tool must not turn an image transition into an exit-gate
+            # bypass. Check the deferred exec target before applying either
+            # lifecycle mutation, then check the live image again immediately
+            # before the terminal transition.
+            target_image_id = (
+                str(self._deferred_exec["image"])
+                if self._deferred_exec is not None
+                else None
+            )
+            self._require_direct_exit_syscall_allowed(image_id=target_image_id)
         if self._deferred_exec is not None:
             exec_args = self._deferred_exec
             if self._deferred_exec_context is None:
@@ -188,6 +199,7 @@ class LibOSSyscallSession:
                 ),
             )
         if self._deferred_exit is not None:
+            self._require_direct_exit_syscall_allowed()
             exit_args = self._deferred_exit
             result_handle = self._result_handle_for_exit(exit_args, tool_result)
             self.runtime.process.exit(
@@ -503,8 +515,34 @@ class LibOSSyscallSession:
         }
 
     def _process_exit(self, args: dict[str, Any]) -> dict[str, Any]:
+        target_image_id = (
+            str(self._deferred_exec["image"])
+            if self._deferred_exec is not None
+            else None
+        )
+        self._require_direct_exit_syscall_allowed(image_id=target_image_id)
         self._deferred_exit = dict(args)
         return {"deferred": True, "operation": "process.exit"}
+
+    def _require_direct_exit_syscall_allowed(
+        self,
+        *,
+        image_id: str | None = None,
+    ) -> None:
+        process = self._processes.get_process(self.pid)
+        if process is None:
+            raise NotFound(f"process not found: {self.pid}")
+        candidate_image_ids = [process.image_id]
+        if image_id is not None and image_id != process.image_id:
+            candidate_image_ids.append(image_id)
+        for candidate_image_id in candidate_image_ids:
+            image = self.runtime.get_image(candidate_image_id)
+            if image.metadata.get("completion_gate") == "cumulative_review":
+                raise ValidationError(
+                    "process.exit syscall is unavailable for an active or "
+                    "deferred target image with cumulative completion review; "
+                    "call the guarded process_exit tool instead"
+                )
 
     def _checkpoint_create(self, args: dict[str, Any]) -> dict[str, Any]:
         checkpoint_id = self.runtime.checkpoint.create(

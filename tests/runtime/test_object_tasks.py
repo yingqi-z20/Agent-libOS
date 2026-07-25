@@ -643,6 +643,34 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_object_task_validates_target_arguments_in_runner_after_start(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="review-agent:v0",
+                goal="observe asynchronous target argument validation",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+
+            queued = runtime.object_tasks.start(
+                pid,
+                owner,
+                "write_text_file",
+                {"path": "missing-content.txt"},
+            )
+            failed = runtime.object_tasks.wait(
+                queued.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+
+            assert queued.status == ObjectTaskStatus.QUEUED
+            assert failed.status == ObjectTaskStatus.FAILED
+            assert failed.error == "Invalid arguments for tool `write_text_file`."
+        finally:
+            runtime.close()
+
     def test_object_task_runner_is_not_scheduled_by_llm_scheduler(self) -> None:
         runtime = Runtime.open("local")
         try:
@@ -1951,9 +1979,17 @@ class TestObjectTasks:
                 owner,
                 "receive_process_messages",
                 {"channel": runtime.config.object_tasks.owner_watch_channel},
+                owner_watch=True,
             )
             waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
             assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+
+            disabled = runtime.object_tasks.watch_owner(
+                task.task_id,
+                actor_pid=pid,
+                enabled=False,
+            )
+            assert disabled.owner_watch.enabled is False
 
             runtime.memory.update_object(pid, owner, ObjectPatch(payload={"name": "owner", "version": 2}))
 

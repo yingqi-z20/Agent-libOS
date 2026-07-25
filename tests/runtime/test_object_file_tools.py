@@ -2,11 +2,13 @@ from __future__ import annotations
 import pytest
 import json
 from dataclasses import replace
+from pathlib import Path
 from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ProcessStatus
+from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.observability import json_size_bytes
 
 class TestObjectFileTool:
@@ -71,6 +73,82 @@ class TestObjectFileTool:
         written = self.runtime.tools.call(pid, 'write_object_to_file', {'name': object_name, 'path': target})
         assert written.ok
         assert (self.runtime.workspace_root / target).read_text(encoding='utf-8') == 'capability checked'
+
+    def test_create_object_from_file_rejects_limit_above_filesystem_read_boundary(self) -> None:
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='reject an impossible Object-file read ceiling',
+        )
+
+        rejected = self.runtime.tools.call(
+            pid,
+            'create_object_from_file',
+            {
+                'name': 'impossible.limit',
+                'path': 'does-not-need-to-exist.txt',
+                'max_bytes': (
+                    self.runtime.config.tools.filesystem_read_hard_limit_bytes + 1
+                ),
+            },
+        )
+
+        assert not rejected.ok
+        assert 'effective Object-file read limit' in (rejected.error or '')
+        assert not self.runtime.capability.check(
+            pid,
+            'filesystem:workspace:does-not-need-to-exist.txt',
+            CapabilityRight.READ,
+        )
+
+    def test_create_object_from_file_accepts_runtime_limits_above_builtin_defaults(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        self.runtime.close()
+        config = replace(
+            DEFAULT_CONFIG,
+            tools=replace(
+                DEFAULT_CONFIG.tools,
+                object_file_max_bytes=15_000_000,
+                object_file_hard_limit_bytes=20_000_000,
+                filesystem_read_hard_limit_bytes=20_000_000,
+            ),
+        )
+        self.runtime = Runtime.open(
+            'local',
+            config=config,
+            substrate=LocalResourceProviderSubstrate(tmp_path),
+        )
+        source = 'runtime-configured-object-file.txt'
+        (tmp_path / source).write_text('bounded payload', encoding='utf-8')
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='use the active runtime Object-file limits',
+        )
+        self.runtime.filesystem.grant_path(
+            pid,
+            source,
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+
+        defaulted = self.runtime.tools.call(
+            pid,
+            'create_object_from_file',
+            {'name': 'runtime.default.limit', 'path': source},
+        )
+        explicit = self.runtime.tools.call(
+            pid,
+            'create_object_from_file',
+            {
+                'name': 'runtime.explicit.limit',
+                'path': source,
+                'max_bytes': 16_000_000,
+            },
+        )
+
+        assert defaulted.ok, defaulted.error
+        assert explicit.ok, explicit.error
 
     def test_file_object_token_estimate_limits_prompt_materialization(self) -> None:
         sentinel = f'FILE_OBJECT_BUDGET_SENTINEL_{uuid4().hex}'

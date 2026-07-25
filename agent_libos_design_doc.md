@@ -1,10 +1,13 @@
 # Agent libOS Historical Design Archive
 
-> Status: historical design archive. This document records design intent and
-> future directions, but it is not the source of truth for the current
-> implementation. Use [README.md](README.md) for the current behavior and
-> [docs/invariants.md](docs/invariants.md) for the invariant-to-test map.
-> Sections below may intentionally describe planned or superseded interfaces.
+> **ARCHIVE — NOT A CURRENT CONTRACT.** This historical design archive preserves
+> early design intent and future directions; it is not the source of truth for
+> the current implementation. Sections below intentionally contain planned or
+> superseded capability and approval flows, commands, security properties,
+> checkpoint behavior, JIT languages and sandboxes, storage choices, and payload
+> retention rules. Do not use them to infer current behavior or guarantees. Use
+> [README.md](README.md) and the current `docs/` references for current behavior,
+> and [docs/invariants.md](docs/invariants.md) for the invariant-to-test map.
 
 ## 0. 文档目的
 

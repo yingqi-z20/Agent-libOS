@@ -1767,7 +1767,10 @@ class TestStorageBackendBoundaries:
 
     def test_shared_sqlite_dialect_surface_is_explicitly_ratcheted(self) -> None:
         raw_text = (AGENT_LIBOS / "storage" / "sql.py").read_text(encoding="utf-8")
-        pattern = r"\b(?:PRAGMA\s+[A-Z_]+|INSERT\s+OR\s+[A-Z_]+|COLLATE\s+[A-Z_]+)\b"
+        pattern = (
+            r"\b(?:PRAGMA\s+[A-Z_]+|INSERT\s+OR\s+[A-Z_]+|"
+            r"COLLATE\s+[A-Z_]+|JSON_EXTRACT)\b"
+        )
         matches = list(re.finditer(pattern, raw_text, re.IGNORECASE))
 
         assert {match.group(0).upper() for match in matches} == {
@@ -1775,12 +1778,24 @@ class TestStorageBackendBoundaries:
             "INSERT OR IGNORE",
             "INSERT OR REPLACE",
             "COLLATE BINARY",
+            "JSON_EXTRACT",
         }
         assert all(
             match.group(0).upper().startswith("PRAGMA ")
+            or match.group(0).upper() == "JSON_EXTRACT"
             or match.group(0) == match.group(0).upper()
             for match in matches
         )
+
+    def test_postgres_dialect_translates_skill_description_json_extract(self) -> None:
+        prepared = _PostgresDialect().prepare(
+            "SELECT * FROM skills WHERE "
+            "lower(json_extract(package_json, '$.description')) LIKE ?",
+            with_params=True,
+        )
+
+        assert "json_extract" not in prepared.lower()
+        assert "lower((package_json::jsonb ->> 'description')) LIKE %s" in prepared
 
     def test_postgres_dialect_translates_schema_probe_and_binary_collation(self) -> None:
         dialect = _PostgresDialect()

@@ -44,9 +44,10 @@ character observation window. The package declares a 35 second outer JIT
 sandbox timeout so the shell timeout has time to return its structured
 observation. This per-tool timeout is capped by the Host's
 `tools.deno_timeout_hard_limit_s` (60 seconds by default); it does not raise the
-5 second default used by other JIT tools. Package boot also runs four bundled
+5 second default used by other JIT tools. Package boot also runs five bundled
 JIT contract tests covering ordinary success, successful submission, a denied
-shell syscall, and a failed final submission before registering the tool.
+shell syscall, a failed final submission, and propagation of upstream shell
+truncation before registering the tool.
 
 The package declares required capabilities for workspace filesystem read/write
 and shell execute authority. Those declarations are metadata checked by normal
@@ -54,15 +55,23 @@ process bootstrap rules; they do not grant live authority by themselves. A host
 or benchmark runner must still grant the spawned process the filesystem and
 shell authority it should have for the task.
 
-Observations longer than the window return `output_head`, `output_tail`, and
-`elided_chars` instead of a full `output` field. Timed-out or permission-denied
-commands return a non-zero observation with `exception_info`; the agent prompt
-treats an unrecoverable permission, dependency, or timeout condition as a
-blocker that can be submitted explicitly. Oversized commands are rejected by
-both the JSON schema and the JIT wrapper. If the shell command succeeds but the
-final process-exit syscall fails, the tool returns a non-zero observation that
-retains the same bounded command-output evidence and reports the submission
-failure; it does not claim completion.
+Every command observation propagates `stdout_truncated` and
+`stderr_truncated` from the shell primitive. `output_incomplete` is true when
+either stream was truncated upstream or the wrapper elides captured output.
+The shell primitive can truncate a stream before the wrapper receives it.
+Observations whose captured output is longer than the wrapper window return
+`output_head`, `output_tail`, and `elided_chars` instead of a full `output`
+field. `elided_chars` counts only characters the wrapper removes from the
+already captured strings; it cannot quantify bytes omitted earlier by the shell
+primitive, so the truncation flags remain authoritative for completeness.
+Timed-out or permission-denied commands return a non-zero observation with
+`exception_info`; the agent prompt treats an unrecoverable permission,
+dependency, or timeout condition as a blocker that can be submitted explicitly.
+Oversized commands are rejected by both the JSON schema and the JIT wrapper. If
+the shell command succeeds but the final process-exit syscall fails, the tool
+returns a non-zero observation that retains the same bounded command-output and
+truncation evidence and reports the submission failure; it does not claim
+completion.
 
 Known differences from upstream mini-swe-agent remain:
 

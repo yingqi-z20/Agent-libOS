@@ -72,7 +72,7 @@ def _snapshot() -> dict:
         "images": {},
         "image_artifacts": {},
         "jit_sources": {"tool_1": "export default {}"},
-        "modules": [{"module_id": "core", "source_sha256": "abc"}],
+        "modules": [{"module_id": "core", "source_sha256": "a" * 64}],
     }
 
 
@@ -121,6 +121,36 @@ def test_snapshot_codec_rejects_missing_tables_and_process_rows() -> None:
     missing_process["rows"]["processes"] = []
     with pytest.raises(ValidationError, match="exactly match subtree_pids"):
         SnapshotCodec.decode_mapping(missing_process)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda module: module.pop("module_id"), "module_id"),
+        (lambda module: module.pop("source_sha256"), "source_sha256"),
+        (
+            lambda module: module.__setitem__("source_sha256", "not-a-sha256"),
+            "64-character SHA-256",
+        ),
+    ],
+)
+def test_snapshot_codec_rejects_incomplete_or_malformed_module_requirements(
+    mutation,
+    message: str,
+) -> None:
+    snapshot = _snapshot()
+    mutation(snapshot["modules"][0])
+
+    with pytest.raises(ValidationError, match=message):
+        SnapshotCodec.decode_mapping(snapshot)
+
+
+def test_snapshot_codec_rejects_duplicate_module_requirements() -> None:
+    snapshot = _snapshot()
+    snapshot["modules"].append(dict(snapshot["modules"][0]))
+
+    with pytest.raises(ValidationError, match="duplicate module_id"):
+        SnapshotCodec.decode_mapping(snapshot)
 
 
 @pytest.mark.parametrize(

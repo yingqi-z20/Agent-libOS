@@ -78,7 +78,7 @@
   },
   {
     "name": "swe_submit",
-    "description": "Submit the final SWE-Agent style resolution and request process exit after the tool result.",
+    "description": "Prepare the final SWE-Agent style resolution payload for a separate guarded process_exit call.",
     "source_path": "scripts/swe_submit.ts",
     "input_schema": {
       "type": "object",

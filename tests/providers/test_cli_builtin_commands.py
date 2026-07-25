@@ -530,6 +530,32 @@ class TestCLIBuiltinCommand:
             "message": "process not found: missing-pid",
         }
 
+    def test_cli_missing_capability_uses_structured_error_and_exit_one(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        monkeypatch.setattr("agent_libos.api.cli.Runtime.open", lambda *args, **kwargs: runtime)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+            pytest.raises(SystemExit) as raised,
+        ):
+            cli_entrypoint(["capabilities", "inspect", "cap-missing"])
+
+        assert raised.value.code == 1
+        assert stderr.getvalue() == ""
+        assert json.loads(stdout.getvalue()) == {
+            "schema_version": 1,
+            "error": {
+                "type": "NotFound",
+                "message": "capability not found: cap-missing",
+            },
+        }
+
     def test_cli_unsupported_store_version_uses_structured_error_and_exit_one(
         self,
     ) -> None:
@@ -1013,11 +1039,13 @@ class TestCLIBuiltinCommand:
         assert set(result['candidates']) == {first.operation_id, second.operation_id}
 
     def test_cli_object_task_start_requires_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        runtime = Runtime.open('local')
-        monkeypatch.setattr('agent_libos.api.cli.Runtime.open', lambda *args, **kwargs: runtime)
+        def fail_runtime_open(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError('argparse must reject a missing --wait before opening the Runtime')
 
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout), pytest.raises(SystemExit) as raised:
+        monkeypatch.setattr('agent_libos.api.cli.Runtime.open', fail_runtime_open)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), pytest.raises(SystemExit) as raised:
             cli_main([
                 'object-task',
                 'start',
@@ -1028,7 +1056,22 @@ class TestCLIBuiltinCommand:
                 'get_working_directory',
             ])
 
-        assert 'requires --wait' in str(raised.value)
+        assert raised.value.code == 2
+        assert 'the following arguments are required: --wait' in stderr.getvalue()
+
+    def test_cli_object_task_start_help_describes_required_wait_and_complete_tool_table(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as raised:
+            cli_main(['object-task', 'start', '--help'])
+
+        assert raised.value.code == 0
+        help_text = capsys.readouterr().out
+        normalized_help = ' '.join(help_text.split())
+        assert '[--wait]' not in help_text
+        assert '--wait' in help_text
+        assert 'complete process tool table' in normalized_help
 
     def test_cli_object_task_wait_rejects_non_finite_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runtime = Runtime.open('local')

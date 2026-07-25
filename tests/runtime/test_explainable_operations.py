@@ -602,6 +602,43 @@ def test_explain_output_redacts_sensitive_audit_values() -> None:
         assert "[redacted]" in encoded
 
 
+def test_explain_projection_redacts_uri_cookie_and_credential_metadata() -> None:
+    with temporary_runtime() as runtime:
+        pid = runtime.process.spawn(goal="redact provider diagnostics")
+        dsn_password = "EXPLAIN_DSN_PASSWORD"
+        cookie_secret = "EXPLAIN_COOKIE_SECRET"
+        metadata_secret = "EXPLAIN_CREDENTIAL_METADATA_SECRET"
+        with runtime.operations.scope(
+            kind="runtime",
+            name="test.provider_diagnostic_redaction",
+            actor=pid,
+            pid=pid,
+            expected_roles=["event"],
+        ) as operation:
+            runtime.events.emit(
+                EventType.OBJECT_UPDATED,
+                source=pid,
+                target=f"process:{pid}",
+                payload={
+                    "diagnostic": (
+                        "connection failed for "
+                        f"postgresql://agent:{dsn_password}@db.example/runtime"
+                    ),
+                    "wire_error": f"Set-Cookie: sid={cookie_secret}; HttpOnly\nretry scheduled",
+                    "credentialMetadata": {"opaque": metadata_secret},
+                    "endpoint": "https://api.example.test/v1/status",
+                },
+            )
+
+        encoded = json.dumps(runtime.explain.explain_operation(operation.operation_id))
+        assert dsn_password not in encoded
+        assert cookie_secret not in encoded
+        assert metadata_secret not in encoded
+        assert "postgresql://[redacted]@db.example/runtime" in encoded
+        assert "https://api.example.test/v1/status" in encoded
+        assert "retry scheduled" in encoded
+
+
 def test_concurrent_evidence_expectation_cannot_resurrect_terminal_operation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

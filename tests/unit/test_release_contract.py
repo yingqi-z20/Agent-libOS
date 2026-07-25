@@ -16,11 +16,13 @@ from agent_libos.skills.builtin_catalog import (
 from scripts.check_release_artifacts import (
     BUILTIN_SKILL_ARCHIVE_PATHS,
     BUILTIN_SKILL_IDS,
+    EXPECTED_CONSOLE_SCRIPTS,
     SDIST_REQUIRED_FILES,
     WHEEL_REQUIRED_FILES,
     _BUILTIN_SKILL_MAX_FILE_BYTES,
     _BUILTIN_SKILL_MAX_INSTRUCTION_BYTES,
     _validate_builtin_skill_archive_payloads,
+    _validate_console_scripts,
     validate_version_alignment,
 )
 from tests.conftest import pytest_sessionfinish
@@ -65,6 +67,54 @@ def test_release_status_references_do_not_describe_a_metadata_ledger() -> None:
     assert offenders == []
 
 
+def test_release_status_bounds_unarchived_evidence_and_volatile_counts() -> None:
+    text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
+
+    assert "## Unarchived real-LLM observation" in text
+    assert "not Agent libOS 0.3.4 release evidence" in text
+    assert "AgentDojo harness is a required CI matrix" in text
+    assert "collected pytest nodes" not in text
+    assert not re.search(r"selects [\d,]+ tests", text)
+    for stale_count in ("241,038", "304,779", "138,621"):
+        assert stale_count not in text
+
+
+def test_documented_no_skip_provider_gates_invoke_pytest_directly() -> None:
+    text = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+
+    assert "tests/providers/test_mcp_sdk_integration.py" in text
+    assert "tests/self_evolution/test_builtin_agent_images_real_llm.py" in text
+    assert not re.search(r"scripts/test_matrix\.py[^\n]*--fail-on-skip", text)
+    assert "`--fail-on-skip` is a pytest option" in normalized
+
+
+def test_public_overview_records_corrected_security_and_release_boundaries() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    support = (ROOT / "docs" / "support_matrix.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+    normalized_support = " ".join(support.split())
+
+    for required in (
+        "Trusted Runtime artifact publication is a narrow TCB exception",
+        "typed Git, filesystem writes",
+        "Any recognized transparent executable-launcher",
+        "## Real LLM Configuration",
+        "### Upgrading stores that contain Tool Groups",
+        "benchmarks/builtin_tool_skills/README.md",
+        "benchmarks/long_horizon_agent/README.md",
+        "### Historical references (not current contracts)",
+    ):
+        assert required in normalized_readme
+    for required in (
+        "typed Git, filesystem writes",
+        "static compile",
+        "100k external-effect recovery gate",
+        "10k runtime-publication recovery gate",
+    ):
+        assert required in normalized_support
+
+
 def test_python_wheel_scope_is_the_core_package() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["agent_libos"]
@@ -73,6 +123,9 @@ def test_python_wheel_scope_is_the_core_package() -> None:
 
 
 def test_release_artifacts_require_the_complete_builtin_skill_catalog() -> None:
+    migration_module = "agent_libos/storage/tool_skill_migration.py"
+    assert migration_module in WHEEL_REQUIRED_FILES
+    assert migration_module in SDIST_REQUIRED_FILES
     assert BUILTIN_SKILL_IDS == RUNTIME_BUILTIN_SKILL_IDS
     assert (
         _BUILTIN_SKILL_MAX_INSTRUCTION_BYTES
@@ -130,8 +183,8 @@ def test_readme_clean_install_smoke_covers_wheel_and_source_distribution() -> No
 
     assert "dist/*.whl" in readme
     assert "dist/*.tar.gz" in readme
-    assert readme.count("/agent-libos --help") >= 2
-    assert readme.count("/agent-libos-gui-server --help") >= 2
+    for entrypoint in EXPECTED_CONSOLE_SCRIPTS:
+        assert readme.count(f"/{entrypoint} --help") >= 2
     assert readme.count("uv pip check --python /tmp/agent-libos-") >= 2
 
 
@@ -155,15 +208,66 @@ def test_gui_runtime_engines_are_explicit_and_lockfile_aligned() -> None:
     assert lockfile["packages"][""]["engines"] == package["engines"]
 
 
-def test_console_entrypoint_uses_the_domain_error_boundary() -> None:
+def test_console_entrypoint_registry_and_wheel_contract_are_exact() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["scripts"] == {
-        "agent-libos": "agent_libos.api.cli:cli",
-        "agent-libos-gui-server": "agent_libos.api.gui.server:main",
-        "agent-libos-migrate-tool-groups": (
-            "agent_libos.storage.tool_skill_migration:cli"
-        ),
-    }
+    assert pyproject["project"]["scripts"] == EXPECTED_CONSOLE_SCRIPTS
+
+    valid = "\n".join(
+        ["[console_scripts]"]
+        + [f"{name} = {target}" for name, target in EXPECTED_CONSOLE_SCRIPTS.items()]
+    ).encode()
+    _validate_console_scripts(valid)
+
+    for invalid in (
+        valid.replace(b"agent-libos-migrate-tool-groups = ", b"removed = "),
+        valid.replace(b"agent_libos.api.cli:cli", b"agent_libos.api.cli:main"),
+        valid + b"\nunexpected = package.module:main\n",
+    ):
+        with pytest.raises(ValueError, match="wheel console entry points mismatch"):
+            _validate_console_scripts(invalid)
+
+
+def test_release_documentation_covers_every_console_script() -> None:
+    for path in (
+        ROOT / "README.md",
+        ROOT / "docs" / "cli.md",
+        ROOT / "docs" / "development.md",
+        ROOT / "docs" / "release_status.md",
+    ):
+        text = path.read_text(encoding="utf-8")
+        for entrypoint in EXPECTED_CONSOLE_SCRIPTS:
+            assert entrypoint in text, f"{path.relative_to(ROOT)} omits {entrypoint}"
+
+
+def test_anonymity_checklist_covers_exact_tree_history_and_binary_artifacts() -> None:
+    text = (ROOT / "docs" / "artifact_anonymity.md").read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+
+    for required in (
+        "git status --porcelain=v1 --untracked-files=all",
+        "git submodule status --recursive",
+        "git lfs ls-files --all --long",
+        "git --no-replace-objects rev-list --objects --all",
+        "git --no-replace-objects cat-file",
+        "git --no-replace-objects cat-file --batch-all-objects",
+        "set -o pipefail",
+        'ANON_GIT_SCAN_DIR="$(mktemp -d)" || exit 1',
+        'test -n "$ANON_GIT_SCAN_DIR" || exit 1',
+        'test -n "${ANON_GIT_SCAN_DIR:-}" && test -d "$ANON_GIT_SCAN_DIR" || exit 1',
+        'case "$object_type" in',
+        'commit|tag|tree|blob)',
+        "rg -a -qi",
+        "find \"$ANON_OUTPUT_DIR\" -type f -exec file --mime-type",
+        "-iname '*.whl'",
+        "Never copy a live secret",
+    ):
+        assert required in text
+    assert text.count('commit|tag|tree|blob)') >= 2
+    assert text.count(
+        'git --no-replace-objects cat-file "$object_type" "$object_oid"'
+    ) >= 2
+    assert "--batch-check='%(objectname) %(objecttype) %(objectsize) %(rest)'" in text
+    assert "structural package check is not an anonymity scan" in normalized
 
 
 def test_ci_checkout_does_not_persist_credentials_in_git_config() -> None:
@@ -208,6 +312,27 @@ def test_release_workflow_runs_release_smokes_without_repeating_lane_matrix() ->
     assert "--require-all-passed" in runtime_safety_step
 
 
+def test_agentdojo_ci_uses_its_isolated_frozen_environment() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(
+        encoding="utf-8"
+    )
+    parsed = yaml.safe_load(workflow)
+    job = parsed["jobs"]["agentdojo"]
+
+    assert job["needs"] == "static"
+    assert job["strategy"]["matrix"]["python-version"] == ["3.11", "3.12"]
+    for step_name, command in (
+        ("Install isolated AgentDojo dependencies", "uv sync --frozen"),
+        ("Run isolated AgentDojo tests", "uv run --frozen pytest -q"),
+    ):
+        step = next(item for item in job["steps"] if item.get("name") == step_name)
+        assert step["working-directory"] == "experiments/agentdojo"
+        assert step["run"] == command
+        assert "if" not in step
+        assert "continue-on-error" not in step
+    assert job["timeout-minutes"] == 15
+
+
 def test_fail_on_skip_gate_changes_a_successful_session_to_failure() -> None:
     reporter = type("Reporter", (), {"stats": {"skipped": [object()]}})()
 
@@ -241,6 +366,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     release_job = parsed["jobs"]["release-artifacts"]
     required_jobs = {
         "static",
+        "agentdojo",
         "python",
         "security",
         "deterministic-release",
@@ -404,6 +530,8 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         assert "get_builtin_skill_catalog" in command
         assert "len(catalog.list()) == 26" in command
         assert "sum(len(skill.allowed_tools) for skill in catalog.list()) == 99" in command
+        for entrypoint in EXPECTED_CONSOLE_SCRIPTS:
+            assert f'/{entrypoint}" --help' in command
     sdist_step = str(sdist_install_step["run"])
     install_index = sdist_step.index(
         "uv pip install --python .release-sdist-venv/bin/python"

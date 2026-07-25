@@ -52,7 +52,7 @@ On success, read the normal `GitOperationResult`: `after.token` is the observed 
 
 ### Object lifecycle boundary
 
-The patch Object belongs to the live Runtime/Object-owner lifecycle. Sending its OID to another process does not delegate `ObjectRight.READ`; explicitly share/delegate Object authority through supported Object Memory and Capability workflows. The Object may cross managed worktrees only when their `repository_id` is the same. It cannot be used to bridge unrelated repositories, and it is not promised to survive Runtime reopen, checkpoint/image transfer, or filesystem-only copying. Use a separately supported durable artifact workflow when longer-lived delivery is required.
+The patch Object belongs to the Runtime/Object-owner lifecycle. Sending its OID to another process does not delegate `ObjectRight.READ`; explicitly share/delegate Object authority through supported Object Memory and Capability workflows. The Object may cross managed worktrees only when their `repository_id` is the same and cannot bridge unrelated repositories. An ordinary Runtime reopen loses volatile Object payloads. A checkpoint or checkpoint-derived image is different: when this Object is owned/captured inside the checkpoint subtree, its payload is eligible under the normal checkpoint payload limits and can be restored/remapped with that snapshot. An OID copied by itself, an uncaptured borrowed Object, or filesystem-only copying does not preserve it. Use the checkpoint/image contract deliberately or a separately supported durable artifact workflow for longer-lived delivery.
 
 ## Recommended workflow
 

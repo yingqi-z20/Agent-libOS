@@ -70,8 +70,10 @@ class _LLMProfileSnapshot:
     profile_id: str
     profile: LLMProfile
     legacy_env: Mapping[str, str] = field(repr=False)
+    client_env: Mapping[str, str] = field(repr=False)
     policy: _ResolvedLLMPolicy
     identity_sha256: str
+    client_cache_sha256: str = field(repr=False)
 
 
 class LLMProfileRegistry:
@@ -92,7 +94,7 @@ class LLMProfileRegistry:
         self.config = config or DEFAULT_CONFIG
         self._profiles: dict[str, LLMProfile] = {}
         self._clients: dict[str, Any] = {}
-        self._client_identity_sha256: dict[str, str] = {}
+        self._client_cache_sha256: dict[str, str] = {}
         self._test_clients: dict[str, Any] = {}
         self._lock = threading.RLock()
 
@@ -103,7 +105,7 @@ class LLMProfileRegistry:
         with self._lock:
             self._profiles[selected_id] = selected_profile
             stale = self._clients.pop(selected_id, None)
-            self._client_identity_sha256.pop(selected_id, None)
+            self._client_cache_sha256.pop(selected_id, None)
         self._shutdown_client(stale)
 
     def unregister_profile(self, profile_id: str) -> None:
@@ -113,7 +115,7 @@ class LLMProfileRegistry:
                 raise ValidationError(f"LLM profile is not dynamically registered: {selected_id}")
             self._profiles.pop(selected_id)
             stale_client = self._clients.pop(selected_id, None)
-            self._client_identity_sha256.pop(selected_id, None)
+            self._client_cache_sha256.pop(selected_id, None)
             stale_test_client = self._test_clients.pop(selected_id, None)
         self._shutdown_client(stale_client)
         if stale_test_client is not stale_client:
@@ -171,16 +173,17 @@ class LLMProfileRegistry:
                 client = self._clients.get(selected_id)
                 if (
                     client is not None
-                    and self._client_identity_sha256.get(selected_id) != snapshot.identity_sha256
+                    and self._client_cache_sha256.get(selected_id)
+                    != snapshot.client_cache_sha256
                 ):
                     stale = self._clients.pop(selected_id)
-                    self._client_identity_sha256.pop(selected_id, None)
+                    self._client_cache_sha256.pop(selected_id, None)
                     self._shutdown_client(stale)
                     client = None
                 if client is None:
                     client = self._create_client(selected_id, profile, snapshot=snapshot)
                     self._clients[selected_id] = client
-                    self._client_identity_sha256[selected_id] = snapshot.identity_sha256
+                    self._client_cache_sha256[selected_id] = snapshot.client_cache_sha256
             return ResolvedLLMProfile(
                 profile_id=selected_id,
                 profile=profile,
@@ -227,7 +230,7 @@ class LLMProfileRegistry:
         return self.profile_snapshot(profile_id).identity_sha256
 
     def profile_snapshot(self, profile_id: str) -> _LLMProfileSnapshot:
-        """Freeze one non-secret Host profile/policy view for precheck and resolution."""
+        """Freeze one Host profile, policy, and client-environment resolution."""
 
         selected_id = self._normalize_profile_id(profile_id)
         with self._lock:
@@ -235,16 +238,30 @@ class LLMProfileRegistry:
             return self._profile_snapshot(selected_id, profile)
 
     def _profile_snapshot(self, profile_id: str, profile: LLMProfile) -> _LLMProfileSnapshot:
+        environment = dict(os.environ)
         legacy_env: Mapping[str, str] = (
             MappingProxyType(
                 {
-                    key: os.environ[key]
+                    key: environment[key]
                     for key in _LEGACY_PROFILE_ENV_KEYS
-                    if key in os.environ
+                    if key in environment
                 }
             )
             if self._uses_legacy_openai_env(profile_id)
             else MappingProxyType({})
+        )
+        client_env_keys = {
+            profile.api_key_env,
+            "AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL",
+        }
+        if profile.safety_identifier_env is not None:
+            client_env_keys.add(profile.safety_identifier_env)
+        client_env: Mapping[str, str] = MappingProxyType(
+            {
+                key: environment[key]
+                for key in client_env_keys
+                if key in environment
+            }
         )
         policy = self._resolved_policy(profile, legacy_env)
         identity_profile = asdict(profile)
@@ -286,12 +303,20 @@ class LLMProfileRegistry:
                 ),
             },
         }
+        client_options = self._client_options(
+            profile,
+            legacy_env=legacy_env,
+            client_env=client_env,
+            policy=policy,
+        )
         return _LLMProfileSnapshot(
             profile_id=profile_id,
             profile=profile,
             legacy_env=legacy_env,
+            client_env=client_env,
             policy=policy,
             identity_sha256=hashlib.sha256(dumps(identity).encode("utf-8")).hexdigest(),
+            client_cache_sha256=self._client_options_sha256(client_options),
         )
 
     def shutdown(self) -> None:
@@ -356,49 +381,81 @@ class LLMProfileRegistry:
     ) -> LLMClient:
         if profile.kind != "openai_compatible":
             raise ValidationError(f"unsupported LLM profile kind for {profile_id}: {profile.kind}")
-        env = dict(os.environ)
-        legacy_env = snapshot.legacy_env
-        policy = snapshot.policy
-        api_mode = policy.api_mode
+        options = self._client_options(
+            profile,
+            legacy_env=snapshot.legacy_env,
+            client_env=snapshot.client_env,
+            policy=snapshot.policy,
+        )
+        api_mode = str(options["api_mode"])
         if api_mode not in _API_MODES:
             raise LLMError(f"OPENAI_API_MODE must be one of {sorted(_API_MODES)}, got {api_mode!r}")
-        return LLMClient(
-            base_url=profile.base_url if profile.base_url is not None else _optional_env(legacy_env, "OPENAI_BASE_URL"),
-            model=(
+        return LLMClient(  # type: ignore[arg-type]
+            **options,
+            defaults=self.config.llm,
+        )
+
+    def _client_options(
+        self,
+        profile: LLMProfile,
+        *,
+        legacy_env: Mapping[str, str],
+        client_env: Mapping[str, str],
+        policy: _ResolvedLLMPolicy,
+    ) -> dict[str, Any]:
+        """Resolve every client-construction input from one environment snapshot."""
+
+        return {
+            "base_url": (
+                profile.base_url
+                if profile.base_url is not None
+                else _optional_env(legacy_env, "OPENAI_BASE_URL")
+            ),
+            "model": (
                 profile.model
                 if profile.model is not None
-                else _optional_env(legacy_env, "OPENAI_LANGUAGE_MODEL") or _optional_env(legacy_env, "OPENAI_MODEL")
+                else _optional_env(legacy_env, "OPENAI_LANGUAGE_MODEL")
+                or _optional_env(legacy_env, "OPENAI_MODEL")
             ),
-            api_key=env.get(profile.api_key_env),
-            api_key_env=profile.api_key_env,
-            timeout=(
+            "api_key": client_env.get(profile.api_key_env),
+            "api_key_env": profile.api_key_env,
+            "timeout": (
                 profile.timeout_s
                 if profile.timeout_s is not None
                 else _float_env(legacy_env, "OPENAI_TIMEOUT", self.config.llm.timeout_s)
             ),
-            max_retries=(
+            "max_retries": (
                 profile.max_retries
                 if profile.max_retries is not None
                 else _int_env(legacy_env, "OPENAI_MAX_RETRIES", self.config.llm.max_retries)
             ),
-            api_mode=api_mode,  # type: ignore[arg-type]
-            store=policy.store,
-            reasoning_effort=(
+            "api_mode": policy.api_mode,
+            "store": policy.store,
+            "reasoning_effort": (
                 profile.reasoning_effort
                 if profile.reasoning_effort is not None
                 else _optional_env(legacy_env, "OPENAI_REASONING_EFFORT")
             ),
-            verbosity=profile.verbosity if profile.verbosity is not None else _verbosity_env(legacy_env),
-            safety_identifier=self._profile_safety_identifier(profile, legacy_env, env),
-            prompt_cache_key=(
+            "verbosity": (
+                profile.verbosity
+                if profile.verbosity is not None
+                else _verbosity_env(legacy_env)
+            ),
+            "safety_identifier": self._profile_safety_identifier(
+                profile,
+                legacy_env,
+                client_env,
+            ),
+            "prompt_cache_key": (
                 profile.prompt_cache_key
                 if profile.prompt_cache_key is not None
-                else _optional_env(legacy_env, "OPENAI_PROMPT_CACHE_KEY") or self.config.llm.prompt_cache_key
+                else _optional_env(legacy_env, "OPENAI_PROMPT_CACHE_KEY")
+                or self.config.llm.prompt_cache_key
             ),
-            prompt_cache_retention=policy.prompt_cache_retention,  # type: ignore[arg-type]
-            responses_previous_response_id=policy.responses_previous_response_id,
-            fallback_json_actions=policy.fallback_json_actions,
-            parallel_tool_calls=(
+            "prompt_cache_retention": policy.prompt_cache_retention,
+            "responses_previous_response_id": policy.responses_previous_response_id,
+            "fallback_json_actions": policy.fallback_json_actions,
+            "parallel_tool_calls": (
                 profile.parallel_tool_calls
                 if profile.parallel_tool_calls is not None
                 else _bool_env(
@@ -407,29 +464,40 @@ class LLMProfileRegistry:
                     self.config.llm.parallel_tool_calls,
                 )
             ),
-            enable_thinking=(
+            "enable_thinking": (
                 _bool_env(legacy_env, "OPENAI_ENABLE_THINKING", False)
                 if "OPENAI_ENABLE_THINKING" in legacy_env
                 else None
             ),
-            organization=(
+            "organization": (
                 _optional_env(legacy_env, "OPENAI_ORGANIZATION")
                 or _optional_env(legacy_env, "OPENAI_ORG_ID")
             ),
-            project=(
+            "project": (
                 _optional_env(legacy_env, "OPENAI_PROJECT")
                 or _optional_env(legacy_env, "OPENAI_PROJECT_ID")
             ),
             # Resolution has snapshotted the only ambient OPENAI_* values that
             # may apply. Prevent the SDK from re-reading a different account,
             # endpoint, or provider policy while constructing its client.
-            inherit_ambient_openai_sdk_config=False,
-            allow_custom_base_url=(
+            "inherit_ambient_openai_sdk_config": False,
+            "allow_custom_base_url": (
                 profile.allow_custom_base_url
-                or _bool_env(env, "AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL", False)
+                or _bool_env(
+                    client_env,
+                    "AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL",
+                    False,
+                )
             ),
-            defaults=self.config.llm,
-        )
+        }
+
+    @staticmethod
+    def _client_options_sha256(options: Mapping[str, Any]) -> str:
+        """Hash cache inputs without retaining or exposing their plaintext values."""
+
+        return hashlib.sha256(
+            dumps({"schema_version": 1, "options": dict(options)}).encode("utf-8")
+        ).hexdigest()
 
     def _resolved_policy(
         self,
@@ -545,7 +613,7 @@ class LLMProfileRegistry:
                 if cached is not client:
                     continue
                 self._clients.pop(profile_id, None)
-                self._client_identity_sha256.pop(profile_id, None)
+                self._client_cache_sha256.pop(profile_id, None)
             for profile_id, cached in tuple(self._test_clients.items()):
                 if cached is client:
                     self._test_clients.pop(profile_id, None)

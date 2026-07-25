@@ -228,6 +228,41 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_capability_use_lease_requires_a_positive_json_integer(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject malformed finite-use leases',
+            )
+            invalid_values = [True, 0, -1, 1.5, float('nan'), float('inf')]
+            for index, uses_remaining in enumerate(invalid_values):
+                before = runtime.store.list_capabilities(subject=pid)
+
+                with pytest.raises(ValidationError, match='uses_remaining'):
+                    runtime.capability.issue_trusted(
+                        pid,
+                        f'object:invalid-direct-lease:{index}',
+                        [CapabilityRight.READ],
+                        issued_by='test',
+                        uses_remaining=uses_remaining,
+                    )
+                with pytest.raises(ValidationError, match='uses_remaining'):
+                    runtime.capability.issue(
+                        'test',
+                        pid,
+                        {
+                            'resource': f'object:invalid-structured-lease:{index}',
+                            'rights': ['read'],
+                            'lease': {'uses_remaining': uses_remaining},
+                        },
+                        require_authority=False,
+                    )
+
+                assert runtime.store.list_capabilities(subject=pid) == before
+        finally:
+            runtime.close()
+
     def test_permission_policy_aliases_are_converted_to_effect_and_lease(self) -> None:
         runtime = Runtime.open('local')
         try:

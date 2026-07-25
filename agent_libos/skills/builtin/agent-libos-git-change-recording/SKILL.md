@@ -38,6 +38,8 @@ It requires repository Git write authority, data-flow clearance, and no checkout
 
 For a normal standalone commit, author/committer identity comes from validated Host/repository configuration. For `amend=true`, the command does not use `--reset-author`: it preserves the replaced commit's author while the current configured identity is the committer. Missing required identity fails. The Runtime disables hooks and GPG signing. Before either mode, stop if an active integration is known or possible: the implementation does not reject `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, rebase, or sequencer state, and plain commit can complete or alter that operation.
 
+Commit also performs a protected repository-read preflight before the write, so it requires Git `read` as well as `write` (and any destructive amend authority). A previously returned state token does not supply or reserve that read right; finite read grants are consumed through the normal authority transaction.
+
 `amend=false` creates a normal commit from the whole index. `amend=true` replaces the current tip using that same complete index and new message. Amend is destructive even when the tree is unchanged: it requires repository write/delete/admin authority and mandatory one-use Human approval bound to the exact old state. A request for a normal commit is not consent to amend.
 
 On success, `created_oid` is the resulting HEAD commit and `after.token` observes the successor state. The worktree can remain intentionally dirty after a commit; a clean status is not required unless the user requested one.

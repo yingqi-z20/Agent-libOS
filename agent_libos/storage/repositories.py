@@ -91,6 +91,7 @@ from agent_libos.storage.contracts import (
     TransactionBackendProtocol,
     UnitOfWorkBackendProtocol,
 )
+from agent_libos.storage.base import StoreAssemblyReadiness
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
 
@@ -117,6 +118,31 @@ _CHECKPOINT_OBJECT_IDENTITY_FIELDS = (
     "created_by",
     "created_at",
 )
+_CHECKPOINT_FORK_PENDING_STATUS_MESSAGE = "checkpoint_fork_pending_payload"
+_TERMINAL_PROCESS_STATUSES = frozenset(
+    {
+        ProcessStatus.EXITED.value,
+        ProcessStatus.FAILED.value,
+        ProcessStatus.KILLED.value,
+    }
+)
+
+
+def _checkpoint_fork_quarantine_process_row(
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    item = deepcopy(dict(row))
+    if str(item.get("status")) in _TERMINAL_PROCESS_STATUSES:
+        return item
+    item.update(
+        {
+            "status": ProcessStatus.CREATED.value,
+            "status_message": _CHECKPOINT_FORK_PENDING_STATUS_MESSAGE,
+            "wait_state_json": dumps(None),
+            "outcome_json": dumps(None),
+        }
+    )
+    return item
 
 
 def _checkpoint_object_payload_was_superseded(
@@ -2091,6 +2117,171 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                 self._snapshot_backend.set_object_payload(oid, payloads[oid])
         return tuple(hydrated)
 
+    def rehydrate_checkpoint_fork_object_payloads(
+        self,
+        rows: SnapshotRows,
+        *,
+        object_payloads: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        """Exactly restore volatile payloads after a lost fork commit ACK.
+
+        The fork rows are immutable inputs allocated for one publication.  A
+        durable row must still match that exact input and retain the present
+        runtime-memory marker before its volatile payload is reconstructed.
+        Validation and the cache replacement share the backend lock so a
+        scheduler or Object mutation cannot observe an intermediate state.
+        """
+
+        if any(not isinstance(oid, str) or not oid for oid in object_payloads):
+            raise ValidationError(
+                "checkpoint fork Object payload ids must be non-empty strings"
+            )
+        payloads = {
+            oid: deepcopy(payload)
+            for oid, payload in object_payloads.items()
+        }
+        object_rows = tuple(dict(row) for row in rows.objects)
+        if any(
+            not isinstance(row.get("oid"), str) or not row.get("oid")
+            for row in object_rows
+        ):
+            raise ValidationError(
+                "checkpoint fork Object row ids must be non-empty strings"
+            )
+        expected_rows = {str(row["oid"]): row for row in object_rows}
+        if len(expected_rows) != len(object_rows):
+            raise ValidationError("checkpoint fork Object rows contain duplicate ids")
+        if set(expected_rows) != set(payloads):
+            raise ValidationError(
+                "checkpoint fork Object payloads do not match Object rows"
+            )
+        if not payloads:
+            return ()
+        with self.locked():
+            current_rows: dict[str, dict[str, Any]] = {}
+            for batch in _snapshot_value_batches(sorted(payloads)):
+                placeholders = ", ".join("?" for _ in batch)
+                for row in self._select_rows(
+                    "objects",
+                    f"oid IN ({placeholders})",
+                    batch,
+                    order_by="oid",
+                ):
+                    current_rows[str(row["oid"])] = row
+            if set(current_rows) != set(payloads):
+                raise ValidationError(
+                    "checkpoint fork payload rehydration found missing Object rows"
+                )
+            present_marker = self._snapshot_backend.payload_marker(present=True)
+            for oid in sorted(payloads):
+                current = dict(current_rows[oid])
+                expected = dict(expected_rows[oid])
+                try:
+                    current_marker = loads(current.pop("payload_json"), {})
+                except (TypeError, ValueError) as exc:
+                    raise ValidationError(
+                        f"checkpoint fork Object payload marker is invalid: {oid}"
+                    ) from exc
+                expected.pop("payload_json", None)
+                current_state = (
+                    current_marker,
+                    current.get("lifecycle_state"),
+                    current,
+                )
+                expected_state = (
+                    present_marker,
+                    ObjectLifecycleState.LIVE.value,
+                    expected,
+                )
+                if current_state != expected_state:
+                    raise ValidationError(
+                        "checkpoint fork Object row changed before payload "
+                        f"rehydration: {oid}"
+                    )
+            return self._snapshot_backend.rehydrate_object_payload_cache(payloads)
+
+    def publish_checkpoint_fork_process_rows(
+        self,
+        rows: SnapshotRows,
+    ) -> tuple[str, ...]:
+        """Atomically publish exact target states from durable quarantine."""
+
+        target_rows = tuple(deepcopy(dict(row)) for row in rows.processes)
+        target_pids = tuple(str(row["pid"]) for row in target_rows)
+        if len(set(target_pids)) != len(target_pids):
+            raise ValidationError("checkpoint fork process rows contain duplicate ids")
+        with self.transaction() as cursor:
+            for target in target_rows:
+                quarantined = _checkpoint_fork_quarantine_process_row(target)
+                if quarantined == target:
+                    continue
+                if (
+                    target.get("revision") != 0
+                    or target.get("state_generation") != 0
+                    or target.get("execution_generation") != 0
+                    or target.get("execution_owner_id") is not None
+                    or target.get("execution_lease_id") is not None
+                ):
+                    raise ValidationError(
+                        "checkpoint fork publication requires fresh process identity"
+                    )
+                updated = cursor.execute(
+                    "UPDATE processes SET status = ?, status_message = ?, "
+                    "wait_state_json = ?, outcome_json = ? "
+                    "WHERE pid = ? AND status = ? AND status_message = ? "
+                    "AND wait_state_json = ? AND outcome_json = ? "
+                    "AND revision = 0 AND state_generation = 0 "
+                    "AND execution_generation = 0 "
+                    "AND execution_owner_id IS NULL "
+                    "AND execution_lease_id IS NULL",
+                    (
+                        target["status"],
+                        target.get("status_message"),
+                        target["wait_state_json"],
+                        target["outcome_json"],
+                        target["pid"],
+                        quarantined["status"],
+                        quarantined["status_message"],
+                        quarantined["wait_state_json"],
+                        quarantined["outcome_json"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ValidationError(
+                        "checkpoint fork process left durable quarantine before "
+                        f"publication: {target['pid']}"
+                    )
+        return tuple(sorted(target_pids))
+
+    def checkpoint_fork_process_rows_match(
+        self,
+        rows: SnapshotRows,
+        *,
+        quarantined: bool = False,
+    ) -> bool:
+        expected_rows = {
+            str(row["pid"]): (
+                _checkpoint_fork_quarantine_process_row(row)
+                if quarantined
+                else dict(row)
+            )
+            for row in rows.processes
+        }
+        if len(expected_rows) != len(rows.processes):
+            raise ValidationError("checkpoint fork process rows contain duplicate ids")
+        current_rows: dict[str, dict[str, Any]] = {}
+        with self.locked():
+            for batch in _snapshot_value_batches(sorted(expected_rows)):
+                placeholders = ", ".join("?" for _ in batch)
+                for row in self._select_rows(
+                    "processes",
+                    f"pid IN ({placeholders})",
+                    batch,
+                    order_by="pid",
+                ):
+                    current_rows[str(row["pid"])] = row
+        return current_rows == expected_rows
+
     def _delete_checkpoint_scope(
         self,
         cursor: Any,
@@ -2360,7 +2551,7 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                 self._insert_backend_row(
                     cursor,
                     "processes",
-                    row,
+                    _checkpoint_fork_quarantine_process_row(row),
                     before_insert=before_insert,
                 )
 
@@ -3432,6 +3623,9 @@ class UnitOfWork:
 
     def locked(self) -> AbstractContextManager[None]:
         return self.__store.locked()
+
+    def probe_runtime_assembly_readiness(self) -> StoreAssemblyReadiness:
+        return self.__store.probe_runtime_assembly_readiness()
 
     @contextmanager
     def transaction(self, *, include_object_payloads: bool = False) -> Iterator[UnitOfWork]:

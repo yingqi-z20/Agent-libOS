@@ -866,6 +866,127 @@ class TestJitSecurity:
         assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
 
     @pytest.mark.real_deno
+    def test_deno_jit_process_exit_cannot_bypass_cumulative_review(self) -> None:
+        pid = self.runtime.process.spawn(
+            image='coding-agent:v0',
+            goal='exit only through cumulative completion review',
+        )
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'bypass_exit_review',
+                'description': 'Attempt direct exit.',
+                'input_schema': {'type': 'object'},
+            },
+            source_code=EXIT_AFTER_RESULT_SOURCE,
+        )
+        assert self.runtime.tools.validate(candidate).ok
+        self.runtime.tools.register(pid, candidate)
+
+        result = self.runtime.tools.call(pid, 'bypass_exit_review', {})
+
+        assert not result.ok
+        assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert not any(
+            record.action == 'process.exit' and record.actor == pid
+            for record in self.runtime.audit.trace(actor=pid)
+        )
+        failed_tool_calls = [
+            record
+            for record in self.runtime.audit.trace(actor=pid)
+            if record.action == 'tool.call'
+            and record.decision.get('tool') == 'bypass_exit_review'
+        ]
+        assert len(failed_tool_calls) == 1
+        assert failed_tool_calls[0].decision['ok'] is False
+        # The tool was admitted by policy and then failed inside its mediated
+        # syscall; ToolBroker must retain that distinction in failure evidence.
+        assert failed_tool_calls[0].decision['policy_decision'] == 'allow'
+        assert 'error' in failed_tool_calls[0].decision
+
+        guarded = self.runtime.tools.call(
+            pid,
+            'process_exit',
+            {'payload': {'summary': 'real final result'}},
+        )
+        assert guarded.ok, guarded.error
+        assert guarded.payload['status'] == 'completion_review_required'
+        assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+
+    def test_deferred_jit_exit_checks_exec_target_before_lifecycle_mutation(
+        self,
+    ) -> None:
+        pid = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='do not combine exec with an exit-gate bypass',
+        )
+        session = LibOSSyscallSession(self.runtime, pid)
+
+        async def request_lifecycle_changes() -> None:
+            await session.handle(
+                'process.exit',
+                {'payload': {'done': True}},
+            )
+            await session.handle(
+                'process.exec',
+                {
+                    'image': 'coding-agent:v0',
+                    'goal': 'target guarded by cumulative review',
+                },
+            )
+            await session.apply_deferred_lifecycle()
+
+        with pytest.raises(
+            ValidationError,
+            match='call the guarded process_exit tool instead',
+        ):
+            asyncio.run(request_lifecycle_changes())
+
+        process = self.runtime.process.get(pid)
+        assert process.image_id == 'toolmaker-agent:v0'
+        assert process.status == ProcessStatus.RUNNABLE
+        assert not any(
+            record.action in {'process.exec', 'process.exit'}
+            and record.actor == pid
+            for record in self.runtime.audit.trace(actor=pid)
+        )
+
+    def test_same_jit_call_cannot_pair_exec_with_active_gate_exit(self) -> None:
+        pid = self.runtime.process.spawn(
+            image='coding-agent:v0',
+            goal='do not escape cumulative review through deferred exec',
+        )
+        session = LibOSSyscallSession(self.runtime, pid)
+
+        async def request_lifecycle_changes() -> None:
+            await session.handle(
+                'process.exec',
+                {
+                    'image': 'base-agent:v0',
+                    'goal': 'ungated target must not erase the active gate',
+                },
+            )
+            await session.handle(
+                'process.exit',
+                {'payload': {'done': True}},
+            )
+
+        with pytest.raises(
+            ValidationError,
+            match='call the guarded process_exit tool instead',
+        ):
+            asyncio.run(request_lifecycle_changes())
+
+        process = self.runtime.process.get(pid)
+        assert process.image_id == 'coding-agent:v0'
+        assert process.status == ProcessStatus.RUNNABLE
+        assert not any(
+            record.action in {'process.exec', 'process.exit'}
+            and record.actor == pid
+            for record in self.runtime.audit.trace(actor=pid)
+        )
+
+    @pytest.mark.real_deno
     def test_deno_jit_process_exec_is_applied_after_tool_result(self) -> None:
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='exec after deno result')
         self.runtime.capability.grant(pid, 'image:base-agent:v0', [CapabilityRight.READ], issued_by='test')

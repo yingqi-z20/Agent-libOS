@@ -6,7 +6,7 @@ import re
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BeforeValidator, ConfigDict, StrictInt
+from pydantic import BeforeValidator, ConfigDict, StrictFloat, StrictInt
 from pydantic.dataclasses import dataclass
 
 from agent_libos.models.capability import AuthorityRule
@@ -296,14 +296,14 @@ class DataFlowDefaults:
 class SchedulerDefaults:
     max_quanta: int | None = None
     poll_interval_s: float = 0.01
-    max_workers: int = 8
+    max_workers: StrictInt = 8
     drain_window_s: float = 0.5
     shutdown_join_timeout_s: float = 2.0
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ProcessDefaults:
-    max_tool_calls: int = 256
+    max_tool_calls: StrictInt = 256
     max_child_processes: int = 16
     max_runtime_seconds: float | None = None
     max_context_materialization_tokens: int = 65_536
@@ -345,8 +345,8 @@ class LLMProfile:
     parallel_tool_calls: bool | None = None
     auto_wait_on_empty_tool_calls: bool | None = None
     fallback_json_actions: bool | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
+    temperature: StrictFloat | None = None
+    max_tokens: StrictInt | None = None
     context_window_tokens: int | None = None
     allow_custom_base_url: bool = False
 
@@ -355,8 +355,8 @@ class LLMProfile:
 class LLMDefaults:
     default_profile_id: str = "default"
     profiles: dict[str, LLMProfile] = field(default_factory=lambda: {"default": LLMProfile()})
-    temperature: float = 0.2
-    max_tokens: int = 16_384
+    temperature: StrictFloat = 0.2
+    max_tokens: StrictInt = 16_384
     context_window_tokens: int = 131_072
     timeout_s: float = 60.0
     max_retries: int = 2

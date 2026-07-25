@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,6 +25,74 @@ class CapabilityEffect(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
+
+
+class _ImmutableDict(dict):
+    """JSON-compatible mapping that rejects ordinary in-place mutation."""
+
+    @staticmethod
+    def _reject_mutation(*args: object, **kwargs: object) -> None:
+        raise TypeError("authority rule conditions are immutable")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __ior__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+
+    def __copy__(self) -> "_ImmutableDict":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_ImmutableDict":
+        return self
+
+
+class _ImmutableList(list):
+    """JSON-compatible sequence that rejects ordinary in-place mutation."""
+
+    @staticmethod
+    def _reject_mutation(*args: object, **kwargs: object) -> None:
+        raise TypeError("authority rule conditions are immutable")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __iadd__ = _reject_mutation
+    __imul__ = _reject_mutation
+    append = _reject_mutation
+    clear = _reject_mutation
+    extend = _reject_mutation
+    insert = _reject_mutation
+    pop = _reject_mutation
+    remove = _reject_mutation
+    reverse = _reject_mutation
+    sort = _reject_mutation
+
+    def __copy__(self) -> "_ImmutableList":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_ImmutableList":
+        return self
+
+
+def _freeze_authority_condition(value: Any) -> Any:
+    if isinstance(value, (_ImmutableDict, _ImmutableList)):
+        return value
+    if isinstance(value, Mapping):
+        return _ImmutableDict(
+            (key, _freeze_authority_condition(item)) for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return _ImmutableList(_freeze_authority_condition(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_authority_condition(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_authority_condition(item) for item in value)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    return value
 
 
 class CapabilityStatus(StrEnum):
@@ -77,6 +146,15 @@ class AuthorityRule:
     risk: AuthorityRisk
     conditions: dict[str, Any] = field(default_factory=dict)
     description: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.conditions, Mapping):
+            raise TypeError("authority rule conditions must be a mapping")
+        object.__setattr__(
+            self,
+            "conditions",
+            _freeze_authority_condition(self.conditions),
+        )
 
 
 @dataclass(frozen=True)

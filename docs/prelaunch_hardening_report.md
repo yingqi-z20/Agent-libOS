@@ -82,12 +82,12 @@ Tool、Skill、JIT、Image、Checkpoint 和 GUI 是可见性、编排或人体�
 | Human I/O 与审批 | 并发响应、无类型 answer、隐式策略、terminal retry 可能重复提示；terminal lock 覆盖阻塞 I/O；有界历史可能遮蔽 pending；敏感文本可能进入 metadata | permission 必须显式选择策略；terminal read/write 锁内 claim、锁外 I/O；列表 pending-first；每个 run 使用不可变 Human context；pending intent 只保存长度、hash、purpose 和 error type | 防止审批 ABA、跨 run 策略串扰、exit 饥饿、pending 被历史记录挤出 GUI snapshot、重复人体副作用和敏感文本持久化 |
 | Object Memory | owner/version 检查与 payload 更新之间存在竞态；finalizer 在 SQL 事务内可能造成不可回滚外部 close；event/audit 失败可留下孤立对象或 link | ownership transition lock；LIVE/owner/version CAS；finalizer 位于 SQL 事务外但在所有权锁内；namespace/object/link/update/delete 与 capability/event/audit 原子提交；listing 消费实际使用的有限可见性权限 | 防止 stale update 复活对象、转移/删除误报成功、PTY close 重复，以及有限 READ 无限枚举 metadata |
 | Process、Scheduler 与 ResourceManager | public single-step 可绕过 scheduler lock/charge；core exec、exit/parent wake 和 message wake 可能半提交；清理一个 PID 失败可阻断其他进程 | single-step 统一进入 quantum lock；core exec/message/exit+wake 的 store transition 事务化；高层 image boot 失败使用补偿恢复；per-PID best-effort finalize；run-local Human context；shutdown 可重试；资源 charge 对祖先链原子发布 | 防止同 PID 重入、资源计费旁路、半终止/半唤醒，并减少孤儿进程和半关闭 runtime；不把补偿式 image boot 误述为单事务 |
-| LLM 执行器与上下文 | 真实 async SDK client 可跨已关闭 event loop 复用；pending action 可能在 effect 后、clear 前被重放；Responses provider state 绑定不足 | 真实 client request-scoped 创建/关闭；每代 wait 使用唯一 resume token 和 pending→resuming CAS；provider fingerprint 绑定 pid/context/model/endpoint/credential；compaction/restore 增长 generation | 防止跨 loop transport 崩溃、非幂等动作重复执行和 provider-side chain 跨租户或恢复代复用 |
+| LLM 执行器与上下文 | 真实 async SDK client 可跨已关闭 event loop 复用；pending action 可能在 effect 后、clear 前被重放；把全量本地快照与 Responses provider state 叠加会重复历史 | 真实 client request-scoped 创建/关闭；每代 wait 使用唯一 resume token 和 pending→resuming CAS；AgentProcess 禁用 `previous_response_id` 并记录原因；Runtime 只记录 scope fingerprint 供观测和未来协议使用，低层 client 并不执行该隔离检查 | 防止跨 loop transport 崩溃、非幂等动作重复执行和全量历史双重回放，同时不把尚未启用的 fingerprint 误报为低层租户隔离防线 |
 | Checkpoint、Image、ObjectTask 与 fork | read/cancel 有限权限可被重复使用；snapshot/head/capability/event/audit 可能分步提交；fork 发布前权限可被撤销 | inspect/diff/replay 和跨 actor ObjectTask get/list/wait/cancel 按操作粒度消费有限权限；checkpoint create 同事务；restore/fork scope lock；publish 重验 authority；不克隆有限能力；JIT identity 重映射 | 防止有限权限无限读取/取消、撤销后能力复活、半发布 fork 和跨进程 JIT identity 共享 |
 | Deno/JIT 与 Skill | 宿主被 SIGKILL 时，纯 parent-side monitor 无法保证 Deno 退出；SWE edit 可能在截断源码上写回 | POSIX death pipe + 独立进程组；Windows `KILL_ON_JOB_CLOSE` Job Object gate；containment 建立失败即拒绝启动；SWE edit 在 source 截断时拒绝写入 | 防止宿主异常退出留下无限 CPU/RSS orphan，避免截断输入破坏工作区 |
 | JSON-RPC | endpoint metadata 可在 registry 权限前读取；DNS 发生在 intent 前；registry row、stale grants、event/audit 可能分叉 | 先鉴权再加载 metadata；DNS 前持久化 intent 和一次性 method reservation；DNS 后任何不确定失败保留信息流；registry mutation 原子化 | 关闭 endpoint existence oracle，避免 DNS/transport 已观察却退款，防止注销后 stale 权限继续存在 |
 | MCP | live validation、list/call 与 stdio spawn 需要多项权限，旧路径可能部分消费或在 DNS 前无证据；registry 同样存在 metadata oracle | 主 tool、server、process:spawn、精确 stdio EXECUTE 组合预约；HTTP DNS 纳入 intent；call 与 live validation 共用一个 effect 边界；registry 先鉴权并原子提交 | 保证远程/本地 MCP 在失败窗口的权限与证据一致，并阻止通过 registry 发现未授权 server |
-| PTY Runtime Module | write/resize/close 直接消费有限 Object 权限；自动退出先读 exit code/close 再记录 effect；reader 与 monitor 相互阻塞 | mutation 使用 reserve/commit/restore；auto-exit 在首次 provider 调用前创建 close intent；list 消费有限 READ；reader 与 monitor 独立；wall charge 先于可失败 sampler | 防止交互式终端权限异常退款、自动退出副作用丢失和 blocked reader 绕过预算 |
+| PTY Runtime Module | write/resize/close 直接消费有限 Object 权限；自动退出先读 exit code/close 再记录 effect；reader 与 monitor 相互阻塞 | mutation 使用 reserve/commit/restore；auto-exit 在首次 provider 调用前创建 close intent；list 消费有限 READ；POSIX reader/资源 monitor 独立且 wall charge 先于可失败 sampler；Windows 无该 supervisor，带 `SubprocessLimits` 时启动前拒绝 | 防止交互式终端权限异常退款、自动退出副作用丢失和 POSIX blocked reader 绕过预算；不把 Windows ConPTY I/O 误述为资源监管 |
 | ToolBroker 与 workflow | 全局 name fallback 可解析其他进程的 ephemeral JIT；未知 workflow 名称被当作真实 tool id 返回 | 移除跨进程 ephemeral fallback；缺失工具返回结构化 table denial；workflow 只有成功解析时才暴露 tool id | 关闭跨进程 JIT 可见性通道，API 不再把请求字符串伪装成已注册 identity |
 | GUI/API | Human 请求类型与策略在 UI/API 中表达不足；有界历史可遮蔽新 pending；shutdown 与并发 runtime user 的生命周期不完整 | typed Human request card 与显式策略；Human list pending-first，snapshot 在通用上限下保序并报告截断；API 严格校验；GUI shutdown drain/retry；client 类型、测试、i18n 与样式同步 | 降低误审批和 API 模糊输入，避免历史记录挤掉待处理请求或关闭时访问已释放 store；不承诺单个 snapshot 可容纳超过全局 collection 上限的 pending |
 | Benchmark | 旧 runner 可由 `result.ok` 推断副作用；match 规则和分母不够严格；部分 result 文件可被当作完整 run | schema v1 evidence-first oracle；exact/prefix/glob fail closed；CLI 预写 metadata 后执行 task×runner 完成性校验；未知/缺失/意外证据使 run invalid；显式分母字段 | 指标不再掩盖无证据或缺失任务，27 个任务可重复地产生完整 effect certificate |
@@ -153,12 +153,16 @@ PTY manifest/source hash 与 `config.yaml` 的信任项一致。
 1. 当前环境没有配置 `AGENT_LIBOS_POSTGRES_DSN`，因此 PostgreSQL 只完成了
    shared-contract、SQL 生成、lease key 与静态/单元验证。发布 PostgreSQL
    backend 前应在真实实例上运行 `--run-postgres`。
-2. 当前主机为 macOS。Windows Job Object 和 PTY 分支有 mock/branch 测试，
-   但发布 Windows 支持前仍应在真实 Windows runner 上执行 GUI、PTY、Shell
-   和 Deno parent-death 集成测试。
+2. 当前主机为 macOS。Deno 的 Windows Job Object 分支和 PTY 的 ConPTY
+   分支有 mock/branch 测试，但当前 PTY provider 本身没有 Job Object 或
+   CPU/RSS/wall 监管。发布 Windows 支持前仍应在真实 Windows runner 上执行
+   GUI、PTY、Shell 和 Deno parent-death 集成测试。
 3. 真实 LLM 路径按项目策略保持 opt-in，本轮没有消费 token。发布 provider
    配置前应分别对 Responses 与 Chat Completions 做最小真实 smoke，并保持
-   `store=false` 与 `responses_previous_response_id=false` 默认隐私姿态。
+   `store=false` 与 `responses_previous_response_id=false` 的默认无状态
+   provider 姿态。它只限制 provider 侧状态；默认
+   `llm.persist_full_io=true` 仍会在 RuntimeStore 保留完整 I/O，因此不是
+   端到端隐私保证。
 4. GUI bundle 缺少 `npm`，因此本轮使用 package.json 等价命令完成 Vitest、
    两套 TypeScript 配置和 production build；CI 仍应通过标准 `npm ci` 后运行
    官方 GUI lane。

@@ -45,6 +45,8 @@ from agent_libos.storage import display_store_target
 from agent_libos.utils.serde import to_jsonable
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
+_WORKFLOW_HELP = "Run an Image-bound workflow tool directly without an LLM turn"
+_WORKFLOW_RUN_HELP = "Spawn a workflow process and call one tool from its complete process table"
 
 DEMO_PATCH_PREVIEW_PATH = "agent_outputs/demo_patch_preview.txt"
 DEMO_PATCH_PREVIEW_CONTENT = "change add() expected value\n"
@@ -213,7 +215,7 @@ def main(argv: list[str] | None = None) -> None:
     resources_parser = sub.add_parser("resources", help="Print process resource budget and usage")
     resources_parser.add_argument("pid")
     sub.add_parser("tools", help="Print registered tools")
-    workflow_parser = sub.add_parser("workflow", help="Run a user-facing workflow tool directly")
+    workflow_parser = sub.add_parser("workflow", help=_WORKFLOW_HELP)
     _add_workflow_parser_args(workflow_parser)
     object_task_parser = sub.add_parser(
         "object-task",
@@ -493,7 +495,7 @@ def _run_explain_command(runtime: Runtime, args: argparse.Namespace) -> dict[str
 
 def _add_workflow_parser_args(parser: argparse.ArgumentParser) -> None:
     sub = parser.add_subparsers(dest="workflow_command", required=True)
-    run_parser = sub.add_parser("run", help="Spawn a workflow process and call one visible tool")
+    run_parser = sub.add_parser("run", help=_WORKFLOW_RUN_HELP)
     run_parser.add_argument("tool", help="Tool/workflow name to run.")
     run_parser.add_argument("--args-json", default="{}", help="JSON object passed as tool arguments.")
     run_parser.add_argument("--image", help="AgentImage id to use; defaults to the runtime default image.")
@@ -532,7 +534,7 @@ def _add_object_task_parser_args(parser: argparse.ArgumentParser) -> None:
     owner.add_argument("--owner-oid", help="Owner object id.")
     owner.add_argument("--owner-name", help="Owner object name in the selected namespace.")
     start.add_argument("--namespace", help="Namespace for --owner-name.")
-    start.add_argument("tool", help="Visible tool to run.")
+    start.add_argument("tool", help="Tool bound in the creator's complete process tool table.")
     start.add_argument("--args-json", default="{}", help="JSON object passed as tool arguments.")
     start.add_argument("--notify-pid", help="Process to notify; defaults to --pid.")
     start.add_argument(
@@ -566,7 +568,11 @@ def _add_object_task_parser_args(parser: argparse.ArgumentParser) -> None:
     start.add_argument(
         "--wait",
         action="store_true",
-        help="Wait until the task reaches a terminal or explicit waiting state before printing.",
+        required=True,
+        help=(
+            "Required by the one-shot CLI; wait until the task reaches a terminal "
+            "or explicit waiting state before printing."
+        ),
     )
     start.add_argument("--timeout", type=float, help="Optional wait timeout in seconds.")
 
@@ -1239,7 +1245,7 @@ def _run_capabilities_command(runtime: Runtime, args: argparse.Namespace) -> dic
     if command == "inspect":
         cap = runtime.store.get_capability(args.capability_id)
         if cap is None:
-            raise SystemExit(f"capability not found: {args.capability_id}")
+            raise NotFound(f"capability not found: {args.capability_id}")
         if process_mode and cap.subject != actor:
             runtime.capability.require(actor, cap.resource, CapabilityRight.ADMIN)
         return runtime.capability.inspect(args.capability_id)
@@ -1280,7 +1286,10 @@ def _run_capabilities_command(runtime: Runtime, args: argparse.Namespace) -> dic
 def _add_images_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--actor-pid",
-        help="If set, execute as this process and enforce image capabilities. Omit for admin CLI mode.",
+        help=(
+            "If set, execute as this process and enforce filesystem, image, and checkpoint "
+            "capabilities as applicable. Omit for admin CLI mode."
+        ),
     )
     sub = parser.add_subparsers(dest="images_command", required=True)
     sub.add_parser("list", help="List registered AgentImages")

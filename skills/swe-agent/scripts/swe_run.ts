@@ -13,9 +13,12 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
   });
   const stdout = String(result.stdout ?? "");
   const stderr = String(result.stderr ?? "");
-  const message = stdout.length === 0 && stderr.length === 0
+  const noOutput = stdout.length === 0 && stderr.length === 0;
+  const message = !noOutput
+    ? ""
+    : result.returncode === 0
     ? "Your command ran successfully and did not produce any output."
-    : "";
+    : `Your command exited with return code ${String(result.returncode)} and did not produce any output.`;
   return {
     argv: result.argv ?? argv,
     returncode: result.returncode,

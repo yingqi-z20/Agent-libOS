@@ -141,6 +141,7 @@ _HIGH_RISK_SCHEMA_CONTRACTS: dict[str, dict[str, object]] = {
             "max_bytes": 1048576,
             "object_type": "artifact",
         },
+        "bounds": {"max_bytes": {"minimum": 1, "maximum": 1048576}},
     },
     "write_object_to_file": {
         "required": {"name", "path"},
@@ -429,6 +430,65 @@ def test_builtin_tool_guidance_validation_fails_closed() -> None:
             allowed_tools=["echo"],
             name="agent-libos-example",
         )
+
+
+def test_fork_tool_schema_does_not_claim_copy_on_write_isolation(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(tmp_path / "fork-tool-mode-description.sqlite")
+    try:
+        spec = next(row for row in runtime.tools.list() if row["name"] == "fork_child_process")
+        schema = json.loads(spec["spec_json"])["input_schema"]
+        description = schema["properties"]["mode"]["description"]
+
+        assert "not copy-on-write isolation" in description
+        assert "same Object ids" in description
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("object_default", "object_hard", "filesystem_hard", "expected_default", "expected_maximum"),
+    [
+        (300_000, 500_000, 200_000, 200_000, 200_000),
+        (150_000, 180_000, 220_000, 150_000, 180_000),
+        (15_000_000, 20_000_000, 20_000_000, 15_000_000, 20_000_000),
+    ],
+)
+def test_create_object_from_file_schema_uses_effective_file_read_limits(
+    tmp_path: Path,
+    object_default: int,
+    object_hard: int,
+    filesystem_hard: int,
+    expected_default: int,
+    expected_maximum: int,
+) -> None:
+    config = replace(
+        DEFAULT_CONFIG,
+        tools=replace(
+            DEFAULT_CONFIG.tools,
+            object_file_max_bytes=object_default,
+            object_file_hard_limit_bytes=object_hard,
+            filesystem_read_hard_limit_bytes=filesystem_hard,
+        ),
+    )
+    runtime = Runtime.open(
+        tmp_path / f"object-file-schema-{object_default}-{filesystem_hard}.sqlite",
+        config=config,
+    )
+    try:
+        spec = next(
+            row for row in runtime.tools.list()
+            if row["name"] == "create_object_from_file"
+        )
+        max_bytes = json.loads(spec["spec_json"])["input_schema"]["properties"][
+            "max_bytes"
+        ]
+
+        assert max_bytes["default"] == expected_default
+        assert max_bytes["maximum"] == expected_maximum
+    finally:
+        runtime.close()
 
 
 @pytest.mark.parametrize(

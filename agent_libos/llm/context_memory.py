@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any, TYPE_CHECKING
@@ -20,6 +21,7 @@ from agent_libos.models import (
     Capability,
     CapabilityRight,
     ContextMaterializationManifest,
+    DataFlowContext,
     DataLabels,
     Event,
     EventType,
@@ -159,7 +161,10 @@ class LLMContextMemory:
         events: list[Event],
         capabilities: list[Capability],
         tools: list[dict[str, Any]],
+        *,
+        label_events: list[Event] | None = None,
     ) -> MaterializedContext:
+        trusted_label_events = events if label_events is None else label_events
         if not self.persistent_context_enabled(pid):
             return self._record_source_only_context(pid, process, source_context)
         handle = self.ensure(pid, image, process, tools)
@@ -191,7 +196,7 @@ class LLMContextMemory:
             token_estimate=estimate_tokens(payload),
             historical=obj.metadata,
             source_context=source_context,
-            events=events,
+            events=trusted_label_events,
         )
         metadata = self._persist_context_label_history(pid, metadata)
         label_history = labels_for_explain(metadata)
@@ -1104,15 +1109,57 @@ class LLMContextMemory:
             sources,
         )
 
+    def include_event_labels(
+        self,
+        context: DataFlowContext,
+        events: list[Event],
+    ) -> DataFlowContext:
+        """Merge trusted labels for every event represented in the prompt batch."""
+
+        event_metadata = self._event_metadata(events)
+        if not event_metadata:
+            return context
+        return replace(
+            context,
+            labels=DataLabels.aggregate(
+                (
+                    context.labels,
+                    *(
+                        DataLabels.from_object_metadata(metadata)
+                        for metadata in event_metadata
+                    ),
+                )
+            ),
+        )
+
     @staticmethod
     def _event_metadata(events: list[Event]) -> list[ObjectMetadata]:
         """Recover trusted labels for event payloads copied into the prompt."""
 
         sources: list[ObjectMetadata] = []
+        canonical_fields = frozenset(DataLabels().to_dict())
         for event in events:
-            labels = metadata_from_labels(event.payload.get("data_labels"))
-            if labels is not None:
-                sources.append(labels)
+            if "data_labels" not in event.payload:
+                continue
+            raw_labels = event.payload["data_labels"]
+            if (
+                not isinstance(raw_labels, Mapping)
+                or frozenset(raw_labels) != canonical_fields
+            ):
+                raise ValidationError(
+                    f"event {event.event_id} contains malformed trusted data_labels"
+                )
+            try:
+                labels = metadata_from_labels(DataLabels.from_dict(raw_labels))
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    f"event {event.event_id} contains malformed trusted data_labels"
+                ) from exc
+            if labels is None:
+                raise ValidationError(
+                    f"event {event.event_id} contains malformed trusted data_labels"
+                )
+            sources.append(labels)
         return sources
 
     def _durable_context_label_metadata(self, pid: str) -> ObjectMetadata | None:

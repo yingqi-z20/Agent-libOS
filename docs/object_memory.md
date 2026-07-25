@@ -132,6 +132,14 @@ The trusted Host API returns full `AgentObject` values, including payloads, from
 projections instead. Do not expose the Host manager directly to an untrusted
 caller that should only see the projected form.
 
+The `limit` on `list_namespace` is one shared cap across visible Objects and
+immediate child namespaces, not a per-kind cap. The manager fills visible
+Objects first and uses only the remaining slots for child namespaces. The
+current result has no cursor, `has_more`, or `truncated` marker, so a response
+whose entry count reaches the limit does not prove that the namespace listing
+is complete. Model-facing projections preserve this ordering and completeness
+limitation while omitting Object payloads.
+
 Namespace capabilities gate listing, lookup, Object creation, and creation of
 a child namespace. Creating a child requires `write` on its existing parent;
 successful creation grants the creator `read`, `write`, and `admin` on the new
@@ -217,6 +225,12 @@ Processes hold `MemoryView` objects that summarize which objects are visible as
 goal, context, evidence, or result state. Fork can attenuate a parent view into
 a child. Spawn creates a fresh goal-only view.
 
+Ordinary process fork `mode="copy"` is not copy-on-write cloning. It may
+derive a writable child handle to the same OID, so a child update changes the
+Object the parent sees. Read-only `worker`/`restricted` modes are safer when
+shared mutation is not intended. Checkpoint fork is a different operation: it
+clones eligible owned reconstructable Objects and remaps their identities.
+
 A view root is a borrowed reference unless the Object's explicit owner is that
 process/subtree. Checkpoint restore uses ownership, not reachability, as its
 destructive boundary: restoring a borrower does not roll back the lender's
@@ -276,7 +290,10 @@ tool. Starting a task requires the creator to hold `read`, `write`, and `link`
 rights on the owner object, `process:spawn` `write`, available per-object and
 global ObjectTask concurrency slots, and the requested tool must already be
 visible in the creator process tool table. External capabilities are inherited
-only when explicitly delegated.
+only when explicitly delegated. Start validates this envelope and visibility,
+then returns a queued task; the runner applies the target tool's argument schema
+asynchronously through ToolBroker. Invalid target arguments therefore appear as
+a terminal task failure rather than a synchronous start rejection.
 
 Objects are immutable by default, so their initial owner handle does not include
 `write`. An Object intended to own an ObjectTask must be created with
@@ -380,6 +397,9 @@ The ObjectTask manager also watches ordinary process messages delivered to a
 runner and terminal child-process notices. Those events can resume waiting
 tasks only for tools with explicit replay-safe semantics, currently
 `receive_process_messages` and `wait_child_process`.
+`watch_object_task_owner(enabled=false)` disables future owner notices for an
+active task. It does not remove notices already in the runner mailbox, cancel
+the task, or change Object/target-tool authority.
 
 ## File/Object Bridge
 
@@ -389,7 +409,10 @@ returning full file content as a process-visible tool result:
 - `create_object_from_file` reads a workspace file through the filesystem
   primitive and creates an object. The resulting Object Memory payload is
   checked against the memory payload hard limit before creation; callers must
-  opt into truncation for oversize file objects.
+  opt into truncation for oversize file objects. Its advertised `max_bytes`
+  default and maximum are bounded by both the Object-file settings and the
+  filesystem primitive's read hard limit; under defaults the effective ceiling
+  is 1 MiB even though the separate Object-file absolute limit is higher.
 - `write_object_to_file` materializes object payload into a workspace file
   through the filesystem primitive.
 
@@ -514,9 +537,12 @@ final LLM context is prepared. See
 ## Persistence Invariant
 
 Object metadata and namespace directories are stored in the runtime store.
-Ordinary object payloads are runtime-only; `objects.payload_json` stores a
-runtime-memory marker rather than the user payload for both SQLite and
-PostgreSQL backends.
+Ordinary object payloads are runtime-only; current SQLite and PostgreSQL writes
+store a runtime-memory marker rather than the user payload in
+`objects.payload_json`. The decoder retains a compatibility path for accepted
+legacy full-JSON rows from older development builds; those rows remain durable
+sensitive data and are not rewritten by the marker recovery sweep. See
+[Runtime Storage](storage.md#transaction-model).
 
 If a reopen cannot materialize a live payload cache for a marker row, the
 storage-layer startup recovery sweep releases the object fail-closed instead of

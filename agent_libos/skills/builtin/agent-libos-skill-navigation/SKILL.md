@@ -25,22 +25,22 @@ Use a focused query such as `{"text":"git pull request","limit":8}` whenever the
 
 Pass exactly one ID returned by discovery, for example `{"skill_id":"example-skill"}`. Do not activate from a guessed name.
 
-Activation always has one model-visible result contract: `pid`, `skill_id`, `name`, `version`, `tool_names`, `tool_ids`, `jit_tool_ids`, `instructions_hash`, and `package_sha256`. Package origin, Host trust mechanism, and internal activation provenance are not model routing inputs.
+Activation always has one model-visible result contract: the outer envelope is `{"result": {...}}`, whose nested result contains `pid`, `skill_id`, `name`, `version`, `tool_names`, `tool_ids`, `jit_tool_ids`, `instructions_hash`, and `package_sha256`. Package origin, Host trust mechanism, and internal activation provenance are not model routing inputs.
 
 The runtime validates the exact package snapshot and every binding atomically. A static binding may reveal an image-owned tool; a package-declared JIT binding may add a process-local tool. Neither case grants the primitive Capability or Human approval needed for an effect. Activation authority is determined by Host policy and package contents; if an ASK is pending, resume it rather than submitting a duplicate activation.
 
 New instructions and schemas appear in the next turn. Reactivation is not a harmless read: it replaces the previous snapshot and bindings and can retire superseded JIT, so avoid it when `active=true` or the exact Skill is already in `Loaded skills`.
 
-Direct JIT exposure shows each activated JIT schema. Multiplexed images expose only `run_jit_tool`; use the loaded contract and `{"tool_name":"exact-name","arguments":{...}}`. Never guess a hidden schema.
+Direct JIT exposure shows each activated JIT schema. Multiplexed images expose only `run_jit_tool`; use the loaded contract and `{"tool_name":"exact-name","arguments":{...}}`. The prompt omits the JIT catalog/source resource entries, but an exact loaded-snapshot path already supplied by trusted instructions or earlier authorized evidence remains readable. Never guess a hidden schema or probe filenames.
 
 ### `read_skill_resource`
 
 Read a package-relative resource after activation and before unload, for example `{"skill_id":"example-skill","path":"references/protocol.md","max_bytes":8192}`.
 
-- Use an exact path from loaded instructions or `resources` metadata. Absolute paths, `..`, and inventions fail; this reads neither workspace files nor the live registry package.
+- Use an exact path from loaded instructions, visible `resources` metadata, or prior authorized evidence. Absolute paths, `..`, and inventions fail; this reads neither workspace files nor the live registry package. In multiplexed mode an omitted JIT-contract path is still readable if its exact path is already known, but the tool does not list or discover it.
 - Reads use the immutable loaded snapshot, unaffected by later registry replacement, and need no second `skill:<id>` read grant.
 - `max_bytes` rejects rather than truncates. Omit it for the Host default or choose at least disclosed `size_bytes`; do not probe repeatedly.
-- Inspect `kind`, `size_bytes`, and `sha256`. For `kind="text"`, use `content`; for `kind="base64"`, use `content_base64`. Exactly one payload form is useful.
+- The outer result is `{"resource": {...}}`; inspect the nested `kind`, `size_bytes`, and `sha256`. Both payload keys are present. For `kind="text"`, use non-null `content` and expect `content_base64=null`; for `kind="base64"`, use non-null `content_base64` and expect `content=null`.
 - A Skill with no declared resources needs no resource read. Do not infer package origin from that absence.
 
 ### `unload_skill`
@@ -49,7 +49,7 @@ Call `{"skill_id":"example-skill"}` only after its guidance/resources are no lon
 
 Unload removes that snapshot and its contributed visibility, retires unshared JIT, and restores overlapping or base bindings. It never revokes Capability or reverses external effects. Host policy may require authority for the lifecycle mutation.
 
-The common result contains `pid`, `skill_id`, and `removed_tools`. Empty `removed_tools` is normal when the full process table or another loaded Skill still owns every binding; it does not mean the prompt body remained loaded.
+The outer envelope is `{"result": {...}}`; the nested result contains `pid`, `skill_id`, and `removed_tools`. Empty `removed_tools` is normal when the full process table or another loaded Skill still owns every binding; it does not mean the prompt body remained loaded.
 
 ## Recommended workflow
 
@@ -70,7 +70,7 @@ The common result contains `pid`, `skill_id`, and `removed_tools`. Empty `remove
 - Discovery or activation denial: request only the exact catalog or Skill right made available by Host policy; never duplicate a pending ASK.
 - Unknown activation settlement: inspect the next turn's `Loaded skills` or repeat focused discovery and check `active`. Do not blindly repeat a non-idempotent activation.
 - Missing/oversized resource: compare loaded metadata and correct the path or ceiling once; no filesystem bypass.
-- Multiplexed JIT without a documented name/argument contract: stop and report the incomplete Skill package rather than guessing.
+- Multiplexed JIT without a retained contract or an exact trusted path to its loaded-snapshot contract resource: stop and report the incomplete Skill package rather than guessing names, arguments, or paths.
 - Unknown unload settlement: verify loaded prompt state on the next turn. Schema presence alone is insufficient because the base image or another Skill may own the same binding.
 - Process transition: reassess current loaded state and exact schemas; never rely only on what was loaded in the parent or pre-exec process.
 

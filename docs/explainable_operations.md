@@ -41,12 +41,15 @@ stale-operation handling. A linked publication is authoritative:
 or manual compensation maps to `unknown`. Publication finalization and this
 operation outcome are written in the same store transaction. Recovery is
 idempotent and may correct a previously terminal operation written on the
-wrong side of a crash window. Only an unlinked `running` operation is then
-marked `interrupted`; a durable `waiting` operation remains waiting. If that
-terminal transaction itself fails, the publication remains nonterminal and
-its exactly linked operation remains `running` for recovery instead of being
-independently finalized by the generic operation wrapper. An unlinked or
-mismatched pending-publication signal cannot suppress ordinary terminalization.
+wrong side of a crash window. Generic stale handling then marks a remaining
+`running` operation `unknown` when it or a descendant has a pending or unknown
+external effect; a stale `running` operation without that uncertainty becomes
+`interrupted`, and a durable `waiting` operation remains waiting. If the
+publication terminal transaction itself fails, the publication remains
+nonterminal and its exactly linked operation remains `running` for recovery
+instead of being independently finalized by the generic operation wrapper. An
+unlinked or mismatched pending-publication signal cannot suppress ordinary
+terminalization.
 Launch/exec terminal reconciliation and committed checkpoint-restore operation
 repair are index-backed and hard-bounded by keyset pages. Failed/manual
 checkpoint restores remain forward-recovery inputs. Online terminal
@@ -214,6 +217,16 @@ HTTP:
 The process list returns causal roots; operation detail expands the selected
 root into all explicitly linked descendants.
 
+These two pagination boundaries have different resource semantics. The process
+root list applies its cursor and limit in the RuntimeStore with a bounded
+keyset query. Operation-detail `evidence_limit` and `cursor`, however, are
+presentation bounds on the returned evidence page: the current implementation
+first materializes the complete causal operation tree and its evidence links,
+then groups, sorts, and slices that in memory. They do not make detail lookup
+store-bounded. Very large causal trees are therefore a Host resource boundary;
+deployments must control their size and must not treat the response page limit
+as a database-work or memory cap.
+
 No match returns `404`. An evidence id that maps to multiple causal roots
 returns explicit candidates (`409` over HTTP); the runtime never chooses by
 time or similarity.
@@ -229,12 +242,16 @@ Explain is available only to host CLI and the authenticated local GUI API. It
 is not a model tool or process syscall.
 
 Responses preserve routing ids, statuses, rights, targets, hashes, counts, and
-rollback classification. They apply observability redaction to decisions,
-payload-like fields, credentials, Human content, LLM raw I/O, Object payloads,
-raw command arguments and environments, stdout/stderr, and provider metadata.
-Explain rendering leaves the original audit and external-effect records
-unchanged; it does not rewrite their source fields while producing a redacted
-projection.
+rollback classification. They redact typed payload-like fields, credentials,
+Human content, LLM raw I/O, Object payloads, raw command arguments and
+environments, stdout/stderr, and provider metadata. Nested projections also
+apply the shared syntax-aware filter for known credential keys, scalar
+credential forms, URI/DSN userinfo, and HTTP Cookie headers. This filter is
+defense in depth: it cannot infer that every arbitrary value under an unknown
+field name is sensitive, so evidence producers must use typed sensitive fields
+or explicitly sanitize provider-specific secret formats. Explain rendering
+leaves the original audit and external-effect records unchanged; it does not
+rewrite their source fields while producing a redacted projection.
 
 Unlinked rows are not backfilled or heuristically reconstructed. The 0.3
 schema requires the explanation tables and explicit links; an older or

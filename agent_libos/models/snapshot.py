@@ -8,6 +8,7 @@ typed snapshots without importing concrete runtime orchestration modules.
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import re
 from typing import Any, ClassVar, Mapping
 
 from agent_libos.models.checkpoint import CHECKPOINT_SNAPSHOT_VERSION
@@ -21,6 +22,7 @@ from agent_libos.models.process_state import (
 
 
 SNAPSHOT_SCHEMA_VERSION = CHECKPOINT_SNAPSHOT_VERSION
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _string(value: Any, field_name: str, *, allow_empty: bool = False) -> str:
@@ -45,6 +47,45 @@ def _mapping(value: Any, field_name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValidationError(f"snapshot {field_name} must be an object")
     return {str(key): deepcopy(item) for key, item in value.items()}
+
+
+def _module_requirements(value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        raise ValidationError("snapshot modules must be a list of objects")
+    modules: list[dict[str, Any]] = []
+    seen_module_ids: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise ValidationError(
+                f"snapshot modules[{index}] must be an object"
+            )
+        module_id = item.get("module_id")
+        if (
+            not isinstance(module_id, str)
+            or not module_id
+            or module_id != module_id.strip()
+        ):
+            raise ValidationError(
+                f"snapshot modules[{index}].module_id must be a non-empty canonical string"
+            )
+        source_sha256 = item.get("source_sha256")
+        if (
+            not isinstance(source_sha256, str)
+            or not _SHA256_PATTERN.fullmatch(source_sha256)
+        ):
+            raise ValidationError(
+                "snapshot modules["
+                f"{index}].source_sha256 must be a lowercase 64-character SHA-256 digest"
+            )
+        if module_id in seen_module_ids:
+            raise ValidationError(
+                f"snapshot modules contain duplicate module_id: {module_id}"
+            )
+        seen_module_ids.add(module_id)
+        modules.append(
+            {str(key): deepcopy(module_value) for key, module_value in item.items()}
+        )
+    return tuple(modules)
 
 
 def _row_list(
@@ -320,6 +361,12 @@ class ProcessSnapshot:
                 "snapshot process rows must exactly match subtree_pids"
             )
 
+    @staticmethod
+    def decode_module_requirements(value: Any) -> tuple[dict[str, Any], ...]:
+        """Strictly decode module identities embedded in checkpoint artifacts."""
+
+        return _module_requirements(value)
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ProcessSnapshot":
         unknown = set(value) - cls.TOP_LEVEL_KEYS
@@ -333,9 +380,6 @@ class ProcessSnapshot:
         rows_value = value.get("rows")
         if not isinstance(rows_value, Mapping):
             raise ValidationError("snapshot rows must be an object")
-        modules_value = value.get("modules", [])
-        if not isinstance(modules_value, list) or not all(isinstance(item, Mapping) for item in modules_value):
-            raise ValidationError("snapshot modules must be a list of objects")
         referenced_types = _mapping(value.get("referenced_object_types", {}), "referenced_object_types")
         jit_sources = _mapping(value.get("jit_sources", {}), "jit_sources")
         return cls(
@@ -355,7 +399,7 @@ class ProcessSnapshot:
             images=_mapping(value.get("images", {}), "images"),
             image_artifacts=_mapping(value.get("image_artifacts", {}), "image_artifacts"),
             jit_sources={str(key): _string(item, f"jit_sources.{key}", allow_empty=True) for key, item in jit_sources.items()},
-            modules=tuple({str(key): deepcopy(item) for key, item in module.items()} for module in modules_value),
+            modules=cls.decode_module_requirements(value.get("modules")),
         )
 
     def to_mapping(self, *, copy_values: bool = True) -> dict[str, Any]:

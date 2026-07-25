@@ -44,7 +44,7 @@ Call one logical allowlisted method:
 }
 ```
 
-Pass logical `method_id`, never `rpc_method`. Params must be JSON-serializable and must satisfy a non-empty registered `params_schema`; their allowed shape follows that schema and may be a scalar. An empty schema applies no shape validation. Omitted or null tool input omits wire `params`, so explicit wire null is unavailable. Runtime request IDs are generated, not caller idempotency keys.
+Pass logical `method_id`, never `rpc_method`. Params must be a JSON object or array and must satisfy a non-empty registered `params_schema`; scalars are rejected even when the schema would accept one. An empty schema applies no additional shape validation. Omitted or null tool input omits wire `params`, so explicit wire null is unavailable. Runtime request IDs are generated, not caller idempotency keys.
 
 Preflight resolves registration, checks schema/egress, requires the declared right on `jsonrpc:<endpoint>:<method>`, applies policy/budgets, and bounds the request.
 

@@ -7978,6 +7978,31 @@ class SQLRuntimeStore:
                 (dumps(self.payload_marker(present=True)), oid),
             )
 
+    def rehydrate_object_payload_cache(
+        self,
+        object_payloads: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        """Atomically replace validated volatile payloads without SQL writes."""
+
+        if any(not isinstance(oid, str) or not oid for oid in object_payloads):
+            raise ValidationError(
+                "Object payload cache ids must be non-empty strings"
+            )
+        staged = {
+            oid: deepcopy(payload)
+            for oid, payload in object_payloads.items()
+        }
+        with self._lock:
+            self._ensure_healthy()
+            self._ensure_store_scope_admitted()
+            if self._transaction_depth != 0:
+                raise ValidationError(
+                    "Object payload cache rehydration requires an outermost "
+                    "durable transaction boundary"
+                )
+            self._object_payloads.update(staged)
+            return tuple(sorted(staged))
+
     def forget_object_payload(self, oid: str) -> None:
         self._ensure_healthy()
         self._forget_cached_object_payload(oid)

@@ -6,7 +6,13 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolExecutionError, ToolPolicy
+from agent_libos.tools.base import (
+    SyncAgentTool,
+    ToolContext,
+    ToolErrorCode,
+    ToolExecutionError,
+    ToolPolicy,
+)
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _CANCELLED_HUMAN_REQS_KEY = "cancelled_human_re" "quests"
@@ -74,6 +80,25 @@ _MODEL_PRIVATE_NESTED_FIELDS = {
     "record_id",
     "source_sha256",
     "updated_at",
+}
+_FORK_RECEIPT_KEYS = {
+    "checkpoint_id", "source_pid", "fork_root_pid", "pid_map", "object_map",
+    "tool_map", "status", "main_state_committed", "reconciliation_pending",
+    "post_commit_failures", "outcome_diagnostic",
+}
+_FORK_FAILURE_KEYS = {
+    "phase", "error_type", "message", "audit_error_type", "audit_error",
+    "failure_record_error_type", "failure_record_error",
+}
+_FORK_DIAGNOSTIC_KEYS = {
+    "phase", "interruption_error_type", "interruption",
+    "diagnostic_error_type", "diagnostic_error",
+    "prepared_runtime_assets_retained", "fork_subtree_quarantined",
+    "recovery_signal_record_id", "recovery_signal_error_type",
+    "recovery_signal_error", "lifecycle_fence_requested",
+    "operation_recovery_signal_recorded",
+    "operation_recovery_signal_error_type", "operation_recovery_signal_error",
+    "lifecycle_fence_error_type", "lifecycle_fence_error", "lifecycle_fenced",
 }
 
 
@@ -297,8 +322,10 @@ class ForkCheckpointOutput(BaseModel):
     object_map: dict[str, str]
     tool_map: dict[str, str] = Field(default_factory=dict)
     status: str = "forked"
-    main_state_committed: bool = True
+    main_state_committed: bool | None = True
+    reconciliation_pending: bool = False
     post_commit_failures: list[dict[str, str]] = Field(default_factory=list)
+    outcome_diagnostic: dict[str, Any] | None = None
     pid_map_page: CheckpointResultPage = Field(
         default_factory=_empty_result_page
     )
@@ -466,14 +493,37 @@ class ForkCheckpointTool(SyncAgentTool[ForkCheckpointArgs]):
     tags = ["checkpoint", "fork"]
 
     def run(self, args: ForkCheckpointArgs, ctx: ToolContext) -> ForkCheckpointOutput:
-        return _fork_output(
-            _runtime(ctx).checkpoint.fork_from_checkpoint(
+        limit = _model_preview_limit(ctx)
+        text_limit = _model_preview_text_limit(ctx)
+        try:
+            receipt = _runtime(ctx).checkpoint.fork_from_checkpoint(
                 ctx.pid,
                 args.checkpoint_id,
                 parent_pid=args.parent_pid,
-            ),
-            limit=_model_preview_limit(ctx),
-            text_limit=_model_preview_text_limit(ctx),
+            )
+        except Exception as exc:
+            raw_receipt = getattr(exc, "checkpoint_fork_receipt", None)
+            if not isinstance(raw_receipt, Mapping):
+                raise
+            bounded_receipt = _fork_output(
+                raw_receipt,
+                limit=limit,
+                text_limit=text_limit,
+            )
+            raise ToolExecutionError(
+                "Checkpoint fork outcome requires reconciliation; inspect the "
+                "structured receipt before retrying.",
+                code=ToolErrorCode.EXECUTION_ERROR,
+                retryable=False,
+                details={
+                    "error_type": type(exc).__name__,
+                    "checkpoint_fork_receipt": bounded_receipt.model_dump(),
+                },
+            ) from exc
+        return _fork_output(
+            receipt,
+            limit=limit,
+            text_limit=text_limit,
         )
 
 
@@ -646,17 +696,118 @@ def _restore_output(
     )
 
 
+def _fork_map_is_valid(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return not any(
+        not isinstance(source, str)
+        or not source
+        or not isinstance(target, str)
+        or not target
+        for source, target in value.items()
+    )
+
+
+def _validate_fork_receipt_fields(data: Mapping[str, Any]) -> None:
+    if set(data) - _FORK_RECEIPT_KEYS:
+        raise ValueError("checkpoint fork receipt contains unsupported fields")
+    for key in ("checkpoint_id", "source_pid", "fork_root_pid", "status"):
+        if not isinstance(data.get(key), str) or not data.get(key):
+            raise ValueError(f"checkpoint fork receipt has invalid {key}")
+    for key in ("pid_map", "object_map", "tool_map"):
+        if not _fork_map_is_valid(data.get(key)):
+            raise ValueError(f"checkpoint fork receipt has invalid {key}")
+
+
+def _fork_receipt_outcome(
+    data: Mapping[str, Any],
+) -> tuple[str, bool | None, bool]:
+    committed = data.get("main_state_committed", True)
+    if committed is not None and not isinstance(committed, bool):
+        raise ValueError("checkpoint fork receipt has invalid commit status")
+    pending = data.get("reconciliation_pending", False)
+    if not isinstance(pending, bool):
+        raise ValueError("checkpoint fork receipt has invalid reconciliation status")
+    status = data["status"]
+    if (status, committed, pending) not in {
+        ("forked", True, False),
+        ("forked_with_warnings", True, False),
+        ("fork_outcome_unknown", None, True),
+        ("fork_recovery_required", True, True),
+    }:
+        raise ValueError("checkpoint fork receipt has inconsistent outcome fields")
+    return status, committed, pending
+
+
+def _fork_failure_is_valid(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) - _FORK_FAILURE_KEYS:
+        return False
+    return all(
+        isinstance(value.get(key), str) and value.get(key)
+        for key in ("phase", "error_type", "message")
+    )
+
+
+def _validate_fork_failure_records(data: Mapping[str, Any], status: str) -> None:
+    failures = data.get("post_commit_failures")
+    if not isinstance(failures, list) or any(
+        not _fork_failure_is_valid(value) for value in failures
+    ):
+        raise ValueError("checkpoint fork receipt has invalid failure records")
+    if status == "forked" and failures:
+        raise ValueError("checkpoint fork success receipt cannot contain failures")
+    if status == "forked_with_warnings" and not failures:
+        raise ValueError("checkpoint fork warning receipt requires a failure")
+    if status == "fork_recovery_required" and not failures:
+        raise ValueError("checkpoint fork recovery receipt requires a failure")
+
+
+def _project_fork_diagnostic(
+    data: Mapping[str, Any],
+    *,
+    pending: bool,
+    text_limit: int,
+) -> dict[str, Any] | None:
+    raw_diagnostic = data.get("outcome_diagnostic")
+    if raw_diagnostic is not None and (
+        not isinstance(raw_diagnostic, Mapping)
+        or set(raw_diagnostic) - _FORK_DIAGNOSTIC_KEYS
+    ):
+        raise ValueError("checkpoint fork receipt has invalid outcome diagnostic")
+    if pending and not isinstance(raw_diagnostic, Mapping):
+        raise ValueError("pending checkpoint fork receipt requires a diagnostic")
+    if not isinstance(raw_diagnostic, Mapping):
+        return None
+    return {
+        str(key): (
+            value
+            if isinstance(value, (bool, int)) or value is None
+            else _preview_text(str(value), text_limit)
+        )
+        for key, value in raw_diagnostic.items()
+        if isinstance(value, (str, bool, int)) or value is None
+    }
+
+
 def _fork_output(
     data: Mapping[str, Any],
     *,
     limit: int,
     text_limit: int,
 ) -> ForkCheckpointOutput:
+    _validate_fork_receipt_fields(data)
     pid_map, pid_page = _bounded_mapping(data.get("pid_map"), limit)
     object_map, object_page = _bounded_mapping(data.get("object_map"), limit)
     tool_map, tool_page = _bounded_mapping(data.get("tool_map"), limit)
     raw_failures, failures_page = _bounded_sequence(
         data.get("post_commit_failures"), limit
+    )
+    status, committed, pending = _fork_receipt_outcome(data)
+    _validate_fork_failure_records(data, status)
+    diagnostic = _project_fork_diagnostic(
+        data,
+        pending=pending,
+        text_limit=text_limit,
     )
     return ForkCheckpointOutput(
         checkpoint_id=str(data["checkpoint_id"]),
@@ -665,13 +816,15 @@ def _fork_output(
         pid_map={str(key): str(value) for key, value in pid_map.items()},
         object_map={str(key): str(value) for key, value in object_map.items()},
         tool_map={str(key): str(value) for key, value in tool_map.items()},
-        status=str(data.get("status") or "forked"),
-        main_state_committed=bool(data.get("main_state_committed", True)),
+        status=status,
+        main_state_committed=committed,
+        reconciliation_pending=pending,
         post_commit_failures=[
             _string_mapping(value, text_limit=text_limit)
             for value in raw_failures
             if isinstance(value, Mapping)
         ],
+        outcome_diagnostic=diagnostic,
         pid_map_page=pid_page,
         object_map_page=object_page,
         tool_map_page=tool_page,

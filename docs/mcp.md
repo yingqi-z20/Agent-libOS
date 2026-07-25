@@ -6,7 +6,7 @@ configuration at call time. They pass only:
 
 - `server_id`
 - `tool_id`
-- `arguments`
+- `arguments`, as a JSON object; `null` is normalized to `{}` by the primitive
 
 v1 covers MCP Tools only. MCP Resources and Prompts are not exposed as runtime
 primitives yet.
@@ -55,16 +55,25 @@ http:
 variable names. The runtime does not inherit the full host environment. On
 Windows, it additionally forwards `SYSTEMROOT` and `WINDIR`, when present,
 because they are child-process bootstrap variables rather than manifest
-credentials.
+credentials. A bare Windows `command` additionally requires explicit child
+`PATH` and `PATHEXT` mappings. Target resolution searches only non-empty,
+absolute directories in that captured `PATH`, considers only `.exe`/`.com`
+entries from the captured `PATHEXT`, and never searches the Runtime current
+directory or reads ambient `PATH`/`PATHEXT`.
 
 The accepted v1 shape is closed: unknown server, transport, tool, or header
 fields are rejected instead of being silently ignored. `metadata` and JSON
-Schema contents remain application-defined mappings.
+Schema contents remain application-defined mappings. Field types are strict:
+mapping/array/string fields must use that exact YAML/JSON shape, explicit
+wrong-type or `null` values are not treated as defaults, and every `stdio.args`
+entry must be a string. In particular, `args: "-m"` is rejected rather than
+split into characters, and malformed `input_schema` values cannot silently
+become `{}` and disable validation or live-schema pinning.
 
 | Mapping | Required fields | Optional fields and defaults |
 | --- | --- | --- |
 | server | `server_id`, `transport`, non-empty `tools`, and exactly the transport block selected by `transport` | `schema_version: 1`, `timeout_s: config.mcp.timeout_s`, `max_request_bytes: config.mcp.max_request_bytes`, `max_response_bytes: config.mcp.max_response_bytes`, `metadata: {}` |
-| `stdio` | non-empty single-token `command` | `args: []`, `env: {}`, `cwd: null` |
+| `stdio` | non-empty single-token `command` without `~` expansion; on Windows, a path-qualified command ends in `.exe`/`.com`, while a bare command maps child `PATH` and `PATHEXT` | `args: []`, `env: {}`, `cwd: null` |
 | `http` | `url` | `headers: {}` |
 | tool | `tool_id`, `mcp_name`, `right`, `rollback_class`, `state_mutation`, `information_flow` | `rollback_status` as mapped below, `input_schema: {}`, `metadata: {}` |
 | HTTP header | `env` | `prefix: ""`, `suffix: ""` |
@@ -84,7 +93,9 @@ provider maps it as follows:
 | `unknown` | `unknown` |
 
 An explicitly supplied `rollback_status` is preserved instead of applying this
-default mapping.
+default mapping. The durable manifest retains omission as `null`, while
+registry inspection/tool listing and the default provider's effect
+classification expose the effective mapped value shown above.
 
 A tool cannot combine `no_rollback_required` with `state_mutation: true`. A
 non-empty `input_schema` must be valid JSON Schema and is pinned exactly against
@@ -117,8 +128,9 @@ mcp:<server_id>:*
 mcp:*
 ```
 
-`list_mcp_servers`, `inspect_mcp_server`, and `list_mcp_tools` without live
-refresh require server metadata read authority when called by a process.
+`list_mcp_servers` requires `read` on `config.mcp.registry_resource` (default
+`mcp_server:*`). `inspect_mcp_server` and cached `list_mcp_tools` require
+`read` on the exact `mcp_server:<server_id>` resource when called by a process.
 `list_mcp_tools(refresh=true)` crosses the provider boundary to run
 `tools/list`, so it also requires `execute` on `mcp_server:<server_id>` and is
 recorded as an MCP external read effect. Host/admin refreshes that bypass
@@ -146,7 +158,8 @@ single grant satisfying server read and execute is charged once, not twice.
 For tool calls, the primitive gates on `server_id` and `tool_id` before loading
 server metadata or input schemas. A process without tool invocation authority
 gets a generic denial and cannot enumerate registered MCP server metadata
-through call errors. This early visibility gate does not consume a one-shot
+through call errors. This early invocation-authority gate is unrelated to model
+tool projection and does not consume a one-shot
 tool grant; the exact tool is then authorized after the server spec is loaded,
 and any one-shot use from that decision is consumed only after pre-provider
 validation has passed.
@@ -170,19 +183,31 @@ register/replace/unregister with the interval from that live compare through
 provider-call return; the runtime's single-writer store lease excludes a second
 supported Runtime writer from bypassing the in-process guard.
 
-Tool visibility is not authority. Default images can see the MCP tools, but a
-process cannot call a registered MCP tool without the matching capability.
+Tool binding and model visibility are not authority. The built-in base, coding,
+and review Images bind all four MCP tools in their complete process tool tables.
+Their Skill projection keeps those tools out of the model table until the exact
+`agent-libos-mcp` Skill is activated. Toolmaker and context-compressor do not
+bind these tools and cannot activate that immutable built-in Skill. Neither
+static binding nor later projection lets a process inspect or call a registered
+server without the matching capability.
 
 ## Data-flow Sink
 
 Tool arguments are egress to `mcp:<server_id>:<tool_id>`. The Sink identity hash
 covers the complete server/transport manifest and selected tool manifest, so a
 command, URL, header/env mapping, cwd, tool name/schema, limit, or effect-policy
-change invalidates prior high-sensitivity trust. The early tool-capability
-visibility gate still runs before server metadata lookup; after lookup,
-clearance is enforced before argument-schema validation that could otherwise
-start a stdio provider, runtime env resolution, live validation, DNS, stdio
-spawn, or `call_tool`.
+change invalidates prior high-sensitivity trust. The early tool-capability gate
+still runs before server metadata lookup; after lookup,
+a negative-only clearance precheck rejects impossible egress before exact tool
+or stdio authority, argument-schema validation, Host environment access, or
+executable resolution. For stdio, that precheck may use the Host trust record's
+expected identity hash, but it cannot grant exact clearance or consume a
+conditional release. After exact tool and stdio launch authority succeeds, the
+runtime reads only a manifest-mapped child `PATH` and, on Windows, `PATHEXT`
+when needed to select and hash the executable, then performs exact clearance
+against that executable-bound Sink. HTTP exact clearance requires no
+header-value resolution. No transport, live validation, DNS, stdio spawn, or
+`call_tool` starts during these checks.
 
 Cached `list_tools(refresh=false)` reads and returns registered manifest
 metadata only (`refreshed: false`, `response_bytes: 0`); it does not resolve
@@ -203,9 +228,10 @@ release is exact and one-shot; untrusted MCP cannot send above `normal`.
 For stdio, Host trust means the executable is an approved recipient of the
 arguments. Agent libOS supervises the registered process lifecycle but does not
 claim OS-level control over other file/network I/O performed by that program.
-For an executable resolved inside the mutable workspace, both live validation
-and tool dispatch run a private Host-owned content snapshot rather than
-reopening the authorized path after the final identity check.
+Every executable used by the local SDK provider runs from a private Host-owned
+content snapshot rather than reopening the authorized path after the final
+identity check. Native executables copy only the executable bytes; shebang
+scripts retain the bounded, all-or-nothing direct-sibling compatibility mirror.
 See [Data Flow](data_flow.md).
 
 ## Security Rules
@@ -221,21 +247,30 @@ Runtime environment resolution has operation-specific ordering:
 - live `list_tools(refresh=true)` resolves and validates its HTTP headers or
   stdio environment before finite composite authority is reserved or a pending
   effect is created, so a missing value leaves neither reservation nor intent;
-- `call_tool` resolves the same values after finite tool/stdio authority has
-  been reserved and the pending call intent prepared, but before DNS, stdio
-  snapshot/spawn, live validation, or tool dispatch. A missing or invalid value
-  therefore takes the no-provider-start path, restoring all reservations and
-  abandoning that intent.
+- `call_tool` first performs the negative clearance precheck, exact tool/stdio
+  authority, target-only stdio `PATH` (plus Windows `PATHEXT`) resolution,
+  executable hashing, and exact Sink clearance. It does not resolve HTTP
+  headers or any other stdio child value during those gates. Only after finite
+  authority has been reserved and the pending call intent prepared does it
+  resolve the complete HTTP-header or stdio-child environment, before DNS,
+  stdio snapshot/spawn, live validation, or tool dispatch. A missing or invalid
+  complete value therefore takes the no-provider-start path, restoring all
+  reservations and abandoning that intent.
 
 Each resolving operation materializes the configured HTTP headers or stdio
-child variables once into an immutable, in-memory snapshot. On Windows, the
-same snapshot includes the optional `SYSTEMROOT` and `WINDIR` child bootstrap
-values. The same snapshot is supplied to all provider stages, including both
-`tools/list` and `call_tool` for a legacy two-session provider. The SDK provider
-does not read the mapped host environment variables or Windows bootstrap
-variables again, so a concurrent change cannot replace a validated value
-before dispatch. Snapshots are not persisted or included in audit/effect
-observations.
+child variables into an immutable, in-memory dispatch snapshot. For
+`call_tool`, a mapped child `PATH` and Windows `PATHEXT` used for executable
+selection are captured after exact stdio authority and pinned into that later
+complete snapshot; other child values and all header credentials are first
+read after protected preparation. On Windows, the complete snapshot also
+includes the optional `SYSTEMROOT` and `WINDIR` child bootstrap values. The same snapshot is supplied
+to all provider stages, including both `tools/list` and `call_tool` for a legacy
+two-session provider. The SDK provider does not read the mapped host environment
+variables or Windows bootstrap variables again, so a concurrent change cannot
+replace the selected executable or a validated credential before dispatch.
+Host variables not referenced by the manifest (or required as Windows bootstrap
+keys) are never copied into this input snapshot. Snapshots are not persisted or
+included in audit/effect observations.
 
 For non-local Streamable HTTP, reservation and pending-effect persistence
 precede DNS because host resolution is itself an external observation; an
@@ -245,13 +280,14 @@ tool metadata and fails closed if the
 server no longer exposes the tool or if a pinned `input_schema` changed; those
 post-boundary failures do not restore the use.
 
-For `call_tool`, one absolute deadline begins after protected preparation and
-covers environment snapshotting, primitive DNS, executable snapshotting, live
-`tools/list`, validation, and `call_tool`; each subsequent stage receives only
-the remaining time. For live refresh, environment snapshotting and initial
-executable identity selection precede its deadline; that deadline then covers
-primitive DNS, final executable snapshotting, and `tools/list`. An exhausted
-deadline cannot start the next provider phase.
+For `call_tool`, target-only stdio executable identity selection precedes
+protected preparation. One absolute deadline then begins after preparation and
+covers complete environment snapshotting, primitive DNS, final executable
+snapshotting, live `tools/list`, validation, and `call_tool`; each subsequent
+stage receives only the remaining time. For live refresh, environment
+snapshotting and initial executable identity selection precede its deadline;
+that deadline then covers primitive DNS, final executable snapshotting, and
+`tools/list`. An exhausted deadline cannot start the next provider phase.
 Legacy two-call providers reserve the complete request/response envelope before
 dispatch, but settlement follows observed stage progress: completed response
 bytes are charged exactly, an ordinary exception with unknown response size
@@ -281,14 +317,27 @@ reserved, multicast, or metadata-service destination still fails closed at
 connect time.
 
 stdio transport uses argv, not a shell string. The command must be a single
-argv token; args are separate strings. Environment injection is explicit and
-restricted by `mcp.stdio_env_allowlist`. A stdio manifest is still a local
-process-launch surface, so process actors need explicit `process:spawn` `write`
-and exact `mcp_stdio:<sha256>` `execute` in addition to MCP server/tool
-authority. Each newline-delimited raw stdio response frame is capped at the
-manifest's `max_response_bytes` before JSON parsing or SDK materialization, so
-an oversized frame is rejected without first constructing an unbounded text or
-JSON value.
+argv token, does not perform `~` home expansion, and args are separate strings.
+Windows dispatch accepts only a resolved `.exe` or `.com`; the verified
+absolute snapshot path is passed directly to process creation without the MCP
+SDK performing a second executable lookup. Manifest-selected environment
+injection is restricted by `mcp.stdio_env_allowlist`. For a snapshotted Python
+virtual-environment launcher, the SDK adds compatibility values for
+`VIRTUAL_ENV`, `PATH`,
+`PYTHONNOUSERSITE`, available venv `site-packages` in `PYTHONPATH`, and on macOS
+`__PYVENV_LAUNCHER__`. Those values keep the selected live venv usable but do
+not attest its dependency or plugin tree; only executable bytes are pinned.
+
+An explicit relative `stdio.cwd` is fixed to a directory handle and inherited
+through `/proc/self/fd` on Linux, so replacing the manifest path cannot redirect
+the child. The local SDK rejects configured subdirectory cwd on platforms
+without that stable-handle mechanism; the Host-owned workspace root remains the
+default cwd. A stdio manifest is still a local process-launch surface, so
+process actors need explicit `process:spawn` `write` and exact
+`mcp_stdio:<sha256>` `execute` in addition to MCP server/tool authority. Each
+newline-delimited raw stdio response frame is capped at the manifest's
+`max_response_bytes` before JSON parsing or SDK materialization, so an oversized
+frame is rejected without first constructing an unbounded text or JSON value.
 
 MCP call arguments and audit context are bounded and sanitized. MCP result
 payloads are JSON-serializable; binary-like content is represented by bounded
@@ -312,10 +361,11 @@ fails, the operation is finalized conservatively when possible; otherwise the
 pending/unknown row remains durable.
 
 `call_tool` similarly reserves deduplicated main/stdio authority and creates one
-pending row after local preflight. Runtime environment values are resolved
-after this preparation but before the first provider phase; a failure there
-restores/abandons the reservation and row. Once environment resolution passes,
-that intent spans non-local DNS, the
+pending row after negative clearance precheck, target-only executable identity
+selection, and exact executable-bound Sink clearance. Complete runtime
+environment values are resolved after this preparation but before the first
+provider phase; a failure there restores/abandons the reservation and row. Once
+environment resolution passes, that intent spans non-local DNS, the
 mandatory live tool-metadata validation, and the actual tool call: once DNS or
 either live provider boundary is crossed, schema drift, transport failure,
 event/audit failure, or post-call classifier failure cannot be interpreted as
@@ -331,8 +381,9 @@ not-started, the validation already flowed server metadata: the intent is finali
 
 Completed protected phases impose a conservative classification floor. A
 non-local primitive DNS observation and every live provider boundary force
-`information_flow=true`; the actual tool-call phase also carries the tool's
-declared mutation flag. Manifest classification cannot erase an earlier phase
+`information_flow=true`; the actual tool-dispatch phase, including the default
+combined live-validation-and-call phase, also carries the tool's declared
+mutation flag. Manifest classification cannot erase an earlier phase
 already observed by the composite operation.
 
 Checkpoint reports and benchmark evidence include both finalized and still
@@ -342,13 +393,45 @@ Call-effect metadata includes the data-flow decision, trust generation/hash,
 label/source hashes, and exact Object source refs without persisting the raw
 arguments as data-flow evidence.
 
+## Call And Tool-List Results
+
+`call_mcp_tool`, `mcp.call`, the Python primitive, and `mcp call` expose the
+same `McpCallResult` fields: `server_id`, `tool_id`, `mcp_name`, `status`,
+`ok`, `result`, `error`, `response_bytes`, and `duration_s`.
+
+| `status` | Meaning |
+| --- | --- |
+| `ok` | The tool returned successfully. `result` contains the bounded model-facing `content` and `structured_content` projections. |
+| `mcp_error` | The MCP server returned a tool error. `error` contains the stable error envelope plus any bounded projected returned content. |
+| `transport_error` | The provider or transport failed. An atomic provider also uses this status with `error_type: "LiveToolValidationError"` when combined live validation blocks dispatch. `error` is sanitized rather than exposing raw exception or credential text. |
+| `invalid_response` | The legacy two-call path records this status when mandatory live tool metadata is missing, malformed, or does not match a pinned manifest schema, then raises the validation/provider exception to the caller. |
+| `response_too_large` | The provider response exceeded the registered response limit. |
+
+Local argument/schema validation, capability, Human approval, data-flow,
+environment, and pre-provider resource failures are raised instead of encoded
+as an `McpCallResult` status. Live absence/schema drift has two observable
+forms: the legacy two-call path durably records `invalid_response` and raises,
+while the atomic SDK path returns `transport_error` with
+`error_type: "LiveToolValidationError"` and `call_started: false` in provider
+evidence. Status alone is not proof that dispatch did or did not start; use the
+recorded phase/effect evidence.
+
+`list_mcp_tools`/`mcp.tools` and `mcp tools` return `server_id`, `transport`,
+the manifest-declared `tools`, `refreshed`, and `response_bytes`. Cached
+listing has `refreshed: false` and `response_bytes: 0`. A successful live
+refresh has `refreshed: true` and augments declared tool entries with matched
+live metadata; refresh failures are raised with a sanitized provider error
+instead of returning a partial tool list.
+
 ## CLI
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
-uv run agent-libos --db .agent_libos.sqlite mcp list
+uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml --replace
+uv run agent-libos --db .agent_libos.sqlite mcp list --text demo --limit 20
 uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
 uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp
+uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp --refresh
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp_stdio:<sha256-from-inspect> --rights execute
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mcp:forecast --rights read
@@ -356,16 +439,39 @@ uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --a
 uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
 ```
 
-Registry commands accept `--actor-pid <pid>` to enforce that process's
-`mcp_server:*` or exact server capabilities. Without `--actor-pid`, they run as
-audited admin registry operations. Actor-mode `register` also requires
-filesystem `read` for the manifest path; stdio registration additionally
-requires the launch rights described above. For `mcp call <pid>`, an explicitly
-supplied group-level `--actor-pid` must equal the target `<pid>` and adds no
-authority.
+`mcp list` accepts `--text` and `--limit`; `mcp tools --refresh` performs the
+live provider operation described above. Registering with `--replace` requires
+`admin` rather than `write` on the exact server resource.
 
-For stdio actor mode, run `mcp inspect` after host/admin registration and use
-the returned `stdio_authority_resource` verbatim for the exact execute grant.
+Registry commands accept the group-level `--actor-pid <pid>` before the
+subcommand to enforce that process's
+configured registry-list capability (default `mcp_server:*`) or the exact
+server capability required by the selected item operation. Without
+`--actor-pid`, registry
+mutations run as Host admin operations and emit their normal mutation
+audit/event evidence. Read-only `list`, `inspect`, and `tools` calls do not
+promise a separate admin-operation audit row; they retain the ordinary
+authority, data-flow, provider-refresh, and read evidence applicable to the
+specific call. Actor-mode `register` also requires filesystem `read` for the
+manifest path; stdio registration additionally requires the launch rights
+described above. For `mcp call <pid>`, an explicitly supplied group-level
+`--actor-pid` must equal the target `<pid>` and adds no authority.
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite mcp --actor-pid <pid> tools demo-mcp --refresh
+```
+
+For stdio actor mode, `mcp inspect` works only after a Host/admin has created the
+registry row. It returns the manifest-derived `stdio_authority_resource`, not
+the executable-bound data-flow Sink identity hash. A process therefore cannot
+bootstrap its first stdio registration or high-sensitivity Sink trust through
+`inspect`: either a Host/admin registers first and then grants the returned
+launch resource for later actor operations, or a trusted Host integration
+validates the manifest and precomputes that exact launch resource before an
+actor-mode registration. Executable-bound Sink trust must be resolved and
+registered separately by trusted Host code. Neither inspection nor trust
+registration exposes resolved header or stdio environment values to the
+process.
 
 Per-server register/replace/inspect/tools/unregister authority is checked before
 the store loads existing server metadata. `replace=true` always requires
@@ -387,7 +493,8 @@ uv sync --extra mcp --all-groups
 
 ## Tools And Syscalls
 
-LLM-facing tools:
+LLM tool interfaces, when bound in the complete process table and projected into
+the model tool table:
 
 - `list_mcp_servers`
 - `inspect_mcp_server`

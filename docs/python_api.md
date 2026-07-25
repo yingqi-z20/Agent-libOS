@@ -117,8 +117,11 @@ admission-drain timeout may be reported as `ok: false` rather than raised. A
 successful repeated call is idempotent and reports `already_shutdown: true`.
 Warnings may be present even after store ownership was successfully released.
 
-Shutdown closes Runtime mutation admission, records the shutdown attempt,
-stops owned services and finalizers, and releases the store. It does **not**
+An ordinary shutdown attempt that passes preflight closes Runtime mutation
+admission and records audit/event evidence before stopping owned services and
+finalizers and releasing the store. Preflight misuse, an admission-drain
+timeout, or an active recovery-required fence can return or raise before that
+durable attempt record exists. Shutdown does **not**
 mark live `AgentProcess` rows as exited. Process exit is a separate authorized
 operation.
 
@@ -142,7 +145,7 @@ Choose one style for the lifetime of a Runtime. A Runtime assembled with
 | `run_next_process_once()` | `await arun_next_process_once()` | Run one scheduled quantum |
 | `run_until_idle(...)` | `await arun_until_idle(...)` | Drain all runnable processes and optionally the Human queue |
 | `run_process_until_idle(pid, ...)` | `await arun_process_until_idle(pid, ...)` | Drain one process |
-| `run_workflow(tool, args, ...)` | `await arun_workflow(tool, args, ...)` | Run one image-visible tool through ToolBroker without an LLM turn |
+| `run_workflow(tool, args, ...)` | `await arun_workflow(tool, args, ...)` | Run one tool from the Image-bound complete process table through ToolBroker, without an LLM turn or model-projection check |
 | `shutdown()` | `await ashutdown()` | Release the Runtime composition root |
 
 The synchronous `run_until_idle`, `run_process_until_idle`, and `run_workflow`
@@ -167,7 +170,7 @@ enforce their own authority.
 
 | Property | Purpose |
 | --- | --- |
-| `config`, `workspace_root`, `instance_id` | Effective immutable configuration and Runtime identity |
+| `config`, `workspace_root`, `instance_id` | Effective frozen configuration and Runtime identity; authority-rule conditions are defensively copied and recursively frozen |
 | `process`, `launch`, `process_transitions`, `scheduler` | Process lifecycle, launch, status transitions, and scheduling |
 | `capability`, `authority_manifests` | Capability and Task Authority control planes |
 | `memory`, `object_tasks` | Object Memory and Object-bound background tasks |

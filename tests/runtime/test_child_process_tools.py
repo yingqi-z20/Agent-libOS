@@ -9,7 +9,9 @@ from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
     CapabilityRight,
     EventType,
+    ForkMode,
     KilledProcessOutcome,
+    ObjectPatch,
     ObjectOwnerKind,
     ObjectType,
     ProcessMessageKind,
@@ -33,6 +35,50 @@ def _grant_image_read(runtime: Runtime, pid: str, image_id: str) -> None:
 
 
 class TestChildProcessTool:
+
+    def test_copy_fork_shares_writable_object_identity_instead_of_cloning(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='share an explicitly mutable object',
+            )
+            _grant_process_spawn(runtime, parent)
+            shared = runtime.memory.create_object(
+                parent,
+                ObjectType.ARTIFACT,
+                {'version': 1},
+                immutable=False,
+                name='copy.mode.shared',
+            )
+            parent_process = runtime.process.get(parent)
+            assert parent_process.memory_view is not None
+            parent_process.memory_view.roots.append(shared)
+            runtime.store.update_process(parent_process)
+
+            child = runtime.process.fork(
+                parent,
+                goal='mutate the shared object',
+                mode=ForkMode.COPY,
+            )
+            child_process = runtime.process.get(child)
+            assert child_process.memory_view is not None
+            child_handle = next(
+                handle
+                for handle in child_process.memory_view.roots
+                if handle.oid == shared.oid
+            )
+
+            assert CapabilityRight.WRITE.value in child_handle.rights
+            runtime.memory.update_object(
+                child,
+                child_handle,
+                ObjectPatch(payload={'version': 2}),
+            )
+
+            assert runtime.memory.get_object(parent, shared).payload == {'version': 2}
+        finally:
+            runtime.close()
 
     def test_interrupt_signal_is_rejected_and_durable_interrupt_message_remains_supported(self) -> None:
         runtime = Runtime.open('local')

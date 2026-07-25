@@ -17,11 +17,28 @@ function commandText(value: unknown): string {
   return value;
 }
 
-function observation(returncode: number, output: string, exceptionInfo = ""): Record<string, unknown> {
+function observation(
+  returncode: number,
+  output: string,
+  exceptionInfo = "",
+  stdoutTruncated = false,
+  stderrTruncated = false,
+): Record<string, unknown> {
+  const upstreamIncomplete = stdoutTruncated || stderrTruncated;
+  const outputIncomplete = upstreamIncomplete || output.length > OUTPUT_LIMIT;
+  const truncation = {
+    stdout_truncated: stdoutTruncated,
+    stderr_truncated: stderrTruncated,
+    output_incomplete: outputIncomplete,
+  };
   if (output.length <= OUTPUT_LIMIT) {
     return {
       returncode,
       output,
+      ...truncation,
+      ...(upstreamIncomplete
+        ? { warning: "Shell capture was truncated before this observation; output is incomplete." }
+        : {}),
       exception_info: exceptionInfo,
     };
   }
@@ -30,7 +47,10 @@ function observation(returncode: number, output: string, exceptionInfo = ""): Re
     output_head: output.slice(0, OUTPUT_EDGE),
     output_tail: output.slice(-OUTPUT_EDGE),
     elided_chars: output.length - OUTPUT_EDGE * 2,
-    warning: `Output was longer than ${OUTPUT_LIMIT} characters and was truncated to head/tail windows.`,
+    warning: upstreamIncomplete
+      ? `Captured output was longer than ${OUTPUT_LIMIT} characters and was truncated to head/tail windows. Shell capture was also truncated upstream; elided_chars counts only characters omitted from the captured output.`
+      : `Captured output was longer than ${OUTPUT_LIMIT} characters and was truncated to head/tail windows.`,
+    ...truncation,
     exception_info: exceptionInfo,
   };
 }
@@ -51,7 +71,15 @@ export async function run(args: Record<string, unknown>, libos: LibOS): Promise<
     const stdout = String(result.stdout ?? "");
     const stderr = String(result.stderr ?? "");
     const output = stdout + stderr;
-    const resultObservation = observation(returncode, output);
+    const stdoutTruncated = Boolean(result.stdout_truncated);
+    const stderrTruncated = Boolean(result.stderr_truncated);
+    const resultObservation = observation(
+      returncode,
+      output,
+      "",
+      stdoutTruncated,
+      stderrTruncated,
+    );
     if (returncode === 0 && submit) {
       try {
         await libos.syscall("process.exit", {
@@ -61,7 +89,11 @@ export async function run(args: Record<string, unknown>, libos: LibOS): Promise<
           },
         });
       } catch (error) {
-        return observation(-1, output, `submission failed: ${errorText(error)}`);
+        return {
+          ...resultObservation,
+          returncode: -1,
+          exception_info: `submission failed: ${errorText(error)}`,
+        };
       }
     }
     return resultObservation;

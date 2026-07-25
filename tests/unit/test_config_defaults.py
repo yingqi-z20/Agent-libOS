@@ -22,7 +22,13 @@ from agent_libos.tools.builtin.memory import ListMemoryNamespaceTool
 from agent_libos.tools.builtin.mcp import ListMcpServersArgs, ListMcpServersTool
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models.exceptions import HumanResponseRequired, ValidationError
-from agent_libos.models import CapabilityRight, ProcessStatus
+from agent_libos.models import (
+    AuthorityRisk,
+    AuthorityRule,
+    CapabilityEffect,
+    CapabilityRight,
+    ProcessStatus,
+)
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import SQLiteStore, display_store_target, open_store, redact_store_target
 
@@ -34,6 +40,87 @@ class TestConfigDefaults:
 
         assert "mutated" not in AgentLibOSConfig().llm.profiles
         assert DEFAULT_CONFIG.llm.fallback_json_actions is False
+
+    def test_loaded_shell_rule_conditions_are_deeply_immutable_and_runtime_stable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "shell-rule.yaml"
+        path.write_text(
+            "\n".join(
+                (
+                    "shell:",
+                    "  rules:",
+                    "    - rule_id: custom.tool.inspect",
+                    "      operation: shell.run",
+                    "      effect: allow",
+                    "      risk: harmless",
+                    "      conditions:",
+                    "        argv: [tool, inspect]",
+                    "        match: exact",
+                )
+            ),
+            encoding="utf-8",
+        )
+        config = load_config_file(path)
+        runtime = Runtime.open(":memory:", config=config)
+        try:
+            assert (
+                runtime.shell.rule_engine.classify(["tool", "inspect"]).rule.rule_id
+                == "custom.tool.inspect"
+            )
+            assert (
+                runtime.shell.rule_engine.classify(["tool", "changed"]).rule.rule_id
+                != "custom.tool.inspect"
+            )
+
+            conditions = runtime.config.shell.rules[0].conditions
+            with pytest.raises(TypeError):
+                conditions["match"] = "prefix"
+            with pytest.raises(TypeError):
+                conditions["argv"][1] = "changed"
+
+            assert (
+                runtime.shell.rule_engine.classify(["tool", "inspect"]).rule.rule_id
+                == "custom.tool.inspect"
+            )
+            assert (
+                runtime.shell.rule_engine.classify(["tool", "changed"]).rule.rule_id
+                != "custom.tool.inspect"
+            )
+            assert json.loads(json.dumps(asdict(config)))["shell"]["rules"][0]["conditions"] == {
+                "argv": ["tool", "inspect"],
+                "match": "exact",
+            }
+        finally:
+            runtime.close()
+
+    def test_authority_rule_defensively_copies_and_freezes_nested_conditions(self) -> None:
+        source = {
+            "argv": ["tool", "inspect"],
+            "metadata": {"labels": ["original"]},
+        }
+        rule = AuthorityRule(
+            rule_id="custom.tool.inspect",
+            operation="shell.run",
+            effect=CapabilityEffect.ALLOW,
+            risk=AuthorityRisk.HARMLESS,
+            conditions=source,
+        )
+
+        source["argv"][1] = "changed"
+        source["metadata"]["labels"].append("changed")
+
+        assert rule.conditions["argv"] == ["tool", "inspect"]
+        assert rule.conditions["metadata"]["labels"] == ["original"]
+        with pytest.raises(TypeError):
+            rule.conditions["metadata"]["labels"].append("changed")
+        with pytest.raises(TypeError):
+            rule.conditions["metadata"]["new"] = True
+        assert json.loads(json.dumps(asdict(rule)))["conditions"] == {
+            "argv": ["tool", "inspect"],
+            "metadata": {"labels": ["original"]},
+        }
 
     def test_remote_registry_tool_schema_uses_runtime_list_limits(self) -> None:
         config = replace(
@@ -129,6 +216,68 @@ class TestConfigDefaults:
         assert config.runtime.run_until_idle_max_quanta == 3
         assert config.tools.filesystem_read_max_bytes == 123
         assert config.scheduler.max_workers == 2
+
+    @pytest.mark.parametrize(
+        ("body", "field"),
+        (
+            ("scheduler:\n  max_workers: true\n", "max_workers"),
+            ("process:\n  max_tool_calls: false\n", "max_tool_calls"),
+            ("llm:\n  max_tokens: true\n", "max_tokens"),
+            ("llm:\n  temperature: false\n", "temperature"),
+            (
+                "llm:\n  profiles:\n    default:\n      max_tokens: true\n",
+                "max_tokens",
+            ),
+            (
+                "llm:\n  profiles:\n    default:\n      temperature: false\n",
+                "temperature",
+            ),
+        ),
+    )
+    def test_security_sensitive_numeric_fields_reject_yaml_booleans(
+        self,
+        tmp_path: Path,
+        body: str,
+        field: str,
+    ) -> None:
+        path = tmp_path / f"invalid-{field}.yaml"
+        path.write_text(body, encoding="utf-8")
+
+        with pytest.raises(PydanticValidationError, match=field):
+            load_config_file(path)
+
+    def test_security_sensitive_numeric_fields_accept_numbers(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "numeric-fields.yaml"
+        path.write_text(
+            "\n".join(
+                (
+                    "scheduler:",
+                    "  max_workers: 2",
+                    "process:",
+                    "  max_tool_calls: 0",
+                    "llm:",
+                    "  temperature: 1",
+                    "  max_tokens: 4096",
+                    "  profiles:",
+                    "    default:",
+                    "      temperature: 0",
+                    "      max_tokens: 2048",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        config = load_config_file(path)
+
+        assert config.scheduler.max_workers == 2
+        assert config.process.max_tool_calls == 0
+        assert config.llm.temperature == 1.0
+        assert config.llm.max_tokens == 4096
+        assert config.llm.profiles["default"].temperature == 0.0
+        assert config.llm.profiles["default"].max_tokens == 2048
 
     def test_checkpoint_snapshot_version_is_not_configurable(self, tmp_path: Path) -> None:
         path = tmp_path / 'config.yaml'

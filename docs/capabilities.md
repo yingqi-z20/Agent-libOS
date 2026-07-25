@@ -4,23 +4,33 @@ Agent libOS uses capabilities as the runtime authority subsystem. A visible
 tool, activated Skill, JIT tool, child-process handle, object name, path string,
 image id, checkpoint id, or JSON-RPC endpoint id is not enough to perform a
 protected operation. Protected effects are authorized at primitive use by
-process identity, typed resource pattern, right, effect, constraints, human
-approval, and audit. This lets self-evolving agents change their action surface
+process identity, typed resource pattern, right, effect, constraints, Task
+Authority, data-flow clearance, resource budgets, and Human approval where
+required. Provider-effect intents, events, and audit make those decisions and
+their outcomes observable; audit is settlement evidence, not an authorization
+credential, and provider-success audit evidence may be written only after the
+provider returns. This lets self-evolving agents change their action surface
 without implicitly changing what resources they can affect.
 
 ## Capability Record
 
-Capability records are structured authority statements:
+Durable `Capability` records are structured authority statements:
 
 - `subject`: process or runtime actor that holds the authority.
 - `resource`: canonical typed resource pattern.
 - `rights`: operation rights such as `read`, `write`, or `execute`.
 - `effect`: `allow`, `deny`, or `ask`.
-- `issuer`: actor that issued the record.
+- `issued_by`: actor that issued the record.
 - `issuer_cap_id` and `parent_cap_id`: lineage for grant/delegation decisions.
-- `delegation_depth`: attenuation depth from a parent capability.
+- `delegable`, `revocable`, `delegation_depth`, and `max_delegation_depth`:
+  delegation and attenuation state.
 - `issued_at`, `expires_at`, `uses_remaining`, and `status`.
-- `rules`, `lease`, `delegation`, `constraints`, and `metadata`.
+- `constraints` and `metadata`.
+
+The inspection projection exposes `issued_by` as `issuer` and also derives
+`rules`, `lease`, and `delegation` objects from the durable constraints, expiry,
+use-count, and delegation fields. Those objects are presentation conveniences,
+not additional persisted authority.
 
 One-shot authority is not encoded as a policy string. It is an `allow`
 capability with `uses_remaining=1`; committed primitive use consumes it and
@@ -77,10 +87,12 @@ If a recovery fence invalidates an already-admitted waiter, its capability,
 reservation, event, and audit writes roll back together. Startup and recovery
 code can still mutate under their explicit internal lifecycle lease.
 
-Launch authority is additionally bounded by a metadata-only
-[`TaskAuthorityManifest`](task_authority_manifest.md). Image requirements do
-not compile into capabilities. Model permission requests are rejected before a
-Human prompt when the requested resource/right exceeds the manifest.
+Launch authority is additionally governed by a durable Host-authored
+[`TaskAuthorityManifest`](task_authority_manifest.md). Its authorized entries
+compile into root capabilities, while its effect, expiry, budget, approval, and
+data-flow fields remain independent ceilings. Image requirements do not compile
+into capabilities. Model permission requests are rejected before a Human prompt
+when the requested resource/right exceeds the manifest.
 
 Human approval for a concrete external operation adds an
 `approval_binding` constraint containing an effect id, canonical argument hash,
@@ -99,7 +111,11 @@ their `subject` must equal the process that created the request (or be omitted
 and default to it), otherwise validation fails and the request remains pending.
 
 Authority derivation uses public CapabilityManager transition APIs.
-`derive_authority()` applies source authority and an optional manifest ceiling;
+`derive_authority()` applies source authority and, when `ceiling_specs` is a
+non-empty iterable, an additional manifest ceiling. For this capability API,
+`ceiling_specs=None` and `ceiling_specs=[]` both mean no additional ceiling;
+this is separate from a Task Authority `permitted_effects=[]`, which is an
+explicit provider-effect deny-all value.
 `transition_allowed_rights()` reapplies expiry, finite-use duplication rules,
 and current restrictive policy for checkpoint/fork/restore transitions. These
 surfaces replace subsystem-local resource matching as the transition policy
@@ -197,8 +213,12 @@ details. The decision records:
 - effect and derived human-facing policy,
 - constraint evaluation results,
 - one-shot consumption id when applicable,
-- human approval request id when a primitive asks the human,
 - operation context preview.
+
+A `CapabilityDecision` does not itself create or own a Human request. When a
+primitive acts on an `ask` decision, the Human subsystem owns the durable
+request and direct Host calls receive its id through
+`HumanApprovalRequired`/`HumanResponseRequired`.
 
 Unknown constraint keys fail closed. Primitive-specific evaluators can define
 new constraint keys, but the default manager does not silently ignore unknown
@@ -258,13 +278,17 @@ All authority mutation goes through explicit operations:
   share one store transaction. A validation or evidence-sink failure therefore
   neither publishes the revocation nor consumes its finite authority.
 
-Runtime bootstrap, image bootstrap, human approval, admin CLI, checkpoint
-restore/fork, and tests use explicit embedding-host paths such as
-`issue_trusted()` and emit audit records. These methods, along with operations
-that explicitly set `require_authority=false`, are host API bypasses: the actor
-string is attribution, not authentication, and no configured name or prefix
-makes an ordinary caller trusted. They must not be exposed to an AgentProcess,
-model, Skill, or JIT tool. Ordinary execution must use the checked `issue()`,
+Runtime bootstrap, image bootstrap, Human approval, Host-side CLI mutations,
+checkpoint flows, and tests may use explicit embedding-host paths such as
+`issue_trusted()`. Authority changes through that method retain their normal
+capability evidence, while command/operation evidence remains specific to the
+calling path: unchecked Host diagnostic reads do not promise a command-level
+audit, and checkpoint fork has the documented post-commit best-effort audit
+boundary. These methods, along with operations that explicitly set
+`require_authority=false`, are Host API bypasses: the actor string is
+attribution, not authentication, and no configured name or prefix makes an
+ordinary caller trusted. They must not be exposed to an AgentProcess, model,
+Skill, or JIT tool. Ordinary execution must use the checked `issue()`,
 delegation, and revocation paths and has no implicit signing authority.
 
 Fork and spawn inherit authority only through delegation/attenuation. Exec
@@ -295,12 +319,13 @@ install `always_allow`, and the JSON `approved` boolean must agree with the
 terminal status. Approved ordinary questions require a non-empty string
 `answer` rather than implicit coercion.
 
-Model-facing `request_permission` is not a raw grant API. It first requires the
-caller to hold `human:<name>` write authority, then creates a blocking human
-request. Before a request enters the human queue, the runtime canonicalizes the
-resource, normalizes rights, classifies risk, records resource scope, attaches
-any deterministic constraints, and shows the selected lease shape. Ordinary
-model requests cannot ask for broad high-risk authority such as
+Model-facing `request_permission` is not a raw grant API. It first checks the
+canonical resource/right request against the live Task Authority request
+ceiling, then requires the caller to hold `human:<name>` write authority. No
+Human request is created unless both checks pass. Before a request enters the
+Human queue, the runtime normalizes rights, classifies risk, records resource
+scope, attaches any deterministic constraints, and shows the selected lease
+shape. Ordinary model requests cannot ask for broad high-risk authority such as
 `capability:*` with privileged rights (`admin`, `grant`, `revoke`, `write`,
 `execute`, or `delete`), `shell:*` execute, or root/global filesystem write such
 as `filesystem:/:*` or `filesystem:*`. Workspace-level write
@@ -395,8 +420,9 @@ Host Sink registry writes separately require `admin` on
 
 ## Tool, Skill, And JIT Boundary
 
-The process tool table controls LLM-facing tool visibility. Capabilities
-control primitive effects.
+The complete process tool table is the callable binding set. A separate model
+tool projection controls which schemas the LLM receives. Capabilities control
+primitive effects independently of both.
 
 `ToolPolicy` is declaration metadata only. Fields such as
 `declared_permissions` and `declared_confirmation_required` can help a GUI or a
@@ -404,15 +430,17 @@ human reviewer understand a tool, but the broker does not convert them into
 grants or confirmations. Real authorization still happens in the primitive that
 touches the resource.
 
-For example, a process can see `write_text_file` and still fail to write
-`src/app.py` if it lacks write authority for
+For example, even when the model projection contains `write_text_file`, the
+process still fails to write `src/app.py` if it lacks write authority for
 `filesystem:workspace:src/app.py` or a covering subtree grant.
 
-Loading a Skill can add instructions, existing tools, and Deno/TypeScript JIT
-tools to one process table. It does not grant filesystem, shell, human, object,
-process, image, checkpoint, JSON-RPC, or MCP authority, nor filesystem access or
-global hash trust for another Skill source. JIT
-syscalls bypass the LLM-facing tool table, but they still enter the same
+Activating an immutable built-in Skill projects an all-or-nothing set of
+existing Image-authorized bindings into the model table; activating a registered
+Skill can add its separately authorized static and Deno/TypeScript JIT bindings
+to both tables. Either path may add instructions, but it does not grant
+filesystem, shell, human, object, process, image, checkpoint, JSON-RPC, or MCP
+authority, nor filesystem access or global hash trust for another Skill source.
+JIT syscalls bypass the LLM-facing tool table, but they still enter the same
 primitive authorization path as built-in tools.
 
 Persistent LLM-context enrichment is also explicit authority. The default
@@ -420,16 +448,18 @@ source-only path does not create or append an `llm_context` Object.
 `context:enrichment/execute` opts one process into that delta projection;
 `context:maintenance/execute` separately permits the proactive storage
 waterline and model-window pressure handler to invoke the configured compactor.
-Without both explicit enrichment and maintenance authority, the default
-source-only request is left unchanged. Neither capability supplies the required
+Enrichment authority alone therefore creates and appends the persistent context
+Object. Without enrichment authority the request stays source-only; without
+maintenance authority persistent deltas can still be used, but proactive
+compaction is not authorized. Neither capability supplies the separate required
 child-spawn or compressor-image authority.
 
-The built-in base, coding, review, and toolmaker images expose
-`list_capabilities` and `inspect_capability` so a process can understand its own
-authority; the context-compressor image does not. For the lazy base, coding,
-and review projections, `list_capabilities` is in the initial core while
-`inspect_capability` becomes model-visible after activating the `authority`
-group. `delegate_capability` and
+The static default tool tables of the built-in base, coding, review, and
+toolmaker images contain `list_capabilities` and `inspect_capability`; the
+context-compressor image does not. Those four images use Skill projection, so
+neither capability tool is model-visible in the initial five-tool bootstrap.
+Activating the exact `agent-libos-authority-basics` Skill projects both tools
+(and `request_permission`) for that process. `delegate_capability` and
 `revoke_capability` are registered static tools but are not included in those
 default image tool tables.
 
@@ -482,7 +512,9 @@ Deno/TypeScript JIT tools can use the syscall names:
   servers and tools.
 
 Syscalls do not consult the process tool table. They are authorized by pid,
-capability records, primitive rules, human approval, and audit.
+capability records, primitive rules, and Human approval where required. Their
+audit records are evidence of the decision and outcome, not another authority
+gate.
 
 ## JSON-RPC Authority
 
@@ -547,8 +579,10 @@ on the exact `mcp_stdio:<sha256>` launch resource. The hash covers the canonical
 command, argv, environment mapping, and cwd, so a grant for one launch surface
 cannot authorize another. Registration authorizes persisting that surface;
 refresh and calls are the operations that actually start a local child process.
-Host/admin paths that explicitly bypass actor capability checks remain audited
-host operations.
+Host/admin mutations emit their normal mutation evidence, and live refreshes
+and provider calls retain their operation-specific evidence. Read-only Host
+registry list/inspect/tools paths do not thereby promise a separate
+admin-operation audit.
 
 For both JSON-RPC and MCP, one-time Human approval is bound to the immutable
 registry specification SHA-256 and a monotonic registry generation, as well as
@@ -702,13 +736,15 @@ Shell command risk is classified by argv-token rules before the provider runs:
 - `low`: read-only project inspection such as `git diff`.
 - `medium`: project code execution such as `pytest`, pytest collection,
   `npm test`, or `uv run ...`.
-- `high`: package managers, network-capable tools, script interpreters,
-  `python -m compileall`, service startup, and other commands likely to change
-  host state or cross a boundary. Because executable-family rules run before
-  exact harmless/custom rules, the current classifier also treats
+- `high`: recognized package managers, network-capable tools, script
+  interpreters, and the exact supported `python -m compileall` forms. Because
+  executable-family rules run before exact harmless/custom rules, the current
+  classifier also treats
   `python --version` as a high-risk interpreter command and asks under the two
   mixed automatic policies (`allowlist_auto_else_ask` and
-  `blocklist_ask_else_auto`).
+  `blocklist_ask_else_auto`). An otherwise unrecognized command, including an
+  unrecognized service-startup form, falls back to `medium`; the classifier
+  does not infer hidden behavior from a command name.
 - `destructive`: commands whose direct or nested executable matches the
   built-in delete/move/permission/system-control set. Recognized commands are
   denied even under broad shell policy. This is a deterministic executable
@@ -826,8 +862,10 @@ satisfy a mandatory approval. Ordinary commit, merge, fast-forward pull, and
 non-forced push follow the capability record's normal `allow`/`ask`/`deny`
 effect.
 
-Git tools in the coding/review image table are visibility only. They do not
-grant `git:*`, `git_remote:*`, `git_pr:*`, filesystem, Task Authority effect,
-or data-flow permission. Existing `shell:git` grants are intentionally not
-translated. See [Git Provider and Primitive](git.md) for the complete operation
-and approval matrix.
+Git tools in the coding/review static tables are not part of the initial
+five-tool model projection. The corresponding all-or-nothing Git Skills must be
+activated before their owned schemas become model-visible. Static binding or
+later projection grants no `git:*`, `git_remote:*`, `git_pr:*`, filesystem,
+Task Authority effect, or data-flow permission. Existing `shell:git` grants are
+intentionally not translated. See [Git Provider and Primitive](git.md) for the
+complete operation and approval matrix.

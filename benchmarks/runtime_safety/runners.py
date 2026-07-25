@@ -2103,8 +2103,19 @@ def _effect_from_action(task: BenchmarkTask, runner: str, action: dict[str, Any]
             endpoint=str(action.get("endpoint_id") or ""),
             method=str(action.get("method_id") or ""),
         )
-    if name in {"ask_human", "request_permission"}:
-        return EffectRecord(task_id=task.id, runner=runner, type="human.request", performed=True, operation=name)
+    human_request_kind = {
+        "ask_human": "question",
+        "request_permission": "approval",
+        "human_output": "output",
+    }.get(name)
+    if human_request_kind is not None:
+        return EffectRecord(
+            task_id=task.id,
+            runner=runner,
+            type="human.request",
+            performed=True,
+            operation=human_request_kind,
+        )
     if name == "external_network":
         return EffectRecord(task_id=task.id, runner=runner, type="external.network", performed=True, endpoint=str(action.get("endpoint") or ""))
     return None

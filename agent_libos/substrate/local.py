@@ -74,6 +74,11 @@ _SHELL_DEFAULTS = DEFAULT_CONFIG.shell
 _MCP_LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _MCP_FORBIDDEN_HOSTS = {"metadata.google.internal"}
 _MCP_STDIO_READ_CHUNK_BYTES = 64 * 1024
+_MCP_WINDOWS = os.name == "nt"
+_MCP_WINDOWS_EXECUTABLE_SUFFIXES = {".com", ".exe"}
+_MCP_STABLE_CWD_SUPPORTED = sys.platform.startswith("linux") and Path(
+    "/proc/self/fd"
+).is_dir()
 _SAFE_SHELL_ENV_KEYS = {
     "COMSPEC",
     "LANG",
@@ -91,6 +96,10 @@ _SAFE_SHELL_ENV_KEYS = {
 
 class _ProtectedMetadataDeleteDenied(CapabilityDenied, ProviderEffectNotStarted):
     """A recursive delete rejected before the provider mutated the tree."""
+
+
+class _McpStdioDispatchNotStarted(ValidationError, ProviderEffectNotStarted):
+    """A stdio target failed closed before a child process was created."""
 
 
 class _ProtectedDeleteState:
@@ -2091,6 +2100,13 @@ class SdkMcpProvider:
             server,
             runtime_environment=runtime_environment,
         )
+        if (
+            _MCP_WINDOWS
+            and candidate.suffix.casefold() not in _MCP_WINDOWS_EXECUTABLE_SUFFIXES
+        ):
+            raise ValidationError(
+                "Windows MCP stdio executables must end in .exe or .com"
+            )
         resolved_candidate = candidate.resolve(strict=True)
         if not resolved_candidate.is_file():
             raise ValidationError(
@@ -2108,7 +2124,7 @@ class SdkMcpProvider:
             raise ValidationError("MCP stdio executable resolution requires stdio configuration")
         command = server.stdio.command
         selected_cwd = Path(self._resolved_stdio_cwd(server))
-        raw = Path(command).expanduser()
+        raw = Path(command)
         if raw.is_absolute() or "/" in command or "\\" in command:
             candidate = raw if raw.is_absolute() else selected_cwd / raw
         else:
@@ -2116,7 +2132,17 @@ class SdkMcpProvider:
                 server,
                 runtime_environment=runtime_environment,
             )
-            resolved = shutil.which(command, path=child_env.get("PATH", os.defpath))
+            if _MCP_WINDOWS:
+                resolved = _resolve_windows_mcp_bare_command(
+                    command,
+                    search_path=child_env.get("PATH"),
+                    pathext=child_env.get("PATHEXT"),
+                )
+            else:
+                resolved = shutil.which(
+                    command,
+                    path=child_env.get("PATH", os.defpath),
+                )
             if resolved is None:
                 raise FileNotFoundError(f"MCP stdio executable not found: {command}")
             candidate = Path(resolved)
@@ -2129,19 +2155,8 @@ class SdkMcpProvider:
         *,
         runtime_environment: Mapping[str, str] | None = None,
     ) -> bool:
-        if server.transport != "stdio" or server.stdio is None:
-            return False
-
-        def is_workspace_path(path: Path) -> bool:
-            return path == self.workspace_root or self.workspace_root in path.parents
-
-        if is_workspace_path(Path(resolved_executable).resolve(strict=False)):
-            return True
-        candidate = self._stdio_command_candidate(
-            server,
-            runtime_environment=runtime_environment,
-        )
-        return is_workspace_path(candidate)
+        del resolved_executable, runtime_environment
+        return server.transport == "stdio" and server.stdio is not None
 
     @contextlib.contextmanager
     def _stdio_dispatch_snapshot(
@@ -2169,7 +2184,10 @@ class SdkMcpProvider:
         ):
             yield None
             return
-        with snapshot_executable(resolved) as owned_snapshot:
+        with snapshot_executable(
+            resolved,
+            sibling_policy="scripts",
+        ) as owned_snapshot:
             yield owned_snapshot
 
     @staticmethod
@@ -2418,23 +2436,25 @@ class SdkMcpProvider:
                 # Python can discover its pyvenv.cfg. The resolved target above
                 # remains the identity that was validated by the primitive.
                 command = str(command_candidate)
-            params = StdioServerParameters(
-                command=command,
-                args=list(server.stdio.args),
-                env=self._stdio_dispatch_env(
-                    server,
-                    executable_snapshot,
-                    runtime_environment=runtime_environment,
-                ),
-                cwd=self._resolved_stdio_cwd(server),
-            )
-            async with _strict_stdio_client(
-                params,
-                max_frame_bytes=max_response_bytes,
-            ) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await asyncio.wait_for(session.initialize(), timeout=timeout_s)
-                    yield session
+            with self._stdio_dispatch_cwd(server) as (dispatch_cwd, cwd_fd):
+                params = StdioServerParameters(
+                    command=command,
+                    args=list(server.stdio.args),
+                    env=self._stdio_dispatch_env(
+                        server,
+                        executable_snapshot,
+                        runtime_environment=runtime_environment,
+                    ),
+                    cwd=dispatch_cwd,
+                )
+                async with _strict_stdio_client(
+                    params,
+                    max_frame_bytes=max_response_bytes,
+                    cwd_fd=cwd_fd,
+                ) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await asyncio.wait_for(session.initialize(), timeout=timeout_s)
+                        yield session
             return
         if server.transport == "streamable_http":
             if server.http is None:
@@ -2600,6 +2620,56 @@ class SdkMcpProvider:
         if target != self.workspace_root and self.workspace_root not in target.parents:
             raise ValidationError("MCP stdio cwd escapes workspace root")
         return str(target)
+
+    @contextlib.contextmanager
+    def _stdio_dispatch_cwd(
+        self,
+        server: McpServerSpec,
+    ) -> Iterator[tuple[str, int | None]]:
+        """Bind a replaceable workspace cwd to one stable directory object."""
+
+        try:
+            resolved = self._resolved_stdio_cwd(server)
+        except (OSError, ValidationError) as exc:
+            raise _McpStdioDispatchNotStarted(
+                "MCP stdio cwd changed before dispatch"
+            ) from exc
+        if server.stdio is None or server.stdio.cwd is None:
+            # The workspace root is a Host-owned boundary. A process confined
+            # within it cannot rename or replace that root through workspace
+            # paths, so no child-directory handle is needed.
+            yield resolved, None
+            return
+        if not _MCP_STABLE_CWD_SUPPORTED:
+            raise _McpStdioDispatchNotStarted(
+                "configured MCP stdio cwd requires stable /proc/self/fd support"
+            )
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            cwd_fd = os.open(resolved, flags)
+        except OSError as exc:
+            raise _McpStdioDispatchNotStarted(
+                "MCP stdio cwd changed before dispatch"
+            ) from exc
+        try:
+            fd_path = Path("/proc/self/fd") / str(cwd_fd)
+            try:
+                actual = fd_path.resolve(strict=True)
+            except OSError as exc:
+                raise _McpStdioDispatchNotStarted(
+                    "MCP stdio cwd handle cannot be resolved"
+                ) from exc
+            root = self.workspace_root.resolve(strict=True)
+            if actual != root and root not in actual.parents:
+                raise _McpStdioDispatchNotStarted(
+                    "MCP stdio cwd changed outside workspace before dispatch"
+                )
+            yield str(fd_path), cwd_fd
+        finally:
+            os.close(cwd_fd)
 
     def classify_external_effect(
         self,
@@ -2931,7 +3001,7 @@ def _validate_mcp_connect_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, 
 
 
 def _mcp_platform_env() -> dict[str, str]:
-    if os.name != "nt":
+    if not _MCP_WINDOWS:
         return {}
     env: dict[str, str] = {}
     for key in ("SYSTEMROOT", "WINDIR"):
@@ -2941,14 +3011,115 @@ def _mcp_platform_env() -> dict[str, str]:
     return env
 
 
+def _resolve_windows_mcp_bare_command(
+    command: str,
+    *,
+    search_path: str | None,
+    pathext: str | None,
+) -> str | None:
+    """Resolve from explicit child snapshots without Windows CWD fallback."""
+
+    if search_path is None or pathext is None:
+        raise ValidationError(
+            "Windows MCP stdio bare commands require manifest-mapped child "
+            "PATH and PATHEXT"
+        )
+    directories = _windows_mcp_search_directories(search_path)
+    selected_extensions = _windows_mcp_executable_extensions(pathext)
+    names = _windows_mcp_candidate_names(command, selected_extensions)
+    return _find_windows_mcp_command(directories, names)
+
+
+def _windows_mcp_search_directories(search_path: str) -> list[Path]:
+    path_entries = search_path.split(os.pathsep)
+    if not path_entries:
+        raise ValidationError("Windows MCP stdio PATH must be non-empty")
+    directories: list[Path] = []
+    for entry in path_entries:
+        directory = Path(entry)
+        if not entry or not directory.is_absolute():
+            raise ValidationError(
+                "Windows MCP stdio PATH entries must be non-empty absolute paths"
+            )
+        directories.append(directory)
+    return directories
+
+
+def _windows_mcp_pathext_entry_invalid(extension: str) -> bool:
+    return (
+        not extension
+        or not extension.startswith(".")
+        or extension in {".", ".."}
+        or any(char in extension for char in "/\\:\x00")
+    )
+
+
+def _windows_mcp_executable_extensions(pathext: str) -> list[str]:
+    extensions = pathext.split(os.pathsep)
+    if not extensions or any(
+        _windows_mcp_pathext_entry_invalid(extension)
+        for extension in extensions
+    ):
+        raise ValidationError("Windows MCP stdio PATHEXT is invalid")
+    selected_extensions = [
+        extension
+        for extension in extensions
+        if extension.casefold() in _MCP_WINDOWS_EXECUTABLE_SUFFIXES
+    ]
+    if not selected_extensions:
+        raise ValidationError(
+            "Windows MCP stdio PATHEXT must allow .exe or .com"
+        )
+    return selected_extensions
+
+
+def _windows_mcp_candidate_names(
+    command: str,
+    extensions: list[str],
+) -> list[str]:
+    return (
+        [command]
+        if any(
+            command.casefold().endswith(extension.casefold())
+            for extension in extensions
+        )
+        else [f"{command}{extension}" for extension in extensions]
+    )
+
+
+def _find_windows_mcp_command(
+    directories: list[Path],
+    names: list[str],
+) -> str | None:
+    seen: set[str] = set()
+    for directory in directories:
+        normalized = os.path.normcase(str(directory))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file() and os.access(
+                candidate,
+                os.F_OK | os.X_OK,
+            ):
+                return str(candidate)
+    return None
+
+
 @contextlib.asynccontextmanager
-async def _strict_stdio_client(server: Any, *, max_frame_bytes: int):
+async def _strict_stdio_client(
+    server: Any,
+    *,
+    max_frame_bytes: int,
+    cwd_fd: int | None = None,
+):
     try:
         import anyio
         import anyio.lowlevel
         import mcp.types as mcp_types
         from mcp.os.posix.utilities import terminate_posix_process_tree
-        from mcp.os.win32.utilities import create_windows_process, get_windows_executable_command, terminate_windows_process_tree
+        from mcp.os.win32.utilities import create_windows_process, terminate_windows_process_tree
         from mcp.shared.message import SessionMessage
     except ModuleNotFoundError as exc:
         raise ValidationError(
@@ -2959,9 +3130,15 @@ async def _strict_stdio_client(server: Any, *, max_frame_bytes: int):
     write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
     reader_errors: list[RuntimeError] = []
     process = None
-    command = get_windows_executable_command(server.command) if sys.platform == "win32" else server.command
+    # ``server.command`` is already the verified absolute snapshot path. Do
+    # not let the SDK run a second PATH/PATHEXT lookup after authorization.
+    command = server.command
     try:
-        if sys.platform == "win32":
+        if _MCP_WINDOWS:
+            if cwd_fd is not None:
+                raise _McpStdioDispatchNotStarted(
+                    "Windows MCP stdio cannot receive a POSIX cwd handle"
+                )
             process = await create_windows_process(command, list(server.args), dict(server.env or {}), sys.stderr, server.cwd)
         else:
             process = await anyio.open_process(
@@ -2970,8 +3147,9 @@ async def _strict_stdio_client(server: Any, *, max_frame_bytes: int):
                 stderr=sys.stderr,
                 cwd=server.cwd,
                 start_new_session=True,
+                pass_fds=(() if cwd_fd is None else (cwd_fd,)),
             )
-    except OSError:
+    except (OSError, ValidationError):
         await read_stream.aclose()
         await write_stream.aclose()
         await read_stream_writer.aclose()
@@ -3060,7 +3238,7 @@ async def _strict_stdio_client(server: Any, *, max_frame_bytes: int):
                 with anyio.fail_after(2.0):
                     await process.wait()
             except TimeoutError:
-                if sys.platform == "win32":
+                if _MCP_WINDOWS:
                     await terminate_windows_process_tree(process)
                 else:
                     await terminate_posix_process_tree(process)

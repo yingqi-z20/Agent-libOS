@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mainWindowBounds, shouldCreateBrowserWindow } from "./windowBounds";
 
 describe("mainWindowBounds", () => {
-  it("allows the packaged window to reach the narrow responsive layout", () => {
+  it("allows the production Electron window to reach the narrow responsive layout", () => {
     expect(mainWindowBounds.minWidth).toBeGreaterThanOrEqual(320);
     expect(mainWindowBounds.minWidth).toBeLessThanOrEqual(720);
     expect(mainWindowBounds.minHeight).toBeGreaterThanOrEqual(480);

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, replace
@@ -49,6 +50,200 @@ _CURRENT_OPERATION: ContextVar[_CurrentOperation | None] = ContextVar(
 F = TypeVar("F", bound=Callable[..., Any])
 _RUNTIME_PUBLICATION_BINDING_VERSION = 1
 _RUNTIME_PUBLICATION_METADATA_PREFIX = "runtime_publication_"
+_CHECKPOINT_FORK_OPERATION_NAME = "checkpoint.fork"
+_CHECKPOINT_FORK_RECEIPT_ATTRIBUTE = "checkpoint_fork_receipt"
+_CHECKPOINT_FORK_RECEIPT_KEYS = frozenset(
+    {
+        "checkpoint_id", "source_pid", "fork_root_pid", "pid_map",
+        "object_map", "tool_map", "status", "main_state_committed",
+        "reconciliation_pending", "post_commit_failures", "outcome_diagnostic",
+    }
+)
+_CHECKPOINT_FORK_FAILURE_KEYS = frozenset(
+    {
+        "phase", "error_type", "message", "audit_error_type", "audit_error",
+        "failure_record_error_type", "failure_record_error",
+    }
+)
+_CHECKPOINT_FORK_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "phase", "interruption_error_type", "interruption",
+        "diagnostic_error_type", "diagnostic_error",
+        "prepared_runtime_assets_retained", "fork_subtree_quarantined",
+        "recovery_signal_record_id", "recovery_signal_error_type",
+        "recovery_signal_error", "lifecycle_fence_requested",
+        "operation_recovery_signal_recorded",
+        "operation_recovery_signal_error_type",
+        "operation_recovery_signal_error", "lifecycle_fence_error_type",
+        "lifecycle_fence_error", "lifecycle_fenced",
+    }
+)
+_CHECKPOINT_FORK_MAX_MAP_ITEMS = 4096
+_CHECKPOINT_FORK_MAX_FAILURES = 32
+_CHECKPOINT_FORK_MAX_TEXT = 1024
+
+
+def _bounded_fork_text(value: Any) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _CHECKPOINT_FORK_MAX_TEXT
+    ):
+        return None
+    return value
+
+
+def _canonical_checkpoint_fork_identity(
+    value: Mapping[Any, Any],
+) -> dict[str, str] | None:
+    selected: dict[str, str] = {}
+    for key in ("checkpoint_id", "source_pid", "fork_root_pid", "status"):
+        text = _bounded_fork_text(value.get(key))
+        if text is None:
+            return None
+        selected[key] = text
+    return selected
+
+
+def _canonical_checkpoint_fork_outcome(
+    value: Mapping[Any, Any],
+    status: str,
+) -> tuple[bool | None, bool] | None:
+    committed = value.get("main_state_committed")
+    pending = value.get("reconciliation_pending", False)
+    if committed is not None and not isinstance(committed, bool):
+        return None
+    if not isinstance(pending, bool):
+        return None
+    valid_combinations = {
+        ("forked", True, False),
+        ("forked_with_warnings", True, False),
+        ("fork_outcome_unknown", None, True),
+        ("fork_recovery_required", True, True),
+    }
+    if (status, committed, pending) not in valid_combinations:
+        return None
+    return committed, pending
+
+
+def _canonical_checkpoint_fork_map(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping) or len(value) > _CHECKPOINT_FORK_MAX_MAP_ITEMS:
+        return None
+    normalized: dict[str, str] = {}
+    for raw_source, raw_target in value.items():
+        source = _bounded_fork_text(raw_source)
+        target = _bounded_fork_text(raw_target)
+        if source is None or target is None:
+            return None
+        normalized[source] = target
+    return normalized if len(normalized) == len(value) else None
+
+
+def _canonical_checkpoint_fork_maps(
+    value: Mapping[Any, Any],
+) -> dict[str, dict[str, str]] | None:
+    selected: dict[str, dict[str, str]] = {}
+    for key in ("pid_map", "object_map", "tool_map"):
+        normalized = _canonical_checkpoint_fork_map(value.get(key))
+        if normalized is None:
+            return None
+        selected[key] = normalized
+    return selected
+
+
+def _canonical_checkpoint_fork_failure(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping) or set(value) - _CHECKPOINT_FORK_FAILURE_KEYS:
+        return None
+    selected: dict[str, str] = {}
+    for key, raw_text in value.items():
+        if not isinstance(raw_text, str) or not raw_text:
+            return None
+        selected[str(key)] = raw_text[:_CHECKPOINT_FORK_MAX_TEXT]
+    required = {"phase", "error_type", "message"}
+    return selected if required <= set(selected) else None
+
+
+def _checkpoint_fork_failure_count_matches_status(
+    status: str,
+    failures: list[dict[str, str]],
+) -> bool:
+    if status == "forked":
+        return not failures
+    if status in {"forked_with_warnings", "fork_recovery_required"}:
+        return bool(failures)
+    return True
+
+
+def _canonical_checkpoint_fork_failures(
+    value: Mapping[Any, Any],
+    status: str,
+) -> list[dict[str, str]] | None:
+    raw_failures = value.get("post_commit_failures")
+    if (
+        not isinstance(raw_failures, list)
+        or len(raw_failures) > _CHECKPOINT_FORK_MAX_FAILURES
+    ):
+        return None
+    failures: list[dict[str, str]] = []
+    for raw_failure in raw_failures:
+        failure = _canonical_checkpoint_fork_failure(raw_failure)
+        if failure is None:
+            return None
+        failures.append(failure)
+    if not _checkpoint_fork_failure_count_matches_status(status, failures):
+        return None
+    return failures
+
+
+def _canonical_checkpoint_fork_diagnostic(
+    value: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or set(value) - _CHECKPOINT_FORK_DIAGNOSTIC_KEYS:
+        return None
+    diagnostic: dict[str, Any] = {}
+    for raw_key, raw_item in value.items():
+        key = _bounded_fork_text(raw_key)
+        if key is None or not isinstance(raw_item, (str, bool, int, type(None))):
+            return None
+        diagnostic[key] = (
+            raw_item[:_CHECKPOINT_FORK_MAX_TEXT]
+            if isinstance(raw_item, str)
+            else raw_item
+        )
+    return diagnostic
+
+
+def _canonical_checkpoint_fork_receipt(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or set(value) - _CHECKPOINT_FORK_RECEIPT_KEYS:
+        return None
+    identity = _canonical_checkpoint_fork_identity(value)
+    if identity is None:
+        return None
+    selected: dict[str, Any] = dict(identity)
+    status = identity["status"]
+    outcome = _canonical_checkpoint_fork_outcome(value, status)
+    if outcome is None:
+        return None
+    maps = _canonical_checkpoint_fork_maps(value)
+    if maps is None:
+        return None
+    failures = _canonical_checkpoint_fork_failures(value, status)
+    if failures is None:
+        return None
+    committed, pending = outcome
+    selected["main_state_committed"] = committed
+    selected["reconciliation_pending"] = pending
+    selected.update(maps)
+    selected["post_commit_failures"] = failures
+    raw_diagnostic = value.get("outcome_diagnostic")
+    if raw_diagnostic is not None:
+        diagnostic = _canonical_checkpoint_fork_diagnostic(raw_diagnostic)
+        if diagnostic is None:
+            return None
+        selected["outcome_diagnostic"] = diagnostic
+    elif pending:
+        return None
+    return selected
 
 
 def _validated_public_operation_metadata(
@@ -861,6 +1056,36 @@ class OperationManager:
                 return None
             raise
 
+    @staticmethod
+    def _checkpoint_fork_exception_completion(
+        record: OperationRecord,
+        exc: BaseException,
+    ) -> tuple[OperationOutcome, dict[str, Any]] | None:
+        """Classify only a strictly formed receipt from the fork boundary."""
+
+        if (
+            record.kind != OperationKind.RUNTIME
+            or record.name != _CHECKPOINT_FORK_OPERATION_NAME
+        ):
+            return None
+        stable_receipt = _canonical_checkpoint_fork_receipt(
+            getattr(exc, _CHECKPOINT_FORK_RECEIPT_ATTRIBUTE, None)
+        )
+        if stable_receipt is None:
+            return None
+        committed = stable_receipt["main_state_committed"]
+        pending = stable_receipt["reconciliation_pending"]
+        if pending or committed is None:
+            outcome = OperationOutcome.UNKNOWN
+        elif committed:
+            outcome = OperationOutcome.SUCCEEDED
+        else:
+            outcome = OperationOutcome.FAILED
+        return outcome, {
+            "error_type": type(exc).__name__,
+            "checkpoint_fork_receipt": stable_receipt,
+        }
+
     def _validated_terminalization_publication_id(
         self,
         operation: OperationRecord,
@@ -1144,17 +1369,34 @@ class OperationManager:
                 metadata={"error_type": type(exc).__name__},
             )
             raise
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            completion = self._checkpoint_fork_exception_completion(record, exc)
+            if completion is None:
+                outcome = OperationOutcome.INTERRUPTED
+                completion_metadata = None
+            else:
+                outcome, completion_metadata = completion
             self._finish_unless_admission_stale(
-                OperationOutcome.INTERRUPTED,
+                outcome,
                 operation_id=record.operation_id,
+                metadata=completion_metadata,
             )
             raise
         except BaseException as exc:
+            completion = self._checkpoint_fork_exception_completion(record, exc)
+            if completion is None:
+                outcome = (
+                    OperationOutcome.UNKNOWN
+                    if self._has_unknown_external_effect(record.operation_id)
+                    else OperationOutcome.FAILED
+                )
+                completion_metadata = {"error_type": type(exc).__name__}
+            else:
+                outcome, completion_metadata = completion
             self._finish_unless_admission_stale(
-                OperationOutcome.UNKNOWN if self._has_unknown_external_effect(record.operation_id) else OperationOutcome.FAILED,
+                outcome,
                 operation_id=record.operation_id,
-                metadata={"error_type": type(exc).__name__},
+                metadata=completion_metadata,
             )
             raise
         else:

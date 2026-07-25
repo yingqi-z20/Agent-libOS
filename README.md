@@ -21,13 +21,17 @@ process identity + capability + data labels + Host Sink trust + primitive + audi
 LLM-facing tools, Skills, JIT tools, image definitions, child processes,
 checkpoints, and remote endpoint visibility are ergonomic affordances. They are
 not the security boundary.
-Protected effects happen only inside libOS primitives, where process identity,
-capabilities, human approval, policy, provider containment, events, and audit
-records are enforced.
+Process- or model-selected protected resource operations enter libOS primitive
+or protected-operation SDK boundaries, where process identity, capabilities,
+human approval, policy, provider containment, events, and audit records are
+enforced. Trusted Runtime artifact publication is a narrow TCB exception: image
+package materialization writes only the Runtime-owned private workspace through
+Host filesystem APIs under durable publication recovery and resource
+accounting. It does not grant a process a general filesystem bypass.
 
-This project is still in active development. [agent_libos_design_doc.md](agent_libos_design_doc.md)
-is a historical design archive and may describe planned or superseded
-interfaces.
+This project is still in active development. Current behavior is defined by
+this README and the current references under `docs/`; historical design and
+roadmap files are separated below and are not interface or security contracts.
 
 ## Current System
 
@@ -51,11 +55,13 @@ The implementation currently includes:
 - Optional Object-bound PTY sessions through the trusted `modules/pty` runtime
   module; when that module is loaded, `pty_create` returns an Object Memory
   `EXTERNAL_REF` handle, and read, write, resize, and close rights follow
-  object capabilities. Output reading and process-tree resource supervision
-  use independent workers, and concurrent lifecycle closes converge on one
-  close transition. On Windows, real PTY support requires installing the
-  optional `pty` extra with `uv sync --all-groups --extra pty`; see
-  [docs/modules.md](docs/modules.md).
+  object capabilities. On POSIX, output reading and process-tree resource
+  supervision use independent workers; concurrent lifecycle closes converge on
+  one close transition on every supported backend. The current Windows backend
+  uses optional `pywinpty`/ConPTY, has no Job Object or wall/CPU/RSS supervisor,
+  and rejects a budgeted spawn that supplies `SubprocessLimits`. Install the
+  optional `pty` extra from a source checkout/source distribution; the module
+  itself is not included in the core wheel. See [docs/modules.md](docs/modules.md).
 - Durable process message queues for IPC, including interrupt delivery.
 - Object-bound background tool tasks that can notify processes through the
   same durable message queues, including optional owner-change watches, without
@@ -74,7 +80,8 @@ The implementation currently includes:
   typed resource matching, deny/ask/allow effects, one-shot grants,
   attenuation, revoke, and audit lineage.
 - Runtime-enforced source-to-Sink data labels for LLM, Human, JSON-RPC, MCP,
-  filesystem writes, Shell/PTY input and session control, and process handoffs.
+  typed Git, filesystem writes, Shell/PTY input and session control, and process
+  handoffs.
   Unmatched Sinks are untrusted/normal; Host-trusted Sinks accept data only
   within sensitivity and tenant/principal clearance, while conditional
   high-sensitivity sends require an exact one-shot release. See
@@ -93,8 +100,9 @@ The implementation currently includes:
   entrypoints before `Runtime.open()` returns. Modules can register tools,
   images, syscalls, provider hooks, and startup hooks, but do not grant process
   resource authority.
-- A direct workflow entrypoint for users to run one image-visible tool through
-  ToolBroker without invoking the LLM scheduler.
+- A direct workflow entrypoint for users to run one tool bound in the selected
+  image's complete process tool table through ToolBroker without invoking the
+  LLM scheduler or consulting its narrower model projection.
 - Runtime store persistence, backed by SQLite by default and optionally
   PostgreSQL, for process/object metadata, capabilities, messages, human
   requests, LLM calls, durable LLM wait generations and eligible Responses tool
@@ -109,7 +117,15 @@ The implementation currently includes:
   A dedicated supervisor establishes host-lifetime process-tree containment
   before Deno starts, so hard host termination cannot orphan untrusted code.
 - Declarative Skills that can add prompt instructions, visible tools, and JIT
-  candidates without granting resource authority.
+  candidates without granting resource authority. The shipped base, coding,
+  review, and toolmaker Images use `metadata.tool_projection: skills`: a fresh
+  process presents only `discover_skills`, `activate_skill`,
+  `read_skill_resource`, `unload_skill`, and `process_exit` to the model. Their
+  other static `default_tools` form the initial callable table and the ceiling
+  for immutable built-in Skill projection, not an initial model-visible surface;
+  an applicable built-in Skill projects its complete owned subset only after
+  explicit activation. A separately registered Skill may expand both tables
+  under its own trust and Skill-authority checks.
 - Client-only JSON-RPC 2.0 over HTTP through registered endpoints, method
   capabilities, provider-classified external effects, audit, and checkpoints.
   Per-item registry authority is checked before metadata lookup; registry row,
@@ -134,9 +150,6 @@ Start here, then read the deeper references as needed:
 - [docs/python_api.md](docs/python_api.md): public Python imports, Runtime
   lifecycle, manager properties, sync/async usage, exceptions, and
   compatibility boundaries.
-- [docs/prelaunch_hardening_report.md](docs/prelaunch_hardening_report.md):
-  historical, commit-bound 2026-07-10 subsystem review and validation snapshot;
-  it is not the current release-status source.
 - [docs/architecture.md](docs/architecture.md): runtime layers, provider
   substrate, and the tool/primitive boundary.
 - [docs/threat_model.md](docs/threat_model.md): assets, adversaries, TCB,
@@ -208,10 +221,29 @@ Start here, then read the deeper references as needed:
 - [benchmarks/practical_agent_workflows/README.md](benchmarks/practical_agent_workflows/README.md):
   native-live and modeled practical-workflow evidence contract and report
   schema.
-- [plan.md](plan.md): dated paper-submission roadmap; not the implementation
-  reference for current behavior.
+- [benchmarks/builtin_tool_skills/README.md](benchmarks/builtin_tool_skills/README.md):
+  opt-in paid paired evaluation of Skill projection versus the full tool schema.
+- [benchmarks/long_horizon_agent/README.md](benchmarks/long_horizon_agent/README.md):
+  opt-in paid long-horizon evaluation across restart, follow-up messages, and
+  prompt-injection pressure.
+- [experiments/agentdojo/README.md](experiments/agentdojo/README.md): isolated
+  AgentDojo harness, its frozen Python 3.11–3.12 environment, deterministic CI
+  scope, and opt-in real-model evaluation workflow.
 - [AGENTS.md](AGENTS.md): repository structure, testing, security, and
   contribution guidance for local agents and contributors.
+
+### Historical references (not current contracts)
+
+These files are retained for design and project history. Do not use them to
+infer current commands, interfaces, security guarantees, or release evidence:
+
+- [agent_libos_design_doc.md](agent_libos_design_doc.md): historical design
+  archive containing planned and superseded interfaces.
+- [plan.md](plan.md): dated paper-submission roadmap, not an implementation
+  reference.
+- [docs/prelaunch_hardening_report.md](docs/prelaunch_hardening_report.md):
+  historical, source-bound subsystem review and validation snapshot, not the
+  current release-status source.
 
 ## Quick Start
 
@@ -229,8 +261,9 @@ uv sync --frozen --all-groups
 ### Distribution artifacts
 
 The Python wheel contains the core `agent_libos` package, its immutable built-in
-Tool Skills, and the `agent-libos` and `agent-libos-gui-server` console
-entrypoints. Release validation parses all 26 built-in Skill packages and their
+Tool Skills, and the `agent-libos`, `agent-libos-gui-server`, and explicit
+offline `agent-libos-migrate-tool-groups` console entrypoints. Release
+validation parses all 26 built-in Skill packages and their
 99 uniquely owned tools from both the wheel and source archive. Repository-level
 assets such as the optional PTY Runtime Module, bundled example Skill and Image,
 benchmarks, tests, and documentation are distributed with the Python source
@@ -256,6 +289,7 @@ uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
 /tmp/agent-libos-wheel-check/bin/agent-libos-gui-server --help
+/tmp/agent-libos-wheel-check/bin/agent-libos-migrate-tool-groups --help
 
 uv venv /tmp/agent-libos-sdist-check
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python dist/*.tar.gz
@@ -263,6 +297,7 @@ uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
 /tmp/agent-libos-sdist-check/bin/agent-libos-gui-server --help
+/tmp/agent-libos-sdist-check/bin/agent-libos-migrate-tool-groups --help
 ```
 
 Use fresh paths for each check. On Windows, replace `/tmp/...` with a disposable
@@ -270,6 +305,23 @@ directory and use the environment's `Scripts` directory instead of `bin`. The
 source archive additionally contains repository-level examples, benchmarks,
 documentation, and the optional PTY module that are intentionally absent from
 the core wheel.
+
+### Upgrading stores that contain Tool Groups
+
+Legacy stores with the removed Tool Group image metadata fail closed until they
+are migrated to built-in Tool Skills. Stop every Runtime using the store, run
+the installed migration once without `--apply`, and review its report:
+
+```bash
+agent-libos-migrate-tool-groups /path/to/runtime.sqlite
+```
+
+The default is a complete transactionally rolled-back dry run; startup never
+runs this content migration automatically. If the report is correct, repeat the
+same command with `--apply` to commit it. Pass `--config <path>` for a
+non-default config overlay or supply a PostgreSQL URI in place of the SQLite
+path. See [Tool Broker, Skills, and JIT Tools](docs/tools_and_jit.md#on-demand-tool-skills)
+for conversion rules and immutable-artifact behavior.
 
 Run tests:
 
@@ -313,6 +365,9 @@ and provides responsive user and operator workspaces for concurrent messages,
 interrupts, human approvals, scheduler control, checkpoints, capability and
 Skill administration, Object Tasks, image selection/registration/commit,
 JSON-RPC/MCP registries, audit/Explain inspection, and LLM call visibility.
+The Electron launcher fills missing backend environment values from this
+checkout's `.env`; values already inherited by Electron take precedence. This
+GUI-specific launcher behavior does not apply to the generic CLI or library API.
 
 The demo does not call a real model. It exercises process spawn/fork, Object
 Memory, Deno/TypeScript JIT validation when Deno is available, checkpointing,
@@ -400,9 +455,13 @@ uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
 Both backends implement the same runtime store contract. Process metadata,
 capabilities, audit/events, messages, human requests, LLM call records,
 checkpoints, and registered tools/images/skills are durable store records.
-Ordinary Object Memory payloads remain runtime-only; the object table stores a
-runtime-memory marker, and rows whose payload cache cannot be reconstructed are
-released fail-closed on reopen instead of being treated as real payloads.
+Ordinary Object Memory payloads remain runtime-only; current writes store a
+runtime-memory marker in the object table, and marker rows whose payload cache
+cannot be reconstructed are released fail-closed on reopen instead of being
+treated as real payloads. An accepted legacy row from an older development
+build may still contain full JSON payload data; migrate or recreate such a
+store before claiming marker-only historical retention. See
+[docs/storage.md](docs/storage.md#transaction-model).
 Persistent stores take an active-runtime lease: SQLite uses a secure sidecar
 `flock` where available or an exclusive database lock as fallback, and
 PostgreSQL uses a session advisory lock. Two writable `Runtime` instances
@@ -426,9 +485,11 @@ Omitting `--max-quanta` uses `runtime.run_until_idle_max_quanta`. Its default
 an explicit flag when a bounded run is required.
 
 `workflow run <tool>` spawns a fresh process from the default image, calls one
-visible tool, persists the result object, and exits that process. Pass
-`--image <image_id>` to use another image's tool table. It does not bypass
-primitive capability checks, resource budgets, human approval, or audit.
+tool from its complete process tool table, persists the result object, and exits
+that process. This Host-directed path does not consult the model tool projection
+and does not make the selected tool model-visible. Pass `--image <image_id>` to
+use another image's complete table. It does not bypass primitive capability
+checks, resource budgets, human approval, or audit.
 
 Every LLM action-selection call is persisted as an `llm_calls` row with
 provider ids, model/API mode, token usage when available, errors, and bounded
@@ -439,13 +500,18 @@ payloads are stored by default for self-evolution training and fine-tuning
 pipelines. Deployments that rely on this default should disclose that use in
 the user agreement because it may include sensitive prompt, tool, reasoning, and
 provider payload data; set `llm.persist_full_io: false` in the runtime config
-when a user or operator opts out of full LLM input/output retention.
+when a user or operator opts out of full LLM input/output retention. That
+opt-out cannot run an `image_only` Image (the default for custom packages),
+because transparent replay requires a lossless durable transcript; execution
+fails before provider dispatch. Use a Runtime-owned prompt mode when redacted
+write-time persistence is required.
 
 For deployments that keep full provider I/O initially, the optional payload
 retention maintenance API can later reduce eligible terminal rows through
 content-free summary and hash-only tiers. It is disabled by default, never runs
-during startup, and never trims live Responses-chain or process-result recovery
-payloads. See [Evidence and LLM Payload Retention](docs/evidence_payload_retention.md).
+during startup, and never trims the active `image_only` transcript head,
+compatible Responses-continuation anchors, or process-result recovery payloads.
+See [Evidence and LLM Payload Retention](docs/evidence_payload_retention.md).
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
@@ -453,7 +519,9 @@ uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
 
 ## Real LLM Configuration
 
-Export the real-model settings into the Host process environment:
+The legacy `OPENAI_*` environment variables configure the profile whose id is
+`llm.default_profile_id`. Export them into the Host process environment for a
+single-profile setup:
 
 ```bash
 export OPENAI_BASE_URL=https://example-openai-compatible-endpoint/v1
@@ -461,6 +529,37 @@ export OPENAI_LANGUAGE_MODEL=your-model
 export OPENAI_API_KEY=...
 export AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1
 ```
+
+For multiple models or endpoints, define named profiles in a config overlay and
+keep each secret in the environment variable named by `api_key_env`:
+
+```yaml
+llm:
+  default_profile_id: default
+  profiles:
+    default: {}
+    review:
+      base_url: https://review-provider.example/v1
+      model: review-model
+      api_key_env: REVIEW_API_KEY
+      api_mode: chat
+      allow_custom_base_url: true
+```
+
+Select a configured profile when spawning or execing a process:
+
+```bash
+uv run agent-libos --config agent-config.yaml --db .agent_libos.sqlite \
+  spawn --goal "Review the workspace" --llm-profile review
+```
+
+For a root spawn, an explicit `--llm-profile` wins over the image default and
+then `llm.default_profile_id`; exec and child creation otherwise retain or
+inherit the current process profile. Non-default named profiles do not inherit
+ambient endpoint, model, or provider-policy `OPENAI_*` values, so declare those
+fields explicitly. Every profile reads its API key only from `api_key_env`. See
+[Configuration Reference](docs/configuration.md#effective-llm-profile-precedence)
+for the exact precedence and supported fields.
 
 The Runtime and generic CLI do not implicitly load a workspace `.env`. If these
 values are stored as plain `KEY=value` lines in an untracked `.env`, load it in
@@ -480,19 +579,21 @@ Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`,
 `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific
 `OPENAI_ENABLE_THINKING`.
 
-Provider-side Responses storage/chaining is opt-in: the defaults remain
-`store=false` and `responses_previous_response_id=false`. When both are enabled,
-Agent libOS continues a chain only if the immediately preceding official
-Responses call has the same profile/runtime scope and every unique function
-`call_id` has one complete durable result. The current model, official endpoint,
-API mode, credential identity, and organization/project tenant must also match
-the preceding call's non-secret provider-chain fingerprint. Eligible results
-are sent as native `function_call_output`; partial/redacted/ambiguous output,
-context compaction/restore, or any scope/provider-identity change resets to a
-stateless/plain-context request. Durable waiting actions are claimed once by a
-per-generation resume token. Any exception after that non-replayable claim
-fails the process and retains/audits the interrupted state instead of retrying a
-possibly completed effect. See [docs/development.md](docs/development.md#real-llm-smoke).
+Provider-side Responses storage/chaining policy is opt-in: the defaults remain
+`store=false` and `responses_previous_response_id=false`. The current
+AgentProcess executor nevertheless stays stateless when those settings are
+enabled: it sends each complete locally rebuilt snapshot without
+`previous_response_id`, records that full-snapshot disablement in the LLM call,
+and does not create provider-chain tool-output rows. `store=true` can still
+increase provider-side retention. The low-level `LLMClient` sends an explicitly
+supplied `previous_response_id` only to the official Responses endpoint and only
+with provider storage enabled. Separately, `image_only` replays paired tool
+calls and outputs as a provider-native transcript without relying on
+provider-side state: Responses receives `function_call`/
+`function_call_output` items, while Chat receives assistant/tool messages.
+Durable waiting actions remain protected by per-generation resume tokens
+and non-replayable claims. See
+[docs/development.md](docs/development.md#real-llm-smoke).
 
 ## Common CLI Examples
 
@@ -615,11 +716,12 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - Git calls operate only on the configured, runtime-pinned workspace repository or a trusted
   managed worktree. Mutations require a prior state token plus Git and affected
   filesystem authority; destructive and remote-ref-rewriting operations bind
-  one-use Human approval to exact state/OIDs. Direct Shell/PTY Git argv and
-  transparent executable-launcher wrappers are limited to six hardened
-  inspection commands even under an always-allow shell policy. As with other
-  direct I/O, an authorized general interpreter or native program remains a
-  host-user process and is outside that argv-only compatibility boundary.
+  one-use Human approval to exact state/OIDs. Exactly six directly invoked
+  Shell/PTY Git inspection argv forms are accepted and hardened even under an
+  always-allow shell policy. Any recognized transparent executable-launcher
+  wrapper around Git is rejected before shell policy or Human approval. As with
+  other direct I/O, an authorized general interpreter or native program remains
+  a host-user process and is outside that argv-only compatibility boundary.
 - Human approval is part of a primitive/syscall. Model-facing Tool and JIT
   callers see a final success or final failure, not a public pending/retry
   protocol. A direct Python Host call may instead raise

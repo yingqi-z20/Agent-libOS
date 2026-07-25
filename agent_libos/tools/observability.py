@@ -20,6 +20,21 @@ _SCALAR_SECRET_PATTERNS = (
     re.compile(r"(?i)\b(?:secret|token)[_-][A-Za-z0-9._-]+\b"),
 )
 
+# Userinfo is the credential-bearing component before ``@`` in an absolute
+# URI.  Keep the scheme and destination visible for diagnostics while removing
+# both the username and password.  This intentionally also covers DSN schemes
+# such as postgresql(+driver), mysql, redis, and mongodb.
+_URI_USERINFO_PATTERN = re.compile(
+    r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^\s/@]+)@"
+)
+
+# Cookie values commonly arrive inside provider exception text rather than a
+# structured ``headers`` mapping.  Limit the match to one HTTP header line so
+# surrounding diagnostic text remains useful.
+_HTTP_COOKIE_HEADER_PATTERN = re.compile(
+    r"(?im)(?P<header>\b(?:set-cookie|cookie)\s*:)\s*[^\r\n]*"
+)
+
 SENSITIVE_OBSERVABILITY_KEYS = frozenset(
     {
         "answer",
@@ -30,10 +45,15 @@ SENSITIVE_OBSERVABILITY_KEYS = frozenset(
         "authorization",
         "auth_token",
         "body",
+        "connection_string",
         "content",
         "context",
+        "cookie",
+        "cookie_header",
+        "cookies",
         "credential",
         "credentials",
+        "dsn",
         "input",
         "message",
         "metadata",
@@ -48,6 +68,7 @@ SENSITIVE_OBSERVABILITY_KEYS = frozenset(
         "result",
         "secret",
         "session_token",
+        "set_cookie",
         "source_code",
         "stderr",
         "stdout",
@@ -61,6 +82,7 @@ SENSITIVE_OBSERVABILITY_KEY_FRAGMENTS = frozenset(
         "api_key",
         "apikey",
         "authorization",
+        "connection_string",
         "credential",
         "password",
         "passwd",
@@ -68,6 +90,13 @@ SENSITIVE_OBSERVABILITY_KEY_FRAGMENTS = frozenset(
         "secret",
         "token",
     }
+)
+
+SENSITIVE_OBSERVABILITY_KEY_SUFFIXES = (
+    "_connection_string",
+    "_cookie",
+    "_cookies",
+    "_dsn",
 )
 
 
@@ -140,14 +169,24 @@ def _redact_value(value: Any, *, sensitive_keys: frozenset[str]) -> Any:
 
 
 def _redact_scalar_string(value: str) -> str:
-    redacted = value
+    redacted = _URI_USERINFO_PATTERN.sub(
+        lambda match: f'{match.group("scheme")}[redacted]@',
+        value,
+    )
+    redacted = _HTTP_COOKIE_HEADER_PATTERN.sub(
+        lambda match: f'{match.group("header")} [redacted]',
+        redacted,
+    )
     for pattern in _SCALAR_SECRET_PATTERNS:
         redacted = pattern.sub("[redacted]", redacted)
     return redacted
 
 
 def _is_sensitive_observability_key(key: str, *, sensitive_keys: frozenset[str]) -> bool:
-    normalized = key.strip().lower().replace("-", "_")
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key.strip())
+    normalized = normalized.lower().replace("-", "_")
     if normalized in sensitive_keys:
         return True
-    return any(fragment in normalized for fragment in SENSITIVE_OBSERVABILITY_KEY_FRAGMENTS)
+    return normalized.endswith(SENSITIVE_OBSERVABILITY_KEY_SUFFIXES) or any(
+        fragment in normalized for fragment in SENSITIVE_OBSERVABILITY_KEY_FRAGMENTS
+    )

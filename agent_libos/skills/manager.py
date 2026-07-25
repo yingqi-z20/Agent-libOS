@@ -195,9 +195,18 @@ class SkillManager:
             raise ValidationError(
                 f"Skill id uses the reserved built-in prefix {BUILTIN_SKILL_PREFIX!r}: {spec.skill_id}"
             )
+        actual_sha = self._package_hash(spec)
+        for label, claimed_sha in (
+            ("SkillPackage.package_sha256", spec.package_sha256),
+            ("package_sha256", package_sha256),
+        ):
+            if claimed_sha and claimed_sha != actual_sha:
+                raise ValidationError(
+                    f"{label} does not match the Skill package content hash"
+                )
         selected_source_type = self._validate_source_type(source_type)
         selected_source = source or selected_source_type
-        selected_sha = package_sha256 or spec.package_sha256 or self._package_hash(spec)
+        selected_sha = actual_sha
         if selected_source_type == "global":
             self._require_trusted_global_source(selected_source, selected_sha)
         if require_capability:
@@ -1692,7 +1701,14 @@ class SkillManager:
         selected = next((resource for resource in skill.resources if resource.path == normalized), None)
         if selected is None:
             raise NotFound(f"skill resource not found: {skill_id}/{normalized}")
-        limit = max_bytes or self.config.skills.resource_read_max_bytes
+        if max_bytes is None:
+            limit = self.config.skills.resource_read_max_bytes
+        else:
+            if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+                raise ValidationError("skill resource max_bytes must be an integer")
+            if max_bytes < 1:
+                raise ValidationError("skill resource max_bytes must be >= 1")
+            limit = max_bytes
         if selected.size_bytes > limit:
             raise ValidationError(f"skill resource exceeds max_bytes={limit}: {normalized}")
         self.audit.record(
@@ -3115,10 +3131,18 @@ class SkillManager:
         if resource.kind == "text":
             if resource.content is None:
                 raise ValidationError(f"text skill resource is missing content: {resource.path}")
+            if resource.content_base64 is not None:
+                raise ValidationError(
+                    f"text skill resource must not contain content_base64: {resource.path}"
+                )
             return resource.content.encode("utf-8")
         if resource.kind == "base64":
             if resource.content_base64 is None:
                 raise ValidationError(f"base64 skill resource is missing content: {resource.path}")
+            if resource.content is not None:
+                raise ValidationError(
+                    f"base64 skill resource must not contain text content: {resource.path}"
+                )
             try:
                 return base64.b64decode(resource.content_base64.encode("ascii"), validate=True)
             except (ValueError, binascii.Error) as exc:
@@ -3177,6 +3201,16 @@ class SkillManager:
         return normalized
 
     def _validate_capability_spec(self, spec: dict[str, Any]) -> None:
+        allowed = {"resource", "rights", "constraints"}
+        unknown = sorted(
+            key if isinstance(key, str) else f"<non-string:{type(key).__name__}>"
+            for key in spec
+            if not isinstance(key, str) or key not in allowed
+        )
+        if unknown:
+            raise ValidationError(
+                f"capability spec contains unknown fields: {unknown}"
+            )
         resource = spec.get("resource")
         rights = spec.get("rights")
         if not isinstance(resource, str) or not resource:

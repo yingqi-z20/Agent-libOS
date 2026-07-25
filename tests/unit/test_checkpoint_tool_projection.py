@@ -567,3 +567,79 @@ def test_list_checkpoints_projects_bounded_allowlist_and_window_metadata() -> No
     assert full_window.data["count"] == 5
     assert full_window.data["has_more"] is False
     assert observed_limits == [5, 5]
+
+
+def test_fork_failure_preserves_bounded_retry_safety_receipt() -> None:
+    class Checkpoint:
+        def fork_from_checkpoint(self, actor: str, checkpoint_id: str, parent_pid: str | None):
+            error = RuntimeError("commit outcome unknown")
+            error.checkpoint_fork_receipt = {
+                "checkpoint_id": checkpoint_id,
+                "source_pid": actor,
+                "fork_root_pid": "pid_fork",
+                "pid_map": {actor: "pid_fork"},
+                "object_map": {},
+                "tool_map": {},
+                "status": "fork_outcome_unknown",
+                "main_state_committed": None,
+                "reconciliation_pending": True,
+                "post_commit_failures": [],
+                "outcome_diagnostic": {
+                    "phase": "fork_commit_confirmation",
+                    "diagnostic_error": _RECEIPT_SENTINEL,
+                },
+            }
+            raise error
+
+    result = ForkCheckpointTool().invoke(
+        {"checkpoint_id": "ckpt_unknown"},
+        _context(Checkpoint()),
+    )
+
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.retryable is False
+    receipt = result.error.details["checkpoint_fork_receipt"]
+    assert receipt["main_state_committed"] is None
+    assert receipt["reconciliation_pending"] is True
+    projection = result.model_projection(limit_bytes=4096)
+    projected_receipt = projection["error"]["details"]["checkpoint_fork_receipt"]
+    assert projected_receipt == {
+        "checkpoint_id": "ckpt_unknown",
+        "fork_root_pid": "pid_fork",
+        "status": "fork_outcome_unknown",
+        "main_state_committed": None,
+        "reconciliation_pending": True,
+        "failure_phases": ["fork_commit_confirmation"],
+    }
+    assert _RECEIPT_SENTINEL not in str(projection)
+
+
+def test_fork_tool_rejects_forged_receipt_fields() -> None:
+    class Checkpoint:
+        def fork_from_checkpoint(self, actor: str, checkpoint_id: str, parent_pid: str | None):
+            error = RuntimeError("forged receipt")
+            error.checkpoint_fork_receipt = {
+                "checkpoint_id": checkpoint_id,
+                "source_pid": actor,
+                "fork_root_pid": "pid_fork",
+                "pid_map": {actor: "pid_fork"},
+                "object_map": {},
+                "tool_map": {},
+                "status": "forked",
+                "main_state_committed": True,
+                "reconciliation_pending": False,
+                "post_commit_failures": [],
+                "secret": _RECEIPT_SENTINEL,
+            }
+            raise error
+
+    result = ForkCheckpointTool().invoke(
+        {"checkpoint_id": "ckpt_forged"},
+        _context(Checkpoint()),
+    )
+
+    assert not result.ok
+    assert result.error is not None
+    assert "checkpoint_fork_receipt" not in result.error.details
+    assert _RECEIPT_SENTINEL not in str(result.model_projection(limit_bytes=4096))

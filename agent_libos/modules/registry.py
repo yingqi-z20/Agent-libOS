@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,17 @@ class RuntimeModuleRegistry:
     def _load_core_module_locked(self) -> dict[str, Any]:
         from agent_libos.modules.core import register_module
 
+        source_path_text = inspect.getsourcefile(register_module)
+        if source_path_text is None:
+            raise ValidationError("internal core module source file is unavailable")
+        source_path = Path(source_path_text).resolve()
+        if not source_path.is_file():
+            raise ValidationError(
+                f"internal core module source file is unavailable: {source_path}"
+            )
+        source_bytes = source_path.read_bytes()
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+
         manifest = ModuleManifest(
             schema_version=self.config.modules.schema_version,
             module_id="agent-libos-core:v0",
@@ -77,7 +89,7 @@ class RuntimeModuleRegistry:
             version="v0",
             entrypoint="agent_libos.modules.core:register_module",
             provides=ModuleProvides(),
-            sha256="0" * 64,
+            sha256=source_sha256,
             metadata={"internal": True},
         )
         source = ModuleSource(
@@ -85,8 +97,9 @@ class RuntimeModuleRegistry:
             manifest_path="<internal>",
             manifest_sha256="0" * 64,
             source_path="agent_libos.modules.core",
-            source_sha256="0" * 64,
+            source_sha256=source_sha256,
             entrypoint_object="register_module",
+            source_bytes=source_bytes,
         )
         return self._load_from_entrypoint(source, register_module, enforce_provides=False)
 

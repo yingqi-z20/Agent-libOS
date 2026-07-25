@@ -5,7 +5,7 @@ allowed-tools: git_create_pull_request git_list_pull_requests git_inspect_pull_r
 ---
 # Work with repository-local simulated pull requests
 
-These tools implement a local review record, not a hosted pull request. They write verified JSON metadata under the repository's Git common directory and snapshot refs under `refs/agent-libos/pull-requests/...`; they never contact or update GitHub, GitLab, or another forge. If the user requests an external PR, stop and use a separately configured forge integration.
+These tools implement a local review record, not a hosted pull request. They write verified JSON metadata under the repository's Git common directory and snapshot refs under `refs/agent-libos/pull-requests/...`; they never contact or update GitHub, GitLab, or another forge. The metadata retains PR and review bodies as plaintext so their hashes can be validated. Model inspection returns the PR body but only hashes for review bodies; that projection is not encryption, and common-directory administrators can read the stored text. If the user requests an external PR, stop and use a separately configured forge integration.
 
 PR metadata is shared across managed worktrees of the same repository, but most operations intentionally observe the main repository context. Checkpoint restore and image commit do not promise to package or roll back this Git/provider state. Do not describe these records as remote, globally durable, or transactionally restored with an Agent image.
 
@@ -19,7 +19,7 @@ Create a frozen review record from two existing local branches. `base_ref` and `
 
 Use a fresh main-repository `expected_state_token`. There is no `worktree_id` argument. Title must be nonblank and bounded; body is bounded and may be empty. Creation freezes `base_oid`, `head_oid`, and `patch_sha256`; later branch movement does not update the PR or its snapshot refs.
 
-Creation requires `WRITE` on the deterministically generated PR resource, repository Git `WRITE` for the snapshot refs, and repository data-flow sink clearance. These are independent checks; a visibility/read grant, a token, or Human approval does not supply the others, and a data-flow denial is not fixed with broader Git authority or shell Git.
+Creation requires `WRITE` on the deterministically generated PR resource, repository Git `READ` for its protected verification phase, repository Git `WRITE` for the snapshot refs, and repository data-flow sink clearance. Review, merge, and close likewise perform protected repository reads before their PR mutation. These are independent checks; a visibility/read grant, a token, or Human approval does not supply the others, and a data-flow denial is not fixed with broader Git authority or shell Git.
 
 The PR ID is deterministically derived from actor, expected token, branches, title hash, and body hash. This makes an exact pre-dispatch approval retry target the same ID. It does not make creation generally idempotent: a post-dispatch failure can leave refs, metadata, or both, and a replay can collide with partial state.
 

@@ -13,7 +13,7 @@ from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import GitError
-from benchmarks.runtime_safety.loader import load_task_file, load_tasks
+from benchmarks.runtime_safety.loader import load_tasks
 from benchmarks.runtime_safety.runners import (
     AGENT_LIBOS_RUNNERS,
     RUNNER_INTERVENTIONS,
@@ -250,24 +250,42 @@ def _build_provenance(
 
 
 def _workload_provenance(suite: Path, tasks: list[Any]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    selected_ids = {task.id for task in tasks}
-    paths_by_id: dict[str, Path] = {}
     tasks_root = suite / "tasks"
-    for path in sorted([*tasks_root.glob("*.yaml"), *tasks_root.glob("*.yml")]):
-        loaded = load_task_file(path)
-        if loaded.id in selected_ids:
-            paths_by_id[loaded.id] = path
-    missing = sorted(selected_ids - paths_by_id.keys())
-    if missing:
-        raise RuntimeError(f"cannot locate selected benchmark task files: {missing}")
-    task_entries = [
-        {
-            "task_id": task.id,
-            "path": paths_by_id[task.id].relative_to(suite).as_posix(),
-            "sha256": _sha256_file(paths_by_id[task.id]),
-        }
-        for task in tasks
-    ]
+    task_entries: list[dict[str, str]] = []
+    for task in tasks:
+        path = task.source_path
+        if not isinstance(path, Path):
+            raise RuntimeError(
+                f"selected benchmark task has no loader source path: {task.id}"
+            )
+        try:
+            relative = path.relative_to(suite)
+            relative.relative_to("tasks")
+        except ValueError as exc:
+            raise RuntimeError(
+                f"selected benchmark task source is outside {tasks_root}: {path}"
+            ) from exc
+        if path.suffix != ".yaml":
+            raise RuntimeError(
+                f"selected benchmark task source is not a loader-supported .yaml file: {path}"
+            )
+        frozen_sha256 = task.source_sha256
+        if not isinstance(frozen_sha256, str) or len(frozen_sha256) != 64:
+            raise RuntimeError(
+                f"selected benchmark task has no loader content hash: {task.id}"
+            )
+        current_sha256 = _sha256_file(path)
+        if current_sha256 != frozen_sha256:
+            raise RuntimeError(
+                f"selected benchmark task source changed after loading: {path}"
+            )
+        task_entries.append(
+            {
+                "task_id": task.id,
+                "path": relative.as_posix(),
+                "sha256": frozen_sha256,
+            }
+        )
     workspaces = sorted({str(task.workspace) for task in tasks})
     fixture_entries = [
         {

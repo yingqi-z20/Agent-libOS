@@ -98,6 +98,8 @@ class ReadSkillResourceArgs(BaseModel):
     )
     max_bytes: int | None = Field(
         default=None,
+        gt=0,
+        strict=True,
         description="Optional maximum allowed resource size; a larger resource is rejected rather than truncated.",
     )
 

@@ -51,7 +51,7 @@ def test_long_context_builtin_skill_fits_prompt_budget(skill_id: str) -> None:
                 "`result_oid` reuses",
                 "`payload` creates",
                 "`message` creates",
-                "Call a bare `process_exit`",
+                "Never use an empty `process_exit` as a",
                 "first token stale",
                 "post-ACK review",
                 "fails the process closed",
@@ -80,6 +80,8 @@ def test_long_context_builtin_skill_fits_prompt_budget(skill_id: str) -> None:
             (
                 "with exactly one tool",
                 "Start success proves admission, not execution",
+                "validates target `args` asynchronously",
+                "`enabled=false` disables subsequent notices",
                 "never duplicate on timeout",
                 "Auto-replay applies only",
                 "No effects roll back",
@@ -106,9 +108,28 @@ def test_long_context_builtin_skill_keeps_recovery_contracts(
     assert missing == []
 
 
+def test_runtime_session_never_recommends_empty_process_exit_probe() -> None:
+    package = get_builtin_skill_catalog().get("agent-libos-runtime-session")
+
+    assert package is not None
+    assert "Never use an empty `process_exit` as a" in package.instructions
+    assert "Call a bare `process_exit`" not in package.instructions
+    assert "call a second bare `process_exit`" not in package.instructions
+    assert "process_exit` alone with that result" in package.instructions
+
+
 def test_workspace_editing_skill_distinguishes_following_from_deleting_links() -> None:
     package = get_builtin_skill_catalog().get("agent-libos-workspace-editing")
 
     assert package is not None
     assert "never follows descendant links" in package.instructions
     assert "does remove descendant symlink/junction directory entries" in package.instructions
+
+
+def test_jsonrpc_skill_requires_structured_params() -> None:
+    package = get_builtin_skill_catalog().get("agent-libos-jsonrpc")
+
+    assert package is not None
+    assert "Params must be a JSON object or array" in package.instructions
+    assert "scalars are rejected" in package.instructions
+    assert "may be a scalar" not in package.instructions

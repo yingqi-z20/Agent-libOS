@@ -13,8 +13,9 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, LLMDefaults, LLMProfile
-from agent_libos.llm.user_profiles import UserLLMProfileStore, default_user_llm_profiles_path
+from agent_libos.llm.client import LLMError
 from agent_libos.llm.executor import LLMProcessExecutor
+from agent_libos.llm.user_profiles import UserLLMProfileStore, default_user_llm_profiles_path
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
@@ -206,15 +207,149 @@ class TestLLMProfiles:
         finally:
             runtime.close()
 
-    def test_profile_identity_excludes_api_key_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_profile_identity_excludes_api_key_value(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "first-secret")
         runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
         try:
-            first = runtime.llms.profile_identity_sha256("default")
+            first_snapshot = runtime.llms.profile_snapshot("default")
+            first_client = runtime.llms.resolve(
+                "default",
+                snapshot=first_snapshot,
+            ).client
 
             monkeypatch.setenv("OPENAI_API_KEY", "second-secret")
 
-            assert runtime.llms.profile_identity_sha256("default") == first
+            frozen_client = runtime.llms.resolve(
+                "default",
+                snapshot=first_snapshot,
+            ).client
+            second_snapshot = runtime.llms.profile_snapshot("default")
+            second_client = runtime.llms.resolve(
+                "default",
+                snapshot=second_snapshot,
+            ).client
+
+            assert second_snapshot.identity_sha256 == first_snapshot.identity_sha256
+            assert second_snapshot.client_cache_sha256 != first_snapshot.client_cache_sha256
+            assert frozen_client is first_client
+            assert first_client.api_key == "first-secret"
+            assert second_client is not first_client
+            assert second_client.api_key == "second-secret"
+            assert "first-secret" not in repr(first_snapshot)
+            assert "second-secret" not in repr(second_snapshot)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("initial_value", [None, ""])
+    def test_profile_snapshot_cannot_late_bind_missing_api_key(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        initial_value: str | None,
+    ) -> None:
+        if initial_value is None:
+            monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        else:
+            monkeypatch.setenv("OPENAI_API_KEY", initial_value)
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            snapshot = runtime.llms.profile_snapshot("default")
+            client = runtime.llms.resolve(
+                "default",
+                snapshot=snapshot,
+            ).client
+
+            monkeypatch.setenv("OPENAI_API_KEY", "late-secret")
+
+            assert client.api_key in {None, ""}
+            with pytest.raises(LLMError, match="OPENAI_API_KEY is not configured"):
+                client._client_kwargs()
+            assert LLMProcessExecutor._openai_provider_chain_fingerprint(client) is None
+            assert runtime.llms.resolve(
+                "default",
+                snapshot=snapshot,
+            ).client is client
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("env_name", "before", "after", "client_attribute", "expected"),
+        (
+            pytest.param("OPENAI_TIMEOUT", "7", "9", "timeout", 9.0, id="timeout"),
+            pytest.param("OPENAI_MAX_RETRIES", "1", "3", "max_retries", 3, id="retries"),
+            pytest.param(
+                "OPENAI_REASONING_EFFORT",
+                "low",
+                "high",
+                "reasoning_effort",
+                "high",
+                id="reasoning",
+            ),
+            pytest.param(
+                "OPENAI_VERBOSITY",
+                "low",
+                "high",
+                "verbosity",
+                "high",
+                id="verbosity",
+            ),
+            pytest.param(
+                "OPENAI_SAFETY_IDENTIFIER",
+                "safe-a",
+                "safe-b",
+                "safety_identifier",
+                "safe-b",
+                id="safety-identifier",
+            ),
+            pytest.param(
+                "OPENAI_PROMPT_CACHE_KEY",
+                "cache-a",
+                "cache-b",
+                "prompt_cache_key",
+                "cache-b",
+                id="prompt-cache-key",
+            ),
+            pytest.param(
+                "OPENAI_PARALLEL_TOOL_CALLS",
+                "0",
+                "1",
+                "parallel_tool_calls",
+                True,
+                id="parallel-tool-calls",
+            ),
+        ),
+    )
+    def test_cached_default_client_tracks_each_effective_legacy_option(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_name: str,
+        before: str,
+        after: str,
+        client_attribute: str,
+        expected: object,
+    ) -> None:
+        monkeypatch.setenv(env_name, before)
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            first_snapshot = runtime.llms.profile_snapshot("default")
+            first_client = runtime.llms.resolve(
+                "default",
+                snapshot=first_snapshot,
+            ).client
+
+            monkeypatch.setenv(env_name, after)
+            second_snapshot = runtime.llms.profile_snapshot("default")
+            second_client = runtime.llms.resolve(
+                "default",
+                snapshot=second_snapshot,
+            ).client
+
+            assert second_snapshot.identity_sha256 == first_snapshot.identity_sha256
+            assert second_snapshot.client_cache_sha256 != first_snapshot.client_cache_sha256
+            assert second_client is not first_client
+            assert getattr(second_client, client_attribute) == expected
         finally:
             runtime.close()
 

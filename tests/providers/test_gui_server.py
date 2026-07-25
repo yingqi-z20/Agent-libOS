@@ -4027,6 +4027,22 @@ class TestGuiServer:
             },
             blocking=True,
         )
+        presented = self.server.service.human_request_view(
+            runtime.human.get(request_id)
+        )
+        assert presented['request_id'] == request_id
+        presentation_effect = next(
+            effect
+            for effect in runtime.store.list_external_effects(pid=pid)
+            if effect.provider_metadata.get('context', {}).get('request_id')
+            == request_id
+            and effect.provider_metadata.get('context', {}).get('purpose')
+            == 'gui_presentation'
+        )
+        assert (
+            presentation_effect.provider_metadata['context']['request_kind']
+            == 'approval'
+        )
 
         missing_status, missing = self.request(
             'POST',

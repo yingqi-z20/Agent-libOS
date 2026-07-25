@@ -438,14 +438,24 @@ class HumanObjectManager:
         source_oids: Iterable[str] | None = None,
     ) -> str:
         selected_human = human or self.config.runtime.default_human
-        self.authority_policy.assert_capability_request(pid, resource, rights)
+        authority_spec = self.authority_policy.assert_capability_request(
+            pid,
+            resource,
+            rights,
+        )
         decision = self.capabilities.require(
             pid,
             f"human:{selected_human}",
             CapabilityRight.WRITE,
             consume=False,
         )
-        request = self._permission_request_payload(pid, resource, rights, reason)
+        request = self._permission_request_payload(
+            pid,
+            resource,
+            rights,
+            reason,
+            expires_at=authority_spec.get("expires_at"),
+        )
         reservation_id = self._reserve_one_time_decision(decision, used_by="human")
         try:
             request_id = self.query(
@@ -483,7 +493,15 @@ class HumanObjectManager:
             selected["requested_once_capability"] = constrained
         return selected
 
-    def _permission_request_payload(self, pid: str, resource: str, rights: list[str], reason: str) -> dict[str, Any]:
+    def _permission_request_payload(
+        self,
+        pid: str,
+        resource: str,
+        rights: list[str],
+        reason: str,
+        *,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
         pattern = self.capabilities.parse_resource_pattern(resource)
         try:
             normalized_rights = [CapabilityRight(str(right)).value for right in rights]
@@ -502,7 +520,7 @@ class HumanObjectManager:
                 CapabilityManager.ALWAYS_DENY,
             ],
             "default_if_unanswered": CapabilityManager.ALWAYS_DENY,
-            "expires_at": None,
+            "expires_at": expires_at,
             "uses_remaining": None,
         }
         context = {
@@ -526,6 +544,7 @@ class HumanObjectManager:
                 "resource": pattern.raw,
                 "rights": normalized_rights,
                 "constraints": constraints,
+                **({"expires_at": expires_at} if expires_at is not None else {}),
             },
             "context": context,
         }
@@ -1386,6 +1405,12 @@ class HumanObjectManager:
             if isinstance(public_payload, Mapping)
             else "approval"
         )
+        # Provider evidence uses a cross-presentation semantic identity rather
+        # than the GUI payload schema spelling.  Terminal permission prompts
+        # already record ``approval``; keep GUI presentation evidence aligned
+        # so benchmark matching and audit consumers do not depend on channel.
+        if request_kind == "permission_request":
+            request_kind = "approval"
         observation = _sanitize_human_observability(public_view, metadata_only=True)
         presentation_attempt_id = new_id("hpres")
         effect_context = {
@@ -2093,10 +2118,24 @@ class HumanObjectManager:
             self._permission_decision_spec(permission_spec, request.pid, status, decision)
         once_spec = request.payload.get("requested_once_capability")
         if isinstance(once_spec, dict) and status == HumanRequestStatus.APPROVED:
-            self._capability_request_spec(once_spec, request.pid, label="requested one-time capability")
+            _subject, _resource, _rights, _constraints, expires_at, _delegable = (
+                self._capability_request_spec(
+                    once_spec,
+                    request.pid,
+                    label="requested one-time capability",
+                )
+            )
+            self.authority_policy.bound_capability_expiry(request.pid, expires_at)
         cap_spec = request.payload.get("requested_capability")
         if isinstance(cap_spec, dict) and status == HumanRequestStatus.APPROVED:
-            self._capability_request_spec(cap_spec, request.pid, label="requested capability")
+            _subject, _resource, _rights, _constraints, expires_at, _delegable = (
+                self._capability_request_spec(
+                    cap_spec,
+                    request.pid,
+                    label="requested capability",
+                )
+            )
+            self.authority_policy.bound_capability_expiry(request.pid, expires_at)
 
     def _apply_decision_side_effects(
         self,
@@ -2107,11 +2146,13 @@ class HumanObjectManager:
     ) -> None:
         permission_spec = request.payload.get("requested_permission")
         if isinstance(permission_spec, dict):
-            subject, resource, rights, constraints, policy = self._permission_decision_spec(
-                permission_spec,
-                request.pid,
-                status,
-                decision,
+            subject, resource, rights, constraints, policy, expires_at = (
+                self._permission_decision_spec(
+                    permission_spec,
+                    request.pid,
+                    status,
+                    decision,
+                )
             )
             self.capabilities.set_permission_policy(
                 subject=subject,
@@ -2120,14 +2161,21 @@ class HumanObjectManager:
                 policy=policy,
                 issued_by=responder,
                 constraints=constraints,
+                expires_at=expires_at,
             )
 
         once_spec = request.payload.get("requested_once_capability")
         if isinstance(once_spec, dict) and status == HumanRequestStatus.APPROVED:
-            subject, resource, rights, constraints, _expires_at, _delegable = self._capability_request_spec(
-                once_spec,
+            subject, resource, rights, constraints, requested_expiry, _delegable = (
+                self._capability_request_spec(
+                    once_spec,
+                    request.pid,
+                    label="requested one-time capability",
+                )
+            )
+            expires_at = self.authority_policy.bound_capability_expiry(
                 request.pid,
-                label="requested one-time capability",
+                requested_expiry,
             )
             self.capabilities.grant_once(
                 subject=subject,
@@ -2135,14 +2183,21 @@ class HumanObjectManager:
                 rights=rights,
                 issued_by=responder,
                 constraints=constraints,
+                expires_at=expires_at,
             )
 
         cap_spec = request.payload.get("requested_capability")
         if isinstance(cap_spec, dict) and status == HumanRequestStatus.APPROVED:
-            subject, resource, rights, constraints, expires_at, delegable = self._capability_request_spec(
-                cap_spec,
+            subject, resource, rights, constraints, expires_at, delegable = (
+                self._capability_request_spec(
+                    cap_spec,
+                    request.pid,
+                    label="requested capability",
+                )
+            )
+            expires_at = self.authority_policy.bound_capability_expiry(
                 request.pid,
-                label="requested capability",
+                expires_at,
             )
             self.capabilities.grant(
                 subject=subject,
@@ -2160,11 +2215,13 @@ class HumanObjectManager:
         default_subject: str,
         status: HumanRequestStatus,
         decision: dict[str, Any],
-    ) -> tuple[str, str, list[str], dict[str, Any] | None, str]:
-        subject, resource, rights, constraints, _expires_at, _delegable = self._capability_request_spec(
-            spec,
-            default_subject,
-            label="requested permission",
+    ) -> tuple[str, str, list[str], dict[str, Any] | None, str, str | None]:
+        subject, resource, rights, constraints, requested_expiry, _delegable = (
+            self._capability_request_spec(
+                spec,
+                default_subject,
+                label="requested permission",
+            )
         )
         policy_value = decision.get("policy")
         if not isinstance(policy_value, str):
@@ -2180,7 +2237,16 @@ class HumanObjectManager:
             raise ValidationError("rejected permission requests cannot install always_allow policy")
         if status == HumanRequestStatus.APPROVED and policy == CapabilityManager.ALWAYS_DENY:
             raise ValidationError("approved permission requests cannot install always_deny policy")
-        return subject, resource, rights, constraints, policy
+        expires_at = (
+            self.authority_policy.bound_capability_expiry(
+                default_subject,
+                requested_expiry,
+            )
+            if status == HumanRequestStatus.APPROVED
+            and policy == CapabilityManager.ALWAYS_ALLOW
+            else None
+        )
+        return subject, resource, rights, constraints, policy, expires_at
 
     def _capability_request_spec(
         self,
@@ -2199,19 +2265,35 @@ class HumanObjectManager:
             raise ValidationError(
                 f"{label} subject must match request process: {default_subject}"
             )
-        rights = spec.get("rights", ["execute"])
-        if not isinstance(rights, list):
-            rights = ["execute"]
-        normalized_rights = [str(right) for right in rights]
+        rights = spec.get("rights", [CapabilityRight.EXECUTE.value])
+        if not isinstance(rights, list) or not rights:
+            raise ValidationError(f"{label} rights must be a non-empty list")
+        try:
+            normalized_rights = [
+                CapabilityRight(str(right)).value
+                for right in rights
+            ]
+        except ValueError as exc:
+            raise ValidationError(
+                f"{label} contains an unknown capability right"
+            ) from exc
         constraints = spec.get("constraints")
-        expires_at = spec.get("expires_at")
+        if constraints is not None and not isinstance(constraints, dict):
+            raise ValidationError(f"{label} constraints must be an object")
+        delegable = spec.get("delegable", False)
+        if not isinstance(delegable, bool):
+            raise ValidationError(f"{label} delegable must be a JSON boolean")
+        raw_expires_at = spec.get("expires_at")
+        if raw_expires_at is not None and not isinstance(raw_expires_at, str):
+            raise ValidationError(f"{label} expires_at must be an ISO-8601 datetime string")
+        expires_at = raw_expires_at
         return (
             subject,
             resource,
             normalized_rights,
-            constraints if isinstance(constraints, dict) else None,
+            dict(constraints) if isinstance(constraints, dict) else None,
             expires_at if isinstance(expires_at, str) else None,
-            bool(spec.get("delegable", False)),
+            delegable,
         )
 
     def _reserve_one_time_decision(self, decision: Any, *, used_by: str) -> str | None:

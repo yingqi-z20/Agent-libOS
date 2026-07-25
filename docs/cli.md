@@ -4,8 +4,12 @@ The package installs the `agent-libos` command.
 
 The package also installs `agent-libos-gui-server`, which is used by the
 Electron desktop console described in [docs/gui.md](gui.md).
-Both entrypoints are implemented under `agent_libos.api`, because they are
+Both runtime entrypoints are implemented under `agent_libos.api`, because they are
 host-facing control surfaces over the same runtime boundary.
+
+The wheel also installs `agent-libos-migrate-tool-groups`, an explicit offline,
+one-time migration command for legacy stores. It defaults to a rolled-back dry
+run and is not a normal Runtime control surface; see [Tool Skills](tools_and_jit.md).
 
 Use `--db` to select a runtime store. The sentinel target `local` is in-memory
 SQLite. Any other filesystem path creates or opens a persistent SQLite
@@ -73,8 +77,10 @@ and libpq `key=value` DSNs fail closed rather than becoming SQLite filenames.
 Prefer environment variables or environment-specific config so DSN credentials
 are not committed. SQLite and PostgreSQL implement the same runtime store
 contract. Ordinary Object Memory payloads are runtime-only; SQL object rows
-store a runtime-memory marker, and rows whose live payload cache cannot be
-reconstructed are released fail-closed on reopen.
+written by the current runtime store a runtime-memory marker, and marker rows
+whose live payload cache cannot be reconstructed are released fail-closed on
+reopen. Accepted legacy rows from older development builds may still contain
+full JSON payload data; see [Runtime Storage](storage.md#transaction-model).
 Persistent stores also take an active-runtime lease. SQLite derives both the
 connection target and lease from the canonical database path, so a symlink
 alias cannot open a second writer. Where `fcntl` plus `O_NOFOLLOW` are
@@ -175,8 +181,10 @@ modules       startup Runtime Module inspection and verification
 human         process pending human messages manually
 ```
 
-Run `uv run agent-libos <command> --help` for the complete, argparse-generated
-parameter list. The narrative sections below document workflows and security
+Run `uv run agent-libos <command> --help` for that parser's generated options
+and subcommand list. For nested command groups, continue with
+`uv run agent-libos <group> <subcommand> --help` to see the leaf parameter
+list. The narrative sections below document workflows and security
 contracts; lists labelled “useful options” are intentionally not exhaustive.
 
 `demo` writes the deterministic preview to
@@ -285,11 +293,12 @@ llm:
 ## Workflow Run
 
 `workflow run` is a direct user entrypoint for tools. It spawns a fresh
-AgentProcess from the selected image, calls one visible tool through the normal
-ToolBroker path, and returns the tool result JSON. It does not run the LLM
-scheduler and it does not bypass the image's process tool table, primitive
-capability checks, resource budgets, human approval, result-object persistence,
-events, or audit.
+AgentProcess from the selected image, calls one tool bound in its complete
+process tool table through the normal ToolBroker path, and returns the tool
+result JSON. It does not run the LLM scheduler or consult the narrower model
+tool projection; direct invocation does not make that schema model-visible. It
+also does not bypass primitive capability checks, resource budgets, human
+approval, result-object persistence, events, or audit.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite \
@@ -309,8 +318,10 @@ status code 1.
 ## Object Tasks
 
 `object-task` commands expose Object-bound background tool tasks. A task belongs
-to an existing Object Memory object, runs one visible tool through a dedicated
-runner child process, and reports status as JSON.
+to an existing Object Memory object, runs one tool bound in the creator's
+complete process tool table through a dedicated runner child process, and
+reports status as JSON. The Host-managed runner does not infer model visibility
+from that binding.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite \
@@ -358,24 +369,23 @@ uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
 uv run agent-libos --db .agent_libos.sqlite llm-calls --limit 20
 ```
 
-Records include provider ids, model/API mode, token usage when available, and
-full prompts, visible tools, output, tool calls, reasoning, raw responses, and
-bounded observability envelopes. The envelopes contain preview, byte count,
-hash, and truncation metadata.
+With the default full-I/O policy, records include provider ids, model/API mode,
+token usage when available, full prompts, visible tools, output, tool calls,
+reasoning, raw responses, and bounded observability envelopes. The envelopes
+contain preview, byte count, hash, and truncation metadata.
 For OpenAI Responses requests, request options may show strict tool-schema
-counts, whether prompt-cache or safety identifiers were configured, and any
-non-secret `previous_response_id` chain; configured cache keys and safety
-identifier values are not persisted there. When no provider-side chain is used,
-historical tool outputs are plain bounded context instead of Responses-native
-`function_call_output` items. A chain is continued only when official Responses
-storage/chaining and full local I/O persistence are enabled, the profile/scope
-fingerprint and credential-keyed provider identity fingerprint are unchanged,
-and the immediately preceding function-call manifest has exactly one durable
-output per unique `call_id`. The fingerprint binds model, official endpoint,
-API mode, credential identity, and organization/project without storing the
-credential. Otherwise the next request resets stateless. Request options also
-show whether `parallel_tool_calls` and JSON action fallback were enabled, and
-whether the fallback was used. Canonical usage preserves provider-reported
+counts, whether prompt-cache or safety identifiers were configured and actually
+accepted after compatibility retries, and whether
+`responses_previous_response_id` was configured but disabled for full-snapshot
+execution. Configured cache keys and safety-identifier values are not persisted
+there. The current AgentProcess executor always leaves
+`openai_previous_response_id` null and sends a complete local snapshot.
+Ordinary Runtime prompt modes represent prior tool results in bounded local
+context; `image_only` instead replays a provider-native paired tool transcript
+without provider-side state. Responses receives `function_call`/
+`function_call_output` input items, while Chat receives assistant/tool messages.
+Request options also show whether `parallel_tool_calls` and
+JSON action fallback were enabled, and whether the fallback was used. Canonical usage preserves provider-reported
 `cache_read_tokens` and `cache_write_tokens`, including an explicit zero, even
 when full-I/O persistence is disabled.
 Full LLM input/output persistence is enabled by default for self-evolution
@@ -384,7 +394,9 @@ training and fine-tuning pipelines under the deployment's user agreement. Set
 sensitive prompt, tool, reasoning, provider-error, and provider payload fields.
 The runtime then writes canonical content-free summary envelopes with byte
 counts, JSON shape/count metadata when available, and hashes; it does not keep
-readable previews of those fields.
+readable previews of those fields. An `image_only` Image cannot run under this
+opt-out because it requires an exact durable transcript head; choose another
+prompt mode when content-free write-time persistence is required.
 
 ## Payload Retention
 
@@ -402,8 +414,9 @@ The command returns counts and an optional `next_cursor`. Continue with both
 `--after-created-at <value>` and `--after-record-id <value>`; providing only
 one cursor component fails closed. Dry runs still write a metadata-only audit
 summary, while `--apply` commits payload CAS updates and that audit in one
-transaction. Live/unknown effects, Responses-chain anchors, and process-result
-recovery calls are not eligible. See
+transaction. Live/unknown effects, active `image_only` transcript heads,
+compatible Responses-continuation anchors, and process-result recovery calls
+are not eligible. See
 [Evidence and LLM Payload Retention](evidence_payload_retention.md).
 
 ## Explainable Operations
@@ -430,8 +443,11 @@ uv run agent-libos --db .agent_libos.sqlite explain context <materialization_id>
 Process lists accept `--limit` and `--cursor`; detail/evidence lookups accept
 `--evidence-limit` and `--cursor`. An ambiguous evidence id prints the explicit
 causal-root candidates and exits with status 2. A not-found id prints a
-structured `NotFound` error and exits with status 1. Explain output is metadata/redaction oriented even when
-full LLM I/O persistence is enabled. See
+structured `NotFound` error and exits with status 1. Detail pagination bounds
+the returned presentation only: the current backend constructs the causal tree
+before slicing its evidence projection, so `--evidence-limit` is not a bound on
+backend traversal, memory, or query work. Explain output is metadata/redaction
+oriented even when full LLM I/O persistence is enabled. See
 [explainable_operations.md](explainable_operations.md).
 
 ## Task Authority Manifest at launch
@@ -483,6 +499,10 @@ For a Codex CLI-style loop:
 uv run agent-libos --db .agent_libos.sqlite run --interactive --pid <pid> --max-quanta 20
 ```
 
+`--pid` may be omitted only when the Runtime has exactly one non-terminal
+process. When there are zero or multiple active processes, select the target
+explicitly before entering the interactive loop.
+
 Plain text sends a normal message unless a human question or approval is
 pending, in which case it answers that request.
 
@@ -512,7 +532,8 @@ uv run agent-libos --db .agent_libos.sqlite message <pid> "Use this as job input
 
 Useful options:
 
-- `--kind normal|interrupt`
+- `message --kind normal|interrupt` (`interrupt` is already fixed to the
+  interrupt kind and does not accept this option)
 - `--human <name>`
 - `--channel <channel>`
 - `--subject <text>`
@@ -571,7 +592,7 @@ outcome Object id.
 User-defined images are directory packages:
 
 ```text
-images/review-agent/
+images/custom-review-agent/
   IMAGE.yaml
   prompt.md
   tools/
@@ -586,8 +607,8 @@ images/review-agent/
 `IMAGE.yaml` holds structured metadata and references `prompt.md`:
 
 ```yaml
-image_id: review-agent:v0
-name: review-agent
+image_id: custom-review-agent:v0
+name: custom-review-agent
 prompt: prompt.md
 prompt_mode: image_only
 jit_tool_exposure: direct
@@ -600,6 +621,7 @@ planner:
       name: compact_process_context
       arguments: {}
 default_tools:
+  - compact_process_context
   - read_memory_object
   - human_output
 required_modules:
@@ -653,16 +675,20 @@ table) when the image intends it to run. The `prompt` mode is invalid with
 `prompt_mode: image_only` because it would add Runtime-authored model input.
 
 `required_modules` is optional. Each entry must contain a `module_id` and the
-64-character lowercase `source_sha256` reported by
+64-character hexadecimal `source_sha256` reported by
 `uv run agent-libos modules verify <module.yaml>`. Spawn and exec check that
 the current runtime has already loaded the exact trusted module source; image
-boot never loads modules automatically.
+registration accepts either hex case and stores the normalized lowercase
+digest. Image boot never loads modules automatically.
 
-`default_tools` is exact. The runtime does not add `process_exit`,
-`create_memory_object`, or any other builtin automatically. List every
-LLM-facing builtin the image should be able to call; package JIT tools can still
-use authorized libOS syscalls internally without being mirrored as builtin
-tools in the process tool table.
+`default_tools` is the exact initial static table. The runtime does not add
+`process_exit`, `create_memory_object`, or any other builtin automatically. List
+every builtin that must be bound in that complete table. Without
+`metadata.tool_projection: skills`, those bindings are also the initial model
+projection; with it, only the five required bootstrap tools are initially
+model-visible and applicable immutable built-in Skills project their complete
+owned subsets later. Package JIT tools can still use authorized libOS syscalls
+internally without being mirrored as builtin tools in the process tool table.
 
 ## Image Commands
 
@@ -674,6 +700,17 @@ uv run agent-libos --db .agent_libos.sqlite images register images/mini-swe-agen
 uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
 ```
 
+`images` accepts `--actor-pid <pid>` before the subcommand. Process mode uses
+the following authority contract:
+
+| Image subcommand | Process-mode authority |
+| --- | --- |
+| `list` | image registry `read` |
+| `inspect` | exact image `read` |
+| `validate` | filesystem `read` for the package manifest and package tree, resolved from the actor process working directory |
+| `register` | the same filesystem reads plus exact target-image `write`; `--replace` requires target-image `admin` |
+| `commit` | checkpoint or checkpoint-owner process `read` plus exact target-image `write`; `--replace` requires target-image `admin` |
+
 `images commit` creates a checkpoint-derived image artifact from the checkpoint
 owner root process. It captures owned/captured internal Object Memory (not an
 uncaptured borrowed root), loaded Skills,
@@ -684,8 +721,9 @@ the committed image is spawned or execed. Loaded startup module summaries from
 the checkpoint are copied into the committed image's `required_modules`, so the
 image cannot boot unless those same module sources are loaded again.
 
-Passing `--actor-pid <pid>` makes the CLI enforce that process's checkpoint
-read capability plus exact write capability on a new target image id.
+For `images commit`, passing `--actor-pid <pid>` makes the CLI enforce that
+process's checkpoint or checkpoint-owner process read capability plus exact
+write capability on a new target image id.
 `--replace` instead requires exact admin capability on the existing target
 image. Without `--actor-pid`, the command runs as audited admin CLI.
 
@@ -705,7 +743,13 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint replay <checkpoint_id> <e
 checkpoint capabilities. Restore requires checkpoint `admin`, exact image
 `admin` for every existing image changed by the snapshot, and exact image
 `write` for every missing image it reintroduces. Without `--actor-pid`, the
-command runs as an audited admin actor named `cli`.
+command runs as the trusted `cli` administrator and bypasses process capability
+checks. Creation and restore publish their normal mutation event/audit
+evidence; fork publishes its core mutation event and attempts its documented
+post-commit audit; replay publishes a diagnostic audit. Read-only `list`,
+`inspect`, and `diff` do not promise a separate admin-operation audit.
+Deployments that require one for every Host read must enforce it at the CLI or
+host-access boundary.
 Restore prints `status: restored` after complete reconciliation, or
 `status: restored_with_warnings` with `main_state_committed: true` and
 `post_commit_failures` when image/JIT/finalizer reconciliation fails after the
@@ -751,7 +795,7 @@ uv run agent-libos --db .agent_libos.sqlite capabilities list --subject <pid>
 uv run agent-libos --db .agent_libos.sqlite capabilities inspect <capability_id>
 uv run agent-libos --db .agent_libos.sqlite capabilities explain <pid> filesystem:workspace:README.md read
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:workspace:README.md --rights read
-uv run agent-libos --db .agent_libos.sqlite capabilities delegate <parent_pid> <child_pid> filesystem:workspace:src/* --rights read
+uv run agent-libos --db .agent_libos.sqlite capabilities delegate <parent_pid> <child_pid> 'filesystem:workspace:src/*' --rights read
 uv run agent-libos --db .agent_libos.sqlite capabilities revoke <capability_id> --reason "no longer needed"
 ```
 
@@ -760,11 +804,14 @@ pattern, rights, `allow`/`deny`/`ask` effect, issuer lineage, delegation depth,
 status, expiry, use count, constraints, and metadata. One-shot approval is
 represented as `effect=allow` with `uses_remaining=1`.
 
-Without `--actor-pid`, capability commands run as an audited admin actor; that
-Host mode changes who authorizes `grant` and `revoke`, but does not bypass
-delegation attenuation. `delegate` always requires a covering, delegable parent
-capability. With `--actor-pid`, `grant` additionally requires grant/admin
-authority and `revoke` requires holder, issuer, revoke, or admin authority.
+Without `--actor-pid`, capability mutations run as the Host admin actor and
+publish their normal mutation audit; read-only `list`, `inspect`, and `explain`
+do not each add a separate admin-operation audit row. Host mode changes who
+authorizes `grant` and `revoke`, but does not bypass delegation attenuation.
+`delegate` always requires a covering, delegable parent capability. With
+`--actor-pid`, `grant` additionally requires grant/admin authority. `revoke`
+allows the issuer, a covering revoke/admin holder, or the subject self-revoking
+an `allow`; a subject cannot remove its own restrictive `ask` or `deny` record.
 
 ## JSON-RPC Commands
 
@@ -781,7 +828,9 @@ The manifest path is user supplied; copy and adapt the complete example in
 [jsonrpc.md](jsonrpc.md).
 
 Registry commands accept `--actor-pid <pid>` with the following authority
-contract. Without it, they run as audited admin registry operations.
+contract. Without it, mutations run as Host admin registry operations and emit
+their normal mutation evidence; read-only list/inspect calls do not promise a
+separate admin-operation audit.
 
 | JSON-RPC subcommand | Process-mode authority |
 | --- | --- |
@@ -815,7 +864,9 @@ The manifest path is user supplied; copy and adapt [mcp.md](mcp.md). The `mcp`
 extra is not installed by the core dependency command.
 
 Registry commands accept `--actor-pid <pid>` with the following authority
-contract. Without it, they run as audited admin registry operations.
+contract. Without it, mutations run as Host admin registry operations and emit
+their normal mutation evidence; read-only list/inspect calls do not promise a
+separate admin-operation audit.
 
 | MCP subcommand | Process-mode authority |
 | --- | --- |

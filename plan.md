@@ -1,4 +1,11 @@
-# Agent libOS Development Plan
+# Agent libOS Historical Paper Roadmap
+
+> **HISTORICAL ROADMAP — NOT A CURRENT CONTRACT.** This dated planning record is
+> retained to explain past paper milestones. It is not the implementation reference
+> and intentionally contains incomplete or superseded command names,
+> feature baselines, priorities, and schedules. Do not use it for current
+> runtime behavior, security guarantees, release status, or CLI syntax; use
+> [README.md](README.md) and the current `docs/` references instead.
 
 Paper title:
 
@@ -11,8 +18,9 @@ Target venue: EuroSys 2027 Fall full paper submission
 Note: the 2026-09-24 AoE date is the working deadline used by this roadmap.
 Before artifact freeze, re-check the official CFP and submission system rather
 than treating this file as the source of truth for conference dates.
-This roadmap is not the implementation reference; use `README.md` and `docs/`
-for current runtime behavior, command syntax, and invariant coverage.
+This roadmap remains historical even when an individual milestone happens to
+match current code. Re-check current documentation and tests rather than
+updating operational guidance from this file.
 
 ## 1. Submission Goal
 

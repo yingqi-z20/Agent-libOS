@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from agent_libos.evidence.payload_retention import PayloadRetentionStore
+from agent_libos.storage.base import StoreAssemblyReadiness
 from agent_libos.models import (
     AgentObject,
     AgentImage,
@@ -709,6 +710,25 @@ class SnapshotCheckpointRepositoryProtocol(Protocol):
         snapshot: ProcessSnapshot,
     ) -> tuple[str, ...]: ...
 
+    def rehydrate_checkpoint_fork_object_payloads(
+        self,
+        rows: SnapshotRows,
+        *,
+        object_payloads: Mapping[str, Any],
+    ) -> tuple[str, ...]: ...
+
+    def publish_checkpoint_fork_process_rows(
+        self,
+        rows: SnapshotRows,
+    ) -> tuple[str, ...]: ...
+
+    def checkpoint_fork_process_rows_match(
+        self,
+        rows: SnapshotRows,
+        *,
+        quarantined: bool = False,
+    ) -> bool: ...
+
     def reconcile_restored_object_task_results(
         self,
         snapshot: ProcessSnapshot,
@@ -776,6 +796,8 @@ class TransactionBackendProtocol(Protocol):
         *,
         include_object_payloads: bool = False,
     ) -> AbstractContextManager[Any]: ...
+
+    def probe_runtime_assembly_readiness(self) -> StoreAssemblyReadiness: ...
 
 
 class AuthorityRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
@@ -1321,6 +1343,11 @@ class SnapshotCheckpointBackendProtocol(
     ) -> dict[str, Any]: ...
 
     def set_object_payload(self, oid: str, payload: Any) -> None: ...
+
+    def rehydrate_object_payload_cache(
+        self,
+        object_payloads: Mapping[str, Any],
+    ) -> tuple[str, ...]: ...
 
     def forget_object_payload(self, oid: str) -> None: ...
 

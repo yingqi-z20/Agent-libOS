@@ -110,7 +110,7 @@
   {
     "name": "submit_resolution",
     "use_cases": [
-      "Finish the process with a compact SWE-Agent style final report."
+      "Prepare a compact SWE-Agent style final report, then pass it to the guarded process_exit tool."
     ],
     "input_schema": {
       "type": "object",
@@ -129,13 +129,15 @@
     "output_schema": {
       "type": "object",
       "properties": {
-        "submitted": {"type": "boolean"}
+        "prepared": {"type": "boolean"},
+        "next_action": {"type": "string"},
+        "process_exit_args": {"type": "object"}
       }
     },
     "required_capabilities": [],
-    "side_effects": ["process exit"],
+    "side_effects": [],
     "failure_modes": [
-      "The process may not have completed enough validation to submit safely."
+      "Preparing the payload does not exit the process; process_exit may require cumulative review before terminal completion."
     ]
   }
 ]

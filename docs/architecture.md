@@ -4,8 +4,9 @@ Agent libOS is structured around one boundary: model-visible and
 self-evolving action surfaces are not resource authority. A process may see a
 tool schema, activate a Skill, register a JIT tool, register or exec an image,
 fork a child, restore from a checkpoint, or inspect a remote endpoint, but
-protected effects are authorized only when a primitive runs under that process
-id.
+process-selected external effects enter a primitive and the Protected Operation
+SDK under that process id. Trusted Runtime artifact publication is the narrow
+TCB exception described below; it is not a model-facing authority path.
 
 ## Layer Model
 
@@ -33,19 +34,23 @@ Agent personality / application
      - operation/explain manager
      - protected-operation SDK and evidence retention
      - audit manager
-  -> Resource Provider Substrate
-     - filesystem provider
-     - pinned system-Git provider
-     - clock provider
-     - shell provider
-     - human provider
-     - JSON-RPC over HTTP provider
-     - MCP client provider
+  -> protected provider boundaries
+     - LLM provider service/client
+     - Resource Provider Substrate
+       - filesystem provider
+       - pinned system-Git provider
+       - clock provider
+       - shell provider
+       - human provider
+       - JSON-RPC over HTTP provider
+       - MCP client provider
+     - PTY provider installed by the trusted PTY Runtime Module
   -> host backend
      - local workspace filesystem
      - host clock
      - subprocess backend
      - terminal or UI human I/O
+     - Host-configured LLM API
      - pre-registered remote JSON-RPC endpoints
      - pre-registered MCP servers
      - future container, WASM, or service providers
@@ -57,20 +62,41 @@ process-local JIT candidates. It does not own external authority.
 
 Image registration and `exec` are also self-evolution mechanisms. They can
 change a process prompt, prompt composition mode, default tool table, default
-Skills, and lifecycle shape, but image visibility and target-image metadata do
-not grant resource capabilities or impose resource budgets. Launch-time callers
-provide a durable [`TaskAuthorityManifest`](task_authority_manifest.md) that
-owns capability, effect-class, approval-policy, and resource-budget ceilings.
+Skills, and lifecycle shape. Image visibility, `required_capabilities`, and
+target-image metadata do not grant external resource capabilities or impose
+resource budgets. Launch-time callers may provide an explicit durable
+[`TaskAuthorityManifest`](task_authority_manifest.md). When present, that
+manifest owns capability, effect-class, approval-policy, and resource-budget
+ceilings for later process-controlled transitions. When the caller omits it,
+the Runtime persists an implicit authority record for execution metadata; that
+implicit record is not an explicit Host transition ceiling, and a later
+Host-authorized grant may therefore extend beyond it.
 Image `required_capabilities` are unmet-requirement declarations, not grants.
-Image packages may seed a
-private per-process workspace and process-local JIT tools, but those are scoped
-to the booted process and do not expose the package source directory.
-Default tool tables are exact image declarations: the runtime does not add
-generic lifecycle or Object Memory tools unless the image lists them.
-Images may opt into lazy model projection. The complete image tool table stays
-callable and capability-enforced, while a separate durable model projection
-initially exposes only discovery/core tools. Activating a group changes schemas
-and visibility but never capabilities.
+Image packages are the narrow exception: they may seed a private per-process
+workspace and issue only the filesystem capabilities declared by
+`IMAGE.yaml workspace.grants` for that materialized private copy. This is a
+trusted-package bootstrap rule, separate from a Task Authority ceiling; it
+must not be treated as a general process grant path. Those capabilities are
+initially issued only to the booted process and cannot name or expose the
+package source directory to it. A package may explicitly mark one as
+delegable; any later child derivation must still use the ordinary Capability
+attenuation path and remains confined to the materialized private copy. Package
+JIT tools remain process-local. The Host image registry does retain the
+absolute package source path for administration and inspection, so the stronger
+non-exposure statement does not apply to Host APIs.
+At Image boot, default tool tables are exact declarations: the runtime does not
+implicitly add generic lifecycle or Object Memory tools. Separately registered
+Skills may later expand the process tables under their own trust and
+Skill-authority checks.
+Images may opt into `metadata.tool_projection: skills`. The complete image tool
+table stays callable and capability-enforced, while a separate durable model
+projection initially contains exactly `discover_skills`, `activate_skill`,
+`read_skill_resource`, `unload_skill`, and `process_exit`. This is the shipped
+base, coding, review, and toolmaker contract. Static bindings for filesystem,
+Git, checkpoint, Capability, JSON-RPC, MCP, and other domains are not thereby
+initially model-visible. Activating an applicable built-in Skill projects its
+entire owned subset from the complete table and changes prompt/schema visibility
+without changing Capability authority.
 
 Startup Runtime Modules are different from Skills. A module is trusted Python
 host code loaded before `Runtime.open()` returns. Modules extend the runtime
@@ -103,6 +129,12 @@ backend, not a security bypass. Replacing the filesystem or shell provider must
 not change tool schemas or skip primitive authorization. The concrete provider
 inventory, containment guarantees, extension checklist, and environment
 limitations are documented in [Providers](providers.md).
+
+The LLM provider service/client is assembled beside that substrate rather than
+as a field of the `ResourceProviderSubstrate` protocol. PTY is likewise supplied
+by its trusted Runtime Module, optionally using a Host-injected PTY provider.
+Both still enter the same Protected Operation SDK lifecycle; the distinction is
+composition ownership, not weaker mediation.
 
 LLM, filesystem, Git, clock, shell, Human, JSON-RPC, MCP, and PTY provider boundaries use
 the public [`agent_libos.sdk`](protected_operation_sdk.md) contract. The SDK is
@@ -328,9 +360,11 @@ The assembled graph includes:
   methods, never the concrete Runtime.
 - `CapabilityManager` coordinates separate evaluation, finite-use lease, and
   mutation services.
-- `ResourceManager` validates hierarchical budgets, reserves maximum provider
-  usage envelopes before dispatch, settles exact usage, and recovers ambiguous
-  reservations conservatively on startup.
+- `ResourceManager` validates hierarchical budgets, can durably reserve an
+  operation-supplied maximum provider-usage envelope before dispatch, settles
+  exact usage, and recovers those reservations conservatively on startup.
+  Callers such as the LLM executor that do not use this reservation path retain
+  their separately documented post-completion accounting semantics.
 - `DataFlowManager` owns the versioned Host Sink registry, source/version
   validation, conditional releases, file label bindings, and append-only flow
   decisions. Registry writes require configured `data_flow_sink_registry:*`
@@ -348,7 +382,10 @@ The assembled graph includes:
   `ToolExecutionService`, and `JITToolService` own registration, dispatch, and
   JIT lifecycle respectively.
 - `SkillManager` registers standard Skill packages and activates them into
-  process tool tables and prompt context without granting resource authority.
+  prompt context and the model projection. Immutable built-in Skills project
+  only bindings already present in the complete process table; registered
+  Skills may add separately authorized static/JIT bindings to both tables.
+  Neither path grants resource authority.
 - `ProcessManager` owns process lifecycle, working directories, child
   relationships, and durable spawn/fork publications; `ProcessLaunchService`
   owns launch authority and path policy.
@@ -370,8 +407,12 @@ The assembled graph includes:
 - `LLMProcessExecutor` coordinates one process quantum using explicit process,
   repository, provider, pending-action, context-memory, and action-dispatch
   dependencies. LLM requests remain formal protected bidirectional provider
-  operations; provider-chain reuse is bound to provider, Sink/trust generation,
-  clearance domain, manifest, and context epoch.
+  operations. The Runtime computes and records provider-, Sink-, clearance-,
+  manifest-, and context-sensitive fingerprints, but the current full-snapshot
+  AgentProcess executor disables `previous_response_id` reuse and sends complete
+  local context. The low-level client does not enforce those Runtime
+  fingerprints; its narrower dispatch gate is an explicit id, an official
+  stored Responses request, and representable tool history.
 
 The default substrate is `LocalResourceProviderSubstrate`, rooted at the current
 workspace unless another substrate is injected.
@@ -384,7 +425,13 @@ keeps rollback ownership explicit.
 
 Host-facing control surfaces live under `agent_libos.api`. The CLI entrypoint
 and the local GUI HTTP/SSE server are different presentations over the same
-runtime managers and primitives; neither is an authority boundary by itself.
+runtime managers and primitives. They are not process effect-execution
+boundaries, but they are trusted Host/admin authority-assignment boundaries:
+documented CLI Host commands run with local Host authority, and the GUI bearer
+token authenticates the holder to documented Host/admin routes. Actor/pid modes
+in either surface deliberately switch to process authority. Primitive and
+Protected Operation SDK checks remain the boundary for effects selected by a
+process.
 Both must close a Runtime they own: synchronous hosts call
 `Runtime.shutdown()`, while event-loop hosts call and await
 `Runtime.ashutdown()`. Ordinary shutdown first closes mutation admission and
@@ -429,9 +476,10 @@ never reopened.
 
 ## Tool Boundary
 
-LLM-facing tools are stable wrappers over primitives. For example,
-`write_text_file` can be visible in a process tool table, but the actual write
-still enters the filesystem primitive, which checks:
+LLM-facing tools are stable wrappers over primitives. A binding can exist in the
+complete process tool table without appearing in the model projection. When
+`write_text_file` is projected to the model (or invoked by a trusted direct
+workflow), the actual write still enters the filesystem primitive, which checks:
 
 - workspace containment,
 - process working directory resolution,
@@ -450,7 +498,8 @@ Putting a tool in a process table never grants access to files, shell,
 terminal/human I/O, Object Memory, image registration, checkpoints, or other
 resources.
 
-Likewise, `call_jsonrpc_method` visibility never grants network authority. The
+Likewise, model projection or direct invocation of `call_jsonrpc_method` never
+grants network authority. The
 JSON-RPC primitive accepts only endpoint and method ids, first gates on the
 derived `jsonrpc:<endpoint>:<method>` capability resource without loading the
 endpoint manifest, then resolves URLs and env-backed headers from the registry
@@ -459,7 +508,7 @@ only for an authorized call.
 The same split applies to MCP. `list_mcp_servers`, `inspect_mcp_server`,
 `list_mcp_tools`, and `call_mcp_tool` are stable generic wrappers over a
 registered MCP server registry. Remote MCP tools are not imported into the
-ToolBroker as first-class tools, and a visible `call_mcp_tool` entry still
+ToolBroker as first-class tools, and a model-projected `call_mcp_tool` entry still
 requires `mcp:<server>:<tool>` authority at primitive use. The call path also
 checks that derived tool resource before loading server metadata or input
 schemas, so missing authority cannot be used to enumerate provider manifests.
@@ -489,9 +538,11 @@ fails closed if that containment cannot be established.
 
 ## Persistence And Audit
 
-The runtime store keeps durable mutable state and append-only evidence:
+The runtime store keeps durable mutable state and append-only evidence,
+including:
 
-- processes, working directories, loaded Skills, and tool tables,
+- processes, working directories, loaded Skills, complete callable tool tables,
+  and separate model tool projections,
 - Object Memory metadata and namespace directories,
 - capabilities, finite capability-use reservations, and object handles,
 - resource usage plus durable maximum-usage reservations,
@@ -499,16 +550,22 @@ The runtime store keeps durable mutable state and append-only evidence:
 - tools and JIT candidates,
 - Skill registry and trust rows,
 - loaded Runtime Module status, source hashes, and registration summaries,
-- image registry manifests and checkpoint-derived image artifacts,
+- image registry manifests and package- or checkpoint-derived image artifacts,
 - JSON-RPC endpoint registry rows,
 - MCP server registry rows,
-- checkpoints and checkpoint payload snapshots,
+- checkpoints, checkpoint payload snapshots, and payload-delivery attempts,
 - runtime publications and phase receipts for process launch, process exec, and
   checkpoint restore,
-- durable LLM pending-action generations, Responses tool outputs, and context
-  generations used to validate opt-in provider chaining,
+- Task Authority manifests and process authority bindings,
+- Object Tasks and agent ratings,
+- Host Sink trust rows, data-flow decisions and releases, and durable file
+  labels,
+- explainable operations, evidence links, and context manifests,
+- durable LLM pending-action generations, `image_only` native transcript tool
+  outputs, compatible Responses-continuation rows, and context generations,
 - provider-decided finalized external effects and conservative pending intents,
-  including record-level payload-retention tier/digest provenance,
+  their append-only transition history, and record-level payload-retention
+  tier/digest provenance,
 - events and audit records,
 - LLM call records with provider ids, model/API mode, usage, errors, and
   full prompt, visible tools, output, tool calls, reasoning metadata, raw
@@ -517,7 +574,9 @@ The runtime store keeps durable mutable state and append-only evidence:
   fine-tuning pipelines; this may include sensitive prompt, tool, reasoning,
   and provider payload fields. Set `llm.persist_full_io: false` to opt out and
   store content-free byte counts, JSON-kind/item-count metadata where
-  applicable, and hashes for those fields.
+  applicable, and hashes for those fields. That setting cannot run an
+  `image_only` Image, whose next quantum requires a lossless durable transcript
+  head and therefore fails before provider dispatch.
   Conditional LLM release
   rows apply the same policy before Human approval: with full-I/O persistence
   enabled, SQL stores the prepared request; with it disabled, SQL receives only
@@ -535,8 +594,12 @@ maintenance audit summary commit together; see
 [Evidence and LLM Payload Retention](evidence_payload_retention.md).
 
 Object payloads are not ordinary durable object rows. They live in runtime
-memory, while SQL object rows store only a runtime-memory marker. Rows whose
-live payload cache cannot be reconstructed are released fail-closed on reopen.
+memory, while current SQL object writes store only a runtime-memory marker.
+Accepted legacy rows from older development builds may still contain full JSON
+payloads and must be migrated or recreated before claiming marker-only
+historical retention. Marker rows whose live payload cache cannot be
+reconstructed are released fail-closed on reopen; see
+[Runtime Storage](storage.md#transaction-model).
 Persistent stores take an active-runtime lease so two writable Runtime
 instances cannot concurrently open the same database. File-backed SQLite
 canonicalizes the database path for both the connection and lease. On the
@@ -570,12 +633,17 @@ record immediately before crossing into the shell provider; the result, timeout,
 or resource-limit audit record uses the intent record as its parent and
 correlation id.
 
-Event consumers are bounded at query time rather than loading the durable log
-and slicing it in application memory. Runtime/LLM context uses its configured
-recent-event limit; GUI snapshots use `gui.snapshot_event_limit`; and the
-per-process GUI route accepts a bounded `limit` plus a `before` event-id cursor
-for older pages. Each newest or cursor-bounded SQL window is returned in
-chronological order. The GUI does not expose an unbounded "all events" API.
+Model- and GUI-facing event consumers are bounded at query time rather than
+loading the durable log and slicing it in application memory. Runtime/LLM
+context uses its configured recent-event limit; GUI snapshots use
+`gui.snapshot_event_limit`; and the per-process GUI route accepts a bounded
+`limit` plus a `before` event-id cursor for older pages. Each newest or
+cursor-bounded SQL window is returned in chronological order. The GUI does not
+expose an unbounded "all events" API. Trusted Host code may call
+`EventBus.list(limit=None)`, and checkpoint replay currently loads the complete
+durable event table before locating the checkpoint and selecting the scoped
+replay prefix; those paths are not claimed to provide a storage-work bound and
+should not be exposed as model-facing list operations.
 
 ## Module Map
 
@@ -593,20 +661,22 @@ agent_libos/
   modules/         trusted startup Runtime Module loader, registry, and core module
   ports/           narrow subsystem protocols and dependency-inversion boundaries
   primitives/      libOS primitives for filesystem, Git, clock, shell, JSON-RPC, and MCP
-  runtime/         composition, syscalls, scheduler, processes, events, checkpoints, audit
+  runtime/         public Runtime facade, composition, syscalls, scheduler, processes,
+                   events, checkpoints, audit, and recovery coordination
   sdk/             public protected-operation lifecycle and provider-facing contracts
   skills/          Skill schema, strict loader, trust registry, and SkillManager
   substrate/       provider interfaces and local host-backed implementations
-  storage/         runtime store backends
+  storage/         runtime store backends and installed storage-migration entrypoints
   tools/           tool base classes, ToolBroker, sandbox, and built-in tools
   utils/           shared validation, YAML loading, and helper utilities
-benchmarks/        deterministic runtime-safety benchmark harness and fixtures
+benchmarks/        runtime-safety, practical, Skill-projection, long-horizon, and
+                   other benchmark harnesses and fixtures
 docs/              current implementation documentation
 experiments/       benchmark entrypoints
 gui/               Electron/React desktop console
 images/            workspace AgentImage packages
 modules/           workspace trusted Runtime Module packages
-scripts/           real-model smoke and demo scripts
+scripts/           validation, migration support, release checks, and opt-in model scripts
 skills/            workspace standard Agent Skill packages
 tests/             safety-boundary and regression tests
 ```

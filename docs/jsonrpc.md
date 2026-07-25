@@ -10,14 +10,17 @@ wire method names at call time. They pass only:
 
 - `endpoint_id`
 - `method_id`
-- `params`
+- `params`, as a JSON object or array; `null` means that the wire request omits
+  the optional `params` member
 
 The runtime first constructs the endpoint/method capability resource from the
-two public ids and applies the early visibility gate. Only an authorized caller
-can cause the runtime to resolve endpoint metadata from the registry and validate
-the method schema. It then performs exact authorization, optionally asks the
-human, makes a primitive/provider call through the JSON-RPC provider, records
-audit/events, and writes a provider-classified external-effect row. For a
+two public ids and applies an early invocation-authority gate before registry
+lookup. This metadata-visibility check is unrelated to the LLM model-tool
+projection. Only an authorized caller can cause the runtime to resolve endpoint
+metadata and validate the method schema. It then performs exact authorization,
+optionally asks the human, makes a primitive/provider call through the JSON-RPC
+provider, records audit/events, and writes a provider-classified external-effect
+row. For a
 remote host with several validated addresses, the default HTTP provider may
 try the next pinned address after any exception during connect, TLS, request
 write, response-header parsing, or response-body read. The retry window is the
@@ -26,10 +29,17 @@ server. Endpoint methods therefore must not rely on a single wire-level POST
 attempt for non-idempotency guarantees. A complete HTTP response, including a
 non-2xx or redirect response, is returned without trying another address.
 A caller without invocation authority gets a generic denial and cannot use call
-errors to enumerate registered endpoint metadata. This early visibility gate
+errors to enumerate registered endpoint metadata. This early authority gate
 does not consume a one-shot method grant; the exact method is then authorized
 after the method spec is known, and any one-shot use from that decision is
 consumed only after pre-provider validation has passed.
+
+The client emits the JSON-RPC 2.0 request shape strictly. Scalar `params`
+values are rejected before authority or registry lookup. Responses must be a
+JSON object with `jsonrpc: "2.0"`, the matching request id, and exactly one of
+`result` or `error`. An Error Object must contain an integer `code` (booleans
+are not integers here) and a string `message`; malformed Error Objects produce
+`invalid_response` rather than being coerced into remote errors.
 
 Per-use Human approval is bound to the canonical params hash, the immutable
 SHA-256 digest of the complete registered endpoint spec, and the durable
@@ -80,7 +90,10 @@ max_response_bytes: 1048576
 
 The accepted v1 shape is closed: unknown endpoint, method, or header fields are
 rejected instead of being ignored. `metadata` and JSON Schema contents remain
-application-defined mappings.
+application-defined mappings. Mapping fields must actually be YAML/JSON
+objects: explicit `null`, arrays, strings, or booleans are rejected rather than
+being treated as `{}`. In particular, a malformed `params_schema` cannot
+silently disable parameter validation.
 
 | Mapping | Required fields | Optional fields and defaults |
 | --- | --- | --- |
@@ -129,20 +142,30 @@ punctuation from polluting capability resource matching.
 Endpoint URLs must be HTTP(S). The default rule is HTTPS only. Plain HTTP is
 allowed only for local development hosts: `localhost`, `127.0.0.1`, and `::1`.
 
-The registry rejects:
+Registration does not perform DNS resolution. It validates the URL shape and
+scheme, checks explicitly blocked hostnames, and validates a literal IP address
+when the URL contains one. The registry rejects:
 
 - URL userinfo,
 - URL fragments,
 - non-HTTP(S) schemes,
 - non-local plain HTTP,
-- private, link-local, reserved, multicast, or metadata-service IP targets,
-- DNS results that resolve a non-local endpoint to loopback, private,
-  link-local, reserved, multicast, or other non-public addresses,
+- non-global literal IP targets other than the explicit loopback development
+  addresses above,
+- explicitly blocked metadata-service hostnames,
 - unsafe endpoint or method ids,
 - literal secret header values,
 - header prefixes outside the approved auth-scheme prefixes and any non-empty
   header suffix,
 - forbidden request headers such as `Host` or `Content-Length`.
+
+A hostname that later resolves to a loopback, private, link-local, reserved,
+multicast, or other non-public address is therefore accepted by registration
+and rejected when the method is called. Call-time DNS resolution is the first
+provider phase. By then the protected operation has reserved finite/one-shot
+method authority and created its pending effect row. A successful lookup, or
+an ordinary lookup failure after the hostname was observable, commits that use
+and records conservative information flow even when no HTTP request is sent.
 
 Headers are environment-backed. The registry stores the environment variable
 name and a small approved prefix such as `Bearer `, never the resolved secret
@@ -202,7 +225,7 @@ Endpoint registry operations use endpoint metadata authority:
 
 | Operation | Required capability when `--actor-pid` is used |
 | --- | --- |
-| list endpoints | `jsonrpc_endpoint:* read` |
+| list endpoints | `config.jsonrpc.registry_resource read` (default `jsonrpc_endpoint:*`) |
 | inspect endpoint | `jsonrpc_endpoint:<endpoint_id> read` |
 | register new endpoint | filesystem `read` for the manifest path plus `jsonrpc_endpoint:<endpoint_id> write` |
 | replace endpoint | filesystem `read` for the manifest path plus `jsonrpc_endpoint:<endpoint_id> admin` |
@@ -220,15 +243,24 @@ check or any registry mutation. A duplicate/not-found outcome or any later
 row, event, or audit failure rolls back the transaction and restores the exact
 one-shot grant; success commits the reservation with the mutation and evidence.
 
-Tool visibility does not grant remote authority. Default images expose
-`list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, and
-`call_jsonrpc_method`, but a call still fails without the method capability.
+Tool binding or model visibility does not grant remote authority. With
+`DEFAULT_CONFIG`, the complete process tool tables for `base-agent:v0`,
+`coding-agent:v0`, and `review-agent:v0` bind `list_jsonrpc_endpoints`,
+`inspect_jsonrpc_endpoint`, and `call_jsonrpc_method`. Their initial Skill
+projection contains only the five bootstrap tools, so none of these JSON-RPC
+schemas is initially model-visible. Activating the exact
+`agent-libos-jsonrpc` Skill projects all three without changing Capability
+authority. `toolmaker-agent:v0` and `context-compressor:v0` do not bind them and
+cannot activate that immutable built-in Skill. Custom or committed Images may
+choose another complete table/projection; a projected call still fails without
+the method capability.
 
-## Data-flow Sink
+## Bidirectional Data Flow
 
-`params` is an egress payload to
-`jsonrpc:<endpoint_id>:<method_id>`. After the authority-before-lookup visibility
-gate, the runtime hashes the complete endpoint plus selected method manifest as
+The protected `primitive.jsonrpc.call` contract is `BIDIRECTIONAL`. `params` is
+an egress payload to
+`jsonrpc:<endpoint_id>:<method_id>`. After the authority-before-lookup gate, the
+runtime hashes the complete endpoint plus selected method manifest as
 the Sink configuration identity. A Host trust rule above `normal` must bind
 that hash, along with its sensitivity and tenant/principal clearance. Replacing
 the URL, wire method, schema, headers, limits, or effect metadata changes the
@@ -241,6 +273,23 @@ the exact JSON-RPC method capability, Task Authority effect permission, and
 budget. A conditional high-sensitivity call needs an exact metadata-only
 release; an untrusted endpoint cannot be elevated above `normal`. See
 [Data Flow](data_flow.md).
+
+The return path is ingress. When the first information-flow provider phase is
+observed (normally DNS), the runtime aggregates the request/source context with
+a `normal`-sensitivity, `untrusted` trust and integrity label whose origin is
+`external:jsonrpc`. It propagates that context back from the async worker on
+both success and failure. Consequently, response data and provider errors must
+remain untrusted input to later tools; even a DNS policy rejection may taint the
+active flow because the hostname was already exposed to resolution.
+
+Above-`normal` Sink trust requires the exact endpoint-and-method identity hash.
+Actor-mode inspection deliberately redacts URL and header-policy fields, and
+the current CLI does not emit this hash, so it is not a supported trust-bootstrap
+path. Deployments that need elevated JSON-RPC clearance must provision the hash
+from the exact registered manifest in trusted Host integration code and install
+the Sink rule before agent work starts. Without that Host-side integration,
+leave the Sink at its default `normal` maximum rather than trusting a digest
+reported by a process.
 
 ## External Effects
 
@@ -297,6 +346,24 @@ failure before DNS or any other information flow. DNS observation, transport
 errors, non-2xx responses, JSON-RPC error results, or a later
 certified-not-started transport do not mint another remote-call use.
 
+## Call Result
+
+`call_jsonrpc_method`, `jsonrpc.call`, the Python primitive, and the CLI expose
+the same `JsonRpcCallResult` fields: `endpoint_id`, `method_id`, `rpc_method`,
+`request_id`, `status`, `http_status`, `ok`, `result`, `error`,
+`response_bytes`, and `duration_s`. Local validation, authority, approval, and
+resource failures occur before such a result and are raised through the normal
+runtime error boundary.
+
+| `status` | Meaning |
+| --- | --- |
+| `ok` | A valid matching response carried `result`; `ok=true` and `result` preserves that JSON value. |
+| `jsonrpc_error` | A valid matching response carried an Error Object; `error` preserves its integer `code`, string `message`, and optional `data`. |
+| `http_error` | HTTP was non-2xx, including a refused redirect; `http_status` is present and only a bounded body observation is retained. |
+| `transport_error` | No complete HTTP response was available; `error` is the public provider envelope, not the provider-authored message. |
+| `invalid_response` | The body was not valid UTF-8 JSON or violated the response/Error Object shape or request-id binding. |
+| `response_too_large` | The bounded provider response exceeded the endpoint limit. |
+
 ## CLI
 
 Register and inspect endpoints:
@@ -304,7 +371,9 @@ Register and inspect endpoints:
 ```bash
 uv run agent-libos --db .agent_libos.sqlite jsonrpc register endpoint.yaml
 uv run agent-libos --db .agent_libos.sqlite jsonrpc list
+uv run agent-libos --db .agent_libos.sqlite jsonrpc list --text weather --limit 20
 uv run agent-libos --db .agent_libos.sqlite jsonrpc inspect demo-weather
+uv run agent-libos --db .agent_libos.sqlite jsonrpc register endpoint.yaml --replace
 ```
 
 Grant method authority and call as a process:
@@ -320,25 +389,37 @@ Delete an endpoint:
 uv run agent-libos --db .agent_libos.sqlite jsonrpc unregister demo-weather
 ```
 
-`--actor-pid <pid>` on registry commands enforces that process's
-`jsonrpc_endpoint:*` or exact endpoint capabilities. Method calls always run as
+`list` accepts `--text` and `--limit`; `register --replace` replaces an existing
+row and therefore follows the stronger authority/invalidation rules below.
+`--actor-pid <pid>` is a JSON-RPC group option and must appear before the
+registry subcommand, for example `jsonrpc --actor-pid <pid> inspect
+demo-weather`. It enforces that process's configured
+registry-list capability (default `jsonrpc_endpoint:*`) or the exact endpoint
+capability required by the selected item operation. Method calls always run as
 the target pid and are authorized by that pid's method capability. Actor-mode
 registration reads the manifest through the filesystem primitive. For
 `jsonrpc call <pid>`, an explicitly supplied group-level `--actor-pid` must
 equal the target `<pid>` and adds no authority.
 
+Without `--actor-pid`, registry mutations run as Host admin operations and emit
+their normal mutation event/audit evidence. Read-only Host `list` and `inspect`
+calls do not promise a separate admin-operation audit row; they retain the
+operation-specific read behavior described above.
+
 Replacing an existing endpoint requires endpoint `admin` when an actor pid is
-used. A replace invalidates existing exact method grants for that endpoint so
-old authority cannot silently point at a new URL or wire method. The endpoint
-row replacement, stale method-grant invalidation, event, and audit happen in
-one store transaction; if any part fails, the old endpoint spec remains active.
-Unregistering an endpoint also invalidates exact and wildcard method grants for
-that endpoint in the same transaction, so reusing the same endpoint id cannot
-revive stale method authority.
+used. A replace invalidates every active endpoint-specific method grant: exact
+resources such as `jsonrpc:<endpoint_id>:<method_id>` and the endpoint-prefix
+wildcard `jsonrpc:<endpoint_id>:*`. The namespace-wide `jsonrpc:*` capability is
+not endpoint-specific and remains active. The endpoint row replacement, stale
+method-grant invalidation, event, and audit happen in one store transaction; if
+any part fails, the old endpoint spec remains active. Unregistering an endpoint
+applies the same endpoint-specific invalidation in the same transaction, so
+reusing the same endpoint id cannot revive stale method authority.
 
 ## Tools And Syscalls
 
-LLM-facing tools:
+LLM tool interfaces, when bound in the complete process table and projected into
+the model tool table:
 
 - `list_jsonrpc_endpoints`
 - `inspect_jsonrpc_endpoint`

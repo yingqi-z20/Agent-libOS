@@ -46,6 +46,10 @@ Bash tool contract:
 - Bound output when possible. Large observations may be returned as
   `output_head`, `output_tail`, and `elided_chars` instead of full `output`, so
   use focused commands or summarize large diagnostics through later commands.
+  Always inspect `output_incomplete`, `stdout_truncated`, and
+  `stderr_truncated`: `elided_chars` counts only characters omitted from the
+  shell output that the wrapper received, not any content the shell primitive
+  had already truncated.
 - If an observation shows missing permission, a denied approval, a missing
   dependency, or another host/environment blocker, do not try to bypass Agent
   libOS policy. Gather the smallest evidence needed and continue only if there

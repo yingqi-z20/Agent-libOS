@@ -27,6 +27,7 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.memory.object_memory import ObjectMemoryManager
+import agent_libos.modules.core as core_module
 from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.modules.loader import ModuleLoader
 from agent_libos.runtime.checkpoint_reconciliation import (
@@ -34,7 +35,6 @@ from agent_libos.runtime.checkpoint_reconciliation import (
     CHECKPOINT_RESTORE_V1_PHASES,
     CheckpointRestoreReconciler,
 )
-from agent_libos.runtime.lifecycle import RuntimeLifecycle
 from agent_libos.runtime.lifecycle import RuntimeLifecycle
 from agent_libos.substrate import LocalHumanProvider, LocalResourceProviderSubstrate
 from agent_libos.storage import SQLiteStore
@@ -547,6 +547,34 @@ def _assert_selective_payload_retry_after_mark_open_failure(
 
 class TestCheckpointRestore:
 
+    def test_checkpoint_captures_actual_core_module_source_sha256(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='capture the actual core module digest',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'actual core module digest',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            core = next(
+                module
+                for module in found[1]['modules']
+                if module['module_id'] == 'agent-libos-core:v0'
+            )
+            core_path = Path(core_module.__file__ or '')
+
+            assert core_path.is_file()
+            assert core['source_sha256'] == hashlib.sha256(
+                core_path.read_bytes()
+            ).hexdigest()
+        finally:
+            runtime.close()
+
     def test_restore_publishes_monotonic_revision_and_execution_epoch(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -663,6 +691,74 @@ class TestCheckpointRestore:
                 )
 
             assert runtime.process.get(pid) == before
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('mutation', 'message'),
+        [
+            ('missing_module_id', 'snapshot modules'),
+            ('missing_source_sha256', 'snapshot modules'),
+            ('malformed_source_sha256', 'snapshot modules'),
+            ('mismatched_source_sha256', 'checkpoint requires startup modules'),
+        ],
+    )
+    def test_restore_rejects_invalid_module_identity_without_mutation(
+        self,
+        mutation: str,
+        message: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject an incomplete checkpoint module identity',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'incomplete module identity',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            assert snapshot['modules']
+            module = snapshot['modules'][0]
+            if mutation == 'missing_module_id':
+                module.pop('module_id')
+            elif mutation == 'missing_source_sha256':
+                module.pop('source_sha256')
+            elif mutation == 'malformed_source_sha256':
+                module['source_sha256'] = 'not-a-sha256'
+            else:
+                module['source_sha256'] = 'f' * 64
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+            total_changes = runtime.store.conn.total_changes
+            before = runtime.process.get(pid)
+            before_publications = {
+                publication['publication_id']
+                for publication in runtime.store.list_runtime_publications()
+                if publication['kind'] == 'checkpoint_restore'
+            }
+
+            with pytest.raises(ValidationError, match=message):
+                runtime.checkpoint.restore(
+                    'cli',
+                    checkpoint_id,
+                    require_capability=False,
+                )
+
+            if mutation != 'mismatched_source_sha256':
+                assert runtime.store.conn.total_changes == total_changes
+            assert runtime.process.get(pid) == before
+            assert {
+                publication['publication_id']
+                for publication in runtime.store.list_runtime_publications()
+                if publication['kind'] == 'checkpoint_restore'
+            } == before_publications
         finally:
             runtime.close()
 
@@ -1416,6 +1512,84 @@ class TestCheckpointRestore:
             replayed_ids = [event['event_id'] for event in replayed['events']]
             assert unrelated_event.event_id not in replayed_ids
             assert replayed_ids[-1] == related_event.event_id
+        finally:
+            runtime.close()
+
+    def test_replay_scope_survives_restore_of_post_checkpoint_descendant(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            root = runtime.process.spawn(image='base-agent:v0', goal='stable replay root')
+            runtime.capability.grant(
+                root,
+                'process:spawn',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                root,
+                'before replay descendant',
+                actor=root,
+            )
+            child = runtime.spawn_child_process(root, 'post-checkpoint replay child')
+            target = runtime.events.emit(
+                EventType.PROCESS_SIGNAL,
+                source=child,
+                target=child,
+                payload={'reason': 'stable replay target'},
+            )
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            assert runtime.store.get_process(child) is None
+            replayed = runtime.checkpoint.replay_to_event(
+                checkpoint_id,
+                target.event_id,
+                actor=root,
+            )
+            replayed_ids = [event['event_id'] for event in replayed['events']]
+            assert target.event_id in replayed_ids
+            assert any(
+                event['type'] == EventType.PROCESS_CREATED.value
+                and event['source'] == root
+                and event['target'] == child
+                for event in replayed['events']
+            )
+        finally:
+            runtime.close()
+
+    def test_replay_starts_at_exact_checkpoint_creation_event(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='exact replay watermark')
+            before = runtime.events.emit(
+                EventType.PROCESS_SIGNAL,
+                source=pid,
+                target=pid,
+                payload={'reason': 'before checkpoint'},
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'exact replay start', actor=pid)
+            after = runtime.events.emit(
+                EventType.PROCESS_SIGNAL,
+                source=pid,
+                target=pid,
+                payload={'reason': 'after checkpoint'},
+            )
+
+            with pytest.raises(NotFound, match='event not found after checkpoint'):
+                runtime.checkpoint.replay_to_event(
+                    checkpoint_id,
+                    before.event_id,
+                    actor=pid,
+                )
+
+            replayed = runtime.checkpoint.replay_to_event(
+                checkpoint_id,
+                after.event_id,
+                actor=pid,
+            )
+            replayed_ids = [event['event_id'] for event in replayed['events']]
+            assert before.event_id not in replayed_ids
+            assert replayed_ids[-1] == after.event_id
         finally:
             runtime.close()
 

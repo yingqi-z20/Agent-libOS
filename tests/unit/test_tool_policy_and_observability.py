@@ -328,3 +328,52 @@ class TestToolPolicyAndObservability:
         assert sanitized["redacted"] is True
         assert plain["redacted"] is False
         assert "ordinary failure message" in plain["preview"]
+
+    def test_observability_redacts_uri_userinfo_cookies_and_credential_metadata(self) -> None:
+        dsn_username = "observability-user"
+        dsn_password = "observability-dsn-password"
+        cookie_secret = "observability-cookie-secret"
+        metadata_secret = "observability-metadata-secret"
+        connection_secret = "observability-connection-secret"
+        value = {
+            "diagnostic": (
+                "connect failed for "
+                f"postgresql+psycopg://{dsn_username}:{dsn_password}@db.example/runtime"
+            ),
+            "wire_error": f"Cookie: session={cookie_secret}; Secure\nretry scheduled",
+            "credentialMetadata": {"opaque": metadata_secret},
+            "connectionString": f"Server=db.example;Password={connection_secret}",
+            "endpoint": "https://api.example.test/v1/health?verbose=true",
+            "note": "ordinary provider failure",
+        }
+
+        sanitized = sanitize_for_observability(value, preview_chars=10_000)
+        preview = sanitized["preview"]
+
+        for secret in (
+            dsn_username,
+            dsn_password,
+            cookie_secret,
+            metadata_secret,
+            connection_secret,
+        ):
+            assert secret not in preview
+        assert "postgresql+psycopg://[redacted]@db.example/runtime" in preview
+        assert "Cookie: [redacted]\\nretry scheduled" in preview
+        assert "https://api.example.test/v1/health?verbose=true" in preview
+        assert "ordinary provider failure" in preview
+        assert sanitized["redacted"] is True
+        assert sanitized["sha256"] != hashlib.sha256(json_bytes(value)).hexdigest()
+
+    def test_observability_preserves_noncredential_urls_and_structured_diagnostics(self) -> None:
+        value = {
+            "endpoint": "https://api.example.test/v1/health?verbose=true",
+            "status": 503,
+            "retryable": True,
+            "note": "ordinary provider failure",
+        }
+
+        sanitized = sanitize_for_observability(value, preview_chars=10_000)
+
+        assert sanitized["redacted"] is False
+        assert sanitized["preview"] == json.dumps(value, sort_keys=True)

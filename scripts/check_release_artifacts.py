@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from configparser import ConfigParser, Error as ConfigParserError
 from email import policy
 from email.parser import BytesParser
 import json
@@ -16,6 +17,13 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT_NAME = "agent-libos"
 ARCHIVE_NAME = "agent_libos"
+EXPECTED_CONSOLE_SCRIPTS = {
+    "agent-libos": "agent_libos.api.cli:cli",
+    "agent-libos-gui-server": "agent_libos.api.gui.server:main",
+    "agent-libos-migrate-tool-groups": (
+        "agent_libos.storage.tool_skill_migration:cli"
+    ),
+}
 BUILTIN_SKILL_IDS = (
     "agent-libos-skill-navigation",
     "agent-libos-authority-basics",
@@ -60,6 +68,7 @@ WHEEL_REQUIRED_FILES = frozenset(
         "agent_libos/__main__.py",
         "agent_libos/api/cli.py",
         "agent_libos/api/gui/server.py",
+        "agent_libos/storage/tool_skill_migration.py",
     }
 ) | BUILTIN_SKILL_ARCHIVE_PATHS
 SDIST_REQUIRED_FILES = frozenset(
@@ -69,6 +78,7 @@ SDIST_REQUIRED_FILES = frozenset(
         "README.md",
         "pyproject.toml",
         "agent_libos/__init__.py",
+        "agent_libos/storage/tool_skill_migration.py",
         "config.yaml",
         "modules/pty/module.yaml",
         "modules/pty/pty_module.py",
@@ -294,6 +304,36 @@ def _validate_builtin_skill_archive_payloads(payloads: dict[str, bytes]) -> None
         )
 
 
+def _validate_console_scripts(raw: bytes) -> None:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("wheel entry_points.txt is not UTF-8") from exc
+    parser = ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    try:
+        parser.read_string(text)
+    except ConfigParserError as exc:
+        raise ValueError("wheel entry_points.txt is invalid") from exc
+    actual = (
+        dict(parser.items("console_scripts", raw=True))
+        if parser.has_section("console_scripts")
+        else {}
+    )
+    if actual != EXPECTED_CONSOLE_SCRIPTS:
+        missing = sorted(EXPECTED_CONSOLE_SCRIPTS.keys() - actual.keys())
+        unexpected = sorted(actual.keys() - EXPECTED_CONSOLE_SCRIPTS.keys())
+        mismatched = sorted(
+            name
+            for name in EXPECTED_CONSOLE_SCRIPTS.keys() & actual.keys()
+            if actual[name] != EXPECTED_CONSOLE_SCRIPTS[name]
+        )
+        raise ValueError(
+            "wheel console entry points mismatch: "
+            f"missing={missing}, unexpected={unexpected}, mismatched={mismatched}"
+        )
+
+
 def _validate_wheel(wheel_path: Path, version: str) -> None:
     dist_info = f"{ARCHIVE_NAME}-{version}.dist-info"
     with zipfile.ZipFile(wheel_path) as archive:
@@ -332,14 +372,7 @@ def _validate_wheel(wheel_path: Path, version: str) -> None:
             raise ValueError(
                 "wheel Requires-Python must remain >=3.11,<3.15"
             )
-        entry_points = archive.read(entry_points_path).decode("utf-8")
-        expected_entries = {
-            "agent-libos = agent_libos.api.cli:cli",
-            "agent-libos-gui-server = agent_libos.api.gui.server:main",
-        }
-        missing_entries = sorted(entry for entry in expected_entries if entry not in entry_points)
-        if missing_entries:
-            raise ValueError(f"wheel is missing console entry points: {missing_entries}")
+        _validate_console_scripts(archive.read(entry_points_path))
 
 
 def _looks_like_secret_file(path: PurePosixPath) -> bool:

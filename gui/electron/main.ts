@@ -1,9 +1,9 @@
-import { app, BrowserWindow, dialog, ipcMain, net, protocol, shell, type OpenDialogOptions } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, protocol, shell, type OpenDialogOptions } from "electron";
 import { ChildProcess, ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { databaseTargetFromRenderer } from "./database.js";
 import { redactGuiServerOutput, requireLoopbackDevServerUrl, runtimeServerEnv } from "./env.js";
 import { readImagePackageFiles } from "./imagePackage.js";
@@ -11,7 +11,7 @@ import {
   productionRendererEntryUrl,
   productionRendererOrigin,
   productionRendererScheme,
-  resolveProductionRendererPath
+  readProductionRendererAsset
 } from "./rendererProtocol.js";
 import { isCompletedShutdownResponse } from "./shutdown.js";
 import { mainWindowBounds, shouldCreateBrowserWindow } from "./windowBounds.js";
@@ -430,7 +430,7 @@ async function createWindow() {
         })()`
       ),
       5000,
-      "packaged renderer probe"
+      "production renderer probe"
     );
     const preloadReady = rendererProbe?.preloadReady === true;
     const apiReady = rendererProbe?.apiReady === true;
@@ -521,12 +521,12 @@ function installProductionCsp(window: BrowserWindow) {
 function installProductionRendererProtocol() {
   if (productionRendererProtocolInstalled) return;
   const distRoot = path.join(repoRoot, "gui", "dist");
-  protocol.handle(productionRendererScheme, (request) => {
-    const target = resolveProductionRendererPath(distRoot, request.url);
-    if (target === null || !fs.existsSync(target) || !fs.statSync(target).isFile()) {
+  protocol.handle(productionRendererScheme, async (request) => {
+    const asset = await readProductionRendererAsset(distRoot, request.url);
+    if (asset === null) {
       return new Response("Not found", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
     }
-    return net.fetch(pathToFileURL(target).toString());
+    return new Response(asset.body, { headers: { "Content-Type": asset.contentType } });
   });
   productionRendererProtocolInstalled = true;
 }

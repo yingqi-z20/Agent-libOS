@@ -1000,6 +1000,255 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    def test_source_only_event_labels_gate_provider_egress(self) -> None:
+        runtime = Runtime.open('local', config=SYSTEM_DEFAULT_CONFIG)
+        try:
+            assert runtime.config.llm_context.policy == 'source_only'
+            client = RecordingActionClient(
+                [
+                    {
+                        'action': 'create_memory_object',
+                        'type': 'observation',
+                        'payload': {'should_not_run': True},
+                    }
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='deny a secret event under the product default',
+            )
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
+            runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'SOURCE_ONLY_EVENT_SECRET_SENTINEL'},
+                metadata=ObjectMetadata(
+                    sensitivity='secret',
+                    trust_level='untrusted',
+                ),
+                name='source.only.secret.event.marker',
+            )
+
+            denied = runtime.run_process_once(pid)
+
+            assert not denied['ok']
+            assert 'data-flow denied egress' in denied['error']
+            assert client.user_prompts == []
+            decisions = runtime.store.list_data_flow_decisions(
+                pid=pid,
+                outcome='deny',
+            )
+            assert decisions
+            assert decisions[-1].labels.sensitivity.value == 'secret'
+            assert decisions[-1].labels.trust_level.value == 'untrusted'
+            assert any(
+                record.action == 'data_flow.egress'
+                and record.target == 'llm:default'
+                and record.decision.get('outcome') == 'deny'
+                for record in runtime.audit.trace()
+            )
+            assert any(
+                event.type == EventType.DATA_FLOW_DECISION
+                and event.payload.get('outcome') == 'deny'
+                for event in runtime.events.list(
+                    target='data_flow_sink:llm:default',
+                )
+            )
+            assert runtime.store.get_object_by_name(
+                context_object_name(pid, config=SYSTEM_DEFAULT_CONFIG),
+                namespace=runtime.memory.resolve_namespace(pid),
+            ) is None
+        finally:
+            runtime.close()
+
+    def test_source_only_normal_event_still_reaches_provider(self) -> None:
+        runtime = Runtime.open('local', config=SYSTEM_DEFAULT_CONFIG)
+        try:
+            assert runtime.config.llm_context.policy == 'source_only'
+            client = RecordingActionClient(
+                [{'action': 'process_exit', 'payload': {'done': True}}]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='allow a normal event under the product default',
+            )
+            runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'value': 'normal'},
+                metadata=ObjectMetadata(sensitivity='normal'),
+                name='source.only.normal.event.marker',
+            )
+
+            allowed = runtime.run_process_once(pid)
+
+            assert allowed['ok'], allowed
+            assert len(client.user_prompts) == 1
+            assert 'source.only.normal.event.marker' in client.user_prompts[0]
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'malformed_labels',
+        [
+            None,
+            {},
+            [],
+            'secret',
+            {'not_a_label': 'secret'},
+            {'tenant': 'tenant-a'},
+            {
+                **DataLabels().to_dict(),
+                'unexpected': 'secret',
+            },
+        ],
+    )
+    def test_malformed_event_labels_fail_closed_before_provider_egress(
+        self,
+        malformed_labels: Any,
+    ) -> None:
+        runtime = Runtime.open('local', config=SYSTEM_DEFAULT_CONFIG)
+        try:
+            client = RecordingActionClient(
+                [{'action': 'process_exit', 'payload': {'done': True}}]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject malformed trusted event labels',
+            )
+            runtime.events.emit(
+                EventType.OBJECT_CREATED,
+                source='test',
+                target=pid,
+                payload={
+                    'name': 'malformed.event.label.marker',
+                    'data_labels': malformed_labels,
+                },
+            )
+
+            with pytest.raises(
+                ValidationError,
+                match='malformed trusted data_labels',
+            ):
+                runtime.run_process_once(pid)
+            assert client.user_prompts == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.real_deno
+    @pytest.mark.parametrize(
+        'jit_name',
+        ['data_labels', 'sensitivity', 'tenant'],
+    )
+    @pytest.mark.parametrize(
+        ('config', 'persistent_context'),
+        [
+            pytest.param(SYSTEM_DEFAULT_CONFIG, False, id='source-only'),
+            pytest.param(DEFAULT_CONFIG, True, id='persistent-context'),
+        ],
+    )
+    def test_multiplexed_jit_name_redaction_cannot_strip_trusted_event_labels(
+        self,
+        config: Any,
+        persistent_context: bool,
+        jit_name: str,
+    ) -> None:
+        runtime = Runtime.open('local', config=config)
+        try:
+            assert runtime.config.llm_context.policy == (
+                'llm_context_object' if persistent_context else 'source_only'
+            )
+            if persistent_context:
+                runtime.data_flow.register_sink_trust(
+                    SinkTrustRule(
+                        pattern='llm:default',
+                        trust_level=SinkTrustLevel.TRUSTED,
+                        max_sensitivity='secret',
+                        tenants=('tenant-a',),
+                        principals=('principal-a',),
+                        identity_sha256=runtime.llms.profile_identity_sha256(
+                            'default'
+                        ),
+                    ),
+                    actor='test',
+                    require_capability=False,
+                )
+            _register_multiplexed_image(
+                runtime,
+                prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
+                default_tools=[
+                    'process_exit',
+                    'append_memory_object',
+                    'create_memory_namespace',
+                    'create_memory_object',
+                    'list_memory_namespace',
+                    'read_memory_object',
+                ],
+            )
+            pid = runtime.process.spawn(
+                image='multiplexed-jit:v0',
+                goal='do not release a classified event',
+            )
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
+            # In multiplexed mode this legitimate JIT name is redacted from
+            # presentation data. It must never rewrite the trusted security key
+            # before data-flow labels are recovered.
+            _register_count_tool(runtime, pid, jit_name)
+            client = RecordingActionClient(
+                [
+                    {
+                        'action': 'create_memory_object',
+                        'type': 'observation',
+                        'payload': {'processed': True},
+                    }
+                ]
+            )
+            runtime.llm.client = client
+            runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'secret': 'MULTIPLEXED_EVENT_LABEL_SENTINEL'},
+                metadata=ObjectMetadata(
+                    sensitivity='secret',
+                    trust_level='untrusted',
+                    tenant='tenant-a',
+                    principal='principal-a',
+                ),
+                name='multiplexed.secret.event.marker',
+            )
+
+            result = runtime.run_process_once(pid)
+
+            decisions = runtime.store.list_data_flow_decisions(pid=pid)
+            assert decisions
+            assert decisions[-1].labels.sensitivity.value == 'secret'
+            assert decisions[-1].labels.tenant == 'tenant-a'
+            assert decisions[-1].labels.principal == 'principal-a'
+            context = runtime.store.get_object_by_name(
+                context_object_name(pid, config=config),
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            if persistent_context:
+                assert result['ok'], result
+                assert len(client.user_prompts) == 1
+                assert decisions[-1].outcome.value == 'allow'
+                assert context is not None
+                assert context.metadata.sensitivity == 'secret'
+                assert context.metadata.tenant == 'tenant-a'
+                assert context.metadata.principal == 'principal-a'
+                assert context.payload['label_history']['sensitivity'] == 'secret'
+            else:
+                assert not result['ok']
+                assert 'data-flow denied egress' in result['error']
+                assert client.user_prompts == []
+                assert decisions[-1].outcome.value == 'deny'
+                assert context is None
+        finally:
+            runtime.close()
+
     @pytest.mark.parametrize("publisher", ["create", "update", "append"])
     def test_secret_off_view_object_event_labels_gate_provider_egress(
         self,
@@ -4204,6 +4453,7 @@ def _register_multiplexed_image(
     runtime: Runtime,
     *,
     prompt_mode: str | None = None,
+    default_tools: list[str] | None = None,
 ) -> None:
     runtime.register_image(
         AgentImage(
@@ -4211,7 +4461,7 @@ def _register_multiplexed_image(
             name='multiplexed-jit',
             system_prompt='Use run_jit_tool for JIT tools.',
             prompt_mode=prompt_mode or 'image_only',
-            default_tools=['process_exit'],
+            default_tools=default_tools or ['process_exit'],
             jit_tool_exposure=JIT_TOOL_EXPOSURE_MULTIPLEXED,
         ),
         actor='test',

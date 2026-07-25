@@ -27,6 +27,7 @@ dmypy.json
 
 # Python environments and package builds
 /.venv/
+/experiments/agentdojo/.venv/
 /venv/
 /env/
 /ENV/

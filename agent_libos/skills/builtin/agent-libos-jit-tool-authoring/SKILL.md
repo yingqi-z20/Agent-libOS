@@ -13,7 +13,7 @@ Prefer an existing tool. Author JIT only for reusable bounded logic with a stabl
 
 This checks basic name/schema/source/test sizes and creates a process-owned `proposed` candidate. It does not compile or run source.
 
-Use `[A-Za-z0-9_-]{1,64}`, avoid process tool names, and never use reserved multiplexed name `run_jit_tool`. Describe behavior, not implementation.
+Use `[A-Za-z0-9_-]{1,64}` and avoid process tool names. A multiplexed image hard-reserves `run_jit_tool`; direct mode currently permits that spelling as a real JIT name, but do not use it because a later switch to multiplexed exposure will reject the collision. Describe behavior, not implementation.
 
 Use portable schemas: normally a root object, explicit bounded `properties`, every property in `required`, and `additionalProperties:false`. Model optional values as required nullable unions. Describe the exact JSON return; forbid `undefined`, functions, instances, streams, and cycles. Strict provider projection makes implicit optional properties unreliable.
 
@@ -26,7 +26,7 @@ export async function run(args: { timezone: string }, libos: any) {
 }
 ```
 
-`clock.now` is a canonical runtime route; its argument is `timezone` and it requires the normal `clock:now` read authority. Use only canonical syscall routes and argument contracts explicitly supplied by trusted image/Skill/Host documentation. The model has no syscall-list or syscall-schema introspection operation: do not derive a route from a model tool name, probe likely names, or treat an `unknown syscall` error as discovery. If the exact route and contract are unavailable, keep the JIT pure, use the existing governed tool, or stop for Host guidance.
+`clock.now` is a canonical runtime route; its argument is `timezone` and it requires the normal `clock:now` read authority. Use only canonical syscall routes and argument/result/authority/blocking contracts explicitly supplied by trusted image/Skill/Host documentation. Host code has a name/alias descriptor inventory, but descriptors carry no schemas or authority and the model has no syscall-list or syscall-schema introspection operation. Do not derive a route from a model tool name, probe likely names, or treat an `unknown syscall` error as discovery. If the exact route and full contract are unavailable, keep the JIT pure, use the existing governed tool, or stop for Host guidance.
 
 Each primitive still enforces Capability, approval, provider, data-flow, budget, event, and audit rules; visibility is not authority. Proposal has no capability-request field.
 
@@ -98,7 +98,7 @@ Success returns `tool_id`, `name`, `scope`. `ephemeral_process` is ownership sco
 5. Call `propose_jit_tool` once and preserve the exact process-owned candidate ID.
 6. Validate once. On failure create a corrected candidate; on success retain evidence.
 7. Call `register_jit_tool` once. Verify returned name and scope and preserve `tool_id` as the registration identity.
-8. Preserve the exact registered name and input contract. In direct mode the next model request can expose the JIT as its own native schema and it is called by name. In multiplexed mode only the generic `run_jit_tool` schema is exposed: there is no injected JIT catalog or per-tool schema, so call `{"tool_name":"normalize_records","arguments":{...}}` from the retained contract—never use `name`. If that contract is no longer in context, stop instead of guessing or attempting nonexistent schema lookup.
+8. Preserve the exact registered name and input contract. In direct mode the next model request can expose the JIT as its own native schema and it is called by name. In multiplexed mode only the generic `run_jit_tool` schema is exposed: there is no injected JIT catalog or per-tool schema, so call `{"tool_name":"normalize_records","arguments":{...}}` from the retained contract—never use `name`. If task-local evidence was lost, an exact loaded-snapshot resource path already supplied by trusted instructions/evidence may be read with `read_skill_resource`; multiplexing hides path discovery, not access to a known path. Otherwise stop instead of guessing a name, arguments, or resource filename.
 9. Domain-check a small valid call; require a harmless invalid input to reject before execution. For syscalls, exercise safe declared denial.
 
 ## Failure and recovery
@@ -107,6 +107,7 @@ Success returns `tool_id`, `name`, `scope`. `ephemeral_process` is ownership sco
 - Import, dynamic-code, Deno permission, unknown syscall, or unavailable Deno failure: remove the unsupported dependency or use the proper existing libOS primitive. Do not fall back to shell/network/filesystem access.
 - `ok:false`: preserve errors/warnings/logs, create a new candidate, and validate that ID. There is no model-facing candidate edit or discard operation.
 - Syscall authority/provider/data-flow/budget denial: preserve it; JIT cannot change it. Request only exact authority when intended.
+- Direct `process.exit` is rejected when the active image or a target in the same deferred exec/exit call has cumulative completion review. Return the intended result from the JIT tool, then call the built-in `process_exit` separately; never work around its review/evidence gate. A standalone authorized exec adopts the target image's contract on later calls; it does not permanently inherit the source gate.
 - Collision or owner mismatch: never assume replacement semantics. Choose a new stable name only if it represents a genuinely distinct contract; otherwise stop for Host/operator cleanup or coordination.
 - Unknown lifecycle settlement: do not repeat; no lookup/idempotency key exists. Report known identity and seek authorized Host inspection.
 - Valid test but runtime schema rejection: tests and schemas are separate. Fix the declared contract in a new proposal.

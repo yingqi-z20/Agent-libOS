@@ -67,6 +67,14 @@ class RuntimePublicationOperationPort(Protocol):
 
     def current_id(self) -> str | None: ...
 
+    def finish(
+        self,
+        outcome: OperationOutcome | str,
+        *,
+        operation_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> OperationRecord | None: ...
+
     def attach(self, operation_id: str) -> AbstractContextManager[Any]: ...
 
     def get_operation(self, operation_id: str) -> OperationRecord | None: ...

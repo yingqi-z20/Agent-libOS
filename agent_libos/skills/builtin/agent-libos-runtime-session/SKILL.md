@@ -89,7 +89,9 @@ input precedence is exact:
    `message`.
 3. Otherwise `message` creates internal `{"message": ...}` Object data; it is
    not Human output.
-4. Supplying none can return `result_oid=null` on a one-phase image.
+4. Supplying none can return `result_oid=null` on a one-phase image. Omit all
+   result inputs only when an intentionally empty terminal result is the known
+   contract; never do so to discover whether an exit gate exists.
 
 `review_token` and `completion_evidence` are only for cumulative review. A
 one-phase success returns `status="exited"`; only that status confirms successful
@@ -146,12 +148,15 @@ do not. Use checkpoints, files, or approved storage for durable artifacts.
 ## Completion evidence
 
 Some images, notably the coding image, gate exit; others are one-phase. Do not
-guess. Use this state machine.
+probe that distinction with an empty terminal call. Use this state machine.
 
-### Probe, ACK, probe again
+### Prepare, call, ACK/review
 
-1. Call a bare `process_exit` alone, without token or invented evidence.
-2. If it returns `exited`, stop. If it returns
+1. Finish the cumulative work first and prepare the intended final `result_oid`,
+   `payload`, or `message`. Call `process_exit` alone with that result, without
+   a review token or invented evidence. Never use an empty `process_exit` as a
+   gate probe: on a one-phase image it irreversibly exits with no result.
+2. If the result-bearing call returns `exited`, stop. If it returns
    `completion_review_required`, inspect its goal, source refs, unread/ACKed IDs,
    message count/hash/reference, observed tools, hints, required shape, and errors.
 3. Follow the review's source-neutral `skill_discovery` query, activate one
@@ -159,9 +164,11 @@ guess. Use this state machine.
    messages using exact IDs or `{}` when directed to drain the unread mailbox.
    Default `ack=true` changes each returned message status. Status is part of
    review identity, so ACK makes the first token stale.
-4. After ACK, call a second bare `process_exit`. Use only this post-ACK review's
+4. After ACK, repeat `process_exit` with the intended final result but still
+   without token/evidence to obtain a post-ACK review. Use only this review's
    token, goal OID, acknowledged ID set, and expected refs. If more unread input
-   appears, repeat read then bare probe. Never submit the pre-ACK token.
+   appears, repeat read then the same result-bearing review call. Never submit
+   the pre-ACK token.
 
 Review never inlines Human message bodies. It keeps every ACKed ID, a count and
 hash, plus an `acknowledged_human_message_reference` whose fixed and copied
@@ -170,8 +177,8 @@ use `include_acked=true` and `ack=false`, and inspect `has_more`/`continuation`.
 That continuation has no cursor: if a durable-result bound splits the response,
 subtract returned IDs from the review's full ID list and issue the next exact-ID
 read; repeating identical filters would replay the first page. Empty
-`message_ids` means none. Re-probe after any ACK. Message-count overflow fails
-closed and requires a Host-approved consolidated successor.
+`message_ids` means none. Refresh the review after any ACK. Message-count
+overflow fails closed and requires a Host-approved consolidated successor.
 
 A live goal likewise carries a hash and Object Memory reference, not an inline
 preview. Copy the reference's namespace/name arguments and read by name—never
@@ -194,10 +201,11 @@ must cite observed successful tool names. Blocked/cancelled may cite none but
 must state the exact reason; any cited name must still be observed. Final
 verification may contain only observed successful tool names.
 
-There is no separate “clear review” call. After the post-ACK probe, complete
+There is no separate “clear review” call. After the post-ACK review, complete
 missing tools, prepare evidence, and send required Human output in its own turn.
 Successful tools/Human output do not change the token; a goal version change,
 new Human message, or message ACK does. Then call `process_exit` alone with the
-latest token, evidence, and desired result. Validation rebuilds the current
-successful-tool list. If another review returns, resolve its newest errors and
-input, re-probe after any ACK, and retry. Stop only on `status="exited"`.
+latest token, evidence, and the same desired result. Validation rebuilds the
+current successful-tool list. If another review returns, resolve its newest
+errors and input, refresh after any ACK, and retry. Stop only on
+`status="exited"`.

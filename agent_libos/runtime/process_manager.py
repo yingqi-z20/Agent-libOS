@@ -205,6 +205,11 @@ class ProcessManager:
         authority_manifest: Any | None = None,
     ) -> str:
         selected_image = image or self.config.runtime.default_image_id
+        selected_root_budget = (
+            self._coerce_resource_budget(resource_budget)
+            if resource_budget is not None
+            else None
+        )
         now = utc_now()
         pid = new_id("pid")
         selected_llm_profile = self._resolve_root_llm_profile(selected_image, llm_profile_id)
@@ -225,7 +230,7 @@ class ProcessManager:
                 tool_table={},
                 event_cursor=None,
                 checkpoint_head=None,
-                resource_budget=resource_budget or self._default_resource_budget(),
+                resource_budget=selected_root_budget or self._default_resource_budget(),
                 resource_usage=ResourceUsage(),
                 created_at=now,
                 updated_at=now,
@@ -260,7 +265,7 @@ class ProcessManager:
                 image_id=selected_image,
                 goal_handle=goal_handle,
                 capabilities=capabilities or [],
-                resource_budget=resource_budget,
+                resource_budget=selected_root_budget,
                 authority_manifest=authority_manifest,
             )
             self._run_after_spawn_hooks(pid, selected_image, publication_id)
@@ -330,7 +335,11 @@ class ProcessManager:
         self._require_child_budget(parent_proc)
         inherit_specs = inherit_capabilities or []
         self._validate_inherit_capability_specs(parent, inherit_specs)
-        selected_budget = self._select_child_resource_budget(parent_proc, resource_budget)
+        selected_budget = self._select_child_resource_budget(
+            parent_proc,
+            resource_budget,
+            authority_manifest=authority_manifest,
+        )
         cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
         selected_llm_profile = self._resolve_child_llm_profile(parent_proc, llm_profile_id)
         now = utc_now()
@@ -384,6 +393,7 @@ class ProcessManager:
                     parent_pid=parent,
                     issued_by=f"process.fork:{parent}",
                 )
+                self._assert_manifest_resource_budget(manifest, selected_budget)
                 self._assert_goal_data_flow(child_pid, goal_handle)
             source_view = parent_proc.memory_view or self.memory.create_view(parent, [], mode=ViewMode.READ_ONLY)
             if isinstance(memory_view, MemoryView):
@@ -482,7 +492,11 @@ class ProcessManager:
         self._require_child_budget(parent_proc)
         inherit_specs = inherit_capabilities or []
         self._validate_inherit_capability_specs(parent, inherit_specs)
-        selected_budget = self._select_child_resource_budget(parent_proc, resource_budget)
+        selected_budget = self._select_child_resource_budget(
+            parent_proc,
+            resource_budget,
+            authority_manifest=authority_manifest,
+        )
         selected_initial_status = ProcessStatus(initial_status)
         if selected_initial_status in self.TERMINAL_STATUSES:
             raise ProcessError(f"spawn_child initial_status cannot be terminal: {selected_initial_status.value}")
@@ -553,6 +567,7 @@ class ProcessManager:
                     parent_pid=parent,
                     issued_by=f"process.spawn_child:{parent}",
                 )
+                self._assert_manifest_resource_budget(manifest, selected_budget)
                 self._assert_goal_data_flow(child_pid, goal_handle)
             self._publish_child_launch_authority(
                 publication_id,
@@ -1604,11 +1619,37 @@ class ProcessManager:
         self,
         parent: AgentProcess,
         requested: ResourceBudget | dict[str, Any] | None,
+        *,
+        authority_manifest: Any | None = None,
     ) -> ResourceBudget:
-        selected = self._coerce_resource_budget(requested) if requested is not None else self._child_resource_budget(parent)
+        selected = (
+            self._coerce_resource_budget(requested)
+            if requested is not None
+            else self._child_resource_budget(parent)
+        )
+        if self.authority_manifests is not None:
+            selected = ResourceBudget(
+                **self.authority_manifests.resolve_launch_resource_budget(
+                    supplied=authority_manifest,
+                    resource_budget=selected,
+                    parent_pid=parent.pid,
+                )
+            )
         if self.resources is not None:
-            self.resources.validate_child_budget(parent.pid, selected, reserved_usage=ResourceUsage(child_processes=1))
+            self.resources.validate_child_budget(
+                parent.pid,
+                selected,
+                reserved_usage=ResourceUsage(child_processes=1),
+            )
         return selected
+
+    @staticmethod
+    def _assert_manifest_resource_budget(
+        manifest: Any,
+        selected: ResourceBudget,
+    ) -> None:
+        if ResourceBudget(**manifest.resource_budget) != selected:
+            raise ProcessError("authority manifest resource budget changed during launch")
 
     def _reserve_child_budget(self, parent_pid: str, child_pid: str, budget: ResourceBudget) -> None:
         if self.resources is None:
@@ -1639,7 +1680,14 @@ class ProcessManager:
 
     def _coerce_resource_budget(self, value: ResourceBudget | dict[str, Any]) -> ResourceBudget:
         if isinstance(value, ResourceBudget):
-            return value
+            raw = {
+                name: getattr(value, name)
+                for name in value.__dataclass_fields__
+            }
+            try:
+                return ResourceBudget(**raw)
+            except (TypeError, ValueError) as exc:
+                raise ProcessError(str(exc)) from exc
         if not isinstance(value, dict):
             raise ProcessError("resource_budget must be a mapping")
         allowed = set(ResourceBudget.__dataclass_fields__)
@@ -1648,7 +1696,7 @@ class ProcessManager:
             raise ProcessError(f"unknown resource_budget fields: {unknown}")
         try:
             return ResourceBudget(**{key: item for key, item in value.items() if key in allowed})
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise ProcessError(str(exc)) from exc
 
     def _attenuate_int(self, value: int | None, divisor: int, minimum: int) -> int | None:
@@ -2102,7 +2150,7 @@ class ProcessManager:
         transition_kind: str,
     ) -> None:
         selected_specs = (
-            list(manifest.authorized_capabilities)
+            self.authority_manifests.bounded_capability_specs(manifest)
             if manifest is not None
             else [*requested_capabilities, *inherit_specs]
         )
@@ -2113,7 +2161,7 @@ class ProcessManager:
             target_subject=child_pid,
             requested_specs=selected_specs,
             transition_kind=transition_kind,
-            ceiling_specs=manifest.authorized_capabilities if manifest is not None else None,
+            ceiling_specs=selected_specs if manifest is not None else None,
         )
 
     def _inherit_capability_specs(

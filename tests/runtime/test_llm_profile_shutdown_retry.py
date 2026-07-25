@@ -53,7 +53,7 @@ def _cache_production_client(
     client: Any,
 ) -> None:
     registry._clients[profile_id] = client
-    registry._client_identity_sha256[profile_id] = f"identity:{profile_id}"
+    registry._client_cache_sha256[profile_id] = f"cache:{profile_id}"
 
 
 def test_sync_profile_shutdown_removes_only_successful_unique_clients() -> None:
@@ -75,7 +75,7 @@ def test_sync_profile_shutdown_removes_only_successful_unique_clients() -> None:
     assert transient_failure.close_calls == 1
     assert interrupted.close_calls == 1
     assert registry._clients == {}
-    assert registry._client_identity_sha256 == {}
+    assert registry._client_cache_sha256 == {}
     assert registry._test_clients == {
         "slow": transient_failure,
         "interrupt": interrupted,
@@ -115,7 +115,7 @@ def test_async_profile_shutdown_preserves_interrupts_and_sync_fallbacks() -> Non
         assert interrupted.close_calls == 1
         assert sync_fallback.close_calls == 1
         assert registry._clients == {}
-        assert registry._client_identity_sha256 == {}
+        assert registry._client_cache_sha256 == {}
         assert registry._test_clients == {
             "slow": transient_failure,
             "interrupt": interrupted,

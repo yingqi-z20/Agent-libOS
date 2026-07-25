@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 from dataclasses import replace
@@ -14,7 +15,7 @@ from agent_libos.config import AgentLibOSConfig, SkillDefaults, ToolDefaults
 from agent_libos.models import AgentImage, CapabilityRight
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.skills.schema import JitToolSpec, SkillPackage
+from agent_libos.skills.schema import JitToolSpec, SkillPackage, SkillResource
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from tests.support.skills import write_raw_skill, write_skill_package
 
@@ -251,8 +252,174 @@ class TestSkillPackageLoading:
                     write_skill_package(root, 'bad-jit', jit_tools=[{'name': 'bad', 'description': 'bad', 'source_path': '../escaped.ts'}])
                 with pytest.raises(ValidationError):
                     write_skill_package(root, 'bad-right', required_capabilities=[{'resource': 'filesystem:workspace:*', 'rights': ['*']}])
+                with pytest.raises(
+                    ValidationError,
+                    match='capability spec contains unknown fields',
+                ):
+                    write_skill_package(
+                        root,
+                        'unknown-capability-field',
+                        required_capabilities=[
+                            {
+                                'resource': 'filesystem:workspace:*',
+                                'rights': ['read'],
+                                'constrants': {'path': 'README.md'},
+                            }
+                        ],
+                    )
             finally:
                 runtime.close()
+
+    def test_programmatic_capability_spec_rejects_mixed_unknown_key_types(
+        self,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            capability_spec: dict[Any, Any] = {
+                'resource': 'filesystem:workspace:*',
+                'rights': ['read'],
+                'constrants': {'path': 'README.md'},
+                1: 'unexpected',
+            }
+            package = SkillPackage(
+                skill_id='mixed-capability-keys',
+                name='mixed-capability-keys',
+                description='Reject mixed unknown capability keys.',
+                instructions='Do not load this invalid package.',
+                required_capabilities=[capability_spec],  # type: ignore[list-item]
+            )
+
+            with pytest.raises(
+                ValidationError,
+                match='capability spec contains unknown fields',
+            ):
+                runtime.skills.register_skill_package(
+                    package,
+                    actor='test.host',
+                    require_capability=False,
+                )
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('kind', 'content', 'content_base64', 'expected_error'),
+        [
+            ('text', 'x', 'eA==', 'must not contain content_base64'),
+            ('base64', 'x', 'eA==', 'must not contain text content'),
+        ],
+    )
+    def test_programmatic_skill_resource_rejects_dual_payload_forms(
+        self,
+        kind: str,
+        content: str | None,
+        content_base64: str | None,
+        expected_error: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            package = SkillPackage(
+                skill_id=f'dual-resource-{kind}',
+                name=f'dual-resource-{kind}',
+                description='Reject unhashed alternate resource payloads.',
+                instructions='Do not load this invalid package.',
+                resources=[
+                    SkillResource(
+                        path='references/value.bin',
+                        size_bytes=1,
+                        sha256=hashlib.sha256(b'x').hexdigest(),
+                        kind=kind,
+                        content=content,
+                        content_base64=content_base64,
+                    )
+                ],
+            )
+
+            with pytest.raises(ValidationError, match=expected_error):
+                runtime.skills.register_skill_package(
+                    package,
+                    actor='test.host',
+                    require_capability=False,
+                )
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('claim_source', ('embedded', 'argument'))
+    def test_skill_registration_rejects_claimed_hash_mismatch_before_authority_use(
+        self,
+        claim_source: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject a mismatched Skill content hash',
+            )
+            skill_id = f'hash-mismatch-{claim_source}'
+            authority = runtime.capability.grant_once(
+                actor,
+                f'skill:{skill_id}',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            package = SkillPackage(
+                skill_id=skill_id,
+                name=skill_id,
+                description='Reject a caller-supplied mismatched hash.',
+                instructions='This content has one canonical hash.',
+                package_sha256=('a' * 64 if claim_source == 'embedded' else ''),
+            )
+            kwargs = (
+                {'package_sha256': 'a' * 64}
+                if claim_source == 'argument'
+                else {}
+            )
+
+            with pytest.raises(ValidationError, match='does not match'):
+                runtime.skills.register_skill_package(
+                    package,
+                    actor=actor,
+                    **kwargs,
+                )
+
+            assert runtime.store.get_skill(skill_id) is None
+            assert runtime.store.get_capability(authority.cap_id).uses_remaining == 1
+        finally:
+            runtime.close()
+
+    def test_global_skill_registration_cannot_rebind_trusted_hash_to_other_content(
+        self,
+    ) -> None:
+        runtime = Runtime.open('local')
+        fake_hash = 'b' * 64
+        source = 'global/hash-pin'
+        try:
+            runtime.skills.trust_skill_source(
+                actor='test.host',
+                source_type='global',
+                source=source,
+                package_sha256=fake_hash,
+                require_capability=False,
+            )
+            package = SkillPackage(
+                skill_id='global-hash-pin',
+                name='global-hash-pin',
+                description='Content must match the trusted hash pin.',
+                instructions='Different content cannot reuse a trusted pin.',
+            )
+
+            with pytest.raises(ValidationError, match='does not match'):
+                runtime.skills.register_skill_package(
+                    package,
+                    actor='test.host',
+                    source_type='global',
+                    source=source,
+                    package_sha256=fake_hash,
+                    require_capability=False,
+                )
+
+            assert runtime.store.get_skill(package.skill_id) is None
+        finally:
+            runtime.close()
 
     def test_programmatic_skill_registration_rejects_invalid_jit_timeouts(self) -> None:
         hard_limit = 7.0
@@ -989,7 +1156,14 @@ class TestSkillPackageLoading:
                 with pytest.raises(NotFound, match='tool not found'):
                     runtime.skills.activate_skill_from_workspace_path(pid, 'broken-skill')
 
+                discovered = runtime.skills.discover_skills(
+                    text='broken-skill',
+                    actor=pid,
+                    require_capability=False,
+                )
+
                 assert runtime.store.get_skill('broken-skill') is not None
+                assert [item['skill_id'] for item in discovered] == ['broken-skill']
                 assert runtime.store.get_capability(write_cap.cap_id).uses_remaining == 0
                 assert runtime.store.get_capability(execute_cap.cap_id).uses_remaining == 1
                 assert 'broken-skill' not in runtime.process.get(pid).loaded_skills
@@ -1072,6 +1246,21 @@ class TestSkillPackageLoading:
 
                 with pytest.raises(ValidationError, match='snapshot hash'):
                     runtime.skills._package_from_snapshot(snapshot, context='tampered skill')
+
+                alternate_payload = runtime.skills._skill_snapshot(package)
+                for resource in alternate_payload['resources']:
+                    if resource['path'] == 'references/guide.md':
+                        resource['content_base64'] = 'dW5oYXNoZWQtc2VjcmV0'
+                        break
+
+                with pytest.raises(
+                    ValidationError,
+                    match='must not contain content_base64',
+                ):
+                    runtime.skills._package_from_snapshot(
+                        alternate_payload,
+                        context='alternate-payload skill',
+                    )
             finally:
                 runtime.close()
 
@@ -1116,6 +1305,9 @@ class TestSkillPackageLoading:
     def test_read_skill_resource_requires_loaded_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_dir = write_skill_package(Path(temp_dir), 'resource-skill', allowed_tools=['echo'], extra_resources={'references/guide.md': 'Remember resource-token.\n'})
+            binary_path = skill_dir / 'assets' / 'sample.bin'
+            binary_path.parent.mkdir(parents=True, exist_ok=True)
+            binary_path.write_bytes(b'\xff\x00')
             runtime = Runtime.open('local')
             try:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='read resource')
@@ -1123,9 +1315,160 @@ class TestSkillPackageLoading:
                 with pytest.raises(CapabilityDenied):
                     runtime.skills.read_skill_resource(pid, 'resource-skill', 'references/guide.md')
                 runtime.capability.grant(pid, 'skill:resource-skill', [CapabilityRight.EXECUTE], issued_by='test')
-                runtime.skills.activate_skill(pid, 'resource-skill', actor=pid)
+                activated = runtime.tools.call(
+                    pid,
+                    'activate_skill',
+                    {'skill_id': 'resource-skill'},
+                )
+                assert activated.ok, activated.error
+                assert set(activated.payload) == {'result'}
+                assert set(activated.payload['result']) == {
+                    'pid',
+                    'skill_id',
+                    'name',
+                    'version',
+                    'tool_names',
+                    'tool_ids',
+                    'jit_tool_ids',
+                    'instructions_hash',
+                    'package_sha256',
+                }
                 resource = runtime.skills.read_skill_resource(pid, 'resource-skill', 'references/guide.md')
                 assert 'resource-token' in resource['content']
+                assert resource['content_base64'] is None
+
+                with pytest.raises(ValidationError, match='max_bytes must be >= 1'):
+                    runtime.skills.read_skill_resource(
+                        pid,
+                        'resource-skill',
+                        'references/guide.md',
+                        max_bytes=0,
+                    )
+
+                tool_result = runtime.tools.call(
+                    pid,
+                    'read_skill_resource',
+                    {
+                        'skill_id': 'resource-skill',
+                        'path': 'references/guide.md',
+                    },
+                )
+                zero_limit = runtime.tools.call(
+                    pid,
+                    'read_skill_resource',
+                    {
+                        'skill_id': 'resource-skill',
+                        'path': 'references/guide.md',
+                        'max_bytes': 0,
+                    },
+                )
+                binary_result = runtime.tools.call(
+                    pid,
+                    'read_skill_resource',
+                    {
+                        'skill_id': 'resource-skill',
+                        'path': 'assets/sample.bin',
+                    },
+                )
+
+                assert tool_result.ok, tool_result.error
+                assert set(tool_result.payload) == {'resource'}
+                assert tool_result.payload['resource']['content_base64'] is None
+                assert 'resource-token' in tool_result.payload['resource']['content']
+                assert not zero_limit.ok
+                assert binary_result.ok, binary_result.error
+                assert binary_result.payload['resource']['kind'] == 'base64'
+                assert binary_result.payload['resource']['content'] is None
+                assert binary_result.payload['resource']['content_base64'] == '/wA='
+
+                unloaded = runtime.tools.call(
+                    pid,
+                    'unload_skill',
+                    {'skill_id': 'resource-skill'},
+                )
+                assert unloaded.ok, unloaded.error
+                assert set(unloaded.payload) == {'result'}
+                assert set(unloaded.payload['result']) == {
+                    'pid',
+                    'skill_id',
+                    'removed_tools',
+                }
+            finally:
+                runtime.close()
+
+    @pytest.mark.real_deno
+    def test_multiplexed_prompt_hides_jit_resource_discovery_but_known_path_is_readable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(
+                Path(temp_dir),
+                'multiplexed-resource-skill',
+                jit_tools=[
+                    {
+                        'name': 'multiplexed_contract_tool',
+                        'description': 'Return a bounded deterministic result.',
+                        'source_path': 'scripts/contract.ts',
+                        'input_schema': {'type': 'object'},
+                        'output_schema': {'type': 'object'},
+                        'tests': [{'args': {}, 'expected': {'ok': True}}],
+                    }
+                ],
+                scripts={
+                    'scripts/contract.ts': (
+                        'export function run(args, libos) { return {ok: true}; }\n'
+                    )
+                },
+            )
+            runtime = Runtime.open('local')
+            try:
+                image_id = 'multiplexed-skill-resource:v0'
+                runtime.register_image(
+                    AgentImage(
+                        image_id=image_id,
+                        name='multiplexed-skill-resource',
+                        default_tools=['process_exit'],
+                        jit_tool_exposure='multiplexed',
+                    ),
+                    actor='test',
+                )
+                runtime.skills.register_skill_from_path(
+                    skill_dir,
+                    actor='cli',
+                    require_capability=False,
+                )
+                pid = runtime.process.spawn(
+                    image=image_id,
+                    goal='read one already-known loaded resource path',
+                )
+                runtime.capability.grant(
+                    pid,
+                    'skill:multiplexed-resource-skill',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                )
+                runtime.skills.activate_skill(
+                    pid,
+                    'multiplexed-resource-skill',
+                    actor=pid,
+                )
+
+                context = next(
+                    item
+                    for item in runtime.skills.prompt_context(pid)
+                    if item['skill_id'] == 'multiplexed-resource-skill'
+                )
+                visible_paths = {item['path'] for item in context['resources']}
+                known = runtime.skills.read_skill_resource(
+                    pid,
+                    'multiplexed-resource-skill',
+                    'references/agent-libos/jit-tools.json',
+                )
+
+                assert context['jit_tools'] == []
+                assert 'references/agent-libos/jit-tools.json' not in visible_paths
+                assert 'scripts/contract.ts' not in visible_paths
+                assert 'multiplexed_contract_tool' in known['content']
             finally:
                 runtime.close()
 

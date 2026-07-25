@@ -73,6 +73,7 @@ class BenchmarkTask:
     mock_actions: list[dict[str, Any]] = field(default_factory=list)
     notes: str | None = None
     source_path: Path | None = None
+    source_sha256: str | None = None
 
 
 @dataclass

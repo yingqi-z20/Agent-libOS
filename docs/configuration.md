@@ -10,7 +10,7 @@ operators do not have to infer those rules from example YAML.
 
 Product entrypoints use this order:
 
-1. Start from the deeply immutable `DEFAULT_CONFIG` baseline.
+1. Start from the frozen `DEFAULT_CONFIG` baseline.
 2. If `--config <path>` is present, recursively merge that YAML mapping.
 3. Otherwise load the repository/project-root `config.yaml` when it exists.
    The loader does not search the caller's current working directory.
@@ -19,19 +19,41 @@ Product entrypoints use this order:
 5. For CLI and GUI-server entrypoints, an explicit `--db` store target overrides
    the selected runtime store target.
 6. When an overlay is present, construct and validate a new frozen
-   `AgentLibOSConfig`; without an overlay, the shared immutable baseline is
-   safe to reuse. Unknown fields and unsafe, inverted, or non-finite bounds
-   fail before the Runtime opens. Pydantic accepts its normal compatible
+   `AgentLibOSConfig`; without an overlay, the shared frozen baseline is safe
+   to reuse through the public configuration API. Unknown fields and unsafe,
+   inverted, or non-finite bounds fail before the Runtime opens. Pydantic
+   accepts its normal compatible
    scalar coercions for ordinary dataclass fields (for example a numeric YAML
    string may become a number); callers that generate overlays must not treat
-   this loader as a strict JSON-type validator. Fields whose security contract
-   uses strict numeric types, and the post-construction bound checks, still
-   reject booleans and invalid values.
+   this loader as a strict JSON-type validator. Fields declared with Pydantic's
+   `StrictInt` or `StrictFloat` remain authoritative exceptions: their non-null
+   values must be actual numbers rather than strings and reject booleans. This
+   includes `runtime.publication_recovery_max_attempts`,
+   `runtime.publication_artifact_lookup_hard_limit`, both the `page_size` and
+   `page_hard_limit` fields for publication reconciliation, resource-usage and
+   capability-use reservation recovery, Object payload and ObjectTask recovery,
+   JIT rehydration, external-effect and operation recovery, and payload
+   retention, plus both payload-retention age fields. It also includes
+   `scheduler.max_workers`, `process.max_tool_calls`, `llm.max_tokens`,
+   `llm.temperature`, `llm.profiles.<profile_id>.max_tokens`, and
+   `llm.profiles.<profile_id>.temperature`. The integer-bound fields require
+   integers; temperature accepts integer or floating-point numbers. Consult the
+   typed declarations for the authoritative set. Post-construction checks then
+   reject non-finite, negative, zero, or inverted values as applicable.
 
-The frozen config object has no runtime hot reload. Change the host
-configuration and open a new Runtime. The configured default LLM profile is a
-narrow exception for its documented legacy environment mappings: each profile
-resolution snapshots those values and changes invalidate the cached client.
+The config dataclasses are frozen and have no runtime hot reload. In addition,
+security-critical `shell.rules[*].conditions` values are defensively copied and
+recursively frozen, so ordinary nested mapping or sequence mutation cannot
+change a Shell policy after a Runtime opens. Treat the complete configuration
+as read-only; change the host configuration and open a new Runtime. LLM client
+environment inputs are a narrow exception: each profile resolution captures
+the applicable legacy values plus its named API-key and safety-identifier
+variables in one immutable snapshot. A change to any effective
+client-construction option invalidates and closes the cached client. The
+private, in-memory cache fingerprint is secret-derived, but neither it nor the
+underlying values are persisted, emitted in audit or GUI output, or used as the
+public Sink identity hash.
+
 Library callers should pass an explicit config object when they need a
 different composition:
 
@@ -45,6 +67,28 @@ try:
     ...
 finally:
     runtime.shutdown(actor="library", reason="library.complete")
+```
+
+The public loader helpers support explicit library composition:
+
+- `get_project_root(start=None)` finds the root that owns the installed
+  `agent_libos` tree.
+- `load_config_file(path, base=DEFAULT_CONFIG)` overlays an explicit YAML file
+  on a selected immutable base. Relative paths are owned by the caller's current
+  working directory.
+- `load_config_from_project_root(filename="config.yaml", base=DEFAULT_CONFIG,
+  root=None)` resolves a relative filename below the detected or explicit
+  project root and returns `base` unchanged when the file is absent.
+- `load_config_from_cwd(filename="config.yaml", base=DEFAULT_CONFIG)` is the
+  explicit library opt-in to current-working-directory discovery. Product
+  entrypoints do not call it.
+
+Loaders never mutate `base`, so callers may intentionally layer overlays:
+
+```python
+base = load_config_file("deployment-base.yaml")
+config = load_config_file("host-overrides.yaml", base=base)
+runtime = Runtime.open(config=config)
 ```
 
 The checked-in repository `config.yaml` selects `.agent_libos.sqlite` and loads
@@ -149,6 +193,14 @@ same change.
 | `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
 | `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
 
+`launcher` and `scripts` are validated code-level default catalogs, not settings
+consumed by the CLI or GUI Runtime assembly. The current standalone scripts bind
+those values directly from `DEFAULT_CONFIG` and do not load project or explicit
+YAML overlays. Consequently, putting either group in an overlay constructs the
+requested `AgentLibOSConfig` value but does not change an existing built-in
+launcher or script. Use that script's command-line options where available, or
+pass the selected values explicitly from library code.
+
 `runtime.default_image_id` and `runtime.coding_image_id` name two different
 built-in images. They must also not collide with the fixed
 `review-agent:v0`, `toolmaker-agent:v0`, or `context-compressor:v0` ids; startup
@@ -185,9 +237,12 @@ configurable. A runtime release emits only the snapshot version it can decode.
   increase it per profile only when a task genuinely needs longer single-call
   output. The window controls local pressure management only and is deliberately
   excluded from the Provider/Sink identity hash.
-- JSON-RPC/MCP header and stdio allowlists contain environment-variable names.
-  Manifests reference those names; resolved secret values must not be persisted
-  in registry rows, audit metadata, benchmark provenance, or GUI responses.
+- JSON-RPC/MCP header and stdio allowlists contain exact environment-variable
+  names or trailing-`*` prefix patterns. For example,
+  `AGENT_LIBOS_MCP_*` admits names beginning with `AGENT_LIBOS_MCP_`; `*` has no
+  wildcard meaning anywhere except the final character. Manifests reference
+  those names; resolved secret values must not be persisted in registry rows,
+  audit metadata, benchmark provenance, or GUI responses.
 - `git.executable` is resolved on a Host path outside the workspace. The
   default `git.minimum_version` is `2.26.0`; deployments may configure a
   different dotted numeric threshold. `git.worktree_root` must remain below the workspace, while
@@ -206,9 +261,16 @@ configurable. A runtime release emits only the snapshot version it can decode.
   previews. It also redacts
   conditional LLM release resume rows before approval; exact same-runtime
   approval remains supported, while reopen fails that unrecoverable release
-  closed instead of rebuilding or dispatching it.
-- Provider-side Responses storage and chaining remain opt-in through
-  `llm.store` and `llm.responses_previous_response_id`.
+  closed instead of rebuilding or dispatching it. `prompt_mode: image_only`
+  cannot use this opt-out: custom Images default to that mode, and it fails
+  before provider dispatch unless the lossless native transcript can be written
+  with `persist_full_io=true`.
+- Provider-side Responses storage policy remains opt-in through `llm.store`.
+  `llm.responses_previous_response_id` permits low-level client chaining policy,
+  but the current full-snapshot AgentProcess executor records it as configured
+  and disabled and never sends `previous_response_id`. Enabling either setting
+  can still change the trusted profile identity, and enabling `store` may
+  increase provider retention.
 - `runtime.launch_authority_mode: manifest_required` treats image capability
   requirements as declarations, not grants; this value is fixed in 0.3.
 - `runtime.publication_recovery_max_attempts` bounds durable compensation
@@ -295,8 +357,9 @@ as equivalent:
   unchanged and creates no persistent delta Object. A Host may opt in globally
   with `llm_context_object`, or opt in one process with explicit
   `context:enrichment/execute` authority.
-- `llm_context.recent_event_limit` bounds the newest post-cursor event rows
-  loaded from SQL for an explicitly enabled persistent-context preparation; it
+- `llm_context.recent_event_limit` bounds the earliest next post-cursor event
+  rows loaded from SQL for an explicitly enabled persistent-context
+  preparation. This oldest-first page preserves a gap-free advancing cursor; it
   does not activate delta capture by itself.
 - `llm_context.prompt_event_payload_max_chars` bounds each represented event's
   provider-neutral model payload (default `2,048` characters). Oversized
@@ -305,10 +368,11 @@ as equivalent:
 - `llm_context.storage_compaction_threshold_bytes` is the persisted-context
   waterline that starts automatic compaction before the generic Object Memory
   payload hard limit. It must be positive and strictly less than
-  `tools.memory_payload_hard_limit_bytes`. The process must also have both
-  explicit persistent enrichment and explicit `context:maintenance/execute`
-  authority; otherwise the proactive storage waterline does not elevate its
-  authority or invoke the compactor.
+  `tools.memory_payload_hard_limit_bytes`. The Image's
+  `planner.context_management.mode` must resolve to `auto_compact`, and the
+  process must also have both explicit persistent enrichment and explicit
+  `context:maintenance/execute` authority; otherwise the proactive storage
+  waterline does not elevate its authority or invoke the compactor.
 - `llm_context.storage_compaction_max_chunks` bounds the built-in compressor
   stages used specifically for storage-waterline maintenance. The default is
   four; an Image's explicit `planner.context_management.tool.arguments.max_chunks`

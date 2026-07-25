@@ -103,7 +103,7 @@ class AuthorityManifestManager:
                     label="derived child authority",
                 )
 
-        selected_budget = self._budget_dict(payload.get("resource_budget", resource_budget))
+        selected_budget = self._resolve_resource_budget(payload, resource_budget)
         if parent_is_ceiling:
             self._require_budget_attenuated(parent.resource_budget, selected_budget)
 
@@ -114,8 +114,10 @@ class AuthorityManifestManager:
         )
         approval_policy = {**parent_approval_policy, **supplied_approval_policy}
         if "requestable_capabilities" in approval_policy:
-            approval_policy["requestable_capabilities"] = self._normalize_specs(
-                approval_policy["requestable_capabilities"]
+            approval_policy["requestable_capabilities"] = (
+                self._normalize_requestable_specs(
+                    approval_policy["requestable_capabilities"]
+                )
             )
         permitted_effects = self._effect_classes(
             payload["permitted_effects"]
@@ -132,7 +134,7 @@ class AuthorityManifestManager:
             if "data_flow_policy" in payload
             else parent_data_flow_policy
         )
-        expires_at = self._optional_string(
+        expires_at = self._optional_expiry(
             payload["expires_at"]
             if "expires_at" in payload
             else (parent.expires_at if parent is not None else None),
@@ -200,14 +202,14 @@ class AuthorityManifestManager:
 
     def compile_root_capabilities(self, manifest: TaskAuthorityManifest) -> list[str]:
         cap_ids: list[str] = []
-        for spec in manifest.authorized_capabilities:
+        for spec in self.bounded_capability_specs(manifest):
             cap = self.capabilities.issue_trusted(
                 subject=manifest.pid,
                 resource=str(spec["resource"]),
                 rights=list(spec["rights"]),
                 issued_by=f"authority_manifest:{manifest.manifest_id}",
                 constraints=dict(spec.get("constraints") or {}),
-                expires_at=spec.get("expires_at") or manifest.expires_at,
+                expires_at=spec.get("expires_at"),
                 uses_remaining=spec.get("uses_remaining"),
                 delegable=bool(spec.get("delegable", False)),
                 revocable=bool(spec.get("revocable", True)),
@@ -216,6 +218,26 @@ class AuthorityManifestManager:
             )
             cap_ids.append(cap.cap_id)
         return cap_ids
+
+    def bounded_capability_specs(
+        self,
+        manifest: TaskAuthorityManifest,
+    ) -> list[dict[str, Any]]:
+        """Return declared grants with every lease capped by the manifest."""
+
+        selected: list[dict[str, Any]] = []
+        for raw_spec in manifest.authorized_capabilities:
+            spec = dict(raw_spec)
+            expires_at = self._bounded_expiry(
+                manifest.expires_at,
+                spec.get("expires_at"),
+            )
+            if expires_at is None:
+                spec.pop("expires_at", None)
+            else:
+                spec["expires_at"] = expires_at
+            selected.append(spec)
+        return selected
 
     def bind_checkpoint_fork(
         self,
@@ -341,32 +363,76 @@ class AuthorityManifestManager:
             return None
         return self.get(manifest.manifest_id)
 
-    def assert_capability_request(self, pid: str, resource: str, rights: Iterable[str]) -> None:
+    def assert_capability_request(
+        self,
+        pid: str,
+        resource: str,
+        rights: Iterable[str],
+    ) -> dict[str, Any]:
         manifest = self.get_for_process(pid)
         if manifest is None:
             raise CapabilityDenied(f"{pid} has no task authority manifest")
         self._require_live(manifest)
         spec = self._normalize_spec({"resource": resource, "rights": list(rights)})
-        requestable = self._normalize_specs(
+        requestable = self._normalize_requestable_specs(
             manifest.approval_policy.get("requestable_capabilities", [])
         )
-        self._require_spec_covered(
-            [*manifest.authorized_capabilities, *requestable],
-            spec,
-            label="permission request",
+        for ceiling in [*manifest.authorized_capabilities, *requestable]:
+            candidate = dict(spec)
+            if ceiling.get("expires_at") is not None:
+                candidate["expires_at"] = ceiling["expires_at"]
+            if self.capabilities.spec_covers(ceiling, candidate):
+                return candidate
+        raise CapabilityDenied(
+            f"permission request exceeds task authority manifest: "
+            f"{spec['resource']} rights={spec['rights']}"
         )
 
     def assert_effect(self, pid: str, effect_class: str) -> None:
         manifest = self.get_for_process(pid)
-        if manifest is None or manifest.permitted_effects is None:
+        if manifest is None:
             return
         self._require_live(manifest)
+        if manifest.permitted_effects is None:
+            return
         selected = str(effect_class).strip()
         if any(self._effect_matches(pattern, selected) for pattern in manifest.permitted_effects):
             return
         raise CapabilityDenied(
             f"task authority manifest {manifest.manifest_id} does not permit effect class {selected}"
         )
+
+    def bound_capability_expiry(self, pid: str, expires_at: str | None) -> str | None:
+        """Return a capability expiry constrained by the live task manifest."""
+
+        selected_expiry = self._optional_expiry(
+            expires_at,
+            "capability expires_at",
+        )
+        manifest = self.get_for_process(pid)
+        if manifest is None:
+            return selected_expiry
+        self._require_live(manifest)
+        return self._bounded_expiry(manifest.expires_at, selected_expiry)
+
+    def resolve_launch_resource_budget(
+        self,
+        *,
+        supplied: TaskAuthorityManifest | dict[str, Any] | str | None,
+        resource_budget: ResourceBudget | dict[str, Any] | None,
+        parent_pid: str | None,
+    ) -> dict[str, Any]:
+        """Resolve the effective budget before a child row or reservation exists."""
+
+        payload = self._launch_payload(supplied)
+        selected = self._resolve_resource_budget(payload, resource_budget)
+        parent = self.get_for_process(parent_pid) if parent_pid is not None else None
+        parent_is_ceiling = parent is not None and bool(
+            parent.metadata.get("transition_ceiling", parent.metadata.get("explicit"))
+        )
+        if parent_is_ceiling:
+            self._require_budget_attenuated(parent.resource_budget, selected)
+        return selected
 
     def assert_data_flow_labels(self, pid: str, labels: DataLabels | Any) -> None:
         """Enforce the process's inbound tenant/principal domain.
@@ -409,7 +475,7 @@ class AuthorityManifestManager:
             "permitted_effects": manifest.permitted_effects,
             "resource_budget": manifest.resource_budget,
             "approval_policy": manifest.approval_policy,
-            "requestable_capabilities": self._normalize_specs(
+            "requestable_capabilities": self._normalize_requestable_specs(
                 manifest.approval_policy.get("requestable_capabilities", [])
             ),
             "data_flow_policy": manifest.data_flow_policy,
@@ -443,6 +509,43 @@ class AuthorityManifestManager:
         if not isinstance(values, (list, tuple)):
             raise ValidationError("authority manifest capability collections must be lists")
         return [self._normalize_spec(value) for value in values]
+
+    def _normalize_requestable_specs(
+        self,
+        values: Iterable[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Normalize model-request ceilings without implying grant semantics.
+
+        A model permission request carries only resource, rights, and an expiry
+        inherited from the matching ceiling.  Accept the canonical no-op values
+        emitted by existing Host clients, but reject fields whose grant or lease
+        semantics cannot be propagated through that request path.
+        """
+
+        raw_values = list(values) if isinstance(values, (list, tuple)) else values
+        selected = self._normalize_specs(raw_values)
+        for raw, spec in zip(raw_values, selected):
+            if "constraints" in raw and raw.get("constraints") != {}:
+                raise ValidationError(
+                    "requestable capability constraints must be an empty object"
+                )
+            if spec.get("delegable") is not False:
+                raise ValidationError(
+                    "requestable capability delegable must be false"
+                )
+            if spec.get("revocable") is not True:
+                raise ValidationError(
+                    "requestable capability revocable must be true"
+                )
+            if "uses_remaining" in raw:
+                raise ValidationError(
+                    "requestable capability uses_remaining is not supported"
+                )
+            if "max_delegation_depth" in raw:
+                raise ValidationError(
+                    "requestable capability max_delegation_depth is not supported"
+                )
+        return selected
 
     def _normalize_data_flow_policy(self, value: Any) -> dict[str, Any]:
         selected = self._mapping(value, "data_flow_policy")
@@ -533,20 +636,29 @@ class AuthorityManifestManager:
             "delegable": self._capability_boolean(value, "delegable", default=False),
             "revocable": self._capability_boolean(value, "revocable", default=True),
         }
-        for key in ("expires_at", "uses_remaining"):
-            if value.get(key) is not None:
-                selected[key] = value[key]
+        if value.get("expires_at") is not None:
+            selected["expires_at"] = self._optional_expiry(
+                value["expires_at"],
+                "capability expires_at",
+            )
+        if value.get("uses_remaining") is not None:
+            uses_remaining = value["uses_remaining"]
+            if (
+                isinstance(uses_remaining, bool)
+                or not isinstance(uses_remaining, int)
+                or uses_remaining < 1
+            ):
+                raise ValidationError(
+                    "capability uses_remaining must be a positive integer"
+                )
+            selected["uses_remaining"] = uses_remaining
         max_depth = value.get("max_delegation_depth")
         if max_depth is not None:
-            if isinstance(max_depth, bool):
+            if isinstance(max_depth, bool) or not isinstance(max_depth, int):
                 raise ValidationError("max_delegation_depth must be a non-negative integer")
-            try:
-                normalized_max_depth = int(max_depth)
-            except (TypeError, ValueError) as exc:
-                raise ValidationError("max_delegation_depth must be a non-negative integer") from exc
-            if normalized_max_depth < 0:
+            if max_depth < 0:
                 raise ValidationError("max_delegation_depth must be a non-negative integer")
-            selected["max_delegation_depth"] = normalized_max_depth
+            selected["max_delegation_depth"] = max_depth
         return selected
 
     def _require_spec_covered(
@@ -578,7 +690,9 @@ class AuthorityManifestManager:
     def _require_budget_attenuated(self, parent: dict[str, Any], child: dict[str, Any]) -> None:
         for key, parent_value in parent.items():
             child_value = child.get(key)
-            if parent_value is not None and (child_value is None or float(child_value) > float(parent_value)):
+            if parent_value is not None and (
+                child_value is None or child_value > parent_value
+            ):
                 raise CapabilityDenied(f"derived child resource budget exceeds parent manifest: {key}")
 
     def _require_requestable_capabilities_attenuated(
@@ -586,10 +700,10 @@ class AuthorityManifestManager:
         parent: TaskAuthorityManifest,
         child_policy: dict[str, Any],
     ) -> None:
-        parent_requestable = self._normalize_specs(
+        parent_requestable = self._normalize_requestable_specs(
             parent.approval_policy.get("requestable_capabilities", [])
         )
-        child_requestable = self._normalize_specs(
+        child_requestable = self._normalize_requestable_specs(
             child_policy.get("requestable_capabilities", [])
         )
         allowed = [*parent.authorized_capabilities, *parent_requestable]
@@ -663,15 +777,62 @@ class AuthorityManifestManager:
         selected = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return selected if selected.tzinfo is not None else selected.replace(tzinfo=timezone.utc)
 
+    @classmethod
+    def _bounded_expiry(
+        cls,
+        ceiling: str | None,
+        requested: str | None,
+    ) -> str | None:
+        if ceiling is None:
+            return requested
+        if requested is None:
+            return ceiling
+        return (
+            requested
+            if cls._expiry_datetime(requested) <= cls._expiry_datetime(ceiling)
+            else ceiling
+        )
+
+    @classmethod
+    def _resolve_resource_budget(
+        cls,
+        payload: Mapping[str, Any],
+        resource_budget: ResourceBudget | dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        selected = cls._budget_dict(resource_budget)
+        if "resource_budget" not in payload:
+            return selected
+        ceiling = cls._budget_dict(payload.get("resource_budget"))
+        if resource_budget is None:
+            return ceiling
+        for key, ceiling_value in ceiling.items():
+            if ceiling_value is None:
+                continue
+            current = selected.get(key)
+            if current is None or ceiling_value < current:
+                selected[key] = ceiling_value
+        return selected
+
     @staticmethod
     def _budget_dict(value: ResourceBudget | dict[str, Any] | None) -> dict[str, Any]:
         if value is None:
             return {}
         if isinstance(value, ResourceBudget):
-            return {name: getattr(value, name) for name in value.__dataclass_fields__}
+            selected = {
+                name: getattr(value, name)
+                for name in value.__dataclass_fields__
+            }
+            try:
+                ResourceBudget(**selected)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(f"invalid resource_budget: {exc}") from exc
+            return selected
         if not isinstance(value, dict):
             raise ValidationError("resource_budget must be an object")
-        ResourceBudget(**value)
+        try:
+            ResourceBudget(**value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"invalid resource_budget: {exc}") from exc
         return dict(value)
 
     @staticmethod
@@ -693,13 +854,19 @@ class AuthorityManifestManager:
         if unknown:
             raise ValidationError(f"{label} contains unsupported fields: {unknown}")
 
-    @staticmethod
-    def _optional_string(value: Any, label: str) -> str | None:
+    @classmethod
+    def _optional_expiry(cls, value: Any, label: str) -> str | None:
         if value is None:
             return None
-        selected = str(value).strip()
+        if not isinstance(value, str):
+            raise ValidationError(f"{label} must be an ISO-8601 datetime string")
+        selected = value.strip()
         if not selected:
             raise ValidationError(f"{label} must be non-empty")
+        try:
+            cls._expiry_datetime(selected)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"{label} must be an ISO-8601 datetime") from exc
         return selected
 
     @staticmethod

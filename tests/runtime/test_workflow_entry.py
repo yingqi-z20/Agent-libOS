@@ -5,7 +5,9 @@ from agent_libos.models import ObjectType, ProcessStatus
 
 
 class TestWorkflowEntry:
-    def test_default_workflow_runs_visible_tool_and_exits_with_result_object(self) -> None:
+    def test_default_workflow_runs_complete_table_tool_hidden_from_model_projection(
+        self,
+    ) -> None:
         runtime = Runtime.open("local")
         try:
             result = runtime.run_workflow("get_working_directory")
@@ -18,6 +20,8 @@ class TestWorkflowEntry:
             process = runtime.process.get(result.pid)
             assert process.status == ProcessStatus.EXITED
             assert process.status_message == f"result_oid:{result.result_oid}"
+            assert "get_working_directory" in process.tool_table
+            assert "get_working_directory" not in process.model_tool_table
             assert process.memory_view is not None
             assert result.result_oid in {handle.oid for handle in process.memory_view.roots}
             stored_result = runtime.store.get_object(result.result_oid)

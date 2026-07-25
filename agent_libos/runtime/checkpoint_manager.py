@@ -5,8 +5,8 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import replace
-from typing import Any, Iterable, Mapping, MutableMapping
+from dataclasses import dataclass, replace
+from typing import Any, Iterable, Mapping, MutableMapping, NoReturn
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -35,6 +35,7 @@ from agent_libos.models import (
     ObjectOwnerKind,
     ObjectTaskStatus,
     ObjectType,
+    OperationOutcome,
     ProcessMessageStatus,
     ProcessStatus,
     ProcessWaitState,
@@ -71,9 +72,25 @@ from agent_libos.runtime.snapshots import (
     SnapshotRemapper,
     SnapshotRows,
 )
-from agent_libos.storage import UnitOfWork
+from agent_libos.storage import StoreAssemblyReadiness, UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads, to_jsonable
+
+
+@dataclass
+class _CheckpointForkPublication:
+    actor: str
+    checkpoint: Checkpoint
+    snapshot: dict[str, Any]
+    parent_pid: str | None
+    require_capability: bool
+    remapped: dict[str, Any]
+    fork_rows: SnapshotRows
+    object_payloads: Mapping[str, Any]
+    root_pid: str
+    restored_image_ids: list[str]
+    publication_state: dict[str, Any]
+    post_commit_failures: list[dict[str, str]]
 
 
 class CheckpointManager:
@@ -103,6 +120,7 @@ class CheckpointManager:
         ProcessStatus.WAITING_TOOL.value,
         ProcessStatus.WAITING_HUMAN.value,
     }
+    FORK_COMMITTED_RECEIPT_ATTRIBUTE = "checkpoint_fork_receipt"
 
     def __init__(
         self,
@@ -151,6 +169,7 @@ class CheckpointManager:
         self._messages = messages
         self._operations = operations
         self._owner_instance_id = str(owner_instance_id)
+        self._recovery_required_callback = recovery_required_callback
         self._require_recovery_lease = require_recovery_lease
         self._process_transitions = transitions or ProcessTransitionService(
             self._processes
@@ -516,6 +535,11 @@ class CheckpointManager:
                 checkpoint, snapshot, typed_snapshot = (
                     self._load_checkpoint_typed(checkpoint_id)
                 )
+                # Fail closed on module identity before opening any authority
+                # or main-state publication transaction. The registry lock is
+                # already held, so a matching module cannot be replaced before
+                # the transactional recheck in publication preparation.
+                self._require_snapshot_modules(snapshot)
                 publication_id = self._restore_reconciler.new_publication_id()
                 with self.snapshots.restore_atomic_scope(
                     self._runtime_object_ownership_quiescent,
@@ -919,6 +943,10 @@ class CheckpointManager:
         parent_pid: str | None = None,
         require_capability: bool = True,
     ) -> dict[str, Any]:
+        # Reject same-thread nesting before taking the registry lock. This
+        # preserves the global registry -> store lock order while ensuring a
+        # savepoint can never be mistaken for a durable fork commit.
+        self._reject_nested_checkpoint_fork_transaction()
         # Fork preparation and publication both touch the global JIT/image
         # registries. Keep the lifecycle lock outside every store transaction.
         with self._runtime_registry_lifecycle_quiescent():
@@ -940,7 +968,31 @@ class CheckpointManager:
         parent_pid: str | None,
         require_capability: bool,
     ) -> dict[str, Any]:
-        checkpoint_id = checkpoint.checkpoint_id
+        publication = self._prepare_checkpoint_fork(
+            actor,
+            checkpoint,
+            snapshot,
+            parent_pid=parent_pid,
+            require_capability=require_capability,
+        )
+        self._publish_checkpoint_fork(publication)
+        self._emit_checkpoint_fork_event(publication)
+        self._record_checkpoint_fork_audit(publication)
+        return self._fork_publication_committed_receipt(publication)
+
+    def _prepare_checkpoint_fork(
+        self,
+        actor: str,
+        checkpoint: Checkpoint,
+        snapshot: dict[str, Any],
+        *,
+        parent_pid: str | None,
+        require_capability: bool,
+    ) -> _CheckpointForkPublication:
+        # Recheck after crossing the registry boundary so an instrumentation
+        # wrapper cannot introduce an outer transaction between the first
+        # probe and publication preparation.
+        self._reject_nested_checkpoint_fork_transaction()
         # Preflight without consuming finite authority. The authoritative
         # checks and any finite-use claims happen again in the same transaction
         # that publishes the fork rows, closing revoke/terminal-state TOCTOU
@@ -954,7 +1006,7 @@ class CheckpointManager:
         if require_capability:
             self._require_checkpoint_right(
                 actor,
-                checkpoint_id,
+                checkpoint.checkpoint_id,
                 CapabilityRight.EXECUTE,
                 consume=False,
             )
@@ -967,82 +1019,708 @@ class CheckpointManager:
                 overwrite_existing=False,
                 consume=False,
             )
-        remapped = self._remap_snapshot(snapshot, parent_pid=parent_pid, root_pid=checkpoint.pid)
-        root_pid = remapped["pid_map"][checkpoint.pid]
-        restored_image_ids: list[str] = []
+        remapped = self._remap_snapshot(
+            snapshot,
+            parent_pid=parent_pid,
+            root_pid=checkpoint.pid,
+        )
+        publication = _CheckpointForkPublication(
+            actor=actor,
+            checkpoint=checkpoint,
+            snapshot=snapshot,
+            parent_pid=parent_pid,
+            require_capability=require_capability,
+            remapped=remapped,
+            fork_rows=SnapshotRows.from_mapping(deepcopy(remapped["rows"])),
+            object_payloads=deepcopy(remapped["object_payloads"]),
+            root_pid=remapped["pid_map"][checkpoint.pid],
+            restored_image_ids=[],
+            publication_state={"main_state_committed": False},
+            post_commit_failures=[],
+        )
         try:
             # Prepare in-memory implementations before the transaction that
             # publishes fork process rows. A scheduler can therefore never
             # claim a fork whose process-local JIT handles are not ready.
             self._restore_jit_sources(remapped)
-            self._insert_fork_rows(
+        except BaseException as exc:
+            self._cleanup_uncommitted_fork(
                 remapped,
-                actor=actor,
-                checkpoint_id=checkpoint_id,
-                require_capability=require_capability,
-                fork_parent_pid=parent_pid,
-                fork_root_pid=root_pid,
-                image_snapshot=snapshot,
-                restored_image_ids=restored_image_ids,
+                publication.restored_image_ids,
+                primary=exc,
             )
-        except Exception:
-            self._discard_remapped_jit_sources(remapped)
-            self._discard_uncommitted_fork_images(restored_image_ids)
             raise
-        post_commit_failures: list[dict[str, str]] = []
-        try:
-            self.events.emit(
-                EventType.PROCESS_FORKED,
-                source=actor,
-                target=root_pid,
-                payload={"checkpoint_id": checkpoint_id, "source_pid": checkpoint.pid, "fork_root_pid": root_pid},
+        return publication
+
+    def _publish_checkpoint_fork(
+        self,
+        publication: _CheckpointForkPublication,
+    ) -> None:
+        # Keep the store lock across the commit boundary and any lost-ACK
+        # diagnosis. Newly committed nonterminal rows remain in CREATED
+        # quarantine until their volatile Object payloads are verified.
+        with self._unit_of_work.locked():
+            self._reject_nested_checkpoint_fork_transaction()
+            commit_interruption = self._insert_checkpoint_fork_main_state(
+                publication
             )
-        except Exception as exc:
-            post_commit_failures.append(
-                self._fork_post_commit_failure(
-                    actor=actor,
-                    checkpoint=checkpoint,
-                    fork_root_pid=root_pid,
-                    phase="fork_event_emission",
+            published_rows, published_payloads = (
+                self._checkpoint_fork_publication_artifacts(publication)
+            )
+            self._rehydrate_checkpoint_fork_payloads(
+                publication,
+                published_rows=published_rows,
+                published_payloads=published_payloads,
+                commit_interruption=commit_interruption,
+            )
+            self._publish_checkpoint_fork_process_rows(
+                publication,
+                published_rows=published_rows,
+            )
+            if commit_interruption is not None and not isinstance(
+                commit_interruption,
+                Exception,
+            ):
+                self._attach_fork_receipt(
+                    commit_interruption,
+                    self._fork_publication_committed_receipt(publication),
+                )
+                raise commit_interruption
+
+    def _insert_checkpoint_fork_main_state(
+        self,
+        publication: _CheckpointForkPublication,
+    ) -> BaseException | None:
+        try:
+            self._insert_fork_rows(
+                publication.remapped,
+                fork_rows=publication.fork_rows,
+                object_payloads=publication.object_payloads,
+                actor=publication.actor,
+                checkpoint_id=publication.checkpoint.checkpoint_id,
+                require_capability=publication.require_capability,
+                fork_parent_pid=publication.parent_pid,
+                fork_root_pid=publication.root_pid,
+                image_snapshot=publication.snapshot,
+                restored_image_ids=publication.restored_image_ids,
+                publication_state=publication.publication_state,
+            )
+        except BaseException as exc:
+            durable_commit: bool | None = (
+                True
+                if publication.publication_state["main_state_committed"]
+                else None
+            )
+            if durable_commit is None:
+                try:
+                    durable_commit = self._fork_root_is_persisted(
+                        publication.root_pid
+                    )
+                except BaseException as diagnostic_exc:
+                    self._raise_ambiguous_checkpoint_fork_commit(
+                        publication,
+                        interruption=exc,
+                        diagnostic_error=diagnostic_exc,
+                    )
+            if not durable_commit:
+                self._cleanup_uncommitted_fork(
+                    publication.remapped,
+                    publication.restored_image_ids,
+                    primary=exc,
+                )
+                raise
+            publication.post_commit_failures.append(
+                self._fork_failure(
+                    phase="fork_commit_acknowledgement",
                     exc=exc,
                 )
             )
+            return exc
+        return None
+
+    def _raise_ambiguous_checkpoint_fork_commit(
+        self,
+        publication: _CheckpointForkPublication,
+        *,
+        interruption: BaseException,
+        diagnostic_error: BaseException,
+    ) -> NoReturn:
+        failures = [
+            self._fork_failure(
+                phase="fork_commit_acknowledgement",
+                exc=interruption,
+            ),
+            self._fork_failure(
+                phase="fork_commit_confirmation",
+                exc=diagnostic_error,
+            ),
+        ]
+        secured = self._secure_checkpoint_fork_subtree(
+            remapped=publication.remapped,
+            failures=failures,
+        )
+        if secured == "absent":
+            self._cleanup_uncommitted_fork(
+                publication.remapped,
+                publication.restored_image_ids,
+                primary=interruption,
+            )
+            raise interruption from diagnostic_error
+        receipt = (
+            self._fork_recovery_required_receipt(
+                checkpoint=publication.checkpoint,
+                root_pid=publication.root_pid,
+                remapped=publication.remapped,
+                post_commit_failures=failures,
+                subtree_quarantined=(secured == "terminalized"),
+            )
+            if secured == "terminalized"
+            else self._fork_unknown_outcome_receipt(
+                checkpoint=publication.checkpoint,
+                root_pid=publication.root_pid,
+                remapped=publication.remapped,
+                interruption=interruption,
+                diagnostic_error=diagnostic_error,
+            )
+        )
+        if secured is None:
+            self._record_and_fence_checkpoint_fork_recovery(
+                actor=publication.actor,
+                receipt=receipt,
+            )
+        else:
+            self._record_checkpoint_fork_recovery(
+                actor=publication.actor,
+                receipt=receipt,
+            )
+        self._attach_fork_receipt(interruption, receipt)
+        raise interruption from diagnostic_error
+
+    def _checkpoint_fork_publication_artifacts(
+        self,
+        publication: _CheckpointForkPublication,
+    ) -> tuple[SnapshotRows, Mapping[str, Any]]:
+        published_rows = publication.publication_state.get("fork_rows")
+        published_payloads = publication.publication_state.get("object_payloads")
+        if isinstance(published_rows, SnapshotRows) and isinstance(
+            published_payloads,
+            Mapping,
+        ):
+            return published_rows, published_payloads
+        artifact_exc = ValidationError(
+            "checkpoint fork committed without a frozen publication artifact"
+        )
+        recovery_failures = [
+            *publication.post_commit_failures,
+            self._fork_failure(
+                phase="fork_publication_artifact_recovery",
+                exc=artifact_exc,
+            ),
+        ]
+        receipt = self._checkpoint_fork_recovery_receipt(
+            publication,
+            recovery_failures=recovery_failures,
+        )
+        self._attach_fork_receipt(artifact_exc, receipt)
+        raise artifact_exc
+
+    def _rehydrate_checkpoint_fork_payloads(
+        self,
+        publication: _CheckpointForkPublication,
+        *,
+        published_rows: SnapshotRows,
+        published_payloads: Mapping[str, Any],
+        commit_interruption: BaseException | None,
+    ) -> None:
         try:
-            self.audit.record(
-                actor=actor,
-                action="checkpoint.fork",
-                target=self.checkpoint_resource(checkpoint_id),
-                decision={
-                    "source_pid": checkpoint.pid,
-                    "fork_root_pid": root_pid,
-                    "pid_map": remapped["pid_map"],
-                    "main_state_committed": True,
-                    "status": "forked_with_warnings" if post_commit_failures else "forked",
-                    "post_commit_failures": list(post_commit_failures),
+            self._snapshot_rows.rehydrate_checkpoint_fork_object_payloads(
+                published_rows,
+                object_payloads=published_payloads,
+            )
+        except BaseException as rehydration_exc:
+            recovery_failures = [
+                *publication.post_commit_failures,
+                self._fork_failure(
+                    phase="fork_object_payload_rehydration",
+                    exc=rehydration_exc,
+                ),
+            ]
+            receipt = self._checkpoint_fork_recovery_receipt(
+                publication,
+                recovery_failures=recovery_failures,
+            )
+            propagated = (
+                commit_interruption
+                if commit_interruption is not None
+                and not isinstance(commit_interruption, Exception)
+                else rehydration_exc
+            )
+            self._attach_fork_receipt(propagated, receipt)
+            raise propagated from (
+                rehydration_exc
+                if propagated is commit_interruption
+                else commit_interruption
+            )
+
+    def _publish_checkpoint_fork_process_rows(
+        self,
+        publication: _CheckpointForkPublication,
+        *,
+        published_rows: SnapshotRows,
+    ) -> None:
+        try:
+            self._snapshot_rows.publish_checkpoint_fork_process_rows(
+                published_rows
+            )
+        except BaseException as publication_exc:
+            publication_failure = self._fork_failure(
+                phase="fork_process_state_publication",
+                exc=publication_exc,
+            )
+            try:
+                published = self._snapshot_rows.checkpoint_fork_process_rows_match(
+                    published_rows
+                )
+            except BaseException as diagnostic_exc:
+                recovery_failures = [
+                    *publication.post_commit_failures,
+                    publication_failure,
+                    self._fork_failure(
+                        phase="fork_process_state_publication_confirmation",
+                        exc=diagnostic_exc,
+                    ),
+                ]
+                receipt = self._checkpoint_fork_recovery_receipt(
+                    publication,
+                    recovery_failures=recovery_failures,
+                )
+                self._attach_fork_receipt(publication_exc, receipt)
+                raise publication_exc from diagnostic_exc
+            if not published:
+                recovery_failures = [
+                    *publication.post_commit_failures,
+                    publication_failure,
+                ]
+                receipt = self._checkpoint_fork_recovery_receipt(
+                    publication,
+                    recovery_failures=recovery_failures,
+                )
+                self._attach_fork_receipt(publication_exc, receipt)
+                raise
+            publication.post_commit_failures.append(publication_failure)
+            if not isinstance(publication_exc, Exception):
+                self._attach_fork_receipt(
+                    publication_exc,
+                    self._fork_publication_committed_receipt(publication),
+                )
+                raise
+
+    def _checkpoint_fork_recovery_receipt(
+        self,
+        publication: _CheckpointForkPublication,
+        *,
+        recovery_failures: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        secured = self._secure_checkpoint_fork_subtree(
+            remapped=publication.remapped,
+            failures=recovery_failures,
+        )
+        receipt = self._fork_recovery_required_receipt(
+            checkpoint=publication.checkpoint,
+            root_pid=publication.root_pid,
+            remapped=publication.remapped,
+            post_commit_failures=recovery_failures,
+            subtree_quarantined=(secured == "terminalized"),
+        )
+        if secured is None:
+            self._record_and_fence_checkpoint_fork_recovery(
+                actor=publication.actor,
+                receipt=receipt,
+            )
+        else:
+            self._record_checkpoint_fork_recovery(
+                actor=publication.actor,
+                receipt=receipt,
+            )
+        return receipt
+
+    def _emit_checkpoint_fork_event(
+        self,
+        publication: _CheckpointForkPublication,
+    ) -> None:
+        try:
+            self.events.emit(
+                EventType.PROCESS_FORKED,
+                source=publication.actor,
+                target=publication.root_pid,
+                payload={
+                    "checkpoint_id": publication.checkpoint.checkpoint_id,
+                    "source_pid": publication.checkpoint.pid,
+                    "fork_root_pid": publication.root_pid,
                 },
             )
         except Exception as exc:
-            post_commit_failures.append(
+            failure = self._fork_failure(phase="fork_event_emission", exc=exc)
+            try:
+                failure = self._fork_post_commit_failure(
+                    actor=publication.actor,
+                    checkpoint=publication.checkpoint,
+                    fork_root_pid=publication.root_pid,
+                    phase="fork_event_emission",
+                    exc=exc,
+                )
+            except BaseException as record_exc:
+                failure["failure_record_error_type"] = type(record_exc).__name__
+                failure["failure_record_error"] = str(record_exc)
+                publication.post_commit_failures.append(failure)
+                self._attach_fork_receipt(
+                    record_exc,
+                    self._fork_publication_committed_receipt(publication),
+                )
+                raise
+            publication.post_commit_failures.append(failure)
+        except BaseException as exc:
+            publication.post_commit_failures.append(
+                self._fork_failure(phase="fork_event_emission", exc=exc)
+            )
+            self._attach_fork_receipt(
+                exc,
+                self._fork_publication_committed_receipt(publication),
+            )
+            raise
+
+    def _record_checkpoint_fork_audit(
+        self,
+        publication: _CheckpointForkPublication,
+    ) -> None:
+        try:
+            self.audit.record(
+                actor=publication.actor,
+                action="checkpoint.fork",
+                target=self.checkpoint_resource(
+                    publication.checkpoint.checkpoint_id
+                ),
+                decision={
+                    "source_pid": publication.checkpoint.pid,
+                    "fork_root_pid": publication.root_pid,
+                    "pid_map": publication.remapped["pid_map"],
+                    "main_state_committed": True,
+                    "status": (
+                        "forked_with_warnings"
+                        if publication.post_commit_failures
+                        else "forked"
+                    ),
+                    "post_commit_failures": list(
+                        publication.post_commit_failures
+                    ),
+                },
+            )
+        except Exception as exc:
+            publication.post_commit_failures.append(
                 self._fork_post_commit_failure(
-                    actor=actor,
-                    checkpoint=checkpoint,
-                    fork_root_pid=root_pid,
+                    actor=publication.actor,
+                    checkpoint=publication.checkpoint,
+                    fork_root_pid=publication.root_pid,
                     phase="fork_audit_recording",
                     exc=exc,
                     record_failure=False,
                 )
             )
+        except BaseException as exc:
+            publication.post_commit_failures.append(
+                self._fork_failure(phase="fork_audit_recording", exc=exc)
+            )
+            self._attach_fork_receipt(
+                exc,
+                self._fork_publication_committed_receipt(publication),
+            )
+            raise
+
+    def _fork_publication_committed_receipt(
+        self,
+        publication: _CheckpointForkPublication,
+    ) -> dict[str, Any]:
+        return self._fork_committed_receipt(
+            checkpoint=publication.checkpoint,
+            root_pid=publication.root_pid,
+            remapped=publication.remapped,
+            post_commit_failures=publication.post_commit_failures,
+        )
+
+    def _reject_nested_checkpoint_fork_transaction(self) -> None:
+        if (
+            self._unit_of_work.probe_runtime_assembly_readiness()
+            is StoreAssemblyReadiness.ACTIVE_TRANSACTION
+        ):
+            raise ValidationError(
+                "checkpoint fork cannot run inside an existing store transaction"
+            )
+
+    @staticmethod
+    def _fork_failure(*, phase: str, exc: BaseException) -> dict[str, str]:
         return {
-            "checkpoint_id": checkpoint_id,
+            "phase": phase,
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+
+    def _fork_committed_receipt(
+        self,
+        *,
+        checkpoint: Checkpoint,
+        root_pid: str,
+        remapped: dict[str, Any],
+        post_commit_failures: Iterable[Mapping[str, str]],
+    ) -> dict[str, Any]:
+        failures = [dict(item) for item in post_commit_failures]
+        return {
+            "checkpoint_id": checkpoint.checkpoint_id,
             "source_pid": checkpoint.pid,
             "fork_root_pid": root_pid,
-            "pid_map": remapped["pid_map"],
-            "object_map": remapped["object_map"],
-            "tool_map": remapped["tool_map"],
-            "status": "forked_with_warnings" if post_commit_failures else "forked",
+            "pid_map": dict(remapped["pid_map"]),
+            "object_map": dict(remapped["object_map"]),
+            "tool_map": dict(remapped["tool_map"]),
+            "status": "forked_with_warnings" if failures else "forked",
             "main_state_committed": True,
-            "post_commit_failures": post_commit_failures,
+            "reconciliation_pending": False,
+            "post_commit_failures": failures,
         }
+
+    def _fork_unknown_outcome_receipt(
+        self,
+        *,
+        checkpoint: Checkpoint,
+        root_pid: str,
+        remapped: dict[str, Any],
+        interruption: BaseException,
+        diagnostic_error: BaseException,
+    ) -> dict[str, Any]:
+        return {
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "source_pid": checkpoint.pid,
+            "fork_root_pid": root_pid,
+            "pid_map": dict(remapped["pid_map"]),
+            "object_map": dict(remapped["object_map"]),
+            "tool_map": dict(remapped["tool_map"]),
+            "status": "fork_outcome_unknown",
+            "main_state_committed": None,
+            "reconciliation_pending": True,
+            "post_commit_failures": [],
+            "outcome_diagnostic": {
+                "phase": "fork_commit_confirmation",
+                "interruption_error_type": type(interruption).__name__,
+                "interruption": str(interruption),
+                "diagnostic_error_type": type(diagnostic_error).__name__,
+                "diagnostic_error": str(diagnostic_error),
+                "prepared_runtime_assets_retained": True,
+            },
+        }
+
+    def _fork_recovery_required_receipt(
+        self,
+        *,
+        checkpoint: Checkpoint,
+        root_pid: str,
+        remapped: dict[str, Any],
+        post_commit_failures: Iterable[Mapping[str, str]],
+        subtree_quarantined: bool,
+    ) -> dict[str, Any]:
+        failures = [dict(item) for item in post_commit_failures]
+        return {
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "source_pid": checkpoint.pid,
+            "fork_root_pid": root_pid,
+            "pid_map": dict(remapped["pid_map"]),
+            "object_map": dict(remapped["object_map"]),
+            "tool_map": dict(remapped["tool_map"]),
+            "status": "fork_recovery_required",
+            "main_state_committed": True,
+            "reconciliation_pending": True,
+            "post_commit_failures": failures,
+            "outcome_diagnostic": {
+                "phase": (
+                    failures[-1]["phase"]
+                    if failures
+                    else "fork_recovery_required"
+                ),
+                "fork_subtree_quarantined": subtree_quarantined,
+                "prepared_runtime_assets_retained": True,
+            },
+        }
+
+    def _secure_checkpoint_fork_subtree(
+        self,
+        *,
+        remapped: Mapping[str, Any],
+        failures: list[dict[str, str]],
+    ) -> str | None:
+        """Confirm absence or durably terminalize a whole ambiguous subtree."""
+
+        target_pids = sorted(
+            {str(pid) for pid in remapped.get("pid_map", {}).values()}
+        )
+        try:
+            with self._unit_of_work.transaction():
+                processes = [
+                    self._processes.get_process(pid) for pid in target_pids
+                ]
+                present = [process for process in processes if process is not None]
+                if present and len(present) != len(target_pids):
+                    raise ValidationError(
+                        "checkpoint fork recovery found a partial durable subtree"
+                    )
+                for process in present:
+                    if process.status in self.TERMINAL_STATUSES:
+                        continue
+                    self._process_transitions.transition(
+                        process.pid,
+                        ProcessStatus.FAILED,
+                        expected_revision=process.revision,
+                        expected_status=process.status,
+                        expected_state_generation=process.state_generation,
+                        wait_state=None,
+                        outcome=FailedProcessOutcome(
+                            code="checkpoint_fork_recovery_required"
+                        ),
+                        control=True,
+                        allowed_statuses={process.status},
+                        reason="checkpoint fork publication recovery required",
+                    )
+        except BaseException as exc:
+            failures.append(
+                self._fork_failure(
+                    phase="fork_subtree_terminalization",
+                    exc=exc,
+                )
+            )
+        try:
+            processes = [self._processes.get_process(pid) for pid in target_pids]
+        except BaseException as exc:
+            failures.append(
+                self._fork_failure(
+                    phase="fork_subtree_terminalization_confirmation",
+                    exc=exc,
+                )
+            )
+            return None
+        if all(process is None for process in processes):
+            return "absent"
+        if all(
+            process is not None and process.status in self.TERMINAL_STATUSES
+            for process in processes
+        ):
+            return "terminalized"
+        if processes:
+            failures.append(
+                {
+                    "phase": "fork_subtree_terminalization_confirmation",
+                    "error_type": "ValidationError",
+                    "message": "checkpoint fork subtree remained schedulable",
+                }
+            )
+        return None
+
+    def _record_and_fence_checkpoint_fork_recovery(
+        self,
+        *,
+        actor: str,
+        receipt: MutableMapping[str, Any],
+    ) -> None:
+        """Persist a recovery signal, then close mutation admission."""
+
+        self._record_checkpoint_fork_recovery(actor=actor, receipt=receipt)
+        diagnostic = dict(receipt.get("outcome_diagnostic") or {})
+
+        diagnostic["lifecycle_fence_requested"] = True
+        receipt["outcome_diagnostic"] = diagnostic
+        try:
+            self._operations.finish(
+                OperationOutcome.UNKNOWN,
+                metadata={
+                    "checkpoint_fork_receipt": deepcopy(dict(receipt)),
+                    "checkpoint_fork_recovery_required": True,
+                },
+            )
+            diagnostic["operation_recovery_signal_recorded"] = True
+        except BaseException as exc:
+            diagnostic["operation_recovery_signal_error_type"] = type(exc).__name__
+            diagnostic["operation_recovery_signal_error"] = str(exc)
+        callback = self._recovery_required_callback
+        if callback is None:
+            diagnostic["lifecycle_fence_error_type"] = "RuntimeError"
+            diagnostic["lifecycle_fence_error"] = (
+                "checkpoint fork recovery fence is unavailable"
+            )
+        else:
+            try:
+                callback(
+                    publication_id=(
+                        "checkpoint-fork:"
+                        f"{receipt['checkpoint_id']}:{receipt['fork_root_pid']}"
+                    )
+                )
+                diagnostic["lifecycle_fenced"] = True
+            except BaseException as exc:
+                diagnostic["lifecycle_fence_error_type"] = type(exc).__name__
+                diagnostic["lifecycle_fence_error"] = str(exc)
+        receipt["outcome_diagnostic"] = diagnostic
+
+    def _record_checkpoint_fork_recovery(
+        self,
+        *,
+        actor: str,
+        receipt: MutableMapping[str, Any],
+    ) -> None:
+        """Record recovery only after the safety state commits independently."""
+
+        diagnostic = dict(receipt.get("outcome_diagnostic") or {})
+        try:
+            record = self.audit.record(
+                actor=actor,
+                action="checkpoint.fork.recovery_required",
+                target=self.checkpoint_resource(str(receipt["checkpoint_id"])),
+                decision=deepcopy(dict(receipt)),
+            )
+            diagnostic["recovery_signal_record_id"] = record.record_id
+        except BaseException as exc:
+            diagnostic["recovery_signal_error_type"] = type(exc).__name__
+            diagnostic["recovery_signal_error"] = str(exc)
+        receipt["outcome_diagnostic"] = diagnostic
+
+    def _attach_fork_receipt(
+        self,
+        exc: BaseException,
+        receipt: Mapping[str, Any],
+    ) -> None:
+        stable_receipt = deepcopy(dict(receipt))
+        setattr(exc, self.FORK_COMMITTED_RECEIPT_ATTRIBUTE, stable_receipt)
+        if stable_receipt.get("reconciliation_pending") is True:
+            diagnostic = dict(stable_receipt.get("outcome_diagnostic") or {})
+            exc.add_note(
+                "checkpoint fork requires recovery before any retry; inspect "
+                f"{self.FORK_COMMITTED_RECEIPT_ATTRIBUTE} "
+                f"(checkpoint_id={stable_receipt['checkpoint_id']}, "
+                f"fork_root_pid={stable_receipt['fork_root_pid']}, "
+                f"phase={diagnostic.get('phase')})"
+            )
+            return
+        if stable_receipt.get("main_state_committed") is not True:
+            diagnostic = dict(stable_receipt.get("outcome_diagnostic") or {})
+            exc.add_note(
+                "checkpoint fork durable outcome could not be confirmed; "
+                "prepared runtime assets were retained; inspect "
+                f"{self.FORK_COMMITTED_RECEIPT_ATTRIBUTE} before recovery "
+                f"(checkpoint_id={stable_receipt['checkpoint_id']}, "
+                f"fork_root_pid={stable_receipt['fork_root_pid']}, "
+                f"diagnostic={diagnostic.get('diagnostic_error_type')})"
+            )
+            return
+        exc.add_note(
+            "checkpoint fork main state committed; inspect "
+            f"{self.FORK_COMMITTED_RECEIPT_ATTRIBUTE} before any retry "
+            f"(checkpoint_id={stable_receipt['checkpoint_id']}, "
+            f"fork_root_pid={stable_receipt['fork_root_pid']})"
+        )
 
     def replay_to_event(
         self,
@@ -1052,7 +1730,7 @@ class CheckpointManager:
         actor: str | None = None,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        checkpoint, _snapshot = self._load_checkpoint(checkpoint_id)
+        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
         if require_capability and actor is not None:
             with self._checkpoint_or_process_read_scope(actor, checkpoint):
                 return self.replay_to_event(
@@ -1062,24 +1740,23 @@ class CheckpointManager:
                     require_capability=False,
                 )
         events = self._evidence.list_events()
-        scoped_pids = set(self._subtree_pids(checkpoint.pid))
+        checkpoint_event_index = self._checkpoint_replay_start_index(
+            events,
+            checkpoint,
+        )
+        # Replay scope starts from the frozen subtree, then follows only
+        # explicit parent/child creation events in the durable event stream.
+        # It therefore remains stable if post-checkpoint descendants later
+        # exit or are removed by restore, without treating detached checkpoint
+        # forks merely initiated by the owner as descendants.
+        scoped_pids = {str(pid) for pid in snapshot.get("subtree_pids", [])}
         selected = []
         reached = False
-        for event in events:
-            if event.created_at < checkpoint.created_at:
-                continue
+        for event in events[checkpoint_event_index:]:
             if event.source not in scoped_pids and event.target not in scoped_pids:
                 continue
-            selected.append(
-                {
-                    "event_id": event.event_id,
-                    "type": event.type.value,
-                    "source": event.source,
-                    "target": event.target,
-                    "created_at": event.created_at,
-                    "payload": event.payload,
-                }
-            )
+            selected.append(self._checkpoint_replay_event(event))
+            self._extend_checkpoint_replay_scope(event, scoped_pids)
             if event.event_id == event_id:
                 reached = True
                 break
@@ -1097,6 +1774,49 @@ class CheckpointManager:
             "diagnostic_only": True,
             "events": selected,
         }
+
+    @staticmethod
+    def _checkpoint_replay_start_index(
+        events: list[Any],
+        checkpoint: Checkpoint,
+    ) -> int:
+        for index, event in enumerate(events):
+            if (
+                event.type == EventType.CHECKPOINT_CREATED
+                and event.target == checkpoint.pid
+                and event.payload.get("checkpoint_id") == checkpoint.checkpoint_id
+            ):
+                return index
+        raise NotFound(
+            "checkpoint creation event not found for replay: "
+            f"{checkpoint.checkpoint_id}"
+        )
+
+    @staticmethod
+    def _checkpoint_replay_event(event: Any) -> dict[str, Any]:
+        return {
+            "event_id": event.event_id,
+            "type": event.type.value,
+            "source": event.source,
+            "target": event.target,
+            "created_at": event.created_at,
+            "payload": event.payload,
+        }
+
+    @staticmethod
+    def _extend_checkpoint_replay_scope(event: Any, scoped_pids: set[str]) -> None:
+        if event.type not in {EventType.PROCESS_CREATED, EventType.PROCESS_FORKED}:
+            return
+        parent = event.payload.get("parent")
+        child = event.payload.get("child")
+        if (
+            isinstance(parent, str)
+            and isinstance(child, str)
+            and parent in scoped_pids
+            and event.source == parent
+            and event.target == child
+        ):
+            scoped_pids.add(child)
 
     def _build_snapshot(
         self,
@@ -1189,15 +1909,20 @@ class CheckpointManager:
         return self._modules.loaded_module_summaries()
 
     def _require_snapshot_modules(self, snapshot: dict[str, Any]) -> None:
-        if self._modules is None:
+        required_modules = ProcessSnapshot.decode_module_requirements(
+            snapshot.get("modules")
+        )
+        if not required_modules:
             return
+        if self._modules is None:
+            raise ValidationError(
+                "checkpoint requires startup modules but the runtime module registry is unavailable"
+            )
         missing = []
-        for module in snapshot.get("modules", []):
-            module_id = str(module.get("module_id", ""))
-            source_sha256 = str(module.get("source_sha256", ""))
-            if not module_id:
-                continue
-            if not self._modules.is_loaded(module_id, source_sha256 or None):
+        for module in required_modules:
+            module_id = str(module["module_id"])
+            source_sha256 = str(module["source_sha256"])
+            if not self._modules.is_loaded(module_id, source_sha256):
                 missing.append({"module_id": module_id, "source_sha256": source_sha256})
         if missing:
             raise ValidationError(f"checkpoint requires startup modules that are not loaded: {missing}")
@@ -1820,6 +2545,8 @@ class CheckpointManager:
         self,
         remapped: dict[str, Any],
         *,
+        fork_rows: SnapshotRows,
+        object_payloads: Mapping[str, Any],
         actor: str,
         checkpoint_id: str,
         require_capability: bool,
@@ -1827,9 +2554,13 @@ class CheckpointManager:
         fork_root_pid: str | None = None,
         image_snapshot: dict[str, Any] | None = None,
         restored_image_ids: list[str] | None = None,
+        publication_state: MutableMapping[str, Any] | None = None,
     ) -> None:
-        rows = remapped["rows"]
         with self._unit_of_work.transaction(include_object_payloads=True):
+            # Start from the pre-frozen artifact so callbacks cannot mutate the
+            # publication inputs. Authority revalidation may only remove or
+            # narrow capabilities before the final canonical artifact is set.
+            remapped["rows"] = fork_rows.to_mapping()
             # These checks must share the publication transaction. A revoke or
             # parent exit committed after preflight therefore wins before any
             # fork process/object/image row becomes visible.
@@ -1847,6 +2578,13 @@ class CheckpointManager:
                         overwrite_existing=False,
                     )
             self._revalidate_remapped_fork_capabilities(remapped)
+            published_rows = SnapshotRows.from_mapping(
+                deepcopy(remapped["rows"])
+            )
+            published_payloads = deepcopy(dict(object_payloads))
+            if publication_state is not None:
+                publication_state["fork_rows"] = published_rows
+                publication_state["object_payloads"] = published_payloads
             if image_snapshot is not None:
                 # Image/artifact rows and process rows commit together. The
                 # Runtime's in-memory image entries are explicitly discarded
@@ -1864,8 +2602,8 @@ class CheckpointManager:
             if fork_parent_pid is not None and fork_root_pid is not None:
                 self._reserve_fork_parent_child_budget(fork_parent_pid, fork_root_pid, remapped)
             self._snapshot_rows.insert_checkpoint_fork_rows(
-                SnapshotRows.from_mapping(rows),
-                object_payloads=remapped["object_payloads"],
+                published_rows,
+                object_payloads=published_payloads,
                 before_insert=self._insert_row,
             )
             self._bind_fork_authority_manifests(remapped, actor=actor)
@@ -1874,6 +2612,22 @@ class CheckpointManager:
                 # parent charge, reservation, and fork rows become visible as
                 # one unit or roll back as one unit.
                 self._charge_fork_parent_child_create(fork_parent_pid)
+        if publication_state is not None:
+            # Fast-path acknowledgement for post-commit sinks/wrappers. If an
+            # interruption lands before this assignment, the caller confirms
+            # the unique root from durable storage before deciding cleanup.
+            self._acknowledge_fork_main_state_commit(publication_state)
+
+    @staticmethod
+    def _acknowledge_fork_main_state_commit(
+        publication_state: MutableMapping[str, Any],
+    ) -> None:
+        publication_state["main_state_committed"] = True
+
+    def _fork_root_is_persisted(self, root_pid: str) -> bool:
+        """Confirm the unique fork root after a lost in-memory commit ack."""
+
+        return self._processes.get_process(root_pid) is not None
 
     def _bind_fork_authority_manifests(self, remapped: dict[str, Any], *, actor: str) -> None:
         manifests = self._authority_manifests
@@ -1952,6 +2706,28 @@ class CheckpointManager:
     def _discard_uncommitted_fork_images(self, image_ids: Iterable[str]) -> None:
         for image_id in image_ids:
             self._images.pop(str(image_id), None)
+
+    def _cleanup_uncommitted_fork(
+        self,
+        remapped: dict[str, Any],
+        image_ids: Iterable[str],
+        *,
+        primary: BaseException,
+    ) -> None:
+        cleanup_failures: list[BaseException] = []
+        for cleanup in (
+            lambda: self._discard_remapped_jit_sources(remapped),
+            lambda: self._discard_uncommitted_fork_images(image_ids),
+        ):
+            try:
+                cleanup()
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+        if cleanup_failures:
+            raise BaseExceptionGroup(
+                "checkpoint fork failed and uncommitted cleanup was interrupted",
+                [primary, *cleanup_failures],
+            ) from primary
 
     def _revalidate_remapped_fork_capabilities(self, remapped: dict[str, Any]) -> None:
         """Refresh source authority immediately before fork-row insertion.

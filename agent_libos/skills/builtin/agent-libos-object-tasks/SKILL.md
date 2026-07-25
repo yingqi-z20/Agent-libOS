@@ -15,7 +15,7 @@ Use one intentionally mutable owner from object-memory. It supplies identity, no
 
 Queues one call and returns `{task: ...}`. Pass `owner_oid`, or `owner_name` plus optional `namespace` (process scope by default). OID wins if both appear, so pass one.
 
-- `tool` must be visible in the creator's process tool table; `args` must match its schema. Start success proves admission, not execution or an external effect.
+- `tool` must be visible in the creator's process tool table. Start validates the ObjectTask envelope but the runner validates target `args` asynchronously through ToolBroker. Start success proves admission, not execution or an external effect; malformed target args can make the queued task fail without executing the target.
 - Admission needs owner read/write/link, `process:spawn`, budget, and capacity. Finite owner grants can be consumed at commit.
 - Runner gets the exact tool and owner read/materialize only. Delegate minimal exact specs through `inherit_capabilities`; ambient and non-delegable authority does not follow.
 - `notify_pid` defaults to creator and permits self, direct parent, or direct nonterminal child. Prefer `normal`; use `interrupt` only for needed preemption and a specific channel.
@@ -40,7 +40,7 @@ Timeout can return `queued`/`running` without failing or cancelling. Explicit wa
 
 ### `watch_object_task_owner`
 
-Changes owner notices for an active ID. `watch_events` accepts `updated`/`linked`; empty preserves defaults. Channel/kind target runner. Terminal tasks reject changes. It neither restarts nor grants access. Pair with target `receive_process_messages` using matching filters.
+Changes owner notices for an active ID. `enabled=false` disables subsequent notices; it does not retract messages already published. `watch_events` accepts `updated`/`linked`; empty preserves the task's current events (initially the Host defaults unless start selected a subset). Channel/kind target runner. Terminal tasks reject changes. It neither restarts nor grants access. Pair with target `receive_process_messages` using matching filters.
 
 ### `cancel_object_task`
 

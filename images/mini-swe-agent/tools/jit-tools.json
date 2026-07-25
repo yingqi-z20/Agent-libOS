@@ -30,9 +30,12 @@
         "output_tail": {"type": "string"},
         "elided_chars": {"type": "integer"},
         "warning": {"type": "string"},
+        "stdout_truncated": {"type": "boolean"},
+        "stderr_truncated": {"type": "boolean"},
+        "output_incomplete": {"type": "boolean"},
         "exception_info": {"type": "string"}
       },
-      "required": ["returncode", "exception_info"],
+      "required": ["returncode", "stdout_truncated", "stderr_truncated", "output_incomplete", "exception_info"],
       "additionalProperties": false
     },
     "tests": [
@@ -45,7 +48,7 @@
             "result": {"returncode": 0, "stdout": "ok", "stderr": ""}
           }
         ],
-        "expected": {"returncode": 0, "output": "ok", "exception_info": ""}
+        "expected": {"returncode": 0, "output": "ok", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": ""}
       },
       {
         "args": {"command": "printf done", "submit": true},
@@ -57,11 +60,11 @@
           },
           {
             "name": "process.exit",
-            "args": {"payload": {"status": "submitted", "returncode": 0, "output": "done", "exception_info": ""}},
+            "args": {"payload": {"status": "submitted", "returncode": 0, "output": "done", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": ""}},
             "result": {"status": "exited"}
           }
         ],
-        "expected": {"returncode": 0, "output": "done", "exception_info": ""}
+        "expected": {"returncode": 0, "output": "done", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": ""}
       },
       {
         "args": {"command": "printf denied"},
@@ -73,7 +76,7 @@
             "error": "denied"
           }
         ],
-        "expected": {"returncode": -1, "output": "", "exception_info": "denied"}
+        "expected": {"returncode": -1, "output": "", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": "denied"}
       },
       {
         "args": {"command": "printf done", "submit": true},
@@ -85,12 +88,23 @@
           },
           {
             "name": "process.exit",
-            "args": {"payload": {"status": "submitted", "returncode": 0, "output": "done", "exception_info": ""}},
+            "args": {"payload": {"status": "submitted", "returncode": 0, "output": "done", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": ""}},
             "ok": false,
             "error": "exit denied"
           }
         ],
-        "expected": {"returncode": -1, "output": "done", "exception_info": "submission failed: exit denied"}
+        "expected": {"returncode": -1, "output": "done", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": "submission failed: exit denied"}
+      },
+      {
+        "args": {"command": "printf clipped"},
+        "syscalls": [
+          {
+            "name": "shell.run",
+            "args": {"argv": ["bash", "-lc", "exec 2>&1; printf clipped"], "timeout_s": 30},
+            "result": {"returncode": 0, "stdout": "clipped", "stderr": "", "stdout_truncated": true, "stderr_truncated": false}
+          }
+        ],
+        "expected": {"returncode": 0, "output": "clipped", "warning": "Shell capture was truncated before this observation; output is incomplete.", "stdout_truncated": true, "stderr_truncated": false, "output_incomplete": true, "exception_info": ""}
       }
     ],
     "metadata": {

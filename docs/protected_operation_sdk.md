@@ -95,6 +95,17 @@ and are normalized by trimming surrounding whitespace. Starting an operation
 whose declared policy has no registered handler fails before `prepare`,
 authority reservation, intent creation, or provider code.
 
+Startup Runtime Module entrypoints run, and their buffered handler
+registrations are applied, before prepared-operation recovery. The registered
+provider/startup hook callbacks themselves run only after recovery completes.
+An entrypoint receives the buffered `ModuleContext`, not the hook-time Host
+surface, so it cannot use `protected_operations` directly; registering a
+prepared-recovery handler from a provider/startup hook is too late for that
+startup. Such a handler must therefore be installed by core composition or
+another trusted pre-recovery Host composition step. A module must not persist a
+prepared policy that depends on its later hook execution after a crash; startup
+will correctly fail with a missing handler.
+
 The recovery-specific effect metadata stores the policy name, safe observation,
 contract/actor identity, and reservation IDs; canonical arguments remain
 represented only by their hash. The handler has the signature

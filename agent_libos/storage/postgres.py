@@ -52,6 +52,14 @@ class _PostgresDialect:
             "INSERT OR REPLACE INTO skill_trust",
             "INSERT INTO skill_trust",
         )
+        # Skill discovery keeps package snapshots in canonical JSON text.  The
+        # shared repository uses SQLite's json_extract() to search only the
+        # public description field; translate that exact reviewed expression
+        # rather than broadening search to the private instruction payload.
+        transformed = _SQLITE_SKILL_DESCRIPTION_JSON_EXTRACT.sub(
+            "(package_json::jsonb ->> 'description')",
+            transformed,
+        )
         transformed = re.sub(
             r"\s+INDEXED\s+BY\s+[A-Za-z_][A-Za-z0-9_]*",
             "",
@@ -317,6 +325,10 @@ class PostgresStore(SQLRuntimeStore):
 _PRAGMA_TABLE_INFO = re.compile(r"^\s*PRAGMA\s+table_info\((?P<table>[A-Za-z_][A-Za-z0-9_]*)\)\s*$", re.IGNORECASE)
 _PRAGMA_INDEX_LIST = re.compile(r"^\s*PRAGMA\s+index_list\((?P<table>[A-Za-z_][A-Za-z0-9_]*)\)\s*$", re.IGNORECASE)
 _PRAGMA_INDEX_INFO = re.compile(r"^\s*PRAGMA\s+index_info\((?P<index>[A-Za-z_][A-Za-z0-9_]*)\)\s*$", re.IGNORECASE)
+_SQLITE_SKILL_DESCRIPTION_JSON_EXTRACT = re.compile(
+    r"json_extract\(\s*package_json\s*,\s*'\$\.description'\s*\)",
+    re.IGNORECASE,
+)
 
 
 def _prepare_parameterized_sql(sql: str) -> str:

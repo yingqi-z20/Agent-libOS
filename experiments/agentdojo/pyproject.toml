@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-libos-agentdojo"
+version = "0.1.0"
+description = "Isolated AgentDojo evaluation harness for Agent libOS."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "agentdojo==0.1.35",
+    "agent-libos",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+]
+
+[project.scripts]
+agent-libos-dojo = "agent_libos_dojo.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_libos_dojo"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-config", "-ra"]
+
+[tool.uv.sources]
+agent-libos = { path = "../..", editable = true }

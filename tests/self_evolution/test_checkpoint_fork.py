@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from types import SimpleNamespace
 
@@ -18,17 +19,51 @@ from agent_libos.models import (
     ObjectOwnerKind,
     ObjectRight,
     ObjectType,
+    OperationOutcome,
+    OperationState,
     PausedProcessWait,
     ProcessStatus,
     ResourceBudget,
 )
-from agent_libos.models.exceptions import CapabilityDenied, ProcessError, ProcessWaitRequired, ResourceLimitExceeded
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    ProcessError,
+    ProcessWaitRequired,
+    ResourceLimitExceeded,
+    ValidationError,
+)
 from agent_libos.tools.base import ToolContext
 from agent_libos.tools.builtin.checkpoint import (
     ForkCheckpointArgs,
     ForkCheckpointOutput,
     ForkCheckpointTool,
 )
+from agent_libos.utils.serde import dumps
+
+
+class _CommitThenRaiseConnection:
+    def __init__(self, connection: object) -> None:
+        self._connection = connection
+        self._fault_pending = True
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+    def commit(self) -> None:
+        self._connection.commit()
+        if self._fault_pending:
+            self._fault_pending = False
+            raise RuntimeError('injected checkpoint fork commit acknowledgement loss')
+
+
+def _fork_operation(runtime: Runtime, pid: str):
+    operations = [
+        operation
+        for operation in runtime.store.list_operations(pid=pid)
+        if operation.name == 'checkpoint.fork'
+    ]
+    assert len(operations) == 1
+    return operations[0]
 
 
 class TestCheckpointFork:
@@ -44,7 +79,11 @@ class TestCheckpointFork:
             'status': 'forked_with_warnings',
             'main_state_committed': True,
             'post_commit_failures': [
-                {'phase': 'fork_event_emission', 'error': 'injected failure'},
+                {
+                    'phase': 'fork_event_emission',
+                    'error_type': 'RuntimeError',
+                    'message': 'injected failure',
+                },
             ],
         }
 
@@ -96,7 +135,199 @@ class TestCheckpointFork:
         assert output.tool_map == {}
         assert output.status == 'forked'
         assert output.main_state_committed is True
+        assert output.reconciliation_pending is False
         assert output.post_commit_failures == []
+
+    def test_fork_rejects_nested_outer_store_transaction(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='nested fork transaction')
+            checkpoint_id = runtime.checkpoint.create(pid, 'nested fork', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            before_pids = {process.pid for process in runtime.process.list()}
+
+            with runtime.uow.transaction():
+                with pytest.raises(
+                    ValidationError,
+                    match='cannot run inside an existing store transaction',
+                ):
+                    runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert {process.pid for process in runtime.process.list()} == before_pids
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('mutation', 'message'),
+        [
+            ('missing_module_id', 'snapshot modules'),
+            ('missing_source_sha256', 'snapshot modules'),
+            ('malformed_source_sha256', 'snapshot modules'),
+            ('mismatched_source_sha256', 'checkpoint requires startup modules'),
+        ],
+    )
+    def test_fork_rejects_invalid_module_identity_without_publication(
+        self,
+        mutation: str,
+        message: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject an incomplete checkpoint module identity during fork',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'incomplete module identity',
+                actor=pid,
+            )
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            assert snapshot['modules']
+            module = snapshot['modules'][0]
+            if mutation == 'missing_module_id':
+                module.pop('module_id')
+            elif mutation == 'missing_source_sha256':
+                module.pop('source_sha256')
+            elif mutation == 'malformed_source_sha256':
+                module['source_sha256'] = 'not-a-sha256'
+            else:
+                module['source_sha256'] = 'f' * 64
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+            before_pids = {process.pid for process in runtime.process.list()}
+
+            with pytest.raises(ValidationError, match=message):
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert {process.pid for process in runtime.process.list()} == before_pids
+        finally:
+            runtime.close()
+
+    def test_checkpoint_fork_operation_rejects_forged_receipt(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='forged fork receipt')
+            error = RuntimeError('forged receipt')
+            error.checkpoint_fork_receipt = {
+                'checkpoint_id': 'ckpt_forged',
+                'source_pid': pid,
+                'fork_root_pid': 'pid_forged',
+                'pid_map': {pid: 'pid_forged'},
+                'object_map': {},
+                'tool_map': {},
+                'status': 'forked',
+                'main_state_committed': True,
+                'reconciliation_pending': False,
+                'post_commit_failures': [],
+                'untrusted_extra': {'secret': 'must-not-persist'},
+            }
+
+            with pytest.raises(RuntimeError, match='forged receipt'):
+                with runtime.operations.scope(
+                    kind='runtime',
+                    name='checkpoint.fork',
+                    actor=pid,
+                    pid=pid,
+                ) as operation:
+                    operation_id = operation.operation_id
+                    raise error
+
+            persisted = runtime.store.get_operation(operation_id)
+            assert persisted is not None
+            assert persisted.outcome == OperationOutcome.FAILED
+            assert 'checkpoint_fork_receipt' not in persisted.metadata
+        finally:
+            runtime.close()
+
+    def test_fork_real_commit_ack_loss_rehydrates_payload_and_returns_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork payload ack loss')
+            original = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'value': 41},
+                name='state',
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'payload ack loss', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            original_insert = runtime.checkpoint._insert_fork_rows
+            original_publish = (
+                runtime.uow.snapshots.publish_checkpoint_fork_process_rows
+            )
+            quarantined_statuses: list[ProcessStatus] = []
+
+            def insert_with_commit_fault(*args, **kwargs):
+                runtime.store.conn = _CommitThenRaiseConnection(runtime.store.conn)
+                return original_insert(*args, **kwargs)
+
+            def observe_quarantine(rows):
+                quarantined_statuses.extend(
+                    runtime.store.get_process(str(row['pid'])).status
+                    for row in rows.processes
+                    if str(row['status']) not in {
+                        ProcessStatus.EXITED.value,
+                        ProcessStatus.FAILED.value,
+                        ProcessStatus.KILLED.value,
+                    }
+                )
+                return original_publish(rows)
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_insert_fork_rows',
+                insert_with_commit_fault,
+            )
+            monkeypatch.setattr(
+                runtime.uow.snapshots,
+                'publish_checkpoint_fork_process_rows',
+                observe_quarantine,
+            )
+
+            result = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert result['status'] == 'forked_with_warnings'
+            assert result['main_state_committed'] is True
+            assert result['reconciliation_pending'] is False
+            assert result['post_commit_failures'][0]['phase'] == 'fork_commit_acknowledgement'
+            assert quarantined_statuses
+            assert set(quarantined_statuses) == {ProcessStatus.CREATED}
+            fork_oid = result['object_map'][original.oid]
+            fork_object = runtime.store.get_object(fork_oid)
+            assert fork_object is not None
+            assert fork_object.payload == {'value': 41}
+            root = runtime.store.get_process(result['fork_root_pid'])
+            assert root is not None
+            assert root.status == ProcessStatus.RUNNABLE
+            operation = _fork_operation(runtime, pid)
+            assert operation.state == OperationState.TERMINAL
+            assert operation.outcome == OperationOutcome.SUCCEEDED
+        finally:
+            runtime.close()
 
     @pytest.mark.parametrize(
         ('sink', 'phase'),
@@ -146,6 +377,393 @@ class TestCheckpointFork:
             assert result['main_state_committed'] is True
             assert phase in [failure['phase'] for failure in result['post_commit_failures']]
             assert runtime.store.get_process(result['fork_root_pid']) is not None
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'fault_type',
+        [KeyboardInterrupt, asyncio.CancelledError],
+        ids=['keyboard_interrupt', 'cancelled_error'],
+    )
+    def test_fork_precommit_base_exception_cleans_prepared_runtime_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fault_type: type[BaseException],
+    ) -> None:
+        runtime = Runtime.open('local')
+        cleanup_calls: list[str] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork interrupted before commit')
+            checkpoint_id = runtime.checkpoint.create(pid, 'precommit interruption', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            before_pids = {process.pid for process in runtime.process.list()}
+            original_discard_jit = runtime.checkpoint._discard_remapped_jit_sources
+            original_discard_images = runtime.checkpoint._discard_uncommitted_fork_images
+
+            def interrupt_prepare(_remapped):
+                raise fault_type('injected precommit fork interruption')
+
+            def observe_discard_jit(remapped):
+                cleanup_calls.append('jit')
+                original_discard_jit(remapped)
+
+            def observe_discard_images(image_ids):
+                cleanup_calls.append('images')
+                original_discard_images(image_ids)
+
+            monkeypatch.setattr(runtime.checkpoint, '_restore_jit_sources', interrupt_prepare)
+            monkeypatch.setattr(runtime.checkpoint, '_discard_remapped_jit_sources', observe_discard_jit)
+            monkeypatch.setattr(runtime.checkpoint, '_discard_uncommitted_fork_images', observe_discard_images)
+
+            with pytest.raises(fault_type) as caught:
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert str(caught.value) == 'injected precommit fork interruption'
+            assert cleanup_calls == ['jit', 'images']
+            assert {process.pid for process in runtime.process.list()} == before_pids
+            assert not hasattr(
+                caught.value,
+                runtime.checkpoint.FORK_COMMITTED_RECEIPT_ATTRIBUTE,
+            )
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('sink', 'fault_type'),
+        [
+            ('event', KeyboardInterrupt),
+            ('event', asyncio.CancelledError),
+            ('audit', KeyboardInterrupt),
+            ('audit', asyncio.CancelledError),
+        ],
+        ids=[
+            'event-keyboard-interrupt',
+            'event-cancelled-error',
+            'audit-keyboard-interrupt',
+            'audit-cancelled-error',
+        ],
+    )
+    def test_fork_postcommit_base_exception_preserves_state_and_attaches_receipt(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sink: str,
+        fault_type: type[BaseException],
+    ) -> None:
+        runtime = Runtime.open('local')
+        cleanup_calls: list[str] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork interrupted after commit')
+            checkpoint_id = runtime.checkpoint.create(pid, 'postcommit interruption', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            original_discard_jit = runtime.checkpoint._discard_remapped_jit_sources
+            original_discard_images = runtime.checkpoint._discard_uncommitted_fork_images
+
+            def observe_discard_jit(remapped):
+                cleanup_calls.append('jit')
+                original_discard_jit(remapped)
+
+            def observe_discard_images(image_ids):
+                cleanup_calls.append('images')
+                original_discard_images(image_ids)
+
+            monkeypatch.setattr(runtime.checkpoint, '_discard_remapped_jit_sources', observe_discard_jit)
+            monkeypatch.setattr(runtime.checkpoint, '_discard_uncommitted_fork_images', observe_discard_images)
+            interruption = fault_type(f'injected fork {sink} interruption')
+            if sink == 'event':
+                original_emit = runtime.events.emit
+
+                def interrupt_fork_event(event_type, *args, **kwargs):
+                    if event_type == EventType.PROCESS_FORKED:
+                        raise interruption
+                    return original_emit(event_type, *args, **kwargs)
+
+                monkeypatch.setattr(runtime.events, 'emit', interrupt_fork_event)
+            else:
+                original_record = runtime.audit.record
+
+                def interrupt_fork_audit(*args, **kwargs):
+                    if kwargs.get('action') == 'checkpoint.fork':
+                        raise interruption
+                    return original_record(*args, **kwargs)
+
+                monkeypatch.setattr(runtime.audit, 'record', interrupt_fork_audit)
+
+            with pytest.raises(fault_type) as caught:
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert caught.value is interruption
+            receipt = getattr(
+                caught.value,
+                runtime.checkpoint.FORK_COMMITTED_RECEIPT_ATTRIBUTE,
+            )
+            assert receipt['checkpoint_id'] == checkpoint_id
+            assert receipt['source_pid'] == pid
+            assert receipt['status'] == 'forked_with_warnings'
+            assert receipt['main_state_committed'] is True
+            assert receipt['pid_map'][pid] == receipt['fork_root_pid']
+            expected_phase = (
+                'fork_audit_recording' if sink == 'audit' else 'fork_event_emission'
+            )
+            assert receipt['post_commit_failures'][-1]['phase'] == expected_phase
+            assert runtime.store.get_process(receipt['fork_root_pid']) is not None
+            assert cleanup_calls == []
+            assert any('checkpoint fork main state committed' in note for note in caught.value.__notes__)
+            operation = _fork_operation(runtime, pid)
+            assert operation.state == OperationState.TERMINAL
+            assert operation.outcome == OperationOutcome.SUCCEEDED
+            assert operation.metadata['checkpoint_fork_receipt'] == receipt
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'fault_type',
+        [KeyboardInterrupt, asyncio.CancelledError],
+        ids=['keyboard_interrupt', 'cancelled_error'],
+    )
+    def test_fork_commit_ack_interruption_uses_committed_receipt_without_cleanup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fault_type: type[BaseException],
+    ) -> None:
+        runtime = Runtime.open('local')
+        cleanup_calls: list[str] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork commit acknowledgement')
+            checkpoint_id = runtime.checkpoint.create(pid, 'commit acknowledgement', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            original_insert = runtime.checkpoint._insert_fork_rows
+
+            def interrupt_after_commit(*args, **kwargs):
+                original_insert(*args, **kwargs)
+                raise fault_type('injected fork commit acknowledgement interruption')
+
+            monkeypatch.setattr(runtime.checkpoint, '_insert_fork_rows', interrupt_after_commit)
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_discard_remapped_jit_sources',
+                lambda _remapped: cleanup_calls.append('jit'),
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_discard_uncommitted_fork_images',
+                lambda _image_ids: cleanup_calls.append('images'),
+            )
+
+            with pytest.raises(fault_type) as caught:
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            receipt = getattr(
+                caught.value,
+                runtime.checkpoint.FORK_COMMITTED_RECEIPT_ATTRIBUTE,
+            )
+            assert receipt['main_state_committed'] is True
+            assert receipt['post_commit_failures'] == [
+                {
+                    'phase': 'fork_commit_acknowledgement',
+                    'error_type': fault_type.__name__,
+                    'message': 'injected fork commit acknowledgement interruption',
+                }
+            ]
+            assert runtime.store.get_process(receipt['fork_root_pid']) is not None
+            assert cleanup_calls == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'fault_type',
+        [KeyboardInterrupt, asyncio.CancelledError],
+        ids=['keyboard_interrupt', 'cancelled_error'],
+    )
+    def test_fork_durable_root_confirms_commit_before_in_memory_ack(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fault_type: type[BaseException],
+    ) -> None:
+        runtime = Runtime.open('local')
+        cleanup_calls: list[str] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork durable commit confirmation')
+            checkpoint_id = runtime.checkpoint.create(pid, 'durable commit confirmation', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            interruption = fault_type('injected interruption before in-memory fork ack')
+
+            def interrupt_ack(_publication_state):
+                raise interruption
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_acknowledge_fork_main_state_commit',
+                interrupt_ack,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_discard_remapped_jit_sources',
+                lambda _remapped: cleanup_calls.append('jit'),
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_discard_uncommitted_fork_images',
+                lambda _image_ids: cleanup_calls.append('images'),
+            )
+
+            with pytest.raises(fault_type) as caught:
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert caught.value is interruption
+            receipt = getattr(
+                caught.value,
+                runtime.checkpoint.FORK_COMMITTED_RECEIPT_ATTRIBUTE,
+            )
+            assert receipt['main_state_committed'] is True
+            assert receipt['post_commit_failures'][0]['phase'] == 'fork_commit_acknowledgement'
+            assert runtime.store.get_process(receipt['fork_root_pid']) is not None
+            assert cleanup_calls == []
+        finally:
+            runtime.close()
+
+    def test_fork_commit_diagnostic_failure_fences_runtime_and_marks_unknown(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        cleanup_calls: list[str] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork unknown commit outcome')
+            checkpoint_id = runtime.checkpoint.create(pid, 'unknown commit outcome', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            interruption = asyncio.CancelledError('injected fork publication interruption')
+
+            original_insert = runtime.checkpoint._insert_fork_rows
+
+            def interrupt_after_durable_quarantine(*args, **kwargs):
+                original_insert(*args, **kwargs)
+                kwargs['publication_state']['main_state_committed'] = False
+                raise interruption
+
+            def fail_durable_confirmation(_root_pid):
+                raise RuntimeError('injected durable fork confirmation failure')
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_insert_fork_rows',
+                interrupt_after_durable_quarantine,
+            )
+            monkeypatch.setattr(runtime.checkpoint, '_fork_root_is_persisted', fail_durable_confirmation)
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_secure_checkpoint_fork_subtree',
+                lambda **_kwargs: None,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_discard_remapped_jit_sources',
+                lambda _remapped: cleanup_calls.append('jit'),
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_discard_uncommitted_fork_images',
+                lambda _image_ids: cleanup_calls.append('images'),
+            )
+
+            with pytest.raises(asyncio.CancelledError) as caught:
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert caught.value is interruption
+            assert isinstance(caught.value.__cause__, RuntimeError)
+            assert str(caught.value.__cause__) == 'injected durable fork confirmation failure'
+            receipt = getattr(
+                caught.value,
+                runtime.checkpoint.FORK_COMMITTED_RECEIPT_ATTRIBUTE,
+            )
+            assert receipt['status'] == 'fork_outcome_unknown'
+            assert receipt['main_state_committed'] is None
+            assert receipt['reconciliation_pending'] is True
+            assert receipt['outcome_diagnostic']['phase'] == 'fork_commit_confirmation'
+            assert receipt['outcome_diagnostic']['diagnostic_error_type'] == 'RuntimeError'
+            assert receipt['outcome_diagnostic']['lifecycle_fenced'] is True
+            assert cleanup_calls == []
+            assert runtime.lifecycle.state == 'close_failed'
+            operation = _fork_operation(runtime, pid)
+            assert operation.outcome == OperationOutcome.UNKNOWN
+            assert operation.metadata['checkpoint_fork_receipt']['status'] == 'fork_outcome_unknown'
+            with pytest.raises(RuntimeError):
+                runtime.process.spawn(image='base-agent:v0', goal='must remain fenced')
+        finally:
+            runtime.close()
+
+    def test_fork_payload_rehydration_failure_terminalizes_subtree(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='fork rehydrate failure')
+            runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'value': 9},
+                name='state',
+            )
+            checkpoint_id = runtime.checkpoint.create(pid, 'rehydrate failure', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+
+            def fail_rehydration(*_args, **_kwargs):
+                raise RuntimeError('injected fork payload rehydration failure')
+
+            monkeypatch.setattr(
+                runtime.uow.snapshots,
+                'rehydrate_checkpoint_fork_object_payloads',
+                fail_rehydration,
+            )
+
+            with pytest.raises(RuntimeError, match='payload rehydration failure') as caught:
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            receipt = getattr(
+                caught.value,
+                runtime.checkpoint.FORK_COMMITTED_RECEIPT_ATTRIBUTE,
+            )
+            assert receipt['status'] == 'fork_recovery_required'
+            assert receipt['main_state_committed'] is True
+            assert receipt['reconciliation_pending'] is True
+            assert receipt['outcome_diagnostic']['fork_subtree_quarantined'] is True
+            assert all(
+                runtime.store.get_process(fork_pid).status == ProcessStatus.FAILED
+                for fork_pid in receipt['pid_map'].values()
+            )
+            operation = _fork_operation(runtime, pid)
+            assert operation.outcome == OperationOutcome.UNKNOWN
+            assert operation.metadata['checkpoint_fork_receipt'] == receipt
         finally:
             runtime.close()
 

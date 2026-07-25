@@ -6,9 +6,12 @@ checkpoints, capabilities, Skills, JSON-RPC endpoints, MCP servers, audit
 records, persisted LLM calls, and human Agent ratings.
 
 The GUI is a local-only Electron app. Electron starts
-`agent-libos-gui-server`, receives a random session bearer token, and connects
-to `127.0.0.1` through HTTP and Server-Sent Events. The renderer never receives
-Node.js access; it uses the preload-exposed `libosApi` object.
+`agent-libos-gui-server`, receives a bearer token that is random by default,
+and connects to `127.0.0.1` through HTTP and Server-Sent Events. The renderer
+never receives Node.js access, but the preload-exposed `libosApi` object gives
+it the connection information, including that bearer token, needed for direct
+localhost HTTP and SSE calls. Renderer content and dependency integrity are
+therefore part of the local GUI trusted computing base.
 
 During development the Electron main process starts the backend without a
 shell. It first honors `AGENT_LIBOS_GUI_SERVER_BIN`, then tries the project
@@ -20,11 +23,11 @@ local entrypoint exists.
 ```text
 Electron main process
   -> starts Python agent-libos-gui-server
-  -> owns the random GUI bearer token
-  -> exposes limited preload IPC
+  -> receives the GUI bearer token
+  -> exposes limited preload IPC, including the authenticated connection
 
 React renderer
-  -> calls localhost HTTP APIs
+  -> receives the bearer token through preload and calls localhost HTTP APIs
   -> subscribes to /api/events/stream
   -> renders process, message, approval, audit, and LLM state
 
@@ -44,23 +47,31 @@ that invalidation; the bundled renderer does so. This makes a replay gap
 explicit instead of silently leaving the UI on stale state.
 
 Append-event de-duplication is bounded by the GUI event-buffer configuration.
-Immutable events, audit records, messages, and LLM calls use their durable ids.
-Human requests use the request id together with `updated_at` and `status`, so a
-pending request and its later approved/rejected/cancelled version each produce
-a `human_request.updated` event without growing an unbounded in-process set.
+Append-only events and audit records use their durable ids. Message and LLM-call
+notifications also key de-duplication by durable row id, but that identity key
+does not make every backing message or LLM row immutable; lifecycle updates and
+payload-retention reductions remain governed by the storage contract. Human
+requests use the request id together with `updated_at` and `status`, so a pending
+request and its later approved/rejected/cancelled version each produce a
+`human_request.updated` event without growing an unbounded in-process set.
 
-The GUI server is not a new security boundary. It is a local admin control
-surface over the same primitives, Capability checks, human approval flow,
-events, and audit records used by the CLI. Its Python entrypoint lives under
+The GUI server is not a separate process-effect boundary. It is an
+authenticated local Host/admin authority boundary over the same primitives,
+Capability checks, human approval flow, events, and audit records used by the
+CLI. Possession of its bearer token authorizes the documented Host/admin
+routes; actor-mode routes instead use the selected process's authority. Its
+Python entrypoint lives under
 `agent_libos.api.gui` with the CLI because both are host-facing API surfaces.
 Only a bearer token holder on the same machine can use it; CORS is limited to
-loopback HTTP(S) browser origins plus the exact packaged-renderer origin
+loopback HTTP(S) browser origins plus the exact production-renderer origin
 `agent-libos://app`; it does not accept `Origin: null` or other custom-scheme
-hosts. Packaged Electron serves `gui/dist` through that privileged, secure
-custom protocol instead of `file://`, giving browser requests a stable origin
-without broadening the server allowlist. The protocol resolver rejects other
-authorities, credentials, ports, traversal, and paths outside the distribution
-root.
+hosts. The Electron production-build path serves `gui/dist` through that
+privileged, secure custom protocol instead of `file://`, giving browser
+requests a stable origin without broadening the server allowlist. The protocol
+resolver rejects other authorities, credentials, ports, traversal, missing or
+non-file targets, and symbolic links whose canonical target is outside the
+distribution root. Assets are read from a verified file descriptor so a
+pathname swap after validation cannot redirect the response.
 
 The GUI can display data-flow Audit/Event/Explain evidence produced by runtime
 operations, but it does not expose a Sink-trust mutation route or model tool.
@@ -135,6 +146,13 @@ Run the Electron app:
 npm --prefix gui run electron:dev
 ```
 
+Unlike the general `LLMClient.from_env()` and CLI configuration path, the
+Electron launcher intentionally reads `<repository-root>/.env` before it starts
+`agent-libos-gui-server`. Values already present in the Electron process
+environment take precedence; `.env` only fills missing keys. This is a GUI
+launcher compatibility behavior, not implicit `.env` loading by the CLI or
+library API.
+
 Build and type-check the GUI:
 
 ```bash
@@ -167,8 +185,10 @@ Python GUI server startup, authenticated `/api/health`, and graceful shutdown
 against an in-memory `local` store without creating a BrowserWindow. Smoke
 logging redacts the temporary bearer token. Set
 `AGENT_LIBOS_GUI_SMOKE_WINDOW=1` when a machine has a working desktop/GPU stack
-and you specifically want to exercise the packaged custom-protocol renderer,
-its API origin, and the preload bridge.
+and you specifically want to exercise the production Vite build through the
+custom-protocol BrowserWindow, its API origin, and the preload bridge. This is
+a production-build/custom-protocol smoke, not an installer, packaged-app,
+code-signing, or notarization test; Electron packaging is not configured here.
 
 The Vite development server is bound to `127.0.0.1` and restricts file serving
 to the `gui/` directory. Production dependency audit should remain clean; any
@@ -290,8 +310,8 @@ and expose linked ARIA title/description state. Detail tabs support arrow,
 Home, and End navigation. At narrower widths the operator pane moves from three
 columns to two rows and then to a single scrollable column; the user page,
 forms, dialogs, and image rows also collapse without requiring a wide desktop
-viewport. The packaged window can be resized down to 360px so those layouts are
-reachable. Reduced-motion preferences disable continuous animation.
+viewport. The production Electron window can be resized down to 360px so those
+layouts are reachable. Reduced-motion preferences disable continuous animation.
 
 Detailed cwd and resource budget/usage values are shown in process metadata and
 detail views rather than as fields on every process-tree row. The Object Memory
@@ -316,15 +336,19 @@ area: Electron passes `app.getPath("userData")/llm-profiles.json` to the Python
 server, while direct `agent-libos-gui-server` runs default to `%APPDATA%/Agent
 libOS/llm-profiles.json` on Windows, `~/Library/Application Support/Agent
 libOS/llm-profiles.json` on macOS, and the `agent-libos/llm-profiles.json`
-file under `${XDG_CONFIG_HOME:-~/.config}` on Linux. The file stores model routing fields such
-as profile id, model, base URL, API mode, tuning options, optional
-`context_window_tokens`, prompt-cache/Responses-chain settings, and the
+file under `${XDG_CONFIG_HOME:-~/.config}` on Linux. The file stores model
+routing fields such as profile id, model, base URL, API mode, tuning options,
+optional `context_window_tokens`, prompt-cache/Responses-continuation policy
+settings, and the
 `api_key_env`/`safety_identifier_env` names. It never stores either environment
 variable's value. The bundled editor exposes every field returned by the GUI
 profile summary, including reasoning effort, verbosity, cache retention, and
-explicit Responses-chain reuse; profile deletion requires an inline second
-confirmation. Numeric fields reject fractional integers, non-finite values, and
-values outside their displayed minimums instead of silently coercing them. A
+explicit Responses continuation policy. The current full-snapshot AgentProcess
+executor records that policy but does not send `previous_response_id`; enabling
+provider storage can still increase provider-side retention. Profile deletion
+requires an inline second confirmation. Numeric fields reject fractional
+integers, non-finite values, and values outside their displayed minimums instead
+of silently coercing them. A
 `PUT` is a partial update: profile fields not exposed or omitted by the current
 renderer are preserved rather than silently reset. When a profile has a base URL,
 `allow_custom_base_url: false` is preserved explicitly rather than inferred
@@ -356,7 +380,9 @@ prompt/output observability metadata. This default supports self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. If
 the host runtime is configured with `llm.persist_full_io=False`, the same
 `llm_calls` API returns content-free hashes, counts, and structural envelopes
-for sensitive prompt, tool, reasoning, and provider payload fields.
+for sensitive prompt, tool, reasoning, and provider payload fields. Processes
+using `image_only` cannot run under that setting because their lossless durable
+transcript is unavailable; they fail before provider dispatch.
 
 GUI background auto-run deliberately sets `process_human_queue=false`. It may
 advance runnable model work, but it never auto-approves, auto-denies, or invents
@@ -621,8 +647,12 @@ process syscalls. See [explainable_operations.md](explainable_operations.md).
 the server does not synthesize authority from image requirements. The bundled
 renderer submits an explicit manifest built only from its visible task-access
 controls. It never copies image requirements into grants: its sole launch grant
-is non-delegable `human:owner` write for communication. Selected filesystem,
-the restricted `shell:git` class, and typed local-Git scopes are non-delegable
+in the baseline mode is non-delegable `human:owner` write for communication.
+Enabling reviewed commands additionally grants a non-delegable `shell:*`
+execute capability constrained to `allowlist_auto_else_ask`. Enabling context
+maintenance adds non-delegable enrichment/maintenance, restricted child-spawn,
+and context-compressor image-read capabilities. Selected filesystem, the
+restricted `shell:git` class, and typed local-Git scopes remain non-delegable
 `approval_policy.requestable_capabilities`, so an in-scope model request still
 creates a Human decision and an out-of-scope request is rejected before the
 Human queue. Explain shows the resulting id/hash, grants, unmet requirements,

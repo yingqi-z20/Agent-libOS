@@ -3,9 +3,11 @@
 LLM-facing tools are stable wrappers over libOS primitives. They provide names,
 schemas, validation, and model ergonomics. Primitives enforce authority.
 
-Tool visibility is not resource authority. A process can call only tools in its
-process tool table, but filesystem, shell, JSON-RPC, MCP, human, memory, image,
-Git, clock, and process effects are still authorized by the primitive path. `ToolPolicy`
+Tool visibility is not resource authority. A broker call can resolve only a
+binding in the complete process tool table, while an LLM action must also be in
+the narrower model tool projection. Filesystem, shell, JSON-RPC, MCP, human,
+memory, image, Git, clock, and process effects are still authorized by the
+primitive path. `ToolPolicy`
 contains declaration metadata such as `declared_permissions` and
 `declared_confirmation_required`; it is shown in tool specs for humans and UI,
 but it does not grant permissions or approve execution.
@@ -228,8 +230,9 @@ A workflow is a tool that a user runs directly. `Runtime.run_workflow()` and
 `uv run agent-libos workflow run <tool>` spawn a fresh AgentProcess, call one
 tool through ToolBroker, and return the normal tool result JSON. The entrypoint
 does not run the LLM scheduler and does not create a second authority model:
-the selected image's process tool table still controls visibility, while
-primitives enforce capabilities, approval, budgets, events, and audit.
+the selected Image's complete process tool table controls callability, and its
+model projection is not consulted or widened. Primitives still enforce
+capabilities, approval, budgets, events, and audit.
 
 Successful workflow calls append the tool result object to the workflow
 process view and exit the process with that result. Failed calls mark the
@@ -242,10 +245,17 @@ normal runtime mechanisms. If the tool itself performs `process.exit` or
 
 Object tasks let an AgentObject hold asynchronous tool work. `start_object_task`
 creates a host-managed runner child process, narrows that runner's process tool
-table to the requested visible tool, and calls the tool through ToolBroker. The
+table to the requested creator-bound tool, and calls it through ToolBroker. The
 runner is excluded from the LLM scheduler even if a message wakes it back to a
 `RUNNABLE` process status, and it does not grant external authority unless the
 creator explicitly delegates capabilities into the runner.
+
+Start validates the ObjectTask envelope, owner/authority/capacity, and that the
+named tool is visible before returning the durable queued task. The target
+tool's own argument-schema validation happens later in the asynchronous runner.
+Thus a returned `queued` task does not prove that `args` are valid; malformed
+target arguments produce a terminal task failure that must be observed with
+get/wait.
 
 Successful tasks create the usual tool result object and link the owner object
 to that result with `PRODUCED`. Notifications are ordinary process messages
@@ -281,6 +291,9 @@ safe replay semantics, currently `receive_process_messages` and
 exact stored human-request id after the request settles; a rejected
 `request_permission` resumes so the tool can return the denial, while rejection
 of another human-waiting tool fails the task.
+`watch_object_task_owner` accepts `enabled=false` to disable subsequent owner
+notices for an active task; disabling a watch does not retract notices already
+published, cancel the runner, or alter target-tool authority.
 
 ## Writing Python Tools
 
@@ -437,8 +450,17 @@ paths. `run_jit_tool` is not a real process tool and cannot be called through
 
 Multiplexed mode does not inject a JIT catalog into prompt or context. The
 image or loaded Skill instructions must describe the valid JIT names and
-argument shapes. The name `run_jit_tool` is reserved for multiplexed images and
-cannot be used as a real default tool or JIT tool in that mode.
+argument shapes. Prompt projection also omits the registered package's JIT
+catalog and JIT source entries from its resource summary. This is not a resource
+ACL: if trusted instructions or earlier authorized evidence supplied an exact
+loaded-snapshot resource path, `read_skill_resource` can still read it. It does
+not list paths, so callers must not probe guessed filenames.
+
+The name `run_jit_tool` is hard-reserved when an image uses multiplexed
+exposure: it cannot be a real default tool, manually proposed JIT tool, package
+JIT tool, or image-package JIT tool in that mode. Direct-mode validation does
+not reserve the spelling, but using it as a real JIT name is not portable: a
+later switch to multiplexed exposure will reject the collision.
 
 ## TypeScript Entry Point
 
@@ -559,6 +581,27 @@ The current syscall surface covers existing primitive areas:
 - checkpoint create/list/inspect/diff/restore/fork/replay,
 - Skill discover/inspect/register_path/activate/read_resource/unload.
 
+The authoritative built-in name/alias inventory is generated from
+[`BUILTIN_SYSCALL_DESCRIPTORS`](../agent_libos/runtime/syscall_descriptors.py),
+and its uniqueness/completeness ratchet lives in
+[`test_syscall_descriptors.py`](../tests/unit/test_syscall_descriptors.py).
+Those descriptors intentionally define only canonical spelling, stable aliases,
+and the routed handler; the documentation does not copy a count that would
+become stale when a route changes. Aliases enter the identical canonical
+handler and do not relax validation or authority.
+
+This inventory is Host-side route discovery, not a parameter-schema API.
+Neither it nor `libos` supplies runtime introspection for arguments, results,
+required Capability, idempotency, or blocking. Those properties are
+handler/domain-specific and must come from a trusted Image, loaded Skill, Host
+contract, or the domain documentation. A model must not infer a syscall
+contract from a similarly named model tool. In particular, a successful route
+lookup proves none of the following: that its arguments are valid, that its
+result matches another tool's output, that authority is present, or that it
+will return without a Human/process/message wait. When an exact published
+contract is unavailable, keep the JIT pure, use the governed model-facing tool,
+or stop for Host guidance rather than probing.
+
 Trusted startup Runtime Modules can add additional syscall names through the
 runtime syscall router. They cannot override built-in syscall names, and the
 handler still runs as part of the same `LibOSSyscallSession` under the caller
@@ -643,9 +686,11 @@ result can still return the original error to the caller.
 
 The canonical successful result carrier is a Tool Result Object Memory object,
 subject to a hard serialized payload limit. It is not necessarily the only
-durable copy: eligible OpenAI Responses continuation chains persist the exact
-action-result envelope (including its payload) in `llm_tool_outputs`, and with
-full LLM I/O persistence later call messages may retain the rendered result.
+durable copy: an `image_only` transcript persists its bounded model-facing
+result projection and paired call metadata in `llm_tool_outputs`, and with full
+LLM I/O persistence later call messages may retain the rendered result. The
+current full-snapshot AgentProcess executor does not create provider-side
+Responses-continuation output rows.
 Audit and event envelopes remain bounded/redacted as described above. A failed
 tool result is also stored as a Tool Result Object whenever its trusted data-flow
 context differs from the default context; this labeled carrier prevents error
@@ -658,7 +703,12 @@ reference rather than returned inline from a tool.
 
 ## Deferred Lifecycle
 
-`process.exit` and `process.exec` are normal syscalls from TypeScript. Calling
-them does not terminate the Deno subprocess mid-protocol. The runtime records
-the lifecycle change and applies it after the JIT tool returns its normal
-result.
+`process.exit` and `process.exec` are lifecycle syscalls from TypeScript.
+Calling them does not terminate the Deno subprocess mid-protocol. The runtime
+records the lifecycle change and applies it after the JIT tool returns its
+normal result. Direct `process.exit` is unavailable when the active image (or a
+deferred exec target) uses cumulative completion review; call the built-in
+`process_exit` tool separately so its review/evidence gate remains authoritative.
+When one JIT call requests both lifecycle changes, both images are checked
+before mutation. A standalone authorized exec adopts the target image's contract
+for later calls; it does not permanently carry the source image's gate.

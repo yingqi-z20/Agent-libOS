@@ -44,9 +44,43 @@ jobs:
       - name: Check invariant manifest and pytest collection
         run: uv run python scripts/check_test_invariants.py
 
+  agentdojo:
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    name: agentdojo (${{ matrix.python-version }})
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Install isolated AgentDojo dependencies
+        working-directory: experiments/agentdojo
+        run: uv sync --frozen
+
+      - name: Run isolated AgentDojo tests
+        working-directory: experiments/agentdojo
+        run: uv run --frozen pytest -q
+
   release-artifacts:
     needs:
       - static
+      - agentdojo
       - python
       - security
       - deterministic-release
@@ -91,6 +125,7 @@ jobs:
           "$GITHUB_WORKSPACE/.release-venv/bin/python" -c "import agent_libos, importlib.metadata; from agent_libos.skills import get_builtin_skill_catalog; catalog = get_builtin_skill_catalog(); assert agent_libos.__version__ == importlib.metadata.version('agent-libos'); assert len(catalog.list()) == 26; assert sum(len(skill.allowed_tools) for skill in catalog.list()) == 99"
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos" --help
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos-gui-server" --help
+          "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos-migrate-tool-groups" --help
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos" --db local demo > demo.json
 
       - name: Clean-install source distribution
@@ -104,6 +139,7 @@ jobs:
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" -c "import agent_libos, importlib.metadata; from agent_libos.skills import get_builtin_skill_catalog; catalog = get_builtin_skill_catalog(); assert agent_libos.__version__ == importlib.metadata.version('agent-libos'); assert len(catalog.list()) == 26; assert sum(len(skill.allowed_tools) for skill in catalog.list()) == 99"
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos" --help
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos-gui-server" --help
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos-migrate-tool-groups" --help
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos" --db local demo > demo.json
 
       - name: Preserve validated distributions
