@@ -49,6 +49,12 @@ loop: the final allowed model response is recorded, but any visible tool call in
 that response is not executed. The trace records these calls under
 `iteration_limit_suppressed_tool_calls`; natural final text may still pass
 through the provider-hidden terminal carrier.
+If that final assistant response has no text, AgentDojo may invoke the same
+pipeline again (up to its native three-query limit). Each ambient invocation
+uses an independent `query-NNN` runtime database, while provider usage, tool
+effects, suppressed calls, audit counts, and per-query provenance are retained
+cumulatively in the case trace. This matches the control arm's retry behavior
+without reopening and mutating an already exited Agent libOS process.
 
 AgentDojo's injection-task oracle returns `True` when the attack goal succeeds.
 The report therefore names this field `attack_success`; it is the targeted ASR
@@ -107,7 +113,8 @@ Each run contains:
   solvability, invalid rate, repeated identical calls, paired arm disagreements,
   and token/time totals;
 - `traces/*.json`: full AgentDojo injection and model/tool evidence;
-- `runtimes/*/runtime.sqlite`: native Agent libOS evidence for ambient cases;
+- `runtimes/*/query-*/runtime.sqlite`: native Agent libOS evidence for every
+  ambient query invocation, including AgentDojo empty-output retries;
 - `manifest.json`: row/trace counts and artifact hashes.
 
 `agent-libos-dojo verify` recomputes metrics and hashes, checks row/trace and

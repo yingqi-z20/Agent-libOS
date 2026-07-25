@@ -762,6 +762,8 @@ class AgentLibOSAmbientPipeline(BasePipelineElement):
         self.prompt_mode = prompt_mode
         self.name = "agent-libos-ambient-native-semantics"
         self.last_run: dict[str, Any] = {}
+        self._query_invocation_count = 0
+        self._query_runs: list[dict[str, Any]] = []
 
     def query(
         self,
@@ -771,12 +773,17 @@ class AgentLibOSAmbientPipeline(BasePipelineElement):
         messages: Sequence[ChatMessage] = (),
         extra_args: dict = {},
     ) -> tuple[str, FunctionsRuntime, Env, Sequence[ChatMessage], dict]:
+        self._query_invocation_count += 1
+        query_invocation = self._query_invocation_count
+        runtime_subdir = f"query-{query_invocation:03d}"
         recorder = RunRecorder()
         client = self.client_factory(recorder)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        workspace = self.runtime_dir / "workspace"
+        query_runtime_dir = self.runtime_dir / runtime_subdir
+        query_runtime_dir.mkdir()
+        workspace = query_runtime_dir / "workspace"
         workspace.mkdir(parents=True, exist_ok=True)
-        store = SQLiteStore(self.runtime_dir / "runtime.sqlite")
+        store = SQLiteStore(query_runtime_dir / "runtime.sqlite")
         host: Runtime | None = None
         pid: str | None = None
         error: BaseException | None = None
@@ -880,7 +887,7 @@ class AgentLibOSAmbientPipeline(BasePipelineElement):
             ]
             if returned_messages[-1]["role"] != "assistant":
                 raise PipelineRunError("Agent libOS trace did not end with an assistant response")
-            self.last_run = _ambient_run_snapshot(
+            query_run = _ambient_run_snapshot(
                 host,
                 pid=pid,
                 results=results,
@@ -889,6 +896,11 @@ class AgentLibOSAmbientPipeline(BasePipelineElement):
                 replaced_tool_names=replaced_tool_names,
                 prompt_mode=self.prompt_mode,
                 error=None,
+            )
+            self._record_query_run(
+                query_run,
+                query_invocation=query_invocation,
+                runtime_subdir=runtime_subdir,
             )
             returned_extra = dict(extra_args)
             returned_extra["agent_libos_dojo"] = {
@@ -900,7 +912,7 @@ class AgentLibOSAmbientPipeline(BasePipelineElement):
         except BaseException as exc:
             error = exc
             if host is not None and pid is not None:
-                self.last_run = _ambient_run_snapshot(
+                query_run = _ambient_run_snapshot(
                     host,
                     pid=pid,
                     results=results,
@@ -911,13 +923,18 @@ class AgentLibOSAmbientPipeline(BasePipelineElement):
                     error=exc,
                 )
             else:
-                self.last_run = {
+                query_run = {
                     "arm": "libos_ambient",
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "provider_calls": list(recorder.provider_calls),
                     "usage": recorder.usage(),
                 }
+            self._record_query_run(
+                query_run,
+                query_invocation=query_invocation,
+                runtime_subdir=runtime_subdir,
+            )
             raise
         finally:
             if host is not None:
@@ -925,11 +942,28 @@ class AgentLibOSAmbientPipeline(BasePipelineElement):
             else:
                 store.close()
             if error is not None and not self.last_run:
-                self.last_run = {
-                    "arm": "libos_ambient",
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                }
+                self._record_query_run(
+                    {
+                        "arm": "libos_ambient",
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    },
+                    query_invocation=query_invocation,
+                    runtime_subdir=runtime_subdir,
+                )
+
+    def _record_query_run(
+        self,
+        query_run: Mapping[str, Any],
+        *,
+        query_invocation: int,
+        runtime_subdir: str,
+    ) -> None:
+        selected = dict(query_run)
+        selected["query_invocation"] = query_invocation
+        selected["runtime_subdir"] = runtime_subdir
+        self._query_runs.append(selected)
+        self.last_run = _aggregate_ambient_query_runs(self._query_runs)
 
 
 def make_terminal_client_factory(
@@ -1004,6 +1038,95 @@ def _ambient_run_snapshot(
         "error_type": type(error).__name__ if error is not None else None,
         "error": str(error) if error is not None else None,
     }
+
+
+def _aggregate_ambient_query_runs(
+    query_runs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate every invocation made by AgentDojo's empty-output retry loop."""
+
+    if not query_runs:
+        return {}
+    aggregate = dict(query_runs[-1])
+    provider_calls: list[Any] = []
+    tool_executions: list[Any] = []
+    suppressed_calls: list[Any] = []
+    llm_call_records: list[Any] = []
+    usage: Counter[str] = Counter()
+    audit_counts: Counter[str] = Counter()
+    replaced_tool_names: set[str] = set()
+    query_summaries: list[dict[str, Any]] = []
+    query_transcripts: list[dict[str, Any]] = []
+    scalar_totals: Counter[str] = Counter()
+    for query_run in query_runs:
+        invocation = int(query_run.get("query_invocation") or 0)
+        provider_calls.extend(list(query_run.get("provider_calls") or []))
+        tool_executions.extend(list(query_run.get("tool_executions") or []))
+        suppressed = list(
+            query_run.get("iteration_limit_suppressed_tool_calls") or []
+        )
+        suppressed_calls.extend(suppressed)
+        llm_call_records.extend(list(query_run.get("llm_call_records") or []))
+        for key, value in dict(query_run.get("usage") or {}).items():
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                usage[str(key)] += value
+        for key, value in dict(query_run.get("audit_action_counts") or {}).items():
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                audit_counts[str(key)] += value
+        replaced_tool_names.update(query_run.get("replaced_runtime_tool_names") or [])
+        for key in (
+            "scheduler_result_count",
+            "hidden_terminal_tool_calls",
+            "external_effect_count",
+        ):
+            value = query_run.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                scalar_totals[key] += value
+        messages = list(query_run.get("messages") or [])
+        query_transcripts.append(
+            {
+                "query_invocation": invocation,
+                "messages": messages,
+            }
+        )
+        query_summaries.append(
+            {
+                "query_invocation": invocation,
+                "runtime_subdir": query_run.get("runtime_subdir"),
+                "pid": query_run.get("pid"),
+                "process_status": query_run.get("process_status"),
+                "status_before_host_exit": query_run.get("status_before_host_exit"),
+                "provider_call_count": query_run.get("provider_call_count", 0),
+                "tool_call_count": query_run.get("tool_call_count", 0),
+                "llm_call_record_count": query_run.get("llm_call_record_count", 0),
+                "hidden_terminal_tool_calls": query_run.get(
+                    "hidden_terminal_tool_calls", 0
+                ),
+                "iteration_limit_suppressed_tool_call_count": len(suppressed),
+                "usage": dict(query_run.get("usage") or {}),
+                "error_type": query_run.get("error_type"),
+                "error": query_run.get("error"),
+            }
+        )
+    aggregate.update(
+        {
+            "query_invocation_count": len(query_runs),
+            "query_runs": query_summaries,
+            "query_transcripts": query_transcripts,
+            "provider_calls": provider_calls,
+            "provider_call_count": len(provider_calls),
+            "tool_executions": tool_executions,
+            "tool_call_count": len(tool_executions),
+            "iteration_limit_suppressed_tool_calls": suppressed_calls,
+            "llm_call_records": llm_call_records,
+            "llm_call_record_count": len(llm_call_records),
+            "usage": dict(sorted(usage.items())),
+            "audit_action_counts": dict(sorted(audit_counts.items())),
+            "replaced_runtime_tool_names": sorted(replaced_tool_names),
+            **dict(scalar_totals),
+        }
+    )
+    return aggregate
 
 
 def _dojo_messages_to_openai(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:

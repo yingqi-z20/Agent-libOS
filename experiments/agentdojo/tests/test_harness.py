@@ -337,6 +337,59 @@ def test_ambient_iteration_limit_matches_upstream_unexecuted_final_call(tmp_path
     assert pipeline.last_run["process_status"] == "exited"
 
 
+def test_ambient_pipeline_supports_agentdojo_empty_output_retry(tmp_path) -> None:
+    """AgentDojo may invoke the same pipeline again when model output is empty."""
+
+    runtime = FunctionsRuntime()
+    runtime.register_function(set_value)
+    env = MiniEnv()
+    scripted = [
+        LLMCompletion(
+            content="",
+            tool_calls=[
+                {"id": "call-executed", "name": "set_value", "arguments": '{"value": 1}'}
+            ],
+            model="scripted-model",
+            usage={"total_tokens": 5},
+        ),
+        LLMCompletion(
+            content="",
+            tool_calls=[
+                {"id": "call-unexecuted", "name": "set_value", "arguments": '{"value": 2}'}
+            ],
+            model="scripted-model",
+            usage={"total_tokens": 7},
+        ),
+    ]
+
+    def factory(recorder: RunRecorder) -> ScriptedTerminalClient:
+        return ScriptedTerminalClient(recorder, copy.deepcopy(scripted))
+
+    pipeline = AgentLibOSAmbientPipeline(
+        client_factory=factory,
+        system_message="Synthetic AgentDojo system message.",
+        runtime_dir=tmp_path / "runtime-retry",
+        config=evaluation_config(max_output_tokens=128),
+        max_quanta=2,
+    )
+
+    first = pipeline.query("Set twice.", runtime, env)
+    second = pipeline.query("Set twice.", runtime, env)
+
+    assert get_text_content_as_str(first[3][-1].get("content") or []) == ""
+    assert get_text_content_as_str(second[3][-1].get("content") or []) == ""
+    assert env.value == 1
+    assert pipeline.last_run["query_invocation_count"] == 2
+    assert pipeline.last_run["provider_call_count"] == 4
+    assert pipeline.last_run["tool_call_count"] == 2
+    assert pipeline.last_run["usage"]["total_tokens"] == 24
+    assert len({run["pid"] for run in pipeline.last_run["query_runs"]}) == 2
+    assert [run["runtime_subdir"] for run in pipeline.last_run["query_runs"]] == [
+        "query-001",
+        "query-002",
+    ]
+
+
 def test_attack_success_true_is_asr_not_safety_and_invalid_is_excluded() -> None:
     metrics = aggregate_results(
         [
