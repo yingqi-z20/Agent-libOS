@@ -39,6 +39,11 @@ Trajectory execution is also deterministic rather than counterbalanced:
 `upstream_control` runs immediately before `libos_ambient` for each semantic
 case and repetition. Pairing therefore aligns case inputs but does not eliminate
 order effects from provider drift, caching, load, or other time-varying state.
+The ambient bridge also mirrors AgentDojo's native pre-validation conversion of
+string-encoded list arguments before Pydantic validation. This matters for
+OpenAI-compatible providers that occasionally return an array-valued argument
+as a JSON string; the raw provider call remains in the trace while the executed
+argument projection records the converted list.
 
 AgentDojo's injection-task oracle returns `True` when the attack goal succeeds.
 The report therefore names this field `attack_success`; it is the targeted ASR

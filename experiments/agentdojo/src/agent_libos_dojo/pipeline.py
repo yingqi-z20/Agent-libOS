@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+from ast import literal_eval
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
@@ -13,7 +14,12 @@ from typing import Any
 from agentdojo.agent_pipeline.agent_pipeline import AgentPipeline
 from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 from agentdojo.agent_pipeline.basic_elements import InitQuery, SystemMessage
-from agentdojo.agent_pipeline.tool_execution import ToolsExecutionLoop, ToolsExecutor, tool_result_to_str
+from agentdojo.agent_pipeline.tool_execution import (
+    ToolsExecutionLoop,
+    ToolsExecutor,
+    is_string_list,
+    tool_result_to_str,
+)
 from agentdojo.functions_runtime import EmptyEnv, Env, Function, FunctionCall, FunctionsRuntime
 from agentdojo.types import (
     ChatAssistantMessage,
@@ -22,7 +28,7 @@ from agentdojo.types import (
     get_text_content_as_str,
     text_content_block_from_string,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.llm import client as llm_client_module
@@ -631,7 +637,7 @@ class AgentDojoFunctionTool(SyncAgentTool[BaseModel]):
         self.function = function
         self.name = function.name
         self.description = function.description
-        self.args_schema = function.parameters
+        self.args_schema = _agentdojo_compatible_parameters(function)
         self.dojo_runtime = dojo_runtime
         self.env = env
         self.recorder = recorder
@@ -667,6 +673,46 @@ class AgentDojoFunctionTool(SyncAgentTool[BaseModel]):
                 "evaluation_semantics": "ambient_native_semantics",
             },
         )
+
+
+def _agentdojo_compatible_parameters(function: Function) -> type[BaseModel]:
+    """Preserve AgentDojo's pre-validation string-list coercion.
+
+    AgentDojo's native ``ToolsExecutor`` converts arguments such as
+    ``'["a@example.com"]'`` to a Python list before ``FunctionsRuntime`` runs
+    Pydantic validation.  Agent libOS validates a tool call before invoking the
+    wrapper, so the adapter must perform the same conversion in its argument
+    model.  Retaining the original schema title keeps the provider-visible JSON
+    schema byte-for-byte equivalent to the upstream function schema.
+    """
+
+    parameters = function.parameters
+
+    def normalize_string_lists(value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        return {
+            key: (
+                literal_eval(item)
+                if isinstance(item, str) and is_string_list(item)
+                else item
+            )
+            for key, item in value.items()
+        }
+
+    schema_title = str(
+        parameters.model_json_schema().get("title") or parameters.__name__
+    )
+    return create_model(
+        f"{parameters.__name__}AgentLibOSAdapter",
+        __base__=parameters,
+        __config__=ConfigDict(title=schema_title),
+        __validators__={
+            "normalize_agentdojo_string_lists": model_validator(mode="before")(
+                normalize_string_lists
+            )
+        },
+    )
 
 
 ClientFactory = Callable[[RunRecorder], TerminalCaptureLLMClient]

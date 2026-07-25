@@ -19,6 +19,7 @@ from agent_libos_dojo.cli import main as cli_main
 from agent_libos_dojo.metrics import aggregate_results
 from agent_libos_dojo.pipeline import (
     HIDDEN_TERMINAL_TOOL,
+    AgentDojoFunctionTool,
     AgentLibOSAmbientPipeline,
     PipelineRunError,
     RunRecorder,
@@ -45,6 +46,7 @@ from agent_libos_dojo.runner import (
 
 class MiniEnv(TaskEnvironment):
     value: int = 0
+    recipients: list[str] = []
 
 
 def set_value(
@@ -64,6 +66,19 @@ def delete_file() -> str:
     """Synthetic function whose name collides with an Agent libOS built-in."""
 
     return "synthetic delete"
+
+
+def set_recipients(
+    state: Annotated[MiniEnv, Depends(lambda env: env)],
+    recipients: list[str],
+) -> str:
+    """Store a synthetic recipient list.
+
+    :param recipients: Recipient addresses to store.
+    """
+
+    state.recipients = recipients
+    return f"stored {len(recipients)} recipients"
 
 
 class ScriptedTerminalClient(TerminalCaptureLLMClient):
@@ -226,6 +241,62 @@ def test_terminal_capture_tool_is_removed_before_provider_call(monkeypatch) -> N
     assert recorder.final_answer == "natural final"
     assert result.tool_calls[0]["name"] == HIDDEN_TERMINAL_TOOL
     assert recorder.provider_calls[0]["tool_calls"] == []
+
+
+def test_ambient_bridge_matches_agentdojo_string_list_coercion(tmp_path) -> None:
+    runtime = FunctionsRuntime()
+    runtime.register_function(set_recipients)
+    function = runtime.functions["set_recipients"]
+    env = MiniEnv()
+    scripted = [
+        LLMCompletion(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-list",
+                    "name": "set_recipients",
+                    "arguments": json.dumps(
+                        {"recipients": '["first@example.com", "second@example.com"]'}
+                    ),
+                }
+            ],
+            model="scripted-model",
+            usage={"total_tokens": 5},
+        ),
+        LLMCompletion(
+            content="done",
+            tool_calls=[],
+            model="scripted-model",
+            usage={"total_tokens": 3},
+        ),
+    ]
+
+    def factory(recorder: RunRecorder) -> ScriptedTerminalClient:
+        return ScriptedTerminalClient(recorder, copy.deepcopy(scripted))
+
+    pipeline = AgentLibOSAmbientPipeline(
+        client_factory=factory,
+        system_message="Synthetic AgentDojo system message.",
+        runtime_dir=tmp_path / "runtime-list",
+        config=evaluation_config(max_output_tokens=128),
+        max_quanta=4,
+    )
+    pipeline.query("Store recipients.", runtime, env)
+
+    assert env.recipients == ["first@example.com", "second@example.com"]
+    assert pipeline.last_run["tool_executions"][0]["args"] == {
+        "recipients": ["first@example.com", "second@example.com"]
+    }
+    assert pipeline.last_run["provider_calls"][0]["tool_calls"][0]["args"] == {
+        "recipients": '["first@example.com", "second@example.com"]'
+    }
+    wrapped = AgentDojoFunctionTool(
+        function,
+        dojo_runtime=runtime,
+        env=env,
+        recorder=RunRecorder(),
+    )
+    assert wrapped.args_schema.model_json_schema() == function.parameters.model_json_schema()
 
 
 def test_attack_success_true_is_asr_not_safety_and_invalid_is_excluded() -> None:
