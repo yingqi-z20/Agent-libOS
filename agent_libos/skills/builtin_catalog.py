@@ -21,7 +21,6 @@ BUILTIN_SKILL_MAX_FILE_BYTES = 24 * 1_024
 BUILTIN_SKILL_MAX_INSTRUCTION_BYTES = 16 * 1_024
 BUILTIN_SKILL_MAX_TOOLS = 9
 BUILTIN_SKILL_MAX_TOOL_NAME_CHARS = 128
-BUILTIN_SKILL_CATALOG_METADATA_MAX_BYTES = 12 * 1_024
 
 BUILTIN_SKILL_IDS = (
     "agent-libos-skill-navigation",
@@ -97,15 +96,8 @@ class BuiltinSkillCatalog:
             raise ValidationError(
                 f"built-in Skill catalog must own exactly 99 tools, found {len(owner_by_tool)}"
             )
-        prompt_metadata_bytes = _canonical_prompt_catalog_metadata_bytes(packages)
-        if len(prompt_metadata_bytes) > BUILTIN_SKILL_CATALOG_METADATA_MAX_BYTES:
-            raise ValidationError(
-                "built-in Skill prompt catalog metadata exceeds "
-                f"{BUILTIN_SKILL_CATALOG_METADATA_MAX_BYTES} bytes"
-            )
         self._packages = packages
         self._owner_by_tool = owner_by_tool
-        self._prompt_catalog_metadata_size_bytes = len(prompt_metadata_bytes)
 
     def get(self, skill_id: str) -> SkillPackage | None:
         """Return a defensive copy of one built-in Skill package."""
@@ -127,12 +119,6 @@ class BuiltinSkillCatalog:
         """Return whether an identifier is reserved for built-in Skills."""
 
         return isinstance(skill_id, str) and skill_id.startswith(BUILTIN_SKILL_PREFIX)
-
-    @property
-    def prompt_catalog_metadata_size_bytes(self) -> int:
-        """Return the canonical metadata-only prompt catalog size in bytes."""
-
-        return self._prompt_catalog_metadata_size_bytes
 
     def metadata(self, skill_id: str) -> dict[str, Any] | None:
         """Return discovery/provenance metadata without the instruction body."""
@@ -362,25 +348,6 @@ def _package_hash(package: SkillPackage) -> str:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _canonical_prompt_catalog_metadata_bytes(
-    packages: dict[str, SkillPackage],
-) -> bytes:
-    payload = [
-        {
-            "skill_id": packages[skill_id].skill_id,
-            "description": packages[skill_id].description,
-            "active": False,
-        }
-        for skill_id in BUILTIN_SKILL_IDS
-    ]
-    return json.dumps(
-        payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
 
 
 def _copy_package(package: SkillPackage) -> SkillPackage:

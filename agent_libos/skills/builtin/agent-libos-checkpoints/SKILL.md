@@ -1,6 +1,6 @@
 ---
 name: agent-libos-checkpoints
-description: Capture, inspect, compare, restore, or fork durable process-subtree checkpoints. Use for recoverable internal-state milestones, isolated replay, or deliberate rollback of reconstructable Agent libOS state.
+description: Capture, inspect, compare, restore, or fork durable process-subtree checkpoints and recovery points. Use for recoverable internal-state milestones, isolated replay, or deliberate rollback of reconstructable Agent libOS state.
 allowed-tools: create_checkpoint list_checkpoints inspect_checkpoint diff_checkpoint restore_checkpoint fork_checkpoint
 ---
 # Manage checkpoints

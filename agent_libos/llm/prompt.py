@@ -384,9 +384,11 @@ def _process_message_directive(
         )
     else:
         next_action = (
-            "Your next action must be activate_skill with skill_id "
-            "agent-libos-child-processes. On the following quantum, call "
-            "read_process_messages or receive_process_messages."
+            "Resolve message handling before other work. If the immediately preceding "
+            "discover_skills result identifies a Skill declaring read_process_messages "
+            "or receive_process_messages, activate that exact returned id. Otherwise, "
+            "your next action must be discover_skills with text `messages` and a bounded "
+            "limit. After activation, call a visible message-read tool."
         )
     return (
         "Pending explicit process input (mandatory control action):\n"
@@ -577,10 +579,11 @@ def _available_skill_section(skills: list[dict[str, Any]]) -> str:
     if not visible:
         return ""
     return (
-        "Available built-in Skills (metadata only):\n"
+        "Available Skills (metadata only):\n"
         f"{_prompt_json(visible)}\n"
-        "Activate the smallest matching Skill to load its instructions and "
-        "image-authorized tool schemas. Activation does not grant capability authority."
+        "Use discover_skills when the exact match is uncertain, then activate the "
+        "smallest matching Skill to load its instructions and tool schemas. "
+        "Activation does not grant capability authority."
     )
 
 

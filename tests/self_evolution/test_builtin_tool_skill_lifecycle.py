@@ -57,7 +57,8 @@ def test_same_image_fork_inherits_builtin_projection_but_spawn_child_is_fresh(
         assert spawned_process.tool_table == parent_full_table
         assert WORKSPACE_EDITING_SKILL not in spawned_process.loaded_skills
         assert OVERLAP_TOOL not in spawned_process.model_tool_table
-        assert len(spawned_process.model_tool_table) == 14
+        assert len(spawned_process.model_tool_table) == 5
+        assert spawned_process.loaded_skills == {}
         _assert_no_skill_capabilities(runtime, spawned)
     finally:
         runtime.close()
@@ -467,7 +468,7 @@ def test_cross_image_fork_rebases_builtin_model_baseline_before_unload(
 
         child_process = runtime.process.get(child)
         assert editing_tools.isdisjoint(child_process.model_tool_table)
-        assert len(child_process.model_tool_table) == 14
+        assert len(child_process.model_tool_table) == 5
     finally:
         runtime.close()
 

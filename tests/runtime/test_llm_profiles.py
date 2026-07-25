@@ -809,8 +809,8 @@ class TestLLMProfiles:
                 [
                     _profile_response_tool_call(
                         "resp_profile_a",
-                        "create_memory_object",
-                        {"type": "note", "name": "profile-step", "payload": {"ok": True}},
+                        "discover_skills",
+                        {"text": "memory", "limit": 4},
                     )
                 ]
             )
@@ -818,7 +818,7 @@ class TestLLMProfiles:
             pid = runtime.process.spawn(image="base-agent:v0", goal="reset changed profile chain")
 
             first = runtime.run_next_process_once()
-            assert first["action"]["action"] == "create_memory_object"
+            assert first["action"]["action"] == "discover_skills"
 
             monkeypatch.setenv(env_name, after)
             second_client = runtime.llms.resolve("default").client

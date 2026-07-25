@@ -13,6 +13,7 @@ from agent_libos.models import (
     JIT_MULTIPLEXER_TOOL_NAME,
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
     ObjectType,
+    PROMPT_MODE_LIBOS_DEFAULT,
     ProcessStatus,
     ResourceBudget,
     ToolCandidateStatus,
@@ -479,6 +480,7 @@ class TestImageRegistration:
                 AgentImage(
                     image_id='context-policy:v0',
                     name='context-policy',
+                    prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
                     planner={
                         'custom_planner_extension': {'enabled': True},
                         'context_management': {
@@ -924,7 +926,10 @@ class TestImageRegistration:
 
     def test_image_package_context_management_round_trips(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = _write_image_package(Path(temp_dir) / 'package-agent')
+            root = _write_image_package(
+                Path(temp_dir) / 'package-agent',
+                prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
+            )
             manifest = root / 'IMAGE.yaml'
             manifest.write_text(
                 manifest.read_text(encoding='utf-8').replace(

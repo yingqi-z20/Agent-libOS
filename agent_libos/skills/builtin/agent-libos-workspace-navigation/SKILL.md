@@ -1,6 +1,6 @@
 ---
 name: agent-libos-workspace-navigation
-description: Inspect cwd-relative workspace directories and bounded text, or select this AgentProcess working directory. Use to establish paths and textual evidence before acting; not for writes, binary or range reads, Object transfer, or Git metadata under .git.
+description: Read and inspect cwd-relative workspace directories and bounded text files, or select this AgentProcess working directory. Use to establish paths and textual evidence before acting; not for writes, binary or range reads, Object transfer, or Git metadata under .git.
 allowed-tools: get_working_directory set_working_directory read_directory read_text_file
 ---
 # Navigate the workspace

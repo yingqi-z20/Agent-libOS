@@ -34,6 +34,7 @@ from agent_libos.process_execution import (
     trusted_process_control_mutation,
 )
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.skill_search import skill_search_terms
 from agent_libos.models import (
     AgentObject,
     AgentImage,
@@ -11326,11 +11327,50 @@ class SQLRuntimeStore:
     def list_skills(self, text: str | None = None, limit: int | None = None) -> list[tuple[SkillPackage, dict[str, Any]]]:
         params: list[Any] = []
         sql = "SELECT * FROM skills"
+        exact_query: str | None = None
+        terms: tuple[str, ...] = ()
         if text:
-            needle = f"%{text.lower()}%"
-            sql += " WHERE lower(skill_id) LIKE ? OR lower(name) LIKE ? OR lower(package_json) LIKE ?"
-            params.extend([needle, needle, needle])
-        sql += " ORDER BY name, skill_id"
+            exact_query = text.strip().casefold()
+            terms = skill_search_terms(text)
+            predicates: list[str] = []
+            for term in terms:
+                needle = f"%{term}%"
+                predicates.append(
+                    "(lower(skill_id) LIKE ? OR lower(name) LIKE ? "
+                    "OR lower(json_extract(package_json, '$.description')) LIKE ?)"
+                )
+                params.extend([needle, needle, needle])
+            if predicates:
+                sql += " WHERE " + " AND ".join(predicates)
+        if exact_query:
+            order: list[str] = [
+                "CASE WHEN lower(skill_id) = ? OR lower(name) = ? "
+                "THEN 1 ELSE 0 END DESC"
+            ]
+            params.extend([exact_query, exact_query])
+            phrase = f"%{' '.join(terms)}%"
+            order.append(
+                "CASE WHEN lower(skill_id) LIKE ? OR lower(name) LIKE ? "
+                "OR lower(json_extract(package_json, '$.description')) LIKE ? "
+                "THEN 1000 ELSE 0 END DESC"
+            )
+            params.extend([phrase, phrase, phrase])
+            relevance_parts: list[str] = []
+            for term in terms:
+                needle = f"%{term}%"
+                relevance_parts.append(
+                    "(CASE WHEN lower(skill_id) LIKE ? THEN 12 ELSE 0 END + "
+                    "CASE WHEN lower(name) LIKE ? THEN 10 ELSE 0 END + "
+                    "CASE WHEN lower(json_extract(package_json, '$.description')) "
+                    "LIKE ? THEN 4 ELSE 0 END)"
+                )
+                params.extend([needle, needle, needle])
+            if relevance_parts:
+                order.append(f"({' + '.join(relevance_parts)}) DESC")
+            order.extend(["name", "skill_id"])
+            sql += " ORDER BY " + ", ".join(order)
+        else:
+            sql += " ORDER BY name, skill_id"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)

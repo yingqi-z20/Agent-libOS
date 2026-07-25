@@ -68,12 +68,7 @@ class TestImageCommit:
             )
 
             assert result.image.metadata['tool_projection'] == 'skills'
-            assert result.image.default_skills == [
-                'agent-libos-skill-navigation',
-                'agent-libos-authority-basics',
-                'agent-libos-human-collaboration',
-                'agent-libos-workspace-navigation',
-            ]
+            assert result.image.default_skills == []
             assert 'lazy_tool_groups' not in result.image.metadata
             assert 'initial_tool_groups' not in result.image.metadata
 

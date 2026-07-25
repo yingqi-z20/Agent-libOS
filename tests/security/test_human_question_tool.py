@@ -18,6 +18,9 @@ from agent_libos.models import (
 )
 from agent_libos.substrate import ProviderEffectNotStarted
 
+HUMAN_COLLABORATION_SKILL = 'agent-libos-human-collaboration'
+
+
 class TestHumanQuestionTool:
 
     def setup_method(self) -> None:
@@ -266,6 +269,11 @@ class TestHumanQuestionTool:
             image='base-agent:v0',
             goal='ask then exit',
             authority_manifest=_human_manifest(),
+        )
+        self.runtime.skills.activate_skill(
+            pid,
+            HUMAN_COLLABORATION_SKILL,
+            actor=pid,
         )
         results = asyncio.run(self.runtime.arun_until_idle(max_quanta=4, human_auto_answer='Sunday 02:00 UTC'))
         process = self.runtime.process.get(pid)
@@ -560,6 +568,11 @@ class TestHumanQuestionTool:
                     image='base-agent:v0',
                     goal='ask then reopen',
                     authority_manifest=_human_manifest(),
+                )
+                runtime.skills.activate_skill(
+                    pid,
+                    HUMAN_COLLABORATION_SKILL,
+                    actor=pid,
                 )
                 waiting = runtime.run_next_process_once()
                 request_id = waiting['request_id']

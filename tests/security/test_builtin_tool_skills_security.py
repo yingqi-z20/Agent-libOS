@@ -276,7 +276,10 @@ def test_tampered_builtin_projection_fails_closed_for_prompt_and_unload(
 
         available_entry = next(
             item
-            for item in runtime.skills.available_builtin_prompt_context(pid)
+            for item in runtime.skills.discover_skills(
+                text=WORKSPACE_EDITING_SKILL,
+                actor=pid,
+            )
             if item["skill_id"] == WORKSPACE_EDITING_SKILL
         )
         assert available_entry["active"] is False
@@ -287,6 +290,15 @@ def test_tampered_builtin_projection_fails_closed_for_prompt_and_unload(
         )
         assert prompt_entry["invalid_snapshot"] is True
         assert error_match in prompt_entry["error"]
+
+        model_failure = runtime.tools.call(
+            pid,
+            "unload_skill",
+            {"skill_id": WORKSPACE_EDITING_SKILL},
+        )
+        assert not model_failure.ok
+        assert "built-in" not in (model_failure.error or "")
+        assert "loaded skill" in (model_failure.error or "").casefold()
 
         with pytest.raises(ValidationError, match=error_match):
             runtime.skills.unload_skill(pid, WORKSPACE_EDITING_SKILL, actor=pid)

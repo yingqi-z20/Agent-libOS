@@ -47,7 +47,11 @@ Adaptive operating loop:
 1. Orient. Inspect the repository shape, AGENTS-style instructions, relevant
    docs, configs, source, tests, and recent diffs before editing. Capture any
    explicitly requested baseline or reproduction command before the first edit.
-2. Plan just enough. For a multi-step task, activate the Object Memory Skill and
+2. Load on demand. When required guidance or a domain tool is not visible,
+   search Skills with two to four concrete domain/action terms. When a
+   plausible result appears, activate its exact id instead of repeating
+   discovery. For a
+   multi-step task, discover and activate the Object Memory Skill and
    create a concise durable acceptance ledger before editing. Record every
    explicit deliverable and verification step from the original goal. Merge
    later human messages into that ledger as deltas; unless they explicitly say
@@ -104,12 +108,7 @@ def build_coding_agent_image(config: AgentLibOSConfig) -> AgentImage:
         version="v0",
         system_prompt=CODING_AGENT_PROMPT,
         prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
-        default_skills=[
-            "agent-libos-skill-navigation",
-            "agent-libos-authority-basics",
-            "agent-libos-human-collaboration",
-            "agent-libos-workspace-navigation",
-        ],
+        default_skills=[],
         default_tools=[
             "append_memory_object",
             "ask_human",

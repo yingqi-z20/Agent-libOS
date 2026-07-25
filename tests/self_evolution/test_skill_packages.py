@@ -14,7 +14,6 @@ from agent_libos.config import AgentLibOSConfig, SkillDefaults, ToolDefaults
 from agent_libos.models import AgentImage, CapabilityRight
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
-from agent_libos.skills.builtin_catalog import BUILTIN_SKILL_IDS
 from agent_libos.skills.schema import JitToolSpec, SkillPackage
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from tests.support.skills import write_raw_skill, write_skill_package
@@ -44,30 +43,61 @@ class TestSkillPackageLoading:
                     limit=3,
                 )
 
-                assert tuple(
-                    item['skill_id']
-                    for item in bounded
-                    if item['source_type'] == 'builtin'
-                ) == BUILTIN_SKILL_IDS
                 assert {
                     item['skill_id']
                     for item in bounded
-                    if item['source_type'] != 'builtin'
                 } == {'window-skill-0', 'window-skill-1'}
                 assert has_more is True
-                assert tuple(
-                    item['skill_id']
-                    for item in complete
-                    if item['source_type'] == 'builtin'
-                ) == BUILTIN_SKILL_IDS
                 assert {
                     item['skill_id']
                     for item in complete
-                    if item['source_type'] != 'builtin'
                 } == {'window-skill-0', 'window-skill-1', 'window-skill-2'}
                 assert complete_has_more is False
             finally:
                 runtime.close()
+
+    def test_skill_discovery_ranks_registered_metadata_before_applying_limit(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            for index in range(3):
+                runtime.skills.register_skill_package(
+                    SkillPackage(
+                        skill_id=f'aaa-weak-route-{index}',
+                        name=f'aaa-weak-route-{index}',
+                        description=(
+                            'Quasar workflows use a ledger and reconcile one matching intent.'
+                        ),
+                        instructions='Use echo.',
+                        allowed_tools=['echo'],
+                    ),
+                    actor='test.host',
+                    require_capability=False,
+                )
+            runtime.skills.register_skill_package(
+                SkillPackage(
+                    skill_id='zzz-quasar-ledger-reconcile',
+                    name='zzz-quasar-ledger-reconcile',
+                    description='Handle the matching intent.',
+                    instructions='Use echo.',
+                    allowed_tools=['echo'],
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+
+            page, has_more = runtime.skills.discover_skills_window(
+                text='quasar ledger reconcile intent',
+                actor='test',
+                require_capability=False,
+                limit=1,
+            )
+
+            assert [item['skill_id'] for item in page] == [
+                'zzz-quasar-ledger-reconcile'
+            ]
+            assert has_more is True
+        finally:
+            runtime.close()
 
     def test_skill_discovery_rejects_unbounded_limits(self) -> None:
         runtime = Runtime.open('local')
@@ -75,6 +105,45 @@ class TestSkillPackageLoading:
             for limit in (0, -1, True, runtime.config.skills.discover_limit + 1):
                 with pytest.raises(ValidationError, match='limit'):
                     runtime.skills.discover_skills(require_capability=False, limit=limit)  # type: ignore[arg-type]
+        finally:
+            runtime.close()
+
+    def test_skill_discovery_searches_metadata_not_instruction_bodies(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.skills.register_skill_package(
+                SkillPackage(
+                    skill_id='metadata-search-skill',
+                    name='metadata-search-skill',
+                    description='Find this package using the visible-description-token.',
+                    instructions='The private-instruction-token is body content only.',
+                ),
+                actor='test.host',
+                require_capability=False,
+            )
+
+            visible = runtime.skills.discover_skills(
+                text='visible-description-token',
+                actor='test',
+                require_capability=False,
+            )
+            hidden = runtime.skills.discover_skills(
+                text='private-instruction-token',
+                actor='test',
+                require_capability=False,
+            )
+
+            assert [item['skill_id'] for item in visible] == ['metadata-search-skill']
+            assert hidden == []
+
+            natural_phrase = runtime.skills.discover_skills(
+                text='find visible description token',
+                actor='test',
+                require_capability=False,
+            )
+            assert [item['skill_id'] for item in natural_phrase] == [
+                'metadata-search-skill'
+            ]
         finally:
             runtime.close()
 
@@ -117,16 +186,7 @@ class TestSkillPackageLoading:
                     require_capability=False,
                 )
 
-                assert tuple(
-                    item['skill_id']
-                    for item in discovered
-                    if item['source_type'] == 'builtin'
-                ) == BUILTIN_SKILL_IDS
-                assert [
-                    item['skill_id']
-                    for item in discovered
-                    if item['source_type'] != 'builtin'
-                ] == ['configured-skill']
+                assert [item['skill_id'] for item in discovered] == ['configured-skill']
                 assert loaded_paths == [(root / 'custom-catalog' / 'configured-skill').resolve()]
             finally:
                 runtime.close()

@@ -266,6 +266,7 @@ def test_llm_created_object_unions_explicit_and_all_materialized_context_parents
                 }
             ]
         )
+        runtime.skills.activate_skill(pid, "agent-libos-object-memory", actor=pid)
 
         result = runtime.run_next_process_once()
         assert result["ok"], result

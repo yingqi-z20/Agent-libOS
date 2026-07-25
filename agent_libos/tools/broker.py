@@ -838,20 +838,36 @@ class ToolBroker:
         if process is None:
             raise NotFound(f"process not found: {pid}")
         hidden = self._hidden_jit_tool_names(pid)
-        if not hidden:
-            return dict(process.loaded_skills)
         model_loaded: dict[str, Any] = {}
         for skill_id, loaded in process.loaded_skills.items():
             if not isinstance(loaded, dict):
-                model_loaded[skill_id] = self._redact_hidden_jit_names(loaded, hidden)
+                model_loaded[skill_id] = {"invalid_snapshot": True}
                 continue
-            entry = self._redact_hidden_jit_names(dict(loaded), hidden)
-            entry["jit_tool_ids"] = {}
-            if isinstance(entry.get("tool_names"), list):
-                entry["tool_names"] = [
-                    name for name in entry["tool_names"]
-                    if name != "<multiplexed_jit_tool>"
-                ]
+            # Keep only fields shared by every loaded Skill. Host provenance,
+            # activation kind, receipts, and base-binding restoration state do
+            # not belong in model context or its provider cache fingerprint.
+            entry = {
+                key: loaded[key]
+                for key in (
+                    "skill_id",
+                    "version",
+                    "package_sha256",
+                    "instructions_hash",
+                    "package_snapshot",
+                    "tool_names",
+                    "tool_ids",
+                    "jit_tool_ids",
+                )
+                if key in loaded
+            }
+            entry = self._redact_hidden_jit_names(entry, hidden)
+            if hidden:
+                entry["jit_tool_ids"] = {}
+                if isinstance(entry.get("tool_names"), list):
+                    entry["tool_names"] = [
+                        name for name in entry["tool_names"]
+                        if name != "<multiplexed_jit_tool>"
+                    ]
             model_loaded[skill_id] = entry
         return model_loaded
 

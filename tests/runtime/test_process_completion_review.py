@@ -111,7 +111,10 @@ def test_coding_exit_review_is_nonterminal_published_and_audited(tmp_path: Path)
             "kind": "object_memory",
             "namespace": review["goal"]["reference"]["namespace"],
             "name": review["goal"]["reference"]["name"],
-            "activate_skill": "agent-libos-object-memory",
+            "skill_discovery": {
+                "text": "object memory",
+                "limit": 5,
+            },
             "tool": "read_memory_object",
             "arguments": {
                 "namespace": review["goal"]["reference"]["namespace"],
@@ -288,7 +291,10 @@ def test_exit_review_rejects_stale_token_after_human_followup(tmp_path: Path) ->
         assert message.body not in json.dumps(refreshed_review, ensure_ascii=False)
         assert refreshed_review["acknowledged_human_message_reference"] == {
             "kind": "process_message_ids",
-            "activate_skill": "agent-libos-child-processes",
+            "skill_discovery": {
+                "text": "process messages",
+                "limit": 5,
+            },
             "tool": "read_process_messages",
             "fixed_arguments": {
                 "include_acked": True,
@@ -378,7 +384,10 @@ def test_exit_review_references_messages_without_reinlining_bodies(
         assert len(review["acknowledged_human_messages_sha256"]) == 64
         assert review["acknowledged_human_message_reference"] == {
             "kind": "process_message_ids",
-            "activate_skill": "agent-libos-child-processes",
+            "skill_discovery": {
+                "text": "process messages",
+                "limit": 5,
+            },
             "tool": "read_process_messages",
             "fixed_arguments": {
                 "include_acked": True,
@@ -490,6 +499,7 @@ def test_exit_review_survives_runtime_reopen(tmp_path: Path) -> None:
         assert process.memory_view is not None
         process.memory_view.roots.insert(0, sibling)
         runtime.store.update_process(process)
+        runtime.skills.activate_skill(pid, "agent-libos-authority-basics", actor=pid)
         runtime.llm.client = _SingleActionClient("list_capabilities", {})
         first_quantum = runtime.run_process_once(pid)
         assert first_quantum["action"]["action"] == "list_capabilities"
@@ -550,6 +560,7 @@ def test_exit_review_recovers_goal_from_persistent_context_prompt(
             [CapabilityRight.EXECUTE],
             issued_by="completion-review-test",
         )
+        runtime.skills.activate_skill(pid, "agent-libos-authority-basics", actor=pid)
         runtime.llm.client = _SingleActionClient("list_capabilities", {})
         runtime.run_process_once(pid)
     finally:
@@ -603,6 +614,7 @@ def test_exit_review_fails_closed_after_reopen_without_full_io_retention(
             image="coding-agent:v0",
             goal="this goal must not be copied into durable LLM evidence",
         )
+        runtime.skills.activate_skill(pid, "agent-libos-authority-basics", actor=pid)
         runtime.llm.client = _SingleActionClient("list_capabilities", {})
         first = runtime.run_process_once(pid)
         assert first["action"]["action"] == "list_capabilities"

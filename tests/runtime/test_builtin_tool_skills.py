@@ -13,15 +13,13 @@ import agent_libos.skills.builtin_catalog as builtin_catalog_module
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.prompt import build_user_prompt
-from agent_libos.models import MaterializedContext
+from agent_libos.models import CapabilityRight, MaterializedContext
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.skills.builtin_catalog import (
-    BUILTIN_SKILL_CATALOG_METADATA_MAX_BYTES,
     BUILTIN_SKILL_IDS,
     BUILTIN_SKILL_MAX_FILE_BYTES,
     BUILTIN_SKILL_MAX_INSTRUCTION_BYTES,
     BUILTIN_SKILL_MAX_TOOLS,
-    BuiltinSkillCatalog,
     get_builtin_skill_catalog,
 )
 from agent_libos.skills.schema import SkillPackage
@@ -451,27 +449,6 @@ def test_workspace_tool_skill_guidance_fits_progressive_disclosure_budget(
     assert len(instructions.encode("utf-8")) <= BUILTIN_SKILL_MAX_INSTRUCTION_BYTES
 
 
-def test_builtin_skill_prompt_catalog_metadata_stays_within_budget() -> None:
-    catalog = get_builtin_skill_catalog()
-    payload = [
-        {
-            "skill_id": package.skill_id,
-            "description": package.description,
-            "active": False,
-        }
-        for package in catalog.list()
-    ]
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-    assert catalog.prompt_catalog_metadata_size_bytes == len(encoded)
-    assert len(encoded) <= BUILTIN_SKILL_CATALOG_METADATA_MAX_BYTES
-
-
 def test_builtin_skill_expanded_body_budget_is_fully_model_visible() -> None:
     assert BUILTIN_SKILL_MAX_INSTRUCTION_BYTES == 16 * 1_024
     assert BUILTIN_SKILL_MAX_FILE_BYTES == 24 * 1_024
@@ -577,18 +554,6 @@ def test_registered_integration_list_outputs_expose_completeness() -> None:
         assert "has_more" in output_schema["required"]
 
 
-def test_builtin_skill_prompt_catalog_metadata_budget_fails_closed(monkeypatch) -> None:
-    actual_size = get_builtin_skill_catalog().prompt_catalog_metadata_size_bytes
-    monkeypatch.setattr(
-        builtin_catalog_module,
-        "BUILTIN_SKILL_CATALOG_METADATA_MAX_BYTES",
-        actual_size - 1,
-    )
-
-    with pytest.raises(ValidationError, match="prompt catalog metadata exceeds"):
-        BuiltinSkillCatalog()
-
-
 def test_builtin_skill_catalog_exactly_covers_registered_core_tools(tmp_path: Path) -> None:
     runtime = Runtime.open(tmp_path / "builtin-catalog-core-coverage.sqlite")
     try:
@@ -625,54 +590,248 @@ def test_registered_skills_cannot_claim_reserved_builtin_ids(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
-    ("image_id", "expected_schema_count"),
+    "image_id",
     [
-        ("base-agent:v0", 15),
-        ("coding-agent:v0", 14),
-        ("review-agent:v0", 14),
+        "base-agent:v0",
+        "coding-agent:v0",
+        "review-agent:v0",
+        "toolmaker-agent:v0",
     ],
 )
-def test_builtin_images_start_with_bounded_skill_projection(
+def test_builtin_images_start_with_only_the_source_neutral_skill_lifecycle(
     tmp_path: Path,
     image_id: str,
-    expected_schema_count: int,
 ) -> None:
     runtime = Runtime.open(tmp_path / f"{image_id.replace(':', '-')}.sqlite")
     try:
         pid = runtime.process.spawn(image=image_id, goal="inspect built-in Skill projection")
         process = runtime.process.get(pid)
 
-        assert len(runtime.tools.openai_tool_schemas(pid)) == expected_schema_count
-        assert len(process.model_tool_table) == expected_schema_count
+        assert set(process.model_tool_table) == {
+            "activate_skill",
+            "discover_skills",
+            "process_exit",
+            "read_skill_resource",
+            "unload_skill",
+        }
+        assert process.loaded_skills == {}
+        assert len(runtime.tools.openai_tool_schemas(pid)) == 5
         assert len(process.tool_table) > len(process.model_tool_table)
     finally:
         runtime.close()
 
 
-def test_builtin_discovery_ignores_registered_search_and_page_limit(
+def test_builtin_discovery_obeys_the_same_search_and_page_limit(
     tmp_path: Path,
 ) -> None:
     runtime = Runtime.open(tmp_path / "complete-builtin-discovery.sqlite")
     try:
         pid = runtime.process.spawn(
             image="coding-agent:v0",
-            goal="inspect the complete supported built-in Skill catalog",
+            goal="inspect a bounded visible Skill catalog page",
         )
-        expected_ids = [
-            item["skill_id"]
-            for item in runtime.skills.available_builtin_prompt_context(pid)
-        ]
-
         discovered = runtime.skills.discover_skills_result(
             text="workspace",
             actor=pid,
             limit=1,
         )
 
-        assert len(expected_ids) > 1
-        assert [item["skill_id"] for item in discovered["skills"]] == expected_ids
-        assert discovered["catalog_scope"] == "builtin_only"
-        assert discovered["has_more"] is False
+        assert len(discovered["skills"]) == 1
+        assert discovered["has_more"] is True
+        assert discovered["catalog_scope"] == "visibility_limited"
+        summary = discovered["skills"][0]
+        searchable = " ".join(
+            str(summary[field])
+            for field in ("skill_id", "name", "description")
+        ).casefold()
+        assert "workspace" in searchable
+
+        intent_result = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {"text": "ordinary workspace file write", "limit": 5},
+        )
+        assert intent_result.ok
+        assert intent_result.payload["next_step"] == "activate_skill"
+        assert intent_result.payload["skills"][0]["skill_id"] == WORKSPACE_EDITING_SKILL
+
+        model_result = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {"text": WORKSPACE_EDITING_SKILL, "limit": 1},
+        )
+        assert model_result.ok
+        assert model_result.payload["has_more"] is False
+        assert model_result.payload["visibility_limited"] is True
+        assert model_result.payload["next_step"] == "activate_skill"
+        model_summary = model_result.payload["skills"][0]
+        assert model_summary["skill_id"] == WORKSPACE_EDITING_SKILL
+        assert {
+            "source",
+            "source_type",
+            "catalog_scope",
+            "available_tools",
+        }.isdisjoint(model_summary)
+
+        no_match = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {"text": "nonexistent-zebra-domain", "limit": 5},
+        )
+        assert no_match.ok
+        assert no_match.payload["skills"] == []
+        assert no_match.payload["next_step"] == "refine_search"
+
+        oversized = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {"text": "x" * 1_025, "limit": 5},
+        )
+        assert not oversized.ok
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_skill_id"),
+    [
+        ("ordinary workspace file write", "agent-libos-workspace-editing"),
+        ("git status read-only inspection", "agent-libos-git-inspection"),
+        ("run shell command argv execute", "agent-libos-command-execution"),
+        ("checkpoint recovery point", "agent-libos-checkpoints"),
+        ("mcp registry metadata", "agent-libos-mcp"),
+    ],
+)
+def test_source_neutral_discovery_ranks_concrete_task_terms(
+    tmp_path: Path,
+    query: str,
+    expected_skill_id: str,
+) -> None:
+    runtime = Runtime.open(tmp_path / f"intent-{expected_skill_id}.sqlite")
+    try:
+        pid = runtime.process.spawn(
+            image="coding-agent:v0",
+            goal="select one Skill from task intent",
+        )
+
+        result = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {"text": query, "limit": 5},
+        )
+
+        assert result.ok
+        assert result.payload["next_step"] == "activate_skill"
+        assert result.payload["skills"][0]["skill_id"] == expected_skill_id
+    finally:
+        runtime.close()
+
+
+def test_model_skill_lifecycle_contract_is_source_neutral(tmp_path: Path) -> None:
+    runtime = Runtime.open(tmp_path / "source-neutral-skill-lifecycle.sqlite")
+    registered_skill_id = "source-neutral-clock"
+    try:
+        runtime.skills.register_skill_package(
+            SkillPackage(
+                skill_id=registered_skill_id,
+                name=registered_skill_id,
+                description=(
+                    "Read the current time for source-neutral Skill lifecycle testing."
+                ),
+                instructions=(
+                    "Use `get_current_time` once and verify the returned timezone."
+                ),
+                allowed_tools=["get_current_time"],
+            ),
+            actor="test.host",
+            require_capability=False,
+        )
+        pid = runtime.process.spawn(
+            image="coding-agent:v0",
+            goal="compare model-visible Skill lifecycle contracts",
+        )
+        runtime.capability.grant(
+            pid,
+            runtime.config.skills.registry_resource,
+            [CapabilityRight.READ],
+            issued_by="source-neutral-skill-test",
+        )
+        runtime.capability.grant(
+            pid,
+            runtime.skills.resource_for(registered_skill_id),
+            [CapabilityRight.EXECUTE],
+            issued_by="source-neutral-skill-test",
+        )
+
+        builtin_discovery = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {"text": WORKSPACE_EDITING_SKILL, "limit": 1},
+        )
+        registered_discovery = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {"text": registered_skill_id, "limit": 1},
+        )
+        assert builtin_discovery.ok and registered_discovery.ok
+        builtin_summary = builtin_discovery.payload["skills"][0]
+        registered_summary = registered_discovery.payload["skills"][0]
+        assert set(builtin_summary) == set(registered_summary)
+
+        builtin_activation = runtime.tools.call(
+            pid,
+            "activate_skill",
+            {"skill_id": WORKSPACE_EDITING_SKILL},
+        )
+        registered_activation = runtime.tools.call(
+            pid,
+            "activate_skill",
+            {"skill_id": registered_skill_id},
+        )
+        assert builtin_activation.ok and registered_activation.ok
+        builtin_result = builtin_activation.payload["result"]
+        registered_result = registered_activation.payload["result"]
+        assert set(builtin_result) == set(registered_result)
+        model_loaded = runtime.tools.model_loaded_skills(pid)
+        assert set(model_loaded[WORKSPACE_EDITING_SKILL]) == set(
+            model_loaded[registered_skill_id]
+        )
+
+        builtin_unload = runtime.tools.call(
+            pid,
+            "unload_skill",
+            {"skill_id": WORKSPACE_EDITING_SKILL},
+        )
+        registered_unload = runtime.tools.call(
+            pid,
+            "unload_skill",
+            {"skill_id": registered_skill_id},
+        )
+        assert builtin_unload.ok and registered_unload.ok
+        assert set(builtin_unload.payload["result"]) == set(
+            registered_unload.payload["result"]
+        )
+
+        source_specific_fields = {
+            "activation_kind",
+            "authority_changed",
+            "catalog_scope",
+            "registered",
+            "registered_by",
+            "source",
+            "source_type",
+        }
+        for payload in (
+            builtin_summary,
+            registered_summary,
+            builtin_result,
+            registered_result,
+            model_loaded[WORKSPACE_EDITING_SKILL],
+            model_loaded[registered_skill_id],
+            builtin_unload.payload["result"],
+            registered_unload.payload["result"],
+        ):
+            assert source_specific_fields.isdisjoint(payload)
     finally:
         runtime.close()
 
@@ -744,7 +903,7 @@ def test_incomplete_builtin_skill_is_hidden_and_activation_fails_atomically(
         }
 
         discovered = runtime.skills.discover_skills_result(actor=pid)
-        assert discovered["catalog_scope"] == "builtin_only"
+        assert discovered["catalog_scope"] == "visibility_limited"
         assert WORKSPACE_EDITING_SKILL not in {
             item["skill_id"] for item in discovered["skills"]
         }
@@ -829,7 +988,7 @@ def test_cross_image_fork_rebases_registered_skill_before_unload(tmp_path: Path)
             image="coding-agent:v0",
             goal="carry one ordinary Skill across a narrower image fork",
         )
-        assert "agent-libos-skill-navigation" in runtime.process.get(parent).loaded_skills
+        assert runtime.process.get(parent).loaded_skills == {}
         runtime.skills.register_skill_package(
             SkillPackage(
                 skill_id=ordinary_skill_id,
@@ -880,7 +1039,7 @@ def test_cross_image_fork_rebases_registered_skill_before_unload(tmp_path: Path)
         runtime.close()
 
 
-def test_prompt_discloses_builtin_metadata_before_body(tmp_path: Path) -> None:
+def test_prompt_discloses_no_skill_metadata_until_activation(tmp_path: Path) -> None:
     runtime = Runtime.open(tmp_path / "builtin-prompt-disclosure.sqlite")
     try:
         pid = runtime.process.spawn(
@@ -894,31 +1053,15 @@ def test_prompt_discloses_builtin_metadata_before_body(tmp_path: Path) -> None:
             description=package.description,
         )
 
-        available_before = runtime.skills.available_builtin_prompt_context(pid)
-        editing_before = next(
-            item
-            for item in available_before
-            if item["skill_id"] == WORKSPACE_EDITING_SKILL
-        )
-        assert editing_before == {
-            "skill_id": WORKSPACE_EDITING_SKILL,
-            "description": package.description,
-            "active": False,
-        }
         prompt_before = _render_prompt(runtime, pid)
-        assert WORKSPACE_EDITING_SKILL in prompt_before
-        assert package.description in prompt_before
+        assert WORKSPACE_EDITING_SKILL not in prompt_before
+        assert package.description not in prompt_before
         assert body_marker not in prompt_before
 
         runtime.skills.activate_skill(pid, WORKSPACE_EDITING_SKILL, actor=pid)
 
-        editing_after = next(
-            item
-            for item in runtime.skills.available_builtin_prompt_context(pid)
-            if item["skill_id"] == WORKSPACE_EDITING_SKILL
-        )
-        assert editing_after["active"] is True
         prompt_after = _render_prompt(runtime, pid)
+        assert WORKSPACE_EDITING_SKILL in prompt_after
         assert prompt_after.count(body_marker) == 1
         assert "package_snapshot" not in prompt_after
     finally:
@@ -1019,7 +1162,7 @@ def _render_prompt(runtime: Runtime, pid: str) -> str:
         capabilities=[],
         tools=[],
         skills=runtime.skills.prompt_context(pid),
-        available_skills=runtime.skills.available_builtin_prompt_context(pid),
+        available_skills=[],
     )
 
 

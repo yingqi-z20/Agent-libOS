@@ -286,7 +286,8 @@ def test_paired_images_compare_skills_projection_with_no_skills_baseline(
         assert "write_text_file" not in treatment_tools
         assert "activate_skill" not in baseline_tools
         assert "write_text_file" in baseline_tools
-        assert runtime.skills.available_builtin_prompt_context(baseline_pid) == []
+        assert runtime.process.get(treatment_pid).loaded_skills == {}
+        assert runtime.process.get(baseline_pid).loaded_skills == {}
         assert len(baseline_tools) > len(treatment_tools)
     finally:
         runtime.close()

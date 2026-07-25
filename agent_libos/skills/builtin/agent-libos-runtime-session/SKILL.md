@@ -108,9 +108,10 @@ is still not guaranteed recoverable after reopen.
 3. Compact only with its marker; prefer `force=false`, low sufficient chunks,
    and a deliberate tail. Call alone and yield while Runtime resumes it.
 4. Before exit re-read the cumulative goal/ledger and queued messages. A notice
-   pauses exit: activate `agent-libos-child-processes`, read/ACK input, and merge
-   cumulative follow-ups. Send required `human_output` in a prior turn, then call
-   `process_exit` alone and follow Completion evidence on review.
+   pauses exit: follow source-neutral Skill discovery, activate a result that
+   declares a message-read tool, read/ACK input, and merge cumulative follow-ups.
+   Send required `human_output` in a prior turn, then call `process_exit` alone
+   and follow Completion evidence on review.
 
 ## Failure and recovery
 
@@ -153,10 +154,11 @@ guess. Use this state machine.
 2. If it returns `exited`, stop. If it returns
    `completion_review_required`, inspect its goal, source refs, unread/ACKed IDs,
    message count/hash/reference, observed tools, hints, required shape, and errors.
-3. Read unread Human messages with `agent-libos-child-processes`, using exact IDs
-   or `{}` when directed to drain the unread mailbox. Default `ack=true` changes
-   each returned message status. Status is part of review identity, so ACK makes
-   the first token stale.
+3. Follow the review's source-neutral `skill_discovery` query, activate one
+   returned Skill that declares `read_process_messages`, then read unread Human
+   messages using exact IDs or `{}` when directed to drain the unread mailbox.
+   Default `ack=true` changes each returned message status. Status is part of
+   review identity, so ACK makes the first token stale.
 4. After ACK, call a second bare `process_exit`. Use only this post-ACK review's
    token, goal OID, acknowledged ID set, and expected refs. If more unread input
    appears, repeat read then bare probe. Never submit the pre-ACK token.

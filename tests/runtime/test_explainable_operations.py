@@ -497,6 +497,7 @@ def test_llm_request_persists_context_manifest_without_object_payloads() -> None
             [{"action": "create_memory_object", "type": "observation", "payload": {"secret": "payload-marker"}}]
         )
         pid = runtime.process.spawn(image="base-agent:v0", goal="materialize context")
+        runtime.skills.activate_skill(pid, "agent-libos-object-memory", actor=pid)
 
         result = runtime.run_next_process_once()
         assert result["ok"]
@@ -518,6 +519,11 @@ def test_human_wait_and_resume_reuse_llm_and_tool_operation_ids() -> None:
             [{"action": "ask_human", "question": "Continue?", "context": {"phase": "test"}}]
         )
         pid = runtime.process.spawn(image="review-agent:v0", goal="wait and resume")
+        runtime.skills.activate_skill(
+            pid,
+            "agent-libos-human-collaboration",
+            actor=pid,
+        )
         runtime.capability.grant(pid, "human:owner", [CapabilityRight.WRITE], issued_by="test")
 
         first = runtime.run_next_process_once()

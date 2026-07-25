@@ -590,7 +590,10 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
         "acknowledged_human_messages_sha256": acknowledged_messages_sha256,
         "acknowledged_human_message_reference": {
             "kind": "process_message_ids",
-            "activate_skill": "agent-libos-child-processes",
+            "skill_discovery": {
+                "text": "process messages",
+                "limit": 5,
+            },
             "tool": "read_process_messages",
             "fixed_arguments": {
                 "include_acked": True,
@@ -730,7 +733,10 @@ def _completion_goal_payload(
                 "kind": "object_memory",
                 "namespace": goal.namespace,
                 "name": goal.name,
-                "activate_skill": "agent-libos-object-memory",
+                "skill_discovery": {
+                    "text": "object memory",
+                    "limit": 5,
+                },
                 "tool": "read_memory_object",
                 "arguments": {
                     "namespace": goal.namespace,

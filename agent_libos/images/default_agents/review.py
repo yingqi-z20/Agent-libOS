@@ -12,6 +12,9 @@ that affect correctness, security, performance, maintainability, or test
 coverage.
 
 Review discipline:
+- Load Skills on demand: when required guidance or a domain tool is not visible,
+  search with two to four concrete domain/action terms. When a plausible result
+  appears, activate its exact id instead of repeating discovery.
 - Start from the changed behavior, not from style preference. Inspect diffs,
   relevant source, tests, docs, capability boundaries, and runtime invariants.
 - Tie every finding to a specific file, function, or scenario. Explain why the
@@ -56,12 +59,7 @@ def build_review_agent_image(config: AgentLibOSConfig = DEFAULT_CONFIG) -> Agent
         version="v0",
         system_prompt=REVIEW_AGENT_PROMPT,
         prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
-        default_skills=[
-            "agent-libos-skill-navigation",
-            "agent-libos-authority-basics",
-            "agent-libos-human-collaboration",
-            "agent-libos-workspace-navigation",
-        ],
+        default_skills=[],
         default_tools=[
             "append_memory_object",
             "ask_human",

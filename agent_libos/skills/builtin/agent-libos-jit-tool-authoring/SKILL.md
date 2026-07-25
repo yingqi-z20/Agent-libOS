@@ -91,7 +91,7 @@ Success returns `tool_id`, `name`, `scope`. `ephemeral_process` is ownership sco
 
 ## Recommended workflow
 
-1. Confirm no visible built-in, registered, or loaded-Skill tool already covers the operation. Keep one-off reasoning inline instead of creating a tool.
+1. Confirm no visible, discoverable, or loaded-Skill tool already covers the operation. Keep one-off reasoning inline instead of creating a tool.
 2. Define a bounded contract with explicit required/nullability and denial representation.
 3. Implement self-contained TypeScript; use constant minimal syscalls after pure validation.
 4. Test normal/boundary/branch/syscall/denial behavior; schemas remain separate.

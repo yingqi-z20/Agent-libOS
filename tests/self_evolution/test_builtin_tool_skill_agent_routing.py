@@ -77,6 +77,14 @@ def test_agent_routes_file_editing_through_builtin_skill_and_verifies_content(
                 "path": "routed.txt",
                 "content": "skill-routed\n",
             },
+            {
+                "action": "discover_skills",
+                "text": "agent-libos-workspace-navigation",
+            },
+            {
+                "action": "activate_skill",
+                "skill_id": "agent-libos-workspace-navigation",
+            },
             {"action": "read_text_file", "path": "routed.txt"},
             {"action": "process_exit", "payload": {"verified": True}},
         ]
@@ -108,6 +116,8 @@ def test_agent_routes_file_editing_through_builtin_skill_and_verifies_content(
                 "discover_skills",
                 "activate_skill",
                 "write_text_file",
+                "discover_skills",
+                "activate_skill",
                 "read_text_file",
                 "process_exit",
             ],
@@ -276,7 +286,7 @@ def test_agent_routes_checkpoint_inspection_through_builtin_skill(
                 ]
             )
         ),
-        default_skills=["agent-libos-skill-navigation"],
+        default_skills=[],
         metadata={"tool_projection": "skills"},
     )
     runtime.register_image(image, actor="cli")
@@ -528,18 +538,37 @@ def _assert_standard_route(
     assert _action_names(results) == expected_actions
     assert client.actions == []
     assert all(item["result"]["ok"] for item in results)
+    assert all(
+        marker not in prompt
+        for prompt in client.user_prompts
+        for marker in (
+            "builtin_projection",
+            '"source_type":"builtin"',
+            '"activation_kind"',
+        )
+    )
 
     discovered = _payload(results, "discover_skills")
     matching = [item for item in discovered["skills"] if item["skill_id"] == skill_id]
     assert len(matching) == 1
-    assert matching[0]["source_type"] == "builtin"
     assert matching[0]["active"] is False
-    assert discovered["catalog_scope"] == "builtin_only"
+    assert discovered["visibility_limited"] is True
+    assert {
+        "source",
+        "source_type",
+        "catalog_scope",
+        "available_tools",
+    }.isdisjoint(matching[0])
 
     activation = _payload(results, "activate_skill")["result"]
     assert activation["skill_id"] == skill_id
-    assert activation["activation_kind"] == "builtin_projection"
-    assert activation["authority_changed"] is False
+    assert {
+        "activation_kind",
+        "authority_changed",
+        "source",
+        "source_type",
+        "registered",
+    }.isdisjoint(activation)
 
     batches = [_tool_names(batch) for batch in client.tool_batches]
     assert projected_tool not in batches[0]

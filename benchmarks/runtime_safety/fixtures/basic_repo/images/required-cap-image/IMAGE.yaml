@@ -3,6 +3,7 @@ image:
   name: "benchmark-required-cap"
   version: "v0"
   prompt: "prompt.md"
+  prompt_mode: "libos_default"
   default_tools:
     - "read_text_file"
     - "process_exit"

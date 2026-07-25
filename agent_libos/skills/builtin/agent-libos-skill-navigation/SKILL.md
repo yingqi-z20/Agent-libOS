@@ -1,38 +1,37 @@
 ---
 name: agent-libos-skill-navigation
-description: Discover an applicable Agent Skill, activate its exact snapshot, read declared resources from that loaded snapshot, and unload it when its guidance or tools are no longer needed. Use when the required Skill is not already loaded or when a registered Skill must be found; never use Skill lifecycle operations to obtain Capability authority or bypass a denied tool.
+description: Discover an applicable Agent Skill on demand, activate its exact snapshot, read declared resources from that loaded snapshot, and unload it when its guidance or tools are no longer needed. Use whenever required guidance or a domain tool is not already visible; never use Skill lifecycle operations to obtain Capability authority or bypass a denied tool.
 allowed-tools: discover_skills activate_skill read_skill_resource unload_skill
 ---
 # Navigate Skills
 
-First inspect `Loaded skills` and visible schemas. If the exact Skill is already usable, do not rediscover or reactivate it: activation and unload are durable, audited, non-idempotent lifecycle mutations. Select the smallest direct match; a similar name is not an interchangeable implementation.
+First inspect `Loaded skills` and visible schemas. If the exact Skill is already usable, do not rediscover or reactivate it: activation and unload are durable, audited, non-idempotent lifecycle mutations. Otherwise discover with two to four concrete domain/action terms, select the smallest direct match, and load only that Skill. A similar name is not an interchangeable implementation.
 
 ## Tool guide
 
 ### `discover_skills`
 
-Use `{"text":"git pull request","limit":8}` only when the exact ID is uncertain or a registered Skill may apply.
+Use a focused query such as `{"text":"git pull request","limit":8}` whenever the exact ID is uncertain or the required domain schema is not visible. Query terms are matched independently against visible identity and description metadata, then results are relevance-ranked.
 
-- The result contains `skills`, `catalog_scope`, and `has_more`. Applicable built-ins are a complete prefix and do not count against `limit`; `text` and `limit` bound only registered entries.
-- Model-facing discovery merges applicable built-ins with registered entries; it does not scan directories for unregistered packages. `catalog_scope="builtin_only"` means registry visibility was absent, not that no other Skill exists.
-- Registered discovery needs `read` on the configured `skill:*` registry resource. A limited grant can be consumed, so use a useful first-call limit. Missing authority silently narrows scope to built-ins.
-- There is no cursor. If `has_more=true`, refine `text` or raise `limit` within the Host maximum. If a later call changes to `builtin_only`, report the authority change instead of concluding that prior registered entries disappeared.
-- Built-in summaries include `active` and `available_tools`; registered summaries and the metadata-only prompt catalog omit `active`. Use `Loaded skills` as the primary state check.
-- Discovery neither loads instructions nor grants tool, Capability, provider, or approval authority.
+- `text` and `limit` apply uniformly to every visible Skill. Start with concrete nouns and actions, omit `limit` or use at least 5, and avoid pasting the whole goal. A broad empty query is allowed but is usually wasteful.
+- The result contains one `skills` page plus `has_more`, `visibility_limited`, and `next_step`. Every summary has the same fields regardless of package source: identity, description, declared tool/action/JIT names, required capabilities, package hash, and `active`.
+- `next_step=activate_skill` means choose one plausible returned exact ID rather than searching again. `next_step=refine_search` means shorten or replace the terms; never repeat an unchanged query.
+- There is no cursor. `has_more=true` means more matches exist for this exact query, so refine `text` or raise `limit` within the Host maximum. It does not control whether a zero-result query may be refined.
+- `visibility_limited=true` means catalog authority prevented searching every configured source. It says nothing about the origin of returned entries, does not invalidate a plausible returned match, and does not by itself justify requesting broader authority.
+- Model discovery does not scan directories for packages the Host has not made visible. Do not invent IDs or inspect paths as a fallback.
+- Discovery returns metadata only. It does not load instructions, expose declared domain schemas, grant Capability, contact providers, or approve effects.
 
 ### `activate_skill`
 
-Pass exactly one returned or prompt-provided ID, for example `{"skill_id":"agent-libos-jsonrpc"}`.
+Pass exactly one ID returned by discovery, for example `{"skill_id":"example-skill"}`. Do not activate from a guessed name.
 
-A built-in activates only when the image already owns every declared static tool under the exact IDs. It atomically projects all of them into model visibility; it does not change the full tool table, add JIT, grant Capability, or need current-process `skill:<id>` authority.
+Activation always has one model-visible result contract: `pid`, `skill_id`, `name`, `version`, `tool_names`, `tool_ids`, `jit_tool_ids`, `instructions_hash`, and `package_sha256`. Package origin, Host trust mechanism, and internal activation provenance are not model routing inputs.
 
-A registered activation requires `execute skill:<id>` and can add static/JIT bindings. Resume an ASK decision rather than duplicating it. Reactivation atomically replaces its prior snapshot/bindings and retires superseded JIT.
+The runtime validates the exact package snapshot and every binding atomically. A static binding may reveal an image-owned tool; a package-declared JIT binding may add a process-local tool. Neither case grants the primitive Capability or Human approval needed for an effect. Activation authority is determined by Host policy and package contents; if an ASK is pending, resume it rather than submitting a duplicate activation.
 
-Both persist an immutable snapshot/provenance plus audit/event evidence. `authority_changed=false` means Capability did not expand, not that no state changed.
+New instructions and schemas appear in the next turn. Reactivation is not a harmless read: it replaces the previous snapshot and bindings and can retire superseded JIT, so avoid it when `active=true` or the exact Skill is already in `Loaded skills`.
 
-Built-in success includes `activation_kind="builtin_projection"`, `authority_changed=false`, maps/hashes, and empty `jit_tool_ids`. Registered success includes identity, maps, and hashes but omits those two fields. New guidance/schemas appear next turn.
-
-Direct projection exposes each registered JIT schema. Multiplexed images expose only `run_jit_tool`; use the loaded contract and `{"tool_name":"exact-name","arguments":{...}}`. Never guess a hidden schema.
+Direct JIT exposure shows each activated JIT schema. Multiplexed images expose only `run_jit_tool`; use the loaded contract and `{"tool_name":"exact-name","arguments":{...}}`. Never guess a hidden schema.
 
 ### `read_skill_resource`
 
@@ -42,34 +41,34 @@ Read a package-relative resource after activation and before unload, for example
 - Reads use the immutable loaded snapshot, unaffected by later registry replacement, and need no second `skill:<id>` read grant.
 - `max_bytes` rejects rather than truncates. Omit it for the Host default or choose at least disclosed `size_bytes`; do not probe repeatedly.
 - Inspect `kind`, `size_bytes`, and `sha256`. For `kind="text"`, use `content`; for `kind="base64"`, use `content_base64`. Exactly one payload form is useful.
-- Built-in tool-Skill packages contain only `SKILL.md`, so bundled resources normally belong to registered Skills.
+- A Skill with no declared resources needs no resource read. Do not infer package origin from that absence.
 
 ### `unload_skill`
 
 Call `{"skill_id":"example-skill"}` only after its guidance/resources are no longer needed.
 
-Built-in unload needs no current-process `skill:<id>` right. Registered unload separately requires `execute skill:<id>`. It removes that snapshot/bindings, retires JIT, and restores overlapping/base bindings. It never revokes Capability or reverses external effects.
+Unload removes that snapshot and its contributed visibility, retires unshared JIT, and restores overlapping or base bindings. It never revokes Capability or reverses external effects. Host policy may require authority for the lifecycle mutation.
 
-The result includes `activation_kind`, `removed_tools`, and `authority_changed=false`. Empty `removed_tools` is normal for a built-in because image-owned full-table bindings remain.
+The common result contains `pid`, `skill_id`, and `removed_tools`. Empty `removed_tools` is normal when the full process table or another loaded Skill still owns every binding; it does not mean the prompt body remained loaded.
 
 ## Recommended workflow
 
 1. Check `Loaded skills` and visible schemas. If the exact Skill is already usable, stop navigation and perform the task.
-2. Activate an exact catalog built-in directly; otherwise discover once with focused text and a sufficient limit.
-3. Select by exact ID, description, tools, source type, and package hash—not name resemblance.
-4. Activate once. Match returned `skill_id` and any discovered `package_sha256`.
-5. Validate the tool maps. For a built-in, require `jit_tool_ids == {}` and `set(tool_names) == keys(tool_ids)`, aligned with `available_tools`. For a registered Skill, require `set(tool_names) == keys(tool_ids) union keys(jit_tool_ids)`.
-6. Next turn, confirm its `Loaded skills` instructions and read each schema before use. Read only required declared resources.
+2. Discover once with two to four task terms and a sufficient but bounded limit.
+3. Select by exact ID, description, declared behavior, and package hash—not name resemblance or presumed source.
+4. Activate once. Match the returned `skill_id` and discovered `package_sha256`.
+5. Validate `set(tool_names) == keys(tool_ids) union keys(jit_tool_ids)`. Treat any mismatch as incomplete settlement.
+6. On the next turn, confirm the exact body under `Loaded skills` and inspect each newly visible schema before use. Read only required declared resources.
 7. Use the Skill to finish the user task. Keep it loaded across related steps; unload only when reduced prompt/tool exposure is useful and no later step depends on it.
-8. Recheck after transitions. Same-image fork/restore can preserve snapshots; fresh-child spawn or exec uses target-image defaults and may drop projections.
+8. Recheck after transitions. Fork or restore can preserve snapshots; fresh spawn or exec may start with no loaded Skills or with target-image defaults.
 
 ## Failure and recovery
 
-- Already loaded: do not reactivate; it rewrites lifecycle evidence and can replace registered JIT.
-- Unknown ID or absent registered entry: refine discovery only when `has_more=true`; otherwise report that no visible registered match exists. Do not scan paths or invent an ID through these tools.
-- Unsupported built-in membership, tool-ID mismatch, invalid provenance, or hash mismatch: stop. Do not request partial activation or substitute an unverified global tool.
-- Discovery/activation denial: request only exact catalog `read` or `skill:<id>` `execute`; never duplicate pending ASK.
-- Unknown activation settlement: inspect the next turn's `Loaded skills`; for built-ins, a later discovery `active` value is also usable. Do not blindly repeat a non-idempotent activation.
+- Already loaded: do not reactivate; it rewrites lifecycle evidence and can replace package-declared JIT.
+- No matching entry: follow `next_step=refine_search` and change or shorten the terms once; `has_more` only describes additional matches to the same query. If visibility is limited and no refined query matches, report that authority bounds the conclusion. Do not scan paths or invent an ID through these tools.
+- Tool-ID mismatch, invalid provenance, or hash mismatch: stop. Do not request partial activation or substitute an unverified similarly named tool.
+- Discovery or activation denial: request only the exact catalog or Skill right made available by Host policy; never duplicate a pending ASK.
+- Unknown activation settlement: inspect the next turn's `Loaded skills` or repeat focused discovery and check `active`. Do not blindly repeat a non-idempotent activation.
 - Missing/oversized resource: compare loaded metadata and correct the path or ceiling once; no filesystem bypass.
 - Multiplexed JIT without a documented name/argument contract: stop and report the incomplete Skill package rather than guessing.
 - Unknown unload settlement: verify loaded prompt state on the next turn. Schema presence alone is insufficient because the base image or another Skill may own the same binding.
@@ -77,6 +76,6 @@ The result includes `activation_kind`, `removed_tools`, and `authority_changed=f
 
 ## Completion evidence
 
-Navigation is complete when one exact Skill is loaded, identity/maps are consistent, guidance/schemas are visible, and required resources came from that snapshot with hashes recorded. Domain completion still follows that Skill.
+Navigation is complete when one exact Skill is loaded, identity and common tool maps are consistent, guidance and schemas are visible, and required resources came from that snapshot with hashes recorded. Domain completion still follows that Skill.
 
-After unload, require the exact Skill to be absent from the next `Loaded skills` section. For a built-in, discovery may additionally show `active=false`; registered summaries have no such field. Report `removed_tools` as full-table deletions only, not as a claim that every model schema or prior external effect disappeared.
+After unload, require the exact Skill to be absent from the next `Loaded skills` section; focused discovery may additionally show `active=false`. Report `removed_tools` as full-table deletions only, not as a claim that every model schema or prior external effect disappeared.

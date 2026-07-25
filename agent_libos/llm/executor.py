@@ -1004,7 +1004,9 @@ class LLMProcessExecutor:
             loaded_skills=self._tools.model_loaded_skills(pid),
         )
         skills = self._skills.prompt_context(pid)
-        available_skills = self._skills.available_builtin_prompt_context(pid)
+        # Skill metadata is discovered through the same on-demand tool path as
+        # every other Skill.  Only activated bodies belong in the prompt.
+        available_skills: list[dict[str, Any]] = []
         prepared_context = await self._prepare_llm_context(
             pid=pid,
             image=image,
@@ -5168,7 +5170,7 @@ class LLMProcessExecutor:
             "loaded_skills": getattr(process, "loaded_skills", {}),
             "context_scope": context_scope,
             "tools": to_jsonable(tools),
-            "available_builtin_skills": to_jsonable(available_skills or []),
+            "available_skills": to_jsonable(available_skills or []),
         }
         return hashlib.sha256(dumps(material).encode("utf-8")).hexdigest()
 
@@ -5278,14 +5280,24 @@ class LLMProcessExecutor:
     ) -> dict[str, Any] | None:
         if tool_name in {"read_process_messages", "receive_process_messages"}:
             return None
-        if (
-            tool_name == "activate_skill"
-            and tool_args.get("skill_id") == "agent-libos-child-processes"
-        ):
-            # This built-in activation only projects tools already present in
-            # the image. It is the minimal no-authority bridge needed to make
-            # the interrupt-handling tools visible under Skills projection.
-            return None
+        if tool_name == "discover_skills":
+            # A bounded metadata read is the source-neutral bridge to the
+            # hidden message-handling schema. Keep unrelated discovery from
+            # deferring a mandatory interrupt indefinitely.
+            query = str(tool_args.get("text") or "").casefold()
+            if "message" in query or "mailbox" in query:
+                return None
+        if tool_name == "activate_skill":
+            skill_id = tool_args.get("skill_id")
+            if isinstance(skill_id, str):
+                try:
+                    if self._skills.skill_declares_any_tool(
+                        skill_id,
+                        {"read_process_messages", "receive_process_messages"},
+                    ):
+                        return None
+                except (NotFound, ValidationError):
+                    pass
         instruction = self._process_message_instruction(pid)
         notice = self._messages.notice(
             pid,
@@ -5320,9 +5332,11 @@ class LLMProcessExecutor:
         message_tools = {"read_process_messages", "receive_process_messages"}
         if message_tools.isdisjoint(process.model_tool_table):
             return (
-                "Call activate_skill with skill_id agent-libos-child-processes, then call "
-                "read_process_messages or receive_process_messages to inspect and acknowledge "
-                "unread process messages."
+                "Resolve message handling before other work. If the preceding discovery "
+                "result identifies a Skill declaring read_process_messages or "
+                "receive_process_messages, activate that exact returned id; otherwise call "
+                "discover_skills with text 'messages' and a bounded limit. Then call a "
+                "visible message-read tool to inspect and acknowledge unread process messages."
             )
         return (
             "Call read_process_messages or receive_process_messages to inspect and acknowledge "

@@ -1,6 +1,6 @@
 ---
 name: agent-libos-workspace-editing
-description: Create, replace, or delete workspace text files and directories with explicit mutation and verification semantics. Use after resolving cwd, target, and baseline; not for binary/Object transfer, Git metadata, range edits, or shell commands.
+description: Write, create, replace, or delete ordinary workspace text files and directories with explicit mutation and verification semantics. Use after resolving cwd, target, and baseline; not for binary/Object transfer, Git metadata, range edits, or shell commands.
 allowed-tools: write_text_file write_directory delete_file delete_directory
 ---
 # Edit the workspace

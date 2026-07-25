@@ -813,8 +813,9 @@ class TestProcessMessage:
             runtime.close()
 
     @pytest.mark.parametrize('message_action', ['read_process_messages', 'receive_process_messages'])
-    def test_interrupt_allows_message_skill_activation_before_ack(self, message_action: str) -> None:
+    def test_interrupt_allows_message_skill_discovery_and_activation_before_ack(self, message_action: str) -> None:
         client = PlannedActionClient([
+            {'action': 'discover_skills', 'text': 'messages', 'limit': 4},
             {'action': 'activate_skill', 'skill_id': 'agent-libos-child-processes'},
             {'action': message_action},
         ])
@@ -835,6 +836,22 @@ class TestProcessMessage:
                 body='activate message handling before acknowledging this',
             )
 
+            discovered = runtime.run_process_once(pid)
+            assert discovered['action'] == {
+                'action': 'discover_skills',
+                'text': 'messages',
+                'limit': 4,
+            }
+            assert discovered['result']['ok']
+            assert [
+                item['skill_id']
+                for item in discovered['result']['payload']['skills']
+            ] == ['agent-libos-child-processes']
+            assert message.message_id in {
+                item.message_id
+                for item in runtime.messages.unread(pid, kind=ProcessMessageKind.INTERRUPT)
+            }
+
             activated = runtime.run_process_once(pid)
             assert activated['action'] == {
                 'action': 'activate_skill',
@@ -849,7 +866,9 @@ class TestProcessMessage:
             after_activation = runtime.process.get(pid)
             assert 'read_process_messages' in after_activation.model_tool_table
             assert 'receive_process_messages' in after_activation.model_tool_table
-            assert 'agent-libos-child-processes' in client.user_prompts[0]
+            assert 'agent-libos-child-processes' not in client.user_prompts[0]
+            assert 'discover_skills' in client.user_prompts[0]
+            assert 'agent-libos-child-processes' in client.user_prompts[1]
 
             handled = runtime.run_process_once(pid)
             assert handled['action']['action'] == message_action
@@ -877,8 +896,33 @@ class TestProcessMessage:
 
             blocked = runtime.run_process_once(pid)
             assert blocked['result']['interrupted_by_message']
-            assert 'agent-libos-child-processes' in blocked['result']['error']
+            assert 'discover_skills' in blocked['result']['error']
+            assert "text 'messages'" in blocked['result']['error']
             assert 'agent-libos-runtime-session' not in runtime.process.get(pid).loaded_skills
+            assert len(runtime.messages.unread(pid, kind=ProcessMessageKind.INTERRUPT)) == 1
+        finally:
+            runtime.close()
+
+    def test_interrupt_keeps_unrelated_skill_discovery_blocked(self) -> None:
+        client = PlannedActionClient([
+            {'action': 'discover_skills', 'text': 'workspace editing', 'limit': 4},
+        ])
+        runtime = Runtime.open('local')
+        runtime.llm.client = client
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='read the interrupt first')
+            runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                kind=ProcessMessageKind.INTERRUPT,
+                subject='urgent',
+            )
+
+            blocked = runtime.run_process_once(pid)
+
+            assert blocked['result']['interrupted_by_message']
+            assert 'discover_skills' in blocked['result']['error']
+            assert runtime.process.get(pid).loaded_skills == {}
             assert len(runtime.messages.unread(pid, kind=ProcessMessageKind.INTERRUPT)) == 1
         finally:
             runtime.close()
@@ -904,6 +948,7 @@ class TestProcessMessage:
     def test_normal_message_notice_requires_mediated_read_without_copying_body_to_prompt(self) -> None:
         client = PlannedActionClient([
             {'action': 'get_current_time', 'timezone': 'UTC'},
+            {'action': 'discover_skills', 'text': 'messages', 'limit': 4},
             {'action': 'activate_skill', 'skill_id': 'agent-libos-child-processes'},
             {'action': 'read_process_messages'},
         ])
@@ -922,12 +967,16 @@ class TestProcessMessage:
             assert first['action']['action'] == 'get_current_time'
             assert first['result']['message_notice']['message_ids'] == [message.message_id]
 
+            discovered = runtime.run_process_once(pid)
+            assert discovered['action']['action'] == 'discover_skills'
+            assert discovered['result']['ok']
+
             activated = runtime.run_process_once(pid)
             assert activated['action'] == {
                 'action': 'activate_skill',
                 'skill_id': 'agent-libos-child-processes',
             }
-            activation_prompt = client.user_prompts[1]
+            activation_prompt = client.user_prompts[2]
             assert message.body not in activation_prompt
             assert message.message_id not in activation_prompt
             directive = activation_prompt.rsplit(

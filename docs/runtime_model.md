@@ -226,27 +226,31 @@ An image with `metadata.tool_projection: skills` initially projects only
 `discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill`, and
 `process_exit`, all of which must be present in the image's explicit
 `default_tools` or image validation fails.
-`default_skills` load initial built-in instructions and their complete,
-image-authorized tool sets. Later `activate_skill` calls expand the durable
-model projection from that same full process tool table. A built-in Skill is
-hidden unless all its tools are present; activation cannot partially project a
-Skill, resolve absent tools, or grant authority.
+Shipped images leave `default_skills` empty. All Skill metadata is discovered
+through `discover_skills`, and `activate_skill` expands the durable model
+projection from the full process tool table only after an explicit selection.
+Discovery uses the same bounded metadata-term matching, relevance ordering,
+and `next_step` contract for every visible package source.
+An explicitly configured custom image may still declare generic
+`default_skills`; this is an image requirement, not a built-in LLM protocol.
+An immutable packaged Skill is hidden unless all its tools are present;
+activation cannot partially project a Skill, resolve absent tools, or grant
+authority.
 
 The current built-in image contracts are:
 
 | Image | Intended work | Initial model projection | Declared requirements |
 | --- | --- | --- | --- |
-| `base-agent:v0` | General runtime work and coordination | 15 schemas: bootstrap plus navigation, authority, human, and Object Memory built-ins | configured Human write |
-| `coding-agent:v0` | Repository inspection, editing, Git, and verification | 14 schemas: bootstrap plus navigation, authority, human, and workspace navigation built-ins | configured Human write and workspace read |
-| `review-agent:v0` | Evidence-first review; read-only unless repair is explicitly requested | 14 schemas: bootstrap plus navigation, authority, human, and workspace navigation built-ins | configured Human write and workspace read |
-| `toolmaker-agent:v0` | Import-free Deno/TypeScript JIT proposal, validation, and registration | Narrow explicit table with the JIT authoring guide loaded | configured Human write |
+| `base-agent:v0` | General runtime work and coordination | 5 Skill lifecycle/bootstrap schemas | configured Human write |
+| `coding-agent:v0` | Repository inspection, editing, Git, and verification | 5 Skill lifecycle/bootstrap schemas | configured Human write and workspace read |
+| `review-agent:v0` | Evidence-first review; read-only unless repair is explicitly requested | 5 Skill lifecycle/bootstrap schemas | configured Human write and workspace read |
+| `toolmaker-agent:v0` | Import-free Deno/TypeScript JIT proposal, validation, and registration | 5 Skill lifecycle/bootstrap schemas | configured Human write |
 | `context-compressor:v0` | Structured context compaction | `process_exit` only | none |
 
-The prompt lists only applicable built-in Skill IDs and concise descriptions;
-the catalog deliberately omits dynamic active state so activation preserves a
-stable prompt-cache prefix. Visibility remains separate from authority: Host
-calls and primitives continue to use the complete process tool
-table and Capability set, and built-in activation records no authority change.
+The prompt lists only activated Skill bodies. Discovery metadata is obtained
+on demand through one source-neutral schema. Visibility remains separate from
+authority: Host calls and primitives continue to use the complete process tool
+table and Capability set, and activation does not grant primitive authority.
 Requirement declarations remain Task Authority Manifest inputs, not grants.
 Configured base/coding ids must also remain distinct from the fixed review,
 toolmaker, and context-compressor ids; a collision fails Runtime construction

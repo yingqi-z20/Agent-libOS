@@ -1,6 +1,6 @@
 ---
 name: agent-libos-command-execution
-description: Run one policy-governed, non-interactive host command through the argv-only Shell boundary. Use for builds, tests, searches, or utilities lacking a narrower tool; not for general Git, TTY/streaming work, ad hoc remotes, or attempts to evade policy.
+description: Run or execute one approved, policy-governed, non-interactive host or shell command through the argv-only Shell boundary. Use for builds, tests, searches, or utilities lacking a narrower tool; not for general Git, TTY/streaming work, ad hoc remotes, or attempts to evade policy.
 allowed-tools: run_shell_command
 ---
 # Execute a command

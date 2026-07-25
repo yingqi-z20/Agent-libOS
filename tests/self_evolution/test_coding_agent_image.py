@@ -27,12 +27,7 @@ class TestCodingAgentImage:
         for phrase in required_phrases:
             assert phrase in prompt
         assert 'activate_tool_group' not in prompt
-        assert image.default_skills == [
-            'agent-libos-skill-navigation',
-            'agent-libos-authority-basics',
-            'agent-libos-human-collaboration',
-            'agent-libos-workspace-navigation',
-        ]
+        assert image.default_skills == []
 
     def test_coding_agent_tool_table_covers_repository_workflow(self) -> None:
         image = DEFAULT_IMAGES['coding-agent:v0']
@@ -78,7 +73,7 @@ class TestCodingAgentImage:
             'toolmaker-agent:v0': [
                 'toolmaker image',
                 'Operating contract:',
-                'agent-libos-jit-tool-authoring Skill',
+                'returned JIT tool-authoring Skill',
                 'existing governed tool',
                 'preserve every primitive Capability',
                 'human_output',

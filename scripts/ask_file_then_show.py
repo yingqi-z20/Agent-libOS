@@ -138,9 +138,25 @@ class AskFileViewerClient:
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
         self.calls += 1
         if self.step == 0:
-            # Drive the process through real human/file primitives while keeping
-            # this script deterministic and testable without a model call.
             self.step = 1
+            return self._completion(
+                "discover_skills",
+                {"text": "human collaboration", "limit": 5},
+            )
+        if self.step == 1:
+            self._require_discovered_skill(
+                messages,
+                "agent-libos-human-collaboration",
+            )
+            self.step = 2
+            return self._completion(
+                "activate_skill",
+                {"skill_id": "agent-libos-human-collaboration"},
+            )
+        if self.step == 2:
+            # Drive the process through real Skill, Human, and filesystem
+            # lifecycles while keeping the script deterministic and token-free.
+            self.step = 3
             return self._completion(
                 "ask_human",
                 {
@@ -148,17 +164,33 @@ class AskFileViewerClient:
                     "context": {"path_rule": "Use a path under the runtime workspace root."},
                 },
             )
-        if self.step == 1:
+        if self.step == 3:
             answer = self._last_tool_result(messages, "ask_human").get("answer")
             if not isinstance(answer, str) or not answer.strip():
                 raise AssertionError("ask_human result did not include a non-empty answer")
             self.selected_path = answer.strip()
-            self.step = 2
+            self.step = 4
+            return self._completion(
+                "discover_skills",
+                {"text": "workspace read text file", "limit": 5},
+            )
+        if self.step == 4:
+            self._require_discovered_skill(
+                messages,
+                "agent-libos-workspace-navigation",
+            )
+            self.step = 5
+            return self._completion(
+                "activate_skill",
+                {"skill_id": "agent-libos-workspace-navigation"},
+            )
+        if self.step == 5:
+            self.step = 6
             return self._completion(
                 "read_text_file",
                 {"path": self.selected_path, "max_bytes": self.max_bytes},
             )
-        if self.step == 2:
+        if self.step == 6:
             read_result = self._last_tool_result(messages, "read_text_file", required=False)
             if read_result is None:
                 self.error = self._last_tool_error(messages) or "read_text_file failed without a visible error"
@@ -169,10 +201,10 @@ class AskFileViewerClient:
                 suffix = "\n\n[content truncated]" if truncated else ""
                 message = f"----- {self.selected_path} -----\n{content}{suffix}"
                 self.displayed = True
-            self.step = 3
+            self.step = 7
             return self._completion("human_output", {"message": message})
-        if self.step == 3:
-            self.step = 4
+        if self.step == 7:
+            self.step = 8
             return self._completion(
                 "process_exit",
                 {
@@ -183,7 +215,7 @@ class AskFileViewerClient:
                     }
                 },
             )
-        if self.step == 4:
+        if self.step == 8:
             review_result = self._last_tool_result(messages, "process_exit")
             review = review_result.get("completion_review")
             if not isinstance(review, dict):
@@ -198,7 +230,7 @@ class AskFileViewerClient:
             evidence_tools = ["ask_human", "human_output"]
             if self.displayed:
                 evidence_tools.insert(1, "read_text_file")
-            self.step = 5
+            self.step = 9
             return self._completion(
                 "process_exit",
                 {
@@ -239,6 +271,23 @@ class AskFileViewerClient:
                 },
             )
         raise AssertionError("file viewer action plan is already complete")
+
+    def _require_discovered_skill(
+        self,
+        messages: list[dict[str, str]],
+        skill_id: str,
+    ) -> None:
+        discovered = self._last_tool_result(messages, "discover_skills")
+        skills = discovered.get("skills")
+        returned_ids = {
+            str(item.get("skill_id") or "")
+            for item in skills
+            if isinstance(item, dict)
+        } if isinstance(skills, list) else set()
+        if skill_id not in returned_ids:
+            raise AssertionError(
+                f"discover_skills did not return expected Skill {skill_id}"
+            )
 
     def _completion(self, name: str, args: dict[str, Any]) -> LLMCompletion:
         return LLMCompletion(

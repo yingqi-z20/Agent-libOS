@@ -93,6 +93,11 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
     try:
         pid = runtime.process.spawn(image="coding-agent:v0", goal=GOAL)
         _grant_authority(runtime, pid)
+        runtime.skills.activate_skill(
+            pid,
+            "agent-libos-workspace-navigation",
+            actor=pid,
+        )
         runtime.llm.client = _SingleActionClient(
             "read_text_file",
             {"path": "AGENTS.md", "max_bytes": 8_000},

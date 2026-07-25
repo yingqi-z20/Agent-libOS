@@ -1,6 +1,6 @@
 ---
 name: agent-libos-git-inspection
-description: Inspect the fixed Runtime Git repository, managed worktrees, status, diffs, history, refs, remotes, and blame before making or verifying a Git decision.
+description: Read-only inspect the fixed Runtime Git repository, managed worktrees, status, diffs, history, refs, remotes, and blame before making or verifying a Git decision.
 allowed-tools: git_repository_info git_status git_diff git_log git_show git_blame git_list_refs git_list_remotes git_list_worktrees
 ---
 # Inspect Git state

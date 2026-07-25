@@ -46,6 +46,9 @@ from tests.support.skills import write_skill_package
 
 RUNTIME_SESSION_SKILL = 'agent-libos-runtime-session'
 CHILD_PROCESSES_SKILL = 'agent-libos-child-processes'
+OBJECT_MEMORY_SKILL = 'agent-libos-object-memory'
+AUTHORITY_SKILL = 'agent-libos-authority-basics'
+HUMAN_COLLABORATION_SKILL = 'agent-libos-human-collaboration'
 DEFAULT_CONFIG = replace(
     SYSTEM_DEFAULT_CONFIG,
     llm_context=replace(
@@ -297,6 +300,7 @@ class TestLLMContextMemory:
         runtime = Runtime.open('local', config=config)
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='bounded events')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
             runtime.llm.client = RecordingActionClient([
                 {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 1}},
                 {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 2}},
@@ -345,6 +349,7 @@ class TestLLMContextMemory:
         runtime = Runtime.open('local', config=config)
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='capture every event')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
             emitted = {
                 runtime.events.emit(
                     EventType.EXTERNAL_WRITE,
@@ -395,6 +400,7 @@ class TestLLMContextMemory:
         monkeypatch.setattr(runtime.llm.context_memory, 'prepare', tracked_prepare)
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='use active context config')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
             runtime.llm.client = RecordingActionClient([
                 {'action': 'create_memory_object', 'type': 'observation', 'payload': {'done': True}},
             ])
@@ -437,6 +443,7 @@ class TestLLMContextMemory:
         try:
             runtime.llm.client = RecordingActionClient([{'action': 'create_memory_object', 'type': 'observation', 'payload': {'seen': 1}}])
             pid = runtime.process.spawn(image='base-agent:v0', goal='create context')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
             runtime.run_next_process_once()
             name = context_object_name(pid)
             obj = runtime.store.get_object_by_name(name, namespace=runtime.memory.resolve_namespace(pid))
@@ -462,6 +469,7 @@ class TestLLMContextMemory:
         try:
             runtime.llm.client = RecordingActionClient([{'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 1}}, {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 2}}])
             pid = runtime.process.spawn(image='base-agent:v0', goal='append context')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
             runtime.run_next_process_once()
             runtime.run_next_process_once()
             first, second = runtime.llm.client.user_prompts
@@ -674,6 +682,7 @@ class TestLLMContextMemory:
                 {'action': 'list_capabilities'},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='track tool projection changes')
+            runtime.skills.activate_skill(pid, AUTHORITY_SKILL, actor=pid)
 
             assert runtime.run_next_process_once()['ok']
             runtime.skills.activate_skill(
@@ -822,6 +831,7 @@ class TestLLMContextMemory:
                 require_capability=False,
             )
             pid = runtime.process.spawn(image='base-agent:v0', goal='preserve context labels')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
             tenant_a = runtime.memory.create_object(
                 pid,
                 ObjectType.EVIDENCE,
@@ -895,6 +905,7 @@ class TestLLMContextMemory:
                 image='base-agent:v0',
                 goal='deny a secret message event',
             )
+            runtime.skills.activate_skill(denied_pid, OBJECT_MEMORY_SKILL, actor=denied_pid)
             denied_source = runtime.memory.create_object(
                 denied_pid,
                 ObjectType.EVIDENCE,
@@ -948,6 +959,7 @@ class TestLLMContextMemory:
                 image='base-agent:v0',
                 goal='allow a secret message event',
             )
+            runtime.skills.activate_skill(allowed_pid, OBJECT_MEMORY_SKILL, actor=allowed_pid)
             allowed_source = runtime.memory.create_object(
                 allowed_pid,
                 ObjectType.EVIDENCE,
@@ -1116,6 +1128,7 @@ class TestLLMContextMemory:
                     image='base-agent:v0',
                     goal='persist context label high water',
                 )
+                runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
                 source = runtime.memory.create_object(
                     pid,
                     ObjectType.EVIDENCE,
@@ -1790,6 +1803,7 @@ class TestLLMContextMemory:
                 {'action': 'process_exit', 'payload': {'done': True}},
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='track object updates')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
             handle = runtime.memory.create_object(
                 pid=pid,
                 object_type=ObjectType.OBSERVATION,
@@ -1846,6 +1860,7 @@ class TestLLMContextMemory:
                 ]
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='parallel enabled')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
 
             result = runtime.run_next_process_once()
 
@@ -1901,6 +1916,7 @@ class TestLLMContextMemory:
                 [{'action': 'process_exit', 'payload': {'done': True}}],
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='repair invalid batch')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
 
             result = runtime.run_next_process_once()
 
@@ -1928,6 +1944,7 @@ class TestLLMContextMemory:
                 ]
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='stop after exit')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
 
             result = runtime.run_next_process_once()
 
@@ -2096,6 +2113,7 @@ class TestLLMContextMemory:
             _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'parallel message wait')
             runtime.skills.activate_skill(child, CHILD_PROCESSES_SKILL, actor=child)
+            runtime.skills.activate_skill(child, OBJECT_MEMORY_SKILL, actor=child)
 
             waiting = runtime.run_process_once(child)
 
@@ -2152,6 +2170,7 @@ class TestLLMContextMemory:
             _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'still running')
             runtime.skills.activate_skill(parent, CHILD_PROCESSES_SKILL, actor=parent)
+            runtime.skills.activate_skill(parent, OBJECT_MEMORY_SKILL, actor=parent)
             runtime.llm.client = MultiToolActionClient([
                 [
                     {'action': 'create_memory_object', 'type': 'observation', 'payload': {'step': 'before-wait'}},
@@ -2218,6 +2237,8 @@ class TestLLMContextMemory:
                     ],
                 },
             )
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
+            runtime.skills.activate_skill(pid, HUMAN_COLLABORATION_SKILL, actor=pid)
 
             waiting = runtime.run_process_once(pid)
 
@@ -2473,6 +2494,7 @@ class TestLLMContextMemory:
             try:
                 runtime.llm.client = client
                 pid = runtime.process.spawn(image='base-agent:v0', goal='chain responses state')
+                runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
                 first = runtime.run_next_process_once()
                 second = runtime.run_next_process_once()
 
@@ -2579,6 +2601,7 @@ class TestLLMContextMemory:
                 image="base-agent:v0",
                 goal="keep unverified provider response state stateless",
             )
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
 
             first = runtime.run_next_process_once()
             second = runtime.run_next_process_once()
@@ -2652,6 +2675,7 @@ class TestLLMContextMemory:
                 require_capability=False,
             )
             pid = runtime.process.spawn(image='base-agent:v0', goal='reset raced response chain')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
             first = runtime.run_next_process_once()
             assert first['action']['action'] == 'create_memory_object'
 
@@ -2790,6 +2814,7 @@ class TestLLMContextMemory:
         try:
             runtime.llm.client = first_client
             pid = runtime.process.spawn(image="base-agent:v0", goal="reset provider response chain")
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
             first = runtime.run_next_process_once()
             assert first["action"]["action"] == "create_memory_object"
 
@@ -2891,6 +2916,7 @@ class TestLLMContextMemory:
             runtime.llm.client = client
             pid = runtime.process.spawn(image='base-agent:v0', goal='reset incomplete parallel response chain')
             runtime.skills.activate_skill(pid, CHILD_PROCESSES_SKILL, actor=pid)
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
 
             first = runtime.run_next_process_once()
             second = runtime.run_next_process_once()
@@ -3007,6 +3033,7 @@ class TestLLMContextMemory:
                 image='base-agent:v0',
                 goal='keep text responses stateless under retention opt-out',
             )
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
 
             first = runtime.run_next_process_once()
             second = runtime.run_next_process_once()
@@ -3337,6 +3364,7 @@ class TestLLMContextMemory:
             try:
                 runtime.llm.client = client
                 pid = runtime.process.spawn(image='base-agent:v0', goal='chain reset after compaction')
+                runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
                 first = runtime.run_next_process_once()
                 context_obj = runtime.store.get_object_by_name(
                     context_object_name(pid),

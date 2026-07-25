@@ -90,6 +90,11 @@ async def run_interleaved_clock_demo(
                 "agent-libos-runtime-session",
                 actor=pid,
             )
+            runtime.skills.activate_skill(
+                pid,
+                "agent-libos-human-collaboration",
+                actor=pid,
+            )
         client.configure(
             pid_a,
             label="A",

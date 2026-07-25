@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolExecutionError, ToolPolicy
+from agent_libos.utils.skill_search import SKILL_SEARCH_TEXT_MAX_CHARS
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
@@ -13,43 +15,77 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 class DiscoverSkillsArgs(BaseModel):
     text: str | None = Field(
         default=None,
+        max_length=SKILL_SEARCH_TEXT_MAX_CHARS,
         description=(
-            "Optional text matched against registered and Host-catalog Skill ids, names, "
-            "and descriptions; applicable built-in Skills are always returned in full."
+            "Optional text matched against visible Skill ids, names, and descriptions. "
+            "Use a task-specific query to load only relevant metadata."
         ),
     )
     limit: int | None = Field(
         default=None,
         description=(
-            "Maximum matching registered and Host-catalog Skill summaries to return; "
-            "applicable built-in Skills do not count toward this limit."
+            "Maximum matching Skill summaries to return across every visible source."
         ),
     )
+
+
+class DiscoveredSkill(BaseModel):
+    skill_id: str
+    name: str
+    version: str
+    description: str
+    allowed_tools: list[str]
+    actions: list[str]
+    jit_tools: list[str]
+    required_capabilities: list[dict[str, Any]]
+    package_sha256: str
+    active: bool = False
 
 
 class DiscoverSkillsOutput(BaseModel):
-    skills: list[dict[str, Any]] = Field(
-        description=(
-            "The complete applicable built-in catalog followed by the requested page of "
-            "registered or Host-catalog Skills."
-        )
+    skills: list[DiscoveredSkill] = Field(
+        description="One bounded page of matching visible Skill metadata."
     )
-    catalog_scope: str = Field(description="Authority-bounded catalog sources included in this result.")
     has_more: bool = Field(
         default=False,
         description=(
-            "Whether another matching registered or Host-catalog Skill exists; the built-in "
-            "catalog in this result is already complete."
+            "Whether more matching visible Skills exist. There is no cursor; refine text or "
+            "raise limit within the Host maximum."
         ),
+    )
+    visibility_limited: bool = Field(
+        default=False,
+        description=(
+            "Whether catalog authority prevented this process from searching every configured "
+            "Skill source. This does not identify the source of any returned Skill."
+        ),
+    )
+    next_step: Literal["activate_skill", "refine_search"] = Field(
+        description=(
+            "Recommended next lifecycle step. Activate one plausible returned exact id; "
+            "refine only when no returned Skill fits, and never repeat an unchanged search."
+        )
     )
 
 
 class ActivateSkillArgs(BaseModel):
-    skill_id: str = Field(description="Exact Skill id returned by discover_skills or the built-in Skill catalog.")
+    skill_id: str = Field(description="Exact Skill id returned by discover_skills.")
+
+
+class ActivatedSkill(BaseModel):
+    pid: str
+    skill_id: str
+    name: str
+    version: str
+    tool_names: list[str]
+    tool_ids: dict[str, str]
+    jit_tool_ids: dict[str, str]
+    instructions_hash: str
+    package_sha256: str
 
 
 class ActivateSkillOutput(BaseModel):
-    result: dict[str, Any]
+    result: ActivatedSkill
 
 
 class ReadSkillResourceArgs(BaseModel):
@@ -74,15 +110,24 @@ class UnloadSkillArgs(BaseModel):
     skill_id: str = Field(description="Exact id of a Skill currently loaded in this process.")
 
 
+class UnloadedSkill(BaseModel):
+    pid: str
+    skill_id: str
+    removed_tools: list[str]
+
+
 class UnloadSkillOutput(BaseModel):
-    result: dict[str, Any]
+    result: UnloadedSkill
 
 
 class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
     name = "discover_skills"
     description = (
-        "List every applicable built-in tool Skill and search registered Agent Skills visible to this process. "
-        "Use the returned exact id with activate_skill; discovery does not activate tools or grant authority."
+        "Search visible Agent Skills by task intent and return one relevance-ranked metadata "
+        "page. Start with two to four concrete domain/action terms and omit limit or use at "
+        "least 5. When a plausible result appears, activate its exact id instead of repeating "
+        "discovery; visibility_limited does not invalidate returned matches. Discovery does "
+        "not load instructions, expose domain tools, or grant authority."
     )
     args_schema = DiscoverSkillsArgs
     output_schema = DiscoverSkillsOutput
@@ -95,12 +140,18 @@ class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
     tags = ["skill", "inspect"]
 
     def run(self, args: DiscoverSkillsArgs, ctx: ToolContext) -> DiscoverSkillsOutput:
+        discovered = _runtime(ctx).skills.discover_skills_result(
+            args.text,
+            actor=ctx.pid,
+            limit=args.limit,
+        )
         return DiscoverSkillsOutput(
-            **_runtime(ctx).skills.discover_skills_result(
-                args.text,
-                actor=ctx.pid,
-                limit=args.limit,
-            )
+            skills=discovered["skills"],
+            has_more=bool(discovered["has_more"]),
+            visibility_limited=(
+                discovered.get("catalog_scope") == "visibility_limited"
+            ),
+            next_step=("activate_skill" if discovered["skills"] else "refine_search"),
         )
 
 
@@ -121,7 +172,15 @@ class ActivateSkillTool(SyncAgentTool[ActivateSkillArgs]):
     tags = ["skill", "activate"]
 
     def run(self, args: ActivateSkillArgs, ctx: ToolContext) -> ActivateSkillOutput:
-        return ActivateSkillOutput(result=_runtime(ctx).skills.activate_skill(ctx.pid, args.skill_id, actor=ctx.pid))
+        try:
+            result = _runtime(ctx).skills.activate_skill(
+                ctx.pid,
+                args.skill_id,
+                actor=ctx.pid,
+            )
+        except ValidationError as exc:
+            raise ValidationError(_source_neutral_error_message(str(exc))) from exc
+        return ActivateSkillOutput(result=result)
 
 
 class ReadSkillResourceTool(SyncAgentTool[ReadSkillResourceArgs]):
@@ -141,15 +200,17 @@ class ReadSkillResourceTool(SyncAgentTool[ReadSkillResourceArgs]):
     tags = ["skill", "resource", "inspect"]
 
     def run(self, args: ReadSkillResourceArgs, ctx: ToolContext) -> ReadSkillResourceOutput:
-        return ReadSkillResourceOutput(
-            resource=_runtime(ctx).skills.read_skill_resource(
+        try:
+            resource = _runtime(ctx).skills.read_skill_resource(
                 ctx.pid,
                 args.skill_id,
                 args.path,
                 actor=ctx.pid,
                 max_bytes=args.max_bytes,
             )
-        )
+        except ValidationError as exc:
+            raise ValidationError(_source_neutral_error_message(str(exc))) from exc
+        return ReadSkillResourceOutput(resource=resource)
 
 
 class UnloadSkillTool(SyncAgentTool[UnloadSkillArgs]):
@@ -169,10 +230,34 @@ class UnloadSkillTool(SyncAgentTool[UnloadSkillArgs]):
     tags = ["skill", "unload"]
 
     def run(self, args: UnloadSkillArgs, ctx: ToolContext) -> UnloadSkillOutput:
-        return UnloadSkillOutput(result=_runtime(ctx).skills.unload_skill(ctx.pid, args.skill_id, actor=ctx.pid))
+        try:
+            result = _runtime(ctx).skills.unload_skill(
+                ctx.pid,
+                args.skill_id,
+                actor=ctx.pid,
+            )
+        except ValidationError as exc:
+            raise ValidationError(_source_neutral_error_message(str(exc))) from exc
+        return UnloadSkillOutput(result=result)
 
 
 def _runtime(ctx: ToolContext) -> Any:
     if ctx.runtime is None:
         raise ToolExecutionError("Runtime is unavailable.")
     return ctx.runtime
+
+
+def _source_neutral_error_message(message: str) -> str:
+    """Remove Host-only package provenance labels from model tool failures."""
+
+    replacements = (
+        ("reserved built-in Skill", "reserved Skill"),
+        ("built-in loaded Skill", "loaded Skill"),
+        ("built-in tool Skill", "Skill"),
+        ("built-in Skill", "Skill"),
+        ("built-in tool", "tool"),
+    )
+    result = message
+    for source, replacement in replacements:
+        result = result.replace(source, replacement)
+    return result

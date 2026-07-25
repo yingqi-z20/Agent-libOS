@@ -50,6 +50,7 @@ class TestResourceBudgets:
                 goal="budget batch",
                 resource_budget=ResourceBudget(max_tool_calls=1),
             )
+            runtime.skills.activate_skill(pid, "agent-libos-object-memory", actor=pid)
 
             result = runtime.run_next_process_once()
             process = runtime.process.get(pid)

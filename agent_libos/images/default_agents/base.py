@@ -19,11 +19,14 @@ Instruction hierarchy:
 
 Decision loop:
 1. Orient. Read the goal and factual runtime context before choosing an action.
-2. Decide. Choose the least risky sufficient action that advances the goal.
-3. Act. Respect the current tool visibility and authority boundaries.
-4. Verify. Re-check important claims against context or concrete evidence. If
+2. Load on demand. If needed guidance or a domain tool is not visible, search
+   Skills with two to four concrete domain/action terms. When a plausible
+   result appears, activate its exact id instead of repeating discovery.
+3. Decide. Choose the least risky sufficient action that advances the goal.
+4. Act. Respect the current tool visibility and authority boundaries.
+5. Verify. Re-check important claims against context or concrete evidence. If
    verification is unavailable, state the gap plainly.
-5. Report and exit. Before process_exit, use human_output once for a concise
+6. Report and exit. Before process_exit, use human_output once for a concise
    final user-facing result unless the goal explicitly requests machine-only
    output; do not duplicate a final result already sent. Then call process_exit
    with summary, evidence, verification, residual_risks, and follow_up. If
@@ -51,12 +54,7 @@ def build_base_agent_image(config: AgentLibOSConfig) -> AgentImage:
         version="v0",
         system_prompt=BASE_AGENT_PROMPT,
         prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
-        default_skills=[
-            "agent-libos-skill-navigation",
-            "agent-libos-authority-basics",
-            "agent-libos-human-collaboration",
-            "agent-libos-object-memory",
-        ],
+        default_skills=[],
         default_tools=[
             "append_memory_object",
             "ask_human",

@@ -33,7 +33,6 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.ports import AuditPort, EventPort, RuntimePublicationReceiptRecorder
 from agent_libos.skills.builtin_catalog import (
-    BUILTIN_SKILL_CATALOG_SCOPE,
     BUILTIN_SKILL_PREFIX,
     BuiltinSkillCatalog,
     get_builtin_skill_catalog,
@@ -42,6 +41,10 @@ from agent_libos.skills.schema import ActionSchema, JitToolSpec, LoadedSkill, Sk
 from agent_libos.storage import UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import bounded_json_loads, dumps, to_jsonable
+from agent_libos.utils.skill_search import (
+    skill_metadata_exact_match,
+    skill_metadata_search_score,
+)
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -426,12 +429,7 @@ class SkillManager:
         require_capability: bool = True,
         limit: int | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
-        """Return all applicable built-ins plus one bounded registered catalog page.
-
-        ``text`` and ``limit`` apply only to registered and Host-catalog
-        entries. The built-in prefix is always the complete set supported by
-        the actor's current image.
-        """
+        """Return one uniformly filtered and bounded visible Skill page."""
 
         skills, has_more, _scope = self._discover_skills_window_with_scope(
             text,
@@ -459,6 +457,25 @@ class SkillManager:
         )
         return {"skills": skills, "catalog_scope": scope, "has_more": has_more}
 
+    def skill_declares_any_tool(
+        self,
+        skill_id: str,
+        tool_names: set[str] | frozenset[str],
+    ) -> bool:
+        """Return whether a catalog package declares any selected tool name.
+
+        This source-neutral Host predicate is used only to validate mandatory
+        control-flow activations before the normal activation path enforces
+        package trust, process compatibility, and authority.
+        """
+
+        skill, _metadata = self._get_skill(skill_id)
+        declared = {
+            *skill.allowed_tools,
+            *(tool.name for tool in skill.jit_tools),
+        }
+        return not declared.isdisjoint(tool_names)
+
     def _discover_skills_window_with_scope(
         self,
         text: str | None,
@@ -467,7 +484,7 @@ class SkillManager:
         require_capability: bool,
         limit: int | None,
     ) -> tuple[list[dict[str, Any]], bool, str]:
-        """Merge complete immutable built-ins with a bounded non-built-in page."""
+        """Return one uniformly bounded page across every visible Skill source."""
 
         reservations: dict[str, str] = {}
         include_registered = (
@@ -489,57 +506,125 @@ class SkillManager:
             reservations = self._reserve_skill_rights([decision], used_by="skill")
         try:
             selected_limit = self._bounded_discover_limit(limit)
-            builtins = self._available_builtin_summaries(actor)
-            registered: list[dict[str, Any]] = []
+            process = self.processes.get_process(actor) if actor is not None else None
+            builtins = self._available_builtin_summaries(actor, text=text)
             if include_registered:
-                registered.extend(
-                    self._skill_summary(skill, metadata)
-                    for skill, metadata in self.store.list_skills(
+                registered, registered_has_more = (
+                    self._registered_discovery_summaries(
+                        process,
                         text=text,
-                        limit=selected_limit + 1,
+                        limit=selected_limit,
                     )
                 )
-            if actor is None and len(registered) <= selected_limit:
-                seen = {
-                    item["skill_id"]
-                    for item in (*builtins, *registered)
-                }
-                registered.extend(
-                    self._discover_host_skill_catalog(
-                        text=text,
-                        limit=selected_limit + 1 - len(registered),
-                        exclude_skill_ids=seen,
-                    )
-                )
+            else:
+                registered, registered_has_more = [], False
+            host_entries, host_has_more = self._host_discovery_summaries(
+                actor,
+                builtins=builtins,
+                registered=registered,
+                text=text,
+                limit=selected_limit,
+            )
+            combined, exact_match = self._rank_discovery_summaries(
+                [*builtins, *registered, *host_entries],
+                text=text,
+            )
+            if exact_match:
+                registered_has_more = False
+                host_has_more = False
         except Exception:
             self._restore_skill_rights(reservations)
             raise
         self._commit_skill_rights(reservations)
-        scope = "builtin_and_registered" if include_registered else "builtin_only"
+        scope = "all_visible_sources" if include_registered else "visibility_limited"
+        page: list[dict[str, Any]] = []
+        for item in combined[:selected_limit]:
+            visible = dict(item)
+            visible.pop("_discovery_score", None)
+            page.append(visible)
         return (
-            [*builtins, *registered[:selected_limit]],
-            len(registered) > selected_limit,
+            page,
+            (
+                len(combined) > selected_limit
+                or registered_has_more
+                or host_has_more
+            ),
             scope,
         )
 
-    def available_builtin_prompt_context(self, pid: str) -> list[dict[str, Any]]:
-        """Return compact metadata for built-ins the current image can fully project."""
-
-        process = self.processes.get_process(pid)
-        if process is None:
-            raise NotFound(f"process not found: {pid}")
-        if "activate_skill" not in process.model_tool_table:
-            return []
-        return [
-            {
-                "skill_id": item["skill_id"],
-                "description": item["description"],
-                "active": item["active"],
+    def _registered_discovery_summaries(
+        self,
+        process: Any | None,
+        *,
+        text: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        rows = self.store.list_skills(text=text, limit=limit + 1)
+        result: list[dict[str, Any]] = []
+        for skill, metadata in rows:
+            summary = {
+                **self._skill_summary(skill, metadata),
+                "active": self._loaded_skill_is_trusted(process, skill.skill_id),
             }
-            for item in self._available_builtin_summaries(pid)
-        ]
+            score = self._skill_discovery_score(summary, text)
+            if score is None:
+                continue
+            summary["_discovery_score"] = score
+            result.append(summary)
+        return result, len(rows) > limit
 
-    def _available_builtin_summaries(self, actor: str | None) -> list[dict[str, Any]]:
+    def _host_discovery_summaries(
+        self,
+        actor: str | None,
+        *,
+        builtins: list[dict[str, Any]],
+        registered: list[dict[str, Any]],
+        text: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if actor is not None:
+            return [], False
+        seen = {item["skill_id"] for item in (*builtins, *registered)}
+        entries = self._discover_host_skill_catalog(
+            text=text,
+            limit=limit + 1,
+            exclude_skill_ids=seen,
+        )
+        for item in entries:
+            item["active"] = False
+        return entries, len(entries) > limit
+
+    @staticmethod
+    def _rank_discovery_summaries(
+        summaries: list[dict[str, Any]],
+        *,
+        text: str | None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        ranked = sorted(
+            summaries,
+            key=lambda item: (
+                -int(item.get("_discovery_score") or 0),
+                str(item.get("name") or "").casefold(),
+                str(item.get("skill_id") or ""),
+            ),
+        )
+        exact = [
+            item
+            for item in ranked
+            if skill_metadata_exact_match(
+                skill_id=str(item.get("skill_id") or ""),
+                name=str(item.get("name") or ""),
+                text=text,
+            )
+        ]
+        return (exact, True) if exact else (ranked, False)
+
+    def _available_builtin_summaries(
+        self,
+        actor: str | None,
+        *,
+        text: str | None = None,
+    ) -> list[dict[str, Any]]:
         process = self.processes.get_process(actor) if actor is not None else None
         result: list[dict[str, Any]] = []
         for skill in self._builtin_catalog.list():
@@ -547,29 +632,54 @@ class SkillManager:
                 continue
             metadata = self._builtin_catalog.metadata(skill.skill_id)
             assert metadata is not None
-            active = False
-            if process is not None and skill.skill_id in process.loaded_skills:
-                try:
-                    active = self._loaded_builtin_projection_is_trusted(
-                        skill.skill_id,
-                        process.loaded_skills[skill.skill_id],
-                        process,
-                    )
-                except ValidationError:
-                    # Persisted state is untrusted prompt input.  A malformed
-                    # record must not make a built-in package appear active;
-                    # prompt_context() exposes a bounded invalid-snapshot
-                    # diagnostic without copying the record into the prompt.
-                    active = False
-            result.append(
-                {
-                    **self._skill_summary(skill, metadata),
-                    "active": active,
-                    "available_tools": list(skill.allowed_tools),
-                    "catalog_scope": BUILTIN_SKILL_CATALOG_SCOPE,
-                }
-            )
+            summary = {
+                **self._skill_summary(skill, metadata),
+                "active": self._loaded_skill_is_trusted(
+                    process,
+                    skill.skill_id,
+                ),
+            }
+            score = self._skill_discovery_score(summary, text)
+            if score is None:
+                continue
+            summary["_discovery_score"] = score
+            result.append(summary)
         return result
+
+    @staticmethod
+    def _skill_discovery_score(
+        summary: Mapping[str, Any],
+        text: str | None,
+    ) -> int | None:
+        return skill_metadata_search_score(
+            skill_id=str(summary.get("skill_id") or ""),
+            name=str(summary.get("name") or ""),
+            description=str(summary.get("description") or ""),
+            text=text,
+        )
+
+    def _loaded_skill_is_trusted(self, process: Any | None, skill_id: str) -> bool:
+        if process is None or skill_id not in process.loaded_skills:
+            return False
+        loaded = process.loaded_skills[skill_id]
+        try:
+            if self._builtin_catalog.is_builtin_id(skill_id):
+                return self._loaded_builtin_projection_is_trusted(
+                    skill_id,
+                    loaded,
+                    process,
+                )
+            activation_kind = (
+                loaded.get("activation_kind", "registered")
+                if isinstance(loaded, dict)
+                else "registered"
+            )
+            if activation_kind != "registered":
+                return False
+            self._skill_for_loaded_record(skill_id, loaded)
+            return True
+        except ValidationError:
+            return False
 
     def _builtin_supported_by_process(self, skill: SkillPackage, process: Any) -> bool:
         image = self._images.get(process.image_id)
@@ -998,11 +1108,9 @@ class SkillManager:
                     EventType.SKILL_LOADED,
                     source=actor,
                     target=pid,
-                    payload={
-                        "skill_id": skill.skill_id,
-                        "tool_names": loaded.tool_names,
-                        "activation_kind": "builtin_projection",
-                    },
+                    # Model-visible lifecycle events use the same payload for
+                    # every Skill source. Provenance stays in Host audit state.
+                    payload={"skill_id": skill.skill_id, "tool_names": loaded.tool_names},
                 )
                 self.audit.record(
                     actor=actor,
@@ -1029,6 +1137,8 @@ class SkillManager:
             "skill_id": skill.skill_id,
             "name": skill.name,
             "version": skill.version,
+            # Host callers retain provenance/effect detail. The model-facing
+            # ActivateSkillOutput deliberately projects the common fields only.
             "activation_kind": "builtin_projection",
             "tool_names": loaded.tool_names,
             "tool_ids": tool_ids,
@@ -1268,6 +1378,8 @@ class SkillManager:
         return {
             "pid": pid,
             "skill_id": skill_id,
+            # Host callers and audit tooling may inspect these fields; the
+            # model-facing UnloadSkillOutput omits them for every Skill source.
             "activation_kind": "builtin_projection" if builtin_projection else "registered",
             "removed_tools": sorted(removed),
             "authority_changed": False,
@@ -1989,7 +2101,6 @@ class SkillManager:
         result: list[dict[str, Any]] = []
         seen = set(exclude_skill_ids or ())
         roots = self._skill_catalog_roots()
-        needle = text.lower() if text else None
         for root in roots:
             if not root.exists() or not root.is_dir():
                 continue
@@ -2021,11 +2132,13 @@ class SkillManager:
                         "registered": False,
                         "diagnostics": [str(exc)],
                     }
-                if needle and needle not in dumps(summary).lower():
+                score = self._skill_discovery_score(summary, text)
+                if score is None:
                     continue
                 skill_id = str(summary["skill_id"])
                 if skill_id in seen:
                     continue
+                summary["_discovery_score"] = score
                 result.append(summary)
                 seen.add(skill_id)
                 if len(result) >= limit:

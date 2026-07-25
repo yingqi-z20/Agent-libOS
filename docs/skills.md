@@ -104,22 +104,29 @@ longer matches its declared size/SHA is rejected.
 
 ## Progressive Disclosure
 
-When `activate_skill` is model-visible, the process prompt includes only the
-applicable built-in Skill IDs and descriptions. This catalog is deliberately
-stable across activation so a changing `active` flag does not invalidate the
-prompt-cache prefix. Full `SKILL.md` instructions and owned tool schemas appear
-after activation. A built-in is
-applicable only when every declared tool has an exact binding in the
-image-authorized process tool table; unsupported built-ins are omitted rather
-than advertised as unusable.
+Fresh shipped images put no Skill metadata or body in the model prompt. The
+model starts with the common Skill lifecycle bootstrap and uses
+`discover_skills` only when task-specific guidance or a domain schema is
+needed. `text` and `limit` apply to every visible Skill in one uniformly bounded
+page. Discovery treats two to four concrete metadata terms as an intent query,
+requires each informative term, and relevance-ranks the matches. `next_step`
+directs the model to activate a plausible exact id or refine a zero-result
+query; an unchanged query is never pagination. `has_more` only reports more
+matches for the same query, while `visibility_limited` reports that catalog
+authority prevented searching all configured sources. There is no cursor.
 
-Process-mediated `discover_skills` always returns the complete set of those
-applicable built-ins with `source_type: builtin`, `active`, and
-`catalog_scope`. The `text` filter, `limit`, and `has_more` window apply only to
-registered or Host-catalog entries; they never filter, count, or truncate the
-built-in prefix. Registered workspace/global/runtime entries are merged only
-when the actor has `skill:*` `read`. Registered catalog results also include
-fields such as package hash and high-level tool/action names.
+Every model-facing discovery item has the same schema: identity, description,
+declared high-level bindings and requirements, package hash, and `active`.
+Source type, registration provenance, and the Host's immutable built-in
+implementation are intentionally absent. Discovery returns metadata only; the
+full `SKILL.md` body and domain tool schemas appear after activation.
+
+The Host still omits any package that cannot be activated safely by the current
+image. For an immutable packaged Skill, every declared static tool must have an
+exact image-authorized process binding. Registered workspace/global/runtime
+entries are searched only when the actor has the configured catalog `read`
+authority. These trust and applicability differences are enforcement details,
+not different LLM protocols.
 
 Activation materializes the full body into the process prompt and records the
 exact package snapshot on the process. Bundled resources are read explicitly
@@ -142,12 +149,13 @@ For a registered Skill, `allowed-tools` adds existing static tools to the full
 process and model tool tables during activation. The tools remain wrappers over
 primitives; visibility does not imply resource authority.
 
-For an immutable built-in Skill, `allowed-tools` has the narrower
-`builtin_projection` meaning. Activation atomically copies every named binding
-from the existing full process tool table into the model projection. It does
-not accept a partial intersection, resolve a missing tool from the registry,
-add to the full table, create JIT code, or grant Capability. The trusted
-in-memory catalog—not user-writable metadata—selects this activation kind.
+For an immutable packaged Skill, the Host internally uses a trusted projection:
+activation atomically copies every named binding from the existing full process
+tool table into the model projection. It does not accept a partial intersection,
+resolve a missing tool from the registry, add to the full table, create JIT
+code, or grant Capability. This provenance distinction remains in durable Host
+state and audit evidence, but the model receives the same activation result
+shape as for every other Skill.
 
 `references/agent-libos/jit-tools.json` declares TypeScript JIT tools. Each
 entry references a `scripts/*.ts` source file:
@@ -214,10 +222,11 @@ unconsumed expected syscalls fail validation.
 ## Sources And Trust
 
 Built-in packages are loaded read-only from `agent_libos` package resources and
-reported with `source_type: builtin`. They are neither durable registry rows nor
-members of any configurable catalog root. Their package snapshots still bind
-loaded prompt instructions and tool ownership across runtime reopen, fork,
-checkpoint, and context compaction.
+kept separate from durable registry rows and configurable catalog roots. This
+source provenance is available to Host administration and audit, not to the
+model-facing discovery or lifecycle result schemas. Their package snapshots
+still bind loaded prompt instructions and tool ownership across runtime reopen,
+fork, checkpoint, and context compaction.
 
 Host-side catalog discovery searches exactly the roots in
 `skills.workspace_dirs`, followed by `skills.global_dirs`, with equivalent
@@ -311,13 +320,14 @@ discards its unpublished candidates and executable aliases, including when
 authority settlement fails. Reactivation retires only the superseded JIT ids
 after the replacement and its authority settlement commit.
 
-Each loaded record has `activation_kind: registered | builtin_projection`.
-Built-in activation must preserve the full process tool table and Capability
-set byte-for-byte while updating only the model projection and loaded prompt
-snapshot; its audit evidence records `authority_changed: false`. Permission-free
-unload is accepted only when the runtime can validate both that activation kind
-and its catalog/snapshot provenance. A forged source, hash, ID, or persisted
-activation kind fails closed.
+Host-private loaded records retain the provenance needed to distinguish a
+registered activation from an immutable packaged projection. That field is not
+rendered into prompts or model tool results. An immutable projection must
+preserve the full process tool table and Capability set byte-for-byte while
+updating only model visibility and the loaded prompt snapshot. Permission-free
+unload is accepted only when the runtime validates its trusted catalog and
+snapshot provenance. A forged source, hash, ID, or persisted activation kind
+fails closed.
 
 `unload_skill` removes tool visibility and prompt instructions contributed by
 that Skill, along with the loaded Skill's process-local JIT tool and candidate
@@ -345,8 +355,9 @@ are rejected before a result set can become unbounded.
   `discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill`,
   and `process_exit`; every bootstrap tool must be authorized by
   `default_tools`, or image validation fails.
-- Image `default_skills` activate at spawn and exec time; failure fails image
-  boot instead of starting with a partial default Skill set.
+- An explicitly configured image `default_skills` set activates at spawn and
+  exec time; failure fails image boot instead of starting partially. Shipped
+  general-purpose images leave this set empty so all Skills load on demand.
 - Fork and checkpoint restore inherit loaded Skill snapshots, activation kind,
   provenance, and corresponding model-tool visibility.
 - Spawn-child starts without parent-activated Skills.

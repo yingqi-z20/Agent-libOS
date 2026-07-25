@@ -720,7 +720,7 @@ class TestConfigDefaults:
             pid = runtime.process.spawn(image=DEFAULT_CONFIG.runtime.default_image_id, goal='two-step process')
             results = asyncio.run(runtime.arun_until_idle())
             assert len(results) == 2
-            assert results[0]['action']['action'] == 'create_memory_object'
+            assert results[0]['action']['action'] == 'discover_skills'
             assert results[1]['action']['action'] == 'process_exit'
             assert runtime.process.get(pid).status == ProcessStatus.EXITED
         finally:
@@ -733,7 +733,7 @@ class TestConfigDefaults:
             pid = runtime.process.spawn(image=config.runtime.default_image_id, goal='two-step process')
             results = asyncio.run(runtime.arun_until_idle())
             assert len(results) == 1
-            assert results[0]['action']['action'] == 'create_memory_object'
+            assert results[0]['action']['action'] == 'discover_skills'
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         finally:
             runtime.close()
@@ -745,7 +745,7 @@ class TestConfigDefaults:
             pid = runtime.process.spawn(image=config.runtime.default_image_id, goal='two-step process')
             results = asyncio.run(runtime.arun_until_idle(max_quanta=1))
             assert len(results) == 1
-            assert results[0]['action']['action'] == 'create_memory_object'
+            assert results[0]['action']['action'] == 'discover_skills'
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         finally:
             runtime.close()
@@ -757,7 +757,7 @@ class TestConfigDefaults:
             pid = runtime.process.spawn(image=config.runtime.default_image_id, goal='two-step process')
             results = asyncio.run(runtime.arun_process_until_idle(pid))
             assert len(results) == 1
-            assert results[0]['action']['action'] == 'create_memory_object'
+            assert results[0]['action']['action'] == 'discover_skills'
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         finally:
             runtime.close()
@@ -1035,7 +1035,10 @@ class TestConfigDefaults:
 class ScriptedActionClient:
 
     def __init__(self) -> None:
-        self.actions = [{'action': 'create_memory_object', 'type': 'observation', 'name': 'step', 'payload': {'ok': True}}, {'action': 'process_exit', 'payload': {'done': True}}]
+        self.actions = [
+            {'action': 'discover_skills', 'text': 'memory', 'limit': 4},
+            {'action': 'process_exit', 'payload': {'done': True}},
+        ]
 
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
         action = self.actions.pop(0)

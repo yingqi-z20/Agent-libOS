@@ -50,8 +50,8 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
         goal=(
             "Machine-only evaluation: create the ordinary workspace file skill-eval.txt "
             "with exactly `routed` followed by one newline. This is a normal workspace "
-            "edit, not an Object Memory payload transfer. Use the smallest appropriate "
-            "built-in capability, perform the operation, verify completion, and exit "
+            "edit, not an Object Memory payload transfer. Discover and load the smallest "
+            "appropriate Skill, perform the operation, verify completion, and exit "
             "without calling human_output."
         ),
         expected_skill_id="agent-libos-workspace-editing",
@@ -64,7 +64,7 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
         goal=(
             "Machine-only evaluation: inspect the current repository change state and "
             "report whether it is clean. Do not stage, commit, switch branches, or use a "
-            "shell command. Use the smallest appropriate built-in capability for the "
+            "shell command. Discover and load the smallest appropriate Skill for the "
             "read-only inspection, perform it, then exit without calling human_output."
         ),
         expected_skill_id="agent-libos-git-inspection",
@@ -81,8 +81,8 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
         goal=(
             "Machine-only evaluation: run the approved argv-only command `git status "
             "--short` and report its output. The request explicitly requires live command "
-            "execution rather than the typed Git inspection interface. Use the smallest "
-            "appropriate built-in capability, run the command, and exit without calling "
+            "execution rather than the typed Git inspection interface. Discover and load "
+            "the smallest appropriate Skill, run the command, and exit without calling "
             "human_output."
         ),
         expected_skill_id="agent-libos-command-execution",
@@ -95,7 +95,7 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
         goal=(
             "Machine-only evaluation: capture the current process's reconstructable "
             "internal state as a recovery point. Do not build, load, or commit an Agent "
-            "Image. Use the smallest appropriate built-in capability, create the recovery "
+            "Image. Discover and load the smallest appropriate Skill, create the recovery "
             "point with a concise reason, and exit without calling human_output."
         ),
         expected_skill_id="agent-libos-checkpoints",
@@ -108,7 +108,7 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
         goal=(
             "Machine-only evaluation: list Host-registered MCP server metadata using only "
             "the local registry. Do not refresh tools, contact a server, or inspect a plain "
-            "JSON-RPC endpoint. Use the smallest appropriate built-in capability, list the "
+            "JSON-RPC endpoint. Discover and load the smallest appropriate Skill, list the "
             "metadata even if it is empty, and exit without calling human_output."
         ),
         expected_skill_id="agent-libos-mcp",
@@ -380,14 +380,15 @@ def _run_once(
         initial_schemas = runtime.tools.openai_tool_schemas(pid)
         initial_schema_bytes = _json_bytes(initial_schemas)
         authorized_schema_bytes = _authorized_schema_bytes(runtime, pid)
-        catalog_metadata_bytes = _json_bytes(
-            runtime.skills.available_builtin_prompt_context(pid)
-        )
+        # Both arms begin without an eagerly injected Skill catalog. Treatment
+        # discovers metadata through the same model tool used for every Skill.
+        catalog_metadata_bytes = 0
 
         results = runtime.run_process_until_idle(pid, max_quanta=_MAX_QUANTA)
         process = runtime.process.get(pid)
         actions = _action_sequence(results)
         observations = _action_observations(results)
+        discovery_trace = _discovery_trace(observations)
         activated_skills = [
             str(action.get("skill_id") or "")
             for action in actions
@@ -485,6 +486,7 @@ def _run_once(
             "correct_skill_activation": correct_activation,
             "correct_route": correct_route,
             "actions": [str(action.get("action") or "") for action in actions],
+            "discovery_trace": discovery_trace,
             "invalid_tool_calls": invalid_tool_calls,
             "llm_calls": len(calls),
             "models": sorted(
@@ -671,6 +673,42 @@ def _action_observations(results: Iterable[Any]) -> list[dict[str, Any]]:
                 {"action": dict(action), "result": dict(tool_result)}
             )
     return observations
+
+
+def _discovery_trace(
+    observations: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Retain bounded routing evidence without storing arbitrary task arguments."""
+
+    trace: list[dict[str, Any]] = []
+    for observation in observations:
+        action = observation.get("action")
+        result = observation.get("result")
+        if not isinstance(action, dict) or action.get("action") != "discover_skills":
+            continue
+        payload = result.get("payload") if isinstance(result, dict) else None
+        skills = payload.get("skills") if isinstance(payload, dict) else None
+        trace.append(
+            {
+                "text": action.get("text"),
+                "limit": action.get("limit"),
+                "ok": result.get("ok") if isinstance(result, dict) else None,
+                "skill_ids": [
+                    str(item.get("skill_id") or "")
+                    for item in skills
+                    if isinstance(item, dict)
+                ]
+                if isinstance(skills, list)
+                else [],
+                "has_more": payload.get("has_more")
+                if isinstance(payload, dict)
+                else None,
+                "next_step": payload.get("next_step")
+                if isinstance(payload, dict)
+                else None,
+            }
+        )
+    return trace
 
 
 def _first_successful_observation(

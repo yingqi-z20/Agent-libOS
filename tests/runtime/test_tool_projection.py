@@ -45,16 +45,7 @@ OBJECT_MEMORY_TOOLS = {
     "read_memory_object",
 }
 
-BASE_INITIAL_TOOLS = (
-    SKILL_BOOTSTRAP_TOOLS | AUTHORITY_TOOLS | HUMAN_TOOLS | OBJECT_MEMORY_TOOLS
-)
-
-WORKSPACE_INITIAL_TOOLS = (
-    SKILL_BOOTSTRAP_TOOLS
-    | AUTHORITY_TOOLS
-    | HUMAN_TOOLS
-    | WORKSPACE_NAVIGATION_TOOLS
-)
+INITIAL_TOOLS = SKILL_BOOTSTRAP_TOOLS
 
 
 def test_review_image_projects_small_model_schema_without_removing_callable_tools(tmp_path: Path) -> None:
@@ -65,10 +56,11 @@ def test_review_image_projects_small_model_schema_without_removing_callable_tool
         initial_schema = runtime.tools.openai_tool_schemas(pid)
 
         assert len(process.tool_table) > len(process.model_tool_table)
-        assert set(process.model_tool_table) == WORKSPACE_INITIAL_TOOLS
-        assert "list_capabilities" in process.model_tool_table
+        assert set(process.model_tool_table) == INITIAL_TOOLS
+        assert process.loaded_skills == {}
+        assert "list_capabilities" not in process.model_tool_table
         assert "read_text_file" in process.tool_table
-        assert "read_text_file" in process.model_tool_table
+        assert "read_text_file" not in process.model_tool_table
         assert "write_text_file" not in process.model_tool_table
         assert "delete_file" not in process.model_tool_table
         assert len(dumps(initial_schema).encode("utf-8")) < 16_000
@@ -91,7 +83,7 @@ def test_review_image_projects_small_model_schema_without_removing_callable_tool
         assert schema_bytes_after > schema_bytes_before
         assert capabilities_after == capabilities_before
         assert after.tool_table == full_tool_table
-        assert "read_text_file" in after.model_tool_table
+        assert "read_text_file" not in after.model_tool_table
         assert "write_text_file" in after.model_tool_table
         assert "delete_file" in after.model_tool_table
     finally:
@@ -125,19 +117,19 @@ def test_all_skill_projected_builtin_images_start_small_without_changing_authori
     try:
         expectations = {
             "base-agent:v0": (
-                BASE_INITIAL_TOOLS,
+                INITIAL_TOOLS,
                 "agent-libos-child-processes",
-                30_000,
+                12_000,
             ),
             "coding-agent:v0": (
-                WORKSPACE_INITIAL_TOOLS,
+                INITIAL_TOOLS,
                 "agent-libos-command-execution",
-                20_000,
+                12_000,
             ),
             "review-agent:v0": (
-                WORKSPACE_INITIAL_TOOLS,
+                INITIAL_TOOLS,
                 "agent-libos-git-inspection",
-                16_000,
+                12_000,
             ),
         }
         for image_id, (expected_tools, activation_skill, schema_limit) in expectations.items():
@@ -146,6 +138,7 @@ def test_all_skill_projected_builtin_images_start_small_without_changing_authori
             schemas = runtime.tools.openai_tool_schemas(pid)
 
             assert set(process.model_tool_table) == expected_tools
+            assert process.loaded_skills == {}
             assert len(process.tool_table) > len(process.model_tool_table)
             assert len(dumps(schemas).encode("utf-8")) < schema_limit
 

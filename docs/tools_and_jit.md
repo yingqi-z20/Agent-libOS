@@ -51,13 +51,13 @@ The current built-in tool surface includes tools for:
 - Checkpoint: create, list, inspect, diff, restore, and fork.
 - Skills: discover, activate, read bundled resources, and unload.
 - JIT: propose, validate, and register Deno/TypeScript tools.
-- Built-in tool Skills: discover intent-focused guidance and project only the
+- Tool Skills: discover intent-focused guidance on demand and project only the
   image-authorized tool schemas needed for the current task.
 - Utility actions such as `echo` and `parse_pytest_log`.
 
 Use `uv run agent-libos tools` to inspect registered tools in a runtime.
 
-## Built-In Tool Skills
+## On-Demand Tool Skills
 
 An image with `metadata.tool_projection: skills` starts with a small
 model-facing projection instead of exposing every image tool schema at once.
@@ -66,24 +66,25 @@ The fixed bootstrap requires the complete image-authorized set of
 `process_exit`; a Skills-projection image missing any member is rejected. The
 image's full process tool table is unchanged.
 
-The prompt contains a compact, activation-stable catalog of applicable built-in
-Skill IDs and descriptions. It does not contain active flags, every Skill body,
-or tool schemas. `discover_skills` returns the same applicable built-ins plus
-their current active metadata even when the caller has no registered-Skill
-catalog read capability. `activate_skill` then
-loads the selected instructions and atomically copies all of that Skill's exact
-bindings from the full process tool table into the model projection. An image
-may select initially active instruction sets with `default_skills`.
+Fresh shipped images contain neither Skill catalog metadata nor Skill bodies in
+the prompt. `discover_skills` searches every source visible under current
+catalog authority using one common, `text`/`limit`-bounded result schema.
+Concrete query terms are matched independently against id, name, and
+description metadata and results are relevance-ranked; `next_step` tells the
+model to activate a plausible exact id rather than rediscovering it.
+`activate_skill` then loads the exact selected instructions and tool bindings.
+Model-visible discovery, activation, loaded-prompt, and unload contracts never
+identify a Skill as built-in or registered.
 
-Applicability is all-or-nothing: a built-in Skill is hidden and cannot activate
+Host enforcement still treats applicability as all-or-nothing: an immutable
+packaged Skill is hidden and cannot activate
 unless every declared tool already exists in the image-authorized process tool
 table. Activation never resolves a missing binding from the global registry,
 adds to the full table, grants Capability, or approves a primitive effect. It
-records `authority_changed: false`; filesystem, shell, Git, remote, checkpoint,
-human, and other effects still pass through their normal authority and approval
-boundaries. Same-process activation and unload of an immutable built-in Skill
-need no `skill:*` Capability because they only change model visibility.
-Cross-process operations still require `process:<pid>` `admin`.
+records its trust provenance only in Host-private state and audit evidence;
+filesystem, shell, Git, remote, checkpoint, human, and other effects still pass
+through normal authority and approval boundaries. Cross-process operations
+still require `process:<pid>` `admin`.
 
 The catalog gives each of the 99 built-in static tools one intent-focused owner
 across 26 Skills, with at most nine tools per Skill. The owner is available
@@ -120,12 +121,11 @@ ambiguous:
 | `agent-libos-git-remotes` | Fetch, pull, or push configured remotes |
 | `agent-libos-git-pull-requests` | Manage repository-local simulated pull requests |
 
-The built-in base image initially exposes 15 schemas by loading navigation,
-authority, human-collaboration, and Object Memory guidance. Coding and review
-each expose 14 by loading navigation, authority, human-collaboration, and
-workspace-navigation guidance; editing, Git, shell, and other schemas remain
-on demand. Toolmaker keeps its narrow full projection and loads the JIT
-authoring guide. Context-compressor remains a single-tool image.
+Base, coding, review, and toolmaker each start with the same five Skill
+lifecycle/bootstrap schemas and no loaded Skill. They discover and activate
+navigation, authority, human collaboration, Object Memory, workspace, JIT, or
+other domain guidance only when the task requires it. Context-compressor
+remains a single-tool image.
 
 The former `lazy_tool_groups`/`initial_tool_groups` image metadata and
 `discover_tool_groups`/`activate_tool_group` tools are removed rather than

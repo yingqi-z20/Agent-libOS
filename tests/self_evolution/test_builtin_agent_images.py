@@ -7,7 +7,7 @@ import pytest
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.images import DEFAULT_IMAGES, build_default_images
 from agent_libos.llm.prompt import ACTION_PROTOCOL, BASE_SYSTEM_PROMPT, build_system_prompt
-from agent_libos.skills.builtin_catalog import get_builtin_skill_catalog
+from agent_libos.skills.builtin_catalog import BUILTIN_SKILL_IDS
 
 
 BUILTIN_IMAGE_IDS = {
@@ -53,28 +53,24 @@ def test_builtin_image_contracts_are_unique_bounded_and_internally_coherent() ->
 
 
 @pytest.mark.parametrize(
-    ("image_id", "expected_initial_schema_count"),
+    "image_id",
     [
-        ("base-agent:v0", 15),
-        ("coding-agent:v0", 14),
-        ("review-agent:v0", 14),
+        "base-agent:v0",
+        "coding-agent:v0",
+        "review-agent:v0",
+        "toolmaker-agent:v0",
     ],
 )
-def test_skill_projected_builtin_images_contain_complete_initial_skill_packages(
+def test_skill_projected_builtin_images_defer_every_skill_package(
     image_id: str,
-    expected_initial_schema_count: int,
 ) -> None:
     image = DEFAULT_IMAGES[image_id]
-    catalog = get_builtin_skill_catalog()
     image_tools = set(image.default_tools)
+    system_prompt = build_system_prompt(image)
 
-    initially_projected = set(SKILL_PROJECTION_BOOTSTRAP)
-    for skill_id in image.default_skills:
-        package = catalog.get(skill_id)
-        assert package is not None
-        initially_projected.update(package.allowed_tools)
-    assert initially_projected <= image_tools
-    assert len(initially_projected) == expected_initial_schema_count
+    assert image.default_skills == []
+    assert SKILL_PROJECTION_BOOTSTRAP <= image_tools
+    assert all(skill_id not in system_prompt for skill_id in BUILTIN_SKILL_IDS)
 
 
 def test_builtin_image_capability_requirements_follow_runtime_identity_config() -> None:
@@ -146,9 +142,7 @@ def test_review_image_starts_read_only_and_defers_mutation_and_test_tools() -> N
     review = DEFAULT_IMAGES["review-agent:v0"]
 
     assert review.metadata["tool_projection"] == "skills"
-    assert "agent-libos-workspace-navigation" in review.default_skills
-    assert "agent-libos-workspace-editing" not in review.default_skills
-    assert "agent-libos-test-log-analysis" not in review.default_skills
+    assert review.default_skills == []
     assert "parse_pytest_log" in review.default_tools
 
 
@@ -159,9 +153,7 @@ def test_builtin_prompts_use_real_tool_names_and_current_jit_contract() -> None:
     assert "call exit with" not in BASE_SYSTEM_PROMPT
     assert "version-pinned allowlisted JSR" not in prompts
     assert "version-pinned imports" not in prompts
-    assert DEFAULT_IMAGES["toolmaker-agent:v0"].default_skills == [
-        "agent-libos-jit-tool-authoring"
-    ]
+    assert DEFAULT_IMAGES["toolmaker-agent:v0"].default_skills == []
     assert "follow the AgentImage's final reporting contract" in ACTION_PROTOCOL
     assert "Do not prepend that working-directory path" in ACTION_PROTOCOL
     assert "do not call the effect merely to elicit a denial" in ACTION_PROTOCOL

@@ -768,7 +768,7 @@ class LauncherDefaults:
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ScriptDefaults:
     ask_file_max_bytes: int = 65_536
-    ask_file_max_quanta: int = 6
+    ask_file_max_quanta: int = 10
     document_summary_max_bytes: int = 65_536
     document_summary_max_read_bytes: int = 1_048_576
     document_summary_max_quanta: int = 10

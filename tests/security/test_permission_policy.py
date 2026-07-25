@@ -13,6 +13,9 @@ from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequire
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, HumanRequestStatus, ProcessStatus
 
+AUTHORITY_SKILL = 'agent-libos-authority-basics'
+
+
 class TestPermissionPolicy:
 
     def setup_method(self) -> None:
@@ -622,6 +625,11 @@ class TestPermissionPolicy:
         ])
         self.runtime.llm.client = client
         pid = self._spawn_review(goal='request deny policy')
+        self.runtime.skills.activate_skill(
+            pid,
+            AUTHORITY_SKILL,
+            actor=pid,
+        )
         self._grant_human(pid)
 
         results = self.runtime.run_until_idle(
