@@ -102,17 +102,7 @@ class ScriptedTerminalClient(TerminalCaptureLLMClient):
         ]
         self.recorder.record_provider_request(messages=messages, tools=visible_tools)
         completion = self.responses.pop(0)
-        self.recorder.record_assistant(copy.deepcopy(completion))
-        if not completion.tool_calls:
-            self.recorder.final_answer = completion.content
-            completion.tool_calls = [
-                {
-                    "id": "scripted-final",
-                    "name": HIDDEN_TERMINAL_TOOL,
-                    "arguments": json.dumps({"content": completion.content}),
-                }
-            ]
-        return completion
+        return self._prepare_runtime_completion(completion)
 
 
 def test_ambient_pipeline_mutates_dojo_environment_and_returns_final_trace(tmp_path) -> None:
@@ -297,6 +287,54 @@ def test_ambient_bridge_matches_agentdojo_string_list_coercion(tmp_path) -> None
         recorder=RunRecorder(),
     )
     assert wrapped.args_schema.model_json_schema() == function.parameters.model_json_schema()
+
+
+def test_ambient_iteration_limit_matches_upstream_unexecuted_final_call(tmp_path) -> None:
+    runtime = FunctionsRuntime()
+    runtime.register_function(set_value)
+    env = MiniEnv()
+    scripted = [
+        LLMCompletion(
+            content="",
+            tool_calls=[
+                {"id": "call-executed", "name": "set_value", "arguments": '{"value": 1}'}
+            ],
+            model="scripted-model",
+            usage={"total_tokens": 5},
+        ),
+        LLMCompletion(
+            content="still working",
+            tool_calls=[
+                {"id": "call-unexecuted", "name": "set_value", "arguments": '{"value": 2}'}
+            ],
+            model="scripted-model",
+            usage={"total_tokens": 7},
+        ),
+    ]
+
+    def factory(recorder: RunRecorder) -> ScriptedTerminalClient:
+        return ScriptedTerminalClient(recorder, copy.deepcopy(scripted))
+
+    pipeline = AgentLibOSAmbientPipeline(
+        client_factory=factory,
+        system_message="Synthetic AgentDojo system message.",
+        runtime_dir=tmp_path / "runtime-limit",
+        config=evaluation_config(max_output_tokens=128),
+        max_quanta=2,
+    )
+    _, _, returned_env, messages, _ = pipeline.query("Set twice.", runtime, env)
+
+    assert returned_env.value == 1
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["tool_calls"][0].id == "call-unexecuted"
+    assert [item["args"] for item in pipeline.last_run["tool_executions"]] == [
+        {"value": 1}
+    ]
+    assert pipeline.last_run["iteration_limit_suppressed_tool_calls"] == [
+        {"id": "call-unexecuted", "name": "set_value", "arguments": '{"value": 2}'}
+    ]
+    assert pipeline.last_run["hidden_terminal_tool_calls"] == 1
+    assert pipeline.last_run["process_status"] == "exited"
 
 
 def test_attack_success_true_is_asr_not_safety_and_invalid_is_excluded() -> None:

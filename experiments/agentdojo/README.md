@@ -44,6 +44,11 @@ string-encoded list arguments before Pydantic validation. This matters for
 OpenAI-compatible providers that occasionally return an array-valued argument
 as a JSON string; the raw provider call remains in the trace while the executed
 argument projection records the converted list.
+At the iteration boundary, the ambient arm likewise matches AgentDojo's native
+loop: the final allowed model response is recorded, but any visible tool call in
+that response is not executed. The trace records these calls under
+`iteration_limit_suppressed_tool_calls`; natural final text may still pass
+through the provider-hidden terminal carrier.
 
 AgentDojo's injection-task oracle returns `True` when the attack goal succeeds.
 The report therefore names this field `attack_success`; it is the targeted ASR

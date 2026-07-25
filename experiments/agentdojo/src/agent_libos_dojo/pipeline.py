@@ -111,6 +111,9 @@ class RunRecorder:
     provider_calls: list[dict[str, Any]] = field(default_factory=list)
     provider_requests: list[dict[str, Any]] = field(default_factory=list)
     tool_executions: list[dict[str, Any]] = field(default_factory=list)
+    iteration_limit_suppressed_tool_calls: list[dict[str, Any]] = field(
+        default_factory=list
+    )
     final_answer: str | None = None
     _pending_calls: list[FunctionCall] = field(default_factory=list, repr=False)
 
@@ -538,6 +541,7 @@ class TerminalCaptureLLMClient(LLMClient):
 
     recorder: RunRecorder = field(default_factory=RunRecorder, repr=False)
     terminal_tool_name: str = HIDDEN_TERMINAL_TOOL
+    suppress_visible_tool_calls: bool = False
 
     @classmethod
     def from_client(
@@ -579,20 +583,33 @@ class TerminalCaptureLLMClient(LLMClient):
             previous_response_id=previous_response_id,
             parallel_tool_calls=False,
         )
+        return self._prepare_runtime_completion(completion)
+
+    def _prepare_runtime_completion(self, completion: LLMCompletion) -> LLMCompletion:
+        """Record the raw response and adapt terminal/iteration-limit actions."""
+
         self.recorder.record_assistant(copy.deepcopy(completion))
+        if completion.tool_calls and self.suppress_visible_tool_calls:
+            self.recorder.iteration_limit_suppressed_tool_calls.extend(
+                to_jsonable(completion.tool_calls)
+            )
+            self.recorder.final_answer = completion.content
+            completion.tool_calls = [self._terminal_tool_call(completion.content)]
+            return completion
         if not completion.tool_calls:
             self.recorder.final_answer = completion.content
-            completion.tool_calls = [
-                {
-                    "id": f"agentdojo-final-{len(self.recorder.provider_calls)}",
-                    "name": self.terminal_tool_name,
-                    "arguments": json.dumps(
-                        {"content": completion.content},
-                        ensure_ascii=False,
-                    ),
-                }
-            ]
+            completion.tool_calls = [self._terminal_tool_call(completion.content)]
         return completion
+
+    def _terminal_tool_call(self, content: str) -> dict[str, Any]:
+        return {
+            "id": f"agentdojo-final-{len(self.recorder.provider_calls)}",
+            "name": self.terminal_tool_name,
+            "arguments": json.dumps(
+                {"content": content},
+                ensure_ascii=False,
+            ),
+        }
 
 
 class _TerminalArgs(BaseModel):
@@ -817,16 +834,19 @@ class AgentLibOSAmbientPipeline(BasePipelineElement):
                 actor="agentdojo-evaluation",
             )
             pid = host.process.spawn(image=_IMAGE_ID, goal=query)
-            for _ in range(self.max_quanta):
+            for quantum in range(self.max_quanta):
+                # AgentDojo's native loop executes at most ``max_iters`` tool
+                # calls and then performs one final model observation whose
+                # tool calls remain unexecuted.  Agent libOS normally executes
+                # an action in every quantum, so suppress a visible tool only
+                # on that final observation quantum.  Natural final text still
+                # travels through the runtime-only terminal carrier.
+                client.suppress_visible_tool_calls = quantum == self.max_quanta - 1
                 results.extend(host.run_process_until_idle(pid, max_quanta=1))
                 if recorder.final_answer is not None:
                     break
                 if host.process.get(pid).status in host.process.TERMINAL_STATUSES:
                     break
-            if recorder.final_answer is None:
-                raise PipelineRunError(
-                    f"Agent libOS reached max_quanta={self.max_quanta} without a final response"
-                )
             process = host.process.get(pid)
             status_before_host_exit = process.status.value
             if (
@@ -960,6 +980,9 @@ def _ambient_run_snapshot(
         "usage": recorder.usage(),
         "provider_calls": list(recorder.provider_calls),
         "tool_executions": list(recorder.tool_executions),
+        "iteration_limit_suppressed_tool_calls": list(
+            recorder.iteration_limit_suppressed_tool_calls
+        ),
         "messages": to_jsonable(recorder.events),
         "audit_action_counts": dict(sorted(audit_counts.items())),
         "llm_call_records": [
