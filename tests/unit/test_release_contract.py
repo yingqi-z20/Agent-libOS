@@ -1079,7 +1079,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
             "Run deterministic Python lane",
             (
                 "scripts/test_matrix.py --lane ${{ matrix.lane }}",
-                "--max-lane-seconds 900",
+                "--max-lane-seconds 1400",
             ),
         ),
     )
