@@ -14,6 +14,7 @@ from agent_libos.models import (
     DataFlowContext,
     DataFlowDecision,
     DataFlowDirection,
+    DataIntegrity,
     DataSink,
     Event,
     EventPriority,
@@ -70,6 +71,7 @@ class ProtectedOperationContract:
     state_mutation: bool = False
     information_flow: bool = False
     data_flow_direction: DataFlowDirection = DataFlowDirection.NONE
+    minimum_egress_integrity: DataIntegrity = DataIntegrity.UNTRUSTED
     post_provider_failure_mode: PostProviderFailureMode = PostProviderFailureMode.PROPAGATE
     internal_reason: str | None = None
     require_classifier: bool = True
@@ -108,12 +110,25 @@ class ProtectedOperationContract:
             "data_flow_direction",
             DataFlowDirection(self.data_flow_direction),
         )
+        object.__setattr__(
+            self,
+            "minimum_egress_integrity",
+            DataIntegrity(self.minimum_egress_integrity),
+        )
         if (
             self.data_flow_direction is not DataFlowDirection.NONE
             and not self.information_flow
         ):
             raise ValueError(
                 "data-flow directions require information_flow=True"
+            )
+        if (
+            self.minimum_egress_integrity is not DataIntegrity.UNTRUSTED
+            and self.data_flow_direction
+            not in {DataFlowDirection.EGRESS, DataFlowDirection.BIDIRECTIONAL}
+        ):
+            raise ValueError(
+                "minimum egress integrity requires an egress data-flow direction"
             )
 
 
@@ -731,6 +746,7 @@ class ProtectedOperation:
                     event=event,
                     metadata={
                         "context": dict(self.invocation.observation),
+                        "protected_operation": self._protected_operation_evidence(),
                         "provider_phases": self._phase_metadata(),
                         "data_flow": self._data_flow_evidence(),
                         "result": effect_metadata,
@@ -835,12 +851,7 @@ class ProtectedOperation:
                     information_flow=self.contract.information_flow,
                     metadata={
                         "context": observation,
-                        "protected_operation": {
-                            "contract_name": self.contract.name,
-                            "actor": self.invocation.actor,
-                            "reservation_ids": list(self._reservation_ids),
-                            "prepared_recovery": self.contract.prepared_recovery,
-                        },
+                        "protected_operation": self._protected_operation_evidence(),
                         "data_flow": self._data_flow_evidence(),
                     },
                     idempotency_key=self.invocation.idempotency_key,
@@ -1151,6 +1162,7 @@ class ProtectedOperation:
                 "operation": operation,
                 "target_state_version": self.invocation.data_flow_target_state_version,
                 "request_release": True,
+                "minimum_integrity": self.contract.minimum_egress_integrity,
                 "allow_recovered_source_snapshots": (
                     self.invocation.data_flow_allow_recovered_source_snapshots
                 ),
@@ -1243,6 +1255,7 @@ class ProtectedOperation:
             "operation": operation,
             "target_state_version": self.invocation.data_flow_target_state_version,
             "request_release": False,
+            "minimum_integrity": self.contract.minimum_egress_integrity,
             "expected_registry_generation": self._data_flow_registry_generation,
             "allow_recovered_source_snapshots": (
                 self.invocation.data_flow_allow_recovered_source_snapshots
@@ -1299,6 +1312,17 @@ class ProtectedOperation:
         self._additional_data_flow_decisions = tuple(decisions[1:])
         self._additional_data_flow_release_decisions = tuple(releases[1:])
 
+    def _protected_operation_evidence(self) -> dict[str, Any]:
+        return {
+            "contract_name": self.contract.name,
+            "actor": self.invocation.actor,
+            "minimum_egress_integrity": (
+                self.contract.minimum_egress_integrity.value
+            ),
+            "reservation_ids": list(self._reservation_ids),
+            "prepared_recovery": self.contract.prepared_recovery,
+        }
+
     def _data_flow_evidence(self) -> dict[str, Any] | None:
         decision = self._data_flow_decision
         if decision is None:
@@ -1317,8 +1341,8 @@ class ProtectedOperation:
             ]
         return evidence
 
-    @staticmethod
     def _data_flow_decision_evidence(
+        self,
         decision: DataFlowDecision,
         sink: DataSink,
     ) -> dict[str, Any]:
@@ -1343,6 +1367,9 @@ class ProtectedOperation:
             "trust_sha256": decision.trust_hash,
             "registry_generation": decision.registry_generation,
             "release_capability_id": decision.release_capability_id,
+            "minimum_egress_integrity": (
+                self.contract.minimum_egress_integrity.value
+            ),
         }
 
     def _dispatch(self, phase: ProviderPhase) -> None:

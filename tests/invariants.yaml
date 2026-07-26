@@ -2750,6 +2750,20 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "protected-egress-enforces-minimum-integrity",
+      "title": "Host-declared protected egress integrity floors reject lower-integrity sources before provider dispatch and remain bound into effect evidence.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_data_flow_egress.py::test_protected_write_rejects_untrusted_integrity_before_provider_dispatch",
+        "tests/security/test_data_flow_egress.py::test_configured_integrity_floor_blocks_real_filesystem_provider",
+        "tests/runtime/test_protected_operation_coverage.py::test_host_integrity_overrides_are_exact_and_can_only_tighten_egress",
+        "tests/runtime/test_protected_operation_sdk.py::test_minimum_egress_integrity_requires_an_egress_contract",
+        "tests/runtime/test_protected_operation_sdk.py::test_minimum_egress_integrity_is_bound_into_effect_evidence",
+        "tests/unit/test_data_flow_models.py::test_data_flow_config_defaults_to_untrusted_normal_and_loads_rules"
+      ],
+      "benchmark_attack_classes": ["prompt_injection_write"]
+    },
+    {
       "id": "data-labels-propagate-conservatively",
       "title": "Derived Object labels propagate conservatively, Explain stays payload-free, and declassification requires explicit authority.",
       "lane": "runtime",
@@ -3233,6 +3247,7 @@
     "git_worktree_containment": "git-provider-is-pinned-and-non-executable",
     "git_repository_config_execution": "git-provider-is-pinned-and-non-executable",
     "git_remote_authority_bypass": "git-mutations-require-authority-state-and-evidence",
-    "git_patch_lineage": "git-patches-remotes-and-prs-preserve-cas-lineage"
+    "git_patch_lineage": "git-patches-remotes-and-prs-preserve-cas-lineage",
+    "prompt_injection_write": "protected-egress-enforces-minimum-integrity"
   }
 }

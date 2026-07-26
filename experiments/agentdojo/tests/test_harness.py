@@ -21,6 +21,7 @@ from agent_libos_dojo.pipeline import (
     HIDDEN_TERMINAL_TOOL,
     AgentDojoFunctionTool,
     AgentLibOSAmbientPipeline,
+    ControlPipeline,
     PipelineRunError,
     RunRecorder,
     TerminalCaptureLLMClient,
@@ -35,8 +36,11 @@ from agent_libos_dojo.runner import (
     _agent_libos_source_entries,
     _atomic_json,
     _injection_exposed,
+    _tool_execution_observations,
+    _tool_outcome_metrics,
     _manifest,
     _metadata,
+    _query_evidence_valid,
     _sha256_json,
     plan_pilot,
     run,
@@ -81,6 +85,12 @@ def set_recipients(
     return f"stored {len(recipients)} recipients"
 
 
+def read_injection_marker() -> str:
+    """Return a deterministic marker used to prove cross-query evidence retention."""
+
+    return "AGENTDOJO_QUERY_ONE_INJECTION_MARKER"
+
+
 class ScriptedTerminalClient(TerminalCaptureLLMClient):
     def __init__(self, recorder: RunRecorder, responses: list[LLMCompletion]) -> None:
         super().__init__(model="scripted-model", api_key="not-used", recorder=recorder)
@@ -103,6 +113,25 @@ class ScriptedTerminalClient(TerminalCaptureLLMClient):
         self.recorder.record_provider_request(messages=messages, tools=visible_tools)
         completion = self.responses.pop(0)
         return self._prepare_runtime_completion(completion)
+
+
+class ScriptedControlClient(LLMClient):
+    def __init__(self, responses: list[LLMCompletion]) -> None:
+        super().__init__(model="scripted-model", api_key="not-used")
+        self.responses = list(responses)
+
+    def complete_action(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        previous_response_id: str | None = None,
+        parallel_tool_calls: bool | None = None,
+    ) -> LLMCompletion:
+        del messages, tools, temperature, max_tokens, previous_response_id
+        del parallel_tool_calls
+        return self.responses.pop(0)
 
 
 def test_ambient_pipeline_mutates_dojo_environment_and_returns_final_trace(tmp_path) -> None:
@@ -331,7 +360,12 @@ def test_ambient_iteration_limit_matches_upstream_unexecuted_final_call(tmp_path
         {"value": 1}
     ]
     assert pipeline.last_run["iteration_limit_suppressed_tool_calls"] == [
-        {"id": "call-unexecuted", "name": "set_value", "arguments": '{"value": 2}'}
+        {
+            "id": "call-unexecuted",
+            "name": "set_value",
+            "arguments": '{"value": 2}',
+            "query_invocation": 1,
+        }
     ]
     assert pipeline.last_run["hidden_terminal_tool_calls"] == 1
     assert pipeline.last_run["process_status"] == "exited"
@@ -381,13 +415,155 @@ def test_ambient_pipeline_supports_agentdojo_empty_output_retry(tmp_path) -> Non
     assert env.value == 1
     assert pipeline.last_run["query_invocation_count"] == 2
     assert pipeline.last_run["provider_call_count"] == 4
-    assert pipeline.last_run["tool_call_count"] == 2
+    assert pipeline.last_run["tool_call_count"] == 4
+    assert pipeline.last_run["executed_tool_call_count"] == 2
     assert pipeline.last_run["usage"]["total_tokens"] == 24
     assert len({run["pid"] for run in pipeline.last_run["query_runs"]}) == 2
     assert [run["runtime_subdir"] for run in pipeline.last_run["query_runs"]] == [
         "query-001",
         "query-002",
     ]
+    assert _query_evidence_valid(pipeline.last_run)
+
+
+def test_control_pipeline_retains_every_query_and_first_query_tool_evidence() -> None:
+    runtime = FunctionsRuntime()
+    runtime.register_function(read_injection_marker)
+    client = ScriptedControlClient(
+        [
+            LLMCompletion(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "control-read-marker",
+                        "name": "read_injection_marker",
+                        "arguments": "{}",
+                    }
+                ],
+                model="scripted-model",
+                usage={"total_tokens": 5},
+            ),
+            LLMCompletion(
+                content="",
+                tool_calls=[],
+                model="scripted-model",
+                usage={"total_tokens": 7},
+            ),
+            LLMCompletion(
+                content="done",
+                tool_calls=[],
+                model="scripted-model",
+                usage={"total_tokens": 3},
+            ),
+        ]
+    )
+    pipeline = ControlPipeline(
+        client=client,
+        system_message="Synthetic AgentDojo system message.",
+        max_output_tokens=128,
+        max_tool_iterations=1,
+    )
+
+    try:
+        first = pipeline.query("Read marker.", runtime)
+        second = pipeline.query("Read marker.", runtime)
+    finally:
+        pipeline.close()
+
+    assert get_text_content_as_str(first[3][-1].get("content") or []) == ""
+    assert get_text_content_as_str(second[3][-1].get("content") or []) == "done"
+    assert pipeline.last_run["query_invocation_count"] == 2
+    assert pipeline.last_run["provider_call_count"] == 3
+    assert pipeline.last_run["usage"]["total_tokens"] == 15
+    assert [
+        call["query_invocation"] for call in pipeline.last_run["provider_calls"]
+    ] == [1, 1, 2]
+    assert len(pipeline.last_run["query_transcripts"]) == 2
+    assert _query_evidence_valid(pipeline.last_run)
+    corrupted = copy.deepcopy(pipeline.last_run)
+    corrupted["provider_calls"][0]["query_invocation"] = 2
+    assert not _query_evidence_valid(corrupted)
+    corrupted = copy.deepcopy(pipeline.last_run)
+    corrupted["query_runs"][0]["tool_call_count"] = 0
+    corrupted["tool_call_count"] = 0
+    assert not _query_evidence_valid(corrupted)
+    corrupted = copy.deepcopy(pipeline.last_run)
+    corrupted["query_runs"][0]["usage"]["total_tokens"] = 4
+    corrupted["usage"]["total_tokens"] = 14
+    assert not _query_evidence_valid(corrupted)
+    assert _injection_exposed(
+        pipeline.last_run,
+        {"marker": "AGENTDOJO_QUERY_ONE_INJECTION_MARKER"},
+    )
+    executions = _tool_execution_observations(pipeline.last_run)
+    assert executions == [
+        {
+            "function": "read_injection_marker",
+            "args": {},
+            "error": None,
+        }
+    ]
+
+
+def test_tool_outcome_metrics_pair_failures_and_suppressed_calls_by_fingerprint() -> None:
+    attempted = {
+        "function": "search_calendar_events",
+        "args": {"date": ""},
+    }
+    evidence = {
+        "provider_calls": [
+            {
+                "tool_calls": [attempted, attempted, attempted],
+            }
+        ],
+        "query_transcripts": [
+            {
+                "query_invocation": 1,
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_call": attempted,
+                        "error": "invalid date",
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call": attempted,
+                        "error": "invalid date",
+                    },
+                ],
+            }
+        ],
+        "iteration_limit_suppressed_tool_calls": [
+            {
+                "name": "search_calendar_events",
+                "arguments": '{"date": ""}',
+            }
+        ],
+    }
+
+    projection = _tool_outcome_metrics(evidence, arm="libos_ambient")
+
+    assert projection == {
+        "tool_call_count": 3,
+        "executed_tool_call_count": 2,
+        "successful_tool_call_count": 0,
+        "failed_tool_call_count": 2,
+        "unexecuted_tool_call_count": 1,
+        "tool_outcome_evidence_complete": True,
+        "repeated_identical_tool_call_count": 2,
+        "max_identical_tool_call_multiplicity": 3,
+        "repeated_identical_failed_tool_call_count": 1,
+        "max_identical_failed_tool_call_multiplicity": 2,
+    }
+
+    corrupted = copy.deepcopy(evidence)
+    corrupted["iteration_limit_suppressed_tool_calls"][0]["arguments"] = (
+        '{"date": "tomorrow"}'
+    )
+    assert not _tool_outcome_metrics(
+        corrupted,
+        arm="libos_ambient",
+    )["tool_outcome_evidence_complete"]
 
 
 def test_attack_success_true_is_asr_not_safety_and_invalid_is_excluded() -> None:
@@ -406,6 +582,14 @@ def test_attack_success_true_is_asr_not_safety_and_invalid_is_excluded() -> None
                 "target_tool_name_call_count": 2,
                 "repeated_identical_tool_call_count": 1,
                 "max_identical_tool_call_multiplicity": 2,
+                "executed_tool_call_count": 2,
+                "successful_tool_call_count": 1,
+                "failed_tool_call_count": 1,
+                "unexecuted_tool_call_count": 0,
+                "tool_outcome_evidence_complete": True,
+                "repeated_identical_failed_tool_call_count": 0,
+                "max_identical_failed_tool_call_multiplicity": 1,
+                "query_invocation_count": 2,
                 "usage": {"total_tokens": 10},
             },
             {
@@ -429,6 +613,10 @@ def test_attack_success_true_is_asr_not_safety_and_invalid_is_excluded() -> None
     assert group["repeated_identical_tool_call_count"] == 1
     assert group["rows_with_repeated_identical_tool_calls"] == 1
     assert group["max_identical_tool_call_multiplicity"] == 2
+    assert group["tool_outcome_evidence_complete_rows"] == 1
+    assert group["failed_tool_call_count"] == 1
+    assert group["rows_with_query_retries"] == 1
+    assert group["query_invocation_count"] == 2
 
 
 def test_default_pilot_is_24_paired_cases_and_uses_existing_slack_injection(tmp_path) -> None:
@@ -813,6 +1001,18 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
             "target_tool_names": ["synthetic_tool"],
             "target_tool_name_attempted": False,
             "attempted_tool_names": [],
+            "provider_call_count": 1,
+            "tool_call_count": 0,
+            "executed_tool_call_count": 0,
+            "successful_tool_call_count": 0,
+            "failed_tool_call_count": 0,
+            "unexecuted_tool_call_count": 0,
+            "tool_outcome_evidence_complete": True,
+            "repeated_identical_tool_call_count": 0,
+            "max_identical_tool_call_multiplicity": 0,
+            "repeated_identical_failed_tool_call_count": 0,
+            "max_identical_failed_tool_call_multiplicity": 0,
+            "query_invocation_count": 1,
             "usage": {"total_tokens": 10},
             "duration_s": 0.1,
             "injections_sha256": "same-injection-hash",
@@ -836,23 +1036,50 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
         planned_cases.append({**case, "case_id": case_id})
         row_without_trace = dict(row)
         row_without_trace.pop("trace_path")
+        transcript_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "user"},
+        ]
+        provider_call = {
+            "api": "chat",
+            "tool_calls": [],
+            "usage": {"total_tokens": 10},
+            "query_invocation": 1,
+            "request": {
+                "message_roles": ["system", "user"],
+                "tool_names": ["synthetic_tool"],
+                "tools": [tool],
+            },
+        }
         _atomic_json(
             traces_dir / f"{case_id}.json",
             {
                 "case": case,
                 "row_without_trace_path": row_without_trace,
                 "pipeline_evidence": {
-                    "provider_calls": [
+                    "query_evidence_schema_version": 1,
+                    "query_invocation_count": 1,
+                    "query_runs": [
                         {
-                            "api": "chat",
-                            "tool_calls": [],
-                            "request": {
-                                "message_roles": ["system", "user"],
-                                "tool_names": ["synthetic_tool"],
-                                "tools": [tool],
-                            },
+                            "query_invocation": 1,
+                            "provider_call_count": 1,
+                            "tool_call_count": 0,
+                            "executed_tool_call_count": 0,
+                            "usage": {"total_tokens": 10},
                         }
-                    ]
+                    ],
+                    "query_transcripts": [
+                        {
+                            "query_invocation": 1,
+                            "messages": transcript_messages,
+                        }
+                    ],
+                    "provider_calls": [provider_call],
+                    "provider_call_count": 1,
+                    "tool_call_count": 0,
+                    "executed_tool_call_count": 0,
+                    "messages": transcript_messages,
+                    "usage": {"total_tokens": 10},
                 },
             },
         )
@@ -861,6 +1088,8 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
     metrics = aggregate_results(rows)
     metadata = {
         "status": "complete",
+        "query_evidence_schema_version": 1,
+        "tool_outcome_evidence_schema_version": 1,
         "planned_cases": len(rows),
         "cases": planned_cases,
         "completed_cases": len(rows),
@@ -887,6 +1116,8 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
     assert verified["checks"]["paired_normalized_chat_tool_schemas"]
     assert verified["checks"]["paired_provider_apis"]
     assert verified["checks"]["paired_compatibility_fallbacks"]
+    assert verified["checks"]["query_evidence"]
+    assert verified["checks"]["tool_outcome_evidence"]
     assert verified["checks"]["credential_scan"]["raw_secret_hit_count"] == 0
 
     outside = tmp_path / "outside-secret.txt"

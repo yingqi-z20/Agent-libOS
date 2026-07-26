@@ -142,6 +142,75 @@ def _aggregate_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 ),
             }
         )
+    if any("failed_tool_call_count" in row for row in rows):
+        outcome_rows = [
+            row for row in valid if "failed_tool_call_count" in row
+        ]
+        complete_outcomes = [
+            row
+            for row in outcome_rows
+            if row.get("tool_outcome_evidence_complete") is True
+        ]
+        failed_repeated = [
+            _nonnegative_int(
+                row.get("repeated_identical_failed_tool_call_count")
+            )
+            for row in complete_outcomes
+        ]
+        aggregated.update(
+            {
+                "tool_outcome_evidence_rows": len(outcome_rows),
+                "tool_outcome_evidence_complete_rows": len(complete_outcomes),
+                "tool_outcome_evidence_incomplete_rows": (
+                    len(outcome_rows) - len(complete_outcomes)
+                ),
+                "executed_tool_call_count": sum(
+                    _nonnegative_int(row.get("executed_tool_call_count"))
+                    for row in complete_outcomes
+                ),
+                "successful_tool_call_count": sum(
+                    _nonnegative_int(row.get("successful_tool_call_count"))
+                    for row in complete_outcomes
+                ),
+                "failed_tool_call_count": sum(
+                    _nonnegative_int(row.get("failed_tool_call_count"))
+                    for row in complete_outcomes
+                ),
+                "unexecuted_tool_call_count": sum(
+                    _nonnegative_int(row.get("unexecuted_tool_call_count"))
+                    for row in complete_outcomes
+                ),
+                "repeated_identical_failed_tool_call_count": sum(
+                    failed_repeated
+                ),
+                "rows_with_repeated_identical_failed_tool_calls": sum(
+                    value > 0 for value in failed_repeated
+                ),
+                "max_identical_failed_tool_call_multiplicity": max(
+                    (
+                        _nonnegative_int(
+                            row.get("max_identical_failed_tool_call_multiplicity")
+                        )
+                        for row in complete_outcomes
+                    ),
+                    default=0,
+                ),
+            }
+        )
+    if any("query_invocation_count" in row for row in rows):
+        query_counts = [
+            _nonnegative_int(row.get("query_invocation_count"))
+            for row in valid
+            if "query_invocation_count" in row
+        ]
+        aggregated.update(
+            {
+                "query_evidence_rows": len(query_counts),
+                "query_invocation_count": sum(query_counts),
+                "rows_with_query_retries": sum(value > 1 for value in query_counts),
+                "max_query_invocation_count": max(query_counts, default=0),
+            }
+        )
     return aggregated
 
 

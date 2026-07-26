@@ -17,7 +17,7 @@ and committed and how provider ambiguity is represented.
 Register contracts during trusted Runtime composition:
 
 ```python
-from agent_libos.models import DataFlowDirection
+from agent_libos.models import DataFlowDirection, DataIntegrity
 from agent_libos.sdk import ProtectedOperationContract, ResourcePolicy
 
 runtime.protected_operations.register_contract(
@@ -29,6 +29,7 @@ runtime.protected_operations.register_contract(
         resource_policy=ResourcePolicy.REQUIRED,
         information_flow=True,
         data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+        minimum_egress_integrity=DataIntegrity.UNKNOWN,
     )
 )
 ```
@@ -86,6 +87,15 @@ single `data_sink_revalidator` hook described below applies only to the primary
 Sink. Every ingress/bidirectional invocation must additionally provide a trusted
 `data_flow_ingress_context`; `none` and egress-only invocations must omit it. A
 contract with a data-flow direction must also declare `information_flow=True`.
+
+`minimum_egress_integrity` defaults to `untrusted` and may be raised only for
+an egress or bidirectional contract. The SDK checks it before provider dispatch
+and on every dispatch revalidation; Sink trust and one-shot sensitivity release
+do not override it. Prepared and final effect evidence retain the selected
+floor without retaining the payload.
+Trusted deployment configuration may tighten core descriptors by exact name
+through `data_flow.operation_minimum_integrity`. It cannot weaken a
+code-declared floor or configure an unknown/non-egress descriptor.
 
 If `prepare` changes durable domain state, declare a named
 `prepared_recovery` policy on the contract and register its trusted recovery
@@ -372,6 +382,13 @@ The idempotency contract is deliberately narrower than exactly-once execution:
   fresh identity. The default is therefore not cross-request or cross-restart
   semantic deduplication. Supply a stable explicit key only when the provider
   protocol and recovery logic define that retry identity.
+- An LLM-selected Python tool receives Host-captured
+  `llm_transcript_output_key`, `llm_tool_call_id`, and `llm_tool_name` values in
+  `ToolContext.metadata`. They survive supported Human/child/message waits and
+  can be inputs to a non-secret explicit key when the provider protocol defines
+  that native tool call as the retry identity. They do not authorize the
+  operation, and the runtime never deduplicates calls merely because their
+  function and arguments match.
 
 Startup reconciliation may query by key or provider receipt, but never invokes
 the original provider operation. An unresolved outcome remains `unknown`; do

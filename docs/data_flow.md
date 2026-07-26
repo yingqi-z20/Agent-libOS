@@ -4,7 +4,8 @@ Agent libOS enforces data labels at runtime-mediated payload exits. A visible
 tool, a normal operation capability, or a Human approval is not enough to send
 classified data: the Host-owned Sink registry must also clear the exact Sink,
 the data identity domain must match, and a `conditional` Sink needs an exact
-one-shot release.
+one-shot release. A protected egress contract may additionally require a
+minimum source integrity.
 
 This control is independent of ordinary authority. A `trusted` Sink does not
 grant filesystem write, shell execute, Human output, JSON-RPC method, MCP tool,
@@ -60,6 +61,39 @@ output-schema validation; schema failures, exceptions, and JIT timeout/error
 paths retain a labeled Tool Result carrier. The async JSON-RPC, MCP, and Shell
 wrappers likewise return worker-thread context on both success and failure,
 instead of relying on one-way `ContextVar` copying.
+
+### Operation integrity floors
+
+`ProtectedOperationContract.minimum_egress_integrity` lets trusted Host
+composition require `untrusted`, `unknown`, `checked`, or `verified` integrity
+for one egress or bidirectional operation. The default is `untrusted`, so
+existing contracts retain their prior behavior. A stricter value on a
+non-egress contract is rejected during contract construction.
+
+The floor is checked during early clearance, protected prepare, and every
+provider-phase revalidation. It is independent of Sink sensitivity clearance:
+a trusted Sink or exact one-shot data release cannot authorize a source below
+the operation's integrity floor. Denial occurs before provider dispatch, and
+the selected floor is retained in both protected-operation and payload-free
+data-flow effect evidence.
+
+This mechanism is deliberately Host-selected rather than inferred from a tool
+name or argument pattern. Unclassified LLM, Human, file, Git, JSON-RPC, MCP,
+Shell, and PTY ingress is conservatively `untrusted`; choosing a stricter floor
+therefore creates an explicit containment/utility boundary. It is not enabled
+globally and does not silently turn repeated arguments into authority or
+idempotency.
+
+Core contracts can be tightened by exact name in Host configuration. Unknown
+names, invalid integrity values, attempts to weaken a code-declared floor, and
+strict floors on non-egress contracts fail during Runtime composition:
+
+```yaml
+data_flow:
+  operation_minimum_integrity:
+    primitive.filesystem.write_text: checked
+    primitive.git.push: unknown
+```
 
 ## Sink trust registry
 
@@ -216,8 +250,9 @@ For egress, the runtime performs this sequence:
    protected-operation dispatch revalidation.
 4. Complete the remaining ordinary capability, Task Authority, policy, and
    approval checks. The protected-operation SDK validates the resulting
-   decisions and authorizes or revalidates the final payload against Sinks in
-   tuple order. The primary captures the Sink-registry generation and every
+   decisions and authorizes or revalidates the final payload and any declared
+   minimum source integrity against Sinks in tuple order. The primary captures
+   the Sink-registry generation and every
    later authorization must use that same generation. A conditional Sink with
    no matching release creates only a metadata-only Human release request and
    suspends that attempt, so later Sinks may be checked on a resumed attempt and

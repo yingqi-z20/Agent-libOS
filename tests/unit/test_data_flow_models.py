@@ -177,6 +177,25 @@ def test_data_flow_config_defaults_to_untrusted_normal_and_loads_rules(tmp_path:
     assert config.data_flow.sink_rules[0].pattern == "llm:corp-secure"
     assert config.data_flow.sink_rules[0].tenants == ("tenant-a",)
 
+    integrity_path = tmp_path / "integrity.yaml"
+    integrity_path.write_text(
+        "data_flow:\n"
+        "  operation_minimum_integrity:\n"
+        "    primitive.filesystem.write_text: checked\n",
+        encoding="utf-8",
+    )
+    configured_integrity = load_config_file(integrity_path).data_flow
+    assert (
+        configured_integrity.operation_minimum_integrity[
+            "primitive.filesystem.write_text"
+        ]
+        is DataIntegrity.CHECKED
+    )
+    with pytest.raises(TypeError, match="configuration mappings are immutable"):
+        configured_integrity.operation_minimum_integrity[
+            "primitive.filesystem.write_text"
+        ] = DataIntegrity.UNTRUSTED
+
     with pytest.raises(ValueError, match="must remain untrusted"):
         AgentLibOSConfig(
             data_flow=replace(DEFAULT_CONFIG.data_flow, default_trust_level=SinkTrustLevel.TRUSTED)

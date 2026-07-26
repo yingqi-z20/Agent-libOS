@@ -10,6 +10,7 @@ import stat
 import subprocess
 import time
 from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -442,6 +443,12 @@ def verify_run(
 
     row_trace_alignment = True
     hidden_terminal_absent = True
+    query_evidence_valid = True
+    tool_outcome_evidence_valid = True
+    query_evidence_required = metadata.get("query_evidence_schema_version") == 1
+    tool_outcome_evidence_required = (
+        metadata.get("tool_outcome_evidence_schema_version") == 1
+    )
     provider_api_values: dict[str, set[str]] = defaultdict(set)
     provider_role_shapes: dict[str, set[tuple[str, ...]]] = defaultdict(set)
     for row in rows:
@@ -478,6 +485,16 @@ def verify_run(
             row_trace_alignment = False
             continue
         arm = str(row.get("arm") or "unknown")
+        if query_evidence_required and (
+            not _query_evidence_valid(evidence)
+            or row.get("query_invocation_count")
+            != evidence.get("query_invocation_count")
+        ):
+            query_evidence_valid = False
+        if tool_outcome_evidence_required:
+            expected_outcomes = _tool_outcome_metrics(evidence, arm=arm)
+            if any(row.get(key) != value for key, value in expected_outcomes.items()):
+                tool_outcome_evidence_valid = False
         provider_calls = evidence.get("provider_calls")
         if not isinstance(provider_calls, list):
             row_trace_alignment = False
@@ -505,10 +522,16 @@ def verify_run(
                 hidden_terminal_absent = False
     checks["row_trace_alignment"] = row_trace_alignment
     checks["hidden_terminal_absent_from_provider_surface"] = hidden_terminal_absent
+    checks["query_evidence"] = query_evidence_valid
+    checks["tool_outcome_evidence"] = tool_outcome_evidence_valid
     if not row_trace_alignment:
         errors.append("one or more result rows do not align with their trace")
     if not hidden_terminal_absent:
         errors.append("runtime-only terminal tool leaked into provider evidence")
+    if not query_evidence_valid:
+        errors.append("one or more traces contain inconsistent per-query evidence")
+    if not tool_outcome_evidence_valid:
+        errors.append("one or more result rows disagree with native tool outcome evidence")
 
     recomputed_metrics = aggregate_results(rows)
     metrics_match = recomputed_metrics == metrics
@@ -698,10 +721,7 @@ def _run_case(
     attempted_calls = _assistant_tool_calls(run_evidence)
     attempted_tools = [str(call["function"]) for call in attempted_calls]
     target_tool_set = set(target_tools)
-    call_fingerprints = Counter(
-        _sha256_json({"function": call["function"], "args": call.get("args", {})})
-        for call in attempted_calls
-    )
+    tool_outcomes = _tool_outcome_metrics(run_evidence, arm=case.arm)
     provider_calls = run_evidence.get("provider_calls")
     row = {
         "schema_version": 1,
@@ -734,13 +754,8 @@ def _run_case(
         "provider_call_count": (
             len(provider_calls) if isinstance(provider_calls, list) else None
         ),
-        "tool_call_count": len(attempted_calls),
-        "repeated_identical_tool_call_count": sum(
-            count - 1 for count in call_fingerprints.values()
-        ),
-        "max_identical_tool_call_multiplicity": max(
-            call_fingerprints.values(), default=0
-        ),
+        **tool_outcomes,
+        "query_invocation_count": run_evidence.get("query_invocation_count"),
         "usage": usage,
         "duration_s": round(duration, 6),
         "injections_sha256": _sha256_json(injections) if injections else None,
@@ -917,6 +932,8 @@ def _metadata(
         "effective_llm_config_sha256": _sha256_json(effective_llm_config),
         "temperature": 0.0,
         "parallel_tool_calls": False,
+        "query_evidence_schema_version": 1,
+        "tool_outcome_evidence_schema_version": 1,
         "max_output_tokens_per_call": options.max_output_tokens,
         "max_quanta": options.max_quanta,
         "libos_prompt_mode": options.libos_prompt_mode,
@@ -1155,6 +1172,149 @@ def _provider_execution_observation(
             call.get("fallback_json_action_used") is True
         )
     return frozenset(apis), frozenset(removed), json_fallback_used
+
+
+def _query_evidence_valid(evidence: dict[str, Any]) -> bool:
+    if evidence.get("query_evidence_schema_version") != 1:
+        return False
+    count = evidence.get("query_invocation_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        return False
+    runs = evidence.get("query_runs")
+    transcripts = evidence.get("query_transcripts")
+    provider_calls = evidence.get("provider_calls")
+    if not all(isinstance(value, list) for value in (runs, transcripts, provider_calls)):
+        return False
+    assert isinstance(runs, list)
+    assert isinstance(transcripts, list)
+    assert isinstance(provider_calls, list)
+    if len(runs) != count or len(transcripts) != count:
+        return False
+    expected_invocations = list(range(1, count + 1))
+    run_invocations = [
+        run.get("query_invocation") if isinstance(run, dict) else None
+        for run in runs
+    ]
+    transcript_invocations = [
+        transcript.get("query_invocation")
+        if isinstance(transcript, dict)
+        else None
+        for transcript in transcripts
+    ]
+    if run_invocations != expected_invocations:
+        return False
+    if transcript_invocations != expected_invocations:
+        return False
+    flattened_messages: list[Any] = []
+    executed_counts: Counter[int] = Counter()
+    for transcript in transcripts:
+        assert isinstance(transcript, dict)
+        invocation = int(transcript["query_invocation"])
+        messages = transcript.get("messages")
+        if not isinstance(messages, list) or not all(
+            isinstance(message, dict) for message in messages
+        ):
+            return False
+        flattened_messages.extend(messages)
+        executed_counts[invocation] = sum(
+            message.get("role") == "tool" for message in messages
+        )
+    if evidence.get("messages") != flattened_messages:
+        return False
+    provider_counts: Counter[int] = Counter()
+    attempted_counts: Counter[int] = Counter()
+    provider_calls_by_invocation: dict[int, list[dict[str, Any]]] = defaultdict(
+        list
+    )
+    provider_invocation_order: list[int] = []
+    for provider_call in provider_calls:
+        if not isinstance(provider_call, dict):
+            return False
+        invocation = provider_call.get("query_invocation")
+        if invocation not in expected_invocations:
+            return False
+        selected_invocation = int(invocation)
+        provider_invocation_order.append(selected_invocation)
+        provider_counts[selected_invocation] += 1
+        provider_calls_by_invocation[selected_invocation].append(provider_call)
+        tool_calls = provider_call.get("tool_calls")
+        if not isinstance(tool_calls, list) or not all(
+            isinstance(call, dict) for call in tool_calls
+        ):
+            return False
+        attempted_counts[selected_invocation] += len(tool_calls)
+    if provider_invocation_order != sorted(provider_invocation_order):
+        return False
+    expected_provider_total = 0
+    expected_tool_total = 0
+    expected_executed_tool_total = 0
+    usage: Counter[str] = Counter()
+    for run in runs:
+        assert isinstance(run, dict)
+        invocation = int(run["query_invocation"])
+        provider_count = run.get("provider_call_count")
+        tool_count = run.get("tool_call_count")
+        executed_tool_count = run.get("executed_tool_call_count")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (provider_count, tool_count, executed_tool_count)
+        ):
+            return False
+        assert isinstance(provider_count, int)
+        assert isinstance(tool_count, int)
+        assert isinstance(executed_tool_count, int)
+        if provider_counts[invocation] != provider_count:
+            return False
+        if attempted_counts[invocation] != tool_count:
+            return False
+        if executed_counts[invocation] != executed_tool_count:
+            return False
+        expected_provider_total += provider_count
+        expected_tool_total += tool_count
+        expected_executed_tool_total += executed_tool_count
+        selected_usage = run.get("usage")
+        if not isinstance(selected_usage, dict):
+            return False
+        if selected_usage != _provider_call_usage(
+            provider_calls_by_invocation[invocation]
+        ):
+            return False
+        for key, value in selected_usage.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return False
+            usage[str(key)] += value
+    return (
+        evidence.get("provider_call_count") == expected_provider_total
+        and len(provider_calls) == expected_provider_total
+        and evidence.get("tool_call_count") == expected_tool_total
+        and (
+            evidence.get("executed_tool_call_count")
+            == expected_executed_tool_total
+        )
+        and evidence.get("usage") == dict(sorted(usage.items()))
+    )
+
+
+def _provider_call_usage(
+    provider_calls: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    totals: Counter[str] = Counter()
+    for provider_call in provider_calls:
+        selected_usage = provider_call.get("usage")
+        if not isinstance(selected_usage, Mapping):
+            continue
+        for key, value in selected_usage.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                continue
+            totals[str(key)] += value
+    if "total_tokens" not in totals:
+        prompt = totals.get("prompt_tokens", totals.get("input_tokens", 0))
+        completion = totals.get(
+            "completion_tokens", totals.get("output_tokens", 0)
+        )
+        if prompt or completion:
+            totals["total_tokens"] = prompt + completion
+    return dict(sorted(totals.items()))
 
 
 def _first_provider_tools(trace: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -1412,17 +1572,187 @@ def _assistant_tool_calls(evidence: dict[str, Any]) -> list[dict[str, Any]]:
     return selected
 
 
+def _query_transcript_messages(evidence: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    transcripts = evidence.get("query_transcripts")
+    selected: list[list[dict[str, Any]]] = []
+    if isinstance(transcripts, list):
+        for transcript in transcripts:
+            if not isinstance(transcript, dict):
+                continue
+            messages = transcript.get("messages")
+            if isinstance(messages, list) and all(
+                isinstance(message, dict) for message in messages
+            ):
+                selected.append(messages)
+    if selected:
+        return selected
+    messages = evidence.get("messages")
+    if isinstance(messages, list) and all(
+        isinstance(message, dict) for message in messages
+    ):
+        return [messages]
+    return []
+
+
+def _tool_execution_observations(
+    evidence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return native executed-call outcomes without counting suppressed calls."""
+
+    selected: list[dict[str, Any]] = []
+    for messages in _query_transcript_messages(evidence):
+        for message in messages:
+            if message.get("role") != "tool":
+                continue
+            tool_call = message.get("tool_call")
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") or tool_call.get("name")
+            if not function:
+                continue
+            error = message.get("error")
+            selected.append(
+                {
+                    "function": str(function),
+                    "args": to_jsonable(tool_call.get("args") or {}),
+                    "error": str(error) if error else None,
+                }
+            )
+    if selected:
+        return selected
+    tool_executions = evidence.get("tool_executions")
+    if not isinstance(tool_executions, list):
+        return []
+    for execution in tool_executions:
+        if not isinstance(execution, dict) or not execution.get("function"):
+            continue
+        error = execution.get("error")
+        selected.append(
+            {
+                "function": str(execution["function"]),
+                "args": to_jsonable(execution.get("args") or {}),
+                "error": str(error) if error else None,
+            }
+        )
+    return selected
+
+
+def _suppressed_tool_call_observations(
+    evidence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    raw_calls = evidence.get("iteration_limit_suppressed_tool_calls")
+    if not isinstance(raw_calls, list):
+        return []
+    selected: list[dict[str, Any]] = []
+    for call in raw_calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or call.get("name")
+        if not function:
+            continue
+        arguments = call.get("args", call.get("arguments", {}))
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                # Preserve mismatch evidence without retaining another raw-text
+                # projection in the metric row.
+                arguments = {
+                    "unparsed_sha256": hashlib.sha256(arguments.encode()).hexdigest()
+                }
+        selected.append(
+            {
+                "function": str(function),
+                "args": to_jsonable(arguments),
+            }
+        )
+    return selected
+
+
+def _tool_call_counter(calls: list[dict[str, Any]]) -> Counter[str]:
+    return Counter(
+        _sha256_json(
+            {
+                "function": call["function"],
+                "args": call.get("args", {}),
+            }
+        )
+        for call in calls
+    )
+
+
+def _tool_outcome_metrics(
+    evidence: dict[str, Any],
+    *,
+    arm: str,
+) -> dict[str, int | bool]:
+    """Derive attempt/outcome counts from native transcript evidence."""
+
+    attempted = _assistant_tool_calls(evidence)
+    executed = _tool_execution_observations(evidence)
+    suppressed = _suppressed_tool_call_observations(evidence)
+    attempted_counts = _tool_call_counter(attempted)
+    executed_counts = _tool_call_counter(executed)
+    unpaired_counts = attempted_counts - executed_counts
+    unexpected_executions = executed_counts - attempted_counts
+    suppressed_counts = _tool_call_counter(suppressed)
+    failed = [call for call in executed if call.get("error")]
+    failed_counts = _tool_call_counter(failed)
+    complete = not unexpected_executions and (
+        arm == "upstream_control" or unpaired_counts == suppressed_counts
+    )
+    return {
+        "tool_call_count": len(attempted),
+        "executed_tool_call_count": len(executed),
+        "successful_tool_call_count": sum(
+            call.get("error") is None for call in executed
+        ),
+        "failed_tool_call_count": len(failed),
+        "unexecuted_tool_call_count": sum(unpaired_counts.values()),
+        "tool_outcome_evidence_complete": complete,
+        "repeated_identical_tool_call_count": sum(
+            count - 1 for count in attempted_counts.values()
+        ),
+        "max_identical_tool_call_multiplicity": max(
+            attempted_counts.values(), default=0
+        ),
+        "repeated_identical_failed_tool_call_count": sum(
+            count - 1 for count in failed_counts.values()
+        ),
+        "max_identical_failed_tool_call_multiplicity": max(
+            failed_counts.values(), default=0
+        ),
+    }
+
+
 def _injection_exposed(evidence: dict[str, Any], injections: dict[str, str]) -> bool:
     if not injections:
         return False
     values = [_normalize_exposure_text(value) for value in injections.values() if value]
-    messages = evidence.get("messages")
-    if isinstance(messages, list):
+    for messages in _query_transcript_messages(evidence):
         for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "tool":
+            if message.get("role") != "tool":
                 continue
             if _contains_normalized_text(message.get("content"), values):
                 return True
+    provider_calls = evidence.get("provider_calls")
+    if isinstance(provider_calls, list):
+        for provider_call in provider_calls:
+            if not isinstance(provider_call, dict):
+                continue
+            request = provider_call.get("request")
+            if not isinstance(request, dict):
+                continue
+            messages = request.get("messages")
+            if not isinstance(messages, list):
+                continue
+            for message in messages:
+                if (
+                    isinstance(message, dict)
+                    and message.get("role") == "tool"
+                    and _contains_normalized_text(message.get("content"), values)
+                ):
+                    return True
     tool_executions = evidence.get("tool_executions")
     return isinstance(tool_executions, list) and _contains_normalized_text(
         tool_executions, values

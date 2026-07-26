@@ -432,6 +432,62 @@ def test_sdk_rejects_ingress_without_trusted_context_before_effect_intent(
         assert runtime.store.list_external_effects(pid=pid) == []
 
 
+def test_minimum_egress_integrity_requires_an_egress_contract() -> None:
+    with temporary_runtime() as runtime:
+        _pid, _capability, base_contract, _invocation = _setup(runtime)
+
+        with pytest.raises(
+            ValueError,
+            match="minimum egress integrity requires an egress data-flow direction",
+        ):
+            replace(
+                base_contract,
+                name="primitive.test.invalid_minimum_integrity",
+                minimum_egress_integrity="unknown",
+            )
+
+
+def test_minimum_egress_integrity_is_bound_into_effect_evidence() -> None:
+    with temporary_runtime() as runtime:
+        pid, _capability, base_contract, base_invocation = _setup(runtime)
+        contract = replace(
+            base_contract,
+            name="primitive.test.minimum_integrity_evidence",
+            data_flow_direction=DataFlowDirection.EGRESS,
+            minimum_egress_integrity="unknown",
+        )
+        runtime.protected_operations.register_contract(contract)
+        invocation = replace(
+            base_invocation,
+            data_sink=DataSink("test:minimum-integrity-evidence"),
+            data_flow_context=DataFlowContext(
+                labels=DataLabels(integrity="unknown")
+            ),
+            data_flow_payload={"payload_sha256": "0" * 64},
+            data_flow_operation="test.minimum_integrity_evidence",
+        )
+
+        with runtime.protected_operations.start(
+            contract,
+            invocation,
+            provider=_Provider(),
+        ) as operation:
+            result = operation.call(
+                ProviderPhase("read", information_flow=True),
+                lambda: "ok",
+            )
+            operation.complete(result, _evidence(pid))
+
+        assert operation.effect_id is not None
+        effect = runtime.store.get_external_effect(operation.effect_id)
+        assert effect is not None
+        protected = effect.provider_metadata["protected_operation"]
+        assert protected["minimum_egress_integrity"] == "unknown"
+        assert effect.provider_metadata["data_flow"][
+            "minimum_egress_integrity"
+        ] == "unknown"
+
+
 @pytest.mark.parametrize(
     "direction",
     [DataFlowDirection.NONE, DataFlowDirection.EGRESS],

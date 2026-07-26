@@ -1576,6 +1576,9 @@ class LLMProcessExecutor:
                 pid,
                 action,
                 host_auto_wait=host_auto_wait,
+                context_metadata=self._tool_context_identity_metadata(
+                    tool_call_context
+                ),
             )
         except HumanApprovalRequired as exc:
             return self._wait_for_human_action(
@@ -1645,7 +1648,13 @@ class LLMProcessExecutor:
         for action_index, action in enumerate(actions):
             tool_call_context = self._completion_tool_call_context(completion, index=action_index)
             try:
-                result = await self.adispatch(pid, action)
+                result = await self.adispatch(
+                    pid,
+                    action,
+                    context_metadata=self._tool_context_identity_metadata(
+                        tool_call_context
+                    ),
+                )
             except HumanApprovalRequired as exc:
                 stop_reason = "waiting_human"
                 self._persist_unexecuted_parallel_tool_outputs(
@@ -2221,6 +2230,9 @@ class LLMProcessExecutor:
                         action,
                         context_metadata={
                             **self._pending_data_flow_metadata(pending),
+                            **self._tool_context_identity_metadata(
+                                self._pending_tool_call_context(pending)
+                            ),
                             "human_resume_request_id": request_id,
                             "operation_id": pending.get("tool_operation_id"),
                             **self._context_management_dispatch_metadata(pending),
@@ -2731,6 +2743,23 @@ class LLMProcessExecutor:
         tool_name = str(tool_call.get("name") or "").strip() or None
         return {"response_id": response_id, "tool_call_id": call_id, "tool_name": tool_name}
 
+    @staticmethod
+    def _tool_context_identity_metadata(
+        context: Mapping[str, Any],
+    ) -> dict[str, str]:
+        """Project Host-captured provider identities into trusted ToolContext metadata."""
+
+        projected: dict[str, str] = {}
+        for source, target in (
+            ("response_id", "llm_transcript_output_key"),
+            ("tool_call_id", "llm_tool_call_id"),
+            ("tool_name", "llm_tool_name"),
+        ):
+            value = context.get(source)
+            if isinstance(value, str) and value:
+                projected[target] = value
+        return projected
+
     def _selected_completion_tool_call_context(self, completion: Any) -> dict[str, str | None]:
         tool_calls = list(getattr(completion, "tool_calls", []) or [])
         for index in range(len(tool_calls) - 1, -1, -1):
@@ -2936,6 +2965,9 @@ class LLMProcessExecutor:
                     action,
                     context_metadata={
                         **self._pending_data_flow_metadata(pending),
+                        **self._tool_context_identity_metadata(
+                            self._pending_tool_call_context(pending)
+                        ),
                         "pending_child_resume": True,
                         "pending_child_pid": child_pid,
                         "operation_id": pending.get("tool_operation_id"),
@@ -3039,6 +3071,9 @@ class LLMProcessExecutor:
                     host_auto_wait=bool(host_auto_wait_metadata),
                     context_metadata={
                         **self._pending_data_flow_metadata(pending),
+                        **self._tool_context_identity_metadata(
+                            self._pending_tool_call_context(pending)
+                        ),
                         "operation_id": pending.get("tool_operation_id"),
                         **self._context_management_dispatch_metadata(pending),
                     },

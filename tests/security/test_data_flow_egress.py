@@ -16,9 +16,14 @@ from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, DataFlowDefault
 from agent_libos.models import (
     CapabilityRight,
     DataFlowContext,
+    DataFlowDirection,
+    DataIntegrity,
     DataLabels,
     DataSink,
     EventType,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
     HumanRequestStatus,
     ObjectMetadata,
     ObjectPatch,
@@ -27,6 +32,13 @@ from agent_libos.models import (
     SinkTrustLevel,
     SinkTrustRule,
 )
+from agent_libos.sdk import (
+    ProtectedOperationContract,
+    ProtectedOperationEvidence,
+    ProtectedOperationInvocation,
+    ProviderPhase,
+    ResourcePolicy,
+)
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
@@ -34,6 +46,21 @@ from agent_libos.models.exceptions import (
 )
 from agent_libos.substrate import LocalResourceProviderSubstrate, ProviderEffectNotStarted
 from tests.support.runtime import workspace_runtime
+
+
+class _IntegrityPolicyProvider:
+    def classify_external_effect(
+        self,
+        _operation: str,
+        _context: dict[str, Any],
+        _result: Any,
+    ) -> ExternalEffectClassification:
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+            rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+            state_mutation=True,
+            information_flow=True,
+        )
 
 
 def _secret_source(runtime: Any, pid: str, *, mutable: bool = False):
@@ -83,6 +110,166 @@ def _count_filesystem_boundaries(runtime: Any, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(runtime.filesystem.provider, "state", state)
     monkeypatch.setattr(runtime.filesystem.provider, "write_text", write)
     return calls
+
+
+def test_protected_write_rejects_untrusted_integrity_before_provider_dispatch() -> None:
+    with workspace_runtime() as (runtime, _root):
+        pid = runtime.process.spawn(goal="block untrusted instructions from writes")
+        resource = "test:integrity-protected-write"
+        runtime.capability.issue_trusted(
+            pid,
+            resource,
+            [CapabilityRight.WRITE],
+            issued_by="test.host",
+        )
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=resource,
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="test.host",
+            require_capability=False,
+        )
+        decision = runtime.capability.require(
+            pid,
+            resource,
+            CapabilityRight.WRITE,
+            consume=False,
+        )
+        contract = ProtectedOperationContract(
+            name="primitive.test.integrity_protected_write",
+            provider="test",
+            operation="write",
+            evidence_roles=("audit", "event", "effect"),
+            resource_policy=ResourcePolicy.NONE,
+            state_mutation=True,
+            information_flow=True,
+            data_flow_direction=DataFlowDirection.EGRESS,
+            minimum_egress_integrity=DataIntegrity.UNKNOWN,
+        )
+        runtime.protected_operations.register_contract(contract)
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
+            actor=pid,
+            target=resource,
+            decisions=(decision,),
+            canonical_args={"value": "payload"},
+            observation={"value_sha256": "0" * 64},
+            data_sink=DataSink(resource),
+            data_flow_context=DataFlowContext(
+                labels=DataLabels(
+                    trust_level="untrusted",
+                    integrity="untrusted",
+                    origin="external:prompt-injection",
+                )
+            ),
+            data_flow_payload={"value_sha256": "0" * 64},
+            data_flow_operation="test.integrity_protected_write",
+        )
+        provider_calls = 0
+
+        def provider_write() -> str:
+            nonlocal provider_calls
+            provider_calls += 1
+            return "written"
+
+        with pytest.raises(
+            CapabilityDenied,
+            match="data integrity untrusted is below operation minimum unknown",
+        ):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_IntegrityPolicyProvider(),
+            ) as operation:
+                result = operation.call(
+                    ProviderPhase(
+                        "write",
+                        state_mutation=True,
+                        information_flow=True,
+                    ),
+                    provider_write,
+                )
+                operation.complete(
+                    result,
+                    ProtectedOperationEvidence(
+                        event_type=EventType.EXTERNAL_WRITE,
+                        event_source=pid,
+                        audit_action="primitive.test.integrity_protected_write",
+                        audit_actor=pid,
+                    ),
+                )
+
+        assert provider_calls == 0
+        assert runtime.store.list_external_effects(pid=pid) == []
+        denials = runtime.store.list_data_flow_decisions(pid=pid, outcome="deny")
+        assert len(denials) == 1
+        assert denials[0].labels.integrity is DataIntegrity.UNTRUSTED
+        assert any(
+            record.action == "data_flow.egress"
+            and record.target == resource
+            and record.decision.get("decision_id") == denials[0].decision_id
+            and record.decision.get("outcome") == "deny"
+            for record in runtime.audit.trace()
+        )
+        assert any(
+            event.type == EventType.DATA_FLOW_DECISION
+            and event.payload.get("decision_id") == denials[0].decision_id
+            and event.payload.get("outcome") == "deny"
+            for event in runtime.events.list(target=f"data_flow_sink:{resource}")
+        )
+
+
+def test_configured_integrity_floor_blocks_real_filesystem_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        DEFAULT_CONFIG,
+        data_flow=replace(
+            DEFAULT_CONFIG.data_flow,
+            operation_minimum_integrity={
+                "primitive.filesystem.write_text": DataIntegrity.UNKNOWN,
+            },
+        ),
+    )
+    runtime = Runtime.open(
+        "local",
+        substrate=LocalResourceProviderSubstrate(tmp_path),
+        config=config,
+    )
+    try:
+        pid = runtime.process.spawn(goal="contain untrusted write instructions")
+        path = "contained.txt"
+        runtime.filesystem.grant_path(
+            pid,
+            path,
+            [CapabilityRight.WRITE],
+            issued_by="test",
+        )
+        runtime.data_flow.observe_ingress(
+            DataFlowContext(
+                labels=DataLabels(
+                    trust_level="untrusted",
+                    integrity="untrusted",
+                    origin="external:prompt-injection",
+                )
+            )
+        )
+        calls = _count_filesystem_boundaries(runtime, monkeypatch)
+
+        with pytest.raises(
+            CapabilityDenied,
+            match="data integrity untrusted is below operation minimum unknown",
+        ):
+            runtime.filesystem.write_text(pid, path, "blocked")
+
+        assert calls == {"state": 0, "write": 0}
+        assert not (tmp_path / path).exists()
+        assert runtime.store.list_external_effects(pid=pid) == []
+    finally:
+        runtime.close()
 
 
 def test_untrusted_secret_file_egress_denies_before_state_and_preserves_once(

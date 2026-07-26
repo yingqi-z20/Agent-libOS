@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from agent_libos import AgentImage, Runtime
 from agent_libos.config import DEFAULT_CONFIG
@@ -32,11 +33,175 @@ from agent_libos.models import (
     ObjectMetadata,
     ObjectType,
 )
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
+from agent_libos.tools.base import SyncAgentTool, ToolContext
 from tests.support.skills import write_skill_package
 
 
+class _CaptureToolIdentityArgs(BaseModel):
+    value: str
+
+
+class _CaptureToolIdentity(SyncAgentTool[_CaptureToolIdentityArgs]):
+    name = "capture_tool_identity"
+    description = "Capture the Host-bound model tool-call identity."
+    args_schema = _CaptureToolIdentityArgs
+
+    def __init__(self) -> None:
+        self.seen: list[dict[str, Any]] = []
+
+    def run(
+        self,
+        args: _CaptureToolIdentityArgs,
+        ctx: ToolContext,
+    ) -> dict[str, str]:
+        self.seen.append(dict(ctx.metadata))
+        return {"value": args.value}
+
+
+class _WaitForToolIdentityApproval(_CaptureToolIdentity):
+    name = "wait_for_tool_identity_approval"
+    description = "Wait once, then capture the resumed model tool-call identity."
+
+    def run(
+        self,
+        args: _CaptureToolIdentityArgs,
+        ctx: ToolContext,
+    ) -> dict[str, str]:
+        self.seen.append(dict(ctx.metadata))
+        if "human_resume_request_id" not in ctx.metadata:
+            request_id = ctx.runtime.human.query(
+                pid=ctx.pid,
+                human=ctx.runtime.config.runtime.default_human,
+                request={
+                    "type": "external_operation_approval",
+                    "question": "Approve the identity resume probe",
+                    "context": {"operation": "identity_resume_probe"},
+                },
+                blocking=True,
+            )
+            raise HumanApprovalRequired(request_id, "identity resume probe")
+        return {"value": args.value}
+
+
 class TestLLMPromptModes:
+
+    def test_llm_tool_call_identity_is_bound_into_tool_context(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            capture = _CaptureToolIdentity()
+            runtime.tools.register_tool(capture, registered_by="test", ephemeral=True)
+            runtime.register_image(
+                AgentImage(
+                    image_id="tool-call-identity:v0",
+                    name="tool-call-identity",
+                    system_prompt="Capture exact provider tool-call identity.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["capture_tool_identity", "process_exit"],
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptClient(
+                [
+                    [
+                        _tool_call(
+                            "provider-tool-call-7",
+                            "capture_tool_identity",
+                            {"value": "one"},
+                        )
+                    ],
+                    [
+                        _tool_call(
+                            "provider-exit-8",
+                            "process_exit",
+                            {"payload": {"done": True}},
+                        )
+                    ],
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="tool-call-identity:v0",
+                goal="capture the native tool-call identity",
+            )
+
+            first = runtime.run_process_once(pid)
+            completed = runtime.run_process_once(pid)
+
+            assert first["ok"], first
+            assert completed["ok"], completed
+            assert len(capture.seen) == 1
+            assert capture.seen[0]["llm_transcript_output_key"].startswith("llmcall_")
+            assert capture.seen[0]["llm_tool_call_id"] == "provider-tool-call-7"
+            assert capture.seen[0]["llm_tool_name"] == "capture_tool_identity"
+        finally:
+            runtime.close()
+
+    def test_llm_tool_call_identity_survives_human_wait_resume(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            capture = _WaitForToolIdentityApproval()
+            runtime.tools.register_tool(capture, registered_by="test", ephemeral=True)
+            runtime.register_image(
+                AgentImage(
+                    image_id="tool-call-identity-wait:v0",
+                    name="tool-call-identity-wait",
+                    system_prompt="Resume the exact provider tool call.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=[capture.name, "process_exit"],
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptClient(
+                [
+                    [
+                        _tool_call(
+                            "provider-wait-call-9",
+                            capture.name,
+                            {"value": "resume"},
+                        )
+                    ],
+                    [
+                        _tool_call(
+                            "provider-wait-exit-10",
+                            "process_exit",
+                            {"payload": {"done": True}},
+                        )
+                    ],
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="tool-call-identity-wait:v0",
+                goal="wait and resume the same call",
+            )
+            runtime.capability.grant(
+                pid,
+                f"human:{runtime.config.runtime.default_human}",
+                [CapabilityRight.WRITE],
+                issued_by="test",
+            )
+
+            waiting = runtime.run_process_once(pid)
+            runtime.human.drain_terminal_queue(auto_approve=True)
+            resumed = runtime.run_process_once(pid)
+            completed = runtime.run_process_once(pid)
+
+            assert waiting["waiting_human"]
+            assert resumed["ok"] and resumed["resumed_after_human"]
+            assert completed["ok"]
+            assert len(capture.seen) == 2
+            first, second = capture.seen
+            assert first["llm_tool_call_id"] == "provider-wait-call-9"
+            assert second["llm_tool_call_id"] == first["llm_tool_call_id"]
+            assert (
+                second["llm_transcript_output_key"]
+                == first["llm_transcript_output_key"]
+            )
+            assert "human_resume_request_id" not in first
+            assert second["human_resume_request_id"] == waiting["request_id"]
+        finally:
+            runtime.close()
 
     @pytest.mark.parametrize("identity_key", ["object_oid", "oid"])
     def test_goal_recovery_returns_complete_canonical_object_record(

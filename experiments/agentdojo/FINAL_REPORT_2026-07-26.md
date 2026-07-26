@@ -285,3 +285,28 @@ locator；没有本地副本的读者无法仅凭 hash 取回真实模型响应�
 
 在完成 containment arm 之前，不能从本报告宣称 Agent libOS 已阻止 prompt
 injection、已保护外部效果，或审计证据对直接数据库管理员不可篡改。
+
+## 评测后系统修复（2026-07-26）
+
+全量结果暴露的可修复问题已在后续实现中收敛，但没有回写或重新解释上述真实模型
+artifact：
+
+1. control 的 AgentDojo 空终态重试现在保留每次 query 的完整 transcript、provider
+   请求、usage 与工具小计。新 artifact 使用 `query_evidence_schema_version=1`；严格
+   verifier 会从 trace 重建并核对这些小计。旧 artifact 中唯一自然 control retry
+   仍是历史证据，未被原地修改，因此旧 exposure 数字仍按当时 schema 阅读。
+2. 新的工具结果投影同时报告 attempted、executed-successful、executed-failed 与
+   unexecuted，并把“相同失败重复”与一般重复调用分开。配对采用 function 与规范
+   arguments 指纹；证据不完整的 row 显式进入 incomplete 小计，不能被算作成功。
+3. protected-operation 合同增加 Host 声明的最低 egress integrity。部署可用
+   `data_flow.operation_minimum_integrity` 按精确合同名收紧；低完整性来源会在
+   provider 前拒绝，且 trusted Sink 或 sensitivity release 不能绕过。默认仍为
+   `untrusted`，所以这是显式 containment/utility 取舍，不会把透明 ambient 暗中
+   改成第三臂。
+4. LLM 原生 transcript output key、tool-call ID 与 tool name 现在进入 Host-only
+   `ToolContext.metadata`，并跨 Human/child/message wait-resume 保持稳定，可供有明确
+   provider retry 协议的 protected operation 派生显式 idempotency key。
+
+本修复仍没有增加“相同参数自动去重”，也没有声称已完成第三个 containment arm。
+它修复的是安全机制可配置性、原生调用身份和评测证据完整性；原报告的 2,162 条
+真实模型结论继续作为透明双臂基线。

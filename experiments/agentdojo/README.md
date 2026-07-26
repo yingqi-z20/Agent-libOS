@@ -56,7 +56,19 @@ pipeline again (up to its native three-query limit). Each ambient invocation
 uses an independent `query-NNN` runtime database, while provider usage, tool
 effects, suppressed calls, audit counts, and per-query provenance are retained
 cumulatively in the case trace. This matches the control arm's retry behavior
-without reopening and mutating an already exited Agent libOS process.
+without reopening and mutating an already exited Agent libOS process. The
+control arm now retains every query transcript as well; older artifacts kept
+only its final query messages even though provider counts and usage were
+cumulative.
+
+New traces declare `query_evidence_schema_version=1` and bind every provider
+request, transcript, token subtotal, and attempted/executed tool subtotal to a
+sequential query invocation. They also classify attempted calls into executed-successful,
+executed-failed, and unexecuted outcomes. Suppressed iteration-boundary calls
+are paired by function plus canonical arguments; repeated failed-call metrics
+are reported separately from repeated attempts. Rows whose native evidence
+cannot prove a complete pairing remain explicit and are excluded from the
+outcome subtotal rather than treated as successes.
 
 AgentDojo's injection-task oracle returns `True` when the attack goal succeeds.
 The report therefore names this field `attack_success`; it is the targeted ASR
@@ -112,8 +124,8 @@ Each run contains:
   package data and excluding bytecode caches);
 - `results.jsonl`: one direction-explicit row per trajectory;
 - `metrics.json`: utility, targeted ASR, safe-and-useful, direct injection
-  solvability, invalid rate, repeated identical calls, paired arm disagreements,
-  and token/time totals;
+  solvability, invalid rate, successful/failed/unexecuted and repeated failed
+  calls, query retries, paired arm disagreements, and token/time totals;
 - `traces/*.json`: full AgentDojo injection and model/tool evidence;
 - `runtimes/*/query-*/runtime.sqlite`: native Agent libOS evidence for every
   ambient query invocation, including AgentDojo empty-output retries;
@@ -122,8 +134,10 @@ Each run contains:
 `agent-libos-dojo verify` recomputes metrics and hashes, checks row/trace and
 paired-surface consistency (including realized provider API and compatibility
 fallback parity), proves that the hidden terminal carrier stayed off the
-provider surface, and scans all ordinary run files for the exact API key
-and base URL from the selected dotenv file. Verification rejects symbolic
+provider surface, and rebuilds schema-v1 per-query totals and native tool-call
+outcome projections from each trace. Any disagreement with the result row is a
+verification failure. It also scans all ordinary run files for the exact API
+key and base URL from the selected dotenv file. Verification rejects symbolic
 links, special files, files above 256 MiB, and artifact trees above 2 GiB before
 parsing them. Source provenance likewise rejects symlinks rather than binding
 only a mutable external target path. Completed runs must contain the

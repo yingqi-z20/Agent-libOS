@@ -11,6 +11,7 @@ from pydantic.dataclasses import dataclass
 
 from agent_libos.models.capability import AuthorityRule
 from agent_libos.models.data_flow import (
+    DataIntegrity,
     DataSensitivity,
     SinkTrustLevel,
     SinkTrustRule,
@@ -286,10 +287,27 @@ class DataFlowDefaults:
     default_trust_level: SinkTrustLevel = SinkTrustLevel.UNTRUSTED
     default_max_sensitivity: DataSensitivity = DataSensitivity.NORMAL
     sink_rules: tuple[SinkTrustRule, ...] = ()
+    operation_minimum_integrity: dict[str, DataIntegrity] = field(default_factory=dict)
     registry_resource: str = "data_flow_sink_registry:*"
     registry_list_limit: int = 100
     decision_list_limit: int = 1_000
     file_binding_list_limit: int = 1_000
+
+    def __post_init__(self) -> None:
+        normalized: dict[str, DataIntegrity] = {}
+        for raw_name, raw_integrity in self.operation_minimum_integrity.items():
+            name = str(raw_name)
+            if not name or name != name.strip():
+                raise ValueError(
+                    "data_flow.operation_minimum_integrity keys must be "
+                    "non-empty exact contract names"
+                )
+            normalized[name] = DataIntegrity(raw_integrity)
+        object.__setattr__(
+            self,
+            "operation_minimum_integrity",
+            _ImmutableDict(normalized),
+        )
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)

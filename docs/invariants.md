@@ -97,6 +97,12 @@ longer defines.
   operation descriptors. Egress source, trust, target-state, payload, and exact
   release bindings are revalidated before every provider phase, including
   multi-phase state/resolve-to-write transitions.
+- `protected-egress-enforces-minimum-integrity`: an egress or bidirectional
+  protected-operation contract may declare a minimum source integrity. Lower
+  integrity is rejected before provider dispatch, cannot be overridden by a
+  sensitivity release, and the Host-declared floor remains in final effect
+  evidence. This is an opt-in containment primitive; the permissive default
+  preserves existing contracts.
 - `provider-usage-reservations-fail-closed`: MCP uses one absolute deadline
   across DNS, executable snapshot, live listing, validation, and call dispatch.
   An exhausted deadline cannot start a provider; known response bytes settle

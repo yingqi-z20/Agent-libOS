@@ -16,6 +16,7 @@ from agent_libos.models import (
     DataFlowDecision,
     DataFlowDirection,
     DataFlowOutcome,
+    DataIntegrity,
     DataLabels,
     DataReleaseBinding,
     DataSensitivity,
@@ -28,6 +29,7 @@ from agent_libos.models import (
     SinkTrustLevel,
     SinkTrustRule,
     SinkTrustSpec,
+    integrity_rank,
     sensitivity_rank,
     sink_pattern_matches,
 )
@@ -436,6 +438,7 @@ class DataFlowManager:
         allow_recovered_source_snapshots: bool = False,
         reserved_release_decision: CapabilityDecision | None = None,
         reserved_release_id: str | None = None,
+        minimum_integrity: DataIntegrity | str = DataIntegrity.UNTRUSTED,
     ) -> tuple[DataFlowDecision, CapabilityDecision | None]:
         if (reserved_release_decision is None) != (reserved_release_id is None):
             raise ValidationError(
@@ -467,7 +470,12 @@ class DataFlowManager:
                 source_error,
             )
         trust = self.resolve_sink_trust(sink)
-        policy_error = self._clearance_error(sink, selected_context.labels, trust)
+        policy_error = self._clearance_error(
+            sink,
+            selected_context.labels,
+            trust,
+            minimum_integrity=minimum_integrity,
+        )
         if policy_error is not None:
             return self._deny(
                 pid,
@@ -571,6 +579,7 @@ class DataFlowManager:
         sink: DataSink,
         context: DataFlowContext | None,
         payload: Any,
+        minimum_integrity: DataIntegrity | str = DataIntegrity.UNTRUSTED,
     ) -> DataFlowDecision:
         """Reject impossible egress before provider/profile resolution.
 
@@ -593,7 +602,12 @@ class DataFlowManager:
                 source_error,
             )
         trust = self.resolve_sink_trust(sink)
-        policy_error = self._clearance_error(sink, selected_context.labels, trust)
+        policy_error = self._clearance_error(
+            sink,
+            selected_context.labels,
+            trust,
+            minimum_integrity=minimum_integrity,
+        )
         if policy_error is not None:
             self._deny(
                 pid,
@@ -633,6 +647,7 @@ class DataFlowManager:
         sink: DataSink,
         context: DataFlowContext,
         allow_recovered_source_snapshots: bool = False,
+        minimum_integrity: DataIntegrity | str = DataIntegrity.UNTRUSTED,
     ) -> DataFlowOutcome:
         """Classify current source and Sink state without emitting evidence.
 
@@ -651,7 +666,12 @@ class DataFlowManager:
                 trust = self.resolve_sink_trust(sink)
             except Exception:
                 return DataFlowOutcome.DENY
-            if self._clearance_error(sink, context.labels, trust) is not None:
+            if self._clearance_error(
+                sink,
+                context.labels,
+                trust,
+                minimum_integrity=minimum_integrity,
+            ) is not None:
                 return DataFlowOutcome.DENY
             if (
                 trust is not None
@@ -1251,7 +1271,17 @@ class DataFlowManager:
         sink: DataSink,
         labels: DataLabels,
         trust: SinkTrustSpec | None,
+        *,
+        minimum_integrity: DataIntegrity | str = DataIntegrity.UNTRUSTED,
     ) -> str | None:
+        selected_minimum_integrity = DataIntegrity(minimum_integrity)
+        if integrity_rank(labels.integrity) < integrity_rank(
+            selected_minimum_integrity
+        ):
+            return (
+                f"data integrity {labels.integrity.value} is below operation minimum "
+                f"{selected_minimum_integrity.value}"
+            )
         if labels.is_mixed_identity:
             return "mixed tenant/principal data must be reclassified by the Host"
         max_sensitivity = (

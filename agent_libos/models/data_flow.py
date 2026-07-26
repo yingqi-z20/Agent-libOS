@@ -66,6 +66,11 @@ def sensitivity_rank(value: DataSensitivity | str) -> int:
     return _SENSITIVITY_ORDER.index(selected.value)
 
 
+def integrity_rank(value: DataIntegrity | str) -> int:
+    selected = _coerce_enum(DataIntegrity, value, "integrity")
+    return _INTEGRITY_ORDER.index(selected.value)
+
+
 @dataclass(frozen=True)
 class DataLabels:
     """Trusted, payload-free labels used by the data-flow gate.

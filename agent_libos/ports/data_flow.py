@@ -7,6 +7,7 @@ from agent_libos.models import (
     DataFlowContext,
     DataFlowDecision,
     DataFlowOutcome,
+    DataIntegrity,
     DataReleaseBinding,
     DataSink,
     SinkTrustSpec,
@@ -62,6 +63,7 @@ class HumanDataFlowPort(Protocol):
         sink: DataSink,
         context: DataFlowContext,
         allow_recovered_source_snapshots: bool = False,
+        minimum_integrity: DataIntegrity | str = DataIntegrity.UNTRUSTED,
     ) -> DataFlowOutcome:
         ...
 
@@ -98,6 +100,7 @@ class HumanDataFlowPort(Protocol):
         sink: DataSink,
         context: DataFlowContext | None,
         payload: Any,
+        minimum_integrity: DataIntegrity | str = DataIntegrity.UNTRUSTED,
     ) -> DataFlowDecision:
         ...
 

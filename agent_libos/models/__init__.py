@@ -57,6 +57,7 @@ from agent_libos.models.data_flow import (
     SinkTrustLevel,
     SinkTrustRule,
     SinkTrustSpec,
+    integrity_rank,
     sensitivity_rank,
     sink_pattern_matches,
 )
@@ -465,6 +466,7 @@ __all__ = [
     "RuntimeModuleRegistration",
     "RuntimeModuleStatus",
     "SandboxProfile",
+    "integrity_rank",
     "sensitivity_rank",
     "sink_pattern_matches",
     "SinkTrustLevel",

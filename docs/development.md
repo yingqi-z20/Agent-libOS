@@ -332,6 +332,10 @@ or bidirectional operations must provide stable Sink and trusted-source
 descriptors and route their final dispatch through the SDK's transactional
 data-flow revalidation. Do not infer egress from the older
 `information_flow` flag: reads, DNS, and clock observation use that flag too.
+If the operation must not accept `untrusted` sources, declare an explicit
+`minimum_egress_integrity`; do not implement the rule in a model prompt or tool
+name check. Add a denial-before-provider regression and assert the floor in
+effect evidence.
 Run `uv run python scripts/check_protected_operations.py`; its static checks
 reject egress contracts that omit those descriptors or bypass the common SDK.
 See [data_flow.md](data_flow.md).

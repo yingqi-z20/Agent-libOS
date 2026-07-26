@@ -305,10 +305,20 @@ Python tools should not directly access host resources. Use this pattern:
 3. Keep validation and model-facing ergonomics in the tool.
 4. Call `ctx.runtime.<primitive>` for process, memory, filesystem, human,
    clock, shell, image, Skill, checkpoint, or other libOS operations.
-5. Let primitives enforce capability checks, containment, audit, events, human
+5. For an LLM-selected call, treat `ctx.metadata` values
+   `llm_transcript_output_key`, `llm_tool_call_id`, and `llm_tool_name` as
+   Host-captured optional identity. A protected provider protocol may derive a
+   non-secret explicit idempotency key from them when that protocol defines
+   native-call retry identity; never infer deduplication from matching args.
+6. Let primitives enforce capability checks, containment, audit, events, human
    approval, checkpoint semantics, and policy hooks.
-6. Register the tool through the runtime composition root or ToolBroker-backed
+7. Register the tool through the runtime composition root or ToolBroker-backed
    registry.
+
+The LLM identity metadata remains stable across supported Human, child, and
+message wait/resume paths. It is absent for Host-generated maintenance and
+other non-provider actions, grants no authority, and contains no model-supplied
+payload.
 
 `SyncAgentTool` deliberately sets `enforce_timeout = False`: Python worker
 threads cannot be killed safely, so `ToolPolicy.timeout_s` does not interrupt

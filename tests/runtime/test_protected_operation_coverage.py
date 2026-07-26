@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from agent_libos.models import DataFlowDirection
+from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models import DataFlowDirection, DataIntegrity
 from agent_libos.models.exceptions import ValidationError
+from agent_libos.runtime.descriptor_catalog import (
+    configured_protected_operation_descriptors,
+)
 from agent_libos.sdk import ProtectedOperationInvocation
 from scripts.check_protected_operations import (
     ALLOWED_LIFECYCLE_FILES,
@@ -397,6 +403,63 @@ def test_contract_registry_declares_explicit_data_flow_directions() -> None:
             if contract.data_flow_direction is not DataFlowDirection.NONE
         }
         assert actual == expected
+
+
+def test_host_integrity_overrides_are_exact_and_can_only_tighten_egress() -> None:
+    configured = {
+        contract.name: contract
+        for contract in configured_protected_operation_descriptors(
+            {"primitive.filesystem.write_text": "checked"}
+        )
+    }
+
+    assert (
+        configured["primitive.filesystem.write_text"].minimum_egress_integrity
+        is DataIntegrity.CHECKED
+    )
+    assert (
+        configured["primitive.llm.complete"].minimum_egress_integrity
+        is DataIntegrity.UNTRUSTED
+    )
+
+    runtime = Runtime.open(
+        "local",
+        config=replace(
+            DEFAULT_CONFIG,
+            data_flow=replace(
+                DEFAULT_CONFIG.data_flow,
+                operation_minimum_integrity={
+                    "primitive.filesystem.write_text": DataIntegrity.CHECKED,
+                },
+            ),
+        ),
+    )
+    try:
+        live = {
+            contract.name: contract
+            for contract in runtime.protected_operations.contracts()
+        }
+        assert (
+            live["primitive.filesystem.write_text"].minimum_egress_integrity
+            is DataIntegrity.CHECKED
+        )
+    finally:
+        runtime.close()
+
+    with pytest.raises(
+        ValueError,
+        match="unknown protected operation integrity override",
+    ):
+        configured_protected_operation_descriptors(
+            {"primitive.missing.write": "unknown"}
+        )
+    with pytest.raises(
+        ValueError,
+        match="minimum egress integrity requires an egress data-flow direction",
+    ):
+        configured_protected_operation_descriptors(
+            {"primitive.clock.now": "unknown"}
+        )
 
 
 def test_sdk_rejects_egress_without_concrete_descriptors_before_effect_intent() -> None:

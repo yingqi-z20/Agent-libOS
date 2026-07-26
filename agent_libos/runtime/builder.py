@@ -2508,7 +2508,10 @@ class RuntimeBuilder(Generic[RuntimeT]):
             data_flow=host.data_flow,
         )
         host.external_primitive_boundary_names = (
-            register_protected_operation_descriptors(host.protected_operations)
+            register_protected_operation_descriptors(
+                host.protected_operations,
+                minimum_integrity=host.config.data_flow.operation_minimum_integrity,
+            )
         )
         host.process = ProcessManager(
             host.uow,
