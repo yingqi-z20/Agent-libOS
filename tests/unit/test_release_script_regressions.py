@@ -72,12 +72,12 @@ def test_secret_name_detection_covers_env_variants_and_wheel_payloads(
     assert _looks_like_secret_file(PurePosixPath("agent_libos/.env.production"))
     assert _looks_like_secret_file(PurePosixPath("agent_libos/.ENV.Local"))
 
-    wheel = _write_test_wheel(tmp_path / "agent_libos-0.3.4-py3-none-any.whl")
+    wheel = _write_test_wheel(tmp_path / "agent_libos-1.0.0-py3-none-any.whl")
     with zipfile.ZipFile(wheel, "a") as archive:
         archive.writestr("agent_libos/.env.production", b"TOKEN=not-for-release\n")
 
     with pytest.raises(ValueError, match="wheel contains a secret-like file"):
-        _validate_wheel(wheel, "0.3.4")
+        _validate_wheel(wheel, "1.0.0")
 
 
 def test_object_copy_visibility_check_uses_structured_text_not_json_encoding() -> None:

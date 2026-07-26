@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import math
+import mmap
 import os
 import re
 import shlex
@@ -93,6 +94,7 @@ _CONTENT_FILTER_OPERATIONS = frozenset(
 )
 _DIFF_OPERATIONS = frozenset({"blame", "diff", "log", "show"})
 _MERGE_OPERATIONS = frozenset({"cherry-pick", "merge", "pull", "rebase", "revert"})
+_MINIMUM_SPAWNED_PROCESS_RSS_BYTES = max(1, mmap.PAGESIZE)
 
 
 @dataclass(slots=True)
@@ -874,7 +876,18 @@ class LocalGitProvider:
         stderr_file: Any,
         stdin_delivery: _GitStdinDelivery | None,
     ) -> _GitProcessSupervision:
-        state = _GitProcessSupervision()
+        # RSS is page-granular, so every successfully spawned process has at
+        # least one resident page. Seed that safe lower bound when enforcing a
+        # memory limit so a short-lived Git process cannot exit before psutil's
+        # first sample and incorrectly appear to have consumed zero memory.
+        state = _GitProcessSupervision(
+            peak_memory_bytes=(
+                _MINIMUM_SPAWNED_PROCESS_RSS_BYTES
+                if subprocess_limits is not None
+                and subprocess_limits.memory_bytes is not None
+                else 0
+            )
+        )
         try:
             while True:
                 if stdin_delivery is not None and stdin_delivery.failure is not None:
