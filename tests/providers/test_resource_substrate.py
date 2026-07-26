@@ -18,10 +18,106 @@ from agent_libos.primitives.shell import ShellAdapter
 import agent_libos.substrate.base as substrate_base
 from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.substrate import CommandResult, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate, LocalShellProvider, ResolvedPath, resolve_runtime_python_alias, snapshot_executable, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
+from agent_libos.substrate import CommandResult, FilesystemCompareAndSwapProvider, FilesystemContentConflict, LocalClockProvider, LocalFilesystemProvider, LocalHumanProvider, LocalResourceProviderSubstrate, LocalShellProvider, ResolvedPath, resolve_runtime_python_alias, snapshot_executable, SubprocessLimitExceeded, SubprocessLimits, SubprocessTimeoutExpired
 from modules.pty.pty_module import LocalPtyProvider, _PosixPtySession
 
 class TestResourceProviderSubstrate:
+
+    def test_local_filesystem_provider_write_text_compare_and_swap(self, tmp_path: Path) -> None:
+        provider = LocalFilesystemProvider(tmp_path)
+        target = provider.resolve("document.txt")
+
+        assert isinstance(provider, FilesystemCompareAndSwapProvider)
+        provider.write_text_compare_and_swap(
+            target,
+            "first",
+            "utf-8",
+            expected_content_sha256="missing",
+        )
+        first_digest = hashlib.sha256(b"first").hexdigest()
+        provider.write_text_compare_and_swap(
+            target,
+            "second",
+            "utf-8",
+            expected_content_sha256=first_digest,
+        )
+
+        assert (tmp_path / "document.txt").read_text(encoding="utf-8") == "second"
+        with pytest.raises(FilesystemContentConflict):
+            provider.write_text_compare_and_swap(
+                target,
+                "stale",
+                "utf-8",
+                expected_content_sha256=first_digest,
+            )
+        with pytest.raises(FilesystemContentConflict):
+            provider.write_text_compare_and_swap(
+                target,
+                "duplicate-create",
+                "utf-8",
+                expected_content_sha256="missing",
+            )
+        assert (tmp_path / "document.txt").read_text(encoding="utf-8") == "second"
+
+    @pytest.mark.parametrize(
+        "invalid",
+        ["", "0" * 63, "A" * 64, "not-a-digest"],
+    )
+    def test_local_filesystem_provider_rejects_invalid_cas_token(
+        self,
+        tmp_path: Path,
+        invalid: str,
+    ) -> None:
+        provider = LocalFilesystemProvider(tmp_path)
+
+        with pytest.raises(ValidationError, match="expected_content_sha256"):
+            provider.write_text_compare_and_swap(
+                provider.resolve("document.txt"),
+                "content",
+                "utf-8",
+                expected_content_sha256=invalid,
+            )
+
+        assert not (tmp_path / "document.txt").exists()
+
+    def test_local_filesystem_provider_directory_limit_avoids_eager_listdir(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        provider = LocalFilesystemProvider(tmp_path)
+        for index in range(20):
+            (tmp_path / f"entry-{index:02d}").write_text("x", encoding="utf-8")
+
+        monkeypatch.setattr(
+            os,
+            "listdir",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("bounded listing must not materialize os.listdir")
+            ),
+        )
+        entries = provider.list_directory(provider.resolve("."), limit=4)
+
+        assert len(entries) == 4
+
+    def test_local_filesystem_provider_unlimited_listing_fails_on_hard_overflow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        import agent_libos.substrate.local as local_substrate
+
+        provider = LocalFilesystemProvider(tmp_path)
+        for index in range(4):
+            (tmp_path / f"entry-{index}").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(
+            local_substrate,
+            "_TOOL_DEFAULTS",
+            type("SmallDirectoryDefaults", (), {"directory_entry_hard_limit": 3})(),
+        )
+
+        with pytest.raises(ValidationError, match="bounded provider listing limit"):
+            provider.list_directory(provider.resolve("."))
 
     def test_windows_executable_hash_uses_consistent_path_and_descriptor_identity(
         self,
@@ -214,6 +310,52 @@ class TestResourceProviderSubstrate:
             assert result.returncode == 0
             assert len(result.stdout) == 200000
             assert result.metrics is not None
+
+    def test_local_shell_provider_enforces_character_limit_for_multibyte_utf8(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalShellProvider(temp_dir)
+            result = provider.run(
+                [sys.executable, "-c", "import sys; sys.stdout.write('雪' * 5)"],
+                timeout=5.0,
+                stdout_limit_chars=5,
+            )
+
+            assert result.stdout == "雪" * 5
+            assert not result.stdout_truncated
+
+            with pytest.raises(SubprocessLimitExceeded) as caught:
+                provider.run(
+                    [sys.executable, "-c", "import sys; sys.stdout.write('雪' * 6)"],
+                    timeout=5.0,
+                    stdout_limit_chars=5,
+                )
+
+            assert caught.value.metrics.limit_kind == "subprocess_stdout_chars"
+            assert caught.value.result is not None
+            assert caught.value.result.stdout == "雪" * 5
+            assert caught.value.result.stdout_truncated
+
+    def test_local_shell_provider_does_not_use_unbounded_temporary_output_files(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tempfile,
+            "TemporaryFile",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("shell output capture must use bounded pipes")
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalShellProvider(temp_dir)
+            result = provider.run(
+                [sys.executable, "-c", "print('bounded')"],
+                timeout=5.0,
+            )
+
+        assert result.stdout == "bounded\n"
 
     def test_local_shell_snapshot_preserves_explicit_virtualenv_argv0(
         self,
@@ -694,7 +836,33 @@ class RecordingFilesystemProvider:
         overwrite: bool = True,
     ) -> None:
         self.calls.append('write_text')
-        self.inner.write_text(path, text, encoding, newline, overwrite=overwrite)
+        self.inner.write_text(
+            path,
+            text,
+            encoding,
+            newline,
+            overwrite=overwrite,
+        )
+
+    def write_text_compare_and_swap(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None='\n',
+        *,
+        overwrite: bool = True,
+        expected_content_sha256: str,
+    ) -> None:
+        self.calls.append('write_text_compare_and_swap')
+        self.inner.write_text_compare_and_swap(
+            path,
+            text,
+            encoding,
+            newline,
+            overwrite=overwrite,
+            expected_content_sha256=expected_content_sha256,
+        )
 
     def list_directory(self, path: ResolvedPath, *, limit: int | None = None):
         self.calls.append('list_directory')

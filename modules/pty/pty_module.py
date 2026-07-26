@@ -124,6 +124,14 @@ class PtyProvider(Protocol):
     ) -> ExternalEffectClassification: ...
 
 
+class _PtySpawnContainmentError(RuntimeError):
+    """A provider-created session whose immediate containment did not finish."""
+
+    def __init__(self, message: str, *, orphan_session: PtySession) -> None:
+        super().__init__(message)
+        self.orphan_session = orphan_session
+
+
 @dataclass(frozen=True)
 class PtyModuleSettings:
     max_sessions_global: int = 16
@@ -534,8 +542,9 @@ class _PosixPtySession:
             try:
                 cleanup.close(force=True, timeout_s=1.0)
             except Exception as cleanup_exc:
-                raise RuntimeError(
-                    f"PTY post-spawn initialization failed ({type(exc).__name__}: {exc}) and containment failed"
+                raise _PtySpawnContainmentError(
+                    "PTY post-spawn initialization and containment failed",
+                    orphan_session=cleanup,
                 ) from cleanup_exc
             raise
         finally:
@@ -595,20 +604,30 @@ class _PosixPtySession:
     def close(self, *, force: bool = True, timeout_s: float = 2.0) -> int | None:
         if self._closed:
             return self.exit_code()
+        deadline = time.monotonic() + max(0.0, timeout_s)
         if force:
             self._signal_process_group(signal.SIGTERM)
         if self.proc.poll() is None:
             try:
-                self.proc.wait(timeout=timeout_s)
+                graceful_timeout = max(0.0, deadline - time.monotonic())
+                if force:
+                    graceful_timeout *= 0.5
+                self.proc.wait(timeout=graceful_timeout)
             except subprocess.TimeoutExpired:
                 self._signal_process_group(signal.SIGKILL)
                 try:
-                    self.proc.wait(timeout=1.0)
+                    self.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
                     with contextlib.suppress(ProcessLookupError):
                         self.proc.kill()
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        self.proc.wait(timeout=1.0)
+                    try:
+                        self.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+                    except subprocess.TimeoutExpired as exc:
+                        raise TimeoutError(
+                            "PTY process did not exit within the close deadline"
+                        ) from exc
+        if self.proc.poll() is None:
+            raise TimeoutError("PTY process did not exit within the close deadline")
         self._closed = True
         try:
             os.close(self.master_fd)
@@ -734,6 +753,7 @@ class _WinPtySession:
         return None
 
     def close(self, *, force: bool = True, timeout_s: float = 2.0) -> int | None:
+        deadline = time.monotonic() + max(0.0, timeout_s)
         terminate = getattr(self.proc, "terminate", None)
         close = getattr(self.proc, "close", None)
         if self.is_alive():
@@ -750,9 +770,17 @@ class _WinPtySession:
         wait = getattr(self.proc, "wait", None)
         if callable(wait):
             try:
-                wait(timeout=timeout_s)
+                wait(timeout=max(0.0, deadline - time.monotonic()))
             except TypeError:
-                wait()
+                while self.is_alive() and time.monotonic() < deadline:
+                    time.sleep(
+                        min(0.02, max(0.0, deadline - time.monotonic()))
+                    )
+        else:
+            while self.is_alive() and time.monotonic() < deadline:
+                time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+        if self.is_alive():
+            raise TimeoutError("PTY process did not exit within the close deadline")
         if self.executable_snapshot is not None:
             self.executable_snapshot.close()
             self.executable_snapshot = None
@@ -864,6 +892,8 @@ class _PtyRuntimeSession:
     closing: bool = False
     closed: bool = False
     close_outcome_unknown: bool = False
+    host_only_orphan: bool = False
+    public_session_oid: str | None = None
     recovery_abandoning: bool = False
     exit_code: int | None = None
     last_wall_seconds: float = 0.0
@@ -946,11 +976,13 @@ class _PtySpawnGuards:
     dispatch_pinned: bool = False
     cleanup_attempted: bool = False
     cleanup_succeeded: bool = False
+    cleanup_retained: bool = False
 
     def cleanup_evidence(self) -> dict[str, bool]:
         return {
             "attempted": self.cleanup_attempted,
             "succeeded": self.cleanup_succeeded,
+            "retained": self.cleanup_retained,
         }
 
 
@@ -1363,8 +1395,11 @@ class PtyAdapter:
                 namespace=namespace,
                 object_name=object_name,
             )
-        except BaseException:
+        except BaseException as error:
             error_info = sys.exc_info()
+            orphan_session = getattr(error, "orphan_session", None)
+            if resources.handle is None and orphan_session is not None:
+                resources.handle = orphan_session
             self._cleanup_failed_spawn(plan, guards, resources, protected)
             if reserved_capacity:
                 self._release_session_capacity(plan.pid)
@@ -1472,30 +1507,78 @@ class PtyAdapter:
         resources: _PtySpawnResources,
         protected: Any | None,
     ) -> None:
+        public_session_oid = resources.session_oid
         if resources.executable_snapshot is not None:
             resources.executable_snapshot.close()
         if resources.handle is not None:
             try:
                 guards.cleanup_attempted = True
-                if protected is not None and not protected.terminal:
-                    protected.call(
-                        ProviderPhase("cleanup_close", state_mutation=True),
-                        resources.handle.close,
-                        force=True,
-                        timeout_s=self.config.pty.close_timeout_s,
+                # Predeclare the fallback owner so protected failure evidence
+                # produced inside cleanup_close records the final containment
+                # strategy. A successful close clears it below.
+                guards.cleanup_retained = True
+                if protected is None or protected.terminal:
+                    raise RuntimeError(
+                        "failed PTY spawn cleanup requires a new lifecycle owner"
+                    )
+                protected.call(
+                    ProviderPhase("cleanup_close", state_mutation=True),
+                    resources.handle.close,
+                    force=True,
+                    timeout_s=self.config.pty.close_timeout_s,
+                )
+                alive = protected.call(
+                    ProviderPhase("cleanup_status", information_flow=True),
+                    resources.handle.is_alive,
+                )
+                if alive:
+                    raise TimeoutError(
+                        "failed PTY spawn cleanup returned while the session remained alive"
                     )
                 guards.cleanup_succeeded = True
-            except Exception:
-                pass
-        if resources.session_oid is not None:
+                guards.cleanup_retained = False
+            except BaseException:
+                self._retain_failed_spawn(plan, resources)
+        if public_session_oid is not None:
             try:
                 self.host.memory.delete_object_trusted(
                     plan.pid,
-                    resources.session_oid,
+                    public_session_oid,
                     reason="pty_create_pre_registration_failure",
                 )
             except Exception:
                 pass
+
+    def _retain_failed_spawn(
+        self,
+        plan: _PtyCreatePlan,
+        resources: _PtySpawnResources,
+    ) -> None:
+        assert resources.handle is not None
+        public_session_oid = resources.session_oid
+        orphan_oid = f"orphan:{plan.session_id}"
+        resources.session_oid = orphan_oid
+        session = _PtyRuntimeSession(
+            session_oid=orphan_oid,
+            session_id=plan.session_id,
+            owner_pid=plan.pid,
+            argv=list(plan.argv),
+            cwd=plan.cwd,
+            backend=resources.handle.backend,
+            handle=resources.handle,
+            cols=plan.cols,
+            rows=plan.rows,
+            started_at=utc_now(),
+            started_monotonic=time.monotonic(),
+            buffer_max_chars=self.config.pty.buffer_max_chars,
+            data_sink=plan.spawn_sink,
+            data_flow_context=plan.flow_context,
+            host_only_orphan=True,
+            public_session_oid=public_session_oid,
+        )
+        session.stop_event.set()
+        with self._lock:
+            self._sessions[orphan_oid] = session
 
     def _complete_started_session(
         self,
@@ -1626,6 +1709,7 @@ class PtyAdapter:
                 # label. Serialize only final extraction (not the potentially
                 # blocking wait above) with that publication boundary.
                 with session.control_lock:
+                    self._require_session_open(session)
                     self.host.data_flow.observe_ingress(
                         self._session_ingress_context(session)
                     )
@@ -1927,6 +2011,7 @@ class PtyAdapter:
         authority: CapabilityDecision,
         session: _PtyRuntimeSession | None,
     ) -> PtyCloseResult:
+        session_missing_at_entry = session is None
         if session is not None:
             with self._lock:
                 if self._sessions.get(session_oid) is not session:
@@ -1958,7 +2043,15 @@ class PtyAdapter:
             force=force,
             timeout_s=selected_timeout,
             wait_if_closing=True,
-            authority_decision=authority,
+            # A provider session that was already absent at public-close
+            # entry is the natural-exit path and still has to settle finite
+            # DELETE authority.  If a session disappeared while this caller
+            # waited on its control lock, another public closer already
+            # crossed and settled the provider boundary; replaying its stale
+            # pre-lock decision would spuriously fail an idempotent close.
+            authority_decision=(
+                authority if session is not None or session_missing_at_entry else None
+            ),
             data_sink=data_sink,
             data_flow_context=data_flow_context,
             data_flow_payload=data_flow_payload,
@@ -2017,7 +2110,7 @@ class PtyAdapter:
         )
 
     def _cleanup_failed_started_session(self, session: _PtyRuntimeSession, *, actor: str, reason: str) -> None:
-        session.stop_event.set()
+        public_session_oid = self._fence_failed_started_session(session)
         try:
             self._close_session(
                 session.session_oid,
@@ -2034,9 +2127,33 @@ class PtyAdapter:
             # false local-cleanup claim.
             pass
         try:
-            self.host.memory.delete_object_trusted("runtime.pty", session.session_oid, reason=reason)
+            self.host.memory.delete_object_trusted(
+                "runtime.pty",
+                public_session_oid,
+                reason=reason,
+            )
         except Exception:
             pass
+
+    def _fence_failed_started_session(
+        self,
+        session: _PtyRuntimeSession,
+    ) -> str:
+        """Remove a failed create from every caller-addressable session key."""
+
+        with session.control_lock:
+            public_session_oid = session.session_oid
+            orphan_oid = f"orphan:{session.session_id}"
+            with self._lock:
+                if self._sessions.get(public_session_oid) is session:
+                    self._sessions.pop(public_session_oid, None)
+                with session.lock:
+                    session.public_session_oid = public_session_oid
+                    session.session_oid = orphan_oid
+                    session.host_only_orphan = True
+                self._sessions[orphan_oid] = session
+            session.stop_event.set()
+        return public_session_oid
 
     def release_stale_session_objects(self) -> list[str]:
         released: list[str] = []
@@ -2065,6 +2182,8 @@ class PtyAdapter:
             session_oids = list(self._sessions)
         for oid in session_oids:
             try:
+                with self._lock:
+                    session = self._sessions.get(oid)
                 self._close_session(
                     oid,
                     actor="runtime",
@@ -2072,6 +2191,9 @@ class PtyAdapter:
                     force=True,
                     timeout_s=self.config.pty.close_timeout_s,
                     wait_if_closing=True,
+                    retry_host_only_orphan=bool(
+                        session is not None and session.host_only_orphan
+                    ),
                 )
             except Exception as exc:
                 ok = False
@@ -2677,10 +2799,20 @@ class PtyAdapter:
         data_sink: DataSink | None = None,
         data_flow_context: DataFlowContext | None = None,
         data_flow_payload: dict[str, Any] | None = None,
+        retry_host_only_orphan: bool = False,
     ) -> int | None:
         with self._lock:
             session = self._sessions.get(session_oid)
         if session is None:
+            if authority_decision is not None:
+                self.host.capability.claim_decision_use(
+                    authority_decision,
+                    used_by=actor,
+                    reason=(
+                        "PTY Object deletion completed after natural-exit "
+                        "cleanup removed the provider session"
+                    ),
+                )
             return None
         self._validate_close_descriptors(
             authority_decision,
@@ -2692,6 +2824,7 @@ class PtyAdapter:
             session,
             timeout_s=timeout_s,
             wait_if_closing=wait_if_closing,
+            retry_host_only_orphan=retry_host_only_orphan,
         )
         if remove_only:
             self._settle_remove_only_close(
@@ -2744,15 +2877,23 @@ class PtyAdapter:
         *,
         timeout_s: float,
         wait_if_closing: bool,
+        retry_host_only_orphan: bool,
     ) -> tuple[bool, int | None]:
         wait_for_close: threading.Event | None = None
         exit_code: int | None = None
         with session.lock:
             if session.close_outcome_unknown:
-                raise ValidationError(
-                    "PTY session has an unresolved prior close outcome and "
-                    f"cannot be retried: {session.session_oid}"
-                )
+                if not (retry_host_only_orphan and session.host_only_orphan):
+                    raise ValidationError(
+                        "PTY session has an unresolved prior close outcome and "
+                        f"cannot be retried: {session.session_oid}"
+                    )
+                # A failed create has already been removed from every public
+                # session key and its reader is stopped. Repeating force-close
+                # is therefore a Host lifecycle convergence attempt, not a
+                # caller-visible replay. The earlier unknown effect remains
+                # durable; the retry records its own protected effect.
+                session.close_outcome_unknown = False
             if session.closing:
                 if not wait_if_closing:
                     raise ValidationError(
@@ -2901,6 +3042,10 @@ class PtyAdapter:
                 force=plan.force,
                 timeout_s=plan.timeout_s,
             )
+            if plan.session.handle.is_alive():
+                raise TimeoutError(
+                    "PTY provider close returned while the session remained alive"
+                )
         except ProviderEffectNotStarted:
             raise
         except BaseException:
@@ -3030,6 +3175,9 @@ class PtyAdapter:
             session = self._sessions.get(session_oid)
         if session is None:
             raise NotFound(f"PTY session is not active: {session_oid}")
+        with session.lock:
+            if session.host_only_orphan:
+                raise NotFound(f"PTY session is not active: {session_oid}")
         return session
 
     def _protected(self) -> Any:
@@ -3102,12 +3250,12 @@ class PtyAdapter:
 
     def _require_session_open(self, session: _PtyRuntimeSession) -> None:
         with session.lock:
-            if session.closed:
+            if session.closed or session.host_only_orphan:
                 raise NotFound(f"PTY session is not active: {session.session_oid}")
 
     def _session_alive(self, session: _PtyRuntimeSession) -> bool:
         with session.lock:
-            if session.closed:
+            if session.closed or session.host_only_orphan:
                 return False
         return session.handle.is_alive()
 
@@ -3115,6 +3263,8 @@ class PtyAdapter:
         with session.lock:
             if session.closed:
                 return session.exit_code
+            if session.host_only_orphan:
+                return None
         return session.handle.exit_code()
 
     def _mark_session_exited(self, session: _PtyRuntimeSession, *, resource: str) -> None:

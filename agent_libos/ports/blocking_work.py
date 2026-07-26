@@ -56,12 +56,15 @@ async def run_blocking_once(
         max_workers=1,
         thread_name_prefix="agent-libos-standalone-blocking",
     )
-    future = executor.submit(context.run, call)
-    wrapped = asyncio.wrap_future(future)
-    cancelled = False
-    caller_task = asyncio.current_task()
-    initial_cancellations = caller_task.cancelling() if caller_task is not None else 0
     try:
+        # Cleanup ownership begins as soon as the executor exists.  Both
+        # ``submit`` and ``wrap_future`` are fallible, and a successful submit
+        # may already have started user work before wrapping fails.
+        future = executor.submit(context.run, call)
+        wrapped = asyncio.wrap_future(future)
+        cancelled = False
+        caller_task = asyncio.current_task()
+        initial_cancellations = caller_task.cancelling() if caller_task is not None else 0
         while True:
             try:
                 result = await asyncio.shield(wrapped)
@@ -97,7 +100,9 @@ async def run_blocking_once(
             return result
     finally:
         # The loop above exits only after ``future`` is done, so this cannot
-        # strand provider work or block on a still-running task.
+        # strand provider work.  During setup failure it may wait for a
+        # successfully submitted worker, which is the required owned-resource
+        # lifecycle rather than returning while work remains live.
         executor.shutdown(wait=True, cancel_futures=False)
 
 

@@ -31,6 +31,8 @@ class EchoTool(SyncAgentTool[EchoArgs]):
 
 
 class ParsePytestLogArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     log: str = Field(
         description="Captured pytest output text to summarize; this tool does not run pytest or read a log file."
     )

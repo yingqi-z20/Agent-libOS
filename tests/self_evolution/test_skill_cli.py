@@ -4,12 +4,15 @@ import contextlib
 import io
 import json
 import tempfile
+from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from agent_libos import Runtime
+from agent_libos.api.cli import _run_skills_command
 from agent_libos.api.cli import main as cli_main
 from agent_libos.models import CapabilityRight
 from agent_libos.models.exceptions import CapabilityDenied
@@ -28,12 +31,88 @@ class TestSkillCli:
             registered = self._cli_json(['--db', db_path, 'skills', 'register', str(skill_dir)])
             discovered = self._cli_json(['--db', db_path, 'skills', 'discover', '--text', 'cli'])
             spawned = self._cli_json(['--db', db_path, 'spawn', '--goal', 'cli skill'])
-            loaded = self._cli_json(['--db', db_path, 'skills', 'activate', spawned['pid'], 'cli-skill'])
+            discovered_skill = next(item for item in discovered if item['skill_id'] == 'cli-skill')
+            loaded = self._cli_json(
+                [
+                    '--db',
+                    db_path,
+                    'skills',
+                    'activate',
+                    spawned['pid'],
+                    'cli-skill',
+                    '--expected-package-sha256',
+                    discovered_skill['package_sha256'],
+                ]
+            )
             assert validated['skill_id'] == 'cli-skill'
             assert registered['skill_id'] == 'cli-skill'
-            assert any(item['skill_id'] == 'cli-skill' for item in discovered)
+            assert discovered_skill['package_sha256'] == registered['package_sha256']
             assert loaded['skill_id'] == 'cli-skill'
             assert 'echo' in loaded['tool_names']
+
+    @pytest.mark.parametrize(
+        'activate_args',
+        [
+            ['skills', 'activate', 'pid-1', 'cli-skill'],
+            [
+                'skills',
+                'activate',
+                'pid-1',
+                'cli-skill',
+                '--expected-package-sha256',
+                'A' * 64,
+            ],
+            [
+                'skills',
+                'activate',
+                'pid-1',
+                'cli-skill',
+                '--expected-package-sha256',
+                'a' * 63,
+            ],
+        ],
+    )
+    def test_skill_cli_activate_requires_exact_discovery_package_sha256(
+        self,
+        activate_args: list[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main(activate_args)
+        assert exc_info.value.code == 2
+
+    def test_skill_cli_activate_forwards_exact_discovery_package_sha256(self) -> None:
+        package_sha256 = 'b' * 64
+        captured: dict[str, Any] = {}
+
+        def activate_skill(pid: str, skill_id: str, **kwargs: Any) -> dict[str, Any]:
+            captured.update(pid=pid, skill_id=skill_id, **kwargs)
+            return {'skill_id': skill_id, 'package_sha256': package_sha256}
+
+        runtime = SimpleNamespace(
+            skills=SimpleNamespace(activate_skill=activate_skill),
+        )
+        result = _run_skills_command(
+            runtime,
+            Namespace(
+                actor_pid='actor-1',
+                skills_command='activate',
+                pid='target-1',
+                skill_id='cli-skill',
+                expected_package_sha256=package_sha256,
+            ),
+        )
+
+        assert result == {
+            'skill_id': 'cli-skill',
+            'package_sha256': package_sha256,
+        }
+        assert captured == {
+            'pid': 'target-1',
+            'skill_id': 'cli-skill',
+            'actor': 'actor-1',
+            'require_capability': True,
+            'expected_package_sha256': package_sha256,
+        }
 
     def test_skill_cli_actor_pid_register_reads_workspace_package_through_primitive(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:

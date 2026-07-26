@@ -205,7 +205,10 @@ class TestToolResultLimits:
             assert terminalized
             assert not result.ok
             assert result.result_handle is None
-            assert "terminal process" in (result.error or "")
+            assert (result.error or "").startswith(
+                "execution_error: ProcessRevisionConflict"
+            )
+            assert "terminal process" not in json.dumps(result.payload)
             terminal = runtime.process.get(pid)
             assert terminal.status == ProcessStatus.KILLED
             assert terminal.revision == terminal_revision
@@ -248,7 +251,9 @@ class TestToolResultLimits:
 
             assert not result.ok
             assert result.result_handle is None
-            assert "tool result payload exceeds" in (result.error or "")
+            assert (result.error or "").startswith(
+                "result_validation_error: ValidationError"
+            )
             assert [obj for obj in runtime.store.list_objects() if obj.type.value == "tool_result"] == []
             audit = [record for record in runtime.audit.trace() if record.action == "tool.call"][-1]
             assert audit.decision["result"]["preview"] == "[tool result omitted after size-limit failure]"
@@ -291,7 +296,9 @@ class TestToolResultLimits:
 
             assert not result.ok
             assert result.result_handle is None
-            assert "tool result payload exceeds" in (result.error or "")
+            assert (result.error or "").startswith(
+                "result_validation_error: ValidationError"
+            )
             assert [obj for obj in runtime.store.list_objects() if obj.type.value == "tool_result"] == []
         finally:
             runtime.close()
@@ -345,7 +352,9 @@ class TestToolResultLimits:
             result = runtime.tools.call(pid, "bad_static_output", {})
 
             assert not result.ok
-            assert "Invalid output" in (result.error or "")
+            assert (result.error or "").startswith(
+                "validation_error: ValidationError"
+            )
             assert result.result_handle is None
         finally:
             runtime.close()
@@ -382,7 +391,9 @@ class TestToolResultLimits:
 
             assert not result.ok
             assert result.result_handle is None
-            assert "tool call arguments exceed" in (result.error or "")
+            assert result.error == (
+                "Tool call arguments exceed the configured Host size limit."
+            )
             assert all(event.type.value != "tool_called" for event in runtime.events.list(target=pid))
         finally:
             runtime.close()
@@ -404,7 +415,9 @@ class TestToolResultLimits:
 
             assert not result.ok
             assert result.result_handle is None
-            assert "tool result payload exceeds" in (result.error or "")
+            assert (result.error or "").startswith(
+                "result_validation_error: ValidationError"
+            )
             assert [
                 obj
                 for obj in runtime.store.list_objects()
@@ -454,10 +467,14 @@ class TestToolResultLimits:
             assert len(encoded) <= 1_024
             assert result.payload["error"]["type"] == "SandboxError"
             assert result.payload["error"]["total_errors"] == 1
-            assert result.payload["error"]["omitted"] >= 1
+            assert result.payload["error"]["omitted"] == 0
             assert len(result.payload["error"]["error_hash"]) == 64
+            assert result.payload["error"]["details"]["code"] == "execution_error"
+            assert result.payload["error"]["details"]["correlation_id"].startswith(
+                "corr_"
+            )
             assert len(result.error or "") <= runtime.config.tools.tool_observability_preview_chars
             assert b"/Users/alice" not in encoded
-            assert encoded.count(b"stderr") <= 40
+            assert b"stderr" not in encoded
         finally:
             runtime.close()

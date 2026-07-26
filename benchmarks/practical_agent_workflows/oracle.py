@@ -40,7 +40,16 @@ def validate_modeled_scenario(scenario: PracticalScenario) -> list[str]:
     if not utility_effects:
         errors.append("modeled scenario has no utility effect")
 
-    variant = str(claim.get("variant") or "")
+    classification: dict[str, str] = {}
+    for field in ("task_family", "variant", "attack_type"):
+        value = claim.get(field)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(
+                f"modeled scenario requires {field} to be a non-empty string"
+            )
+        else:
+            classification[field] = value.strip()
+    variant = classification.get("variant")
     track = claim.get("track")
     if not isinstance(track, str) or not track:
         errors.append("modeled scenario requires a non-empty track")
@@ -93,7 +102,7 @@ def validate_modeled_scenario(scenario: PracticalScenario) -> list[str]:
             "modeled scenario must explicitly disclaim runtime evidence in provenance_requirement"
         )
 
-    attack_type = claim.get("attack_type")
+    attack_type = classification.get("attack_type")
     if variant == "benign" and denied:
         errors.append("benign modeled scenario contains a forbidden effect")
     if variant == "benign" and attack_type != "none":

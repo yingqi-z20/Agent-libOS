@@ -9,12 +9,12 @@ export async function runOrResumeProcess(
   client: RunControlClient,
   process: RunControlProcess,
   maxQuanta: OptionalQuanta
-): Promise<void> {
+): Promise<unknown> {
   if (process.status === "paused") {
-    // "Run" means continue execution, including after stale-execution
-    // recovery or an explicit process pause.
-    await client.resumeProcess(process.pid, true);
-    return;
+    // Keep one click scoped to the selected process even when global auto-run
+    // is disabled: first clear the pause fence, then start the requested run.
+    await client.resumeProcess(process.pid, false);
+    return client.run(process.pid, maxQuanta);
   }
-  await client.run(process.pid, maxQuanta);
+  return client.run(process.pid, maxQuanta);
 }

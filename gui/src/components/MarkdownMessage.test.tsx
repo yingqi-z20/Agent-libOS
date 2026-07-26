@@ -1,3 +1,7 @@
+// @vitest-environment jsdom
+
+import { flushSync } from "react-dom";
+import { createRoot } from "react-dom/client";
 import { renderToReadableStream, renderToStaticMarkup } from "react-dom/server";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -47,6 +51,38 @@ describe("MarkdownMessage", () => {
     expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
   });
 
+  it("renders every markdown image destination as escaped text without network elements", () => {
+    const html = renderToStaticMarkup(
+      <MarkdownMessage text={markdownImagePayload()} fallback="" />
+    );
+
+    expect(html).not.toMatch(/<(?:img|link|picture|source)\b/i);
+    expect(html).not.toMatch(/\bsrc(?:set)?=/i);
+    expect(html).not.toContain("collector.example.test");
+    expect(html).toContain("role=\"img\"");
+    expect(html).toContain("aria-label=\"probe &amp; &quot;private&quot;\"");
+    expect(html).toContain("[image: probe &amp; &quot;private&quot;]");
+  });
+
+  it("mounts markdown images as accessible text spans without URL-bearing DOM nodes", () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    flushSync(() => {
+      root.render(<MarkdownMessage text={markdownImagePayload()} fallback="" />);
+    });
+
+    expect(container.querySelector("img, link, picture, source")).toBeNull();
+    expect(container.querySelector("[src], [srcset]")).toBeNull();
+    expect(container.innerHTML).not.toContain("collector.example.test");
+    const placeholders = [...container.querySelectorAll<HTMLElement>("[role='img']")];
+    expect(placeholders).toHaveLength(7);
+    expect(placeholders[0]?.tagName).toBe("SPAN");
+    expect(placeholders[0]?.getAttribute("aria-label")).toBe('probe & "private"');
+    expect(placeholders[0]?.textContent).toBe('[image: probe & "private"]');
+
+    flushSync(() => root.unmount());
+  });
+
   it("only treats explicitly safe external links as clickable", () => {
     expect(isSafeMarkdownHref("https://example.test/path")).toBe(true);
     expect(isSafeMarkdownHref("http://example.test/path")).toBe(true);
@@ -75,62 +111,88 @@ describe("MarkdownMessage", () => {
 
   it("keeps user messages as plain text while rendering assistant markdown", async () => {
     const snapshot = userPageSnapshot();
-    const process = snapshot.processes[0];
-    const html = await renderWithSuspense(
-      <I18nProvider>
-        <UserPage
-          connection={{ url: "http://127.0.0.1:1", token: "token", db: "local" }}
-          snapshot={snapshot}
-          selectedPid="pid_1"
-          selectedProcess={process}
-          taskLabels={{ pid_1: "Render markdown" }}
-          maxQuanta={null}
-          spawnGoal="goal"
-          spawnImage="coding-agent:v0"
-          spawnLlmProfile=""
-          spawnWorkingDirectory=""
-          spawnWorkspaceAccess="edit"
-          spawnAllowGitRequests={true}
-          spawnCommandAccess="none"
-          spawnContextMaintenance
-          message=""
-          images={[]}
-          llmProfiles={[]}
-          onSelectPid={() => undefined}
-          onMaxQuantaChange={() => undefined}
-          onSpawnGoalChange={() => undefined}
-          onSpawnImageChange={() => undefined}
-          onSpawnLlmProfileChange={() => undefined}
-          onSpawnWorkingDirectoryChange={() => undefined}
-          onSpawnWorkspaceAccessChange={() => undefined}
-          onSpawnAllowGitRequestsChange={() => undefined}
-          onSpawnCommandAccessChange={() => undefined}
-          onSpawnContextMaintenanceChange={() => undefined}
-          onMessageChange={() => undefined}
-          onSpawn={() => undefined}
-          onImportImage={() => undefined}
-          onCommitImage={() => undefined}
-          onSend={() => undefined}
-          onRespond={async () => true}
-          onRate={async () => true}
-          onCreateLlmProfile={async () => true}
-          onUpdateLlmProfile={async () => true}
-          onDeleteLlmProfile={async () => true}
-          onRun={() => undefined}
-          onPause={() => undefined}
-          onRefresh={() => undefined}
-          onOpenDb={() => undefined}
-          onShowOperator={() => undefined}
-          onStop={() => undefined}
-        />
-      </I18nProvider>
-    );
+    const html = await renderUserPage(snapshot);
 
     expect(html).toContain("**not bold**");
     expect(html).not.toContain("<strong>not bold</strong>");
     expect(html).toContain("<strong>bold</strong>");
   });
+
+  it("renders a protected placeholder instead of conflicting imported output text", async () => {
+    const snapshot = userPageSnapshot();
+    snapshot.human_requests[0].payload = {
+      type: "output",
+      release_required: true,
+      message: "protected render secret sentinel"
+    };
+
+    const html = await renderUserPage(snapshot);
+
+    expect(html).not.toContain("protected render secret sentinel");
+    expect(html).toContain("its content is withheld from this GUI by data-flow policy.");
+  });
 });
+
+function markdownImagePayload(): string {
+  return [
+    '![probe & "private"](https://collector.example.test/https)',
+    "![http](http://collector.example.test/http)",
+    "![protocol relative](//collector.example.test/protocol-relative)",
+    "![file](file:///tmp/private.png)",
+    "![data](data:image/png;base64,AAAA)",
+    "![blob](blob:https://collector.example.test/id)",
+    "![relative](./private.png)"
+  ].join("\n\n");
+}
+
+async function renderUserPage(snapshot: RuntimeSnapshot): Promise<string> {
+  return renderWithSuspense(
+    <I18nProvider>
+      <UserPage
+        connection={{ url: "http://127.0.0.1:1", token: "token", db: "local" }}
+        snapshot={snapshot}
+        selectedPid="pid_1"
+        selectedProcess={snapshot.processes[0]}
+        taskLabels={{ pid_1: "Render markdown" }}
+        taskSettings={{
+          image: "coding-agent:v0",
+          llmProfile: "",
+          maxQuantaInput: "",
+          workingDirectory: "",
+          workspaceAccess: "edit",
+          allowGitRequests: true,
+          commandAccess: "none",
+          contextMaintenance: true
+        }}
+        spawnGoal="goal"
+        message=""
+        images={[]}
+        llmProfiles={[]}
+        onSelectPid={() => undefined}
+        onMaxQuantaChange={() => undefined}
+        onSpawnGoalChange={() => undefined}
+        onSpawnImageChange={() => undefined}
+        onApplyTaskSettings={() => undefined}
+        onMessageChange={() => undefined}
+        onSpawn={() => undefined}
+        onImportImage={() => undefined}
+        onCommitImage={() => undefined}
+        onSend={() => undefined}
+        onRespond={async () => true}
+        onRate={async () => true}
+        onCreateLlmProfile={async () => true}
+        onUpdateLlmProfile={async () => true}
+        onDeleteLlmProfile={async () => true}
+        onRun={() => undefined}
+        onPause={() => undefined}
+        onRefresh={() => undefined}
+        onOpenDb={() => undefined}
+        onShowOperator={() => undefined}
+        onStop={() => undefined}
+      />
+    </I18nProvider>
+  );
+}
 
 async function renderWithSuspense(node: ReactNode): Promise<string> {
   const stream = await renderToReadableStream(node);

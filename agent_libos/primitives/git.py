@@ -8,8 +8,9 @@ import os
 import re
 import threading
 import unicodedata
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
+from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
@@ -44,11 +45,13 @@ from agent_libos.models import (
     ObjectRight,
     ObjectType,
     Provenance,
+    ResourceUsage,
 )
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     GitError,
     HumanApprovalRequired,
+    ResourceLimitExceeded,
     ValidationError,
 )
 from agent_libos.ports import AuditPort, EventPort
@@ -59,10 +62,14 @@ from agent_libos.sdk import (
     ProviderPhase,
 )
 from agent_libos.substrate import (
+    CommandMetrics,
     GitCommandResult,
     GitProvider,
     GitProviderEffectNotStarted,
     GitRepositoryState,
+    GitSubprocessScopeProvider,
+    SubprocessLimitExceeded,
+    SubprocessLimits,
 )
 from agent_libos.utils.ids import new_id, utc_now
 
@@ -155,6 +162,27 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _with_provider_subprocess_scope(
+    method: Callable[..., _T],
+) -> Callable[..., _T]:
+    @wraps(method)
+    def scoped(
+        primitive: Any,
+        pid: str,
+        operation: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> _T:
+        with primitive._provider_subprocess_scope(
+            pid,
+            operation,
+            remote=kwargs.get("remote"),
+        ):
+            return method(primitive, pid, operation, *args, **kwargs)
+
+    return scoped
+
+
 class GitPrimitive:
     """Capability-controlled, typed Git boundary for the Runtime workspace."""
 
@@ -177,12 +205,14 @@ class GitPrimitive:
         self.audit = audit
         self.events = events
         self.protected_operations = protected_operations
+        self.resources = protected_operations.resources
         self.human = human
         self.provider = provider
         self.filesystem = filesystem
         self.memory = memory
         self.data_flow = data_flow
         self._dispatch_state = threading.local()
+        self._resource_scope_state = threading.local()
 
     @property
     def repository_resource(self) -> str:
@@ -500,6 +530,7 @@ class GitPrimitive:
             effect_metadata=summary,
         )
 
+    @_with_provider_subprocess_scope
     def _read(
         self,
         pid: str,
@@ -657,6 +688,157 @@ class GitPrimitive:
                         classification_context=observation,
                         classification_result=summary,
                     )
+
+    def _subprocess_limits(self, pid: str) -> SubprocessLimits | None:
+        if self.resources is None:
+            return None
+        wall = self.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_wall_seconds",
+            "subprocess_wall_seconds",
+        )
+        cpu = self.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_cpu_seconds",
+            "subprocess_cpu_seconds",
+        )
+        memory = self.resources.peak_limit(pid, "max_subprocess_memory_bytes")
+        if wall is not None and wall <= 0:
+            raise ResourceLimitExceeded(
+                f"process {pid} exhausted subprocess wall-time budget"
+            )
+        if cpu is not None and cpu <= 0:
+            raise ResourceLimitExceeded(
+                f"process {pid} exhausted subprocess CPU budget"
+            )
+        if memory is not None and memory <= 0:
+            raise ResourceLimitExceeded(
+                f"process {pid} exhausted subprocess memory budget"
+            )
+        if wall is None and cpu is None and memory is None:
+            return None
+        return SubprocessLimits(
+            wall_seconds=wall,
+            cpu_seconds=cpu,
+            memory_bytes=memory,
+        )
+
+    @staticmethod
+    def _metrics_json(metrics: CommandMetrics | None) -> dict[str, Any] | None:
+        if metrics is None:
+            return None
+        return {
+            "wall_seconds": metrics.wall_seconds,
+            "cpu_seconds": metrics.cpu_seconds,
+            "peak_memory_bytes": metrics.peak_memory_bytes,
+            "killed": metrics.killed,
+            "limit_kind": metrics.limit_kind,
+        }
+
+    def _charge_subprocess_metrics(
+        self,
+        pid: str,
+        metrics: CommandMetrics | None,
+        *,
+        operation: str,
+        remote: str | None,
+    ) -> None:
+        if self.resources is None or metrics is None:
+            return
+        if (
+            metrics.wall_seconds <= 0
+            and metrics.cpu_seconds <= 0
+            and metrics.peak_memory_bytes <= 0
+        ):
+            return
+        self.resources.charge(
+            pid,
+            ResourceUsage(
+                subprocess_wall_seconds=max(0.0, metrics.wall_seconds),
+                subprocess_cpu_seconds=max(0.0, metrics.cpu_seconds),
+                subprocess_peak_memory_bytes=max(0, metrics.peak_memory_bytes),
+            ),
+            source=f"primitive.git.{operation}",
+            context={
+                "operation": operation,
+                "remote": remote,
+                "metrics": self._metrics_json(metrics),
+            },
+            allow_overage=True,
+            kill_on_exceed=True,
+        )
+
+    @contextlib.contextmanager
+    def _provider_subprocess_scope(
+        self,
+        pid: str,
+        operation: str,
+        *,
+        remote: str | None = None,
+    ) -> Iterator[None]:
+        active = getattr(self._resource_scope_state, "current", None)
+        if isinstance(active, dict):
+            if active.get("pid") != pid:
+                raise ValidationError(
+                    "nested Git provider subprocess scopes must keep one process owner"
+                )
+            yield
+            return
+        limits = self._subprocess_limits(pid)
+        scope_provider = (
+            self.provider
+            if isinstance(self.provider, GitSubprocessScopeProvider)
+            else None
+        )
+        if limits is not None and (
+            scope_provider is None
+            or not scope_provider.supports_subprocess_limits
+        ):
+            raise ValidationError(
+                "Git provider must support SubprocessLimits for budgeted execution"
+            )
+        scope: Any | None = None
+        limit_error: SubprocessLimitExceeded | None = None
+        selected_metrics: CommandMetrics | None = None
+        selected_scope = (
+            scope_provider.subprocess_scope(limits=limits)
+            if scope_provider is not None
+            else contextlib.nullcontext(None)
+        )
+        self._resource_scope_state.current = {"pid": pid}
+        try:
+            with selected_scope as scope:
+                try:
+                    yield
+                except SubprocessLimitExceeded as exc:
+                    limit_error = exc
+        finally:
+            metrics = getattr(scope, "metrics", None)
+            if not isinstance(metrics, CommandMetrics) and limit_error is not None:
+                metrics = limit_error.metrics
+            selected_metrics = metrics if isinstance(metrics, CommandMetrics) else None
+            with contextlib.suppress(AttributeError):
+                del self._resource_scope_state.current
+            self._charge_subprocess_metrics(
+                pid,
+                selected_metrics,
+                operation=operation,
+                remote=remote,
+            )
+        if limit_error is not None:
+            reason = str(limit_error)
+            if self.resources is not None:
+                self.resources.kill_if_exceeded(
+                    pid,
+                    reason=reason,
+                    limit={
+                        "kind": limit_error.metrics.limit_kind,
+                        "metrics": self._metrics_json(
+                            selected_metrics or limit_error.metrics
+                        ),
+                    },
+                )
+            raise ResourceLimitExceeded(reason) from limit_error
 
     def _run(
         self,
@@ -1312,9 +1494,19 @@ class GitPrimitive:
             before = self.provider.repository_state(worktree=self._worktree_path(worktree_id))
             oid = self._resolve_commit(ref, worktree_id=worktree_id)
             commit = self._commit(oid, worktree_id=worktree_id)
-            patch_result = self._require_success(
-                self._run(
-                    [
+            parents: tuple[str | None, ...] = tuple(commit.parents) or (None,)
+            if len(parents) > self.config.git.log_entry_hard_limit:
+                raise GitError(
+                    GitErrorCode.OUTPUT_TOO_LARGE.value,
+                    "Git commit parent count exceeds the configured hard limit",
+                    operation="show",
+                )
+            parent_diffs: list[dict[str, Any]] = []
+            aggregate_patch_bytes = 0
+            aggregate_name_bytes = 0
+            for parent_oid in parents:
+                if parent_oid is None:
+                    patch_args = [
                         "show",
                         "--format=",
                         "--no-renames",
@@ -1323,34 +1515,103 @@ class GitPrimitive:
                         "--binary",
                         oid,
                         "--",
-                    ],
-                    worktree_id=worktree_id,
-                    max_output_bytes=self.config.git.patch_hard_limit_bytes,
-                ),
-                "show",
-            )
-            names_result = self._require_success(
-                self._run(
-                    ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", oid, "--"],
-                    worktree_id=worktree_id,
-                    max_output_bytes=self.config.git.output_hard_limit_bytes,
-                ),
-                "show",
-            )
+                    ]
+                    names_args = [
+                        "diff-tree",
+                        "--root",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        "-z",
+                        oid,
+                        "--",
+                    ]
+                else:
+                    patch_args = [
+                        "diff",
+                        "--no-renames",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--binary",
+                        parent_oid,
+                        oid,
+                        "--",
+                    ]
+                    names_args = [
+                        "diff",
+                        "--no-renames",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--name-only",
+                        "-z",
+                        parent_oid,
+                        oid,
+                        "--",
+                    ]
+                patch_result = self._require_success(
+                    self._run(
+                        patch_args,
+                        worktree_id=worktree_id,
+                        max_output_bytes=self.config.git.patch_hard_limit_bytes,
+                    ),
+                    "show",
+                )
+                aggregate_patch_bytes += len(patch_result.stdout)
+                if aggregate_patch_bytes > self.config.git.patch_hard_limit_bytes:
+                    raise GitError(
+                        GitErrorCode.OUTPUT_TOO_LARGE.value,
+                        "aggregate Git parent diffs exceed the configured hard limit",
+                        operation="show",
+                    )
+                names_result = self._require_success(
+                    self._run(
+                        names_args,
+                        worktree_id=worktree_id,
+                        max_output_bytes=self.config.git.output_hard_limit_bytes,
+                    ),
+                    "show",
+                )
+                aggregate_name_bytes += len(names_result.stdout)
+                if aggregate_name_bytes > self.config.git.output_hard_limit_bytes:
+                    raise GitError(
+                        GitErrorCode.OUTPUT_TOO_LARGE.value,
+                        "aggregate Git parent paths exceed the configured hard limit",
+                        operation="show",
+                    )
+                full_parent_patch = patch_result.stdout
+                returned_parent_patch = full_parent_patch[:selected_limit]
+                parent_diffs.append(
+                    {
+                        "parent_oid": parent_oid,
+                        "patch": returned_parent_patch.decode("utf-8", errors="replace"),
+                        "patch_b64": base64.b64encode(returned_parent_patch).decode("ascii"),
+                        "changed_paths": self._bounded_git_paths(names_result.stdout),
+                        "truncated": len(full_parent_patch) > selected_limit,
+                        "bytes": len(full_parent_patch),
+                        "sha256": patch_result.stdout_sha256,
+                    }
+                )
             after = self.provider.repository_state(worktree=self._worktree_path(worktree_id))
             token = self._state_token(before)
             if token.token != self._state_token(after).token:
                 raise GitError(GitErrorCode.STALE_STATE.value, "Git state changed while commit was being read", retryable=True)
-            full = patch_result.stdout
-            returned = full[:selected_limit]
+            canonical = parent_diffs[0]
             payload = {
                 "commit": commit,
-                "patch": returned.decode("utf-8", errors="replace"),
-                "patch_b64": base64.b64encode(returned).decode("ascii"),
-                "changed_paths": self._bounded_git_paths(names_result.stdout),
-                "truncated": len(full) > selected_limit,
-                "bytes": len(full),
-                "sha256": patch_result.stdout_sha256,
+                # Preserve the historical top-level fields as the root or
+                # first-parent view. Multi-parent callers must inspect every
+                # entry in parent_diffs before claiming complete evidence.
+                "patch_base_oid": canonical["parent_oid"],
+                "patch": canonical["patch"],
+                "patch_b64": canonical["patch_b64"],
+                "changed_paths": canonical["changed_paths"],
+                "truncated": canonical["truncated"],
+                "bytes": canonical["bytes"],
+                "sha256": canonical["sha256"],
+                "parent_diffs": parent_diffs,
+                "parent_diffs_truncated": any(
+                    bool(item["truncated"]) for item in parent_diffs
+                ),
                 "state": token,
             }
             summary = {
@@ -1361,6 +1622,8 @@ class GitPrimitive:
                 "truncated": payload["truncated"],
                 "bytes": payload["bytes"],
                 "sha256": payload["sha256"],
+                "parent_diffs": len(parent_diffs),
+                "parent_diffs_truncated": payload["parent_diffs_truncated"],
                 "state_token": token.token,
             }
             return payload, summary
@@ -3295,6 +3558,7 @@ class GitPrimitive:
             else:
                 self._dispatch_state.current = previous_state
 
+    @_with_provider_subprocess_scope
     def _mutate(
         self,
         pid: str,
@@ -3830,7 +4094,19 @@ class GitPrimitive:
                 oid = self._resolve_commit(ref, worktree_id=worktree_id)
                 self._mark_git_source_carrier("commit", oid)
                 if operation == "merge":
-                    args = ["merge", "--no-edit", "--no-gpg-sign", oid]
+                    previous_stash_oid = self._resolve_stash_commit(
+                        0,
+                        worktree_id=worktree_id,
+                        optional=True,
+                    )
+                    args = [
+                        "merge",
+                        "--no-edit",
+                        "--no-gpg-sign",
+                        "--commit",
+                        "--no-squash",
+                        oid,
+                    ]
                 elif operation == "rebase":
                     args = ["rebase", "--no-autostash", oid]
                 elif operation == "cherry_pick":
@@ -3839,6 +4115,67 @@ class GitPrimitive:
                     args = ["revert", "--no-edit", "--no-gpg-sign", oid]
             self._mutation_command(before, "integrate", args, worktree_id=worktree_id)
             current = self.provider.repository_state(worktree=self._worktree_path(worktree_id))
+            if operation == "merge":
+                merge_head = self._run(
+                    [
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "--end-of-options",
+                        "MERGE_HEAD",
+                    ],
+                    worktree_id=worktree_id,
+                    max_output_bytes=65536,
+                )
+                if merge_head.returncode not in {0, 1}:
+                    self._require_success(merge_head, "integrate")
+                current_stash_oid = self._resolve_stash_commit(
+                    0,
+                    worktree_id=worktree_id,
+                    optional=True,
+                )
+                parsed = self._parse_status(
+                    current,
+                    limit=self.config.git.status_entry_hard_limit,
+                )
+                non_terminal = (
+                    merge_head.returncode == 0
+                    or any(
+                        entry.kind == GitStatusKind.UNMERGED
+                        for entry in parsed.entries
+                    )
+                    or current_stash_oid != previous_stash_oid
+                )
+                if non_terminal:
+                    raise GitError(
+                        GitErrorCode.CONFLICT.value,
+                        "typed Git merge returned without a terminal, stash-preserving state",
+                        operation="integrate",
+                    )
+                if current.head_oid is None:
+                    raise GitError(
+                        GitErrorCode.COMMAND_FAILED.value,
+                        "typed Git merge returned without a final HEAD",
+                        operation="integrate",
+                    )
+                ancestry = self._run(
+                    [
+                        "merge-base",
+                        "--is-ancestor",
+                        oid,
+                        current.head_oid,
+                    ],
+                    worktree_id=worktree_id,
+                    max_output_bytes=65536,
+                )
+                if ancestry.returncode not in {0, 1}:
+                    self._require_success(ancestry, "integrate")
+                if ancestry.returncode != 0:
+                    raise GitError(
+                        GitErrorCode.COMMAND_FAILED.value,
+                        "typed Git merge did not integrate the selected commit",
+                        operation="integrate",
+                    )
             return current.head_oid, {"integration": operation, "source_oid": oid, "abort_kind": abort_kind}, ()
 
         return self._mutate(
@@ -4713,10 +5050,15 @@ class GitPrimitive:
                 },
                 consume=False,
             )
-        return self.provider.preflight_remote_fingerprint(
-            selected,
-            worktree=self._worktree_path(worktree_id),
-        )
+        with self._provider_subprocess_scope(
+            pid,
+            "remote_preflight",
+            remote=selected,
+        ):
+            return self.provider.preflight_remote_fingerprint(
+                selected,
+                worktree=self._worktree_path(worktree_id),
+            )
 
     @staticmethod
     def _fingerprint_context(
@@ -4869,9 +5211,21 @@ class GitPrimitive:
             target_oid = self._resolve_commit(tracking_ref, worktree_id=worktree_id)
             self._mark_git_source_carrier("commit", target_oid)
             if strategy == "ff_only":
-                args = ["merge", "--ff-only", "--no-edit", target_oid]
+                args = [
+                    "merge",
+                    "--ff-only",
+                    "--no-edit",
+                    target_oid,
+                ]
             elif strategy == "merge":
-                args = ["merge", "--no-edit", "--no-gpg-sign", target_oid]
+                args = [
+                    "merge",
+                    "--no-edit",
+                    "--no-gpg-sign",
+                    "--commit",
+                    "--no-squash",
+                    target_oid,
+                ]
             else:
                 args = ["rebase", "--no-autostash", target_oid]
             try:
@@ -4982,8 +5336,9 @@ class GitPrimitive:
                 GitErrorCode.INVALID_REF.value,
                 "destructive push requires expected remote OID",
             )
-        if force_with_lease_oid is not None and not _OID_RE.fullmatch(
-            force_with_lease_oid
+        if force_with_lease_oid is not None and (
+            not _OID_RE.fullmatch(force_with_lease_oid)
+            or not any(character != "0" for character in force_with_lease_oid)
         ):
             raise GitError(
                 GitErrorCode.INVALID_REF.value,
@@ -5190,11 +5545,18 @@ class GitPrimitive:
         expected_sha256: str | None,
         create: bool = False,
         lineage_prebound: bool = False,
+        capacity_preflighted: bool = False,
     ) -> GitPullRequest:
         data = self._pull_request_payload(
             pull_request,
             review_bodies=review_bodies,
         )
+        if not capacity_preflighted:
+            self._preflight_pull_request_metadata_capacity(
+                pull_request.pr_id,
+                data,
+                create=create,
+            )
         content_sha256 = _sha256(data)
         if not lineage_prebound:
             self._mark_git_output_carrier("pull_request", pull_request.pr_id)
@@ -5218,6 +5580,52 @@ class GitPrimitive:
             bytes=len(data),
             sha256=content_sha256,
         )
+
+    def _preflight_pull_request_metadata_capacity(
+        self,
+        pr_id: str,
+        data: bytes,
+        *,
+        create: bool,
+    ) -> None:
+        if len(data) > self.config.git.output_hard_limit_bytes:
+            raise GitError(
+                GitErrorCode.OUTPUT_TOO_LARGE.value,
+                "pull request metadata exceeds its hard limit",
+                operation="pull_request_metadata",
+            )
+        rows = self.provider.list_pull_request_metadata(
+            limit=self.config.git.status_entry_hard_limit,
+        )
+        current = next(
+            (current_data for current_id, current_data, _digest in rows if current_id == pr_id),
+            None,
+        )
+        if create and current is not None:
+            raise GitError(
+                GitErrorCode.ALREADY_EXISTS.value,
+                "pull request already exists",
+                operation="pull_request_metadata",
+            )
+        if not create and current is None:
+            return
+        projected_count = len(rows) + (1 if create and current is None else 0)
+        if projected_count > self.config.git.status_entry_hard_limit:
+            raise GitError(
+                GitErrorCode.OUTPUT_TOO_LARGE.value,
+                "pull request metadata count exceeds its hard limit",
+                operation="pull_request_metadata",
+            )
+        projected_bytes = sum(len(current_data) for _pr_id, current_data, _digest in rows)
+        if current is not None:
+            projected_bytes -= len(current)
+        projected_bytes += len(data)
+        if projected_bytes > self.config.git.output_hard_limit_bytes:
+            raise GitError(
+                GitErrorCode.OUTPUT_TOO_LARGE.value,
+                "pull request metadata exceeds its aggregate limit",
+                operation="pull_request_metadata",
+            )
 
     @staticmethod
     def _parse_pull_request_metadata(data: bytes, *, expected_pr_id: str | None = None) -> tuple[GitPullRequest, dict[str, str]]:
@@ -5374,6 +5782,11 @@ class GitPrimitive:
                 f"create {base_snapshot} {base_oid}\n"
                 f"create {head_snapshot} {head_oid}\n"
             ).encode("ascii")
+            self._preflight_pull_request_metadata_capacity(
+                pr_id,
+                self._pull_request_payload(pull_request),
+                create=True,
+            )
             self._mark_git_output_carrier("pull_request", pr_id)
             self._prebind_pull_request_lineage(pr_id)
             self._mutation_command(
@@ -5388,6 +5801,7 @@ class GitPrimitive:
                 expected_sha256=None,
                 create=True,
                 lineage_prebound=True,
+                capacity_preflighted=True,
             )
             created.append(pull_request)
             return head_oid, {
@@ -5472,7 +5886,7 @@ class GitPrimitive:
             pull_requests = [replace(item, state=token) for item in pull_requests]
             payload = {
                 "pull_requests": pull_requests,
-                "truncated": matched_total > limit or len(rows) == scan_limit,
+                "truncated": matched_total > limit,
                 "bytes": bytes_read,
                 "sha256": digest.hexdigest(),
                 "state": token,

@@ -62,6 +62,21 @@ class TestTestMatrix:
             "AGENT_LIBOS_KEEP_AGENT_OUTPUTS": "1"
         }
 
+    def test_pytest_command_receives_execution_receipt_plugin(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        command = test_matrix._commands_for(_args(lane="unit"))[0]
+        receipt = tmp_path / "receipt.json"
+
+        wrapped = test_matrix._with_invariant_receipt(command, receipt)
+
+        assert wrapped.argv[3:5] == ["-p", "scripts.check_test_invariants"]
+        assert wrapped.env == {
+            "AGENT_LIBOS_INVARIANT_EXECUTION_RECEIPT": str(receipt)
+        }
+        assert command.env is None
+
     def test_pytest_environment_combines_real_llm_and_output_retention(self) -> None:
         assert test_matrix._pytest_env(
             _args(run_real_llm=True, keep_agent_outputs=True)
@@ -259,6 +274,57 @@ time.sleep(30)
 
         assert status == test_matrix.PROCESS_TIMEOUT_EXIT_CODE
         assert child_pid_file.exists(), "parent did not spawn the descendant before timeout"
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 2
+        while psutil.pid_exists(child_pid) and time.monotonic() < deadline:
+            try:
+                if psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.01)
+        try:
+            final_status = psutil.Process(child_pid).status()
+        except psutil.NoSuchProcess:
+            final_status = None
+        assert final_status in {None, psutil.STATUS_ZOMBIE}
+
+    def test_successful_command_terminates_a_spawned_descendant(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        child_pid_file = tmp_path / "successful-child.pid"
+        child_code = """
+import signal
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+"""
+        parent_code = """
+import pathlib
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, "-c", sys.argv[1]])
+pathlib.Path(sys.argv[2]).write_text(str(child.pid), encoding="utf-8")
+"""
+
+        status = test_matrix._run(
+            test_matrix.Command(
+                "successful process-tree regression",
+                [
+                    test_matrix.sys.executable,
+                    "-c",
+                    parent_code,
+                    child_code,
+                    str(child_pid_file),
+                ],
+            ),
+            max_seconds=2,
+        )
+
+        assert status == 0
         child_pid = int(child_pid_file.read_text(encoding="utf-8"))
         deadline = time.monotonic() + 2
         while psutil.pid_exists(child_pid) and time.monotonic() < deadline:

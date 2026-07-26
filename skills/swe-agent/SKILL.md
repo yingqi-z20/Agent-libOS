@@ -20,6 +20,11 @@ Use this skill when the goal is to fix, review, or improve a software repository
 1. Localize before editing. Use directory views, grep, focused file windows, and tests to identify the smallest relevant code region.
 2. Prefer the SWE-style tools for repository navigation and patching:
    - `swe_view` for directory listings and bounded file windows with line numbers.
+     File reads begin at byte zero. `start_line` in the result is the effective
+     start after clamping the request into the observed prefix;
+     `total_lines` and `lines_below` count only lines observed in that prefix.
+     If `truncated_by_bytes` is true, the unobserved suffix has an unknown line
+     count, so do not treat either field as a complete-file total.
    - `swe_grep` for concise repository search. Its `max_results` bounds both
      returned match lines and the file list derived from those lines.
    - `swe_edit` for exact-text or line-range edits.
@@ -42,7 +47,9 @@ Use this skill when the goal is to fix, review, or improve a software repository
    `swe_run.returncode`; nonzero is failure even when stdout/stderr are empty,
    and its empty-output message never turns that case into success. If a test
    fails, inspect it, patch again, and rerun a focused command before broader
-   tests.
+   tests. Also inspect `stdout_truncated` and `stderr_truncated`: `swe_run`
+   returns retained stream prefixes, and a true flag means the corresponding
+   suffix is unknown even though `returncode` remains authoritative.
 6. Before submit, summarize changed files, tests run, remaining risk, and any missing authority. If the runtime denies filesystem or shell access, request the least privilege needed instead of working around the primitive.
 
 `swe_run` caps its mediated shell deadline at 55 seconds inside a 60-second

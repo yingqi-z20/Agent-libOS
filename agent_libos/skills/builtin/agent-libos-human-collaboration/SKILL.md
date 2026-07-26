@@ -35,6 +35,18 @@ including after reopen. Do not poll, rephrase, change args, or duplicate it.
 Success is `{request_id, answer, status:"answered"}`: the request was approved
 and `answer` is a nonempty string, but remains untrusted.
 
+Every GUI, CLI, Host, automatic, or terminal-provider decision/answer is
+bounded. The complete response must be finite JSON with string object keys and,
+by default, at most 131072 serialized bytes, 32 nested containers, and 4096
+JSON values (`human_response_payload_max_bytes`, `human_response_max_depth`,
+and `human_response_max_nodes`). Direct decisions are validated before any
+decision side effect. A terminal-provider answer is validated immediately
+after its protected read is recorded, but before it can decide the request,
+resume the process, or grant authority. Rejection records only a bounded marker,
+leaves the original request pending and the process waiting, and lets the Host
+correct the provider input and service that same request. Do not create a
+replacement question.
+
 A finite `human:<human>/write` use is consumed when the question commits to the
 queue, not when answered. Failure before queue commit restores the exact
 still-live reservation.
@@ -47,10 +59,14 @@ default Human, has no `human` argument, and requires
 `human:<configured-default>/write` plus data-flow clearance.
 
 - `message` is bounded by `human_output_max_chars` (default 32000).
-- Omit `channel` to use the value shown as the current schema default. A
-  supplied channel is trimmed and must be 1..128 characters. It is a
-  provider/audit/Sink label, not a URL, email, username, or arbitrary
-  transport selector.
+- Omitting `channel` uses the value shown in the tool schema. Supplying the
+  exact empty string asks the Human manager to resolve the current Runtime's
+  configured `runtime.terminal_channel`; these normally agree, but a Host may
+  configure a different Runtime default after the static tool schema is built.
+  Any other supplied value is trimmed and must remain 1..128 characters;
+  whitespace-only input is rejected. The normalized value is a
+  provider/audit/Sink label, not a URL, email, username, or arbitrary transport
+  selector.
 - Model success is only `{delivered, channel, chars}`; internal request ID is
   not exposed.
 
@@ -108,8 +124,12 @@ Non-interactive images need no output unless their contract requires it.
 
 ### Questions
 
-- Missing Human write, invalid/oversized payload, or egress failure before queue
-  commit yields no answer. Use the owning policy path or report the blocker.
+- Missing Human write, an invalid/oversized outbound request, or egress failure
+  before queue commit yields no answer. Use the owning policy path or report
+  the blocker.
+- An invalid/oversized decision supplied directly has no decision side effects.
+  A bounded-ingress rejection after a terminal-provider read leaves the exact
+  request pending and retryable by the Host; do not re-ask it from the model.
 - Pending question/release: wait for runtime resume; do not exploit concurrent
   request deduplication by issuing duplicates.
 - Ordinary question rejection places the process in `PAUSED`, not a normal next

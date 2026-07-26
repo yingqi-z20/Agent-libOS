@@ -88,6 +88,11 @@ Package validation is bounded by `AgentLibOSConfig.skills`: `SKILL.md` is read
 with `skill_md_max_bytes` for process-driven workspace registration and the
 hard host limit is `skill_md_hard_limit_bytes`; bundled resources are limited
 by `resource_read_max_bytes`, `package_max_bytes`, and `max_package_files`.
+Resource traversal is independently bounded by `max_package_directories` and
+`max_package_depth`, whose defaults are 256 aggregate directories and 32
+levels, respectively. Missing optional resource roots do not consume the
+directory budget. Detecting a package that exceeds either topology bound
+rejects the complete package; traversal never returns a partial package.
 Every bounded workspace read is fail-closed: if `SKILL.md`, an explicitly
 referenced metadata file, a JIT source, or an optionally discovered resource
 reports `truncated: true`, registration rejects the package rather than hashing
@@ -107,6 +112,8 @@ longer matches its declared size/SHA is rejected. SHA-256 here is an unkeyed
 content fingerprint, not a digital signature, MAC, publisher identity, or proof
 that the instructions are safe. Global trust records are exact hash pins whose
 authenticity depends on how the Host obtained and approved that hash.
+The exact fields, defaults, and cross-field validation rules are listed in the
+[configuration reference](configuration.md#configuration-reference).
 
 ## Progressive Disclosure
 
@@ -114,18 +121,32 @@ Fresh shipped images put no Skill metadata or body in the model prompt. The
 model starts with the common Skill lifecycle bootstrap and uses
 `discover_skills` only when task-specific guidance or a domain schema is
 needed. `text` and `limit` apply to every visible Skill in one uniformly bounded
-page. Discovery treats two to four concrete metadata terms as an intent query,
-requires each informative term, and relevance-ranks the matches. `next_step`
-directs the model to activate a plausible exact id or refine a zero-result
-query; an unchanged query is never pagination. `has_more` only reports more
-matches for the same query, while `visibility_limited` reports that catalog
-authority prevented searching all configured sources. There is no cursor.
+page. Discovery case-folds and de-duplicates Unicode word terms from the query,
+and drops one-character and common low-information terms when at least one
+informative term remains. A one-term query requires that term to match Skill
+id, name, or description. A query with two or more selected terms requires at
+least two distinct term matches; it does not require every term to match.
+An exact full id or name match returns only exact matches. Otherwise results
+combine a normalized-phrase bonus with the number and location of matched
+terms; id/name hits weigh more than description-only hits. The combined score
+sorts descending, with deterministic case-folded name and id tie-breaking.
+`next_step` is `activate_skill` when a returned match is not current,
+`use_loaded_skill` when every returned match has the same loaded/catalog hash,
+or `refine_search` for a zero-result query; an unchanged query is never
+pagination. `has_more` only
+reports more matches for the same query, while `visibility_limited` reports
+that catalog authority prevented searching all configured sources. There is no
+cursor.
 
 Every model-facing discovery item has the same schema: identity, description,
 declared high-level bindings and requirements, package hash, and `active`.
 Source type, registration provenance, and the Host's immutable built-in
 implementation are intentionally absent. Discovery returns metadata only; the
 full `SKILL.md` body and domain tool schemas appear after activation.
+`active=true` binds the trusted loaded snapshot to the discovery row's exact
+`package_sha256`; an older immutable snapshot remains loaded but is reported
+inactive after catalog replacement. Activation requires that discovered hash
+as `expected_package_sha256` and fails before publication if it is stale.
 
 For an immutable packaged Skill, discovery omits the package unless every
 declared static tool has an exact image-authorized process binding. Registered
@@ -265,7 +286,22 @@ Host-side catalog discovery searches exactly the roots in
 paths de-duplicated. Defaults include `skills/`, `.agent_libos/skills/`, and
 the compatible `.agents/skills/` and `.claude/skills/` roots. Overriding
 `workspace_dirs` replaces that workspace-root set; there are no additional
-implicit catalog roots.
+implicit catalog roots. Host catalog enumeration and registered-row search are
+both bounded by `skills.catalog_scan_limit` (1000 by default). Detecting entry
+or row N+1 rejects discovery instead of returning a result that could be
+mistaken for a complete search.
+
+Host-path loading, including admin validation/registration and Host catalog
+inspection, takes an identity-stable package snapshot. It rejects symlink or
+reparse-point components, hard-linked package files, non-regular files,
+non-directory resource topology, and platforms on which a stable file or
+directory identity cannot be established. Files must remain linked at the
+same path with the same identity and metadata throughout their bounded read;
+directories are checked before and after enumeration. A concurrent rename,
+replacement, mutation, growth, or other identity uncertainty therefore fails
+the whole load rather than hashing or registering a mixed snapshot. These are
+Host-path rules; process-driven workspace registration below additionally goes
+through the filesystem primitive and its authority and path-safety contract.
 
 Workspace Skills are registered through the filesystem primitive when an
 AgentProcess is the actor. The process must be able to read `SKILL.md` and any
@@ -300,8 +336,13 @@ Admin CLI registration can read and snapshot a workspace package directly:
 ```bash
 uv run agent-libos --db .agent_libos.sqlite skills validate skills/swe-agent
 uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills discover --text swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent --expected-package-sha256 <package_sha256-from-discover>
 ```
+
+Activation requires the exact lowercase package hash from discovery and fails
+without replacing the loaded snapshot if the registered content changed in
+between. Rediscover and review the new metadata before using a new hash.
 
 With `--actor-pid`, process-mode commands enforce that process's applicable
 filesystem, registry, Skill, target-process, source, and trust capabilities.
@@ -423,6 +464,19 @@ a line-range edit normalizes inserted text to the first separator encountered;
 if neither separator exists it uses LF. `swe_run` always returns `returncode`;
 empty output is described as successful only for return code zero, so callers
 must treat a nonzero code as failure even when both streams are empty.
+For a file, `swe_view` reads from byte zero and then selects a bounded line
+window from the decoded prefix. Its returned `start_line` is the effective
+start after clamping the request into `1..max(total_lines, 1)`, not an echo of
+an out-of-range request. `total_lines` counts only logical lines in the
+observed prefix, and `lines_below` counts only observed-prefix lines below the
+returned window. When `truncated_by_bytes` is true, neither field describes or
+estimates the unobserved suffix; conclusions about the complete file require a
+complete-file-safe read or a narrower source.
+`swe_run` returns the bounded prefixes retained by the shell primitive and
+propagates `stdout_truncated` and `stderr_truncated`. If either flag is true,
+the corresponding stream is incomplete even though `returncode` remains the
+command's exit status; the absent suffix must not be treated as evidence that
+a diagnostic or match did not occur.
 `swe_grep` propagates the shell capture's truncation flags. If stdout was
 truncated, `matches_incomplete` is true, `omitted_matches` is null because the
 total is unknowable, and `observed_omitted_matches` counts only captured matches

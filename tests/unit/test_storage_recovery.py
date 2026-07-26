@@ -13,6 +13,7 @@ import pytest
 
 import agent_libos.storage.sqlite as sqlite_backend
 from agent_libos.models import (
+    AgentObject,
     AgentProcess,
     Capability,
     CapabilityStatus,
@@ -22,7 +23,10 @@ from agent_libos.models import (
     MemoryView,
     KilledProcessOutcome,
     ObjectHandle,
+    ObjectMetadata,
+    ObjectType,
     ProcessStatus,
+    Provenance,
     ResourceBudget,
     ResourceUsage,
     ViewMode,
@@ -182,29 +186,59 @@ class _FinalizeFailureConnection(_ConnectionProxy):
         commit_failures: int = 0,
         rollback_failures: int = 0,
         release_failures: int = 0,
+        commit_error: BaseException | None = None,
+        rollback_error: BaseException | None = None,
+        release_error: BaseException | None = None,
     ) -> None:
         super().__init__(connection)
         self.commit_failures = commit_failures
         self.rollback_failures = rollback_failures
         self.release_failures = release_failures
+        self.commit_error = commit_error or RuntimeError("injected commit failure")
+        self.rollback_error = rollback_error or RuntimeError("injected rollback failure")
+        self.release_error = release_error or RuntimeError("injected release failure")
 
     def commit(self) -> None:
         if self.commit_failures:
             self.commit_failures -= 1
-            raise RuntimeError("injected commit failure")
+            raise self.commit_error
         self._connection.commit()
 
     def rollback(self) -> None:
         if self.rollback_failures:
             self.rollback_failures -= 1
-            raise RuntimeError("injected rollback failure")
+            raise self.rollback_error
         self._connection.rollback()
 
     def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
         if sql.lstrip().upper().startswith("RELEASE SAVEPOINT") and self.release_failures:
             self.release_failures -= 1
-            raise RuntimeError("injected release failure")
+            raise self.release_error
         return self._connection.execute(sql, parameters)
+
+
+class _CommitThenRaiseConnection(_ConnectionProxy):
+    def __init__(self, connection: sqlite3.Connection, error: BaseException) -> None:
+        super().__init__(connection)
+        self.error = error
+
+    def commit(self) -> None:
+        self._connection.commit()
+        raise self.error
+
+
+class _ReleaseThenRaiseConnection(_ConnectionProxy):
+    def __init__(self, connection: sqlite3.Connection, error: BaseException) -> None:
+        super().__init__(connection)
+        self.error = error
+        self.failed = False
+
+    def execute(self, sql: str, parameters: Any = ()) -> Any:
+        result = self._connection.execute(sql, parameters)
+        if not self.failed and sql.strip().upper().startswith("RELEASE SAVEPOINT"):
+            self.failed = True
+            raise self.error
+        return result
 
 
 class _ExecuteFailureConnection(_ConnectionProxy):
@@ -270,6 +304,31 @@ def _finite_capability(cap_id: str) -> Capability:
     )
 
 
+def _runtime_object(
+    oid: str,
+    payload: Any,
+    *,
+    version: int = 1,
+) -> AgentObject:
+    now = utc_now()
+    return AgentObject(
+        oid=oid,
+        namespace="system",
+        name=oid,
+        type=ObjectType.ARTIFACT,
+        schema_version="1",
+        payload=payload,
+        metadata=ObjectMetadata(),
+        provenance=Provenance(created_from_action="test"),
+        version=version,
+        immutable=False,
+        created_by="test",
+        created_at=now,
+        updated_at=now,
+        owner_id="pid_test",
+    )
+
+
 def _create_legacy_objects_table(connection: sqlite3.Connection, table: str = "objects") -> None:
     connection.execute(
         f"""
@@ -310,6 +369,152 @@ def _create_legacy_objects_table(connection: sqlite3.Connection, table: str = "o
 
 
 class TestStoreTransactionRecovery:
+    def test_payload_reader_waits_for_rollback_without_observing_uncommitted_cache(
+        self,
+    ) -> None:
+        store = SQLiteStore(":memory:")
+        payload_mutated = threading.Event()
+        release_writer = threading.Event()
+        reader_finished = threading.Event()
+        writer_errors: list[BaseException] = []
+        reader_errors: list[BaseException] = []
+        observed: list[Any] = []
+        oid = "obj_payload_isolation"
+        before = _runtime_object(oid, {"value": "committed"})
+        after = replace(
+            before,
+            payload={"value": "uncommitted"},
+            version=2,
+            updated_at=utc_now(),
+        )
+
+        def mutate_then_rollback() -> None:
+            try:
+                with pytest.raises(RuntimeError, match="rollback payload"):
+                    with store.transaction():
+                        assert store.update_object(
+                            after,
+                            expected_version=before.version,
+                        )
+                        payload_mutated.set()
+                        assert release_writer.wait(timeout=5)
+                        raise RuntimeError("rollback payload")
+            except BaseException as exc:
+                writer_errors.append(exc)
+
+        def read_payload() -> None:
+            try:
+                assert payload_mutated.wait(timeout=5)
+                observed.append(store.object_payload(oid))
+            except BaseException as exc:
+                reader_errors.append(exc)
+            finally:
+                reader_finished.set()
+
+        try:
+            store.insert_object(before)
+            writer = threading.Thread(target=mutate_then_rollback, daemon=True)
+            reader = threading.Thread(target=read_payload, daemon=True)
+            writer.start()
+            assert payload_mutated.wait(timeout=5)
+            reader.start()
+            leaked_before_rollback = reader_finished.wait(timeout=0.2)
+            release_writer.set()
+            writer.join(timeout=5)
+            reader.join(timeout=5)
+
+            assert not writer.is_alive()
+            assert not reader.is_alive()
+            assert not leaked_before_rollback
+            assert writer_errors == []
+            assert reader_errors == []
+            assert observed == [{"value": "committed"}]
+            assert store.object_payload(oid) == {"value": "committed"}
+            restored = store.get_object(oid)
+            assert restored is not None
+            assert restored.version == 1
+            assert restored.payload == {"value": "committed"}
+        finally:
+            release_writer.set()
+            store.close()
+
+    def test_get_object_reads_sql_row_and_payload_from_one_store_snapshot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store = SQLiteStore(":memory:")
+        row_selected = threading.Event()
+        writer_started = threading.Event()
+        writer_finished = threading.Event()
+        reader_errors: list[BaseException] = []
+        writer_errors: list[BaseException] = []
+        observed: list[AgentObject] = []
+        oid = "obj_payload_snapshot"
+        before = _runtime_object(oid, {"value": "before"})
+        after = replace(
+            before,
+            payload={"value": "after"},
+            version=2,
+            updated_at=utc_now(),
+        )
+        try:
+            store.insert_object(before)
+            original_has_payload = store.has_object_payload
+
+            def coordinated_has_payload(*args: Any, **kwargs: Any) -> bool:
+                if threading.current_thread().name == "payload-snapshot-reader":
+                    row_selected.set()
+                    assert writer_started.wait(timeout=5)
+                    # A correct get_object holds the store lock across both
+                    # the SQL row and cache read, keeping this writer blocked.
+                    writer_finished.wait(timeout=0.2)
+                return original_has_payload(*args, **kwargs)
+
+            monkeypatch.setattr(store, "has_object_payload", coordinated_has_payload)
+
+            def read_object() -> None:
+                try:
+                    selected = store.get_object(oid)
+                    assert selected is not None
+                    observed.append(selected)
+                except BaseException as exc:
+                    reader_errors.append(exc)
+
+            def update_object() -> None:
+                try:
+                    assert row_selected.wait(timeout=5)
+                    writer_started.set()
+                    assert store.update_object(after, expected_version=before.version)
+                except BaseException as exc:
+                    writer_errors.append(exc)
+                finally:
+                    writer_finished.set()
+
+            reader = threading.Thread(
+                target=read_object,
+                name="payload-snapshot-reader",
+                daemon=True,
+            )
+            writer = threading.Thread(target=update_object, daemon=True)
+            reader.start()
+            writer.start()
+            reader.join(timeout=5)
+            writer.join(timeout=5)
+
+            assert not reader.is_alive()
+            assert not writer.is_alive()
+            assert reader_errors == []
+            assert writer_errors == []
+            assert len(observed) == 1
+            assert observed[0].version == 1
+            assert observed[0].payload == {"value": "before"}
+            current = store.get_object(oid)
+            assert current is not None
+            assert current.version == 2
+            assert current.payload == {"value": "after"}
+        finally:
+            store.close()
+
     def test_process_memory_root_append_is_commutative(self) -> None:
         store = SQLiteStore(":memory:")
         process = _runnable_process("pid_roots")
@@ -395,7 +600,7 @@ class TestStoreTransactionRecovery:
     def test_outer_rollback_restores_payload_mutated_by_committed_inner_transaction(self) -> None:
         store = SQLiteStore(":memory:")
         try:
-            store.set_object_payload("obj_payload", {"value": "before"})
+            store.insert_object(_runtime_object("obj_payload", {"value": "before"}))
 
             with pytest.raises(RuntimeError, match="rollback outer"):
                 with store.transaction():
@@ -409,7 +614,7 @@ class TestStoreTransactionRecovery:
     def test_nested_payload_commit_merges_earliest_before_image_into_parent(self) -> None:
         store = SQLiteStore(":memory:")
         try:
-            store.set_object_payload("obj_payload", {"value": "before"})
+            store.insert_object(_runtime_object("obj_payload", {"value": "before"}))
 
             with pytest.raises(RuntimeError, match="rollback outer"):
                 with store.transaction():
@@ -425,7 +630,7 @@ class TestStoreTransactionRecovery:
     def test_set_object_payload_sql_failure_restores_previous_payload(self) -> None:
         store = SQLiteStore(":memory:")
         try:
-            store.set_object_payload("obj_payload", {"value": "before"})
+            store.insert_object(_runtime_object("obj_payload", {"value": "before"}))
             store.conn = _ExecuteFailureConnection(
                 store.conn,
                 marker="UPDATE objects SET payload_json",
@@ -438,10 +643,140 @@ class TestStoreTransactionRecovery:
         finally:
             store.close()
 
+    def test_set_object_payload_rejects_missing_and_released_rows_without_cache(
+        self,
+    ) -> None:
+        store = SQLiteStore(":memory:")
+        missing_oid = "obj_payload_missing"
+        released_oid = "obj_payload_released"
+        try:
+            with pytest.raises(
+                ValidationError,
+                match="missing or released Object",
+            ):
+                store.set_object_payload(missing_oid, {"value": "orphan"})
+            assert store.get_persisted_object_state(missing_oid) is None
+            assert not store.has_object_payload(missing_oid)
+            assert missing_oid not in store._object_payloads
+            with pytest.raises(KeyError):
+                store.object_payload(missing_oid)
+
+            store.insert_object(
+                _runtime_object(released_oid, {"value": "before release"})
+            )
+            assert store.delete_object(released_oid)
+            before = store.get_persisted_object_state(released_oid)
+            assert before is not None
+            assert before.lifecycle_state.value == "released"
+            assert not before.payload_present
+
+            with pytest.raises(
+                ValidationError,
+                match="missing or released Object",
+            ):
+                store.set_object_payload(released_oid, {"value": "resurrected"})
+
+            after = store.get_persisted_object_state(released_oid)
+            assert after == before
+            assert not store.has_object_payload(released_oid)
+            assert released_oid not in store._object_payloads
+            with pytest.raises(KeyError):
+                store.object_payload(released_oid)
+        finally:
+            store.close()
+
+    def test_concurrent_release_and_set_payload_never_caches_a_released_object(
+        self,
+    ) -> None:
+        store = SQLiteStore(":memory:")
+        oid = "obj_payload_release_race"
+        start = threading.Barrier(3)
+        set_outcomes: list[str] = []
+        release_outcomes: list[bool] = []
+        unexpected: list[BaseException] = []
+
+        def set_payload() -> None:
+            try:
+                start.wait(timeout=5)
+                store.set_object_payload(oid, {"value": "racing"})
+                set_outcomes.append("updated")
+            except ValidationError:
+                set_outcomes.append("rejected")
+            except BaseException as exc:
+                unexpected.append(exc)
+
+        def release() -> None:
+            try:
+                start.wait(timeout=5)
+                release_outcomes.append(store.delete_object(oid))
+            except BaseException as exc:
+                unexpected.append(exc)
+
+        try:
+            store.insert_object(_runtime_object(oid, {"value": "initial"}))
+            setter = threading.Thread(target=set_payload, daemon=True)
+            releaser = threading.Thread(target=release, daemon=True)
+            setter.start()
+            releaser.start()
+            start.wait(timeout=5)
+            setter.join(timeout=5)
+            releaser.join(timeout=5)
+
+            assert not setter.is_alive()
+            assert not releaser.is_alive()
+            assert unexpected == []
+            assert set_outcomes in (["updated"], ["rejected"])
+            assert release_outcomes == [True]
+            state = store.get_persisted_object_state(oid)
+            assert state is not None
+            assert state.lifecycle_state.value == "released"
+            assert not state.payload_present
+            assert not store.has_object_payload(oid)
+            assert oid not in store._object_payloads
+        finally:
+            store.close()
+
+    def test_set_object_payload_ack_loss_poison_reopens_to_released_state(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "set-payload-ack-loss.sqlite"
+        oid = "obj_payload_ack_loss"
+        store = SQLiteStore(db_path)
+        store.insert_object(_runtime_object(oid, {"value": "before"}))
+        diagnostic = RuntimeError("injected payload commit acknowledgement loss")
+        store.conn = _CommitThenRaiseConnection(store.conn, diagnostic)
+        try:
+            with pytest.raises(
+                ValidationError,
+                match="unusable after uncertain transaction commit",
+            ):
+                store.set_object_payload(oid, {"value": "after"})
+            assert store._poisoned_reason == "commit_outcome_uncertain"
+            assert store._object_payloads[oid] == {"value": "after"}
+        finally:
+            store.close()
+
+        reopened = SQLiteStore(db_path)
+        try:
+            summary = reopened.recover_missing_runtime_object_payloads(
+                require_recovery_lease=lambda: None,
+            )
+            assert summary.total_count == 1
+            assert summary.sample_oids == (oid,)
+            state = reopened.get_persisted_object_state(oid)
+            assert state is not None
+            assert state.lifecycle_state.value == "released"
+            assert not state.payload_present
+            assert state.recovered_after_reopen
+            assert not reopened.has_object_payload(oid)
+        finally:
+            reopened.close()
+
     def test_set_object_payload_commit_failure_restores_previous_payload(self) -> None:
         store = SQLiteStore(":memory:")
         try:
-            store.set_object_payload("obj_payload", {"value": "before"})
+            store.insert_object(_runtime_object("obj_payload", {"value": "before"}))
             store.conn = _FinalizeFailureConnection(store.conn, commit_failures=1)
 
             with pytest.raises(RuntimeError, match="injected commit failure"):
@@ -479,7 +814,7 @@ class TestStoreTransactionRecovery:
     def test_commit_failure_rolls_back_sql_and_object_payload_snapshot(self) -> None:
         store = SQLiteStore(":memory:")
         try:
-            store.set_object_payload("obj_payload", {"value": "before"})
+            store.insert_object(_runtime_object("obj_payload", {"value": "before"}))
             store.conn = _FinalizeFailureConnection(store.conn, commit_failures=1)
 
             with pytest.raises(RuntimeError, match="injected commit failure"):
@@ -504,26 +839,197 @@ class TestStoreTransactionRecovery:
         finally:
             store.close()
 
+    def test_commit_error_after_apply_never_serves_mixed_sql_and_payload_state(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "commit-after-apply.sqlite"
+        store = SQLiteStore(db_path)
+        oid = "obj_commit_after_apply"
+        before = _runtime_object(oid, {"value": "before"})
+        after = replace(
+            before,
+            payload={"value": "after"},
+            version=2,
+            updated_at=utc_now(),
+        )
+        store.insert_object(before)
+        secret = "/private/runtime/tenant.sqlite?password=commit-secret"
+        diagnostic = RuntimeError(
+            f"injected diagnostic after commit applied at {secret}"
+        )
+        store.conn = _CommitThenRaiseConnection(store.conn, diagnostic)
+        try:
+            with pytest.raises(
+                ValidationError,
+                match="unusable after uncertain transaction commit",
+            ) as caught:
+                store.update_object(after, expected_version=before.version)
+
+            assert secret not in str(caught.value)
+            assert caught.value.__cause__ is None
+            assert store._poisoned_reason == "commit_outcome_uncertain"
+            assert len(store._poisoned_failure_fingerprints) == 1
+            fingerprint = store._poisoned_failure_fingerprints[0]
+            assert fingerprint["error_type"] == "RuntimeError"
+            assert fingerprint["exception_text"]["bytes"] == len(
+                str(diagnostic).encode("utf-8")
+            )
+            assert len(fingerprint["exception_text"]["sha256"]) == 64
+            assert secret not in repr(fingerprint)
+            assert store._object_payloads[oid] == {"value": "after"}
+            with pytest.raises(
+                ValidationError,
+                match="unusable after uncertain transaction commit",
+            ) as health:
+                store.get_object(oid)
+            assert secret not in str(health.value)
+            connection = sqlite3.connect(db_path)
+            try:
+                row = connection.execute(
+                    "SELECT version FROM objects WHERE oid = ?",
+                    (oid,),
+                ).fetchone()
+            finally:
+                connection.close()
+            assert row == (2,)
+        finally:
+            store.close()
+
+    def test_single_oid_transaction_does_not_copy_unrelated_cached_payloads(self) -> None:
+        store = SQLiteStore(":memory:")
+
+        class CopyProbe:
+            def __init__(self) -> None:
+                self.copies = 0
+
+            def __deepcopy__(self, _memo: dict[int, Any]) -> CopyProbe:
+                self.copies += 1
+                return self
+
+        probe = CopyProbe()
+        try:
+            store.insert_object(_runtime_object("target", {"value": "before"}))
+            with store.locked():
+                store._object_payloads["unrelated"] = probe
+
+            with store.transaction(include_object_payloads=True):
+                store.set_object_payload("target", {"value": "after"})
+
+            assert probe.copies == 0
+            assert store.object_payload("target") == {"value": "after"}
+        finally:
+            store.close()
+
+    def test_release_error_after_apply_poison_does_not_restore_only_payload_cache(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "release-after-apply.sqlite"
+        store = SQLiteStore(db_path)
+        oid = "obj_release_after_apply"
+        before = _runtime_object(oid, {"value": "before"})
+        after = replace(
+            before,
+            payload={"value": "after"},
+            version=2,
+            updated_at=utc_now(),
+        )
+        store.insert_object(before)
+        secret = "/private/runtime/savepoint.sqlite?token=savepoint-secret"
+        diagnostic = RuntimeError(
+            f"injected diagnostic after savepoint release at {secret}"
+        )
+        store.conn = _ReleaseThenRaiseConnection(store.conn, diagnostic)
+        try:
+            with pytest.raises(
+                ValidationError,
+                match="unusable after transaction rollback failure",
+            ) as caught:
+                with store.transaction():
+                    with store.transaction():
+                        assert store.update_object(
+                            after,
+                            expected_version=before.version,
+                        )
+            assert secret not in str(caught.value)
+            assert caught.value.__cause__ is None
+            assert store._poisoned_reason == "savepoint_release_recovery_failed"
+            assert all(
+                secret not in repr(fingerprint)
+                for fingerprint in store._poisoned_failure_fingerprints
+            )
+
+            # RELEASE took effect inside the still-uncommitted outer
+            # transaction. The failed ROLLBACK TO makes its exact nested state
+            # unknowable, so the store remains unreadable and does not pretend
+            # that restoring the payload alone recovered it.
+            assert store._object_payloads[oid] == {"value": "after"}
+            with pytest.raises(
+                ValidationError,
+                match="unusable after transaction rollback failure",
+            ) as health:
+                store.get_object(oid)
+            assert secret not in str(health.value)
+            connection = sqlite3.connect(db_path)
+            try:
+                row = connection.execute(
+                    "SELECT version FROM objects WHERE oid = ?",
+                    (oid,),
+                ).fetchone()
+            finally:
+                connection.close()
+            assert row == (1,)
+        finally:
+            store.close()
+
     def test_rollback_failure_poison_closes_store(self) -> None:
         store = SQLiteStore(":memory:")
-        store.conn = _FinalizeFailureConnection(store.conn, commit_failures=1, rollback_failures=1)
+        commit_secret = "/private/commit.sqlite?password=commit-driver-secret"
+        rollback_secret = "/private/rollback.sqlite?password=rollback-driver-secret"
+        store.conn = _FinalizeFailureConnection(
+            store.conn,
+            commit_failures=1,
+            rollback_failures=1,
+            commit_error=RuntimeError(f"commit failed at {commit_secret}"),
+            rollback_error=RuntimeError(f"rollback failed at {rollback_secret}"),
+        )
         try:
-            with pytest.raises(ValidationError, match="unusable.*rollback failure"):
+            with pytest.raises(
+                ValidationError,
+                match="unusable.*rollback failure",
+            ) as caught:
                 with store.transaction() as cursor:
                     cursor.execute(
                         "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
                         ("uncertain", None, "{}", "test", "1", "1"),
                     )
+            assert caught.value.__cause__ is None
+            assert commit_secret not in str(caught.value)
+            assert rollback_secret not in str(caught.value)
+            assert store._poisoned_reason == "transaction_commit_rollback_failed"
+            assert len(store._poisoned_failure_fingerprints) == 2
+            assert all(
+                commit_secret not in repr(fingerprint)
+                and rollback_secret not in repr(fingerprint)
+                and len(fingerprint["exception_text"]["sha256"]) == 64
+                for fingerprint in store._poisoned_failure_fingerprints
+            )
 
-            with pytest.raises(ValidationError, match="unusable.*rollback failure"):
+            with pytest.raises(
+                ValidationError,
+                match="unusable.*rollback failure",
+            ) as health:
                 store.list_processes()
+            assert commit_secret not in str(health.value)
+            assert rollback_secret not in str(health.value)
         finally:
             store.close()
 
     def test_release_savepoint_failure_rolls_back_nested_sql_and_payload(self) -> None:
         store = SQLiteStore(":memory:")
         try:
-            store.set_object_payload("obj_payload", {"value": "before"})
+            store.insert_object(_runtime_object("obj_payload", {"value": "before"}))
             store.conn = _FinalizeFailureConnection(store.conn, release_failures=1)
 
             with store.transaction() as outer:

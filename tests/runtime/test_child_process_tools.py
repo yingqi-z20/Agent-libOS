@@ -3,6 +3,7 @@ import pytest
 import asyncio
 import json
 import re
+import threading
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
@@ -11,6 +12,7 @@ from agent_libos.models import (
     EventType,
     ForkMode,
     KilledProcessOutcome,
+    MergeResult,
     ObjectPatch,
     ObjectOwnerKind,
     ObjectType,
@@ -23,11 +25,19 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.runtime.syscalls import LibOSSyscallSession
+from agent_libos.skills import get_builtin_skill_catalog
 from scripts.llm_context_probe import last_tool_result, static_prefix
+from tests.support.public_errors import assert_public_error_message
 
 
 def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
     runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+
+
+def _skill_package_sha256(skill_id: str) -> str:
+    package = get_builtin_skill_catalog().get(skill_id)
+    assert package is not None
+    return package.package_sha256
 
 
 def _grant_image_read(runtime: Runtime, pid: str, image_id: str) -> None:
@@ -168,6 +178,33 @@ class TestChildProcessTool:
         finally:
             runtime.close()
 
+    def test_parent_exit_rejects_live_descendants_without_orphaning_them(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='settle descendants before exit')
+            child = runtime.process.fork(parent, goal='remain live until explicitly settled')
+
+            with pytest.raises(ProcessError, match='descendants are nonterminal'):
+                runtime.process.exit(parent, message='must not commit')
+
+            blocked = runtime.tools.call(
+                parent,
+                'process_exit',
+                {'payload': {'must_not_commit': True}},
+            )
+            assert not blocked.ok
+
+            assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
+            assert runtime.process.get(child).status == ProcessStatus.RUNNABLE
+            assert child in runtime.scheduler.runnable_pids()
+
+            runtime.process.signal_child(parent, child, ProcessSignal.TERMINATE)
+            runtime.process.exit(parent, message='now safe')
+            assert runtime.process.get(parent).status == ProcessStatus.EXITED
+            assert runtime.process.get(child).status == ProcessStatus.KILLED
+        finally:
+            runtime.close()
+
     def test_child_list_signal_and_budget_are_enforced(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -189,10 +226,20 @@ class TestChildProcessTool:
             assert resumed.payload['status'] == 'runnable'
             denied_signal = runtime.tools.call(parent, 'signal_child_process', {'child_pid': other, 'signal': 'pause'})
             assert not denied_signal.ok
-            assert 'not a child' in (denied_signal.error or '')
+            assert_public_error_message(
+                denied_signal.error,
+                code='execution_error',
+                error_type='ProcessError',
+                forbidden=('not a child', other),
+            )
             denied_fork = runtime.tools.call(parent, 'fork_child_process', {'goal': 'second child'})
             assert not denied_fork.ok
-            assert 'exhausted child process budget' in (denied_fork.error or '')
+            assert_public_error_message(
+                denied_fork.error,
+                code='execution_error',
+                error_type='ResourceLimitExceeded',
+                forbidden=('exhausted child process budget',),
+            )
         finally:
             runtime.close()
 
@@ -547,7 +594,12 @@ class TestChildProcessTool:
             )
 
             assert not denied.ok
-            assert 'image:coding-agent:v0' in (denied.error or '')
+            assert_public_error_message(
+                denied.error,
+                code='permission_denied',
+                error_type='CapabilityDenied',
+                forbidden=('image:coding-agent:v0',),
+            )
             assert len(runtime.process.list()) == before
             assert runtime.process.list_children(parent) == []
         finally:
@@ -954,6 +1006,200 @@ class TestChildProcessTool:
         finally:
             runtime.close()
 
+    def test_merge_child_memory_rolls_back_view_ownership_release_and_audit_together(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='merge rollback parent')
+            child = runtime.process.fork(parent, goal='merge rollback child')
+            adopted = runtime.memory.create_object(
+                child,
+                ObjectType.SUMMARY,
+                {'adopt': True},
+                name='child.merge.rollback.adopt',
+            )
+            released = runtime.memory.create_object(
+                child,
+                ObjectType.EVIDENCE,
+                {'release': True},
+                name='child.merge.rollback.release',
+            )
+            runtime.capability.revoke_resource_trusted(
+                f'object:{released.oid}',
+                revoked_by='test',
+                reason='force merge skip',
+            )
+            runtime.process.exit(child, result=adopted)
+
+            before_parent = runtime.process.get(parent)
+            assert before_parent.memory_view is not None
+            before_parent_roots = [handle.oid for handle in before_parent.memory_view.roots]
+            before_adopted = runtime.store.get_object(adopted.oid)
+            before_released = runtime.store.get_object(released.oid)
+            assert before_adopted is not None
+            assert before_released is not None
+            before_parent_caps = {
+                cap.cap_id for cap in runtime.store.list_capabilities(subject=parent)
+            }
+            before_audit_ids = {record.record_id for record in runtime.audit.trace()}
+            original_record = runtime.audit.record
+
+            def fail_final_merge_audit(*args: Any, **kwargs: Any):
+                if kwargs.get('action') == 'process.merge_child_memory':
+                    raise RuntimeError('injected child merge audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_final_merge_audit)
+
+            with pytest.raises(RuntimeError, match='injected child merge audit failure'):
+                runtime.process.merge_child_memory(parent, child)
+
+            after_parent = runtime.process.get(parent)
+            assert after_parent.memory_view is not None
+            assert [handle.oid for handle in after_parent.memory_view.roots] == before_parent_roots
+            after_adopted = runtime.store.get_object(adopted.oid)
+            after_released = runtime.store.get_object(released.oid)
+            assert after_adopted is not None
+            assert after_released is not None
+            assert (after_adopted.owner_kind, after_adopted.owner_id, after_adopted.version) == (
+                before_adopted.owner_kind,
+                before_adopted.owner_id,
+                before_adopted.version,
+            )
+            assert (after_released.owner_kind, after_released.owner_id, after_released.version) == (
+                before_released.owner_kind,
+                before_released.owner_id,
+                before_released.version,
+            )
+            assert {
+                cap.cap_id for cap in runtime.store.list_capabilities(subject=parent)
+            } == before_parent_caps
+            assert {record.record_id for record in runtime.audit.trace()} == before_audit_ids
+        finally:
+            runtime.close()
+
+    def test_terminal_parent_cannot_adopt_terminal_child_memory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='terminal merge parent')
+            child = runtime.process.fork(parent, goal='terminal merge child')
+            child_object = runtime.memory.create_object(
+                child,
+                ObjectType.SUMMARY,
+                {'terminal': True},
+                name='child.terminal.parent.merge',
+            )
+            runtime.process.exit(child, result=child_object)
+            monkeypatch.setattr(
+                runtime.process,
+                '_complete_terminal_cleanup',
+                lambda *_args, **_kwargs: {},
+            )
+            runtime.process.exit(parent)
+            assert runtime.process.get(parent).status == ProcessStatus.EXITED
+
+            with pytest.raises(ProcessError, match='terminated process'):
+                runtime.process.merge_child_memory(parent, child)
+
+            retained = runtime.store.get_object(child_object.oid)
+            assert retained is not None
+            assert retained.owner_kind == ObjectOwnerKind.PROCESS
+            assert retained.owner_id == child
+            parent_view = runtime.process.get(parent).memory_view
+            assert parent_view is not None
+            assert child_object.oid not in {handle.oid for handle in parent_view.roots}
+            runtime.process.retry_terminal_cleanup(parent)
+        finally:
+            runtime.close()
+
+    def test_merge_child_memory_replay_is_a_durable_noop(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='idempotent merge parent')
+            child = runtime.process.fork(parent, goal='idempotent merge child')
+            child_object = runtime.memory.create_object(
+                child,
+                ObjectType.SUMMARY,
+                {'once': True},
+                name='child.merge.once',
+            )
+            runtime.process.exit(child, result=child_object)
+
+            first = runtime.process.merge_child_memory(parent, child)
+            second = runtime.process.merge_child_memory(parent, child)
+
+            assert child_object.oid in first.merged_oids
+            assert second == type(second)(merged_oids=[], skipped_oids=[])
+            active_parent_caps = [
+                cap
+                for cap in runtime.store.list_capabilities(subject=parent)
+                if cap.resource == f'object:{child_object.oid}' and cap.active and not cap.revoked
+            ]
+            assert len(active_parent_caps) == 1
+            assert sum(
+                record.action == 'process.merge_child_memory'
+                for record in runtime.audit.trace()
+            ) == 1
+        finally:
+            runtime.close()
+
+    def test_concurrent_child_memory_merge_has_one_durable_winner(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='concurrent merge parent')
+            child = runtime.process.fork(parent, goal='concurrent merge child')
+            child_object = runtime.memory.create_object(
+                child,
+                ObjectType.SUMMARY,
+                {'once': 'concurrent'},
+                name='child.merge.concurrent.once',
+            )
+            runtime.process.exit(child, result=child_object)
+            barrier = threading.Barrier(3)
+            results: list[MergeResult] = []
+            errors: list[BaseException] = []
+
+            def merge() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    results.append(runtime.process.merge_child_memory(parent, child))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            workers = [threading.Thread(target=merge, daemon=True) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            barrier.wait(timeout=5)
+            for worker in workers:
+                worker.join(timeout=5)
+
+            assert all(not worker.is_alive() for worker in workers)
+            assert errors == []
+            assert sum(not result.merged_oids for result in results) == 1
+            assert sum(
+                child_object.oid in result.merged_oids for result in results
+            ) == 1
+            assert sum(
+                record.action == 'process.merge_child_memory'
+                for record in runtime.audit.trace()
+            ) == 1
+            assert len(
+                [
+                    cap
+                    for cap in runtime.store.list_capabilities(subject=parent)
+                    if cap.resource == f'object:{child_object.oid}'
+                    and cap.active
+                    and not cap.revoked
+                ]
+            ) == 1
+        finally:
+            runtime.close()
+
     def test_parent_exit_releases_unmerged_terminal_child_memory(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -1020,7 +1266,12 @@ class TestChildProcessTool:
             exited = runtime.tools.call(process, 'process_exit', {'result_oid': secret.oid})
 
             assert not exited.ok
-            assert 'lacks read' in (exited.error or '')
+            assert_public_error_message(
+                exited.error,
+                code='permission_denied',
+                error_type='CapabilityDenied',
+                forbidden=('lacks read', secret.oid),
+            )
             assert runtime.process.get(process).status == ProcessStatus.RUNNABLE
         finally:
             runtime.close()
@@ -1039,7 +1290,12 @@ class TestChildProcessTool:
             child = forked.payload['child_pid']
             denied = runtime.tools.call(child, 'read_text_file', {'path': path})
             assert not denied.ok
-            assert 'lacks read' in (denied.error or '')
+            assert_public_error_message(
+                denied.error,
+                code='permission_denied',
+                error_type='CapabilityDenied',
+                forbidden=('lacks read',),
+            )
         finally:
             runtime.close()
 
@@ -1063,7 +1319,15 @@ class ParentChildClient:
         self.parent_pid = pid
         if self.parent_step == 0:
             self.parent_step = 1
-            return self._completion('activate_skill', {'skill_id': 'agent-libos-child-processes'})
+            return self._completion(
+                'activate_skill',
+                {
+                    'skill_id': 'agent-libos-child-processes',
+                    'expected_package_sha256': _skill_package_sha256(
+                        'agent-libos-child-processes'
+                    ),
+                },
+            )
         if self.parent_step == 1:
             self.parent_step = 2
             return self._completion('fork_child_process', {'goal': 'return value 42', 'mode': 'worker', 'include_parent_roots': False})

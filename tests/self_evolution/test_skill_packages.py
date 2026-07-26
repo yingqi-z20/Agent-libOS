@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import os
 import tempfile
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,12 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, SkillDefaults, ToolDefaults
-from agent_libos.models import AgentImage, CapabilityRight
+from agent_libos.models import AgentImage, CapabilityRight, EventType
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.skills.schema import JitToolSpec, SkillPackage, SkillResource
 from agent_libos.substrate import LocalResourceProviderSubstrate
+from tests.support.public_errors import assert_public_error_message
 from tests.support.skills import write_raw_skill, write_skill_package
 
 
@@ -97,6 +99,51 @@ class TestSkillPackageLoading:
                 'zzz-quasar-ledger-reconcile'
             ]
             assert has_more is True
+        finally:
+            runtime.close()
+
+    def test_skill_discovery_returns_split_owner_partial_matches(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            for skill_id, description in (
+                (
+                    'constellation-reader',
+                    'Read constellation workspace text safely.',
+                ),
+                (
+                    'constellation-writer',
+                    'Write constellation workspace text safely.',
+                ),
+                (
+                    'constellation-unrelated',
+                    'Observe constellation telemetry.',
+                ),
+            ):
+                runtime.skills.register_skill_package(
+                    SkillPackage(
+                        skill_id=skill_id,
+                        name=skill_id,
+                        description=description,
+                        instructions='Use echo.',
+                        allowed_tools=['echo'],
+                    ),
+                    actor='test.host',
+                    require_capability=False,
+                )
+
+            discovered = runtime.skills.discover_skills(
+                text='constellation read write',
+                actor='test',
+                require_capability=False,
+                limit=5,
+            )
+
+            discovered_ids = [item['skill_id'] for item in discovered]
+            assert set(discovered_ids[:2]) == {
+                'constellation-reader',
+                'constellation-writer',
+            }
+            assert 'constellation-unrelated' not in discovered_ids
         finally:
             runtime.close()
 
@@ -1276,7 +1323,15 @@ class TestSkillPackageLoading:
                 runtime.filesystem.grant_path(pid, 'syscall-skill/SKILL.md', [CapabilityRight.READ], issued_by='test')
                 runtime.capability.grant(pid, 'skill:syscall-skill', [CapabilityRight.WRITE, CapabilityRight.EXECUTE], issued_by='test')
                 registered = self._run(LibOSSyscallSession(runtime, pid).handle('skill.register_path', {'path': 'syscall-skill'}))
-                loaded = self._run(LibOSSyscallSession(runtime, pid).handle('skill.activate', {'skill_id': 'syscall-skill'}))
+                loaded = self._run(
+                    LibOSSyscallSession(runtime, pid).handle(
+                        'skill.activate',
+                        {
+                            'skill_id': 'syscall-skill',
+                            'expected_package_sha256': registered['package_sha256'],
+                        },
+                    )
+                )
                 assert registered['skill_id'] == 'syscall-skill'
                 assert loaded['skill_id'] == 'syscall-skill'
                 assert 'echo' in runtime.process.get(pid).tool_table
@@ -1298,7 +1353,12 @@ class TestSkillPackageLoading:
                 assert 'read_text_file' in runtime.process.get(pid).tool_table
                 assert not runtime.capability.check(pid, 'filesystem:workspace:secret.txt', CapabilityRight.READ)
                 assert not result.ok
-                assert 'lacks read' in (result.error or '')
+                assert_public_error_message(
+                    result.error,
+                    code='permission_denied',
+                    error_type='CapabilityDenied',
+                    forbidden=('lacks read', 'secret.txt'),
+                )
             finally:
                 runtime.close()
 
@@ -1311,14 +1371,21 @@ class TestSkillPackageLoading:
             runtime = Runtime.open('local')
             try:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='read resource')
-                runtime.skills.register_skill_from_path(skill_dir, actor='cli', require_capability=False)
+                registered = runtime.skills.register_skill_from_path(
+                    skill_dir,
+                    actor='cli',
+                    require_capability=False,
+                )
                 with pytest.raises(CapabilityDenied):
                     runtime.skills.read_skill_resource(pid, 'resource-skill', 'references/guide.md')
                 runtime.capability.grant(pid, 'skill:resource-skill', [CapabilityRight.EXECUTE], issued_by='test')
                 activated = runtime.tools.call(
                     pid,
                     'activate_skill',
-                    {'skill_id': 'resource-skill'},
+                    {
+                        'skill_id': 'resource-skill',
+                        'expected_package_sha256': registered['package_sha256'],
+                    },
                 )
                 assert activated.ok, activated.error
                 assert set(activated.payload) == {'result'}
@@ -1511,6 +1578,153 @@ class TestSkillPackageLoading:
                 assert resource['content'].replace('\r\n', '\n') == 'original-resource-token\n'
             finally:
                 runtime.close()
+
+    def test_reopen_marks_replaced_package_inactive_and_activation_uses_hash_cas(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / 'skill-replace-reopen.sqlite'
+            skill_id = 'reopen-cas-skill'
+            skill_dir = write_skill_package(
+                root,
+                skill_id,
+                allowed_tools=['echo'],
+                body='# reopen-cas-skill\n\nUse package A.\n',
+            )
+            runtime = Runtime.open(database)
+            try:
+                pid = runtime.process.spawn(
+                    image='coding-agent:v0',
+                    goal='activate only the discovered Skill content',
+                )
+                package_a = runtime.skills.register_skill_from_path(
+                    skill_dir,
+                    actor='test.host',
+                    require_capability=False,
+                )
+                runtime.skills.activate_skill(
+                    pid,
+                    skill_id,
+                    actor=pid,
+                    require_capability=False,
+                    expected_package_sha256=package_a['package_sha256'],
+                )
+                write_skill_package(
+                    root,
+                    skill_id,
+                    allowed_tools=['echo'],
+                    body='# reopen-cas-skill\n\nUse package B.\n',
+                )
+                package_b = runtime.skills.register_skill_from_path(
+                    skill_dir,
+                    actor='test.host',
+                    replace=True,
+                    require_capability=False,
+                )
+                assert package_b['package_sha256'] != package_a['package_sha256']
+                runtime.capability.grant(
+                    pid,
+                    runtime.config.skills.registry_resource,
+                    [CapabilityRight.READ],
+                    issued_by='test.host',
+                )
+                execute = runtime.capability.grant_once(
+                    pid,
+                    runtime.skills.resource_for(skill_id),
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test.host',
+                )
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(database)
+            try:
+                discovered = reopened.tools.call(
+                    pid,
+                    'discover_skills',
+                    {'text': skill_id, 'limit': 1},
+                )
+                assert discovered.ok
+                summary = discovered.payload['skills'][0]
+                assert summary['package_sha256'] == package_b['package_sha256']
+                assert summary['active'] is False
+                assert discovered.payload['next_step'] == 'activate_skill'
+
+                before = reopened.process.get(pid)
+                before_loaded = deepcopy(before.loaded_skills)
+                before_tool_table = dict(before.tool_table)
+                before_model_tool_table = dict(before.model_tool_table)
+                before_candidates = reopened.store.select_table_rows('tool_candidates')
+                before_event_ids = {event.event_id for event in reopened.events.list()}
+                before_audit_ids = {record.record_id for record in reopened.audit.trace()}
+                prepare_calls = 0
+                original_prepare = reopened.skills._prepare_jit_tools
+
+                def observe_prepare(*args: Any, **kwargs: Any) -> Any:
+                    nonlocal prepare_calls
+                    prepare_calls += 1
+                    return original_prepare(*args, **kwargs)
+
+                monkeypatch.setattr(reopened.skills, '_prepare_jit_tools', observe_prepare)
+                stale = reopened.tools.call(
+                    pid,
+                    'activate_skill',
+                    {
+                        'skill_id': skill_id,
+                        'expected_package_sha256': package_a['package_sha256'],
+                    },
+                )
+
+                assert not stale.ok
+                assert (
+                    stale.payload['error']['details']['error_type']
+                    == 'SkillPackageChanged'
+                )
+                after_stale = reopened.process.get(pid)
+                assert after_stale.loaded_skills == before_loaded
+                assert after_stale.tool_table == before_tool_table
+                assert after_stale.model_tool_table == before_model_tool_table
+                assert reopened.store.select_table_rows('tool_candidates') == before_candidates
+                assert reopened.store.get_capability(execute.cap_id).uses_remaining == 1
+                assert prepare_calls == 0
+                assert not [
+                    event
+                    for event in reopened.events.list()
+                    if event.event_id not in before_event_ids
+                    and event.type == EventType.SKILL_LOADED
+                ]
+                assert not [
+                    record
+                    for record in reopened.audit.trace()
+                    if record.record_id not in before_audit_ids
+                    and record.action == 'skill.activate'
+                ]
+
+                activated = reopened.tools.call(
+                    pid,
+                    'activate_skill',
+                    {
+                        'skill_id': skill_id,
+                        'expected_package_sha256': package_b['package_sha256'],
+                    },
+                )
+                assert activated.ok
+                assert activated.payload['result']['package_sha256'] == package_b['package_sha256']
+                assert reopened.store.get_capability(execute.cap_id).uses_remaining == 0
+                assert prepare_calls == 1
+
+                current = reopened.tools.call(
+                    pid,
+                    'discover_skills',
+                    {'text': skill_id, 'limit': 1},
+                )
+                assert current.ok
+                assert current.payload['skills'][0]['active'] is True
+                assert current.payload['next_step'] == 'use_loaded_skill'
+            finally:
+                reopened.close()
 
     def test_checkpoint_restore_and_fork_do_not_resurrect_global_skill_trust(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -52,10 +52,8 @@ class _PostgresDialect:
             "INSERT OR REPLACE INTO skill_trust",
             "INSERT INTO skill_trust",
         )
-        # Skill discovery keeps package snapshots in canonical JSON text.  The
-        # shared repository uses SQLite's json_extract() to search only the
-        # public description field; translate that exact reviewed expression
-        # rather than broadening search to the private instruction payload.
+        # Retain compatibility for migrations and downstream repositories that
+        # still issue the former reviewed description-only SQLite expression.
         transformed = _SQLITE_SKILL_DESCRIPTION_JSON_EXTRACT.sub(
             "(package_json::jsonb ->> 'description')",
             transformed,
@@ -131,6 +129,21 @@ class _PostgresConnection:
         """Driver-reported session state after a possibly partial close."""
 
         return bool(self._conn.closed)
+
+    @property
+    def in_transaction(self) -> bool | None:
+        """Report a definite transaction state after a commit diagnostic."""
+
+        status = self._conn.info.transaction_status
+        name = str(getattr(status, "name", "")).upper()
+        if name == "IDLE":
+            return False
+        if name in {"INTRANS", "INERROR"}:
+            return True
+        # ACTIVE should not remain observable after a synchronous commit call
+        # returns. Treat it as indeterminate rather than claiming rollback can
+        # definitely recover an outcome that may already have crossed commit.
+        return None
 
     def commit(self) -> None:
         self._conn.commit()

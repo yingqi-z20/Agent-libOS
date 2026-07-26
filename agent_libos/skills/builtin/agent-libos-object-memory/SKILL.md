@@ -24,6 +24,8 @@ Creates one slash-delimited `namespace`; `parent_namespace` defaults to its path
 
 Lists readable Objects and direct readable child namespaces. Never broaden an omitted/exact scope. Bounded `limit` is shared: Objects consume it first, then children. No cursor/total/completeness exists; a full page or missing name does not prove absence.
 
+Object and direct-child namespace discovery use bounded keyset pages under a separate configured scan ceiling. If that ceiling is reached before the requested result is complete, listing fails explicitly; narrow the namespace or limit instead of treating the failed scan as evidence of absence.
+
 Objects expose OID/namespace/name/type/version; children expose namespace/parent. Namespace and entry read rights are enforced and finite grants may be consumed. Payload, metadata, labels, immutability, provenance, and view membership are absent.
 
 ### `create_memory_object`
@@ -31,11 +33,17 @@ Objects expose OID/namespace/name/type/version; children expose namespace/parent
 Creates typed JSON and attaches its handle to the caller's MemoryView. Required: `type`, direct JSON `payload`. Optional: name, namespace, metadata, parents, `immutable` (true).
 
 - Valid types are `task`, `goal`, `plan`, `step`, `constraint`, `message`, `human_decision`, `human_request`, `tool_result`, `observation`, `error_trace`, `code_patch`, `test_result`, `evidence`, `claim`, `summary`, `skill`, `tool_spec`, `tool_candidate`, `tool_artifact`, `checkpoint`, `process_state`, `external_ref`, and `artifact`. Type classifies; it does not impose a payload schema.
-- Pass containers directly, not encoded strings. Payload is bounded. Choose a stable name for later read/append/transfer/task use.
+- Pass containers directly, not encoded strings. A JSON-looking string is still
+  a string and is stored literally; use an actual object/array value when a
+  container is intended. Payload is bounded. Choose a stable name for later
+  read/append/transfer/task use.
 - Set `immutable=false` at creation when append/writable ownership is needed. Use a `plan` with `{"entries":[]}` as a ledger.
-- `metadata` accepts `title`, `summary`, `tags`, `mime_type`, `sensitivity`, `retention_policy`, `trust_level`, `integrity`, `tenant`, and `principal`. Origin/token estimate are derived; models cannot declassify or elevate trust/integrity.
+- `metadata` accepts only `title`, `summary`, `tags`, `mime_type`, `sensitivity`, `retention_policy`, `trust_level`, `integrity`, `tenant`, and `principal`. Fields and collection items are strictly typed and bounded by configured character, item-count, and canonical-byte limits. Origin/token estimate are derived; models cannot declassify or elevate trust/integrity.
 - `parent_oids` are readable source Objects, never paths/call IDs. They supplement observed sources; invalid parents reject. Runtime controls labels/provenance.
 - Needs namespace write plus parent read. Output is OID/namespace/name/type, not version, metadata, labels, provenance, or mutability.
+- Object publication, its capability/audit evidence, and caller MemoryView root
+  attachment share one transaction. A view-attachment failure rolls the create
+  back instead of leaving an unreported named Object.
 
 ### `read_memory_object`
 
@@ -47,7 +55,10 @@ Output includes identity/version/pointer, type/shape, `serialized_bytes`, `sha25
 
 ### `append_memory_object`
 
-Appends direct JSON `entry`; `list_field` defaults to `entries`. On object payload, a missing field is created (typos matter) and non-list fails. Root lists ignore the field and return null. Scalars/immutable Objects fail.
+Appends direct JSON `entry`; JSON-looking strings remain literal strings.
+`list_field` defaults to `entries`. On object payload, a missing field is
+created (typos matter) and non-list fails. Root lists ignore the field and
+return null. Scalars/immutable Objects fail.
 
 Needs namespace read and Object read/write; inherits flow labels/provenance and size limits. Output is identity, new version, `appended=true`, field, and length—not content. No caller CAS exists; internal conditional update can conflict. Version is not append count.
 

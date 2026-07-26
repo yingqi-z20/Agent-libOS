@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from typing import Any
+
+
+_OPENAI_SCHEMA_MAX_DEPTH = 64
+_OPENAI_SCHEMA_MAX_NODES = 4_096
+_OPENAI_SCHEMA_MAX_BYTES = 1_048_576
 
 
 def openai_chat_tool_schema(
@@ -78,11 +84,11 @@ def normalize_openai_strict_schema(
     compatible.
     """
 
-    original = deepcopy(schema)
+    _validate_schema_bounds(schema)
     candidate = deepcopy(schema)
     if _normalize_schema(candidate):
         return candidate, True
-    return original, False
+    return deepcopy(schema), False
 
 
 def normalize_openai_structured_output_schema(
@@ -94,6 +100,79 @@ def normalize_openai_structured_output_schema(
             "structured output schema must be compatible with OpenAI strict JSON schema"
         )
     return normalized
+
+
+def _validate_schema_bounds(schema: dict[str, Any]) -> None:
+    """Reject cyclic or oversized schemas before copying or recursive traversal."""
+
+    pending: list[tuple[Any, int, bool]] = [(schema, 0, False)]
+    active_containers: set[int] = set()
+    node_count = 0
+    encoded_bytes = 0
+
+    while pending:
+        value, depth, leaving = pending.pop()
+        if leaving:
+            active_containers.remove(id(value))
+            continue
+
+        node_count += 1
+        if node_count > _OPENAI_SCHEMA_MAX_NODES:
+            raise ValueError(
+                "OpenAI schema exceeds maximum node count="
+                f"{_OPENAI_SCHEMA_MAX_NODES}"
+            )
+        if depth > _OPENAI_SCHEMA_MAX_DEPTH:
+            raise ValueError(
+                "OpenAI schema exceeds maximum depth="
+                f"{_OPENAI_SCHEMA_MAX_DEPTH}"
+            )
+
+        if isinstance(value, dict):
+            if any(not isinstance(key, str) for key in value):
+                raise ValueError("OpenAI schema object keys must be strings")
+            container_id = id(value)
+            if container_id in active_containers:
+                raise ValueError("OpenAI schema must not contain cyclic containers")
+            active_containers.add(container_id)
+            pending.append((value, depth, True))
+            encoded_bytes += 2 + max(0, len(value) - 1) + len(value)
+            for key, child in reversed(tuple(value.items())):
+                encoded_bytes += len(
+                    json.dumps(
+                        key,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                pending.append((child, depth + 1, False))
+        elif isinstance(value, list):
+            container_id = id(value)
+            if container_id in active_containers:
+                raise ValueError("OpenAI schema must not contain cyclic containers")
+            active_containers.add(container_id)
+            pending.append((value, depth, True))
+            encoded_bytes += 2 + max(0, len(value) - 1)
+            pending.extend(
+                (child, depth + 1, False) for child in reversed(value)
+            )
+        else:
+            try:
+                encoded = json.dumps(
+                    value,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("OpenAI schema must contain only JSON values") from exc
+            encoded_bytes += len(encoded.encode("utf-8"))
+
+        if encoded_bytes > _OPENAI_SCHEMA_MAX_BYTES:
+            raise ValueError(
+                "OpenAI schema exceeds maximum encoded bytes="
+                f"{_OPENAI_SCHEMA_MAX_BYTES}"
+            )
 
 
 def _normalize_schema(schema: Any) -> bool:

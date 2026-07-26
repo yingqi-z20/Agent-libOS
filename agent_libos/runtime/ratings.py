@@ -63,18 +63,21 @@ class AgentRatingManager:
             updated_at=now,
             metadata=dict(metadata or {}),
         )
-        saved = self.store.upsert_agent_rating(rating)
-        self.audit.record(
-            actor=f"human:{selected_rater}",
-            action="agent.rating.upsert",
-            target=f"process:{pid}",
-            decision={
-                "rating_id": saved.rating_id,
-                "score": saved.score,
-                "source": saved.source,
-                "comment_chars": len(saved.comment),
-            },
-        )
+        # The upsert, exact same-key readback performed by the repository, and
+        # required audit evidence share one commit/serialization boundary.
+        with self.store.transaction():
+            saved = self.store.upsert_agent_rating(rating)
+            self.audit.record(
+                actor=f"human:{selected_rater}",
+                action="agent.rating.upsert",
+                target=f"process:{pid}",
+                decision={
+                    "rating_id": saved.rating_id,
+                    "score": saved.score,
+                    "source": saved.source,
+                    "comment_chars": len(saved.comment),
+                },
+            )
         return saved
 
     def _require_process(self, pid: str) -> None:

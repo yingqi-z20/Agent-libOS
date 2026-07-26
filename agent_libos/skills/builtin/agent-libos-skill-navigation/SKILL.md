@@ -11,11 +11,12 @@ First inspect `Loaded skills` and visible schemas. If the exact Skill is already
 
 ### `discover_skills`
 
-Use a focused query such as `{"text":"git pull request","limit":8}` whenever the exact ID is uncertain or the required domain schema is not visible. Query terms are matched independently against visible identity and description metadata, then results are relevance-ranked.
+Use a focused query such as `{"text":"git pull request","limit":8}` whenever the exact ID is uncertain or the required domain schema is not visible. Query terms are matched independently against visible identity and description metadata, then results are relevance-ranked. A multi-capability query can return multiple narrowly owned Skills when each has sufficient term coverage; activate each relevant exact ID instead of trying to force one Skill to own the whole query.
 
-- `text` and `limit` apply uniformly to every visible Skill. Start with concrete nouns and actions, omit `limit` or use at least 5, and avoid pasting the whole goal. A broad empty query is allowed but is usually wasteful.
+- `text` and `limit` apply uniformly to every visible Skill. Start with concrete nouns and actions, omit `limit` or use at least 5 as an unquoted JSON integer, and avoid pasting the whole goal. A broad empty query is allowed but is usually wasteful.
 - The result contains one `skills` page plus `has_more`, `visibility_limited`, and `next_step`. Every summary has the same fields regardless of package source: identity, description, declared tool/action/JIT names, required capabilities, package hash, and `active`.
-- `next_step=activate_skill` means choose one plausible returned exact ID rather than searching again. `next_step=refine_search` means shorten or replace the terms; never repeat an unchanged query.
+- `active=true` means the trusted loaded snapshot has the same `package_sha256` as this catalog entry. A loaded older snapshot remains immutable and usable, but discovery reports it as `active=false` after package replacement or a catalog upgrade.
+- `next_step=activate_skill` means at least one returned match is not the current loaded content. `next_step=use_loaded_skill` means every returned match is already loaded at the discovered hash. `next_step=refine_search` means no match was returned, so shorten or replace the terms; never repeat an unchanged query.
 - There is no cursor. `has_more=true` means more matches exist for this exact query, so refine `text` or raise `limit` within the Host maximum. It does not control whether a zero-result query may be refined.
 - `visibility_limited=true` means catalog authority prevented searching every configured source. It says nothing about the origin of returned entries, does not invalidate a plausible returned match, and does not by itself justify requesting broader authority.
 - Model discovery does not scan directories for packages the Host has not made visible. Do not invent IDs or inspect paths as a fallback.
@@ -23,13 +24,13 @@ Use a focused query such as `{"text":"git pull request","limit":8}` whenever the
 
 ### `activate_skill`
 
-Pass exactly one ID returned by discovery, for example `{"skill_id":"example-skill"}`. Do not activate from a guessed name.
+Pass exactly one ID and its hash from the same discovery result, for example `{"skill_id":"example-skill","expected_package_sha256":"<64 lowercase hex characters>"}`. Do not activate from a guessed name or omit, normalize, or substitute the discovered hash.
 
 Activation always has one model-visible result contract: the outer envelope is `{"result": {...}}`, whose nested result contains `pid`, `skill_id`, `name`, `version`, `tool_names`, `tool_ids`, `jit_tool_ids`, `instructions_hash`, and `package_sha256`. Package origin, Host trust mechanism, and internal activation provenance are not model routing inputs.
 
-The runtime validates the exact package snapshot and every binding atomically. A static binding may reveal an image-owned tool; a package-declared JIT binding may add a process-local tool. Neither case grants the primitive Capability or Human approval needed for an effect. Activation authority is determined by Host policy and package contents; if an ASK is pending, resume it rather than submitting a duplicate activation.
+The runtime compare-and-swaps against `expected_package_sha256`, then validates the exact package snapshot and every binding atomically under the registry lifecycle lock. If registration or catalog content changed after discovery, activation fails before process, tool, or JIT publication. A static binding may reveal an image-owned tool; a package-declared JIT binding may add a process-local tool. Neither case grants the primitive Capability or Human approval needed for an effect. Activation authority is determined by Host policy and package contents; if an ASK is pending, resume it rather than submitting a duplicate activation.
 
-New instructions and schemas appear in the next turn. Reactivation is not a harmless read: it replaces the previous snapshot and bindings and can retire superseded JIT, so avoid it when `active=true` or the exact Skill is already in `Loaded skills`.
+New instructions and schemas appear in the next turn. Reactivation is not a harmless read: it replaces the previous snapshot and bindings and can retire superseded JIT, so avoid it when `active=true`. If the same ID is loaded but discovery reports `active=false`, keep the old immutable snapshot unless the newly discovered metadata and hash justify an explicit replacement.
 
 Direct JIT exposure shows each activated JIT schema. Multiplexed images expose only `run_jit_tool`; use the loaded contract and `{"tool_name":"exact-name","arguments":{...}}`. The prompt omits the JIT catalog/source resource entries, but an exact loaded-snapshot path already supplied by trusted instructions or earlier authorized evidence remains readable. Never guess a hidden schema or probe filenames.
 
@@ -56,7 +57,7 @@ The outer envelope is `{"result": {...}}`; the nested result contains `pid`, `sk
 1. Check `Loaded skills` and visible schemas. If the exact Skill is already usable, stop navigation and perform the task.
 2. Discover once with two to four task terms and a sufficient but bounded limit.
 3. Select by exact ID, description, declared behavior, and package hash—not name resemblance or presumed source.
-4. Activate once. Match the returned `skill_id` and discovered `package_sha256`.
+4. If `next_step=use_loaded_skill`, do not reactivate. Otherwise activate once with the selected discovery row's exact ID and `package_sha256`; match both against the activation receipt.
 5. Validate `set(tool_names) == keys(tool_ids) union keys(jit_tool_ids)`. Treat any mismatch as incomplete settlement.
 6. On the next turn, confirm the exact body under `Loaded skills` and inspect each newly visible schema before use. Read only required declared resources.
 7. Use the Skill to finish the user task. Keep it loaded across related steps; unload only when reduced prompt/tool exposure is useful and no later step depends on it.
@@ -66,7 +67,8 @@ The outer envelope is `{"result": {...}}`; the nested result contains `pid`, `sk
 
 - Already loaded: do not reactivate; it rewrites lifecycle evidence and can replace package-declared JIT.
 - No matching entry: follow `next_step=refine_search` and change or shorten the terms once; `has_more` only describes additional matches to the same query. If visibility is limited and no refined query matches, report that authority bounds the conclusion. Do not scan paths or invent an ID through these tools.
-- Tool-ID mismatch, invalid provenance, or hash mismatch: stop. Do not request partial activation or substitute an unverified similarly named tool.
+- Tool-ID mismatch or invalid provenance: stop. Do not request partial activation or substitute an unverified similarly named tool.
+- `SkillPackageChanged` activation error: the stale activation made no lifecycle mutation. Rediscover, re-evaluate the changed metadata and hash, and activate only if that exact new content is still appropriate; never retry the stale hash.
 - Discovery or activation denial: request only the exact catalog or Skill right made available by Host policy; never duplicate a pending ASK.
 - Unknown activation settlement: inspect the next turn's `Loaded skills` or repeat focused discovery and check `active`. Do not blindly repeat a non-idempotent activation.
 - Missing/oversized resource: compare loaded metadata and correct the path or ceiling once; no filesystem bypass.

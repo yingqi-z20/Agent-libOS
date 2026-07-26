@@ -25,8 +25,9 @@ longer defines.
 - `primitive-checks-before-effects`: primitives enforce capability, policy,
   approval, and validation before side effects, including hidden provider
   metadata gates, filesystem mutation authority before target-state
-  observation, stale-size-safe bounded reads, PTY spawn cleanup, and write
-  limits. Filesystem/clock/shell/PTY provider calls persist a pending `unknown`
+  observation, descriptor-bound no-follow filesystem state snapshots,
+  stale-size-safe bounded reads, PTY spawn cleanup, and write limits.
+  Filesystem/clock/shell/PTY provider calls persist a pending `unknown`
   effect intent before the boundary, CAS the same id on final classification,
   and after attempting the call remove it without a final record only when the
   provider certifies `ProviderEffectNotStarted` and every completed earlier
@@ -34,16 +35,29 @@ longer defines.
   authority. Clock sleep/asleep inserts the intent before its first monotonic
   observation, treats elapsed-time measurement as information flow, and permits
   restore/abandon only when that first observation is certified not-started.
-- `capability-matching-and-delegation`: typed matching, deny dominance,
+- `capability-matching-and-delegation`: typed matching and global precedence
+  across every matching capability: `DENY` (including restrictive authority
+  rules carried by otherwise-allow capabilities), then an exact matched
+  one-shot human approval binding that safely resolves an ASK boundary, then
+  `ASK`, then ordinary `ALLOW`. Stale, target-version-mismatched, or
+  other-operation approval bindings never participate in that exception;
   one-shot grants, atomic default consumption, exact effect reservations,
   revoke-wins restoration, crash abandonment, grant-as-transfer,
   parent-linked delegation attenuation, restrictive parent boundaries,
-  malformed authority-rule fail-closed behavior, and ISO-normalized leases.
+  strict authority-rule decoding where only absent or null conditions become
+  an empty mapping, malformed authority-rule fail-closed behavior, and
+  ISO-normalized leases.
   Delegation publishes its row/process attachment/evidence atomically, and a
   multi-spec authority derivation is prevalidated and committed all-or-nothing.
 - `capability-subject-isolation`: preselected capability candidates are filtered
   to the requested process subject, and Human-approved capability
   specifications cannot redirect authority to another process.
+- `capability-list-api-pages-are-hard-bounded`: GUI and CLI capability lists
+  reject non-positive, coercible, or over-configured limits. Include-inactive
+  views push the bound into SQL before decoding; active-only views use a stable
+  capability-id keyset, retain one bounded page at a time, and continue through
+  expired or invalid parent chains until they collect the exact requested page
+  or exhaust the source.
 - `authority-mutations-revalidate-inside-one-transaction`: JSON-RPC, MCP,
   DataFlow, Skill registration/activation/unload/trust, capability issue/revoke, and
   checkpoint publication recompute the complete allow/deny decision after
@@ -66,6 +80,12 @@ longer defines.
   trees serialize fairly, including normalized aliases and missing-parent
   creation, while unrelated paths remain concurrent and widening reentrant
   lock upgrades fail.
+- `filesystem-host-aliases-share-one-authority-and-label-identity`: host path
+  aliases that name the same filesystem entry share capability and data-label
+  identity, while genuinely distinct host names remain distinct. Manifest
+  schema v2 records the exact Darwin and Linux nodes required for this claim;
+  the configured native-platform CI matrix selects those markers separately
+  and fails if any selected platform node skips.
 - `task-authority-manifest-bounds-launch`: image requirements are declarations;
   Host manifest inputs are closed and strictly typed. Unknown fields, invalid
   scalar types, and malformed provider-effect wildcard forms fail closed before
@@ -177,7 +197,12 @@ longer defines.
 - `object-memory-names-are-not-capabilities`: Object Memory names and
   namespaces do not bypass object capabilities. Successful namespace listing
   consumes every finite namespace/object visibility decision used in the
-  returned result in the same transaction as its audit.
+  returned result in the same transaction as its audit. Namespace discovery
+  and non-exact queries use payload-free Object keyset pages and bounded direct
+  child-namespace keyset pages under an independent scan ceiling; only
+  authorized text candidates or returned list entries load payloads. Reaching
+  the ceiling before a complete result fails explicitly and rolls back derived
+  handles and finite-use consumption.
 - `object-memory-materialization-budget-is-authoritative`: Object Memory
   context materialization is bounded by final rendered object text, not trusted
   metadata token estimates.
@@ -190,9 +215,16 @@ longer defines.
   compaction before the Object Memory hard limit; without the independent
   maintenance authority it cannot elevate the process. Synchronous or resumed
   failure terminates without recursively retrying the same oversized
-  generation.
+  generation. A failed compaction job stores one correlated public envelope
+  plus a private type/byte-count/SHA-256 observation, never Host, Provider, OS,
+  validation, or authority exception text. Interrupt and cancellation signals
+  retain their control-flow exception type after the job is durably failed;
+  they cannot become a successful tool result.
 - `child-memory-merge-lifecycle-is-explicit`: terminal child process memory
-  remains mergeable, then is adopted or released by the parent lifecycle.
+  remains mergeable only by a live direct parent. Handle grants, parent roots,
+  ownership adoption/release, child-view consumption, and audit evidence commit
+  atomically; the consumed terminal view is a durable idempotency marker, so
+  concurrent or replayed merges have one winner and no duplicate authority.
 - `object-memory-lifecycle-is-explicit`: Object Memory ownership, release, and
   RAII cleanup are explicit and revoke stale authority, including Object-bound
   PTY handles. Lifecycle mutations serialize ownership-lock before store
@@ -200,16 +232,31 @@ longer defines.
   races, concurrent updates, and owner ABA fail closed. Trusted delete rolls
   back Object release, capability revocation, audit, and in-memory payload
   together; a multi-Object ownership transfer and its audit are all-or-nothing.
+  Forked MemoryView roots are prevalidated and their child grants, finite source
+  uses, and audit commit in one ownership-lock/transaction boundary. Mutable
+  Object metadata is structurally revalidated and bounded by configured field,
+  collection, item, and canonical-byte limits before any Object side effect.
+  Namespace metadata is strict, finite, cycle-free bounded JSON under the same
+  byte ceiling and is rejected before namespace, capability, audit, event, or
+  cache mutation across Host, tool, and syscall entrypoints.
   Link authorization, both Objects' LIVE checks, finite-use consumption, and
   evidence share that same ownership-lock/transaction linearization point.
 - `runtime-store-single-active-writer`: a writable persistent runtime store has
-  at most one active Runtime opener across canonical/symlink path aliases.
-  SQLite validates a no-follow regular-file lease or uses its kernel exclusive
-  fallback; the secure POSIX path keeps database/lease/journal/WAL/SHM files
-  owner-only; PostgreSQL keys advisory leases by database/schema.
+  at most one active Runtime opener across canonical, symlink, hardlink, renamed
+  inode, and replaced-lockfile aliases. SQLite validates owner-only, single-link
+  database/lease/journal/WAL/SHM files and holds both an adjacent path lease and
+  an inode-keyed private identity lease; an existing path that disappears during
+  preflight is never recreated. PostgreSQL keys advisory leases by database/schema.
 - `storage-transactions-recover-or-fail-closed`: commit/savepoint finalization
-  failure restores SQL and opted-in Object payload state; rollback failure
-  poisons/closes the store.
+  failure restores SQL and lazily journaled per-Object payload state when the
+  transaction is definitely rollbackable. A commit diagnostic after the driver
+  stops reporting an active transaction is outcome-uncertain and poisons/closes
+  the store without manufacturing a mixed SQL/payload snapshot; rollback failure
+  likewise poisons/closes the store. Poison errors expose only stable reason
+  codes; driver-authored exception text is retained only as in-memory type,
+  byte-count, and SHA-256 diagnostics. Direct payload-cache replacement first
+  conditionally updates exactly one live Object row, so missing or released
+  identifiers cannot create cache-only payloads or resurrect released state.
 - `runtime-domain-storage-uses-exact-typed-facades`: Runtime, process, syscall,
   data-flow, and Tool orchestration use exact typed storage facades; persisted
   Object security projections are validated without materializing runtime-only
@@ -263,9 +310,36 @@ longer defines.
   authority reservations, operation links, events, and audit commit or roll
   back as one unit, so an evidence-sink failure cannot publish a partial Human
   authority transition.
+- `human-response-payloads-are-bounded-before-side-effects`: Human decisions
+  and provider answers are bounded by canonical byte size, JSON depth, and node
+  count before request, process, or capability decision state can change.
+  Direct invalid decisions publish no event or audit. A terminal-provider read
+  is protected and evidenced before its result can be validated; an invalid
+  answer contributes only a bounded rejection marker to that evidence and
+  leaves the pending request retryable.
+- `jit-syscall-arguments-are-exactly-typed-and-bounded`: every field consumed
+  by a common-contract built-in JIT syscall is validated against its exact JSON
+  type and configured hard bounds before primitives, deferred lifecycle state,
+  mailbox acknowledgement, destructive/replacement semantics, or success
+  audit can occur. Invalid calls remain charged and request-audited, canonical
+  aliases share the same contract, and finite integer or floating-point JSON
+  durations retain their documented numeric behavior. Capability delegation
+  retains its capability-domain validation.
+- `builtin-tool-arguments-are-exactly-typed`: model-facing built-in Tool calls
+  validate both JSON strings and mappings in Pydantic strict mode before tool
+  execution. Numeric or string lookalikes therefore cannot enable recursive
+  deletion, preserve authority across exec, inherit parent memory into a child,
+  or select destructive Git mutation controls; correctly typed JSON values
+  retain their documented behavior.
 - `shell-and-jit-containment`: native Shell execution is argv-constrained and
   remains behind Shell policy, capability/effect checks, and finite-use leases;
-  it is a Host subprocess boundary, not the Deno JIT sandbox. Deno JIT
+  destructive built-in denial remains absolute, while matching custom denials
+  override built-in ask/allow classifications. Custom argv rules compare the
+  full conservative cross-platform executable identity and combine argv,
+  regex, cwd, timeout, and direct operation conditions conjunctively against a
+  complete primitive operation context; missing required context cannot
+  auto-allow execution. It is a Host subprocess boundary, not the Deno JIT
+  sandbox. Deno JIT
   candidates are separately sandbox-validated, process-local, cached-only at
   runtime, and mediated through primitive syscalls. JIT lifecycle
   rows/aliases/handles commit atomically, composite failures discard unpublished
@@ -282,10 +356,13 @@ longer defines.
   certified `ProviderEffectNotStarted`, and record ambiguous failures as
   `unknown`. PTY spawn/write/resize/close use structured pending intents and
   same-id conditional finalization; spawn publication failures retain cleanup
-  metadata, while classifier failures finalize unknown evidence rather than
-  dropping it. Follow-on finite object rights reserve/restore around the host
-  call, and automatic child-exit cleanup records a close intent before exit-code
-  observation/close. Object release finalizers run outside the SQL transaction so PTY
+  metadata, fence every failed-create handle behind a Host-only orphan key
+  before best-effort public Object deletion, and permit lifecycle close retry
+  without making the orphan caller-addressable. Classifier failures finalize
+  unknown evidence rather than dropping it. Follow-on finite object rights
+  reserve/restore around the host call, and automatic child-exit cleanup records
+  a close intent before exit-code observation/close. Object release finalizers
+  run outside the SQL transaction so PTY
   close can durably record its intent; `swe_edit` refuses truncated source.
   Auto-allowed direct Git inspection disables optional locks, repository
   fsmonitor, and external diff helpers before the provider boundary. Direct Git
@@ -314,10 +391,14 @@ longer defines.
   operation.
 - `audit-query-windows-retain-latest-records`: limited audit queries select the
   latest matching records before returning them chronologically, and process
-  audit views filter before applying their limit.
+  audit views filter before applying their limit. Query limits, filters, and
+  presentation flags require exact scalar types and reject values above the
+  configured source bound before reaching storage.
 - `event-query-windows-are-store-bounded`: LLM context and GUI process-event
   reads apply cursor/filter and limit in the store, return the newest bounded
   matching window in order, and do not materialize an unbounded event history.
+  Public event queries reject coerced filters, cursors, booleans, and limits
+  above that source bound before dispatching a store query.
 - `gui-snapshot-reads-are-source-bounded`: top-level snapshot collections fetch
   at most the configured collection window plus one lookahead row before
   assembly. Process unread/interrupt counts, recent messages, bounded LLM
@@ -379,6 +460,12 @@ longer defines.
   repeated, forged, cross-purpose, or otherwise ordinary old-token mutation.
   Terminal signals use the same durable boundary; independent post-commit
   terminal notifier/finalizer failures cannot strand the other cleanup phase.
+- `process-tool-table-authority-is-atomic`: complete process tool-table
+  authority and the narrower model projection use process-row CAS inside the
+  same transaction as their audit and ambient operation-evidence link. Audit,
+  link, or other `BaseException` failures leave neither a partial row nor
+  evidence behind; durable state remains unchanged after reopen, and
+  concurrent configurations commit as complete serialized tables.
 - `runtime-publication-compensation-is-retry-safe`: interrupted process launch
   and exec publications carry typed, exact artifact ownership receipts before
   publication-owned effects commit. Each recovery claim is durable before
@@ -507,7 +594,9 @@ longer defines.
   work.
 - `scheduler-quantum-ownership-is-serialized`: scheduler and direct pid
   single-step APIs share the same runtime lock, store claim, and resource-charge
-  boundary, so one process cannot be re-entered concurrently. Terminal process
+  boundary, so one process cannot be re-entered concurrently. Constructor and
+  run controls require exact, finite, bounded scalar types before creating a
+  worker or dispatching a quantum. Terminal process
   rows are immutable to ordinary writers, and a detached worker's execution
   generation/owner/lease token cannot mutate any process-local field. A bound
   worker token never falls back to Host authority for another PID; intentional
@@ -539,6 +628,13 @@ longer defines.
   runtime in `close_failed` instead of reporting a false rollback. Terminal
   commit receipts remain authoritative if acknowledgement is interrupted,
   while a successor claim may legitimately advance the live row.
+- `awaitable-quantum-cleanup-is-bounded-and-lifecycle-honest`: one monotonic
+  shutdown deadline bounds pending-task cancellation, asynchronous-generator
+  finalization, and default-executor cleanup after every awaitable quantum.
+  Cancellation-resistant work fails the quantum explicitly and releases its
+  process execution lease. A still-running default-executor worker remains a
+  scheduler lifecycle fence, so runtime shutdown reports incomplete until the
+  worker actually stops and a retry can close shared state safely.
 - `runtime-shutdown-is-drained-and-retry-safe`: scheduler work, ObjectTask
   executors, Human/provider blocking jobs, PTY reader/monitor workers, active
   admission leases, and GUI runtime users drain before shared state closes; a
@@ -551,8 +647,8 @@ longer defines.
   mutation inventory is installed under admission. Every public Human control
   method is classified as mutation or read-only; approvals, presentation,
   terminal draining, cancellation, and recovery are rejected at `STOPPING`
-  before any durable or in-memory write. All 48 public CapabilityManager
-  methods are likewise classified as read, mutation, or audit-sensitive mixed;
+  before any durable or in-memory write. Every public CapabilityManager method
+  is likewise classified as read, mutation, or audit-sensitive mixed;
   the public lease and mutation subservices are complete guarded ratchets, so
   direct lower-level calls cannot bypass lifecycle fail-close. Runtime-owned blocking work uses a
   drainable supervisor; standalone reusable components use an owned one-call
@@ -680,6 +776,18 @@ longer defines.
   Loaded-Skill provenance preserves a base/shared alias until its last actual
   source is unloaded; noncanonical persisted provenance is rejected before
   unload. Discovery rejects non-positive, boolean, and above-config limits.
+- `skill-read-cancellation-restores-finite-authority`: Skill discovery and
+  inspection restore reserved finite read authority when interrupted before
+  publication, including cancellation exceptions outside `Exception`.
+  Compensation preserves the original failure; if restoration itself fails,
+  authority remains consumed, the failure is annotated, and restart abandons
+  the stale reservation without minting another use.
+- `skill-package-snapshots-are-identity-stable-and-bounded`: Host Skill
+  packages retain and revalidate a no-follow root-to-parent directory chain,
+  reject link or identity changes before hashing, and read every regular file
+  to EOF through per-file and cumulative byte limits. Workspace package reads
+  enforce the same cumulative budget before reading the remaining files, while
+  stable Host and workspace snapshots produce the same package hash.
 - `workspace-skill-snapshots-reject-truncated-inputs`: workspace Skill
   registration rejects truncated `SKILL.md`, extension metadata, and JIT source
   reads before parsing or hashing them, so a snapshot never authenticates only
@@ -688,14 +796,45 @@ longer defines.
   Skill metadata plus image-package JIT manifests reject oversized JSON
   integers and excessive nesting as typed validation failures instead of
   leaking interpreter parser exceptions.
+- `shared-json-codecs-are-finite-and-node-bounded`: shared JSON decoding
+  applies fixed integer, nesting, node, and finite-number limits, while shared
+  serialization never emits non-standard `NaN` or `Infinity` tokens. Ordinary
+  finite JSON remains compatible and memory exhaustion is never normalized as
+  an input error.
+- `yaml-documents-fail-closed-at-bootstrap-limits`: the shared YAML loader
+  applies configuration-independent UTF-8 byte, parser-event, composed-node,
+  nesting-depth, alias-count, expanded alias-graph, logical scalar-byte, and
+  radix-independent integer-digit limits before Python object construction.
+  Recursive aliases, non-string mapping keys, and duplicate keys fail as typed
+  validation errors. Duplicate checks apply to pre-merge source pairs so
+  standard merge precedence and explicit overrides remain supported. Malformed
+  scalar tags are normalized at the construction boundary, while `MemoryError`,
+  cancellation, and other system exceptions still propagate. Bootstrap config
+  reads only one bounded prefix, uses this same loader, preserves merge
+  behavior, and retains its public `ValueError` contract.
 - `runtime-modules-load-trusted-code-atomically`: startup Runtime Modules bind
   trust to the current source hash, reject ambiguous manifests and duplicate
   module ids, resolve import strings without executing untrusted package code,
-  bound source hashing, and roll back failed declared or hook-created
-  tool/image/syscall/hook registrations so persisted module status stays
-  aligned with loaded runtime state. One shared runtime registry lock serializes
+  read manifests and sources to EOF through bounded identity-stable descriptors,
+  retain and revalidate a no-follow POSIX root-to-parent descriptor chain (or
+  the equivalent Win32 handle chain), guard every package parent directory
+  against replacement/reparse traversal,
+  reject direct registration-buffer mutation that bypasses `provides`, and roll
+  back failed declared or hook-created tool/image/syscall/hook registrations so
+  persisted module status stays aligned with loaded runtime state. Module
+  failure rows, audits, and warning results contain correlated text-free error
+  envelopes and diagnostic hashes rather than exception-authored text. Package
+  import interruption also removes its synthetic namespace/importer for every
+  `BaseException`, so cancellation cannot leave import state behind. One shared
+  runtime registry lock serializes
   the full module lifecycle with official Tool/Image publications, preventing
   a failed snapshot restore from clobbering a concurrent successful load.
+- `module-json-manifests-use-bounded-strict-parsing`: Runtime Module JSON
+  manifests preflight through the shared strict JSON parser before the
+  module-specific duplicate-key pass, so compact depth, node, integer, and
+  non-finite-number attacks fail as typed validation errors even when the
+  interpreter integer guard is disabled. The existing bounded,
+  identity-stable Host read and ordinary finite metadata semantics remain.
 - `checkpoint-restore-and-fork-are-scoped`: checkpoint creation atomically
   captures one consistent store snapshot and publishes its row, head, initial
   read capability, event, and audit. Restore/fork are scoped,
@@ -760,7 +899,15 @@ longer defines.
   external authority. Failed registration/commit removes new artifacts and
   restores replaced manifests; failed package boot/exec removes the exact
   publication-owned capability, receipt, private workspace, and unpublished
-  JIT source/candidate state. Registry callers and
+  JIT source/candidate state. Image-package workspace grant `recursive` and
+  `delegable` values are admitted only as exact booleans (with absent fields
+  defaulting to false), before image/artifact publication, private-directory
+  creation, capability issuance, or related audit/publication evidence. Host
+  package bytes are read through bounded,
+  identity-stable Unix or Win32 descriptors while guarded root-to-parent
+  component chains (no-follow POSIX descriptors or replacement-blocking Win32
+  handles) prevent
+  reparse/replacement traversal. Registry callers and
   getters receive isolated deep copies, concurrent same-id registrations are
   serialized and revalidated in the cache/store critical section, and
   committed-image boot does not overwrite the global Skill registry. New image
@@ -773,7 +920,11 @@ longer defines.
   registration and calls use registered endpoint/method authority, gate calls
   and per-item registry operations before manifest metadata is exposed, and
   classify provider effects. Provider dispatch uses immutable Host-snapshotted
-  transport inputs and ignores ambient proxy configuration. Registry
+  transport inputs and ignores ambient proxy configuration. A single monotonic
+  deadline spans pinned connection, TLS handshake, request dispatch, response
+  headers, and the complete bounded body. Its joined per-socket watchdog closes
+  only that request socket; a timeout after dispatch never fails over or replays
+  a potentially non-idempotent request. Registry
   row/stale-grant/event/audit mutations are
   transactional, including finite registry-authority reservation/settlement.
   A call reserves finite authority and persists pending evidence
@@ -788,6 +939,11 @@ longer defines.
   deduplicated main, server, process-spawn, and exact stdio authority and persist
   pending evidence before DNS/live-provider boundaries. Local/stdio first-call
   PENS may restore; non-local DNS observation cannot be erased.
+- `registry-manifests-admit-only-finite-json`: MCP and JSON-RPC mapping and
+  YAML registration recursively reject non-finite values in server/endpoint
+  metadata, tool/method metadata, and input/parameter schemas before durable
+  mutation. Validation exposes stable domain errors, propagates memory and
+  control failures, and preserves nested finite JSON.
 - `explainable-operations-use-explicit-causality`: protected LLM, Tool,
   syscall, primitive, and runtime boundaries persist typed parent/child rows and
   explicit evidence links. Human/child/message waits reuse their durable
@@ -817,6 +973,30 @@ longer defines.
   source Object selection/omission reason, version, transform, tokens, hashes,
   final context generation/Object, and compaction metadata without copying
   Object payloads or rendered prompt text.
+- `process-terminal-cleanup-is-durable-and-bounded`: a committed exit, failure,
+  kill, or cancellation atomically creates one durable cleanup intent. Its
+  notifier and process-finalizer phases are independently fenced and
+  idempotent; incomplete work is retryable during the same call or after
+  reopen without rewriting the terminal outcome. Startup recovery reads only
+  hard-bounded `(created_at, pid)` keyset pages and retains at most one page of
+  diagnostic samples.
+- `internal-exception-text-never-crosses-runtime-boundaries`: unknown internal
+  exceptions, post-dispatch validation/authority failures, Provider failures,
+  Runtime Module failures, and JIT output/syscall failures expose only stable
+  public codes, types, and correlation ids. Only Host input validation proven
+  to precede tool/provider implementation dispatch may use a fixed,
+  instance-free template. Scheduler status, process/tool failure results,
+  action feedback, and GUI responses never retain exception text; durable
+  diagnostics bind the same correlation id to only the error type, byte count,
+  and SHA-256 fingerprint. Workflow failures, image-boot status and rollback
+  evidence, terminal notifier/resource-finalizer warnings, and Runtime assembly
+  cleanup handles follow the same boundary. Context-compaction job state follows the same
+  envelope and fingerprint boundary, including validation, authority,
+  interruption, and cancellation failures. Checkpoint post-commit and recovery
+  receipts and invalid ResourceUsage projections likewise never echo exception
+  text or unknown caller-supplied field names. A process-local marker distinguishes caught
+  exceptions from deliberate structured `ToolResult` failures, and serialized
+  fields cannot forge that marker.
 - `runtime-safety-benchmark-is-deterministic`: benchmark tasks and smoke runs
   remain task-schema-v1/run-output-schema-v2, deterministic, and token-free by
   default. Effect outcome and evidence are explicit; exact/prefix/glob matching
@@ -827,6 +1007,10 @@ longer defines.
   require real tool, provider-state, external-effect, and operation evidence;
   modeled rows stay in a separate denominator.
 
+- `skill-discovery-catalogs-are-bounded-and-source-consistent`: Host and persisted Skill catalogs share Unicode matching and fail closed at the configured scan ceiling.
+- `runtime-registration-mutations-are-audit-atomic`: Tool and syscall route bindings roll back atomically when required audit recording fails.
+- `rating-mutations-are-audit-atomic`: rating updates and required audit records commit or roll back in one transaction.
+
 ## Known Test Gaps
 
 - The runtime-safety benchmark is an early deterministic workload, not a
@@ -834,17 +1018,23 @@ longer defines.
 - Explainability tests verify provenance completeness and deterministic
   summaries, but do not yet measure whether operators understand explanations
   better in a user study.
-- Per-change Python CI exercises 3.11 and 3.14 on Ubuntu. Python 3.12/3.13 are
-  inside the declared package range but are not separate jobs, and native
-  macOS/Windows SQLite locking and ACL behavior, process-tree containment,
-  Deno parent-death handling, PTY lifecycle, and Git path/credential behavior
-  remain environment-gated.
+- Per-change Python CI exercises 3.11 and 3.14 on Ubuntu and the complete
+  deterministic `all` lane on native Windows Python 3.11 with Deno and the
+  optional PTY dependency installed. A separate configured Python 3.11 matrix
+  runs the required host-filesystem-identity nodes on Ubuntu and macOS 14 with
+  `--fail-on-skip`. Python 3.12/3.13 are inside the declared package range but
+  are not separate root-runtime jobs, and broader macOS runtime behavior remains
+  environment-gated. Windows CI does not create guarantees the implementation
+  does not provide: ConPTY still lacks Job Object/parent-death and wall/CPU/RSS
+  supervision, while credential-manager and real remote-authentication paths
+  remain explicit environment gates.
 - PostgreSQL CI uses PostgreSQL 17 on Ubuntu. Other supported server versions
   and deployment TLS/authentication topologies are not release-gated here.
 - JSON-RPC, MCP, and Git remote tests use deterministic loopback or local
-  remotes. Real proxy/TLS/DNS policy, HTTPS/OpenSSH authentication, and the
-  optional real MCP SDK/server path require environment-gated runs. GitHub and
-  GitLab API integrations, and MCP Resources/Prompts, are not implemented.
+  remotes. The complete MCP SDK integration file runs on Ubuntu from the frozen
+  optional extra; real proxy/TLS/DNS policy, HTTPS/OpenSSH authentication, and
+  remote MCP deployment identity remain environment-gated. GitHub and GitLab
+  API integrations, and MCP Resources/Prompts, are not implemented.
 - Real LLM credentials and token-spending paths are opt-in. The default matrix
   covers mock/action-selection behavior, not a live request for every supported
   profile or provider deployment.
@@ -861,3 +1051,11 @@ longer defines.
   unimplemented million-publication recovery profile remain outside the
   per-change gate. See `docs/support_matrix.md` for the authoritative coverage
   matrix and release-gate procedure.
+- Release-artifact CI uses remote Actions pinned to reviewed full commit SHAs,
+  builds one canonical wheel/source pair with a frozen release tool group,
+  rejects extra or non-regular output, records its exact checksum manifest, and
+  makes the Python 3.11–3.14 clean installs consume that same pair with
+  hash-bearing root-lock dependency exports. Moving hosted runner images and
+  compatibility selectors plus the lack of signed attestation mean this is not
+  a bit-for-bit reproducible publication chain; PyPI upload or any external
+  release mutation remains separately authorized.

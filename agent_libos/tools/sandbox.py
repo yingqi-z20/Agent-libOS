@@ -35,7 +35,7 @@ from agent_libos.substrate import (
 )
 from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
 from agent_libos.utils.public_errors import (
-    provider_error_envelope,
+    public_error_envelope,
     provider_error_envelope_from_mapping,
 )
 from agent_libos.utils.serde import to_jsonable
@@ -55,6 +55,7 @@ _DENO_TYPES_DIRECTIVE_RE = re.compile(r"(?im)^\s*//\s*@deno-types\s*=")
 _PROCESS_CLEANUP_TIMEOUT_S = 1.0
 _PROCESS_CLEANUP_POLL_INTERVAL_S = 0.02
 _VALIDATION_SUMMARY_MAX_DEPTH = 64
+_SANDBOX_FAILURE_METRICS_ATTR = "_agent_libos_command_metrics"
 _POSIX_HOST_PATH_RE = re.compile(
     r"(?<![:/A-Za-z0-9._-])(?:file://)?/"
     r"(?:[^\s/\\\"'<>|,;()[\]{}]+/)+"
@@ -157,6 +158,27 @@ def summarize_validation_value(
         "preview_truncated": len(safe_serialized) > max(1, preview_chars),
         "lossy": lossy,
     }
+
+
+def _exact_json_equal(actual: Any, expected: Any) -> bool:
+    """Compare JSON types exactly while treating all finite numbers alike."""
+
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return type(actual) is bool and type(expected) is bool and actual == expected
+    if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+        return bool(actual == expected)
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(actual, dict):
+        return actual.keys() == expected.keys() and all(
+            _exact_json_equal(actual[key], expected[key]) for key in actual
+        )
+    if isinstance(actual, list):
+        return len(actual) == len(expected) and all(
+            _exact_json_equal(left, right)
+            for left, right in zip(actual, expected, strict=True)
+        )
+    return bool(actual == expected)
 
 
 def _canonical_validation_value(
@@ -389,6 +411,27 @@ class SandboxExecutionResult:
     metrics: CommandMetrics | None = None
 
 
+def sandbox_failure_metrics(error: BaseException) -> CommandMetrics | None:
+    """Return metrics retained on an ordinary sandbox execution failure."""
+
+    metrics = getattr(error, _SANDBOX_FAILURE_METRICS_ATTR, None)
+    return metrics if isinstance(metrics, CommandMetrics) else None
+
+
+def _attach_sandbox_failure_metrics(
+    error: BaseException,
+    metrics: CommandMetrics | None,
+) -> None:
+    if metrics is None:
+        return
+    try:
+        setattr(error, _SANDBOX_FAILURE_METRICS_ATTR, metrics)
+    except (AttributeError, TypeError):
+        # All built-in Agent libOS sandbox exceptions currently support
+        # attributes. Keep the original failure type if a foreign one does not.
+        return
+
+
 @dataclass(frozen=True)
 class _SupervisedProcessHandle:
     process: asyncio.subprocess.Process
@@ -558,7 +601,15 @@ class DenoTypescriptSandbox(SandboxBackend):
             tmp_path = Path(tmp)
             (tmp_path / "candidate.ts").write_text(source_code, encoding="utf-8")
             (tmp_path / "runner.ts").write_text(self._runner_source(), encoding="utf-8")
-            command = [deno, "run", "--no-prompt"]
+            command = [
+                deno,
+                "run",
+                "--no-prompt",
+                "--no-code-cache",
+                "--no-remote",
+                "--no-npm",
+                "--deny-import",
+            ]
             if cached_only:
                 command.append("--cached-only")
             command.append("runner.ts")
@@ -570,6 +621,7 @@ class DenoTypescriptSandbox(SandboxBackend):
                 windows_job,
                 windows_gate,
             ) = self._prepare_supervised_launch(command, tmp_path)
+            launch_kwargs["env"] = self._isolated_deno_environment(tmp_path)
             proc: asyncio.subprocess.Process | None = None
             monitor_task: asyncio.Task[CommandMetrics] | None = None
             serve_task: asyncio.Task[Any] | None = None
@@ -580,18 +632,13 @@ class DenoTypescriptSandbox(SandboxBackend):
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    limit=max(self.max_stdout_bytes, self.max_stderr_bytes) + 1,
                     **launch_kwargs,
                 )
                 if death_read_fd is not None:
                     os.close(death_read_fd)
                     death_read_fd = None
-                if windows_job is not None:
-                    try:
-                        windows_job.assign_pid(proc.pid)
-                        assert windows_gate is not None
-                        windows_gate.write_text("contained\n", encoding="utf-8")
-                    except Exception as exc:
-                        raise SandboxError("failed to attach Deno supervisor to Windows Job Object") from exc
+                self._attach_windows_supervisor(proc, windows_job, windows_gate)
                 monitor_task = asyncio.create_task(self._monitor_process(proc, limits), name="deno-resource-monitor")
                 serve_task = asyncio.create_task(
                     self._serve_process(proc, args, syscall_handler),
@@ -603,23 +650,13 @@ class DenoTypescriptSandbox(SandboxBackend):
                     return_when=asyncio.FIRST_EXCEPTION,
                 )
                 if not done:
-                    for task in pending:
-                        task.cancel()
-                    raise SubprocessTimeoutExpired(
-                        f"Deno JIT tool timed out after {selected_timeout}s",
-                        metrics=CommandMetrics(
-                            wall_seconds=float(selected_timeout),
-                            killed=True,
-                            limit_kind="subprocess_timeout",
-                        ),
+                    await self._raise_deno_execution_timeout(
+                        proc,
+                        monitor_task,
+                        pending,
+                        selected_timeout,
                     )
-                for task in done:
-                    exc = task.exception()
-                    if exc is not None:
-                        await self._kill_process(proc)
-                        for pending_task in pending:
-                            pending_task.cancel()
-                        raise exc
+                self._raise_completed_task_failure(done)
                 if serve_task not in done:
                     done_all, pending = await asyncio.wait(
                         {serve_task, monitor_task},
@@ -632,20 +669,21 @@ class DenoTypescriptSandbox(SandboxBackend):
                             task.cancel()
                         raise SandboxError("Deno JIT tool exited before result")
                 value = serve_task.result()
-                if not monitor_task.done():
-                    await asyncio.wait({monitor_task}, timeout=1.0, return_when=asyncio.ALL_COMPLETED)
-                metrics = monitor_task.result() if monitor_task.done() and not monitor_task.cancelled() else None
+                metrics = await self._settle_monitor_metrics(monitor_task)
                 wrapped = SandboxExecutionResult(value=value, metrics=metrics)
                 return wrapped if return_metrics else value
-            except SubprocessTimeoutExpired:
+            except (SubprocessLimitExceeded, SubprocessTimeoutExpired):
                 await self._kill_process(proc)
                 raise
             except TimeoutError as exc:
                 await self._kill_process(proc)
                 raise TimeoutError(f"Deno JIT tool timed out after {selected_timeout}s") from exc
-            except Exception:
-                if proc is not None:
-                    await self._kill_process(proc)
+            except Exception as exc:
+                await self._retain_failed_execution_metrics(
+                    exc,
+                    proc,
+                    monitor_task,
+                )
                 raise
             finally:
                 try:
@@ -665,6 +703,54 @@ class DenoTypescriptSandbox(SandboxBackend):
                     if windows_job is not None:
                         windows_job.close()
 
+    async def _raise_deno_execution_timeout(
+        self,
+        proc: asyncio.subprocess.Process,
+        monitor_task: asyncio.Task[CommandMetrics],
+        pending: set[asyncio.Task[Any]],
+        selected_timeout: float,
+    ) -> NoReturn:
+        await self._kill_process(proc)
+        observed = await self._settle_monitor_metrics(monitor_task)
+        metrics = observed or CommandMetrics()
+        self._cancel_tasks(task for task in pending if task is not monitor_task)
+        raise SubprocessTimeoutExpired(
+            f"Deno JIT tool timed out after {selected_timeout}s",
+            metrics=CommandMetrics(
+                wall_seconds=max(float(selected_timeout), metrics.wall_seconds),
+                cpu_seconds=metrics.cpu_seconds,
+                peak_memory_bytes=metrics.peak_memory_bytes,
+                killed=True,
+                limit_kind="subprocess_timeout",
+            ),
+        )
+
+    @staticmethod
+    def _raise_completed_task_failure(done: set[asyncio.Task[Any]]) -> None:
+        for task in done:
+            error = task.exception()
+            if error is not None:
+                raise error
+
+    async def _retain_failed_execution_metrics(
+        self,
+        error: Exception,
+        proc: asyncio.subprocess.Process | None,
+        monitor_task: asyncio.Task[CommandMetrics] | None,
+    ) -> None:
+        if proc is not None:
+            await self._kill_process(proc)
+        if monitor_task is None:
+            return
+        if (
+            monitor_task.done()
+            and not monitor_task.cancelled()
+            and monitor_task.exception() is error
+        ):
+            return
+        metrics = await self._settle_monitor_metrics(monitor_task)
+        _attach_sandbox_failure_metrics(error, metrics)
+
     def run_tests(
         self,
         source_code: str,
@@ -683,7 +769,15 @@ class DenoTypescriptSandbox(SandboxBackend):
         try:
             version = self.deno_version()
         except SandboxError as exc:
-            return ValidationResult(ok=False, errors=[str(exc)])
+            return ValidationResult(
+                ok=False,
+                errors=[
+                    public_error_envelope(
+                        exc,
+                        code="deno_version_error",
+                    )["message"]
+                ],
+            )
         errors: list[str] = []
         logs: list[str] = [f"language=typescript", f"deno={version}"]
         metrics: list[CommandMetrics] = []
@@ -699,6 +793,9 @@ class DenoTypescriptSandbox(SandboxBackend):
             except (SubprocessLimitExceeded, SubprocessTimeoutExpired):
                 raise
             except Exception as exc:
+                failure_metrics = sandbox_failure_metrics(exc)
+                if failure_metrics is not None:
+                    metrics.append(failure_metrics)
                 errors.append(
                     self._validation_failure(
                         status="failed",
@@ -727,6 +824,9 @@ class DenoTypescriptSandbox(SandboxBackend):
             except (SubprocessLimitExceeded, SubprocessTimeoutExpired):
                 raise
             except Exception as exc:
+                failure_metrics = sandbox_failure_metrics(exc)
+                if failure_metrics is not None:
+                    metrics.append(failure_metrics)
                 errors.append(
                     self._validation_failure(
                         status="failed",
@@ -736,7 +836,7 @@ class DenoTypescriptSandbox(SandboxBackend):
                     )
                 )
                 continue
-            matches = "expected" not in test or result_value == test["expected"]
+            matches = _exact_json_equal(result_value, test["expected"])
             result_summary = summarize_validation_value(
                 result_value,
                 preview_chars=self.validation_result_preview_chars,
@@ -817,11 +917,15 @@ class DenoTypescriptSandbox(SandboxBackend):
                     tasks,
                     selected_timeout,
                 )
-                self._validate_deno_check_output(
-                    handle.process,
-                    stdout,
-                    stderr,
-                )
+                try:
+                    self._validate_deno_check_output(
+                        handle.process,
+                        stdout,
+                        stderr,
+                    )
+                except Exception as exc:
+                    _attach_sandbox_failure_metrics(exc, metrics)
+                    raise
                 return metrics
             finally:
                 await self._cleanup_deno_check(handle, tasks)
@@ -840,6 +944,7 @@ class DenoTypescriptSandbox(SandboxBackend):
             deno,
             "check",
             "--quiet",
+            "--no-code-cache",
             "--config",
             "deno.json",
             "--no-lock",
@@ -861,6 +966,7 @@ class DenoTypescriptSandbox(SandboxBackend):
             windows_job,
             windows_gate,
         ) = self._prepare_supervised_launch(command, tmp_path)
+        launch_kwargs["env"] = self._isolated_deno_environment(tmp_path)
         process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
@@ -1039,7 +1145,10 @@ class DenoTypescriptSandbox(SandboxBackend):
         try:
             metadata["deno_version"] = self.deno_version()
         except SandboxError as exc:
-            metadata["deno_version_error"] = str(exc)
+            metadata["deno_version_error"] = public_error_envelope(
+                exc,
+                code="deno_version_error",
+            )["message"]
         return metadata
 
     def deno_version(self) -> str:
@@ -1173,6 +1282,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         started_at = time.monotonic()
         peak_memory = 0
         cpu_seconds = 0.0
+        cpu_high_water_by_pid: dict[int, float] = {}
         try:
             ps_proc = psutil.Process(proc.pid)
         except (psutil.Error, OSError) as exc:
@@ -1183,14 +1293,18 @@ class DenoTypescriptSandbox(SandboxBackend):
         while proc.returncode is None:
             wall_seconds = time.monotonic() - started_at
             try:
-                cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+                cpu_seconds, peak_memory = self._sample_process_tree(
+                    ps_proc,
+                    peak_memory,
+                    cpu_high_water_by_pid,
+                )
             except OSError as exc:
                 if limits is not None:
                     await self._kill_process(proc)
                     raise SandboxError("Deno resource monitor cannot enforce subprocess limits") from exc
                 # The outer wall timeout and process-group containment remain
                 # active even where the host denies process-tree inspection.
-                cpu_seconds, peak_memory = 0.0, 0
+                pass
             limit_kind = self._limit_kind(
                 wall_seconds=wall_seconds,
                 cpu_seconds=cpu_seconds,
@@ -1213,11 +1327,15 @@ class DenoTypescriptSandbox(SandboxBackend):
             await asyncio.sleep(0.02)
         wall_seconds = time.monotonic() - started_at
         try:
-            final_cpu_seconds, peak_memory = self._sample_process_tree(ps_proc, peak_memory)
+            final_cpu_seconds, peak_memory = self._sample_process_tree(
+                ps_proc,
+                peak_memory,
+                cpu_high_water_by_pid,
+            )
         except OSError as exc:
             if limits is not None:
                 raise SandboxError("Deno resource monitor could not verify subprocess limits") from exc
-            final_cpu_seconds, peak_memory = 0.0, 0
+            final_cpu_seconds = cpu_seconds
         return CommandMetrics(
             wall_seconds=wall_seconds,
             cpu_seconds=max(cpu_seconds, final_cpu_seconds),
@@ -1225,6 +1343,23 @@ class DenoTypescriptSandbox(SandboxBackend):
             killed=False,
             limit_kind=None,
         )
+
+    @staticmethod
+    async def _settle_monitor_metrics(
+        monitor_task: asyncio.Task[CommandMetrics],
+    ) -> CommandMetrics | None:
+        if not monitor_task.done():
+            done, _pending = await asyncio.wait(
+                {monitor_task},
+                timeout=_PROCESS_CLEANUP_TIMEOUT_S,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            if not done:
+                monitor_task.cancel()
+                return None
+        if monitor_task.cancelled():
+            return None
+        return monitor_task.result()
 
     def _limit_kind(
         self,
@@ -1244,22 +1379,36 @@ class DenoTypescriptSandbox(SandboxBackend):
             return "subprocess_memory_bytes"
         return None
 
-    def _sample_process_tree(self, proc: psutil.Process, peak_memory: int) -> tuple[float, int]:
-        cpu_seconds = 0.0
+    def _sample_process_tree(
+        self,
+        proc: psutil.Process,
+        peak_memory: int,
+        cpu_high_water_by_pid: dict[int, float] | None = None,
+    ) -> tuple[float, int]:
+        cpu_by_pid = (
+            cpu_high_water_by_pid
+            if cpu_high_water_by_pid is not None
+            else {}
+        )
         memory_bytes = 0
         processes = [proc]
         try:
             processes.extend(proc.children(recursive=True))
-        except psutil.Error:
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
             pass
+        except (psutil.Error, OSError) as exc:
+            raise OSError("cannot enumerate Deno subprocess tree") from exc
         for item in processes:
             try:
                 times = item.cpu_times()
-                cpu_seconds += float(times.user) + float(times.system)
+                sampled_cpu = float(times.user) + float(times.system)
                 memory_bytes += int(item.memory_info().rss)
-            except psutil.Error:
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
-        return cpu_seconds, max(peak_memory, memory_bytes)
+            except (psutil.Error, OSError) as exc:
+                raise OSError("cannot inspect Deno subprocess resource usage") from exc
+            cpu_by_pid[item.pid] = max(cpu_by_pid.get(item.pid, 0.0), sampled_cpu)
+        return sum(cpu_by_pid.values()), max(peak_memory, memory_bytes)
 
     async def _handle_syscall_frame(
         self,
@@ -1287,31 +1436,17 @@ class DenoTypescriptSandbox(SandboxBackend):
                 {"type": "syscall_result", "id": frame_id, "ok": True, "payload": to_jsonable(result)},
             )
         except Exception as exc:
-            public_error = provider_error_envelope(exc)
+            public_error = public_error_envelope(exc, code="syscall_error")
             await self._write_frame(
                 proc,
                 {
                     "type": "syscall_result",
                     "id": frame_id,
                     "ok": False,
-                    "error": (
-                        public_error["message"]
-                        if public_error is not None
-                        else str(exc)
-                    ),
-                    "error_type": (
-                        public_error["error_type"]
-                        if public_error is not None
-                        else type(exc).__name__
-                    ),
-                    **(
-                        {
-                            "code": public_error["code"],
-                            "correlation_id": public_error["correlation_id"],
-                        }
-                        if public_error is not None
-                        else {}
-                    ),
+                    "error": public_error["message"],
+                    "error_type": public_error["error_type"],
+                    "code": public_error["code"],
+                    "correlation_id": public_error["correlation_id"],
                 },
             )
 
@@ -1373,6 +1508,41 @@ class DenoTypescriptSandbox(SandboxBackend):
         if os.name == "nt":
             return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
         return {"start_new_session": True}
+
+    @staticmethod
+    def _isolated_deno_environment(tmp_path: Path) -> dict[str, str]:
+        """Keep Deno's permission-exempt caches and storage inside one run."""
+
+        roots = {
+            "DENO_DIR": tmp_path / ".deno",
+            "HOME": tmp_path / ".home",
+            "TMPDIR": tmp_path / ".tmp",
+            "TMP": tmp_path / ".tmp",
+            "TEMP": tmp_path / ".tmp",
+            "XDG_CACHE_HOME": tmp_path / ".cache",
+            "XDG_CONFIG_HOME": tmp_path / ".config",
+            "XDG_DATA_HOME": tmp_path / ".data",
+        }
+        for root in set(roots.values()):
+            root.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment.update({key: str(value) for key, value in roots.items()})
+        environment.update(
+            {
+                "DENO_NO_PROMPT": "1",
+                "DENO_NO_UPDATE_CHECK": "1",
+                "NO_COLOR": "1",
+            }
+        )
+        if os.name == "nt":
+            environment.update(
+                {
+                    "APPDATA": str(tmp_path / ".data"),
+                    "LOCALAPPDATA": str(tmp_path / ".data"),
+                    "USERPROFILE": str(tmp_path / ".home"),
+                }
+            )
+        return environment
 
     async def _kill_process(self, proc: asyncio.subprocess.Process) -> None:
         # Cleanup is intentionally idempotent. Re-signalling a process-group ID
@@ -1447,6 +1617,7 @@ class DenoTypescriptSandbox(SandboxBackend):
 
     def _test_syscall_handler(self, test: dict[str, Any], index: int) -> tuple[SyscallHandler, Callable[[], None]]:
         expected = list(test.get("syscalls", []))
+        total_expected = len(expected)
 
         async def handler(name: str, args: dict[str, Any]) -> Any:
             if not expected:
@@ -1458,7 +1629,16 @@ class DenoTypescriptSandbox(SandboxBackend):
             if "args" in spec and spec["args"] != args:
                 raise SandboxError(f"test {index} syscall {name} expected args {spec['args']!r}, got {args!r}")
             if spec.get("ok", True) is False:
-                raise SandboxError(str(spec.get("error", "mock syscall failed")))
+                # Candidate self-tests must exercise the same text-free syscall
+                # boundary as a live JIT call while remaining deterministic.
+                # The spec-authored diagnostic is intentionally not exposed to
+                # candidate code or included in equality-based expectations.
+                ordinal = total_expected - len(expected)
+                raise ProviderHostError(
+                    code="syscall_error",
+                    error_type="SandboxError",
+                    correlation_id=f"corr_jit_test_{index}_{ordinal}",
+                )
             return spec.get("result", spec.get("payload"))
 
         def assert_consumed() -> None:
@@ -1473,10 +1653,15 @@ class DenoTypescriptSandbox(SandboxBackend):
         if len(tests) > self.max_tests:
             errors.append(f"JIT tests exceed max count: {self.max_tests}")
         for index, test in enumerate(tests, start=1):
+            if not isinstance(test, dict):
+                errors.append(f"JIT test {index} must be a JSON object")
+                continue
             try:
                 ensure_json_size(test, self.max_test_case_bytes, f"JIT test {index}")
             except Exception as exc:
                 errors.append(str(exc))
+            if "expected" not in test:
+                errors.append(f"JIT test {index} must include expected")
         return errors
 
     def _aggregate_metrics(self, metrics: list[CommandMetrics]) -> dict[str, Any]:
@@ -1542,14 +1727,16 @@ class DenoTypescriptSandbox(SandboxBackend):
         )
 
     def _contains_dynamic_import(self, source_code: str) -> bool:
-        tokens = self._typescript_tokens(source_code)
+        tokens = self._typescript_tokens(source_code, preserve_line_breaks=True)
         for index, token in enumerate(tokens):
             if token != ("identifier", "import"):
                 continue
-            previous_token = tokens[index - 1] if index > 0 else None
+            previous_index = self._previous_significant_token_index(tokens, index)
+            previous_token = tokens[previous_index] if previous_index is not None else None
             if previous_token == ("punct", "."):
                 continue
-            next_token = tokens[index + 1] if index + 1 < len(tokens) else None
+            next_index = self._next_significant_token_index(tokens, index)
+            next_token = tokens[next_index] if next_index is not None else None
             if next_token == ("punct", "("):
                 if self._looks_like_method_definition(tokens, index):
                     continue
@@ -1754,7 +1941,8 @@ class DenoTypescriptSandbox(SandboxBackend):
         return [specifier] if specifier is not None else []
 
     def _looks_like_method_definition(self, tokens: list[tuple[str, str]], index: int) -> bool:
-        previous_token = tokens[index - 1] if index > 0 else None
+        previous_index = self._previous_significant_token_index(tokens, index)
+        previous_token = tokens[previous_index] if previous_index is not None else None
         if previous_token not in {("punct", "{"), ("punct", ",")}:
             return False
         depth = 0
@@ -1766,9 +1954,36 @@ class DenoTypescriptSandbox(SandboxBackend):
             if token == ("punct", ")"):
                 depth -= 1
                 if depth == 0:
-                    next_token = tokens[cursor + 1] if cursor + 1 < len(tokens) else None
-                    return next_token == ("punct", "{")
+                    next_index = self._next_significant_token_index(tokens, cursor)
+                    if next_index is None:
+                        return False
+                    if any(
+                        token_kind == "linebreak"
+                        for token_kind, _token_value in tokens[cursor + 1 : next_index]
+                    ):
+                        return False
+                    return tokens[next_index] == ("punct", "{")
         return False
+
+    @staticmethod
+    def _previous_significant_token_index(
+        tokens: list[tuple[str, str]],
+        index: int,
+    ) -> int | None:
+        cursor = index - 1
+        while cursor >= 0 and tokens[cursor][0] == "linebreak":
+            cursor -= 1
+        return cursor if cursor >= 0 else None
+
+    @staticmethod
+    def _next_significant_token_index(
+        tokens: list[tuple[str, str]],
+        index: int,
+    ) -> int | None:
+        cursor = index + 1
+        while cursor < len(tokens) and tokens[cursor][0] == "linebreak":
+            cursor += 1
+        return cursor if cursor < len(tokens) else None
 
     def _string_after_from(self, tokens: list[tuple[str, str]], index: int) -> str | None:
         for cursor in range(index, len(tokens)):
@@ -1781,27 +1996,36 @@ class DenoTypescriptSandbox(SandboxBackend):
             return next_token[1] if next_token is not None and next_token[0] == "string" else None
         return None
 
-    def _typescript_tokens(self, source_code: str) -> list[tuple[str, str]]:
+    def _typescript_tokens(
+        self,
+        source_code: str,
+        *,
+        preserve_line_breaks: bool = False,
+    ) -> list[tuple[str, str]]:
         tokens: list[tuple[str, str]] = []
         index = 0
         length = len(source_code)
         while index < length:
             char = source_code[index]
-            if char.isspace():
-                index += 1
-                continue
-            if char == "/" and index + 1 < length and source_code[index + 1] == "/":
-                index = self._skip_line_comment(source_code, index + 2)
-                continue
-            if char == "/" and index + 1 < length and source_code[index + 1] == "*":
-                index = self._skip_block_comment(source_code, index + 2)
+            trivia_end = self._typescript_trivia_end(source_code, index)
+            if trivia_end is not None:
+                self._append_linebreak_token(
+                    tokens,
+                    source_code[index:trivia_end],
+                    preserve_line_breaks=preserve_line_breaks,
+                )
+                index = trivia_end
                 continue
             if char in {"'", '"'}:
                 value, index = self._read_string_literal(source_code, index)
                 tokens.append(("string", value))
                 continue
             if char == "`":
-                template_tokens, index = self._read_template_literal_tokens(source_code, index + 1)
+                template_tokens, index = self._read_template_literal_tokens(
+                    source_code,
+                    index + 1,
+                    preserve_line_breaks=preserve_line_breaks,
+                )
                 tokens.extend(template_tokens)
                 continue
             if self._is_identifier_start(char):
@@ -1815,6 +2039,35 @@ class DenoTypescriptSandbox(SandboxBackend):
                 tokens.append(("punct", char))
             index += 1
         return tokens
+
+    def _typescript_trivia_end(
+        self,
+        source_code: str,
+        index: int,
+    ) -> int | None:
+        char = source_code[index]
+        if char.isspace():
+            cursor = index + 1
+            while cursor < len(source_code) and source_code[cursor].isspace():
+                cursor += 1
+            return cursor
+        if char != "/" or index + 1 >= len(source_code):
+            return None
+        if source_code[index + 1] == "/":
+            return self._skip_line_comment(source_code, index + 2)
+        if source_code[index + 1] == "*":
+            return self._skip_block_comment(source_code, index + 2)
+        return None
+
+    @staticmethod
+    def _append_linebreak_token(
+        tokens: list[tuple[str, str]],
+        trivia: str,
+        *,
+        preserve_line_breaks: bool,
+    ) -> None:
+        if preserve_line_breaks and ("\n" in trivia or "\r" in trivia):
+            tokens.append(("linebreak", "\n"))
 
     def _skip_line_comment(self, source_code: str, index: int) -> int:
         newline = source_code.find("\n", index)
@@ -1843,7 +2096,13 @@ class DenoTypescriptSandbox(SandboxBackend):
             index += 1
         return "".join(chars), index
 
-    def _read_template_literal_tokens(self, source_code: str, index: int) -> tuple[list[tuple[str, str]], int]:
+    def _read_template_literal_tokens(
+        self,
+        source_code: str,
+        index: int,
+        *,
+        preserve_line_breaks: bool = False,
+    ) -> tuple[list[tuple[str, str]], int]:
         tokens: list[tuple[str, str]] = []
         while index < len(source_code):
             char = source_code[index]
@@ -1853,33 +2112,47 @@ class DenoTypescriptSandbox(SandboxBackend):
             if char == "`":
                 return tokens, index + 1
             if char == "$" and index + 1 < len(source_code) and source_code[index + 1] == "{":
-                expression_tokens, index = self._read_template_expression_tokens(source_code, index + 2)
+                expression_tokens, index = self._read_template_expression_tokens(
+                    source_code,
+                    index + 2,
+                    preserve_line_breaks=preserve_line_breaks,
+                )
                 tokens.extend(expression_tokens)
                 continue
             index += 1
         return tokens, index
 
-    def _read_template_expression_tokens(self, source_code: str, index: int) -> tuple[list[tuple[str, str]], int]:
+    def _read_template_expression_tokens(
+        self,
+        source_code: str,
+        index: int,
+        *,
+        preserve_line_breaks: bool = False,
+    ) -> tuple[list[tuple[str, str]], int]:
         tokens: list[tuple[str, str]] = []
         depth = 1
         length = len(source_code)
         while index < length:
             char = source_code[index]
-            if char.isspace():
-                index += 1
-                continue
-            if char == "/" and index + 1 < length and source_code[index + 1] == "/":
-                index = self._skip_line_comment(source_code, index + 2)
-                continue
-            if char == "/" and index + 1 < length and source_code[index + 1] == "*":
-                index = self._skip_block_comment(source_code, index + 2)
+            trivia_end = self._typescript_trivia_end(source_code, index)
+            if trivia_end is not None:
+                self._append_linebreak_token(
+                    tokens,
+                    source_code[index:trivia_end],
+                    preserve_line_breaks=preserve_line_breaks,
+                )
+                index = trivia_end
                 continue
             if char in {"'", '"'}:
                 value, index = self._read_string_literal(source_code, index)
                 tokens.append(("string", value))
                 continue
             if char == "`":
-                template_tokens, index = self._read_template_literal_tokens(source_code, index + 1)
+                template_tokens, index = self._read_template_literal_tokens(
+                    source_code,
+                    index + 1,
+                    preserve_line_breaks=preserve_line_breaks,
+                )
                 tokens.extend(template_tokens)
                 continue
             if self._is_identifier_start(char):

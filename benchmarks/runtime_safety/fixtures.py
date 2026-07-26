@@ -15,17 +15,30 @@ from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationE
 
 
 def prepare_workspace(task: BenchmarkTask, suite_root: str | Path, run_root: str | Path, runner: str) -> Path:
-    suite = Path(suite_root)
+    suite = Path(suite_root).resolve(strict=True)
     source = suite / task.workspace
-    if not source.exists() or not source.is_dir():
+    if source.is_symlink():
+        raise BenchmarkValidationError(
+            f"{task.id}: workspace fixture root may not be a symlink: {source}"
+        )
+    try:
+        resolved_source = source.resolve(strict=True)
+    except OSError as exc:
+        raise BenchmarkValidationError(
+            f"{task.id}: workspace fixture does not exist: {source}"
+        ) from exc
+    if (
+        not resolved_source.is_dir()
+        or (resolved_source != suite and suite not in resolved_source.parents)
+    ):
         raise BenchmarkValidationError(f"{task.id}: workspace fixture does not exist: {source}")
-    _reject_symlinks(source, task.id)
-    _reject_git_metadata(source, task.id)
+    _reject_symlinks(resolved_source, task.id)
+    _reject_git_metadata(resolved_source, task.id)
     target = Path(run_root) / "workspaces" / runner / task.id
     if target.exists():
         shutil.rmtree(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, target)
+    shutil.copytree(resolved_source, target)
     _apply_setup_files(task, target)
     _reject_git_metadata(target, task.id)
     _apply_setup_git(task, target)
@@ -106,6 +119,8 @@ def _apply_setup_git(task: BenchmarkTask, workspace: Path) -> None:
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": str(global_config),
                 "GIT_TERMINAL_PROMPT": "0",
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
                 "PATH": provider._safe_path(),
             }
         )

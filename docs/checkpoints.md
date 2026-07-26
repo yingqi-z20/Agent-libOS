@@ -8,7 +8,8 @@ block, not a mechanism for rewinding the outside world.
 
 A checkpoint captures scoped state needed to reconstruct the owner subtree:
 
-- process rows and statuses,
+- process rows and statuses, including each process's resource budget,
+  accumulated resource-usage counters, and selected `llm_profile_id`,
 - process working directories,
 - Object Memory metadata and payloads owned by the subtree,
 - borrowed MemoryView root references and their types, without treating the
@@ -31,6 +32,27 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
   `checkpoint_commit` and `image_package` boot kinds,
 - loaded startup Runtime Module ids and their lowercase, 64-character SHA-256
   source digests.
+
+Destructive restore replaces the per-process resource-budget and accumulated
+resource-usage fields with the values in the captured process rows; fork copies
+those captured values into the new process identities. This is distinct from
+the durable `resource_usage_reservations` ledger used to account around
+provider dispatch. Usage-reservation rows are not snapshot tables and are not
+deleted, restored, or remapped by checkpoint operations. They retain their
+current status and are handled by the ordinary reservation settlement/recovery
+path, so callers must not interpret restored process counters as a rollback of
+that ledger. The similarly named `process_resource_reservations` rows listed
+above are parent/child budget allocations and *are* reconstructable subtree
+state.
+
+`process_terminal_cleanups` are also deliberately excluded. Their completed
+phases, attempts, owner, and lease describe Host cleanup work for the current
+process identity, not agent state that is safe to replay. When restore or fork
+publishes a terminal process row, the repository creates a fresh `pending`
+cleanup intent in the same transaction; an old lease or partial phase list is
+not restored or remapped. Terminal cleanup can consequently invoke an
+unacknowledged phase again, so its notification and process-finalization work
+must remain idempotent.
 
 Capabilities whose resource starts with `checkpoint:` control access to a
 checkpoint artifact; they are not reconstructable process state. They are
@@ -90,6 +112,14 @@ host module environment. Each restored/forked process continues to use the
 immutable `package_snapshot` in its `loaded_skills` record. Historical
 checkpoint `skills` rows remain readable compatibility data, not a host
 registry mutation.
+
+Only the selected `llm_profile_id` in each process row is captured. The Host's
+current profile definition, endpoint/model selection, policy, credentials,
+client instance, and client cache are not part of a checkpoint. Restore and
+fork therefore resolve the captured id against current Host configuration when
+the process next needs an LLM; a missing profile fails closed before provider
+dispatch. A profile that still exists may intentionally have a different Host
+definition, so a checkpoint does not pin or roll back provider configuration.
 
 Host filesystem, Git checkout/index/refs/worktrees/simulated-PR metadata and
 remote calls, shell, JSON-RPC/MCP remote calls, and provider effects are not
@@ -654,6 +684,19 @@ artifacts only for the missing images it reintroduces. It never replaces an
 image id that already exists. When actor capability checks are enabled, fork
 therefore requires both `execute` on the checkpoint and `write` on each missing
 `image:<image_id>` resource it would reintroduce.
+
+An existing image id is a deliberate current-Host compatibility boundary, not
+an immutable identity pin. If the Host changed that image after checkpoint
+creation, the fork keeps the captured process state and image id but executes
+under the image definition currently registered for that id. The result can be
+a hybrid of captured process/Object/tool-binding state and the current same-id
+prompt, safety policy, defaults, or boot metadata. Fork does not compare that
+definition with the captured one and does not require image-write authority
+merely because they differ. The ordinary checkpoint-inspect projection does
+not expose the captured image definition, so it cannot by itself prove replay
+equivalence. A Host that requires exact replay must preserve and compare image
+registration provenance through a trusted Host path, or keep immutable,
+versioned image ids so a different contract cannot occupy the same id.
 
 Fork also never replaces the global Skill registry. Forked processes consume
 their captured `loaded_skills.package_snapshot`; checkpoint compatibility rows

@@ -26,7 +26,7 @@ from agent_libos.tools.builtin import (
 )
 from agent_libos.tools.registry import stable_static_tool_id
 from agent_libos.utils.ids import utc_now
-from agent_libos.utils.serde import dumps, loads, to_jsonable
+from agent_libos.utils.serde import bounded_json_loads, dumps, to_jsonable
 
 
 LEGACY_TOOL_GROUP_TOOLS = ("discover_tool_groups", "activate_tool_group")
@@ -168,6 +168,10 @@ _TERMINAL_OBJECT_TASK_STATES = frozenset(
 _TERMINAL_PUBLICATION_STATES = frozenset({"committed", "rolled_back"})
 _MIGRATED_STATIC_TOOL_CREATED_AT = "2026-07-24T00:00:00+00:00"
 _CORE_STATIC_TOOL_SCOPE = "module:agent-libos-core:v0"
+# Legacy checkpoint documents already share this default hard ceiling. Apply
+# the same explicit bound to every JSON column before migration planning so an
+# operator gets one deterministic error instead of unbounded parsing/copying.
+_LEGACY_JSON_HARD_LIMIT_BYTES = 16_777_216
 
 
 class ToolSkillMigrationError(ValidationError):
@@ -1706,9 +1710,16 @@ def _preflight_inflight_activity(cursor: Any, static_tools: _StaticToolPlan) -> 
             )
     for row in _rows(cursor, "SELECT * FROM runtime_publications ORDER BY publication_id"):
         publication = dict(row)
+        operation_reconciled = _persisted_boolean(
+            publication.get("operation_reconciled"),
+            path=(
+                "runtime_publications["
+                f"{publication.get('publication_id')!r}].operation_reconciled"
+            ),
+        )
         unresolved = (
             str(publication.get("state")) not in _TERMINAL_PUBLICATION_STATES
-            or not bool(publication.get("operation_reconciled"))
+            or not operation_reconciled
         )
         if unresolved and _contains_token(
             {
@@ -1771,9 +1782,16 @@ def _preflight_checkpoint_restore_references(
             isinstance(planned_checkpoint_id, str)
             and planned_checkpoint_id in checkpoint_ids
         )
+        operation_reconciled = _persisted_boolean(
+            row.get("operation_reconciled"),
+            path=(
+                "runtime_publications["
+                f"{row.get('publication_id')!r}].operation_reconciled"
+            ),
+        )
         unresolved = (
             str(row.get("state")) not in _TERMINAL_PUBLICATION_STATES
-            or not bool(row.get("operation_reconciled"))
+            or not operation_reconciled
         )
         if unresolved and changes_planned_snapshot:
             raise ToolSkillMigrationError(
@@ -2085,9 +2103,22 @@ def _json_value(value: Any, path: str) -> Any:
     if not isinstance(value, str):
         raise ToolSkillMigrationError(f"{path} must contain JSON text")
     try:
-        return loads(value)
+        return bounded_json_loads(
+            value,
+            max_bytes=_LEGACY_JSON_HARD_LIMIT_BYTES,
+        )
     except (TypeError, ValueError) as exc:
         raise ToolSkillMigrationError(f"{path} contains malformed JSON") from exc
+
+
+def _persisted_boolean(value: Any, *, path: str) -> bool:
+    """Decode a backend boolean without laundering malformed persisted values."""
+
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in {0, 1}:
+        return value == 1
+    raise ToolSkillMigrationError(f"{path} must be stored as 0 or 1")
 
 
 def _json_object(value: Any, path: str) -> dict[str, Any]:

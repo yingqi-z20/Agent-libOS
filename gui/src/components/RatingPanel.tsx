@@ -50,7 +50,16 @@ export function RatingPanel({ process, onSave }: RatingPanelProps) {
             role="radio"
             aria-checked={score === value}
             aria-label={t("rating.starLabel", { score: value })}
+            tabIndex={(score || 1) === value ? 0 : -1}
             onClick={() => setScore(value)}
+            onKeyDown={(event) => {
+              const next = ratingValueForKey(value, event.key);
+              if (next === null) return;
+              event.preventDefault();
+              setScore(next);
+              const radios = event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("[role='radio']");
+              radios?.[next - 1]?.focus();
+            }}
           >
             <Star size={17} fill={value <= score ? "currentColor" : "none"} />
           </button>
@@ -71,4 +80,12 @@ export function RatingPanel({ process, onSave }: RatingPanelProps) {
       </div>
     </section>
   );
+}
+
+export function ratingValueForKey(current: number, key: string): number | null {
+  if (key === "Home") return 1;
+  if (key === "End") return 5;
+  if (key === "ArrowRight" || key === "ArrowUp") return current === 5 ? 1 : current + 1;
+  if (key === "ArrowLeft" || key === "ArrowDown") return current === 1 ? 5 : current - 1;
+  return null;
 }

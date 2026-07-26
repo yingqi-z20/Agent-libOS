@@ -40,10 +40,14 @@ def upcast_permitted_effects_policy(value: Any) -> list[str] | None:
         raise ValueError("permitted effects policy must be a versioned object")
     if set(value) != {"schema_version", "effects"}:
         raise ValueError("permitted effects policy has unsupported fields")
-    if value.get("schema_version") != PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION:
+    schema_version = value.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version != PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION
+    ):
         raise ValueError(
             "unsupported permitted effects policy schema_version: "
-            f"{value.get('schema_version')!r}"
+            f"{schema_version!r}"
         )
     effects = value.get("effects")
     if effects is None:

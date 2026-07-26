@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from agent_libos.memory.object_memory import ObjectMemoryManager
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.serde import dumps, loads
 
@@ -41,6 +42,8 @@ def _manager(
     manager = ObjectMemoryManager.__new__(ObjectMemoryManager)
     manager._object_release_finalizers = []
     manager._durable_object_release_finalizers = {}
+    manager.config = DEFAULT_CONFIG
+    manager.audit = SimpleNamespace(record=lambda **_kwargs: None)
     manager.bind_durable_object_release_finalizer(
         FINALIZER_ID,
         prepare,
@@ -101,6 +104,49 @@ def test_prepare_rejects_cyclic_json_containers() -> None:
 
     with pytest.raises(ValidationError, match="contains a cycle"):
         _prepare(manager, [_object()])
+
+
+def test_prepare_rejects_intent_before_exceeding_depth_node_or_byte_bounds() -> None:
+    deep: dict[str, Any] = {}
+    cursor = deep
+    for _ in range(ObjectMemoryManager._BOUNDED_JSON_MAX_DEPTH + 1):
+        nested: dict[str, Any] = {}
+        cursor["nested"] = nested
+        cursor = nested
+    cases = (
+        (deep, 16_384, "maximum JSON depth"),
+        ({"items": [None] * 16}, 8, "maximum JSON nodes"),
+        ({"padding": "x" * 64}, 32, "exceeds 32 bytes"),
+    )
+
+    for intent, limit_bytes, expected_error in cases:
+        manager = _manager(lambda _obj, _actor, _reason, _work_id, value=intent: value)
+        with pytest.raises(ValidationError, match=expected_error):
+            _prepare(
+                manager,
+                [_object()],
+                intent_limit_bytes=limit_bytes,
+            )
+
+
+def test_online_release_applies_the_configured_durable_intent_byte_bound() -> None:
+    finalized: list[dict[str, Any]] = []
+    manager = _manager(
+        lambda _obj, _actor, _reason, _work_id: {"padding": "x" * 64},
+        lambda intent, _actor, _reason, _work_id: finalized.append(intent),
+    )
+    manager.config = SimpleNamespace(
+        checkpoint=SimpleNamespace(payload_capture_limit_bytes=32)
+    )
+
+    with pytest.raises(ValidationError, match="exceeds 32 bytes"):
+        manager.run_object_release_finalizers_trusted(
+            _object(),  # type: ignore[arg-type]
+            actor="test.host",
+            reason="bounded online release",
+        )
+
+    assert finalized == []
 
 
 def test_mapping_intent_round_trips_without_changing_authenticated_value() -> None:

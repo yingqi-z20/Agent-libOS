@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from pathlib import PurePath
+from dataclasses import dataclass, replace
+from pathlib import PurePath, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable
 
 from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect
@@ -103,8 +103,10 @@ class AuthorityRuleCodec:
         if unknown_fields:
             raise ValidationError(f"authority rule has unknown fields: {', '.join(unknown_fields)}")
         try:
-            conditions = value.get("conditions") or {}
-            if not isinstance(conditions, dict):
+            conditions = value.get("conditions") if "conditions" in value else None
+            if conditions is None:
+                conditions = {}
+            elif not isinstance(conditions, dict):
                 raise ValidationError("authority rule conditions must be a mapping")
             return AuthorityRule(
                 rule_id=self._string(value.get("rule_id"), "rule_id"),
@@ -137,11 +139,71 @@ class AuthorityRuleCodec:
 class ShellRuleEngine:
     """Deterministic argv classifier used before shell provider execution."""
 
-    def __init__(self, custom_rules: Iterable[AuthorityRule | dict[str, Any]] = ()) -> None:
+    def __init__(
+        self,
+        custom_rules: Iterable[AuthorityRule | dict[str, Any]] = (),
+        *,
+        evaluator: Any | None = None,
+    ) -> None:
         codec = AuthorityRuleCodec()
         self.custom_rules = [codec.coerce(rule) for rule in custom_rules]
+        if evaluator is None:
+            # Import lazily because CapabilityEvaluator imports this module for
+            # the shared AuthorityRule codec.
+            from agent_libos.capability.evaluator import CapabilityEvaluator
 
-    def classify(self, argv: list[str]) -> RuleMatch:
+            evaluator = CapabilityEvaluator(codec)
+        self._evaluator = evaluator
+        for rule in self.custom_rules:
+            unknown = self._evaluator.unknown_authority_rule_conditions(rule)
+            malformed = self._evaluator.malformed_authority_rule_conditions(rule)
+            if unknown or malformed:
+                details = unknown or malformed
+                kind = "unknown" if unknown else "malformed"
+                raise ValidationError(
+                    f"shell rule {rule.rule_id} has {kind} conditions: {', '.join(details)}"
+                )
+
+    def classify(self, argv: list[str], *, context: dict[str, Any] | None = None) -> RuleMatch:
+        builtin = self.classify_builtin(argv)
+        if builtin.rule.effect == CapabilityEffect.DENY:
+            return builtin
+
+        selected_context = dict(context or {})
+        selected_context.setdefault("operation", "shell.run")
+        selected_context.setdefault("authority_operation", "shell.run")
+        selected_context["argv"] = list(argv)
+
+        matched_custom: list[RuleMatch] = []
+        missing_context = False
+        for rule in self.custom_rules:
+            if rule.operation != "shell.run":
+                continue
+            if self._missing_context_keys(rule, selected_context):
+                missing_context = True
+                continue
+            if self._matches_rule(selected_context, rule):
+                matched_custom.append(RuleMatch(rule=rule, matched_argv=self._rule_argv(rule)))
+
+        for effect in (CapabilityEffect.DENY, CapabilityEffect.ASK, CapabilityEffect.ALLOW):
+            selected = next((match for match in matched_custom if match.rule.effect == effect), None)
+            if selected is None:
+                continue
+            if effect == CapabilityEffect.DENY:
+                return selected
+            if builtin.rule.effect == CapabilityEffect.ASK and builtin.rule.rule_id != "shell.unknown.default":
+                return builtin
+            if missing_context:
+                return self._missing_context_match(argv)
+            return self._guard_auto_allow(argv, selected)
+
+        if missing_context:
+            return self._missing_context_match(argv)
+        return builtin
+
+    def classify_builtin(self, argv: list[str]) -> RuleMatch:
+        if not argv:
+            raise ValidationError("shell argv must contain at least one token")
         path_qualified_argv0 = self.argv0_has_path(argv[0]) if argv else False
         normalized = self._normalize_argv(argv)
         direct = normalized[0]
@@ -216,10 +278,6 @@ class ShellRuleEngine:
                 ),
             )
 
-        for rule in self.custom_rules:
-            if self._matches_rule(argv, normalized, rule):
-                return self._guard_auto_allow(argv, RuleMatch(rule=rule, matched_argv=self._rule_argv(rule)))
-
         if not path_qualified_argv0 and self._is_harmless(normalized):
             return self._guard_auto_allow(
                 argv,
@@ -255,33 +313,79 @@ class ShellRuleEngine:
             ),
         )
 
-    def _matches_rule(self, raw_argv: list[str], argv: list[str], rule: AuthorityRule) -> bool:
-        if rule.operation != "shell.run":
-            return False
-        conditions = rule.conditions
+    def _matches_rule(self, context: dict[str, Any], rule: AuthorityRule) -> bool:
+        conditions = dict(rule.conditions)
         rule_argv = conditions.get("argv")
         if rule_argv is not None:
-            if not isinstance(rule_argv, list) or not all(isinstance(item, str) for item in rule_argv):
+            actual_argv = context.get("argv")
+            if (
+                not isinstance(rule_argv, list)
+                or not all(isinstance(item, str) for item in rule_argv)
+                or not isinstance(actual_argv, list)
+                or not all(isinstance(item, str) for item in actual_argv)
+            ):
                 return False
-            if raw_argv and rule_argv:
-                rule_has_path = self.argv0_has_path(rule_argv[0])
-                if self.argv0_has_path(raw_argv[0]) and not rule_has_path:
-                    return False
-            expected = [self.normalize_executable(rule_argv[0]), *rule_argv[1:]] if rule_argv else []
-            match = str(conditions.get("match", "exact"))
-            if match == "exact":
-                return argv == expected
-            if match == "prefix":
-                return len(argv) >= len(expected) and argv[: len(expected)] == expected
-            return False
-        regex = conditions.get("regex_token")
-        if isinstance(regex, str):
-            try:
-                pattern = re.compile(regex)
-            except re.error:
+            normalized_conditions = {
+                "argv": self._normalize_custom_argv(rule_argv),
+                "match": conditions.get("match", "exact"),
+            }
+            normalized_context = {"argv": self._normalize_custom_argv(actual_argv)}
+            if not self._evaluator.argv_condition_matches(normalized_conditions, normalized_context):
                 return False
-            return any(pattern.fullmatch(token) for token in argv)
-        return False
+            conditions.pop("argv", None)
+            conditions.pop("match", None)
+        remaining_rule = replace(rule, conditions=conditions)
+        return self._evaluator.authority_rule_matches(remaining_rule, context)
+
+    def _missing_context_keys(self, rule: AuthorityRule, context: dict[str, Any]) -> list[str]:
+        missing: list[str] = []
+        for key in rule.conditions:
+            required = "timeout_s" if key in {"timeout_s", "timeout_max_s"} else key
+            if key in {"argv", "match", "regex_token"}:
+                continue
+            if required not in context:
+                missing.append(required)
+        return sorted(set(missing))
+
+    def _missing_context_match(self, argv: list[str]) -> RuleMatch:
+        direct = self.normalize_executable(argv[0]) if argv else ""
+        return self._match(
+            "shell.custom.context-required",
+            CapabilityEffect.DENY,
+            AuthorityRisk.HIGH,
+            (direct,),
+            "custom shell rule denied because complete operation context is unavailable",
+        )
+
+    def _normalize_custom_argv(self, argv: list[str]) -> list[str]:
+        if not argv:
+            return []
+        return [self.normalize_argv0_identity(argv[0]), *argv[1:]]
+
+    def normalize_argv0_identity(self, value: str) -> str:
+        raw = value.strip()
+        if not self.argv0_has_path(raw):
+            return f"bare:{self.normalize_executable(raw)}"
+        if self._is_windows_path(raw):
+            path = PureWindowsPath(raw)
+            normalized = path.as_posix().casefold()
+            normalized = self._strip_windows_executable_suffix(normalized)
+            kind = "absolute" if path.is_absolute() else "relative"
+            return f"windows-{kind}:{normalized}"
+        path = PurePosixPath(raw)
+        kind = "absolute" if path.is_absolute() else "relative"
+        return f"posix-{kind}:{path.as_posix()}"
+
+    @staticmethod
+    def _is_windows_path(value: str) -> bool:
+        return "\\" in value or bool(re.match(r"^[A-Za-z]:[\\/]", value))
+
+    @staticmethod
+    def _strip_windows_executable_suffix(value: str) -> str:
+        for suffix in _WINDOWS_EXECUTABLE_SUFFIXES:
+            if value.endswith(suffix):
+                return value[: -len(suffix)]
+        return value
 
     def _normalize_argv(self, argv: list[str]) -> list[str]:
         if not argv:

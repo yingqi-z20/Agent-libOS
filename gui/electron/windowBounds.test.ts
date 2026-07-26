@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mainWindowBounds, shouldCreateBrowserWindow } from "./windowBounds";
+import { mainWindowBounds, shouldCreateBrowserWindow } from "./windowBounds.js";
 
 describe("mainWindowBounds", () => {
   it("allows the production Electron window to reach the narrow responsive layout", () => {

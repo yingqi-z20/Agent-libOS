@@ -34,10 +34,10 @@ Use a token only for the same repository/worktree observation and exact decision
 
 - `git_diff` with `scope="worktree"` reads tracked unstaged changes versus the index. It does not include untracked file contents. `scope="staged"` reads the index versus HEAD. Both require `base=null` and `head=null`. `scope="range"` requires both exact `base` and `head` and resolves them to commit OIDs. `paths` are literal restrictions, not patterns. Diff generation disables rename detection, external diff, and textconv and includes binary patch data, so a rename can appear as delete plus add.
 - `git_log` returns bounded structured commit metadata from `ref`, or from the current HEAD OID when `ref=null`. It does not return patches or accept a path filter. `truncated=true` means more commits exist beyond the returned limit.
-- `git_show` resolves exactly one commit and returns its structured metadata, byte-safe changed paths, and a bounded binary patch. A tag is peeled to a commit for this operation.
+- `git_show` resolves exactly one commit and returns its structured metadata plus explicit root/per-parent diffs. `parent_diffs` has one entry with `parent_oid=null` for a root commit, one entry for an ordinary commit, and one entry per parent in `commit.parents` order for a merge or stash commit. Each entry has its own byte-safe `changed_paths`, `patch`/`patch_b64`, `truncated`, `bytes`, and `sha256`. The top-level patch fields are a compatibility view of the root or first-parent entry, identified by `patch_base_oid`; they are never complete evidence for every side of a multi-parent commit. A tag is peeled to a commit for this operation.
 - `git_blame` returns bounded raw porcelain for one literal path. When `ref=null` and HEAD exists, it deliberately blames the current HEAD OID, not dirty worktree bytes. Set an exact ref/OID to select another committed version. Use workspace-reading tools when the task is to inspect uncommitted file content.
 
-For `git_diff` and `git_show`, `patch` is a convenience UTF-8 rendering and `patch_b64` is the exact returned byte prefix. For `git_blame`, the analogous fields are `content` and `content_b64`. If `truncated=true`, neither field is a complete result. Where a full capture fit under the hard bound, `bytes` describes its full byte length and `sha256` its full digest even when only a soft-limited prefix is rendered. For limit-driven listings such as log or refs, the digest covers the bounded capture, not all history or all refs.
+For `git_diff`, the top-level `git_show` root/first-parent view, and each `git_show.parent_diffs` entry, `patch` is a convenience UTF-8 rendering and `patch_b64` is the exact returned byte prefix. For `git_blame`, the analogous fields are `content` and `content_b64`. If the corresponding `truncated=true`, neither field is complete. `git_show.parent_diffs_truncated=true` means at least one parent view is incomplete; raise `max_bytes` within its hard bound or inspect that exact parent/commit pair with `git_diff(scope="range")`. Where a full capture fit under the hard bound, `bytes` describes its full byte length and `sha256` its full digest even when only a soft-limited prefix is rendered. For limit-driven listings such as log or refs, the digest covers the bounded capture, not all history or all refs.
 
 ### Refs, remotes, and worktrees
 
@@ -52,18 +52,18 @@ All reads are bounded and can fail with `output_too_large` instead of returning 
 1. Select `main` or an exact returned `worktree_id`. Start with `git_repository_info` when repository identity or object format is unknown, then call `git_status`.
 2. Check `truncated` before interpreting entries. For renames, retain both `path` and `original_path`; for lossy paths retain only their `path_b64` forms.
 3. Read both `git_diff(scope="worktree")` and `git_diff(scope="staged")` for a change-recording decision. Inspect untracked content through workspace tools because worktree diff omits it. Inspect ignored paths separately when the task names them, and stop at a submodule gitlink when nested-repository evidence is required.
-4. Resolve history questions with `git_log`, then use `git_show` on exact OIDs. For a proposed range, call `git_diff(scope="range", base=<exact>, head=<exact>)` and require a complete patch.
+4. Resolve history questions with `git_log`, then use `git_show` on exact OIDs. For a multi-parent commit, decide whether the requested meaning is its first-parent tree delta or every parent comparison; inspect the matching complete `parent_diffs` entries and never generalize from the top-level first-parent view alone. For a proposed range, call `git_diff(scope="range", base=<exact>, head=<exact>)` and require a complete patch.
 5. Use `git_list_refs`, `git_list_remotes`, or `git_list_worktrees` for topology. Re-read status for every affected worktree rather than treating a main checkout observation as its local state.
 6. Immediately before a mutation, repeat the narrow status/diff/ref read after the last edit or test and carry its newest same-worktree `state.token`. Re-evaluate the operation, paths, and destructive scope; do not merely replace an old token.
 
 ## Failure and recovery
 
 - `repository_busy` means the bounded repository lock was unavailable. Wait briefly, then perform a fresh read; do not assume the prior observation is current.
-- `stale_state` during a read means repository state or data-flow lineage changed while it was observed. Discard the result and read again. During a mutation it means the old decision was not dispatched by that invocation; re-inspect and re-decide.
+- `stale_state` during a read means repository state or data-flow lineage changed while it was observed. Discard the result and read again. For a mutation, only an initial state-token CAS rejection before the first state-changing provider effect certifies that no mutation from this invocation began; read-only preflight/provider observations may already have occurred. A multi-phase operation can instead detect drift after an earlier phase; notably, pull can fetch its tracking ref and then return `stale_state` before integration. Use the operation Skill's reconciliation procedure rather than treating the code alone as proof of no effect.
 - `output_too_large` or `truncated=true` is incomplete evidence. Narrow literal paths, reduce the ref kind/history question, or use a supported complete artifact workflow. Never summarize omitted content as clean or absent.
 - Lossy rendered text is not byte evidence. Use the corresponding base64 field or path token.
 - `unsafe_repository`, `unsafe_repository_config`, or an unsupported operation is a stop condition. Do not bypass the typed boundary with shell Git; direct shell Git supports only a small hardened inspection subset and does not add missing typed mutations.
-- A read succeeding does not make a later mutation idempotent. The model-facing Git error projection does not expose every provider settlement detail. After any mutation error that is not clearly a pre-dispatch validation, permission, approval, or stale-state rejection, conservatively assume dispatch may have started and use the mutation Skill's read/reconciliation procedure before any retry; do not wait for a literal timeout or `unknown_effect` code.
+- A read succeeding does not make a later mutation idempotent. The model-facing Git error projection does not expose every provider settlement detail. After any mutation error that is not clearly a pre-dispatch validation, permission, approval, or **initial** state-token CAS rejection, conservatively assume dispatch may have started and use the mutation Skill's read/reconciliation procedure before any retry; do not wait for a literal timeout or `unknown_effect` code.
 
 ## Completion evidence
 
@@ -73,7 +73,7 @@ An inspection claim is complete only when all of the following hold:
 - status, relevant diffs/history, and all byte-safe paths are untruncated, with ignored and submodule blind spots stated explicitly;
 - untracked content was not mistaken for worktree diff content;
 - exact refs resolved to the intended full OIDs, with no revision-expression guesswork;
-- patch/content byte fields and their `bytes`/`sha256` meanings were interpreted correctly;
+- patch/content byte fields and their `bytes`/`sha256` meanings were interpreted correctly, and every required merge/stash parent diff was present and untruncated;
 - remote URLs were treated as redacted observations and no local token was called remote proof;
 - the final same-worktree `state.token` was obtained after the last relevant change;
 - any subsequent mutation is separately authorized and verified by a new read.

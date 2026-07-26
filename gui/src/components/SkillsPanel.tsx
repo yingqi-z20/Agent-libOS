@@ -1,9 +1,10 @@
 import { Download, Eye, Play, RefreshCw, Search, Unplug } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { LibOSClient } from "../api/client";
 import type { RuntimeProcess, SkillSummary } from "../api/types";
 import type { ConfirmationRequest } from "../adminTypes";
 import { useI18n } from "../i18n";
+import { RequestEpoch } from "../requestEpoch";
 import { CollapsibleJson } from "./CollapsibleJson";
 
 export function SkillsPanel({
@@ -28,23 +29,45 @@ export function SkillsPanel({
   const [details, setDetails] = useState<unknown>(null);
   const [loading, setLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const inspectRequests = useRef(new RequestEpoch());
+  const selectedIdRef = useRef(selectedId);
+  const clientRef = useRef(client);
+  const pidRef = useRef(process.pid);
+  selectedIdRef.current = selectedId;
+  clientRef.current = client;
+  pidRef.current = process.pid;
   const filtered = useMemo(() => filterSkills(skills, query), [query, skills]);
   const loadedIds = new Set(Object.keys(process.loaded_skills));
+  const selectedSkill = skills.find((skill) => skill.skill_id === selectedId);
+  const selectedPackageSha256 = packageSha256(selectedSkill?.package_sha256);
+  const selectedIsCurrent = selectedPackageSha256 !== null
+    && process.loaded_skills[selectedId]?.package_sha256 === selectedPackageSha256;
 
   useEffect(() => {
     if (!filtered.some((skill) => skill.skill_id === selectedId)) setSelectedId(filtered[0]?.skill_id ?? "");
   }, [filtered, selectedId]);
 
+  useEffect(() => {
+    inspectRequests.current.invalidate();
+    setLoading(false);
+    return () => inspectRequests.current.invalidate();
+  }, [client, process.pid, selectedId]);
+
   async function inspect() {
     if (!selectedId) return;
+    const inspectedId = selectedId;
+    const inspectedClient = client;
+    const inspectedPid = process.pid;
+    const request = inspectRequests.current.begin();
     setLoading(true);
     setLocalError(null);
     try {
-      setDetails(await client.inspectSkill(selectedId));
+      const result = await client.inspectSkill(selectedId);
+      if (inspectRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && pidRef.current === inspectedPid) setDetails(result);
     } catch (error) {
-      setLocalError(describe(error));
+      if (inspectRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && pidRef.current === inspectedPid) setLocalError(describe(error));
     } finally {
-      setLoading(false);
+      if (inspectRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && pidRef.current === inspectedPid) setLoading(false);
     }
   }
 
@@ -62,6 +85,10 @@ export function SkillsPanel({
   function confirmLifecycle(action: "activate" | "unload") {
     if (!selectedId) return;
     const skillId = selectedId;
+    const expectedPackageSha256 = action === "activate"
+      ? packageSha256(skills.find((skill) => skill.skill_id === skillId)?.package_sha256)
+      : null;
+    if (action === "activate" && expectedPackageSha256 === null) return;
     const actor = processAuthority ? process.pid : undefined;
     confirmAction({
       title: t(action === "activate" ? "skills.activateTitle" : "skills.unloadTitle"),
@@ -69,10 +96,21 @@ export function SkillsPanel({
       details: {
         pid: process.pid,
         skill_id: skillId,
+        ...(expectedPackageSha256 !== null
+          ? { expected_package_sha256: expectedPackageSha256 }
+          : {}),
         authority: actor ? "process" : "host-admin"
       },
       action: async () => {
-        if (action === "activate") await client.activateSkill(skillId, process.pid, true, actor);
+        if (action === "activate" && expectedPackageSha256 !== null) {
+          await client.activateSkill(
+            skillId,
+            process.pid,
+            expectedPackageSha256,
+            true,
+            actor
+          );
+        }
         else await client.unloadSkill(skillId, process.pid, true, actor);
       }
     });
@@ -109,7 +147,7 @@ export function SkillsPanel({
       </label>
       <div className="adminActions">
         <button disabled={!selectedId || loading} onClick={() => void inspect()}><Eye size={14} />{t("skills.inspect")}</button>
-        <button className="warning" disabled={!selectedId || loadedIds.has(selectedId)} onClick={() => confirmLifecycle("activate")}><Play size={14} />{t("skills.activate")}</button>
+        <button className="warning" disabled={!selectedId || selectedPackageSha256 === null || selectedIsCurrent} onClick={() => confirmLifecycle("activate")}><Play size={14} />{t("skills.activate")}</button>
         <button className="danger" disabled={!selectedId || !loadedIds.has(selectedId)} onClick={() => confirmLifecycle("unload")}><Unplug size={14} />{t("skills.unload")}</button>
       </div>
 
@@ -138,6 +176,10 @@ export function filterSkills(skills: SkillSummary[], query: string): SkillSummar
   return skills.filter((skill) => [skill.skill_id, skill.name, skill.description, skill.source]
     .filter((value): value is string => typeof value === "string")
     .some((value) => value.toLocaleLowerCase().includes(selected)));
+}
+
+export function packageSha256(value: unknown): string | null {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : null;
 }
 
 function describe(error: unknown): string {

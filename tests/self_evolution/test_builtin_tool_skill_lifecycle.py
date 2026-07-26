@@ -356,6 +356,51 @@ def test_reopen_reproduces_old_builtin_snapshot_after_catalog_upgrade(
         loaded_context = _loaded_context(reopened, pid)
         assert loaded_context["instructions"] != upgraded.instructions
         assert reopened.process.get(pid).tool_table == expected_full_table
+
+        discovered = reopened.tools.call(
+            pid,
+            "discover_skills",
+            {"text": WORKSPACE_EDITING_SKILL, "limit": 1},
+        )
+        assert discovered.ok
+        assert discovered.payload["skills"][0]["package_sha256"] == upgraded.package_sha256
+        assert discovered.payload["skills"][0]["active"] is False
+        assert discovered.payload["next_step"] == "activate_skill"
+
+        stale = reopened.tools.call(
+            pid,
+            "activate_skill",
+            {
+                "skill_id": WORKSPACE_EDITING_SKILL,
+                "expected_package_sha256": loaded_snapshot["package_sha256"],
+            },
+        )
+        assert not stale.ok
+        assert stale.payload["error"]["details"]["error_type"] == "SkillPackageChanged"
+        assert (
+            reopened.process.get(pid).loaded_skills[WORKSPACE_EDITING_SKILL]
+            == loaded_snapshot
+        )
+
+        activated = reopened.tools.call(
+            pid,
+            "activate_skill",
+            {
+                "skill_id": WORKSPACE_EDITING_SKILL,
+                "expected_package_sha256": upgraded.package_sha256,
+            },
+        )
+        assert activated.ok
+        assert activated.payload["result"]["package_sha256"] == upgraded.package_sha256
+        assert _loaded_context(reopened, pid)["instructions"] == upgraded.instructions
+        rediscovered = reopened.tools.call(
+            pid,
+            "discover_skills",
+            {"text": WORKSPACE_EDITING_SKILL, "limit": 1},
+        )
+        assert rediscovered.ok
+        assert rediscovered.payload["skills"][0]["active"] is True
+        assert rediscovered.payload["next_step"] == "use_loaded_skill"
         _assert_no_skill_capabilities(reopened, pid)
     finally:
         reopened.close()

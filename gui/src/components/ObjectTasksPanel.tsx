@@ -1,9 +1,10 @@
 import { Ban, Eye, Play, RefreshCw, Timer, Workflow } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { LibOSClient } from "../api/client";
 import type { ObjectTask, RuntimeProcess, ToolSummary } from "../api/types";
 import type { ConfirmationRequest, RunGuiAction } from "../adminTypes";
 import { useI18n } from "../i18n";
+import { RequestEpoch } from "../requestEpoch";
 import { CollapsibleJson } from "./CollapsibleJson";
 
 const terminalTaskStatuses = new Set([
@@ -43,6 +44,13 @@ export function ObjectTasksPanel({
   const [watchEvents, setWatchEvents] = useState("");
   const [result, setResult] = useState<unknown>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const detailRequests = useRef(new RequestEpoch());
+  const selectedIdRef = useRef(selectedId);
+  const clientRef = useRef(client);
+  const pidRef = useRef(process.pid);
+  selectedIdRef.current = selectedId;
+  clientRef.current = client;
+  pidRef.current = process.pid;
   const selected = relevantTasks.find((task) => task.task_id === selectedId) ?? null;
 
   useEffect(() => {
@@ -50,6 +58,11 @@ export function ObjectTasksPanel({
       setSelectedId(relevantTasks[0]?.task_id ?? "");
     }
   }, [relevantTasks, selectedId]);
+
+  useEffect(() => {
+    detailRequests.current.invalidate();
+    return () => detailRequests.current.invalidate();
+  }, [client, process.pid, selectedId]);
 
   function start() {
     const selectedOwnerOid = ownerOid.trim();
@@ -89,11 +102,15 @@ export function ObjectTasksPanel({
 
   async function inspect() {
     if (!selectedId) return;
+    const request = detailRequests.current.begin();
+    const inspectedClient = client;
+    const inspectedPid = process.pid;
     try {
       setLocalError(null);
-      setResult(await client.getObjectTask(selectedId, process.pid));
+      const response = await client.getObjectTask(selectedId, process.pid);
+      if (detailRequests.current.isCurrent(request) && selectedIdRef.current === selectedId && clientRef.current === inspectedClient && pidRef.current === inspectedPid) setResult(response);
     } catch (error) {
-      setLocalError(describe(error));
+      if (detailRequests.current.isCurrent(request) && selectedIdRef.current === selectedId && clientRef.current === inspectedClient && pidRef.current === inspectedPid) setLocalError(describe(error));
     }
   }
 
@@ -112,20 +129,30 @@ export function ObjectTasksPanel({
 
   async function wait() {
     if (!selectedId) return;
+    const taskId = selectedId;
+    const selectedClient = client;
+    const selectedPid = process.pid;
+    const request = detailRequests.current.begin();
     await runAction(async () => {
-      setResult(await client.waitObjectTask(selectedId, process.pid));
+      const response = await client.waitObjectTask(taskId, process.pid);
+      if (detailRequests.current.isCurrent(request) && selectedIdRef.current === taskId && clientRef.current === selectedClient && pidRef.current === selectedPid) setResult(response);
     }, "object_task.wait");
   }
 
   async function updateWatch() {
     if (!selectedId) return;
+    const taskId = selectedId;
+    const selectedClient = client;
+    const selectedPid = process.pid;
+    const request = detailRequests.current.begin();
     await runAction(async () => {
-      setResult(await client.watchObjectTaskOwner({
-        taskId: selectedId,
+      const response = await client.watchObjectTaskOwner({
+        taskId,
         pid: process.pid,
         enabled: ownerWatch,
         watchEvents: splitCsv(watchEvents)
-      }));
+      });
+      if (detailRequests.current.isCurrent(request) && selectedIdRef.current === taskId && clientRef.current === selectedClient && pidRef.current === selectedPid) setResult(response);
     }, "object_task.watch_owner");
   }
 

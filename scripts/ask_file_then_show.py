@@ -105,6 +105,7 @@ async def run_file_viewer(
         )
         results = await runtime.arun_until_idle(
             max_quanta=max_quanta,
+            pids=(pid,),
             human_auto_answer=auto_answer,
         )
         process = runtime.process.get(pid)
@@ -144,14 +145,17 @@ class AskFileViewerClient:
                 {"text": "human collaboration", "limit": 5},
             )
         if self.step == 1:
-            self._require_discovered_skill(
+            package_sha256 = self._discovered_skill_hash(
                 messages,
                 "agent-libos-human-collaboration",
             )
             self.step = 2
             return self._completion(
                 "activate_skill",
-                {"skill_id": "agent-libos-human-collaboration"},
+                {
+                    "skill_id": "agent-libos-human-collaboration",
+                    "expected_package_sha256": package_sha256,
+                },
             )
         if self.step == 2:
             # Drive the process through real Skill, Human, and filesystem
@@ -175,14 +179,17 @@ class AskFileViewerClient:
                 {"text": "workspace read text file", "limit": 5},
             )
         if self.step == 4:
-            self._require_discovered_skill(
+            package_sha256 = self._discovered_skill_hash(
                 messages,
                 "agent-libos-workspace-navigation",
             )
             self.step = 5
             return self._completion(
                 "activate_skill",
-                {"skill_id": "agent-libos-workspace-navigation"},
+                {
+                    "skill_id": "agent-libos-workspace-navigation",
+                    "expected_package_sha256": package_sha256,
+                },
             )
         if self.step == 5:
             self.step = 6
@@ -272,22 +279,30 @@ class AskFileViewerClient:
             )
         raise AssertionError("file viewer action plan is already complete")
 
-    def _require_discovered_skill(
+    def _discovered_skill_hash(
         self,
         messages: list[dict[str, str]],
         skill_id: str,
-    ) -> None:
+    ) -> str:
         discovered = self._last_tool_result(messages, "discover_skills")
         skills = discovered.get("skills")
-        returned_ids = {
-            str(item.get("skill_id") or "")
-            for item in skills
-            if isinstance(item, dict)
-        } if isinstance(skills, list) else set()
-        if skill_id not in returned_ids:
-            raise AssertionError(
-                f"discover_skills did not return expected Skill {skill_id}"
-            )
+        if isinstance(skills, list):
+            for item in skills:
+                if not isinstance(item, dict) or item.get("skill_id") != skill_id:
+                    continue
+                package_sha256 = item.get("package_sha256")
+                if (
+                    isinstance(package_sha256, str)
+                    and len(package_sha256) == 64
+                    and all(character in "0123456789abcdef" for character in package_sha256)
+                ):
+                    return package_sha256
+                raise AssertionError(
+                    f"discover_skills returned invalid package hash for {skill_id}"
+                )
+        raise AssertionError(
+            f"discover_skills did not return expected Skill {skill_id}"
+        )
 
     def _completion(self, name: str, args: dict[str, Any]) -> LLMCompletion:
         return LLMCompletion(

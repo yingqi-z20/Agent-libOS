@@ -11,7 +11,7 @@ This parser is a deterministic marker extractor, not a pytest result parser. Kee
 
 ### `parse_pytest_log`
 
-- Input: one required string field, `log`. It accepts captured text, not a filename, Object id, argv, or test selector.
+- Input: one required string field, `log`. Unknown fields are rejected. It accepts captured text, not a filename, Object id, argv, or test selector.
 - Output: string lists `failed`, `errors`, and `assertions`, plus integer `failure_count`. `failed` and `assertions` contain fully stripped lines. An `errors` item is the stripped source line with exactly its first two characters removed, so it can retain leading whitespace. These strings are not line numbers or indexes and contain no source offsets or neighboring context.
 - Every input line is processed as `line.strip()`, then the first matching rule wins:
   1. a line beginning exactly with case-sensitive `FAILED ` is appended in full to `failed`;
@@ -28,7 +28,7 @@ This parser is a deterministic marker extractor, not a pytest result parser. Kee
 4. Deduplicate by node id and phase only after inspecting context. One test can emit multiple matching lines, and identical messages can occur in different tests.
 5. Use the real test runner or its saved exit status to establish outcome. After a fix, run the narrowest affected test, then any required broader lane; analyze the new output rather than reusing stale markers.
 
-When the original output is too large, first retain it as an authorized file or Object and extract bounded regions with an appropriate tool. Passing only a head or tail is acceptable for local triage if explicitly labeled partial; it is not complete failure enumeration.
+When the original output is too large, first retain it as an authorized file or Object and extract bounded regions with an appropriate tool. `parse_pytest_log` itself has no cursor, offset, or paging contract, so repeatedly passing the same oversized log cannot recover omitted input or results. Passing only a head or tail is acceptable for local triage if explicitly labeled partial; it is not complete failure enumeration.
 
 ## Failure and recovery
 

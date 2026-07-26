@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import socket
 import stat
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Protocol
+from typing import Any, Iterator, Literal, Mapping, Protocol, runtime_checkable
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
@@ -30,6 +31,67 @@ from agent_libos.models.external_effect import ExternalEffectClassification
 from agent_libos.models.exceptions import ValidationError
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_PROVIDER_DNS_MAX_IN_FLIGHT = 8
+_PROVIDER_DNS_SLOTS = threading.BoundedSemaphore(_PROVIDER_DNS_MAX_IN_FLIGHT)
+
+
+def _bounded_provider_getaddrinfo(
+    host: str,
+    port: int,
+    *,
+    deadline: float | None,
+    operation: str,
+) -> list[Any]:
+    """Resolve one Host name within shared provider capacity and a deadline."""
+
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
+        raise TimeoutError(
+            f"{operation} absolute deadline exhausted waiting for DNS resolver capacity"
+        )
+    if not _PROVIDER_DNS_SLOTS.acquire(timeout=remaining):
+        raise TimeoutError(
+            f"{operation} absolute deadline exhausted waiting for DNS resolver capacity"
+        )
+    done = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def resolve() -> None:
+        try:
+            outcome["infos"] = socket.getaddrinfo(
+                host,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            _PROVIDER_DNS_SLOTS.release()
+            done.set()
+
+    try:
+        threading.Thread(
+            target=resolve,
+            name=f"agent-libos-provider-dns-{operation.lower()}",
+            daemon=True,
+        ).start()
+    except BaseException:
+        _PROVIDER_DNS_SLOTS.release()
+        raise
+
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
+        raise TimeoutError(
+            f"{operation} absolute deadline exhausted during DNS resolution for {host}"
+        )
+    if not done.wait(remaining):
+        raise TimeoutError(
+            f"{operation} absolute deadline exhausted during DNS resolution for {host}"
+        )
+    error = outcome.get("error")
+    if error is not None:
+        raise error
+    return list(outcome.get("infos", []))
 
 
 class HierarchicalPathLock:
@@ -416,20 +478,40 @@ def _validate_executable_snapshot_source_identity(
 
 def _mirror_executable_snapshot_siblings(
     selected: Path,
-    directory: Path,
+    dispatch_directory: Path,
+    snapshot_root: Path,
     *,
     sibling_limit: int,
     sibling_policy: str,
     header: bytes,
 ) -> None:
-    should_mirror = sibling_policy == "all" or (
+    mirrored = 0
+    should_mirror_direct = sibling_policy == "all" or (
         sibling_policy == "scripts" and header == b"#!"
     )
-    if should_mirror:
-        _mirror_executable_siblings(
+    if should_mirror_direct:
+        mirrored = _mirror_executable_siblings(
             selected,
-            directory,
+            dispatch_directory,
             sibling_limit=sibling_limit,
+            mirrored=mirrored,
+        )
+    # Native launchers commonly resolve shared libraries through
+    # ``$ORIGIN/../lib`` or ``@executable_path/../lib``. Keep the copied
+    # executable one directory below the private root and expose the original
+    # prefix siblings there so moving the bytes does not break the loader.
+    # Windows resolves adjacent DLLs in the executable directory instead.
+    should_mirror_prefix = (
+        os.name != "nt"
+        and header != b"#!"
+        and sibling_policy in {"all", "scripts"}
+    )
+    if should_mirror_prefix:
+        _mirror_executable_siblings(
+            selected.parent,
+            snapshot_root,
+            sibling_limit=sibling_limit,
+            mirrored=mirrored,
         )
 
 
@@ -442,8 +524,9 @@ def snapshot_executable(
     """Copy one stable executable into a private Host-owned dispatch object.
 
     ``scripts`` mirrors the existing bounded sibling set only for a shebang
-    script.  Native executables do not need their often very large system
-    directory mirrored merely to pin the bytes that the OS will execute.
+    script. Native POSIX executables retain a bounded view of their install
+    prefix so relative dynamic-loader paths keep working after the bytes are
+    moved into the private snapshot.
     """
 
     if sibling_policy not in {"all", "scripts", "none"}:
@@ -463,7 +546,9 @@ def snapshot_executable(
         ) from exc
 
     directory = Path(tempfile.mkdtemp(prefix="agent-libos-executable-"))
-    destination = directory / (selected.name or "executable")
+    dispatch_directory = directory / (selected.parent.name or "bin")
+    dispatch_directory.mkdir(mode=0o700)
+    destination = dispatch_directory / (selected.name or "executable")
     destination_fd: int | None = None
     try:
         before = os.fstat(source_fd)
@@ -488,6 +573,7 @@ def snapshot_executable(
         destination_fd = None
         _mirror_executable_snapshot_siblings(
             selected,
+            dispatch_directory,
             directory,
             sibling_limit=sibling_limit,
             sibling_policy=sibling_policy,
@@ -523,7 +609,8 @@ def _mirror_executable_siblings(
     snapshot_directory: Path,
     *,
     sibling_limit: int,
-) -> None:
+    mirrored: int = 0,
+) -> int:
     """Expose sibling resources beside a private executable snapshot.
 
     Scripts commonly resolve resources relative to ``$0`` or ``__file__``.
@@ -542,12 +629,19 @@ def _mirror_executable_siblings(
         or sibling_limit <= 0
     ):
         raise ValidationError("executable snapshot sibling limit must be a positive integer")
+    if (
+        isinstance(mirrored, bool)
+        or not isinstance(mirrored, int)
+        or mirrored < 0
+        or mirrored > sibling_limit
+    ):
+        raise ValidationError("executable snapshot mirrored sibling count is invalid")
     siblings: list[Path] = []
     try:
         for sibling in source.parent.iterdir():
             if sibling.name == source.name:
                 continue
-            if len(siblings) >= sibling_limit:
+            if mirrored + len(siblings) >= sibling_limit:
                 raise ValidationError(
                     "executable snapshot sibling count exceeds configured limit "
                     f"{sibling_limit}"
@@ -582,6 +676,7 @@ def _mirror_executable_siblings(
                     "executable snapshot cannot expose sibling resource "
                     f"{sibling.name!r}"
                 ) from link_error
+    return mirrored + len(siblings)
 
 
 def resolve_runtime_python_alias(
@@ -755,6 +850,10 @@ class ProviderEffectNotStarted(RuntimeError):
     """
 
 
+class FilesystemContentConflict(ValidationError, ProviderEffectNotStarted):
+    """A filesystem compare-and-swap precondition failed before mutation."""
+
+
 class FilesystemProvider(Protocol):
     namespace: str
     root_display: str
@@ -804,6 +903,22 @@ class FilesystemProvider(Protocol):
         context: dict[str, Any],
         result: Any,
     ) -> ExternalEffectClassification: ...
+
+
+@runtime_checkable
+class FilesystemCompareAndSwapProvider(Protocol):
+    """Optional provider extension for atomic conditional text writes."""
+
+    def write_text_compare_and_swap(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None = "\n",
+        *,
+        overwrite: bool = True,
+        expected_content_sha256: str | Literal["missing"],
+    ) -> None: ...
 
 
 class ClockProvider(Protocol):
@@ -962,6 +1077,50 @@ class GitProvider(Protocol):
     ) -> ExternalEffectClassification: ...
 
 
+@runtime_checkable
+class GitSubprocessScopeProvider(Protocol):
+    """Optional Git provider extension for scoped subprocess supervision.
+
+    Budgeted callers must also require ``supports_subprocess_limits`` to be
+    true; the method may remain available on a platform that cannot enforce
+    the requested operating-system limits.
+    """
+
+    supports_subprocess_limits: bool
+
+    def subprocess_scope(
+        self,
+        *,
+        limits: SubprocessLimits | None = None,
+    ) -> Iterator[Any]: ...
+
+
+@runtime_checkable
+class GitLimitedRunProvider(Protocol):
+    """Optional Git provider extension for one bounded direct invocation.
+
+    Budgeted callers must also require ``supports_subprocess_limits`` to be
+    true before calling ``run_with_limits``.
+    """
+
+    supports_subprocess_limits: bool
+
+    def run_with_limits(
+        self,
+        args: Sequence[str],
+        *,
+        worktree: str | Path | None = None,
+        timeout: float | None = None,
+        stdin: bytes | None = None,
+        max_output_bytes: int | None = None,
+        read_only: bool = True,
+        remote: str | None = None,
+        expected_remote_fingerprint: str | None = None,
+        verify_after: bool = True,
+        limits: SubprocessLimits,
+    ) -> GitCommandResult: ...
+
+
 class HumanProvider(Protocol):
     def write(self, message: str) -> None: ...
 
@@ -1037,6 +1196,18 @@ class McpProvider(Protocol):
         context: dict[str, Any],
         result: Any,
     ) -> ExternalEffectClassification: ...
+
+
+@runtime_checkable
+class McpSubprocessLimitsProvider(Protocol):
+    """Opt-in marker for MCP dispatch methods that accept ``limits=``.
+
+    A provider exposing this marker with the exact value ``True`` guarantees
+    that its ``validate_and_call``, ``list_tools``, and ``call_tool`` methods
+    accept an optional :class:`SubprocessLimits` keyword argument.
+    """
+
+    supports_subprocess_limits: Literal[True]
 
 
 class ResourceProviderSubstrate(Protocol):

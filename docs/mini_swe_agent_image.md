@@ -39,8 +39,10 @@ The wrapper runs:
 bash -lc "exec 2>&1; <command>"
 ```
 
-with a 30 second shell timeout, a 32,768-character command limit, and a 10,000
-character observation window. The package declares a 35 second outer JIT
+with a 30 second shell timeout, a 32,768-Unicode-code-point command limit, and a
+10,000-code-point observation window. The JSON Schema validator and TypeScript
+wrapper use the same unit, so astral characters such as emoji count once and
+head/tail elision never splits a UTF-16 surrogate pair. The package declares a 35 second outer JIT
 sandbox timeout so the shell timeout has time to return its structured
 observation. This per-tool timeout is capped by the Host's
 `tools.deno_timeout_hard_limit_s` (60 seconds by default); it does not raise the
@@ -61,7 +63,7 @@ either stream was truncated upstream or the wrapper elides captured output.
 The shell primitive can truncate a stream before the wrapper receives it.
 Observations whose captured output is longer than the wrapper window return
 `output_head`, `output_tail`, and `elided_chars` instead of a full `output`
-field. `elided_chars` counts only characters the wrapper removes from the
+field. `elided_chars` counts only Unicode code points the wrapper removes from the
 already captured strings; it cannot quantify bytes omitted earlier by the shell
 primitive, so the truncation flags remain authoritative for completeness.
 Timed-out or permission-denied commands return a non-zero observation with

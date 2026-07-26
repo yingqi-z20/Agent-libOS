@@ -2,19 +2,45 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool, StrictInt, field_validator
 
-from agent_libos.models import CapabilityEffect
-from agent_libos.models.exceptions import CapabilityDenied
+from agent_libos.models import Capability, CapabilityEffect
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 
 class ListCapabilitiesArgs(BaseModel):
     include_inactive: bool = Field(default=False, description="Include revoked, disabled, or expired capabilities.")
+    limit: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum records in this page; bounded by the Host capability list limit.",
+    )
+    after_cap_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Exclusive capability identifier cursor returned by the previous page.",
+    )
+
+    @field_validator("limit")
+    @classmethod
+    def _positive_limit(cls, value: int | None) -> int | None:
+        if value is not None and value < 1:
+            raise ValueError("limit must be a positive integer")
+        return value
+
+    @field_validator("after_cap_id")
+    @classmethod
+    def _non_empty_cursor(cls, value: str | None) -> str | None:
+        if value is not None and not value:
+            raise ValueError("after_cap_id must be a non-empty string")
+        return value
 
 
 class ListCapabilitiesOutput(BaseModel):
     capabilities: list[dict[str, Any]]
+    has_more: bool
+    next_cursor: str | None = None
 
 
 class InspectCapabilityArgs(BaseModel):
@@ -31,10 +57,17 @@ class DelegateCapabilityArgs(BaseModel):
     rights: list[str]
     effect: str = Field(default=CapabilityEffect.ALLOW.value)
     expires_at: str | None = None
-    uses_remaining: int | None = None
-    delegable: bool = False
+    uses_remaining: StrictInt | None = Field(default=None, ge=1)
+    delegable: StrictBool = False
     constraints: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("uses_remaining")
+    @classmethod
+    def _positive_uses_remaining(cls, value: int | None) -> int | None:
+        if value is not None and value < 1:
+            raise ValueError("uses_remaining must be a positive integer")
+        return value
 
 
 class DelegateCapabilityOutput(BaseModel):
@@ -56,6 +89,40 @@ def _runtime(ctx: ToolContext) -> Any:
     return ctx.runtime
 
 
+def _presentation_budget(runtime: Any) -> int:
+    limit = min(
+        runtime.config.tools.tool_result_payload_hard_limit_bytes,
+        runtime.config.tools.memory_payload_hard_limit_bytes,
+    )
+    # Reserve half of the carrier for the durable tool envelope, telemetry,
+    # and model-facing projection. The capability manager enforces this
+    # budget incrementally before materializing another record.
+    return max(1, limit // 2)
+
+
+def _mutation_capability_receipt(
+    runtime: Any,
+    cap: Capability,
+) -> dict[str, Any]:
+    """Return success evidence without failing after the mutation committed."""
+
+    try:
+        return runtime.capability.inspect_for_presentation(
+            cap.cap_id,
+            max_bytes=_presentation_budget(runtime),
+        )
+    except ValidationError:
+        # An exceptionally small Host result budget can be unable to carry the
+        # complete authority identity.  The mutation has already committed at
+        # this point, so return a positive, bounded settlement marker instead
+        # of a validation failure that could invite an unsafe duplicate call.
+        return {
+            "cap_id": cap.cap_id,
+            "status": cap.status.value,
+            "presentation_omitted": True,
+        }
+
+
 class ListCapabilitiesTool(SyncAgentTool[ListCapabilitiesArgs]):
     name = "list_capabilities"
     description = "List the current process capabilities without granting new authority."
@@ -66,8 +133,18 @@ class ListCapabilitiesTool(SyncAgentTool[ListCapabilitiesArgs]):
 
     def run(self, args: ListCapabilitiesArgs, ctx: ToolContext) -> ListCapabilitiesOutput:
         runtime = _runtime(ctx)
-        caps = runtime.capability.list_subject(ctx.pid, include_inactive=args.include_inactive)
-        return ListCapabilitiesOutput(capabilities=[runtime.capability.inspect(cap.cap_id) for cap in caps])
+        page = runtime.capability.presentation_page(
+            subject=ctx.pid,
+            include_inactive=args.include_inactive,
+            limit=args.limit,
+            after_cap_id=args.after_cap_id,
+            max_bytes=_presentation_budget(runtime),
+        )
+        return ListCapabilitiesOutput(
+            capabilities=page.capabilities,
+            has_more=page.has_more,
+            next_cursor=page.next_cursor,
+        )
 
 
 class InspectCapabilityTool(SyncAgentTool[InspectCapabilityArgs]):
@@ -85,7 +162,12 @@ class InspectCapabilityTool(SyncAgentTool[InspectCapabilityArgs]):
             raise ToolExecutionError("Capability not found.", code=ToolErrorCode.VALIDATION_ERROR)
         if cap.subject != ctx.pid:
             raise ToolExecutionError("Cannot inspect another process capability.", code=ToolErrorCode.PERMISSION_DENIED)
-        return InspectCapabilityOutput(capability=runtime.capability.inspect(args.cap_id))
+        return InspectCapabilityOutput(
+            capability=runtime.capability.inspect_for_presentation(
+                args.cap_id,
+                max_bytes=_presentation_budget(runtime),
+            )
+        )
 
 
 class DelegateCapabilityTool(SyncAgentTool[DelegateCapabilityArgs]):
@@ -119,7 +201,9 @@ class DelegateCapabilityTool(SyncAgentTool[DelegateCapabilityArgs]):
             )
         except CapabilityDenied as exc:
             raise ToolExecutionError(str(exc), code=ToolErrorCode.PERMISSION_DENIED) from exc
-        return DelegateCapabilityOutput(capability=runtime.capability.inspect(cap.cap_id))
+        return DelegateCapabilityOutput(
+            capability=_mutation_capability_receipt(runtime, cap)
+        )
 
 
 class RevokeCapabilityTool(SyncAgentTool[RevokeCapabilityArgs]):
@@ -136,4 +220,6 @@ class RevokeCapabilityTool(SyncAgentTool[RevokeCapabilityArgs]):
             cap = runtime.capability.revoke(args.cap_id, revoked_by=ctx.pid, reason=args.reason)
         except CapabilityDenied as exc:
             raise ToolExecutionError(str(exc), code=ToolErrorCode.PERMISSION_DENIED) from exc
-        return RevokeCapabilityOutput(capability=runtime.capability.inspect(cap.cap_id))
+        return RevokeCapabilityOutput(
+            capability=_mutation_capability_receipt(runtime, cap)
+        )

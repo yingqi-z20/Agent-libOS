@@ -24,7 +24,7 @@ describe("previewImageManifest", () => {
     });
   });
 
-  it("previews simple IMAGE.yaml package manifests", () => {
+  it("does not approximate IMAGE.yaml with a parser that differs from the backend", () => {
     const preview = previewImageManifest(`
 image:
   image_id: package-agent:v0
@@ -42,12 +42,12 @@ image:
 `);
 
     expect(preview).toMatchObject({
-      image_id: "package-agent:v0",
-      name: "package-agent",
-      version: "v1",
-      default_tools_count: 2,
-      required_capabilities_count: 1,
-      required_modules_count: 1
+      image_id: null,
+      name: null,
+      version: null,
+      default_tools_count: null,
+      required_capabilities_count: null,
+      required_modules_count: null
     });
   });
 });

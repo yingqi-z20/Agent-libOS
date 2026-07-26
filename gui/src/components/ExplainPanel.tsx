@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ExplainOperationResponse, OperationEvidence, OperationListResponse, OperationSummary } from "../api/types";
 import { useI18n } from "../i18n";
+import { RequestEpoch } from "../requestEpoch";
 import { CollapsibleJson } from "./CollapsibleJson";
 
 export function ExplainPanel({
@@ -8,13 +9,17 @@ export function ExplainPanel({
   listOperations,
   explainOperation,
   resolveOperation,
-  lookup
+  lookup,
+  refreshKey,
+  connectionKey
 }: {
   pid: string;
-  listOperations(pid: string, cursor?: string): Promise<OperationListResponse>;
-  explainOperation(operationId: string, cursor?: string): Promise<ExplainOperationResponse>;
-  resolveOperation(kind: string, id: string): Promise<ExplainOperationResponse>;
+  listOperations(pid: string, cursor?: string, signal?: AbortSignal): Promise<OperationListResponse>;
+  explainOperation(operationId: string, cursor?: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
+  resolveOperation(kind: string, id: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
   lookup: { kind: string; id: string; nonce: number } | null;
+  refreshKey: string;
+  connectionKey: string;
 }) {
   const { formatTime, t } = useI18n();
   const [operations, setOperations] = useState<OperationSummary[]>([]);
@@ -22,51 +27,106 @@ export function ExplainPanel({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [explanation, setExplanation] = useState<ExplainOperationResponse | null>(null);
   const [evidenceType, setEvidenceType] = useState("all");
-  const [busy, setBusy] = useState(false);
+  const [listBusy, setListBusy] = useState(false);
+  const [detailBusy, setDetailBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const listRequests = useRef(new RequestEpoch());
+  const detailRequests = useRef(new RequestEpoch());
+  const selectedIdRef = useRef(selectedId);
+  const lookupRef = useRef(lookup);
+  const handledLookupNonce = useRef<number | null>(null);
+  const listAbort = useRef<AbortController | null>(null);
+  const detailAbort = useRef<AbortController | null>(null);
+  const listOperationsRef = useRef(listOperations);
+  const explainOperationRef = useRef(explainOperation);
+  const resolveOperationRef = useRef(resolveOperation);
+  selectedIdRef.current = selectedId;
+  lookupRef.current = lookup;
+  listOperationsRef.current = listOperations;
+  explainOperationRef.current = explainOperation;
+  resolveOperationRef.current = resolveOperation;
+  const busy = listBusy || detailBusy;
+
+  useEffect(() => () => {
+    listAbort.current?.abort();
+    detailAbort.current?.abort();
+    listRequests.current.invalidate();
+    detailRequests.current.invalidate();
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    setOperations([]);
-    setExplanation(null);
-    setSelectedId(null);
+    listAbort.current?.abort();
+    detailAbort.current?.abort();
+    const listController = new AbortController();
+    const detailController = new AbortController();
+    listAbort.current = listController;
+    detailAbort.current = detailController;
+    const listRequest = listRequests.current.begin();
+    const detailRequest = detailRequests.current.begin();
     setError(null);
-    setBusy(true);
-    void listOperations(pid).then(async (response) => {
-      if (cancelled) return;
+    setListBusy(true);
+    setDetailBusy(false);
+    void listOperationsRef.current(pid, undefined, listController.signal).then((response) => {
+      if (!listRequests.current.isCurrent(listRequest)) return;
       setOperations(response.operations);
       setOperationCursor(response.next_cursor);
-      const first = response.operations[0];
-      if (lookup || !first) return;
-      const detail = await explainOperation(first.operation_id);
-      if (!cancelled) {
+      const pendingLookup = lookupRef.current && handledLookupNonce.current !== lookupRef.current.nonce;
+      const targetId = operationIdForRefresh(selectedIdRef.current, response.operations, Boolean(pendingLookup));
+      const target = targetId ? { operation_id: targetId } : null;
+      if (!target) {
+        if (!selectedIdRef.current) setExplanation(null);
+        return;
+      }
+      if (pendingLookup || !detailRequests.current.isCurrent(detailRequest)) return;
+      setDetailBusy(true);
+      void explainOperationRef.current(target.operation_id, undefined, detailController.signal).then((detail) => {
+        if (!detailRequests.current.isCurrent(detailRequest)) return;
         setSelectedId(detail.selected_operation_id);
         setExplanation(detail);
-      }
+        setEvidenceType("all");
+      }).catch((reason) => {
+        if (detailRequests.current.isCurrent(detailRequest)) setError(String(reason));
+      }).finally(() => {
+        if (detailRequests.current.isCurrent(detailRequest)) setDetailBusy(false);
+      });
     }).catch((reason) => {
-      if (!cancelled) setError(String(reason));
+      if (listRequests.current.isCurrent(listRequest)) setError(String(reason));
     }).finally(() => {
-      if (!cancelled) setBusy(false);
+      if (listRequests.current.isCurrent(listRequest)) setListBusy(false);
     });
-    return () => { cancelled = true; };
-  }, [pid]);
+    return () => {
+      listController.abort();
+      detailController.abort();
+      if (listRequests.current.isCurrent(listRequest)) listRequests.current.invalidate();
+      if (detailRequests.current.isCurrent(detailRequest)) detailRequests.current.invalidate();
+    };
+  }, [connectionKey, pid, refreshKey]);
 
   useEffect(() => {
-    if (!lookup) return;
-    let cancelled = false;
-    setBusy(true);
-    void resolveOperation(lookup.kind, lookup.id).then((detail) => {
-      if (cancelled) return;
+    if (!lookup || handledLookupNonce.current === lookup.nonce) return;
+    handledLookupNonce.current = lookup.nonce;
+    detailAbort.current?.abort();
+    const controller = new AbortController();
+    detailAbort.current = controller;
+    const request = detailRequests.current.begin();
+    setDetailBusy(true);
+    setError(null);
+    void resolveOperationRef.current(lookup.kind, lookup.id, controller.signal).then((detail) => {
+      if (!detailRequests.current.isCurrent(request)) return;
+      setOperations((current) => mergeOperations(current, detail.operations));
       setSelectedId(detail.selected_operation_id);
       setExplanation(detail);
       setEvidenceType("all");
     }).catch((reason) => {
-      if (!cancelled) setError(String(reason));
+      if (detailRequests.current.isCurrent(request)) setError(String(reason));
     }).finally(() => {
-      if (!cancelled) setBusy(false);
+      if (detailRequests.current.isCurrent(request)) setDetailBusy(false);
     });
-    return () => { cancelled = true; };
-  }, [lookup?.nonce]);
+    return () => {
+      controller.abort();
+      if (detailRequests.current.isCurrent(request)) detailRequests.current.invalidate();
+    };
+  }, [connectionKey, lookup?.nonce, pid]);
 
   const evidenceTypes = useMemo(
     () => ["all", ...Array.from(new Set((explanation?.evidence ?? []).map((item) => item.evidence_type))).sort()],
@@ -78,35 +138,73 @@ export function ExplainPanel({
   );
 
   async function select(operationId: string) {
-    setBusy(true);
+    handledLookupNonce.current = lookupRef.current?.nonce ?? handledLookupNonce.current;
+    detailAbort.current?.abort();
+    const controller = new AbortController();
+    detailAbort.current = controller;
+    const request = detailRequests.current.begin();
+    setDetailBusy(true);
     setError(null);
+    setSelectedId(operationId);
     try {
-      setSelectedId(operationId);
-      setExplanation(await explainOperation(operationId));
+      const detail = await explainOperationRef.current(operationId, undefined, controller.signal);
+      if (!detailRequests.current.isCurrent(request)) return;
+      setSelectedId(detail.selected_operation_id);
+      setExplanation(detail);
       setEvidenceType("all");
     } catch (reason) {
-      setError(String(reason));
+      if (detailRequests.current.isCurrent(request)) setError(String(reason));
     } finally {
-      setBusy(false);
+      if (detailRequests.current.isCurrent(request)) setDetailBusy(false);
     }
   }
 
   async function loadMoreOperations() {
     if (!operationCursor) return;
-    const response = await listOperations(pid, operationCursor);
-    setOperations((current) => [...current, ...response.operations]);
-    setOperationCursor(response.next_cursor);
+    const cursor = operationCursor;
+    listAbort.current?.abort();
+    const controller = new AbortController();
+    listAbort.current = controller;
+    const request = listRequests.current.begin();
+    setListBusy(true);
+    setError(null);
+    try {
+      const response = await listOperationsRef.current(pid, cursor, controller.signal);
+      if (!listRequests.current.isCurrent(request)) return;
+      setOperations((current) => mergeOperations(current, response.operations));
+      setOperationCursor(response.next_cursor);
+    } catch (reason) {
+      if (listRequests.current.isCurrent(request)) setError(String(reason));
+    } finally {
+      if (listRequests.current.isCurrent(request)) setListBusy(false);
+    }
   }
 
   async function loadMoreEvidence() {
     if (!explanation?.next_cursor) return;
-    const next = await explainOperation(explanation.selected_operation_id, explanation.next_cursor);
-    setExplanation(mergeEvidencePage(explanation, next));
+    detailAbort.current?.abort();
+    const controller = new AbortController();
+    detailAbort.current = controller;
+    const current = explanation;
+    const request = detailRequests.current.begin();
+    setDetailBusy(true);
+    setError(null);
+    try {
+      const next = await explainOperationRef.current(current.selected_operation_id, current.next_cursor ?? undefined, controller.signal);
+      if (!detailRequests.current.isCurrent(request)) return;
+      setExplanation((latest) => latest?.selected_operation_id === current.selected_operation_id
+        ? mergeEvidencePage(latest, next)
+        : latest);
+    } catch (reason) {
+      if (detailRequests.current.isCurrent(request)) setError(String(reason));
+    } finally {
+      if (detailRequests.current.isCurrent(request)) setDetailBusy(false);
+    }
   }
 
-  if (busy && operations.length === 0) return <div className="empty">{t("explain.loading")}</div>;
+  if (busy && operations.length === 0 && !explanation) return <div className="empty">{t("explain.loading")}</div>;
   if (error) return <div className="empty explainError">{error}</div>;
-  if (operations.length === 0) return <div className="empty">{t("explain.empty")}</div>;
+  if (operations.length === 0 && !explanation) return <div className="empty">{t("explain.empty")}</div>;
 
   return (
     <div className="explainPanel">
@@ -123,7 +221,7 @@ export function ExplainPanel({
             <span>{operation.outcome} · {formatTime(operation.started_at)}</span>
           </button>
         ))}
-        {operationCursor ? <button type="button" onClick={() => void loadMoreOperations()}>{t("explain.loadMore")}</button> : null}
+        {operationCursor ? <button type="button" disabled={listBusy} onClick={() => void loadMoreOperations()}>{t("explain.loadMore")}</button> : null}
       </section>
 
       {explanation ? (
@@ -155,12 +253,12 @@ export function ExplainPanel({
           <section className="explainEvidence">
             <div className="explainEvidenceHeader">
               <h3>{t("explain.timeline")}</h3>
-              <select value={evidenceType} onChange={(event) => setEvidenceType(event.currentTarget.value)}>
+              <select aria-label={t("explain.timeline")} value={evidenceType} onChange={(event) => setEvidenceType(event.currentTarget.value)}>
                 {evidenceTypes.map((value) => <option value={value} key={value}>{value}</option>)}
               </select>
             </div>
             {visibleEvidence.map((item) => <EvidenceRow key={`${item.evidence_type}:${item.evidence_id}`} item={item} />)}
-            {explanation.next_cursor ? <button type="button" onClick={() => void loadMoreEvidence()}>{t("explain.loadMore")}</button> : null}
+            {explanation.next_cursor ? <button type="button" disabled={detailBusy} onClick={() => void loadMoreEvidence()}>{t("explain.loadMore")}</button> : null}
           </section>
         </>
       ) : null}
@@ -202,6 +300,15 @@ export function buildOperationChildren(operations: OperationSummary[]): Map<stri
   return children;
 }
 
+export function operationIdForRefresh(
+  selectedId: string | null,
+  operations: OperationSummary[],
+  lookupPending: boolean
+): string | null {
+  if (selectedId) return selectedId;
+  return lookupPending ? null : operations[0]?.operation_id ?? null;
+}
+
 export function filterOperationEvidence(items: OperationEvidence[], evidenceType: string): OperationEvidence[] {
   return items.filter((item) => evidenceType === "all" || item.evidence_type === evidenceType);
 }
@@ -224,6 +331,12 @@ export function mergeEvidencePage(
     ...next,
     evidence: Array.from(evidence.values())
   };
+}
+
+function mergeOperations(current: OperationSummary[], next: OperationSummary[]): OperationSummary[] {
+  const merged = new Map(current.map((item) => [item.operation_id, item]));
+  for (const item of next) merged.set(item.operation_id, item);
+  return Array.from(merged.values());
 }
 
 function EvidenceRow({ item }: { item: OperationEvidence }) {

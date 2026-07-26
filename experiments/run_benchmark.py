@@ -6,8 +6,10 @@ import importlib.metadata
 import json
 import os
 import platform
+import stat
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ from benchmarks.runtime_safety.runners import (
     AGENT_LIBOS_RUNNERS,
     RUNNER_INTERVENTIONS,
     RUNNER_NAMES,
+    output_run_lease,
     run_suite,
     write_run_outputs,
 )
@@ -35,6 +38,38 @@ _PROVENANCE_DISTRIBUTIONS = (
     "jsonschema",
     "PyYAML",
 )
+_MAX_PROVENANCE_FILE_BYTES = 256 * 1024 * 1024
+_MAX_PROVENANCE_TREE_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_PROVENANCE_FILES = 100_000
+_PROVENANCE_CHUNK_BYTES = 1024 * 1024
+
+
+@dataclass
+class _ProvenanceBudget:
+    files: int = 0
+    bytes: int = 0
+
+    def add_file(self, path: Path) -> None:
+        self.files += 1
+        if self.files > _MAX_PROVENANCE_FILES:
+            raise RuntimeError(
+                "benchmark provenance exceeds the source file-count limit"
+            )
+        try:
+            size = path.lstat().st_size
+        except OSError as exc:
+            raise RuntimeError(f"benchmark provenance cannot stat {path}") from exc
+        if size > _MAX_PROVENANCE_FILE_BYTES:
+            raise RuntimeError(
+                f"benchmark provenance file exceeds the size limit: {path}"
+            )
+
+    def add_bytes(self, amount: int) -> None:
+        self.bytes += amount
+        if self.bytes > _MAX_PROVENANCE_TREE_BYTES:
+            raise RuntimeError(
+                "benchmark provenance exceeds the aggregate byte limit"
+            )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -93,29 +128,42 @@ def main(argv: list[str] | None = None) -> None:
                 + ", ".join(unsupported_runners)
             )
     output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
-    metadata: dict[str, Any] = {
-        "output_schema_version": 2,
-        "run_id": f"run_{uuid.uuid4().hex}",
-        "completion_state": "in_progress",
-        "suite": str(suite),
-        "tasks": [task.id for task in tasks],
-        "runners": runners,
-        "llm_mode": args.llm,
-        "pid": os.getpid(),
-        "provenance": _build_provenance(
-            suite,
+    run_id = f"run_{uuid.uuid4().hex}"
+    with output_run_lease(output, run_id) as ownership_token:
+        metadata: dict[str, Any] = {
+            "output_schema_version": 2,
+            "run_id": run_id,
+            "completion_state": "in_progress",
+            "suite": str(suite),
+            "tasks": [task.id for task in tasks],
+            "runners": runners,
+            "llm_mode": args.llm,
+            "pid": os.getpid(),
+            "provenance": _build_provenance(
+                suite,
+                tasks,
+                runners=runners,
+                llm_mode=args.llm,
+                max_quanta=args.max_quanta,
+            ),
+        }
+        _write_json_atomic(output / "metadata.json", metadata)
+        _clear_stale_derived_outputs(output)
+        runs = run_suite(
             tasks,
+            suite,
+            output,
             runners=runners,
             llm_mode=args.llm,
             max_quanta=args.max_quanta,
-        ),
-    }
-    _write_json_atomic(output / "metadata.json", metadata)
-    _clear_stale_derived_outputs(output)
-    runs = run_suite(tasks, suite, output, runners=runners, llm_mode=args.llm, max_quanta=args.max_quanta)
-    write_run_outputs(runs, output)
-    metrics = write_metrics(output)
+        )
+        write_run_outputs(
+            runs,
+            output,
+            expected_run_id=run_id,
+            ownership_token=ownership_token,
+        )
+        metrics = write_metrics(output)
     runner_failures = [
         {
             "task_id": run.result.task_id,
@@ -290,11 +338,31 @@ def _workload_provenance(suite: Path, tasks: list[Any]) -> tuple[list[dict[str, 
     fixture_entries = [
         {
             "path": workspace,
-            "sha256": _hash_path(suite / workspace),
+            "sha256": _hash_path(_fixture_source_root(suite, workspace)),
         }
         for workspace in workspaces
     ]
     return task_entries, fixture_entries
+
+
+def _fixture_source_root(suite: Path, workspace: str) -> Path:
+    suite_root = suite.resolve(strict=True)
+    source = suite_root / workspace
+    if source.is_symlink():
+        raise RuntimeError(
+            f"benchmark fixture root may not be a symbolic link: {source}"
+        )
+    try:
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"benchmark provenance path does not exist: {source}"
+        ) from exc
+    if resolved != suite_root and suite_root not in resolved.parents:
+        raise RuntimeError(f"benchmark fixture escapes suite root: {source}")
+    if not resolved.is_dir():
+        raise RuntimeError(f"benchmark fixture is not a directory: {source}")
+    return resolved
 
 
 def _git_provenance() -> dict[str, Any]:
@@ -343,13 +411,14 @@ def _git_provenance() -> dict[str, Any]:
     digest.update(status_result)
     digest.update(b"\0diff\0")
     digest.update(diff_result)
+    untracked_budget = _ProvenanceBudget()
     for raw_path in sorted(item for item in untracked_result.split(b"\0") if item):
         relative = raw_path.decode("utf-8", errors="surrogateescape")
         digest.update(b"\0untracked\0")
         digest.update(raw_path)
         path = REPO_ROOT / relative
         if path.is_file() or path.is_symlink():
-            digest.update(_path_bytes(path))
+            _update_digest_from_path(digest, path, untracked_budget)
     return {
         "available": True,
         "commit": commit or None,
@@ -403,37 +472,134 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _sha256_file(
+    path: Path,
+    *,
+    budget: _ProvenanceBudget | None = None,
+) -> str:
+    digest = hashlib.sha256()
+    _update_digest_from_path(
+        digest,
+        path,
+        budget if budget is not None else _ProvenanceBudget(),
+        marker=False,
+    )
+    return digest.hexdigest()
 
 
 def _hash_path(path: Path) -> str:
     if not path.exists() and not path.is_symlink():
         raise RuntimeError(f"benchmark provenance path does not exist: {path}")
     if path.is_file() or path.is_symlink():
-        return hashlib.sha256(_path_bytes(path)).hexdigest()
-    files = sorted(
-        item for item in path.rglob("*")
-        if item.is_file() or item.is_symlink()
-    )
+        digest = hashlib.sha256()
+        _update_digest_from_path(digest, path, _ProvenanceBudget())
+        return digest.hexdigest()
+    files: list[Path] = []
+    stack = [path]
+    entries_seen = 0
+    while stack:
+        directory = stack.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen > _MAX_PROVENANCE_FILES:
+                        raise RuntimeError(
+                            "benchmark provenance exceeds the source entry limit"
+                        )
+                    selected = Path(entry.path)
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode):
+                        stack.append(selected)
+                    elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                        files.append(selected)
+                    else:
+                        raise RuntimeError(
+                            "benchmark provenance contains a special file: "
+                            f"{selected}"
+                        )
+        except OSError as exc:
+            raise RuntimeError(
+                f"benchmark provenance cannot traverse {directory}"
+            ) from exc
     return _hash_files(files, relative_to=path)
 
 
 def _hash_files(paths: list[Path], *, relative_to: Path) -> str:
     digest = hashlib.sha256()
+    budget = _ProvenanceBudget()
     for path in sorted(paths, key=lambda item: item.as_posix()):
         relative = path.relative_to(relative_to).as_posix()
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(_path_bytes(path))
+        _update_digest_from_path(digest, path, budget)
         digest.update(b"\0")
     return digest.hexdigest()
 
 
 def _path_bytes(path: Path) -> bytes:
+    """Return one explicitly bounded provenance input for compatibility tests."""
+
     if path.is_symlink():
-        return b"symlink\0" + os.readlink(path).encode("utf-8", errors="surrogateescape")
-    return b"file\0" + path.read_bytes()
+        target = os.readlink(path).encode("utf-8", errors="surrogateescape")
+        if len(target) > _MAX_PROVENANCE_FILE_BYTES:
+            raise RuntimeError(f"benchmark provenance symlink is too large: {path}")
+        return b"symlink\0" + target
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_PROVENANCE_FILE_BYTES:
+        raise RuntimeError(f"benchmark provenance file is invalid or too large: {path}")
+    with path.open("rb") as stream:
+        data = stream.read(_MAX_PROVENANCE_FILE_BYTES + 1)
+    if len(data) > _MAX_PROVENANCE_FILE_BYTES:
+        raise RuntimeError(f"benchmark provenance file is too large: {path}")
+    return b"file\0" + data
+
+
+def _update_digest_from_path(
+    digest: Any,
+    path: Path,
+    budget: _ProvenanceBudget,
+    *,
+    marker: bool = True,
+) -> None:
+    budget.add_file(path)
+    initial = path.lstat()
+    if stat.S_ISLNK(initial.st_mode):
+        target = os.readlink(path).encode("utf-8", errors="surrogateescape")
+        budget.add_bytes(len(target))
+        if marker:
+            digest.update(b"symlink\0")
+        digest.update(target)
+        return
+    if not stat.S_ISREG(initial.st_mode):
+        raise RuntimeError(f"benchmark provenance path is not a regular file: {path}")
+    if marker:
+        digest.update(b"file\0")
+    observed = 0
+    with path.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino):
+            raise RuntimeError(f"benchmark provenance file changed before read: {path}")
+        for chunk in iter(lambda: stream.read(_PROVENANCE_CHUNK_BYTES), b""):
+            observed += len(chunk)
+            if observed > _MAX_PROVENANCE_FILE_BYTES:
+                raise RuntimeError(
+                    f"benchmark provenance file exceeds the size limit: {path}"
+                )
+            budget.add_bytes(len(chunk))
+            digest.update(chunk)
+        final = os.fstat(stream.fileno())
+    if (
+        observed != initial.st_size
+        or (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns)
+        != (
+            initial.st_dev,
+            initial.st_ino,
+            initial.st_size,
+            initial.st_mtime_ns,
+        )
+    ):
+        raise RuntimeError(f"benchmark provenance file changed while hashing: {path}")
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import builtins
 import contextlib
+import hashlib
 import inspect
+import os
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -17,11 +20,16 @@ from agent_libos.models.exceptions import (
     CapabilityDenied,
     NotFound,
     ProcessError,
+    ProcessTerminalCleanupRequired,
     ProcessWaitRequired,
     RuntimePublicationPending,
     ValidationError,
 )
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 from agent_libos.models import (
     AgentProcess,
     CapabilityRight,
@@ -70,10 +78,16 @@ from agent_libos.process_execution import (
 from agent_libos.storage import UnitOfWork
 
 
+class _SanitizedFinalizationInterruption(BaseException):
+    """Public aggregate leaf that carries no original exception text."""
+
+
 class ProcessManager:
     """Process lifecycle primitive."""
 
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+    TERMINAL_CLEANUP_PHASES = ("terminal_notify", "process_finalize")
+    _TERMINAL_CLEANUP_LOCK_STRIPES = 64
 
     def __init__(
         self,
@@ -114,8 +128,13 @@ class ProcessManager:
         self._before_spawn_hooks: builtins.list[Callable[[str], None]] = []
         self._after_spawn_hooks: builtins.list[Callable[[str, str, str], None]] = []
         self._object_task_terminal_notifier = object_task_terminal_notifier
+        self._host_managed_runner_checker: Callable[[str], bool] | None = None
         self._failed_launch_artifact_cleanup = failed_launch_artifact_cleanup
         self.owner_instance_id = str(owner_instance_id)
+        self._terminal_cleanup_locks = tuple(
+            threading.RLock()
+            for _ in range(self._TERMINAL_CLEANUP_LOCK_STRIPES)
+        )
         self._require_recovery_lease = require_recovery_lease
         self._recovery_required_callback = recovery_required_callback
         # Preserve the builder-bound lifecycle method as an immutable local
@@ -136,6 +155,14 @@ class ProcessManager:
             else lambda _publication_id: contextlib.nullcontext()
         )
         self.transitions = transitions or ProcessTransitionService(self.store)
+
+    def bind_host_managed_runner_checker(
+        self,
+        checker: Callable[[str], bool],
+    ) -> None:
+        """Identify published ObjectTask runners with Host-owned lifecycle."""
+
+        self._host_managed_runner_checker = checker
 
     def add_after_spawn_hook(self, hook: Callable[..., None]) -> None:
         """Register a spawn hook, adapting the legacy two-argument shape."""
@@ -203,7 +230,13 @@ class ProcessManager:
         working_directory: str | None = None,
         llm_profile_id: str | None = None,
         authority_manifest: Any | None = None,
+        _claim_owner_id: str | None = None,
+        _execution_token_out: builtins.list[ProcessExecutionToken] | None = None,
     ) -> str:
+        if (_claim_owner_id is None) != (_execution_token_out is None):
+            raise ValidationError(
+                "claimed process spawn requires both an owner id and token receiver"
+            )
         selected_image = image or self.config.runtime.default_image_id
         selected_root_budget = (
             self._coerce_resource_budget(resource_budget)
@@ -278,6 +311,17 @@ class ProcessManager:
                     expected_revision=process.revision,
                     expected_status=ProcessStatus.CREATED,
                 )
+                execution_token: ProcessExecutionToken | None = None
+                if _claim_owner_id is not None:
+                    execution_token = self.store.claim_execution(
+                        pid,
+                        owner_id=_claim_owner_id,
+                    )
+                    if execution_token is None:
+                        raise ProcessError(
+                            f"new process could not be atomically claimed: {pid}"
+                        )
+                    process = self._get(pid)
                 event = self.events.emit(
                     EventType.PROCESS_CREATED,
                     source="runtime",
@@ -306,11 +350,52 @@ class ProcessManager:
                         "revision": process.revision,
                     },
                 )
+            if execution_token is not None:
+                assert _execution_token_out is not None
+                _execution_token_out.append(execution_token)
             return pid
         except BaseException as exc:
             return self._finish_failed_launch(publication_id, pid, exc)
         finally:
             control_scope.close()
+
+    def spawn_claimed(
+        self,
+        *,
+        owner_id: str,
+        image: str | None = None,
+        goal: dict[str, Any] | str | ObjectHandle | None = None,
+        capabilities: builtins.list[dict[str, Any]] | None = None,
+        resource_budget: ResourceBudget | None = None,
+        working_directory: str | None = None,
+        llm_profile_id: str | None = None,
+        authority_manifest: Any | None = None,
+    ) -> tuple[str, ProcessExecutionToken]:
+        """Publish a root process already owned by one execution controller.
+
+        The RUNNABLE transition, execution claim, launch evidence, and
+        publication commit share one Store transaction, so a scheduler can
+        never observe and claim the workflow process first.
+        """
+
+        selected_owner = str(owner_id).strip()
+        if not selected_owner:
+            raise ValidationError("claimed process spawn owner_id must be non-empty")
+        tokens: builtins.list[ProcessExecutionToken] = []
+        pid = self.spawn(
+            image=image,
+            goal=goal,
+            capabilities=capabilities,
+            resource_budget=resource_budget,
+            working_directory=working_directory,
+            llm_profile_id=llm_profile_id,
+            authority_manifest=authority_manifest,
+            _claim_owner_id=selected_owner,
+            _execution_token_out=tokens,
+        )
+        if len(tokens) != 1:
+            raise ProcessError(f"claimed process spawn returned no execution token: {pid}")
+        return pid, tokens[0]
 
     def fork(
         self,
@@ -328,8 +413,11 @@ class ProcessManager:
         source_oids: Iterable[str] | None = None,
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
+        _launch_authority_reservations: Iterable[str] = (),
+        _validated_working_directory: str | None = None,
     ) -> str:
         parent_proc = self._require_active_parent(parent, "fork")
+        launch_authority_reservations = tuple(_launch_authority_reservations)
         fork_mode = ForkMode(mode)
         selected_image = image or parent_proc.image_id
         self._require_child_budget(parent_proc)
@@ -340,7 +428,11 @@ class ProcessManager:
             resource_budget,
             authority_manifest=authority_manifest,
         )
-        cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
+        cwd = self._select_child_working_directory(
+            working_directory,
+            inherited=parent_proc.working_directory,
+            validated=_validated_working_directory,
+        )
         selected_llm_profile = self._resolve_child_llm_profile(parent_proc, llm_profile_id)
         now = utc_now()
         child_pid = new_id("pid")
@@ -421,8 +513,17 @@ class ProcessManager:
             )
             self._run_after_spawn_hooks(child_pid, child.image_id, publication_id)
             self._publication_phase(publication_id, "image_configured")
-            self._charge_child_creation(parent)
             with self.store.transaction():
+                self._require_parent_launch_fence(
+                    parent_proc,
+                    action="fork",
+                )
+                self._commit_launch_authority_reservations(
+                    launch_authority_reservations,
+                    parent_pid=parent,
+                    operation="process.fork",
+                )
+                self._charge_child_creation(parent)
                 child = self._get(child_pid)
                 child = self.transitions.transition(
                     child_pid,
@@ -486,8 +587,11 @@ class ProcessManager:
         source_oids: Iterable[str] | None = None,
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
+        _launch_authority_reservations: Iterable[str] = (),
+        _validated_working_directory: str | None = None,
     ) -> str:
         parent_proc = self._require_active_parent(parent, "spawn child from")
+        launch_authority_reservations = tuple(_launch_authority_reservations)
         selected_image = image or parent_proc.image_id
         self._require_child_budget(parent_proc)
         inherit_specs = inherit_capabilities or []
@@ -500,7 +604,11 @@ class ProcessManager:
         selected_initial_status = ProcessStatus(initial_status)
         if selected_initial_status in self.TERMINAL_STATUSES:
             raise ProcessError(f"spawn_child initial_status cannot be terminal: {selected_initial_status.value}")
-        cwd = self._normalize_working_directory(working_directory or parent_proc.working_directory)
+        cwd = self._select_child_working_directory(
+            working_directory,
+            inherited=parent_proc.working_directory,
+            validated=_validated_working_directory,
+        )
         selected_llm_profile = self._resolve_child_llm_profile(parent_proc, llm_profile_id)
         now = utc_now()
         child_pid = new_id("pid")
@@ -580,8 +688,17 @@ class ProcessManager:
             )
             self._run_after_spawn_hooks(child_pid, child.image_id, publication_id)
             self._publication_phase(publication_id, "image_configured")
-            self._charge_child_creation(parent)
             with self.store.transaction():
+                self._require_parent_launch_fence(
+                    parent_proc,
+                    action="spawn child from",
+                )
+                self._commit_launch_authority_reservations(
+                    launch_authority_reservations,
+                    parent_pid=parent,
+                    operation="process.spawn_child",
+                )
+                self._charge_child_creation(parent)
                 child = self._get(child_pid)
                 child = self.transitions.transition(
                     child_pid,
@@ -799,7 +916,7 @@ class ProcessManager:
 
     def wait(self, pid: str, child: str, timeout: float | None = None) -> ProcessResult:
         with self.store.locked():
-            parent = self._get(pid)
+            parent = self._require_active_parent(pid, "wait for child from")
             child_proc = self._require_child(parent.pid, child)
             if child_proc.status not in self.TERMINAL_STATUSES:
                 if timeout == 0:
@@ -820,8 +937,10 @@ class ProcessManager:
         # Keep the receiver-domain check, source ownership transfer, and
         # handle publication under one lock domain so a mutable result cannot
         # change labels between validation and delivery.
-        with self.memory.ownership_locked(), self.store.locked():
-            parent = self._get(pid)
+        with self.memory.ownership_locked(), self.store.transaction(
+            include_object_payloads=True
+        ):
+            parent = self._require_active_parent(pid, "receive child result in")
             child_proc = self._require_child(parent.pid, child)
             outcome = child_proc.outcome
             if isinstance(outcome, (ExitedProcessOutcome, FailedProcessOutcome)) and outcome.result_oid:
@@ -844,28 +963,47 @@ class ProcessManager:
                     self.transitions.wait_token(parent),
                     control=False,
                 )
-        self.audit.record(
-            actor=pid,
-            action="process.wait",
-            target=f"process:{child}",
-            output_refs=[result_handle.oid] if result_handle else [],
-            decision={"child_status": child_proc.status.value},
-        )
-        return ProcessResult(
-            pid=child,
-            status=child_proc.status,
-            result=result_handle,
-            message=child_proc.status_message,
-            wait_state=child_proc.wait_state,
-            outcome=child_proc.outcome,
-            state_generation=child_proc.state_generation,
-        )
+            self.audit.record(
+                actor=pid,
+                action="process.wait",
+                target=f"process:{child}",
+                output_refs=[result_handle.oid] if result_handle else [],
+                decision={"child_status": child_proc.status.value},
+            )
+            return ProcessResult(
+                pid=child,
+                status=child_proc.status,
+                result=result_handle,
+                message=child_proc.status_message,
+                wait_state=child_proc.wait_state,
+                outcome=child_proc.outcome,
+                state_generation=child_proc.state_generation,
+            )
 
     def set_working_directory(self, pid: str, path: str) -> AgentProcess:
+        return self._persist_working_directory(
+            pid,
+            self._normalize_working_directory(path),
+        )
+
+    def set_validated_working_directory(self, pid: str, path: str) -> AgentProcess:
+        """Persist one provider-validated canonical workspace identity unchanged.
+
+        This is the controlled component boundary used by ``ProcessLaunchService``
+        after the filesystem provider has authorized and canonicalized ``path``.
+        It still validates the identity's shape before changing process state.
+        """
+
+        return self._persist_working_directory(
+            pid,
+            self._validated_working_directory_identity(path),
+        )
+
+    def _persist_working_directory(self, pid: str, path: str) -> AgentProcess:
         process = self._get(pid)
         if process.status in self.TERMINAL_STATUSES:
             raise ProcessError(f"cannot change working directory for terminated process: {pid}")
-        process.working_directory = self._normalize_working_directory(path)
+        process.working_directory = path
         process.updated_at = utc_now()
         process = self.store.patch_process(
             pid,
@@ -912,6 +1050,19 @@ class ProcessManager:
     ) -> AgentProcess:
         child_proc = self._require_child(pid, child)
         sig = ProcessSignal(signal)
+        if (
+            child_proc.status in self.TERMINAL_STATUSES
+            and sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}
+        ):
+            cleanup = self.terminal_cleanup_state(child)
+            if cleanup["state"] != "completed":
+                self.retry_terminal_cleanup(
+                    child,
+                    _actor=pid,
+                    _legacy_audit_action="process.signal_finalize_failed",
+                    _context={"signal": sig.value, "retry": True},
+                )
+                return self._get(child)
         self._require_signal_applicable(child_proc, sig)
         payload: dict[str, Any] = {}
         reason_handle: ObjectHandle | None = None
@@ -972,27 +1123,109 @@ class ProcessManager:
         policy: MergePolicy | None = None,
     ) -> MergeResult:
         selected_policy = policy or MergePolicy()
-        with self.memory.ownership_locked(), self.store.locked():
+        # Ownership is the outer lifecycle lock everywhere in Object Memory.
+        # The SQL transaction then makes handle grants, parent-view roots,
+        # ownership transfer/release, child-view consumption, and audits one
+        # rollback unit.
+        with self.memory.ownership_locked(), self.store.transaction(
+            include_object_payloads=True
+        ):
+            self._require_active_parent(pid, "merge child memory for")
             child_proc = self._require_child(pid, child)
             if child_proc.status not in self.TERMINAL_STATUSES:
                 raise ProcessError(f"cannot merge running child process: {child}")
-            if child_proc.memory_view is None:
-                return MergeResult(merged_oids=[], skipped_oids=[])
-            candidate_oids = {handle.oid for handle in child_proc.memory_view.roots}
-            if selected_policy.include_child_created:
-                candidate_oids.update(
-                    obj.oid
-                    for obj in self.objects.list_objects_owned_by(ObjectOwnerKind.PROCESS, child)
+
+            process_owned_oids = set(
+                self.objects.list_object_oids_owned_by(
+                    ObjectOwnerKind.PROCESS,
+                    child,
                 )
+            )
+            result_owned_oids = set(
+                self.objects.list_object_oids_owned_by(
+                    ObjectOwnerKind.PROCESS_RESULT,
+                    child,
+                )
+            )
+            child_roots = (
+                list(child_proc.memory_view.roots)
+                if child_proc.memory_view is not None
+                else []
+            )
+            if not child_roots and not process_owned_oids and not result_owned_oids:
+                return MergeResult(merged_oids=[], skipped_oids=[])
+
+            child_view = child_proc.memory_view
+            if child_view is None:
+                child_view = MemoryView(
+                    view_id=new_id("view"),
+                    owner_pid=child,
+                    roots=[],
+                    filters=[],
+                    rights_policy="merge_terminal_child",
+                    created_from=None,
+                    mode=ViewMode.READ_ONLY,
+                )
+            candidate_oids = (
+                {handle.oid for handle in child_view.roots}
+                if selected_policy.include_updated
+                else set()
+            )
+            if selected_policy.include_child_created:
+                candidate_oids.update(process_owned_oids)
             for oid in sorted(candidate_oids):
                 if self.objects.get_object(oid) is not None:
                     self._assert_object_data_flow(pid, oid)
-            result = self.memory.merge_view(pid, child_proc.memory_view, policy=selected_policy)
+            result = self.memory.merge_view(pid, child_view, policy=selected_policy)
             parent = self._get(pid)
             for handle in result.merged_handles:
                 self._add_handle_to_process_view(parent, handle)
             adopted = self.memory.adopt_process_owned(child, pid, result.merged_oids)
             released = self.memory.release_process_owned(child)
+            retained_child_owned = sorted(
+                {
+                    *self.objects.list_object_oids_owned_by(
+                        ObjectOwnerKind.PROCESS,
+                        child,
+                    ),
+                    *self.objects.list_object_oids_owned_by(
+                        ObjectOwnerKind.PROCESS_RESULT,
+                        child,
+                    ),
+                }
+            )
+            # release_process_owned has no preserve set on merge and raises on
+            # any failed deletion. Successful leftovers are therefore exactly
+            # the ObjectTask-pinned tail that must remain child-owned.
+            result.adopted_oids = sorted(adopted)
+            result.released_oids = sorted(released)
+            result.retained_child_owned_oids = retained_child_owned
+            result.pinned_child_owned_oids = list(retained_child_owned)
+
+            # Clearing the terminal child's roots is the durable idempotency
+            # marker. A replay sees no roots or child-owned objects and returns
+            # before issuing handles or audit rows.
+            if child_proc.memory_view is not None and child_proc.memory_view.roots:
+                consumed_view = deepcopy(child_proc.memory_view)
+                consumed_view.roots = []
+                with trusted_terminal_process_mutation(
+                    child,
+                    expected_revision=child_proc.revision,
+                    expected_generation=child_proc.execution_generation,
+                    allowed_statuses={child_proc.status},
+                    execution_token=current_process_execution_token(),
+                    reason="consume terminal child memory after merge",
+                ):
+                    self.store.patch_process_control(
+                        child,
+                        {
+                            "memory_view": consumed_view,
+                            "updated_at": utc_now(),
+                        },
+                        expected_revision=child_proc.revision,
+                        allowed_statuses={child_proc.status},
+                        reason="consume terminal child memory after merge",
+                    )
             self.audit.record(
                 actor=pid,
                 action="process.merge_child_memory",
@@ -1003,6 +1236,9 @@ class ProcessManager:
                     "skipped": result.skipped_oids,
                     "adopted": adopted,
                     "released_child_owned": released,
+                    "retained_child_owned": retained_child_owned,
+                    "pinned_child_owned": retained_child_owned,
+                    "child_view_consumed": bool(child_roots),
                 },
             )
             return result
@@ -1017,6 +1253,19 @@ class ProcessManager:
     ) -> None:
         proc = self._get(target)
         sig = ProcessSignal(signal)
+        if (
+            proc.status in self.TERMINAL_STATUSES
+            and sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}
+        ):
+            cleanup = self.terminal_cleanup_state(target)
+            if cleanup["state"] != "completed":
+                self.retry_terminal_cleanup(
+                    target,
+                    _actor="runtime",
+                    _legacy_audit_action="process.signal_finalize_failed",
+                    _context={"signal": sig.value, "retry": True},
+                )
+                return
         selected_payload = dict(payload or {})
         reason = selected_payload.pop("reason", None)
         self._require_signal_applicable(proc, sig)
@@ -1284,14 +1533,10 @@ class ProcessManager:
             self._wake_parent_waiting_on_child(process)
 
     def _complete_terminal_signal(self, process: AgentProcess, *, actor: str, signal: ProcessSignal) -> None:
-        preserve_oids: set[str] = set()
-        if isinstance(process.outcome, KilledProcessOutcome) and process.outcome.reason_oid:
-            preserve_oids.add(process.outcome.reason_oid)
         self._complete_terminal_cleanup(
             process,
             actor=actor,
             audit_action="process.signal_finalize_failed",
-            preserve_oids=preserve_oids,
             context={"signal": signal.value},
         )
 
@@ -1301,33 +1546,338 @@ class ProcessManager:
         *,
         actor: str,
         audit_action: str,
-        preserve_oids: set[str],
         context: dict[str, Any],
-    ) -> list[dict[str, str]]:
-        errors: list[dict[str, str]] = []
+    ) -> dict[str, Any]:
+        return self.retry_terminal_cleanup(
+            process.pid,
+            _actor=actor,
+            _legacy_audit_action=audit_action,
+            _context=context,
+        )
+
+    def terminal_cleanup_state(self, pid: str) -> dict[str, Any]:
+        process = self._get(pid)
+        if process.status not in self.TERMINAL_STATUSES:
+            raise ProcessError(
+                f"process is not terminal and has no cleanup outcome: {pid}"
+            )
+        cleanup = self.store.get_process_terminal_cleanup(pid)
+        if cleanup is None:
+            raise ProcessError(f"terminal cleanup intent is missing: {pid}")
+        return cleanup
+
+    def retry_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        _actor: str = "runtime.process_terminal",
+        _legacy_audit_action: str | None = None,
+        _context: dict[str, Any] | None = None,
+        _recover_stale: bool = False,
+    ) -> dict[str, Any]:
+        """Finish the durable, phase-fenced cleanup for one terminal process."""
+
+        process = self._get(pid)
+        if process.status not in self.TERMINAL_STATUSES:
+            raise ProcessError(f"cannot clean up non-terminal process: {pid}")
+        with self._terminal_cleanup_lock(pid):
+            cleanup = self.terminal_cleanup_state(pid)
+            if cleanup["state"] == "completed":
+                return cleanup
+
+            expected_lease_id: str | None = None
+            if cleanup["state"] == "running":
+                lease_owner = cleanup.get("owner_id")
+                if not _recover_stale and lease_owner != self.owner_instance_id:
+                    raise ProcessError(
+                        "process terminal cleanup is already running: "
+                        f"{pid} owner={lease_owner}"
+                    )
+                expected_lease_id = str(cleanup["lease_id"])
+
+            lease_id = new_id("process_cleanup_lease")
+            claimed = self.store.claim_process_terminal_cleanup(
+                pid,
+                owner_id=self.owner_instance_id,
+                lease_id=lease_id,
+                expected_lease_id=expected_lease_id,
+            )
+            if claimed is None:
+                latest = self.terminal_cleanup_state(pid)
+                if latest["state"] == "completed":
+                    return latest
+                raise ProcessError(
+                    "process terminal cleanup lease was not acquired: "
+                    f"{pid} state={latest['state']}"
+                )
+
+            completed_phases = set(claimed["completed_phases"])
+            phase_failures: list[tuple[str, BaseException]] = []
+            for phase in self.TERMINAL_CLEANUP_PHASES:
+                if phase in completed_phases:
+                    continue
+                try:
+                    process = self._get(pid)
+                    if phase == "terminal_notify":
+                        self._notify_object_task_process_terminal(pid)
+                    else:
+                        self._finalize_terminal_process(
+                            process,
+                            preserve_oids=self._terminal_preserve_oids(process),
+                        )
+                    marked = self.store.complete_process_terminal_cleanup_phase(
+                        pid,
+                        lease_id=lease_id,
+                        phase=phase,
+                    )
+                    if marked is None:
+                        raise ProcessError(
+                            "process terminal cleanup lost its phase lease: "
+                            f"{pid} phase={phase}"
+                        )
+                    claimed = marked
+                    completed_phases.add(phase)
+                except BaseException as exc:
+                    # Cleanup phases are independent and idempotent.  Keep
+                    # attempting later phases so a broken notifier cannot
+                    # strand memory/capability finalizers (or vice versa).
+                    phase_failures.append((phase, exc))
+
+            if phase_failures:
+                self._raise_terminal_cleanup_failures(
+                    pid,
+                    lease_id=lease_id,
+                    claimed=claimed,
+                    phase_failures=phase_failures,
+                    actor=_actor,
+                    terminal_status=process.status.value,
+                    legacy_audit_action=_legacy_audit_action,
+                    context=_context,
+                )
+
+            finished = self.store.finish_process_terminal_cleanup(
+                pid,
+                lease_id=lease_id,
+            )
+            if finished is None:
+                raise ProcessError(
+                    f"process terminal cleanup could not commit completion: {pid}"
+                )
+            try:
+                self.audit.record(
+                    actor=_actor,
+                    action="process.terminal_cleanup_completed",
+                    target=f"process:{pid}",
+                    decision={
+                        "terminal_status": process.status.value,
+                        "attempt": finished["attempt_count"],
+                        "completed_phases": list(finished["completed_phases"]),
+                    },
+                )
+            except BaseException:
+                # The cleanup row is the authoritative observation.  A failed
+                # diagnostic sink cannot reopen already-completed finalizers.
+                pass
+            return finished
+
+    def _raise_terminal_cleanup_failures(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+        claimed: dict[str, Any],
+        phase_failures: list[tuple[str, BaseException]],
+        actor: str,
+        terminal_status: str,
+        legacy_audit_action: str | None,
+        context: dict[str, Any] | None,
+    ) -> NoReturn:
+        failed_phase, first_error = phase_failures[0]
+        errors = [
+            {"phase": phase, **internal_exception_observation(exc)}
+            for phase, exc in phase_failures
+        ]
+        durable_error: dict[str, Any] = {
+            **internal_exception_observation(first_error),
+            "errors": errors,
+        }
+        failed = None
+        persistence_error: dict[str, Any] | None = None
         try:
-            self._notify_object_task_process_terminal(process.pid)
-        except Exception as exc:
-            errors.append({"phase": "terminal_notify", "error": f"{type(exc).__name__}: {exc}"})
-        try:
-            self._finalize_terminal_process(process, preserve_oids=preserve_oids)
-        except Exception as exc:
-            errors.append({"phase": "process_finalize", "error": f"{type(exc).__name__}: {exc}"})
-        if not errors:
-            return []
+            failed = self.store.fail_process_terminal_cleanup(
+                pid,
+                lease_id=lease_id,
+                phase=failed_phase,
+                error=durable_error,
+            )
+        except BaseException as persistence_exc:
+            persistence_error = internal_exception_observation(persistence_exc)
+        observed = failed or claimed
+        self._record_terminal_cleanup_failure(
+            pid,
+            actor=actor,
+            attempt=int(observed["attempt_count"]),
+            terminal_status=terminal_status,
+            errors=errors,
+            persistence_error=persistence_error,
+            legacy_audit_action=legacy_audit_action,
+            context=context,
+        )
+        # Do not chain ordinary provider errors: durable evidence retains only
+        # their sanitized observation. Control-flow BaseExceptions are retained
+        # as leaves after every independent phase and diagnostic has run.
+        required = ProcessTerminalCleanupRequired(
+            pid=pid,
+            phase=failed_phase,
+            attempt=int(observed["attempt_count"]),
+        )
+        interruptions = [
+            exc for _phase, exc in phase_failures if not isinstance(exc, Exception)
+        ]
+        if interruptions:
+            raise BaseExceptionGroup(
+                "process terminal cleanup interrupted after all phases were attempted",
+                [required, *interruptions],
+            )
+        raise required
+
+    def recover_terminal_cleanups(self) -> dict[str, Any]:
+        """Reclaim incomplete cleanup leases through bounded keyset pages."""
+
+        self._require_recovery_lease()
+        page_size = (
+            self.config.runtime.process_terminal_cleanup_recovery_page_size
+        )
+        after: ProcessCursor | None = None
+        pending_total = 0
+        recovered_total = 0
+        failure_total = 0
+        recovered_sample: list[str] = []
+        failure_sample: list[dict[str, Any]] = []
+        interruptions: list[BaseException] = []
+        while True:
+            page = self.store.list_process_terminal_cleanups(
+                after=after,
+                limit=page_size,
+            )
+            if not page:
+                break
+            for cleanup in page:
+                pending_total += 1
+                pid = str(cleanup["pid"])
+                try:
+                    completed = self.retry_terminal_cleanup(
+                        pid,
+                        _actor="runtime.recovery",
+                        _recover_stale=True,
+                    )
+                    if completed["state"] == "completed":
+                        recovered_total += 1
+                        if len(recovered_sample) < page_size:
+                            recovered_sample.append(pid)
+                except BaseException as exc:
+                    failure_total += 1
+                    if not isinstance(exc, Exception):
+                        interruptions.append(exc)
+                    if len(failure_sample) < page_size:
+                        failure_sample.append(
+                            {
+                                "pid": pid,
+                                "error": internal_exception_observation(exc),
+                            }
+                        )
+            last = page[-1]
+            next_cursor = ProcessCursor(
+                created_at=str(last["created_at"]),
+                pid=str(last["pid"]),
+            )
+            if after is not None and next_cursor <= after:
+                raise ProcessError(
+                    "process terminal cleanup recovery page did not advance"
+                )
+            after = next_cursor
+            if len(page) < page_size:
+                break
+        if interruptions:
+            if len(interruptions) == 1:
+                raise interruptions[0]
+            raise BaseExceptionGroup(
+                "process terminal cleanup recovery interrupted after bounded recovery",
+                interruptions,
+            )
+        return {
+            "pending": pending_total,
+            "recovered_count": recovered_total,
+            "failure_count": failure_total,
+            "recovered": recovered_sample,
+            "failures": failure_sample,
+            "diagnostics_truncated": (
+                recovered_total > len(recovered_sample)
+                or failure_total > len(failure_sample)
+            ),
+        }
+
+    def _terminal_cleanup_lock(self, pid: str) -> threading.RLock:
+        stripe = sum(pid.encode("utf-8")) % len(self._terminal_cleanup_locks)
+        return self._terminal_cleanup_locks[stripe]
+
+    @staticmethod
+    def _terminal_preserve_oids(process: AgentProcess) -> set[str]:
+        outcome = process.outcome
+        if isinstance(outcome, (ExitedProcessOutcome, FailedProcessOutcome)):
+            return {outcome.result_oid} if outcome.result_oid else set()
+        if isinstance(outcome, KilledProcessOutcome):
+            return {outcome.reason_oid} if outcome.reason_oid else set()
+        return set()
+
+    def _record_terminal_cleanup_failure(
+        self,
+        pid: str,
+        *,
+        actor: str,
+        attempt: int,
+        terminal_status: str,
+        errors: list[dict[str, Any]],
+        persistence_error: dict[str, Any] | None,
+        legacy_audit_action: str | None,
+        context: dict[str, Any] | None,
+    ) -> None:
+        first = errors[0]
+        decision: dict[str, Any] = {
+            "terminal_status": terminal_status,
+            "phase": first["phase"],
+            "attempt": attempt,
+            "error": {
+                "error_type": first["error_type"],
+                "exception_text": dict(first["exception_text"]),
+            },
+            "errors": [dict(error) for error in errors],
+        }
+        if persistence_error is not None:
+            decision["persistence_error"] = dict(persistence_error)
         try:
             self.audit.record(
                 actor=actor,
-                action=audit_action,
-                target=f"process:{process.pid}",
-                decision={**context, "errors": errors},
+                action="process.terminal_cleanup_failed",
+                target=f"process:{pid}",
+                decision=decision,
             )
-        except Exception:
-            # The terminal transition is already durable.  A secondary warning
-            # sink failure must not turn a committed signal into a retryable
-            # API error or skip the remaining cleanup phase.
+        except BaseException:
             pass
-        return errors
+        if legacy_audit_action is None:
+            return
+        try:
+            self.audit.record(
+                actor=actor,
+                action=legacy_audit_action,
+                target=f"process:{pid}",
+                decision={
+                    **dict(context or {}),
+                    "errors": [dict(error) for error in errors],
+                },
+            )
+        except BaseException:
+            pass
 
     def pause(self, pid: str, reason: str) -> None:
         self.signal(pid, ProcessSignal.PAUSE, {"reason": reason})
@@ -1361,7 +1911,26 @@ class ProcessManager:
         process = self._get(pid)
         if process.status in self.TERMINAL_STATUSES:
             self._release_rejected_exit_result(pid, result)
+            cleanup = self.terminal_cleanup_state(pid)
+            if cleanup["state"] != "completed":
+                self.retry_terminal_cleanup(
+                    pid,
+                    _actor=pid,
+                    _legacy_audit_action="process.exit_finalize_failed",
+                    _context={"status": process.status.value, "retry": True},
+                )
+                return None
             raise ProcessError(f"cannot exit terminal process: {pid} status={process.status.value}")
+        live_descendants = self._live_descendant_pids(pid)
+        if live_descendants and failed:
+            self._terminate_descendants_for_failed_exit(pid)
+            live_descendants = self._live_descendant_pids(pid)
+        if live_descendants:
+            raise ProcessError(
+                "cannot exit process while descendants are nonterminal; "
+                "wait for or terminate them first: "
+                + ", ".join(live_descendants)
+            )
         message_present = message is not None
         # Terminal state, child-budget release, evidence, and parent wakeup are
         # one durable lifecycle transition, including any generated result.
@@ -1372,6 +1941,13 @@ class ProcessManager:
             if process.status in self.TERMINAL_STATUSES:
                 self._release_rejected_exit_result(pid, result)
                 raise ProcessError(f"cannot exit terminal process: {pid} status={process.status.value}")
+            live_descendants = self._live_descendant_pids(pid)
+            if live_descendants:
+                raise ProcessError(
+                    "cannot exit process while descendants are nonterminal; "
+                    "wait for or terminate them first: "
+                    + ", ".join(live_descendants)
+                )
             if result is None and payload is not None:
                 selected_sources = self.flow_source_oids(pid, source_oids)
                 result = self.memory.create_object(
@@ -1441,40 +2017,171 @@ class ProcessManager:
             process,
             actor=pid,
             audit_action="process.exit_finalize_failed",
-            preserve_oids={result.oid} if result is not None else set(),
             context={"status": process.status.value, "result_oid": result.oid if result is not None else None},
         )
         return result
 
+    def _live_descendant_pids(self, pid: str) -> builtins.list[str]:
+        stack = list(self.store.list_child_processes(pid))
+        live: builtins.list[str] = []
+        while stack:
+            child = stack.pop()
+            stack.extend(self.store.list_child_processes(child.pid))
+            if (
+                child.status not in self.TERMINAL_STATUSES
+                and not self._is_host_managed_runner(child.pid)
+            ):
+                live.append(child.pid)
+        return sorted(live)
+
+    def _is_host_managed_runner(self, pid: str) -> bool:
+        checker = self._host_managed_runner_checker
+        if checker is None:
+            return False
+        try:
+            return bool(checker(pid))
+        except Exception:
+            # Runner classification is a safety exception. Failure to prove it
+            # keeps the process under ordinary descendant lifecycle rules.
+            return False
+
+    def _terminate_descendants_for_failed_exit(self, pid: str) -> None:
+        stack: builtins.list[tuple[AgentProcess, int]] = [
+            (child, 1) for child in self.store.list_child_processes(pid)
+        ]
+        descendants: builtins.list[tuple[AgentProcess, int]] = []
+        while stack:
+            child, depth = stack.pop()
+            descendants.append((child, depth))
+            stack.extend(
+                (grandchild, depth + 1)
+                for grandchild in self.store.list_child_processes(child.pid)
+            )
+        for child, _depth in sorted(
+            descendants,
+            key=lambda item: (-item[1], item[0].pid),
+        ):
+            current = self.store.get_process(child.pid)
+            if current is None or current.status in self.TERMINAL_STATUSES:
+                continue
+            if self._is_host_managed_runner(child.pid):
+                continue
+            try:
+                self.signal(
+                    child.pid,
+                    ProcessSignal.TERMINATE,
+                    {"reason": f"ancestor process failed: {pid}"},
+                )
+            except ProcessTerminalCleanupRequired:
+                latest = self.store.get_process(child.pid)
+                if latest is None or latest.status not in self.TERMINAL_STATUSES:
+                    raise
+
     def finalize_killed_processes(self, pids: Iterable[str], *, reason: str) -> None:
-        errors: list[str] = []
+        failures: list[tuple[str, str, BaseException]] = []
+        interruptions: list[BaseException] = []
         for pid in pids:
             process = self.store.get_process(pid)
             if process is None or process.status != ProcessStatus.KILLED:
                 continue
             try:
-                self._finalize_terminal_process(process, preserve_oids=set())
-            except Exception as exc:
-                errors.append(f"{pid}: process_finalize: {type(exc).__name__}: {exc}")
-            try:
-                self.events.emit(
-                    EventType.PROCESS_EXITED,
-                    source=pid,
-                    target=process.parent_pid,
-                    payload={"pid": pid, "status": process.status.value, "result_oid": None, "reason": reason},
+                self.retry_terminal_cleanup(
+                    pid,
+                    _actor="resource_manager",
+                    _context={"reason": reason},
                 )
-            except Exception as exc:
-                errors.append(f"{pid}: exit_event: {type(exc).__name__}: {exc}")
+            except BaseException as exc:
+                failures.append((pid, "terminal_cleanup", exc))
+                if not isinstance(exc, Exception):
+                    interruptions.append(exc)
             try:
-                self._notify_object_task_process_terminal(pid)
-            except Exception as exc:
-                # A resource kill can cover an entire descendant tree. One
-                # phase or process' cleanup failure must not skip the remaining
-                # phases or strand every later killed process. Report the
-                # aggregate after attempting them all.
-                errors.append(f"{pid}: terminal_notify: {type(exc).__name__}: {exc}")
-        if errors:
-            raise RuntimeError("killed process finalization failed: " + "; ".join(errors))
+                self._emit_killed_process_exit_event(
+                    process,
+                    reason=reason,
+                )
+            except BaseException as exc:
+                failures.append((pid, "exit_event", exc))
+                if not isinstance(exc, Exception):
+                    interruptions.append(exc)
+        if failures:
+            self._raise_killed_process_finalization_failure(
+                failures,
+                interruptions=interruptions,
+            )
+
+    def _emit_killed_process_exit_event(
+        self,
+        process: AgentProcess,
+        *,
+        reason: str,
+    ) -> None:
+        self.events.emit_once(
+            self._terminal_event_id(process, EventType.PROCESS_EXITED),
+            EventType.PROCESS_EXITED,
+            source=process.pid,
+            target=process.parent_pid,
+            payload={
+                "pid": process.pid,
+                "status": process.status.value,
+                "result_oid": None,
+                "reason": reason,
+            },
+            causality={
+                "kind": "process_terminal_state",
+                "pid": process.pid,
+                "state_generation": process.state_generation,
+            },
+        )
+
+    @staticmethod
+    def _terminal_event_id(process: AgentProcess, event_type: EventType) -> str:
+        identity = (
+            f"{event_type.value}\x00{process.pid}\x00{process.state_generation}"
+        ).encode("utf-8")
+        return f"evt_terminal_{hashlib.sha256(identity).hexdigest()}"
+
+    @staticmethod
+    def _raise_killed_process_finalization_failure(
+        failures: list[tuple[str, str, BaseException]],
+        *,
+        interruptions: list[BaseException],
+    ) -> NoReturn:
+        aggregate = RuntimeError("killed process finalization failed")
+        public_error = public_error_envelope(
+            aggregate,
+            code="killed_process_finalization_failed",
+        )
+        aggregate.args = (public_error["message"],)
+        observations = tuple(
+            {
+                "pid": pid,
+                "phase": phase,
+                **internal_exception_observation(
+                    error,
+                    correlation_id=public_error["correlation_id"],
+                ),
+            }
+            for pid, phase, error in failures
+        )
+        aggregate.finalization_failures = observations  # type: ignore[attr-defined]
+        if interruptions:
+            sanitized_interruptions = [
+                _SanitizedFinalizationInterruption(
+                    public_error_envelope(
+                        interruption,
+                        code="killed_process_finalization_interrupted",
+                    )["message"]
+                )
+                for interruption in interruptions
+            ]
+            grouped = BaseExceptionGroup(
+                "killed process finalization interrupted after full cleanup",
+                [aggregate, *sanitized_interruptions],
+            )
+            grouped.finalization_failures = observations  # type: ignore[attr-defined]
+            raise grouped
+        failures.clear()
+        raise aggregate
 
     def _finalize_terminal_process(self, process: AgentProcess, preserve_oids: set[str]) -> None:
         self._release_terminal_child_memory(process.pid, preserve_oids=preserve_oids)
@@ -1530,6 +2237,48 @@ class ProcessManager:
             raise ProcessError(f"cannot {action} terminated process: {pid}")
         return process
 
+    def _require_parent_launch_fence(
+        self,
+        expected: AgentProcess,
+        *,
+        action: str,
+    ) -> AgentProcess:
+        current = self._require_active_parent(expected.pid, action)
+        if (
+            current.status != expected.status
+            or current.state_generation != expected.state_generation
+        ):
+            raise ProcessError(
+                "parent process changed during child publication: "
+                f"{expected.pid} expected={expected.status.value}/"
+                f"{expected.state_generation} found={current.status.value}/"
+                f"{current.state_generation}"
+            )
+        return current
+
+    def _commit_launch_authority_reservations(
+        self,
+        reservation_ids: tuple[str, ...],
+        *,
+        parent_pid: str,
+        operation: str,
+    ) -> None:
+        if any(
+            type(reservation_id) is not str or not reservation_id
+            for reservation_id in reservation_ids
+        ) or len(reservation_ids) != len(set(reservation_ids)):
+            raise ValidationError("process launch authority reservations must be unique ids")
+        for reservation_id in reservation_ids:
+            committed = self.capabilities.commit_reserved_use(
+                reservation_id,
+                committed_by=f"{operation}:{parent_pid}",
+                reason="one-time process launch authority committed",
+            )
+            if not committed:
+                raise CapabilityDenied(
+                    "process launch authority reservation could not be committed"
+                )
+
     def _default_resource_budget(self) -> ResourceBudget:
         defaults = self.config.process
         return ResourceBudget(
@@ -1567,6 +2316,38 @@ class ProcessManager:
                 continue
             parts.append(part)
         return "/".join(parts) if parts else "."
+
+    def _select_child_working_directory(
+        self,
+        path: str | None,
+        *,
+        inherited: str,
+        validated: str | None,
+    ) -> str:
+        if validated is not None:
+            if path is not None:
+                raise ValidationError(
+                    "raw and validated working directories are mutually exclusive"
+                )
+            return self._validated_working_directory_identity(validated)
+        if not path:
+            return self._validated_working_directory_identity(inherited)
+        return self._normalize_working_directory(path)
+
+    @staticmethod
+    def _validated_working_directory_identity(path: str) -> str:
+        """Check canonical shape without rewriting the provider's path identity."""
+
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise ProcessError("validated working directory must be a canonical string")
+        if path == ".":
+            return path
+        has_windows_drive = os.name == "nt" and bool(os.path.splitdrive(path)[0])
+        if os.path.isabs(path) or has_windows_drive or any(
+            part in {"", ".", ".."} for part in path.split("/")
+        ):
+            raise ProcessError("validated working directory is not canonical")
+        return path
 
     def _resolve_root_llm_profile(self, image_id: str, explicit_profile_id: str | None) -> str:
         if self._llm_profile_resolver is not None:
@@ -2445,21 +3226,45 @@ class ProcessManager:
                     raise ValidationError(
                         "process repository returned an invalid orphan recovery page"
                     )
-                self.transitions.transition(
-                    process.pid,
-                    ProcessStatus.FAILED,
-                    expected_revision=process.revision,
-                    expected_status=ProcessStatus.CREATED,
-                    expected_state_generation=process.state_generation,
-                    outcome=FailedProcessOutcome(code="orphaned_launch"),
-                    status_message="orphaned_launch",
-                )
-                self.audit.record(
-                    actor="runtime.recovery",
-                    action="orphaned_launch",
-                    target=f"process:{process.pid}",
-                    decision={"status": "failed"},
-                )
+                with self.store.transaction():
+                    failed = self.transitions.transition(
+                        process.pid,
+                        ProcessStatus.FAILED,
+                        expected_revision=process.revision,
+                        expected_status=ProcessStatus.CREATED,
+                        expected_state_generation=process.state_generation,
+                        outcome=FailedProcessOutcome(code="orphaned_launch"),
+                        status_message="orphaned_launch",
+                    )
+                    event = self.events.emit_once(
+                        self._terminal_event_id(
+                            failed,
+                            EventType.PROCESS_EXITED,
+                        ),
+                        EventType.PROCESS_EXITED,
+                        source=failed.pid,
+                        target=failed.parent_pid,
+                        payload={
+                            "pid": failed.pid,
+                            "status": failed.status.value,
+                            "result_oid": None,
+                            "reason": "orphaned_launch",
+                        },
+                        causality={
+                            "kind": "process_terminal_state",
+                            "pid": failed.pid,
+                            "state_generation": failed.state_generation,
+                        },
+                    )
+                    self.audit.record(
+                        actor="runtime.recovery",
+                        action="orphaned_launch",
+                        target=f"process:{process.pid}",
+                        decision={
+                            "status": "failed",
+                            "event_id": event.event_id,
+                        },
+                    )
                 previous = cursor
             if page.next_cursor is None:
                 break

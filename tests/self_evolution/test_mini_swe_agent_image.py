@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -77,8 +78,8 @@ class TestMiniSWEAgentImage:
             "Implement the general solution",
             "Operating loop:",
             "Run focused tests first",
-            "32,768 characters",
-            "10,000-character head/tail contract",
+            "32,768 Unicode code points",
+            "10,000-code-point head/tail contract",
             "`submit: true`",
         ]
 
@@ -250,8 +251,13 @@ class TestMiniSWEAgentImage:
             "stdout_truncated": False,
             "stderr_truncated": False,
             "output_incomplete": False,
-            "exception_info": "shell command timed out after 30s",
+            "exception_info": result["exception_info"],
         }
+        assert re.fullmatch(
+            r"syscall_error: TimeoutError \(correlation_id=corr_[0-9a-f]+\)",
+            result["exception_info"],
+        )
+        assert "shell command timed out after 30s" not in result["exception_info"]
 
     def test_bash_source_contract_uses_explicit_submit_flag(self) -> None:
         source = PACKAGE_ROOT.joinpath("tools/scripts/bash.ts").read_text(encoding="utf-8")
@@ -262,6 +268,7 @@ class TestMiniSWEAgentImage:
         assert "const COMMAND_MAX_CHARS = 32768;" in source
         assert "const OUTPUT_LIMIT = 10000;" in source
         assert "const OUTPUT_EDGE = 5000;" in source
+        assert "return Array.from(value);" in source
         assert 'argv: ["bash", "-lc", `exec 2>&1; ${command}`]' in source
         assert 'libos.syscall("shell.run"' in source
         assert 'libos.syscall("process.exit"' in source
@@ -271,7 +278,7 @@ class TestMiniSWEAgentImage:
         assert "stdout_truncated" in source
         assert "stderr_truncated" in source
         assert "output_incomplete" in source
-        assert "elided_chars counts only characters omitted from the captured output" in source
+        assert "elided_chars counts only Unicode code points omitted from the captured output" in source
         assert "status: \"submitted\",\n          output," not in source
         assert "return observation(-1" in source
 
@@ -284,7 +291,7 @@ class TestMiniSWEAgentImage:
             observed.append((name, args))
             return {}
 
-        with pytest.raises(SandboxError, match="command exceeds 32768 characters"):
+        with pytest.raises(SandboxError, match="command exceeds 32768 Unicode code points"):
             asyncio.run(
                 DenoTypescriptSandbox().arun_source(
                     source,
@@ -294,6 +301,58 @@ class TestMiniSWEAgentImage:
             )
 
         assert observed == []
+
+    @pytest.mark.real_deno
+    def test_bash_source_counts_command_limit_in_unicode_code_points(self) -> None:
+        source = PACKAGE_ROOT.joinpath("tools/scripts/bash.ts").read_text(encoding="utf-8")
+        observed: list[tuple[str, dict[str, Any]]] = []
+
+        async def handler(name: str, args: dict[str, Any]) -> Any:
+            observed.append((name, args))
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+        accepted = "😀" * 20_000
+        result = asyncio.run(
+            DenoTypescriptSandbox().arun_source(
+                source,
+                {"command": accepted},
+                syscall_handler=handler,
+            )
+        )
+        assert result["returncode"] == 0
+        assert observed[0][1]["argv"][-1].endswith(accepted)
+
+        observed.clear()
+        with pytest.raises(SandboxError, match="command exceeds 32768 Unicode code points"):
+            asyncio.run(
+                DenoTypescriptSandbox().arun_source(
+                    source,
+                    {"command": "😀" * 32_769},
+                    syscall_handler=handler,
+                )
+            )
+        assert observed == []
+
+    @pytest.mark.real_deno
+    def test_bash_source_elides_output_on_unicode_code_point_boundaries(self) -> None:
+        source = PACKAGE_ROOT.joinpath("tools/scripts/bash.ts").read_text(encoding="utf-8")
+
+        async def handler(name: str, args: dict[str, Any]) -> Any:
+            assert name == "shell.run"
+            return {"returncode": 0, "stdout": "😀" * 12_000, "stderr": ""}
+
+        result = asyncio.run(
+            DenoTypescriptSandbox().arun_source(
+                source,
+                {"command": "printf unicode"},
+                syscall_handler=handler,
+            )
+        )
+        assert len(result["output_head"]) == 5_000
+        assert len(result["output_tail"]) == 5_000
+        assert result["output_head"] == "😀" * 5_000
+        assert result["output_tail"] == "😀" * 5_000
+        assert result["elided_chars"] == 2_000
 
     @pytest.mark.real_deno
     def test_submit_uses_bounded_observation_instead_of_raw_shell_output(self) -> None:
@@ -353,7 +412,7 @@ class TestMiniSWEAgentImage:
         assert result["stderr_truncated"] is False
         assert result["output_incomplete"] is True
         assert result["elided_chars"] == 2000
-        assert "counts only characters omitted from the captured output" in result[
+        assert "counts only Unicode code points omitted from the captured output" in result[
             "warning"
         ]
 
@@ -377,7 +436,12 @@ class TestMiniSWEAgentImage:
         )
 
         assert result["returncode"] == -1
-        assert result["exception_info"] == "submission failed: exit denied"
+        assert re.fullmatch(
+            r"submission failed: syscall_error: PermissionError "
+            r"\(correlation_id=corr_[0-9a-f]+\)",
+            result["exception_info"],
+        )
+        assert "exit denied" not in result["exception_info"]
         assert len(result["output_head"]) == 5000
         assert len(result["output_tail"]) == 5000
         assert result["elided_chars"] == 2000

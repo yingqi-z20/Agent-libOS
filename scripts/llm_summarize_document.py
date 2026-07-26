@@ -12,8 +12,10 @@ from agent_libos.models import HumanRequestStatus, ProcessStatus, ResourceBudget
 
 if __package__:  # pragma: no branch - depends on module versus file execution
     from scripts.runtime_assembly import aopen_runtime
+    from scripts.workflow_evidence import has_committed_filesystem_write
 else:  # pragma: no cover - exercised by direct-entrypoint subprocess tests
     from runtime_assembly import aopen_runtime
+    from workflow_evidence import has_committed_filesystem_write
 
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
@@ -85,6 +87,8 @@ async def amain(args: argparse.Namespace) -> None:
     try:
         document_path = _workspace_relative_document(args.document, runtime.workspace_root)
         output_path = _workspace_relative_output(args.output, runtime.workspace_root)
+        if output_path == document_path:
+            raise SystemExit("Output path must differ from the source document")
         # The process begins with read authority from the coding image but no
         # write authority; it must request a policy before write_text_file works.
         pid = runtime.process.spawn(
@@ -122,13 +126,19 @@ async def amain(args: argparse.Namespace) -> None:
         permission_policy = args.permission_policy
         if permission_policy is None and args.auto_approve:
             permission_policy = CapabilityManager.ALWAYS_ALLOW
-        await runtime.arun_until_idle(
+        results = await runtime.arun_until_idle(
             max_quanta=args.max_quanta,
             human_auto_approve=True if args.auto_approve else None,
             human_auto_policy=permission_policy,
         )
         process = runtime.process.get(pid)
         output_exists = (runtime.workspace_root / output_path).exists()
+        write_receipt_bound = has_committed_filesystem_write(
+            runtime,
+            pid,
+            results,
+            output_path,
+        )
 
         if process.status == ProcessStatus.FAILED:
             raise SystemExit(f"Agent process failed: {process.status_message}")
@@ -136,7 +146,8 @@ async def amain(args: argparse.Namespace) -> None:
             raise SystemExit(
                 f"Agent process did not exit after {args.max_quanta} quanta; status={process.status.value}"
             )
-        if not output_exists and not _had_permission_rejection(runtime, pid):
+        permission_rejected = _had_permission_rejection(runtime, pid)
+        if (not output_exists or not write_receipt_bound) and not permission_rejected:
             raise SystemExit(f"Agent exited without writing summary file: {output_path}")
     finally:
         await runtime.ashutdown(actor="script", reason="script.complete")

@@ -5,10 +5,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-import yaml
 from pydantic import TypeAdapter
 
 from agent_libos.config.defaults import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.models.exceptions import ValidationError
+from agent_libos.utils.yaml_loader import YAML_MAX_UTF8_BYTES, load_yaml_mapping
 
 _CONFIG_ADAPTER = TypeAdapter(AgentLibOSConfig)
 
@@ -31,17 +32,15 @@ def load_config_file(path: str | Path, *, base: AgentLibOSConfig = DEFAULT_CONFI
     if not selected.exists():
         raise FileNotFoundError(f"config file not found: {selected}")
     try:
-        data = yaml.safe_load(selected.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
+        data = load_yaml_mapping(_read_config_text(selected))
+    except ValidationError as exc:
+        if str(exc) == "YAML document must be a mapping":
+            raise ValueError(
+                f"config YAML root must be a mapping: {selected}"
+            ) from exc
         raise ValueError(f"invalid YAML config {selected}: {exc}") from exc
-    if data is None:
-        overlay: Mapping[str, Any] = {}
-    elif isinstance(data, Mapping):
-        overlay = data
-    else:
-        raise ValueError(f"config YAML root must be a mapping: {selected}")
 
-    merged = _deep_merge(asdict(base), overlay)
+    merged = _deep_merge(asdict(base), data)
     return _CONFIG_ADAPTER.validate_python(merged)
 
 
@@ -82,3 +81,17 @@ def _deep_merge(base: Any, overlay: Any) -> Any:
                 merged[key] = value
         return merged
     return overlay
+
+
+def _read_config_text(path: Path) -> str:
+    with path.open("rb") as handle:
+        raw = handle.read(YAML_MAX_UTF8_BYTES + 1)
+    if len(raw) > YAML_MAX_UTF8_BYTES:
+        raise ValidationError(
+            "YAML document exceeds "
+            f"YAML_MAX_UTF8_BYTES={YAML_MAX_UTF8_BYTES}"
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValidationError("YAML document must be valid UTF-8 text") from exc

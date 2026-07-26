@@ -3,47 +3,98 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import platform
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from agent_libos.utils.ids import new_id, utc_now
-from experiments.run_benchmark import REPO_ROOT, _git_provenance
+from experiments.run_benchmark import (
+    REPO_ROOT,
+    _ProvenanceBudget,
+    _git_provenance,
+    _sha256_file,
+)
 
 
-def new_recovery_run_identity() -> tuple[str, str]:
-    """Return an opaque run id and its UTC start timestamp."""
+@dataclass(frozen=True)
+class RecoverySourceEntry:
+    path: str
+    sha256: str
 
-    return new_id("benchmark_run"), utc_now()
+
+@dataclass(frozen=True)
+class RecoveryRunIdentity:
+    run_id: str
+    started_at: str
+    source_entries: tuple[RecoverySourceEntry, ...]
+    source_sha256: str
+    git_provenance: dict[str, Any]
+
+
+def new_recovery_run_identity(
+    *,
+    source_paths: tuple[Path, ...],
+) -> RecoveryRunIdentity:
+    """Capture identity and immutable source digests before measured work."""
+
+    selected_source_paths: set[Path] = set()
+    for raw_path in (Path(__file__), *source_paths):
+        absolute = raw_path.absolute()
+        if absolute.is_symlink():
+            raise RuntimeError(
+                f"recovery benchmark source may not be a symlink: {absolute}"
+            )
+        selected_source_paths.add(absolute.resolve(strict=True))
+    source_entries: list[RecoverySourceEntry] = []
+    source_budget = _ProvenanceBudget()
+    for path in sorted(selected_source_paths, key=lambda item: item.as_posix()):
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"recovery benchmark source is not a regular file: {path}")
+        try:
+            relative = path.relative_to(REPO_ROOT).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"recovery benchmark source is outside the repository: {path}"
+            ) from exc
+        source_entries.append(
+            RecoverySourceEntry(
+                path=relative,
+                sha256=_sha256_file(path, budget=source_budget),
+            )
+        )
+    aggregate = hashlib.sha256()
+    for entry in source_entries:
+        aggregate.update(entry.path.encode("utf-8"))
+        aggregate.update(b"\0")
+        aggregate.update(entry.sha256.encode("ascii"))
+        aggregate.update(b"\0")
+    return RecoveryRunIdentity(
+        run_id=new_id("benchmark_run"),
+        started_at=utc_now(),
+        source_entries=tuple(source_entries),
+        source_sha256=aggregate.hexdigest(),
+        git_provenance=_git_provenance(),
+    )
 
 
 def build_recovery_artifact_metadata(
     *,
     benchmark_id: str,
-    run_id: str,
-    started_at: str,
+    identity: RecoveryRunIdentity,
     selected_profile: str,
     profile_defaults: dict[str, int],
     explicit_overrides: dict[str, int],
     effective_parameters: dict[str, Any],
-    source_paths: tuple[Path, ...],
 ) -> dict[str, Any]:
     """Build non-secret identity, invocation, source, and environment evidence."""
 
-    selected_source_paths = {Path(__file__).resolve()}
-    selected_source_paths.update(path.resolve() for path in source_paths)
     source_entries = [
         {
-            "path": path.relative_to(REPO_ROOT).as_posix(),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "path": entry.path,
+            "sha256": entry.sha256,
         }
-        for path in sorted(selected_source_paths, key=lambda item: item.as_posix())
+        for entry in identity.source_entries
     ]
-    aggregate = hashlib.sha256()
-    for entry in source_entries:
-        aggregate.update(entry["path"].encode("utf-8"))
-        aggregate.update(b"\0")
-        aggregate.update(entry["sha256"].encode("ascii"))
-        aggregate.update(b"\0")
 
     effective_profile_parameters = {
         key: effective_parameters[key] for key in profile_defaults
@@ -52,8 +103,8 @@ def build_recovery_artifact_metadata(
     return {
         "schema_version": 1,
         "benchmark_id": benchmark_id,
-        "run_id": run_id,
-        "started_at": started_at,
+        "run_id": identity.run_id,
+        "started_at": identity.started_at,
         "completed_at": utc_now(),
         "invocation": {
             "selected_profile": selected_profile,
@@ -69,9 +120,9 @@ def build_recovery_artifact_metadata(
         },
         "provenance": {
             "schema_version": 1,
-            "git": _git_provenance(),
+            "git": identity.git_provenance,
             "benchmark_sources": source_entries,
-            "benchmark_source_sha256": aggregate.hexdigest(),
+            "benchmark_source_sha256": identity.source_sha256,
             "environment": {
                 "python_version": platform.python_version(),
                 "python_implementation": platform.python_implementation(),

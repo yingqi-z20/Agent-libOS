@@ -159,6 +159,37 @@ class TestFilesystemDirectoryTool:
             finally:
                 runtime.close()
 
+    def test_misspelled_overwrite_flag_cannot_replace_existing_file(self) -> None:
+        path = self._write_fixture(
+            f'agent_outputs/strict_write_{uuid4().hex}.txt',
+            'original',
+        )
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='reject a misspelled overwrite control',
+        )
+        self.runtime.filesystem.grant_path(
+            pid,
+            path,
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+
+        result = self.runtime.tools.call(
+            pid,
+            'write_text_file',
+            {
+                'path': path,
+                'content': 'replacement',
+                'overwite': False,
+            },
+        )
+
+        assert not result.ok
+        assert result.error == 'Invalid arguments for tool `write_text_file`.'
+        assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'original'
+        assert self.runtime.store.list_external_effects(pid=pid) == []
+
     @pytest.mark.parametrize(
         ('tool_name', 'args'),
         [
@@ -196,7 +227,9 @@ class TestFilesystemDirectoryTool:
                 result = runtime.tools.call(pid, tool_name, args)
 
                 assert not result.ok
-                assert 'Git metadata' in (result.error or '')
+                assert (result.error or '').startswith(
+                    'permission_denied: CapabilityDenied'
+                )
                 assert config.read_text(encoding='utf-8') == '[core]\n'
             finally:
                 runtime.close()
@@ -630,7 +663,7 @@ class TestFilesystemDirectoryTool:
         self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.WRITE], issued_by='test')
         denied = self.runtime.tools.call(pid, 'delete_file', {'path': path})
         assert not denied.ok
-        assert 'lacks delete' in (denied.error or '')
+        assert (denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert (self.runtime.workspace_root / path).exists()
 
     def test_filesystem_resource_keeps_os_distinct_path_names_separate(self) -> None:
@@ -649,6 +682,84 @@ class TestFilesystemDirectoryTool:
             self.runtime.filesystem.read_text(pid, backslash)
         with pytest.raises(CapabilityDenied):
             self.runtime.filesystem.read_text(pid, trailing_space)
+
+    def test_filesystem_tools_round_trip_posix_backslash_path_identity(self) -> None:
+        if os.name == 'nt':
+            pytest.skip('backslash is a path separator on Windows')
+        base = f'agent_outputs/tool_path_identity_{uuid4().hex}'
+        literal_file = self._write_fixture(f'{base}/dir\\file.txt', 'literal')
+        slash_file = self._write_fixture(f'{base}/dir/file.txt', 'slash')
+        slash_directory = self.runtime.workspace_root / base / 'created' / 'directory'
+        slash_directory.mkdir(parents=True)
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='round trip POSIX filesystem tool path identities',
+        )
+        self.runtime.filesystem.grant_path_list(
+            pid,
+            read_dirs=[base],
+            write_dirs=[base],
+            delete_dirs=[base],
+            issued_by='test',
+        )
+
+        listed = self.runtime.tools.call(pid, 'read_directory', {'path': base})
+        assert listed.ok, listed.error
+        literal_entry = next(
+            entry for entry in listed.payload['entries']
+            if entry['name'] == 'dir\\file.txt'
+        )
+        assert literal_entry['path'] == literal_file
+
+        read = self.runtime.tools.call(
+            pid,
+            'read_text_file',
+            {'path': literal_entry['path']},
+        )
+        assert read.ok, read.error
+        assert read.payload['path'] == literal_file
+        assert read.payload['content'] == 'literal'
+
+        written = self.runtime.tools.call(
+            pid,
+            'write_text_file',
+            {'path': literal_entry['path'], 'content': 'updated'},
+        )
+        assert written.ok, written.error
+        assert written.payload['path'] == literal_file
+        assert (self.runtime.workspace_root / literal_file).read_text(encoding='utf-8') == 'updated'
+        assert (self.runtime.workspace_root / slash_file).read_text(encoding='utf-8') == 'slash'
+
+        deleted = self.runtime.tools.call(
+            pid,
+            'delete_file',
+            {'path': literal_entry['path']},
+        )
+        assert deleted.ok, deleted.error
+        assert deleted.payload['path'] == literal_file
+        assert not (self.runtime.workspace_root / literal_file).exists()
+        assert (self.runtime.workspace_root / slash_file).is_file()
+
+        literal_directory = f'{base}/created\\directory'
+        made = self.runtime.tools.call(
+            pid,
+            'write_directory',
+            {'path': literal_directory, 'exist_ok': False},
+        )
+        assert made.ok, made.error
+        assert made.payload['path'] == literal_directory
+        assert (self.runtime.workspace_root / literal_directory).is_dir()
+        assert slash_directory.is_dir()
+
+        removed = self.runtime.tools.call(
+            pid,
+            'delete_directory',
+            {'path': made.payload['path']},
+        )
+        assert removed.ok, removed.error
+        assert removed.payload['path'] == literal_directory
+        assert not (self.runtime.workspace_root / literal_directory).exists()
+        assert slash_directory.is_dir()
 
     def test_local_filesystem_resolve_is_lexical_and_enforces_containment(self) -> None:
         with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
@@ -691,6 +802,66 @@ class TestFilesystemDirectoryTool:
         result = self.runtime.filesystem.read_text(pid, path, max_bytes=1)
         assert result.truncated
         assert result.bytes_read == 1
+        assert result.content == ''
+
+    @pytest.mark.parametrize('encoding', ['utf-8', 'ascii'])
+    def test_truncated_read_rejects_invalid_terminal_byte(self, encoding: str) -> None:
+        path = f'agent_outputs/invalid_terminal_{uuid4().hex}.bin'
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'a\xffZ')
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='reject an invalid terminal byte in a truncated text read',
+        )
+        self.runtime.filesystem.grant_path(
+            pid,
+            path,
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+
+        with pytest.raises(UnicodeDecodeError):
+            self.runtime.filesystem.read_text(
+                pid,
+                path,
+                encoding=encoding,
+                max_bytes=2,
+            )
+
+    @pytest.mark.parametrize(
+        ('encoding', 'max_bytes'),
+        [('utf-8', 1), ('utf-16', 3), ('utf-32', 5)],
+    )
+    def test_truncated_read_omits_only_incomplete_multibyte_unit(
+        self,
+        encoding: str,
+        max_bytes: int,
+    ) -> None:
+        path = f'agent_outputs/incomplete_{encoding}_{uuid4().hex}.bin'
+        target = self.runtime.workspace_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes('éx'.encode(encoding))
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='preserve a valid truncated text prefix',
+        )
+        self.runtime.filesystem.grant_path(
+            pid,
+            path,
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+
+        result = self.runtime.filesystem.read_text(
+            pid,
+            path,
+            encoding=encoding,
+            max_bytes=max_bytes,
+        )
+
+        assert result.truncated
+        assert result.bytes_read == max_bytes
         assert result.content == ''
 
     def test_unrelated_file_reads_do_not_share_one_global_label_io_lock(

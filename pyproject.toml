@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "agent-libos"
-version = "0.3.4"
+version = "1.0.0"
 description = "A minimal Agent libOS runtime with process, object memory, capability, human approval, JIT tool, checkpoint, and audit primitives."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -19,22 +19,30 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "openai>=2.43.0",
-    "psutil>=7.0.0",
-    "pydantic>=2.13.4",
-    "jsonschema>=4.25.0",
-    "pyyaml>=6.0.3",
+    "openai>=2.43.0,<3",
+    "psutil>=7.0.0,<8",
+    "pydantic>=2.13.4,<3",
+    "jsonschema>=4.25.0,<5",
+    "pyyaml>=6.0.3,<7",
+    "regex>=2024.11.6,<2027",
 ]
+
+[project.urls]
+Homepage = "https://github.com/yingqi-z20/Agent-libOS"
+Documentation = "https://github.com/yingqi-z20/Agent-libOS/blob/main/README.md#documentation"
+Repository = "https://github.com/yingqi-z20/Agent-libOS"
+Issues = "https://github.com/yingqi-z20/Agent-libOS/issues"
+"Release status" = "https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/release_status.md"
 
 [project.optional-dependencies]
 postgres = [
-    "psycopg[binary]>=3.2",
+    "psycopg[binary]>=3.2,<4",
 ]
 mcp = [
     "mcp>=1.27,<2",
 ]
 pty = [
-    "pywinpty>=2.0.13; sys_platform == 'win32'",
+    "pywinpty>=2.0.13,<3; sys_platform == 'win32'",
 ]
 
 [dependency-groups]
@@ -43,6 +51,11 @@ dev = [
     "pytest-cov>=6.2.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.8.0",
+]
+release = [
+    "check-wheel-contents==0.6.3",
+    "hatchling==1.31.0",
+    "twine==6.2.0",
 ]
 
 [project.scripts]
@@ -73,6 +86,8 @@ markers = [
     "providers: provider substrate, CLI, GUI server, JSON-RPC, clock, and script smoke tests",
     "benchmark: deterministic runtime-safety benchmark harness tests",
     "invariant(id): runtime safety invariant covered by the test",
+    "platform_darwin: requires native Darwin filesystem semantics",
+    "platform_linux: requires native Linux filesystem semantics",
     "real_deno: runs by default when deno is installed; use --skip-real-deno to skip",
     "real_llm: requires --run-real-llm and OpenAI-compatible credentials",
     "postgres: requires --run-postgres and AGENT_LIBOS_POSTGRES_DSN",

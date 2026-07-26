@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { RuntimeProcess } from "../api/types";
 import { I18nProvider } from "../i18n";
-import { RatingPanel } from "./RatingPanel";
+import { RatingPanel, ratingValueForKey } from "./RatingPanel";
 
 describe("RatingPanel", () => {
   it("renders an existing process rating", () => {
@@ -29,6 +29,14 @@ describe("RatingPanel", () => {
     expect(html).toMatch(/Not rated yet|尚未评分/);
     expect(html).toContain("disabled=\"\"");
     expect(html).toMatch(/Choose a score|选择分数/);
+  });
+
+  it("supports wrapped radio-group keyboard navigation", () => {
+    expect(ratingValueForKey(5, "ArrowRight")).toBe(1);
+    expect(ratingValueForKey(1, "ArrowLeft")).toBe(5);
+    expect(ratingValueForKey(3, "Home")).toBe(1);
+    expect(ratingValueForKey(3, "End")).toBe(5);
+    expect(ratingValueForKey(3, "Enter")).toBeNull();
   });
 });
 

@@ -17,6 +17,7 @@ from agent_libos.api.cli import cli as cli_entrypoint
 from agent_libos.api.cli import _handle_interactive_human_response
 from agent_libos.api.cli import main as cli_main
 from agent_libos.api.cli import _print_interactive_help
+from agent_libos.api.cli import _run_capabilities_command
 from agent_libos.api.cli import _run_interactive_command
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
@@ -29,6 +30,7 @@ from agent_libos.models import (
     ProcessStatus,
     process_outcome_to_mapping,
 )
+from agent_libos.models.exceptions import ValidationError
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 
@@ -50,6 +52,62 @@ def _create_store_with_schema_version(db: Path, version: int) -> None:
 
 
 class TestCLIBuiltinCommand:
+
+    @pytest.mark.parametrize("requested, expected", [(None, 100), (7, 7)])
+    def test_cli_capability_list_validates_and_pushes_limit_to_store(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        requested: int | None,
+        expected: int,
+    ) -> None:
+        runtime = Runtime.open("local")
+        observed: list[tuple[str | None, int | None]] = []
+
+        def record_list(
+            subject: str | None = None,
+            *,
+            limit: int | None = None,
+        ) -> list[object]:
+            observed.append((subject, limit))
+            return []
+
+        monkeypatch.setattr(runtime.store, "list_capabilities", record_list)
+        try:
+            result = _run_capabilities_command(
+                runtime,
+                SimpleNamespace(
+                    actor_pid=None,
+                    capabilities_command="list",
+                    subject=None,
+                    include_inactive=True,
+                    limit=requested,
+                ),
+            )
+            assert result == []
+            assert observed == [(None, expected)]
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("limit", [True, 0, -1, 101, "1", 1.0])
+    def test_cli_capability_list_rejects_invalid_or_oversized_limit(
+        self,
+        limit: object,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            with pytest.raises(ValidationError, match="capability list limit"):
+                _run_capabilities_command(
+                    runtime,
+                    SimpleNamespace(
+                        actor_pid=None,
+                        capabilities_command="list",
+                        subject=None,
+                        include_inactive=True,
+                        limit=limit,
+                    ),
+                )
+        finally:
+            runtime.close()
 
     def test_interactive_run_uses_configured_default_quantum_budget_when_omitted(
         self,
@@ -687,8 +745,9 @@ class TestCLIBuiltinCommand:
             calls: dict[str, object] = {}
 
             class DummyRuntime:
-                def shutdown(self, *, actor: str, reason: str) -> None:
+                def shutdown(self, *, actor: str, reason: str) -> dict[str, bool]:
                     calls['shutdown'] = (actor, reason)
+                    return {'ok': True}
 
             def fake_open(target: object = None, **kwargs: object) -> DummyRuntime:
                 calls['target'] = target
@@ -703,7 +762,7 @@ class TestCLIBuiltinCommand:
                     cli_main(['--config', str(config), 'init'])
 
             assert calls['target'] is None
-            assert stdout.getvalue().strip() == 'initialized postgresql://agent:***@localhost/agent_libos'
+            assert stdout.getvalue().strip() == 'initialized postgresql://***@localhost/agent_libos'
 
     def test_cli_rejects_postgres_backend_without_store_dsn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -724,8 +783,9 @@ class TestCLIBuiltinCommand:
         calls: dict[str, object] = {}
 
         class DummyRuntime:
-            def shutdown(self, *, actor: str, reason: str) -> None:
+            def shutdown(self, *, actor: str, reason: str) -> dict[str, bool]:
                 calls['shutdown'] = (actor, reason)
+                return {'ok': True}
 
         def fake_open(target: object = None, **kwargs: object) -> DummyRuntime:
             calls['target'] = target
@@ -738,7 +798,59 @@ class TestCLIBuiltinCommand:
             cli_main(['--db', dsn, 'init'])
 
         assert calls['target'] == dsn
-        assert stdout.getvalue().strip() == 'initialized postgresql://agent:***@localhost/agent_libos'
+        assert stdout.getvalue().strip() == 'initialized postgresql://***@localhost/agent_libos'
+
+    def test_cli_fails_visibly_when_runtime_reports_incomplete_shutdown(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class DummyRuntime:
+            def shutdown(self, *, actor: str, reason: str) -> dict[str, object]:
+                return {'ok': False, 'errors': ['injected teardown failure']}
+
+        monkeypatch.setattr(Runtime, 'open', staticmethod(lambda *_args, **_kwargs: DummyRuntime()))
+
+        with pytest.raises(RuntimeError, match='teardown remained incomplete'):
+            cli_main(['init'])
+
+    def test_cli_propagates_runtime_shutdown_exception_after_successful_command(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        shutdown_error = OSError('injected shutdown exception')
+
+        class DummyRuntime:
+            def shutdown(self, *, actor: str, reason: str) -> dict[str, object]:
+                raise shutdown_error
+
+        monkeypatch.setattr(Runtime, 'open', staticmethod(lambda *_args, **_kwargs: DummyRuntime()))
+
+        with pytest.raises(OSError) as raised:
+            cli_main(['init'])
+
+        assert raised.value is shutdown_error
+
+    def test_cli_preserves_primary_command_error_when_shutdown_also_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        primary_error = RuntimeError('injected command failure')
+
+        class DummyRuntime:
+            def shutdown(self, *, actor: str, reason: str) -> dict[str, object]:
+                return {'ok': False, 'errors': ['secondary teardown failure']}
+
+        def fail_demo(_runtime: object) -> dict[str, object]:
+            raise primary_error
+
+        monkeypatch.setattr(Runtime, 'open', staticmethod(lambda *_args, **_kwargs: DummyRuntime()))
+        monkeypatch.setattr('agent_libos.api.cli.run_demo', fail_demo)
+
+        with pytest.raises(RuntimeError) as raised:
+            cli_main(['demo'])
+
+        assert raised.value is primary_error
+        assert any('runtime teardown also failed' in note for note in primary_error.__notes__)
 
     def test_cli_cd_changes_process_working_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

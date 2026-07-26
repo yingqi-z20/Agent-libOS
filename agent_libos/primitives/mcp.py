@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import math
 import os
 import re
-import socket
 import threading
 import time
 from functools import partial
@@ -49,6 +49,7 @@ from agent_libos.models.exceptions import (
     HumanApprovalRequired,
     NotFound,
     ProviderHostError,
+    ResourceLimitExceeded,
     ValidationError,
 )
 from agent_libos.models.external_effect import default_external_effect_rollback_status
@@ -58,10 +59,15 @@ from agent_libos.substrate import (
     ExecutableSnapshot,
     executable_content_sha256,
     McpProvider,
+    McpSubprocessLimitsProvider,
     ProviderEffectNotStarted,
+    SubprocessLimits,
     snapshot_executable,
 )
-from agent_libos.substrate.local import _bounded_mcp_content
+from agent_libos.substrate.local import (
+    _allowed_mcp_connect_addresses,
+    _bounded_mcp_content,
+)
 from agent_libos.sdk import (
     ProviderEffectNotStartedResult,
     ProviderRegistryBinding,
@@ -93,6 +99,9 @@ _MCP_PLATFORM_ENV_KEYS = ("SYSTEMROOT", "WINDIR") if os.name == "nt" else ()
 _STDIO_EXECUTABLE_IDENTITY_UNSET = object()
 _PROVIDER_RESULT_RETURNED_ATTR = "_agent_libos_provider_result_returned"
 _INVALID_MCP_TEXT_JSON = object()
+_MCP_PROVIDER_JSON_MAX_DEPTH = 128
+_MCP_PROVIDER_JSON_MAX_NODES = 100_000
+_MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER = 4
 _SERVER_FIELDS = {
     "schema_version",
     "server_id",
@@ -153,11 +162,55 @@ class _McpLiveToolValidationError(ValidationError):
         self.result = result
 
 
+class _ProviderJsonBudget:
+    """Bound normalization work for one provider-owned response tree."""
+
+    __slots__ = (
+        "max_depth",
+        "max_nodes",
+        "max_string_bytes",
+        "nodes",
+        "string_bytes",
+    )
+
+    def __init__(self, max_response_bytes: int) -> None:
+        self.max_depth = _MCP_PROVIDER_JSON_MAX_DEPTH
+        self.max_nodes = min(_MCP_PROVIDER_JSON_MAX_NODES, max(1, max_response_bytes))
+        self.max_string_bytes = max_response_bytes
+        self.nodes = 0
+        self.string_bytes = 0
+
+    def consume_node(self, *, path: str, depth: int) -> None:
+        if depth > self.max_depth:
+            raise TypeError(
+                f"provider JSON exceeds maximum depth={self.max_depth} at {path}"
+            )
+        self.nodes += 1
+        if self.nodes > self.max_nodes:
+            raise TypeError(
+                f"provider JSON exceeds maximum nodes={self.max_nodes} at {path}"
+            )
+
+    def consume_string(self, value: str, *, path: str) -> None:
+        try:
+            encoded_bytes = len(value.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise TypeError(f"provider JSON contains invalid UTF-8 at {path}") from error
+        self.string_bytes += encoded_bytes
+        if self.string_bytes > self.max_string_bytes:
+            raise TypeError(
+                "provider JSON exceeds maximum aggregate string bytes="
+                f"{self.max_string_bytes} at {path}"
+            )
+
+
 def _strict_provider_json_value(
     value: Any,
     *,
     path: str,
     active_containers: set[int],
+    budget: _ProviderJsonBudget,
+    depth: int = 0,
 ) -> Any:
     """Detach an exact JSON tree returned by a Host provider.
 
@@ -167,8 +220,11 @@ def _strict_provider_json_value(
     evidence, accounting, or model-visible projection reads it.
     """
 
+    budget.consume_node(path=path, depth=depth)
     value_type = type(value)
     if value is None or value_type in {str, bool, int}:
+        if value_type is str:
+            budget.consume_string(value, path=path)
         return value
     if value_type is float:
         if not math.isfinite(value):
@@ -186,10 +242,13 @@ def _strict_provider_json_value(
                     raise TypeError(
                         f"provider JSON contains a non-string key at {path}"
                     )
+                budget.consume_string(key, path=f"{path}.<key>")
                 selected[key] = _strict_provider_json_value(
                     item,
                     path=f"{path}[{key!r}]",
                     active_containers=active_containers,
+                    budget=budget,
+                    depth=depth + 1,
                 )
             return selected
         finally:
@@ -205,6 +264,8 @@ def _strict_provider_json_value(
                     item,
                     path=f"{path}[{index}]",
                     active_containers=active_containers,
+                    budget=budget,
+                    depth=depth + 1,
                 )
                 for index, item in enumerate(value)
             ]
@@ -836,23 +897,11 @@ class McpPrimitive:
             server_id=server_id,
             tool_id=tool_id,
         )
-        operation_context.update(
-            {
-                "capability_ids": list(
-                    dict.fromkeys(
-                        [
-                            *decision.matched_capability_ids,
-                            *[
-                                cap_id
-                                for auxiliary in auxiliary_decisions
-                                for cap_id in auxiliary.matched_capability_ids
-                            ],
-                        ]
-                    )
-                ),
-                "selected_capability_id": decision.selected_capability_id,
-                "sandbox_profile": self._profile_json(profile),
-            }
+        self._attach_call_authority_context(
+            operation_context,
+            decision=decision,
+            auxiliary_decisions=auxiliary_decisions,
+            profile=profile,
         )
         request_bytes = len(dumps({"name": tool.mcp_name, "arguments": selected_args}).encode("utf-8"))
         if request_bytes > spec.max_request_bytes:
@@ -923,6 +972,7 @@ class McpPrimitive:
                     ),
                     self._validate_runtime_resolution,
                     spec,
+                    deadline=deadline,
                 )
 
             validate_and_call = getattr(self.provider, "validate_and_call", None)
@@ -942,6 +992,7 @@ class McpPrimitive:
                         provider_kwargs = self._provider_dispatch_kwargs(
                             spec,
                             deadline=deadline,
+                            pid=pid,
                             runtime_environment=runtime_environment,
                             executable_snapshot=executable_snapshot,
                         )
@@ -951,7 +1002,7 @@ class McpPrimitive:
                             selected_args,
                             **provider_kwargs,
                         )
-                        return self._validated_provider_call_result(raw_result)
+                        return self._validated_provider_call_result(spec, raw_result)
                     except ProviderEffectNotStarted as error:
                         return ProviderEffectNotStartedResult(
                             error=error,
@@ -1082,6 +1133,7 @@ class McpPrimitive:
                     provider_kwargs = self._provider_dispatch_kwargs(
                         spec,
                         deadline=deadline,
+                        pid=pid,
                         runtime_environment=runtime_environment,
                         executable_snapshot=executable_snapshot,
                     )
@@ -1091,7 +1143,7 @@ class McpPrimitive:
                         selected_args,
                         **provider_kwargs,
                     )
-                    return self._validated_provider_call_result(raw_result), None
+                    return self._validated_provider_call_result(spec, raw_result), None
                 except ProviderEffectNotStarted as error:
                     return ProviderEffectNotStartedResult(
                         error=error,
@@ -1171,6 +1223,30 @@ class McpPrimitive:
                 ),
             )
             return completed
+
+    def _attach_call_authority_context(
+        self,
+        operation_context: dict[str, Any],
+        *,
+        decision: Any,
+        auxiliary_decisions: list[Any],
+        profile: Any,
+    ) -> None:
+        capability_ids = [
+            *decision.matched_capability_ids,
+            *[
+                cap_id
+                for auxiliary in auxiliary_decisions
+                for cap_id in auxiliary.matched_capability_ids
+            ],
+        ]
+        operation_context.update(
+            {
+                "capability_ids": list(dict.fromkeys(capability_ids)),
+                "selected_capability_id": decision.selected_capability_id,
+                "sandbox_profile": self._profile_json(profile),
+            }
+        )
 
     def _resolve_tool_call_target(
         self,
@@ -1453,16 +1529,18 @@ class McpPrimitive:
         tool: McpToolSpec,
         *,
         timeout_s: float | None = None,
+        pid: str | None = None,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
     ) -> McpToolListResult:
-        provider_kwargs: dict[str, Any] = {
-            "timeout_s": server.timeout_s if timeout_s is None else timeout_s,
-            "max_response_bytes": server.max_response_bytes,
-            "runtime_environment": runtime_environment,
-        }
-        if executable_snapshot is not None:
-            provider_kwargs["executable_snapshot"] = executable_snapshot
+        selected_timeout = server.timeout_s if timeout_s is None else timeout_s
+        provider_kwargs = self._provider_dispatch_kwargs(
+            server,
+            deadline=time.monotonic() + selected_timeout,
+            pid=pid,
+            runtime_environment=runtime_environment,
+            executable_snapshot=executable_snapshot,
+        )
         try:
             raw_result = self.provider.list_tools(
                 server,
@@ -1502,17 +1580,18 @@ class McpPrimitive:
         server: McpServerSpec,
         *,
         deadline: float,
+        pid: str,
         executable_snapshot: ExecutableSnapshot | None,
         runtime_environment: Mapping[str, str],
     ) -> tuple[McpToolListResult | None, ProviderHostError | None]:
         try:
-            provider_kwargs: dict[str, Any] = {
-                "timeout_s": self._remaining_timeout(deadline),
-                "max_response_bytes": server.max_response_bytes,
-                "runtime_environment": runtime_environment,
-            }
-            if executable_snapshot is not None:
-                provider_kwargs["executable_snapshot"] = executable_snapshot
+            provider_kwargs = self._provider_dispatch_kwargs(
+                server,
+                deadline=deadline,
+                pid=pid,
+                runtime_environment=runtime_environment,
+                executable_snapshot=executable_snapshot,
+            )
             raw_result = self.provider.list_tools(server, **provider_kwargs)
             return self._validated_tool_list_result(server, raw_result), None
         except ProviderEffectNotStarted:
@@ -1549,6 +1628,7 @@ class McpPrimitive:
                 ),
                 self._validate_runtime_resolution,
                 server,
+                deadline=deadline,
             )
         executable_snapshot = self._stdio_snapshot_for_dispatch(
             pid=pid,
@@ -1568,6 +1648,7 @@ class McpPrimitive:
                 self._invoke_list_tools_provider,
                 server,
                 deadline=deadline,
+                pid=pid,
                 executable_snapshot=executable_snapshot,
                 runtime_environment=runtime_environment,
             )
@@ -1596,9 +1677,23 @@ class McpPrimitive:
                 response_bytes=response_bytes,
                 duration_s=duration_s,
             )
+            budget = _ProviderJsonBudget(server.max_response_bytes)
+            selected_tools = self._validated_provider_tools(
+                tools,
+                budget=budget,
+                max_tools=self.config.mcp.list_limit,
+            )
+            canonical_response_bytes = self._canonical_provider_json_bytes(
+                [to_jsonable(tool) for tool in selected_tools],
+                context="MCP tools/list response",
+            )
+            if canonical_response_bytes > server.max_response_bytes:
+                raise TypeError("MCP tools/list canonical response exceeds max_response_bytes")
+            if response_bytes < canonical_response_bytes:
+                raise TypeError("MCP tools/list response_bytes underreports canonical response")
             return McpToolListResult(
                 server_id=server_id,
-                tools=self._validated_provider_tools(tools),
+                tools=selected_tools,
                 response_bytes=response_bytes,
                 duration_s=float(duration_s),
             )
@@ -1641,10 +1736,18 @@ class McpPrimitive:
             raise TypeError("MCP tools/list duration_s is invalid")
 
     @staticmethod
-    def _validated_provider_tools(tools: list[Any]) -> list[McpProviderTool]:
+    def _validated_provider_tools(
+        tools: list[Any],
+        *,
+        budget: _ProviderJsonBudget,
+        max_tools: int,
+    ) -> list[McpProviderTool]:
+        if len(tools) > max_tools:
+            raise TypeError(f"MCP tools/list exceeds maximum tool count={max_tools}")
         selected_tools: list[McpProviderTool] = []
         names: set[str] = set()
-        for item in tools:
+        for index, item in enumerate(tools):
+            budget.consume_node(path=f"$.tools[{index}]", depth=1)
             if not isinstance(item, McpProviderTool):
                 raise TypeError("MCP tools/list contains an invalid tool")
             name = item.name
@@ -1653,10 +1756,16 @@ class McpPrimitive:
             metadata = item.metadata
             if type(name) is not str or not name:
                 raise TypeError("MCP tools/list tool name is invalid")
+            budget.consume_string(name, path=f"$.tools[{index}].name")
             if name in names:
                 raise TypeError("MCP tools/list contains duplicate tool names")
             if description is not None and type(description) is not str:
                 raise TypeError("MCP tools/list tool description is invalid")
+            if description is not None:
+                budget.consume_string(
+                    description,
+                    path=f"$.tools[{index}].description",
+                )
             if type(input_schema) is not dict or type(metadata) is not dict:
                 raise TypeError("MCP tools/list tool metadata is invalid")
             selected_tools.append(
@@ -1665,13 +1774,17 @@ class McpPrimitive:
                     description=description,
                     input_schema=_strict_provider_json_value(
                         input_schema,
-                        path="$.tools[].input_schema",
+                        path=f"$.tools[{index}].input_schema",
                         active_containers=set(),
+                        budget=budget,
+                        depth=2,
                     ),
                     metadata=_strict_provider_json_value(
                         metadata,
-                        path="$.tools[].metadata",
+                        path=f"$.tools[{index}].metadata",
                         active_containers=set(),
+                        budget=budget,
+                        depth=2,
                     ),
                 )
             )
@@ -1679,75 +1792,183 @@ class McpPrimitive:
         return selected_tools
 
     @staticmethod
-    def _validated_provider_call_result(result: Any) -> McpProviderCallResult:
+    def _canonical_provider_json_bytes(value: Any, *, context: str) -> int:
+        try:
+            return len(dumps(value).encode("utf-8"))
+        except (TypeError, ValueError, RecursionError, UnicodeEncodeError) as error:
+            raise TypeError(f"{context} is not canonical JSON") from error
+
+    @staticmethod
+    def _validate_provider_call_header(
+        server: McpServerSpec,
+        result: McpProviderCallResult,
+    ) -> None:
+        if type(result.is_error) is not bool or type(result.too_large) is not bool:
+            raise TypeError("MCP provider call flags are invalid")
+        if type(result.call_started) is not bool:
+            raise TypeError("MCP provider call_started is invalid")
+        byte_fields = (
+            ("response_bytes", result.response_bytes),
+            ("list_request_bytes", result.list_request_bytes),
+            ("list_response_bytes", result.list_response_bytes),
+            ("call_request_bytes", result.call_request_bytes),
+            ("call_response_bytes", result.call_response_bytes),
+        )
+        for field_name, selected in byte_fields:
+            if type(selected) is not int or selected < 0:
+                raise TypeError(f"MCP provider {field_name} is invalid")
+        for field_name, selected in (
+            ("response_bytes", result.response_bytes),
+            ("list_response_bytes", result.list_response_bytes),
+            ("call_response_bytes", result.call_response_bytes),
+        ):
+            if selected > server.max_response_bytes:
+                raise TypeError(
+                    f"MCP provider {field_name} exceeds max_response_bytes"
+                )
+        if (
+            type(result.duration_s) not in {int, float}
+            or not math.isfinite(result.duration_s)
+            or result.duration_s < 0
+        ):
+            raise TypeError("MCP provider duration_s is invalid")
+        for field_name, selected in (
+            ("error", result.error),
+            ("error_type", result.error_type),
+            ("correlation_id", result.correlation_id),
+        ):
+            if selected is not None and type(selected) is not str:
+                raise TypeError(f"MCP provider {field_name} is invalid")
+
+    @staticmethod
+    def _validated_provider_call_payloads(
+        server: McpServerSpec,
+        result: McpProviderCallResult,
+    ) -> tuple[Any, Any]:
+        budget = _ProviderJsonBudget(server.max_response_bytes)
+        selected_content = _strict_provider_json_value(
+            result.content,
+            path="$.content",
+            active_containers=set(),
+            budget=budget,
+        )
+        selected_structured_content = _strict_provider_json_value(
+            result.structured_content,
+            path="$.structured_content",
+            active_containers=set(),
+            budget=budget,
+        )
+        for field_name, selected in (
+            ("error", result.error),
+            ("error_type", result.error_type),
+            ("correlation_id", result.correlation_id),
+        ):
+            if selected is not None:
+                budget.consume_string(selected, path=f"$.{field_name}")
+        return selected_content, selected_structured_content
+
+    @staticmethod
+    def _validate_provider_call_byte_contract(
+        server: McpServerSpec,
+        result: McpProviderCallResult,
+        *,
+        selected_content: Any,
+        selected_structured_content: Any,
+    ) -> None:
+        has_response_payload = (
+            result.error is None
+            or result.content is not None
+            or result.structured_content is not None
+        )
+        canonical_response_bytes = 0
+        if has_response_payload:
+            canonical_response_bytes = McpPrimitive._canonical_provider_json_bytes(
+                {
+                    "content": selected_content,
+                    "structured_content": selected_structured_content,
+                },
+                context="MCP tool response",
+            )
+            if canonical_response_bytes > server.max_response_bytes:
+                raise TypeError("MCP tool canonical response exceeds max_response_bytes")
+        if result.too_large:
+            McpPrimitive._validate_oversized_provider_call_bytes(server, result)
+        elif has_response_payload:
+            McpPrimitive._validate_canonical_provider_call_bytes(
+                result,
+                canonical_response_bytes=canonical_response_bytes,
+            )
+
+    @staticmethod
+    def _validate_oversized_provider_call_bytes(
+        server: McpServerSpec,
+        result: McpProviderCallResult,
+    ) -> None:
+        if result.response_bytes < server.max_response_bytes:
+            raise TypeError(
+                "MCP provider response_bytes underreports an oversized response"
+            )
+        if (
+            result.call_response_bytes
+            and result.call_response_bytes < server.max_response_bytes
+        ):
+            raise TypeError(
+                "MCP provider call_response_bytes underreports an oversized response"
+            )
+
+    @staticmethod
+    def _validate_canonical_provider_call_bytes(
+        result: McpProviderCallResult,
+        *,
+        canonical_response_bytes: int,
+    ) -> None:
+        if result.response_bytes < canonical_response_bytes:
+            raise TypeError(
+                "MCP provider response_bytes underreports canonical response"
+            )
+        if (
+            result.call_response_bytes
+            and result.call_response_bytes < canonical_response_bytes
+        ):
+            raise TypeError(
+                "MCP provider call_response_bytes underreports canonical response"
+            )
+
+    @staticmethod
+    def _validated_provider_call_result(
+        server: McpServerSpec,
+        result: Any,
+    ) -> McpProviderCallResult:
         """Decode every provider-owned call field into an inert value object."""
 
         try:
             if not isinstance(result, McpProviderCallResult):
                 raise TypeError("MCP provider returned an invalid call result")
-            content = result.content
-            structured_content = result.structured_content
-            is_error = result.is_error
-            error = result.error
-            response_bytes = result.response_bytes
-            duration_s = result.duration_s
-            too_large = result.too_large
-            error_type = result.error_type
-            correlation_id = result.correlation_id
-            list_request_bytes = result.list_request_bytes
-            list_response_bytes = result.list_response_bytes
-            call_request_bytes = result.call_request_bytes
-            call_response_bytes = result.call_response_bytes
-            call_started = result.call_started
-            if type(is_error) is not bool or type(too_large) is not bool:
-                raise TypeError("MCP provider call flags are invalid")
-            if type(call_started) is not bool:
-                raise TypeError("MCP provider call_started is invalid")
-            for field_name, selected in (
-                ("response_bytes", response_bytes),
-                ("list_request_bytes", list_request_bytes),
-                ("list_response_bytes", list_response_bytes),
-                ("call_request_bytes", call_request_bytes),
-                ("call_response_bytes", call_response_bytes),
-            ):
-                if type(selected) is not int or selected < 0:
-                    raise TypeError(f"MCP provider {field_name} is invalid")
-            if (
-                type(duration_s) not in {int, float}
-                or not math.isfinite(duration_s)
-                or duration_s < 0
-            ):
-                raise TypeError("MCP provider duration_s is invalid")
-            for field_name, selected in (
-                ("error", error),
-                ("error_type", error_type),
-                ("correlation_id", correlation_id),
-            ):
-                if selected is not None and type(selected) is not str:
-                    raise TypeError(f"MCP provider {field_name} is invalid")
+            McpPrimitive._validate_provider_call_header(server, result)
+            selected_content, selected_structured_content = (
+                McpPrimitive._validated_provider_call_payloads(server, result)
+            )
+            McpPrimitive._validate_provider_call_byte_contract(
+                server,
+                result,
+                selected_content=selected_content,
+                selected_structured_content=selected_structured_content,
+            )
             return McpProviderCallResult(
-                content=_strict_provider_json_value(
-                    content,
-                    path="$.content",
-                    active_containers=set(),
-                ),
-                structured_content=_strict_provider_json_value(
-                    structured_content,
-                    path="$.structured_content",
-                    active_containers=set(),
-                ),
-                is_error=is_error,
-                error=error,
-                response_bytes=response_bytes,
-                duration_s=float(duration_s),
-                too_large=too_large,
-                error_type=error_type,
-                correlation_id=correlation_id,
-                list_request_bytes=list_request_bytes,
-                list_response_bytes=list_response_bytes,
-                call_request_bytes=call_request_bytes,
-                call_response_bytes=call_response_bytes,
-                call_started=call_started,
+                content=selected_content,
+                structured_content=selected_structured_content,
+                is_error=result.is_error,
+                error=result.error,
+                response_bytes=result.response_bytes,
+                duration_s=float(result.duration_s),
+                too_large=result.too_large,
+                error_type=result.error_type,
+                correlation_id=result.correlation_id,
+                list_request_bytes=result.list_request_bytes,
+                list_response_bytes=result.list_response_bytes,
+                call_request_bytes=result.call_request_bytes,
+                call_response_bytes=result.call_response_bytes,
+                call_started=result.call_started,
             )
         except ProviderHostError as error:
             _mark_provider_result_returned(error)
@@ -1767,8 +1988,9 @@ class McpPrimitive:
         tool: McpToolSpec,
         *,
         deadline: float,
+        pid: str,
         executable_snapshot: ExecutableSnapshot | None,
-        runtime_environment: Mapping[str, str],
+        runtime_environment: Mapping[str, str] | None,
     ) -> tuple[McpToolListResult | None, Exception | None, int]:
         """Retain known list bytes while keeping not-started failures exceptional."""
 
@@ -1777,6 +1999,7 @@ class McpPrimitive:
                 server,
                 tool,
                 timeout_s=self._remaining_timeout(deadline),
+                pid=pid,
                 executable_snapshot=executable_snapshot,
                 runtime_environment=runtime_environment,
             )
@@ -1821,6 +2044,7 @@ class McpPrimitive:
                     server,
                     tool,
                     deadline=deadline,
+                    pid=pid,
                     executable_snapshot=executable_snapshot,
                     runtime_environment=runtime_environment,
                 ),
@@ -1843,7 +2067,8 @@ class McpPrimitive:
         server: McpServerSpec,
         *,
         deadline: float,
-        runtime_environment: Mapping[str, str],
+        pid: str | None,
+        runtime_environment: Mapping[str, str] | None,
         executable_snapshot: ExecutableSnapshot | None,
     ) -> dict[str, Any]:
         selected: dict[str, Any] = {
@@ -1853,7 +2078,61 @@ class McpPrimitive:
         }
         if executable_snapshot is not None:
             selected["executable_snapshot"] = executable_snapshot
+        if server.transport == "stdio":
+            usage_pid = self._resource_usage_pid(pid)
+            limits = (
+                self._subprocess_limits(usage_pid)
+                if usage_pid is not None
+                else None
+            )
+            if limits is not None:
+                if (
+                    not isinstance(
+                        self.provider,
+                        McpSubprocessLimitsProvider,
+                    )
+                    or self.provider.supports_subprocess_limits is not True
+                ):
+                    raise ValidationError(
+                        "MCP provider must explicitly support SubprocessLimits "
+                        "before budgeted stdio execution"
+                    )
+                selected["limits"] = limits
         return selected
+
+    def _subprocess_limits(self, pid: str) -> SubprocessLimits | None:
+        if self.resources is None:
+            return None
+        wall = self.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_wall_seconds",
+            "subprocess_wall_seconds",
+        )
+        cpu = self.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_cpu_seconds",
+            "subprocess_cpu_seconds",
+        )
+        memory = self.resources.peak_limit(pid, "max_subprocess_memory_bytes")
+        if wall is not None and wall <= 0:
+            raise ResourceLimitExceeded(
+                f"process {pid} exhausted subprocess wall-time budget"
+            )
+        if cpu is not None and cpu <= 0:
+            raise ResourceLimitExceeded(
+                f"process {pid} exhausted subprocess CPU budget"
+            )
+        if memory is not None and memory <= 0:
+            raise ResourceLimitExceeded(
+                f"process {pid} exhausted subprocess memory budget"
+            )
+        if wall is None and cpu is None and memory is None:
+            return None
+        return SubprocessLimits(
+            wall_seconds=wall,
+            cpu_seconds=cpu,
+            memory_bytes=memory,
+        )
 
     @staticmethod
     def _safe_not_started_error(error: ProviderEffectNotStarted) -> ProviderHostError:
@@ -1910,8 +2189,12 @@ class McpPrimitive:
         tool: McpToolSpec,
         provider_result: McpProviderCallResult,
     ) -> McpCallResult:
-        provider_result = self._validated_provider_call_result(provider_result)
+        provider_result = self._validated_provider_call_result(server, provider_result)
         if provider_result.error:
+            safe_message = self._safe_transport_error_message(
+                server,
+                provider_result.error_type,
+            )
             return McpCallResult(
                 server_id=server.server_id,
                 tool_id=tool.tool_id,
@@ -1922,6 +2205,11 @@ class McpPrimitive:
                     "code": "mcp_provider_error",
                     "error_type": provider_result.error_type or "TransportError",
                     "correlation_id": provider_result.correlation_id or new_id("corr"),
+                    **(
+                        {"message": safe_message}
+                        if safe_message is not None
+                        else {}
+                    ),
                 },
                 response_bytes=provider_result.response_bytes,
                 duration_s=provider_result.duration_s,
@@ -1967,6 +2255,40 @@ class McpPrimitive:
             response_bytes=provider_result.response_bytes,
             duration_s=provider_result.duration_s,
         )
+
+    @staticmethod
+    def _safe_transport_error_message(
+        server: McpServerSpec,
+        error_type: str | None,
+    ) -> str | None:
+        if error_type == "McpStdioFrameTooLarge":
+            return (
+                "MCP stdio frame exceeded "
+                f"max_response_bytes={server.max_response_bytes}"
+            )
+        if error_type == "McpStdioStdoutTooLarge":
+            return (
+                "MCP stdio stdout exceeded max_output_bytes="
+                f"{server.max_response_bytes * _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER}"
+            )
+        if error_type == "McpStdioStderrTooLarge":
+            return (
+                "MCP stdio stderr exceeded "
+                f"max_output_bytes={server.max_response_bytes}"
+            )
+        if error_type == "McpHttpSseFrameTooLarge":
+            return (
+                "MCP HTTP SSE frame exceeded "
+                f"max_response_bytes={server.max_response_bytes}"
+            )
+        if error_type == "McpHttpResponseTooLarge":
+            return (
+                "MCP HTTP response exceeded "
+                f"max_response_bytes={server.max_response_bytes}"
+            )
+        if error_type == "McpHttpContentEncodingDenied":
+            return "MCP HTTP response uses unsupported Content-Encoding"
+        return None
 
     def _failure(
         self,
@@ -3363,7 +3685,12 @@ class McpPrimitive:
             raise ValidationError("MCP plain HTTP is allowed only for local development hosts")
         self._validate_host_literal(host, allow_local=host in _LOCAL_HTTP_HOSTS)
 
-    def _validate_runtime_resolution(self, server: McpServerSpec) -> tuple[str, ...]:
+    def _validate_runtime_resolution(
+        self,
+        server: McpServerSpec,
+        *,
+        deadline: float | None = None,
+    ) -> tuple[str, ...]:
         if server.http is None:
             return ()
         parsed = urlsplit(server.http.url)
@@ -3372,15 +3699,21 @@ class McpPrimitive:
             raise ValidationError("MCP HTTP URL must include a host")
         if host in _LOCAL_HTTP_HOSTS:
             return ()
+        selected_deadline = (
+            time.monotonic() + server.timeout_s if deadline is None else deadline
+        )
         try:
-            infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
-        except socket.gaierror as exc:
-            raise ValidationError(f"MCP host could not be resolved: {host}") from exc
-        addresses = sorted({info[4][0] for info in infos})
-        if not addresses:
-            raise ValidationError(f"MCP host resolved no addresses: {host}")
-        for address in addresses:
-            self._validate_host_literal(address, allow_local=False)
+            addresses = _allowed_mcp_connect_addresses(
+                host,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                deadline=selected_deadline,
+            )
+        except TimeoutError as exc:
+            raise ProviderHostError(
+                code="mcp_dns_timeout",
+                error_type=type(exc).__name__,
+                correlation_id=new_id("corr"),
+            ) from None
         return tuple(addresses)
 
     def _runtime_resolution_observes_host(self, server: McpServerSpec) -> bool:
@@ -3442,13 +3775,19 @@ class McpPrimitive:
 
     def _validate_json_value(self, value: Any, field: str) -> None:
         try:
-            dumps(value)
-        except Exception as exc:
+            json.dumps(
+                value,
+                ensure_ascii=True,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, RecursionError) as exc:
             raise ValidationError(f"MCP {field} must be JSON-serializable") from exc
 
     def _validate_json_schema(self, schema: dict[str, Any], field: str) -> None:
         if not schema:
             return
+        self._validate_json_value(schema, field)
         try:
             jsonschema_validator_for(schema).check_schema(schema)
         except JsonSchemaSchemaError as exc:

@@ -47,7 +47,14 @@ For detached or new-branch mode, `created_oid` is the selected start commit, not
 - `operation="create"`: `name` is the new tag; optional `target` resolves to a commit and omission uses current HEAD. `message=null` creates an unsigned lightweight tag. A non-empty `message` creates an unsigned annotated tag. `force=true` replaces an existing tag and is destructive.
 - `operation="delete"`: `name` is deleted. Omit `target` and `message`; force adds no safer meaning to deletion and should remain false.
 
-Creation cannot tag arbitrary trees/blobs and cannot sign. `created_oid` is the target commit even for an annotated tag; it is not the annotated tag object's ref OID. Use `git_list_refs(kind="tags")` to verify the authoritative tag ref, and use exact OIDs for later push leases. Delete or force requires repository delete/admin and one-use approval; ordinary creation requires repository write. No checkout filesystem authority is conferred.
+Creation cannot tag arbitrary trees/blobs and cannot sign. Creating an annotated
+tag additionally requires a usable Host/repository tagger identity; lightweight
+tag creation does not. `created_oid` is the target commit even for an annotated
+tag; it is not the annotated tag object's ref OID. Use
+`git_list_refs(kind="tags")` to verify the authoritative tag ref, and use exact
+OIDs for later push leases. Delete or force requires repository delete/admin
+and one-use approval; ordinary creation requires repository write. No checkout
+filesystem authority is conferred.
 
 ### `git_worktree`
 

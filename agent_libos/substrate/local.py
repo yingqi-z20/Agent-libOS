@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import codecs
 import contextlib
 import ctypes
 import errno
 import hashlib
 import http.client
-import heapq
 import ipaddress
+import math
 import os
 import re
 import signal
@@ -17,12 +18,16 @@ import shutil
 import socket
 import ssl
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Iterator
+from itertools import islice
+from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Mapping
@@ -49,11 +54,13 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.primitives.git_command_policy import trusted_git_read_operation
 from agent_libos.models.external_effect import default_external_effect_rollback_status
+from agent_libos.ports.blocking_work import run_blocking_once
 from agent_libos.substrate.base import (
     CommandMetrics,
     CommandResult,
     DirectoryEntrySnapshot,
     ExecutableSnapshot,
+    FilesystemContentConflict,
     HierarchicalPathLock,
     PathState,
     ProviderEffectNotStarted,
@@ -63,6 +70,7 @@ from agent_libos.substrate.base import (
     SubprocessLimitExceeded,
     SubprocessLimits,
     SubprocessTimeoutExpired,
+    _bounded_provider_getaddrinfo,
 )
 from agent_libos.substrate.git import LocalGitProvider
 from agent_libos.utils.ids import new_id
@@ -74,11 +82,22 @@ _SHELL_DEFAULTS = DEFAULT_CONFIG.shell
 _MCP_LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _MCP_FORBIDDEN_HOSTS = {"metadata.google.internal"}
 _MCP_STDIO_READ_CHUNK_BYTES = 64 * 1024
+_MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER = 4
 _MCP_WINDOWS = os.name == "nt"
 _MCP_WINDOWS_EXECUTABLE_SUFFIXES = {".com", ".exe"}
 _MCP_STABLE_CWD_SUPPORTED = sys.platform.startswith("linux") and Path(
     "/proc/self/fd"
 ).is_dir()
+_JSONRPC_DEADLINE_THREAD_PREFIX = "agent-libos-jsonrpc-deadline"
+_DARWIN_F_GETPATH = 50
+_DARWIN_F_GETPATH_BUFFER_BYTES = 1024
+_DARWIN_ATTR_BIT_MAP_COUNT = 5
+_DARWIN_ATTR_VOL_INFO = 0x80000000
+_DARWIN_ATTR_VOL_CAPABILITIES = 0x00020000
+_DARWIN_ATTR_VOL_FSTYPENAME = 0x00100000
+_DARWIN_VOL_CAP_FMT_CASE_SENSITIVE = 0x00000100
+_DARWIN_VOL_CAP_FMT_CASE_PRESERVING = 0x00000200
+_DARWIN_NORMALIZATION_INSENSITIVE_FILESYSTEMS = {"apfs"}
 _SAFE_SHELL_ENV_KEYS = {
     "COMSPEC",
     "LANG",
@@ -102,9 +121,43 @@ class _McpStdioDispatchNotStarted(ValidationError, ProviderEffectNotStarted):
     """A stdio target failed closed before a child process was created."""
 
 
+class _McpStdioDispatchStarted(ValidationError):
+    """A stdio child was created but failed post-spawn isolation checks."""
+
+
 class _ProtectedDeleteState:
     def __init__(self) -> None:
         self.mutation_started = False
+
+
+@dataclass(frozen=True)
+class _FilesystemContentSnapshot:
+    sha256: str
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+class _DarwinAttrList(ctypes.Structure):
+    _fields_ = [
+        ("bitmapcount", ctypes.c_uint16),
+        ("reserved", ctypes.c_uint16),
+        ("commonattr", ctypes.c_uint32),
+        ("volattr", ctypes.c_uint32),
+        ("dirattr", ctypes.c_uint32),
+        ("fileattr", ctypes.c_uint32),
+        ("forkattr", ctypes.c_uint32),
+    ]
+
+
+@dataclass(frozen=True)
+class _DarwinVolumeIdentityPolicy:
+    case_sensitive: bool
+    case_preserving: bool
+    normalization_insensitive: bool
+    filesystem_type: str
 
 
 if os.name == "nt":
@@ -169,6 +222,8 @@ if os.name == "nt":
     _kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
 
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_LIMIT_JOB_TIME = 0x00000004
+    _JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
     _PROCESS_TERMINATE = 0x0001
     _PROCESS_SET_QUOTA = 0x0100
@@ -188,19 +243,31 @@ class WindowsJobObject:
         self._closed = False
 
     @classmethod
-    def create(cls) -> "WindowsJobObject":
+    def create(
+        cls,
+        limits: SubprocessLimits | None = None,
+    ) -> "WindowsJobObject":
         if os.name != "nt":
             raise OSError("Windows job objects are only available on Windows")
         handle = _kernel32.CreateJobObjectW(None, None)
         if not handle:
             raise ctypes.WinError(ctypes.get_last_error())
-        limits = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        job_limits = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        limit_flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if limits is not None and limits.cpu_seconds is not None:
+            job_limits.BasicLimitInformation.PerJobUserTimeLimit = int(
+                limits.cpu_seconds * 10_000_000
+            )
+            limit_flags |= _JOB_OBJECT_LIMIT_JOB_TIME
+        if limits is not None and limits.memory_bytes is not None:
+            job_limits.JobMemoryLimit = int(limits.memory_bytes)
+            limit_flags |= _JOB_OBJECT_LIMIT_JOB_MEMORY
+        job_limits.BasicLimitInformation.LimitFlags = limit_flags
         if not _kernel32.SetInformationJobObject(
             handle,
             _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-            ctypes.byref(limits),
-            ctypes.sizeof(limits),
+            ctypes.byref(job_limits),
+            ctypes.sizeof(job_limits),
         ):
             error = ctypes.get_last_error()
             _kernel32.CloseHandle(handle)
@@ -275,11 +342,140 @@ class _WindowsDirectoryGuard:
             _kernel32.CloseHandle(self.handle)
 
 
+def _darwin_volume_identity_policy(path: Path) -> _DarwinVolumeIdentityPolicy:
+    """Read the mounted volume's future-name comparison policy.
+
+    Darwin exposes case sensitivity through ATTR_VOL_CAPABILITIES. Unicode
+    normalization behavior is format-defined rather than a capability bit, so
+    only APFS is treated as normalization-insensitive and preserving enough
+    for this canonical creation scheme;
+    unsupported formats fail closed for non-ASCII future names below.
+    """
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        getattrlist = libc.getattrlist
+    except (AttributeError, OSError) as exc:
+        raise CapabilityDenied(
+            "cannot determine Darwin volume path identity semantics"
+        ) from exc
+    getattrlist.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(_DarwinAttrList),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_ulong,
+    ]
+    getattrlist.restype = ctypes.c_int
+    attributes = _DarwinAttrList(
+        _DARWIN_ATTR_BIT_MAP_COUNT,
+        0,
+        0,
+        (
+            _DARWIN_ATTR_VOL_INFO
+            | _DARWIN_ATTR_VOL_CAPABILITIES
+            | _DARWIN_ATTR_VOL_FSTYPENAME
+        ),
+        0,
+        0,
+        0,
+    )
+    buffer = ctypes.create_string_buffer(256)
+    if getattrlist(
+        os.fsencode(path),
+        ctypes.byref(attributes),
+        buffer,
+        ctypes.sizeof(buffer),
+        0,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise CapabilityDenied(
+            "cannot determine Darwin volume path identity semantics"
+        ) from OSError(error_number, os.strerror(error_number))
+    payload = buffer.raw
+    returned_size = struct.unpack_from("=I", payload, 0)[0]
+    capabilities_size = 8 * ctypes.sizeof(ctypes.c_uint32)
+    reference_offset = ctypes.sizeof(ctypes.c_uint32) + capabilities_size
+    if returned_size < reference_offset + 8 or returned_size > len(payload):
+        raise CapabilityDenied("invalid Darwin volume path identity metadata")
+    capability_values = struct.unpack_from("=8I", payload, 4)
+    format_capabilities = capability_values[0]
+    valid_format_capabilities = capability_values[4]
+    required_case_capabilities = (
+        _DARWIN_VOL_CAP_FMT_CASE_SENSITIVE
+        | _DARWIN_VOL_CAP_FMT_CASE_PRESERVING
+    )
+    if (
+        valid_format_capabilities & required_case_capabilities
+    ) != required_case_capabilities:
+        raise CapabilityDenied(
+            "Darwin volume does not report valid case identity semantics"
+        )
+    string_offset, string_length = struct.unpack_from(
+        "=iI",
+        payload,
+        reference_offset,
+    )
+    string_start = reference_offset + string_offset
+    string_end = string_start + string_length
+    if (
+        string_offset < 8
+        or string_length < 2
+        or string_start < 0
+        or string_end > returned_size
+    ):
+        raise CapabilityDenied("invalid Darwin volume filesystem identity")
+    try:
+        filesystem_type = payload[string_start:string_end].rstrip(b"\0").decode(
+            "utf-8",
+            errors="strict",
+        ).casefold()
+    except UnicodeDecodeError as exc:
+        raise CapabilityDenied("invalid Darwin volume filesystem identity") from exc
+    if not filesystem_type:
+        raise CapabilityDenied("invalid Darwin volume filesystem identity")
+    return _DarwinVolumeIdentityPolicy(
+        case_sensitive=bool(
+            format_capabilities & _DARWIN_VOL_CAP_FMT_CASE_SENSITIVE
+        ),
+        case_preserving=bool(
+            format_capabilities & _DARWIN_VOL_CAP_FMT_CASE_PRESERVING
+        ),
+        normalization_insensitive=(
+            filesystem_type in _DARWIN_NORMALIZATION_INSENSITIVE_FILESYSTEMS
+        ),
+        filesystem_type=filesystem_type,
+    )
+
+
+def _optional_darwin_volume_identity_policy(
+    path: Path,
+) -> _DarwinVolumeIdentityPolicy | None:
+    try:
+        return _darwin_volume_identity_policy(path)
+    except CapabilityDenied:
+        return None
+
+
 class LocalFilesystemProvider:
     """Local-workspace implementation of the filesystem substrate."""
 
     def __init__(self, root: str | Path, namespace: str = _RUNTIME_DEFAULTS.workspace_namespace):
-        self.root = Path(root).resolve()
+        lexical_root = Path(root).resolve()
+        self.root = (
+            self._darwin_existing_descriptor_path(
+                lexical_root,
+                require_directory=True,
+                purpose="filesystem adapter root",
+            )
+            if sys.platform == "darwin"
+            else lexical_root
+        )
+        self._darwin_volume_policy = (
+            _optional_darwin_volume_identity_policy(self.root)
+            if sys.platform == "darwin"
+            else None
+        )
         self.namespace = namespace
         self.root_display = str(self.root)
         self._path_lock = HierarchicalPathLock()
@@ -287,33 +483,180 @@ class LocalFilesystemProvider:
     def resolve(self, path: Any) -> ResolvedPath:
         raw = Path(path)
         candidate = raw if raw.is_absolute() else self.root / raw
-        # Resource derivation runs before capability authorization.  Keep this
-        # step purely lexical: Path.resolve() would touch the host filesystem,
-        # follow symlinks, and expose their canonical target before the caller
-        # has any read authority.  Provider sinks call _target() after
-        # authorization; that method performs real-path containment and rejects
-        # symlink/junction components on the original lexical path.
+        # Resource derivation runs before capability authorization. Most Hosts
+        # keep this step purely lexical. Darwin's default filesystems can map
+        # several case/Unicode spellings to one directory entry, however, so a
+        # lexical resource would let the same file acquire several authority
+        # and data-label identities. F_GETPATH exposes only descriptor identity
+        # and the Host-stored spelling; it does not read file content. Existing
+        # paths (or the nearest existing parent of a create) are canonicalized
+        # before deriving every downstream resource/lock/label key.
         target = Path(os.path.abspath(os.path.normpath(os.fspath(candidate))))
+        if sys.platform == "darwin":
+            try:
+                target.relative_to(self.root)
+            except ValueError as exc:
+                raise CapabilityDenied(f"path escapes filesystem adapter root: {path}") from exc
+            try:
+                self._reject_reparse_components(target)
+            except CapabilityDenied:
+                # Preserve the lexical identity for a reparse path. Following
+                # it here would reveal the target before authorization. The
+                # provider sink repeats this check after authorization and
+                # rejects the operation without traversing the component.
+                pass
+            else:
+                target = self._darwin_canonical_path(target)
         try:
             relative_path = target.relative_to(self.root)
         except ValueError as exc:
-            raise CapabilityDenied(f"path escapes filesystem adapter root: {path}")
+            raise CapabilityDenied(f"path escapes filesystem adapter root: {path}") from exc
         relative = relative_path.as_posix()
         return ResolvedPath(relative=relative, display=str(target), is_root=target == self.root)
+
+    @staticmethod
+    def _darwin_existing_descriptor_path(
+        path: Path,
+        *,
+        require_directory: bool,
+        purpose: str,
+    ) -> Path:
+        """Return Darwin's stored path spelling for one descriptor identity.
+
+        F_GETPATH is the only supported canonicalization mechanism here. A
+        lexical/case-fold fallback would merge distinct names on case-sensitive
+        volumes, while realpath-style fallback could follow a path that changed
+        between identity derivation and authorization.
+        """
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if require_directory:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        try:
+            fd = os.open(path, flags)
+        except (FileNotFoundError, NotADirectoryError):
+            raise
+        except OSError as exc:
+            raise CapabilityDenied(f"cannot canonicalize {purpose} identity") from exc
+        try:
+            descriptor_stat = os.fstat(fd)
+            if require_directory and not stat.S_ISDIR(descriptor_stat.st_mode):
+                raise CapabilityDenied(f"{purpose} is not a directory")
+            try:
+                import fcntl
+
+                encoded = fcntl.fcntl(
+                    fd,
+                    _DARWIN_F_GETPATH,
+                    b"\0" * _DARWIN_F_GETPATH_BUFFER_BYTES,
+                )
+            except (ImportError, OSError, TypeError, ValueError) as exc:
+                raise CapabilityDenied(f"cannot canonicalize {purpose} identity") from exc
+            if not isinstance(encoded, bytes):
+                raise CapabilityDenied(f"cannot canonicalize {purpose} identity")
+            raw_path = encoded.split(b"\0", 1)[0]
+            if not raw_path:
+                raise CapabilityDenied(f"cannot canonicalize {purpose} identity")
+            canonical = Path(os.fsdecode(raw_path))
+            if not canonical.is_absolute():
+                raise CapabilityDenied(f"cannot canonicalize {purpose} identity")
+            try:
+                path_stat = os.stat(canonical, follow_symlinks=False)
+            except OSError as exc:
+                raise CapabilityDenied(f"cannot verify {purpose} identity") from exc
+            if stat.S_ISLNK(path_stat.st_mode) or (
+                descriptor_stat.st_dev,
+                descriptor_stat.st_ino,
+            ) != (path_stat.st_dev, path_stat.st_ino):
+                raise CapabilityDenied(f"cannot verify {purpose} identity")
+            return Path(os.path.abspath(os.path.normpath(os.fspath(canonical))))
+        finally:
+            os.close(fd)
+
+    def _darwin_canonical_path(self, target: Path) -> Path:
+        current = target
+        missing_parts: list[str] = []
+        while True:
+            try:
+                canonical = self._darwin_existing_descriptor_path(
+                    current,
+                    require_directory=bool(missing_parts),
+                    purpose="filesystem path",
+                )
+                break
+            except (FileNotFoundError, NotADirectoryError):
+                parent = current.parent
+                if parent == current:
+                    raise CapabilityDenied(
+                        "cannot canonicalize filesystem path identity"
+                    )
+                missing_parts.append(current.name)
+                current = parent
+
+        future_policy = (
+            _darwin_volume_identity_policy(canonical)
+            if missing_parts
+            else self._darwin_volume_policy
+        )
+        for part in reversed(missing_parts):
+            canonical = canonical / self._darwin_future_component(
+                part,
+                policy=future_policy,
+            )
+        canonical = Path(os.path.abspath(os.path.normpath(os.fspath(canonical))))
+        try:
+            canonical.relative_to(self.root)
+        except ValueError as exc:
+            raise CapabilityDenied(
+                f"path escapes filesystem adapter root: {target}"
+            ) from exc
+        return canonical
+
+    def _darwin_future_component(
+        self,
+        component: str,
+        *,
+        policy: _DarwinVolumeIdentityPolicy | None,
+    ) -> str:
+        if policy is None:
+            raise CapabilityDenied(
+                "Darwin volume path identity policy is unavailable"
+            )
+        if not policy.case_preserving:
+            raise CapabilityDenied(
+                "cannot derive a stable future path spelling on a "
+                "non-case-preserving Darwin volume"
+            )
+        if policy.normalization_insensitive:
+            selected = unicodedata.normalize("NFC", component)
+        elif component.isascii():
+            selected = component
+        else:
+            raise CapabilityDenied(
+                "cannot derive a safe non-ASCII future path identity on "
+                f"Darwin filesystem {policy.filesystem_type}"
+            )
+        if not policy.case_sensitive:
+            folded_parts: list[str] = []
+            for character in selected:
+                if character.isascii():
+                    folded_parts.append(character.lower())
+                elif character.casefold() == character:
+                    folded_parts.append(character)
+                else:
+                    raise CapabilityDenied(
+                        "cannot derive a safe non-ASCII case-insensitive "
+                        "future path identity"
+                    )
+            selected = "".join(folded_parts)
+        if selected in {"", ".", ".."} or "/" in selected or "\0" in selected:
+            raise CapabilityDenied("invalid canonical future path component")
+        return selected
 
     def state(self, path: ResolvedPath) -> PathState:
         with self._path_lock.hold(path.relative):
             target = self._target(path)
-            if not target.exists():
-                return PathState(exists=False, kind="missing")
-            stat = target.stat()
-            kind = "file" if target.is_file() else "directory" if target.is_dir() else "other"
-            return PathState(
-                exists=True,
-                kind=kind,
-                size_bytes=stat.st_size if target.is_file() else None,
-                modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-            )
+            return self._state_under_root(target)
 
     def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
         with self._path_lock.hold(path.relative):
@@ -334,14 +677,77 @@ class LocalFilesystemProvider:
         *,
         overwrite: bool = True,
     ) -> None:
+        self._write_text(
+            path,
+            text,
+            encoding,
+            newline,
+            overwrite=overwrite,
+            expected_content_sha256=None,
+        )
+
+    def write_text_compare_and_swap(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None = "\n",
+        *,
+        overwrite: bool = True,
+        expected_content_sha256: str,
+    ) -> None:
+        self._write_text(
+            path,
+            text,
+            encoding,
+            newline,
+            overwrite=overwrite,
+            expected_content_sha256=expected_content_sha256,
+        )
+
+    def _write_text(
+        self,
+        path: ResolvedPath,
+        text: str,
+        encoding: str,
+        newline: str | None,
+        *,
+        overwrite: bool,
+        expected_content_sha256: str | None,
+    ) -> None:
+        self._validate_expected_content_sha256(expected_content_sha256)
         with self._path_lock.hold(HierarchicalPathLock.creation_scope(path.relative)):
             target = self._target(path)
+            if expected_content_sha256 is not None:
+                initial = self._content_snapshot_under_root(target)
+                self._require_expected_content(
+                    initial,
+                    expected_content_sha256,
+                    target=target,
+                )
             self._before_path_sink_checked("write_parent", target.parent)
             self._ensure_parent_dirs_under_root(target)
             target = self._target(path)
             self._before_path_sink("write_text", target)
             target = self._target(path)
-            with self._open_write_file(target, encoding=encoding, newline=newline, overwrite=overwrite) as handle:
+            expected_snapshot = None
+            expected_missing = False
+            if expected_content_sha256 is not None:
+                expected_snapshot = self._content_snapshot_under_root(target)
+                self._require_expected_content(
+                    expected_snapshot,
+                    expected_content_sha256,
+                    target=target,
+                )
+                expected_missing = expected_content_sha256 == "missing"
+            with self._open_write_file(
+                target,
+                encoding=encoding,
+                newline=newline,
+                overwrite=overwrite,
+                expected_snapshot=expected_snapshot,
+                expected_missing=expected_missing,
+            ) as handle:
                 handle.write(text)
             self._target(path)
 
@@ -427,7 +833,11 @@ class LocalFilesystemProvider:
         raise ValueError(f"unsupported filesystem external effect operation: {operation}")
 
     def _target(self, path: ResolvedPath) -> Path:
-        target = Path(path.display)
+        # `relative` is the provider-issued authority identity. Reconstruct the
+        # sink path from it instead of trusting a caller-controlled display
+        # string, and keep Darwin case/Unicode aliases pinned to the spelling
+        # used for capability and data-label settlement.
+        target = self.root / path.relative
         resolved = target.resolve()
         if self.root not in resolved.parents and resolved != self.root:
             raise CapabilityDenied(f"path escapes filesystem adapter root: {path.relative}")
@@ -465,15 +875,53 @@ class LocalFilesystemProvider:
             os.close(fd)
             raise
 
-    def _open_write_file(self, target: Path, *, encoding: str, newline: str | None, overwrite: bool) -> Any:
+    def _open_write_file(
+        self,
+        target: Path,
+        *,
+        encoding: str,
+        newline: str | None,
+        overwrite: bool,
+        expected_snapshot: _FilesystemContentSnapshot | None = None,
+        expected_missing: bool = False,
+    ) -> Any:
         try:
-            fd = self._open_under_root(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            if expected_snapshot is not None:
+                if not overwrite:
+                    raise ValidationError(
+                        "filesystem CAS overwrite of existing content requires overwrite=true"
+                    )
+                fd = self._open_under_root(target, os.O_WRONLY)
+            else:
+                fd = self._open_under_root(
+                    target,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                )
         except FileExistsError:
+            if expected_missing:
+                raise FilesystemContentConflict(
+                    "filesystem content changed before compare-and-swap write"
+                ) from None
             if not overwrite:
                 raise
             fd = self._open_under_root(target, os.O_WRONLY)
+        except FileNotFoundError:
+            if expected_snapshot is not None:
+                raise FilesystemContentConflict(
+                    "filesystem content changed before compare-and-swap write"
+                ) from None
+            raise
         try:
             self._validate_open_regular_file(fd, target)
+            if expected_snapshot is not None:
+                observed = self._snapshot_from_stat(
+                    expected_snapshot.sha256,
+                    os.fstat(fd),
+                )
+                if observed != expected_snapshot:
+                    raise FilesystemContentConflict(
+                        "filesystem content changed before compare-and-swap write"
+                    )
             os.ftruncate(fd, 0)
             return os.fdopen(fd, "w", encoding=encoding, newline=newline)
         except Exception:
@@ -496,6 +944,90 @@ class LocalFilesystemProvider:
         finally:
             with contextlib.suppress(OSError):
                 os.close(dir_fd)
+
+    def _state_under_root(self, target: Path) -> PathState:
+        if self._supports_dir_fd_state():
+            return self._state_under_root_dir_fd(target)
+        if os.name == "nt":
+            return self._state_under_root_windows(target)
+        raise CapabilityDenied(
+            "filesystem state requires descriptor-bound path inspection"
+        )
+
+    def _state_under_root_dir_fd(self, target: Path) -> PathState:
+        parts = self._relative_parts(target)
+        if not parts:
+            root_fd = self._open_root_dir_fd()
+            try:
+                self._before_path_sink_checked("state", target)
+                return self._path_state_from_stat(os.fstat(root_fd))
+            finally:
+                os.close(root_fd)
+
+        try:
+            parent_fd, name = self._open_parent_dir_fd(target)
+        except FileNotFoundError:
+            return PathState(exists=False, kind="missing")
+        try:
+            self._before_path_sink_checked("state", target)
+            try:
+                observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return PathState(exists=False, kind="missing")
+            if stat.S_ISLNK(observed.st_mode):
+                raise CapabilityDenied(
+                    f"filesystem path contains a symlink or junction: {target}"
+                )
+            return self._path_state_from_stat(observed)
+        finally:
+            os.close(parent_fd)
+
+    def _state_under_root_windows(self, target: Path) -> PathState:
+        guard = (
+            self._windows_directory_guard(target)
+            if target == self.root
+            else self._windows_parent_directory_guard(target)
+        )
+        if guard is None:
+            raise CapabilityDenied(
+                "filesystem state requires a guarded Windows path"
+            )
+        try:
+            self._before_path_sink_checked("state", target)
+            try:
+                observed = target.lstat()
+            except FileNotFoundError:
+                return PathState(exists=False, kind="missing")
+            file_attributes = int(getattr(observed, "st_file_attributes", 0))
+            reparse_attribute = int(
+                getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+            )
+            if stat.S_ISLNK(observed.st_mode) or file_attributes & reparse_attribute:
+                raise CapabilityDenied(
+                    f"filesystem path contains a symlink or junction: {target}"
+                )
+            return self._path_state_from_stat(observed)
+        finally:
+            guard.close()
+
+    @staticmethod
+    def _path_state_from_stat(observed: os.stat_result) -> PathState:
+        kind = (
+            "file"
+            if stat.S_ISREG(observed.st_mode)
+            else "directory"
+            if stat.S_ISDIR(observed.st_mode)
+            else "other"
+        )
+        return PathState(
+            exists=True,
+            kind=kind,
+            size_bytes=observed.st_size if kind == "file" else None,
+            modified_at=datetime.fromtimestamp(
+                observed.st_mtime,
+                timezone.utc,
+            ).isoformat(),
+        )
 
     def _delete_file_under_root(self, path: ResolvedPath, target: Path) -> None:
         if self._supports_dir_fd_deletes():
@@ -795,6 +1327,14 @@ class LocalFilesystemProvider:
             and os.listdir in os.supports_fd
         )
 
+    @staticmethod
+    def _supports_dir_fd_state() -> bool:
+        return (
+            os.open in os.supports_dir_fd
+            and os.stat in os.supports_dir_fd
+            and os.stat in os.supports_follow_symlinks
+        )
+
     def _open_parent_dir_fd(self, target: Path) -> tuple[int, str]:
         parts = self._relative_parts(target)
         if not parts:
@@ -817,7 +1357,7 @@ class LocalFilesystemProvider:
             and os.stat in os.supports_dir_fd
         )
         if require_list:
-            supported = supported and os.listdir in os.supports_fd
+            supported = supported and os.scandir in os.supports_fd
         return supported
 
     def _ensure_parent_dirs_under_root(self, target: Path) -> None:
@@ -892,10 +1432,22 @@ class LocalFilesystemProvider:
     def _list_directory_under_root(self, target: Path, *, limit: int | None) -> list[DirectoryEntrySnapshot]:
         if not self._supports_dir_fd_directory_ops(require_list=True):
             return self._fallback_list_directory(target, limit=limit)
+        selected_limit, reject_overflow = self._directory_scan_limit(limit)
         dir_fd = self._open_directory_under_root(target)
         try:
-            names = os.listdir(dir_fd)
-            selected_names = heapq.nsmallest(limit, names) if limit is not None and limit > 0 else sorted(names)
+            with os.scandir(dir_fd) as iterator:
+                names = [
+                    entry.name
+                    for entry in islice(
+                        iterator,
+                        selected_limit + (1 if reject_overflow else 0),
+                    )
+                ]
+            if reject_overflow and len(names) > selected_limit:
+                raise ValidationError(
+                    "filesystem directory exceeds the bounded provider listing limit"
+                )
+            selected_names = sorted(names)
             entries: list[DirectoryEntrySnapshot] = []
             for name in selected_names:
                 stat_result = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -983,6 +1535,7 @@ class LocalFilesystemProvider:
                 guard.close()
 
     def _fallback_list_directory(self, target: Path, *, limit: int | None) -> list[DirectoryEntrySnapshot]:
+        selected_limit, reject_overflow = self._directory_scan_limit(limit)
         guard = _WindowsDirectoryGuard.open(target) if os.name == "nt" else None
         try:
             if guard is None:
@@ -993,10 +1546,19 @@ class LocalFilesystemProvider:
                 raise CapabilityDenied(f"filesystem directory path changed during validation: {target}")
             if self.root not in opened.parents and opened != self.root:
                 raise CapabilityDenied(f"filesystem directory path escapes adapter root: {target}")
-            if limit is not None and limit > 0:
-                children = heapq.nsmallest(limit, target.iterdir(), key=lambda item: item.name)
-            else:
-                children = sorted(target.iterdir(), key=lambda item: item.name)
+            with os.scandir(target) as iterator:
+                children = [
+                    Path(entry.path)
+                    for entry in islice(
+                        iterator,
+                        selected_limit + (1 if reject_overflow else 0),
+                    )
+                ]
+            if reject_overflow and len(children) > selected_limit:
+                raise ValidationError(
+                    "filesystem directory exceeds the bounded provider listing limit"
+                )
+            children.sort(key=lambda item: item.name)
             return [self._directory_entry(child) for child in children]
         finally:
             if guard is not None:
@@ -1135,6 +1697,79 @@ class LocalFilesystemProvider:
         if stat_result.st_nlink > 1:
             raise CapabilityDenied(f"filesystem path is a hard link with multiple names: {target}")
 
+    @staticmethod
+    def _validate_expected_content_sha256(value: str | None) -> None:
+        if value is None or value == "missing":
+            return
+        if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValidationError(
+                "expected_content_sha256 must be 'missing' or 64 lowercase hexadecimal characters"
+            )
+
+    def _content_snapshot_under_root(
+        self,
+        target: Path,
+    ) -> _FilesystemContentSnapshot | None:
+        try:
+            handle = self._open_existing_file(target, os.O_RDONLY)
+        except FileNotFoundError:
+            return None
+        with handle:
+            before = os.fstat(handle.fileno())
+            digest = hashlib.sha256()
+            while True:
+                chunk = handle.read(64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+            before_snapshot = self._snapshot_from_stat(digest.hexdigest(), before)
+            after_snapshot = self._snapshot_from_stat(digest.hexdigest(), after)
+            if before_snapshot != after_snapshot:
+                raise FilesystemContentConflict(
+                    "filesystem content changed while computing compare-and-swap identity"
+                )
+            return after_snapshot
+
+    @staticmethod
+    def _snapshot_from_stat(
+        sha256: str,
+        observed: os.stat_result,
+    ) -> _FilesystemContentSnapshot:
+        return _FilesystemContentSnapshot(
+            sha256=sha256,
+            device=int(observed.st_dev),
+            inode=int(observed.st_ino),
+            size=int(observed.st_size),
+            modified_ns=int(observed.st_mtime_ns),
+            changed_ns=int(observed.st_ctime_ns),
+        )
+
+    @staticmethod
+    def _require_expected_content(
+        snapshot: _FilesystemContentSnapshot | None,
+        expected: str,
+        *,
+        target: Path,
+    ) -> None:
+        matches = (
+            snapshot is None
+            if expected == "missing"
+            else snapshot is not None and snapshot.sha256 == expected
+        )
+        if not matches:
+            raise FilesystemContentConflict(
+                f"filesystem content compare-and-swap conflict: {target}"
+            )
+
+    @staticmethod
+    def _directory_scan_limit(limit: int | None) -> tuple[int, bool]:
+        if limit is None:
+            return int(_TOOL_DEFAULTS.directory_entry_hard_limit), True
+        if isinstance(limit, bool) or type(limit) is not int or limit <= 0:
+            raise ValidationError("filesystem provider listing limit must be positive")
+        return limit, False
+
     def _require_existing_single_link_file(self, target: Path, *, allow_missing: bool = False) -> None:
         try:
             stat_result = target.lstat()
@@ -1214,6 +1849,81 @@ class LocalClockProvider:
         raise ValueError(f"unsupported clock external effect operation: {operation}")
 
 
+class _BoundedUnicodePipeCapture:
+    """Drain one subprocess pipe while retaining at most ``limit`` characters."""
+
+    _READ_BYTES = 4_096
+
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        limit: int,
+        overflow_event: threading.Event,
+    ) -> None:
+        self.stream = stream
+        self.limit = limit
+        self.overflow_event = overflow_event
+        self.chunks: list[str] = []
+        self.characters = 0
+        self.truncated = False
+        self.error: BaseException | None = None
+
+    @property
+    def text(self) -> str:
+        return "".join(self.chunks)
+
+    def run(self) -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            while True:
+                chunk = os.read(self.stream.fileno(), self._READ_BYTES)
+                if not chunk:
+                    self._append(decoder.decode(b"", final=True))
+                    return
+                if not self._append(decoder.decode(chunk, final=False)):
+                    return
+        except BaseException as exc:
+            self.error = exc
+            self.overflow_event.set()
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                self.stream.close()
+
+    def _append(self, value: str) -> bool:
+        if not value:
+            return True
+        remaining = self.limit - self.characters
+        if len(value) > remaining:
+            if remaining > 0:
+                self.chunks.append(value[:remaining])
+                self.characters += remaining
+            self.truncated = True
+            self.overflow_event.set()
+            return False
+        self.chunks.append(value)
+        self.characters += len(value)
+        return True
+
+
+@dataclass
+class _ShellProcessExecution:
+    proc: subprocess.Popen[bytes]
+    job: WindowsJobObject | None
+    ps_process: psutil.Process | None
+    stdout_capture: _BoundedUnicodePipeCapture
+    stderr_capture: _BoundedUnicodePipeCapture
+    capture_event: threading.Event
+    capture_threads: tuple[threading.Thread, threading.Thread]
+    require_complete_metrics: bool
+    started_at: float
+    peak_memory: int = 0
+    cpu_seconds: float = 0.0
+    limit_kind: str | None = None
+    timed_out: bool = False
+    cleanup_failed: bool = False
+
+
 class LocalShellProvider:
     """Subprocess-backed shell provider scoped to a configured working directory."""
 
@@ -1268,173 +1978,358 @@ class LocalShellProvider:
             stdout_limit_chars,
             stderr_limit_chars,
         )
+        checked_argv, popen_executable = self._prepare_shell_dispatch_argv(
+            argv,
+            selected_cwd,
+            executable_snapshot,
+        )
+        return self._execute_shell_process(
+            argv=argv,
+            checked_argv=checked_argv,
+            popen_executable=popen_executable,
+            selected_cwd=selected_cwd,
+            timeout=timeout,
+            limits=limits,
+            stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit,
+        )
+
+    def _prepare_shell_dispatch_argv(
+        self,
+        argv: list[str],
+        selected_cwd: Path,
+        executable_snapshot: ExecutableSnapshot | None,
+    ) -> tuple[list[str], str | None]:
         requested_argv0 = argv[0] if argv else None
         checked_argv = self._resolve_argv0(argv, selected_cwd)
         popen_executable: str | None = None
-        if executable_snapshot is not None:
-            executable_snapshot.verify()
-            if executable_snapshot.source_path != Path(checked_argv[0]).resolve(
-                strict=False
-            ):
-                raise ValidationError(
-                    "shell executable snapshot does not match resolved argv[0]"
-                )
-            if os.name == "nt":
-                checked_argv = [
-                    str(executable_snapshot.executable_path),
-                    *checked_argv[1:],
-                ]
-            else:
-                # The executable parameter selects the pinned bytes, while
-                # argv[0] retains the caller's invocation spelling. Launchers
-                # such as .venv/bin/python use that spelling to locate
-                # pyvenv.cfg; replacing it with the symlink-resolved base
-                # interpreter silently drops the virtual environment.
-                popen_executable = str(executable_snapshot.executable_path)
-                if requested_argv0 is not None:
-                    checked_argv = [requested_argv0, *checked_argv[1:]]
+        if executable_snapshot is None:
+            return checked_argv, popen_executable
+        executable_snapshot.verify()
+        if executable_snapshot.source_path != Path(checked_argv[0]).resolve(
+            strict=False
+        ):
+            raise ValidationError(
+                "shell executable snapshot does not match resolved argv[0]"
+            )
+        if os.name == "nt":
+            return [
+                str(executable_snapshot.executable_path),
+                *checked_argv[1:],
+            ], None
+        # Select pinned executable bytes while retaining the invocation argv[0]
+        # used by virtual-environment launchers to locate pyvenv.cfg.
+        popen_executable = str(executable_snapshot.executable_path)
+        if requested_argv0 is not None:
+            checked_argv = [requested_argv0, *checked_argv[1:]]
+        return checked_argv, popen_executable
+
+    def _execute_shell_process(
+        self,
+        *,
+        argv: list[str],
+        checked_argv: list[str],
+        popen_executable: str | None,
+        selected_cwd: Path,
+        timeout: float,
+        limits: SubprocessLimits | None,
+        stdout_limit: int,
+        stderr_limit: int,
+    ) -> CommandResult:
         started_at = time.monotonic()
-        with tempfile.TemporaryFile("w+b") as stdout_file, tempfile.TemporaryFile("w+b") as stderr_file:
-            job = self._windows_job_for_run(limits)
-            try:
-                proc = subprocess.Popen(
-                    checked_argv,
-                    executable=popen_executable,
-                    cwd=selected_cwd,
-                    env=self._safe_env(),
-                    shell=False,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    **self._process_group_kwargs(),
+        execution = self._launch_shell_process(
+            checked_argv=checked_argv,
+            popen_executable=popen_executable,
+            selected_cwd=selected_cwd,
+            limits=limits,
+            stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit,
+            started_at=started_at,
+        )
+        try:
+            self._supervise_shell_process(
+                execution,
+                timeout=timeout,
+                limits=limits,
+            )
+        finally:
+            execution.cleanup_failed = self._cleanup_shell_process(execution)
+        return self._finish_shell_execution(execution, argv=argv, timeout=timeout)
+
+    def _launch_shell_process(
+        self,
+        *,
+        checked_argv: list[str],
+        popen_executable: str | None,
+        selected_cwd: Path,
+        limits: SubprocessLimits | None,
+        stdout_limit: int,
+        stderr_limit: int,
+        started_at: float,
+    ) -> _ShellProcessExecution:
+        job = self._windows_job_for_run(limits)
+        proc: subprocess.Popen[bytes] | None = None
+        ps_proc: psutil.Process | None = None
+        capture_threads: tuple[threading.Thread, ...] = ()
+        require_complete_metrics = bool(
+            limits is not None
+            and (limits.cpu_seconds is not None or limits.memory_bytes is not None)
+        )
+        try:
+            proc = subprocess.Popen(
+                checked_argv,
+                executable=popen_executable,
+                cwd=selected_cwd,
+                env=self._safe_env(),
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **self._process_group_kwargs(),
+            )
+            job = self._attach_shell_job(job, proc, limits=limits)
+            ps_proc = self._shell_ps_process(
+                proc,
+                require_complete=require_complete_metrics,
+            )
+            assert proc.stdout is not None and proc.stderr is not None
+            capture_event = threading.Event()
+            stdout_capture = _BoundedUnicodePipeCapture(
+                proc.stdout,
+                limit=stdout_limit,
+                overflow_event=capture_event,
+            )
+            stderr_capture = _BoundedUnicodePipeCapture(
+                proc.stderr,
+                limit=stderr_limit,
+                overflow_event=capture_event,
+            )
+            capture_threads = (
+                threading.Thread(
+                    target=stdout_capture.run,
+                    name=f"agent-libos-shell-stdout-{proc.pid}",
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=stderr_capture.run,
+                    name=f"agent-libos-shell-stderr-{proc.pid}",
+                    daemon=True,
+                ),
+            )
+            for thread in capture_threads:
+                thread.start()
+            return _ShellProcessExecution(
+                proc=proc,
+                job=job,
+                ps_process=ps_proc,
+                stdout_capture=stdout_capture,
+                stderr_capture=stderr_capture,
+                capture_event=capture_event,
+                capture_threads=capture_threads,
+                require_complete_metrics=require_complete_metrics,
+                started_at=started_at,
+            )
+        except BaseException:
+            if proc is not None:
+                self._cleanup_shell_process_parts(
+                    proc,
+                    ps_process=ps_proc,
+                    job=job,
+                    capture_threads=capture_threads,
                 )
-            except Exception:
-                if job is not None:
-                    job.close()
-                raise
-            try:
-                if job is not None:
-                    job.assign(proc)
-            except OSError as exc:
+            elif job is not None:
                 job.close()
-                if limits is not None:
-                    with contextlib.suppress(Exception):
-                        proc.kill()
-                    with contextlib.suppress(Exception):
-                        proc.wait(timeout=1.0)
-                    raise ValidationError("shell provider could not attach Windows Job Object for budgeted execution") from exc
-                job = None
-            require_complete_metrics = bool(
-                limits is not None
-                and (limits.cpu_seconds is not None or limits.memory_bytes is not None)
-            )
-            ps_proc: psutil.Process | None = None
-            try:
-                ps_proc = psutil.Process(proc.pid)
-            except (psutil.Error, OSError) as exc:
-                if require_complete_metrics:
-                    self._kill_process_tree(None, proc)
-                    with contextlib.suppress(Exception):
-                        proc.wait(timeout=1.0)
-                    if job is not None:
-                        job.close()
-                    raise ValidationError(
-                        "shell provider cannot enforce CPU/memory SubprocessLimits because process metrics are unavailable"
-                    ) from exc
-            except Exception:
-                if job is not None:
-                    job.close()
-                self._kill_process_tree(None, proc)
-                with contextlib.suppress(Exception):
-                    proc.wait(timeout=1.0)
-                raise
-            peak_memory = 0
-            cpu_seconds = 0.0
-            limit_kind: str | None = None
-            timed_out = False
-            try:
-                while True:
-                    wall_seconds = time.monotonic() - started_at
-                    if ps_proc is not None:
-                        cpu_seconds, peak_memory = self._sample_process_tree(
-                            ps_proc,
-                            peak_memory,
-                            require_complete=require_complete_metrics,
-                        )
-                    limit_kind = self._limit_kind(
-                        wall_seconds=wall_seconds,
-                        cpu_seconds=cpu_seconds,
-                        peak_memory=peak_memory,
-                        limits=limits,
-                    )
-                    if limit_kind is None:
-                        limit_kind = self._output_limit_kind(stdout_file, stderr_file, stdout_limit, stderr_limit)
-                    if limit_kind is not None:
-                        self._kill_process_tree(ps_proc, proc)
-                        try:
-                            proc.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            pass
-                        break
-                    if timeout is not None and wall_seconds > timeout:
-                        timed_out = True
-                        self._kill_process_tree(ps_proc, proc)
-                        try:
-                            proc.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            pass
-                        break
-                    if proc.poll() is not None:
-                        self._terminate_process_group(proc)
-                        break
-                    time.sleep(0.02)
-            finally:
-                if proc.poll() is None:
-                    self._kill_process_tree(ps_proc, proc)
-                    try:
-                        proc.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        pass
-                if job is not None:
-                    job.close()
-            stdout, stdout_truncated = self._read_limited_output(stdout_file, stdout_limit)
-            stderr, stderr_truncated = self._read_limited_output(stderr_file, stderr_limit)
-            wall_seconds = time.monotonic() - started_at
-            if ps_proc is not None:
-                final_cpu_seconds, peak_memory = self._sample_process_tree(
-                    ps_proc,
-                    peak_memory,
-                    require_complete=require_complete_metrics,
+            raise
+
+    @staticmethod
+    def _attach_shell_job(
+        job: WindowsJobObject | None,
+        proc: subprocess.Popen[bytes],
+        *,
+        limits: SubprocessLimits | None,
+    ) -> WindowsJobObject | None:
+        if job is None:
+            return None
+        try:
+            job.assign(proc)
+        except OSError as exc:
+            job.close()
+            if limits is not None:
+                raise ValidationError(
+                    "shell provider could not attach Windows Job Object for budgeted execution"
+                ) from exc
+            return None
+        return job
+
+    @staticmethod
+    def _shell_ps_process(
+        proc: subprocess.Popen[bytes],
+        *,
+        require_complete: bool,
+    ) -> psutil.Process | None:
+        try:
+            return psutil.Process(proc.pid)
+        except (psutil.Error, OSError) as exc:
+            if require_complete:
+                raise ValidationError(
+                    "shell provider cannot enforce CPU/memory SubprocessLimits because process metrics are unavailable"
+                ) from exc
+            return None
+
+    def _supervise_shell_process(
+        self,
+        execution: _ShellProcessExecution,
+        *,
+        timeout: float,
+        limits: SubprocessLimits | None,
+    ) -> None:
+        while True:
+            wall_seconds = time.monotonic() - execution.started_at
+            if execution.ps_process is not None:
+                execution.cpu_seconds, execution.peak_memory = self._sample_process_tree(
+                    execution.ps_process,
+                    execution.peak_memory,
+                    require_complete=execution.require_complete_metrics,
                 )
-                cpu_seconds = max(cpu_seconds, final_cpu_seconds)
-            metrics = CommandMetrics(
+            execution.limit_kind = self._limit_kind(
                 wall_seconds=wall_seconds,
-                cpu_seconds=cpu_seconds,
-                peak_memory_bytes=peak_memory,
-                killed=timed_out or limit_kind is not None,
-                limit_kind="subprocess_timeout" if timed_out else limit_kind,
+                cpu_seconds=execution.cpu_seconds,
+                peak_memory=execution.peak_memory,
+                limits=limits,
+            ) or self._shell_capture_limit_kind(execution)
+            if execution.limit_kind is not None or self._shell_capture_error(execution):
+                self._stop_shell_process(execution)
+                return
+            if timeout is not None and wall_seconds > timeout:
+                execution.timed_out = True
+                self._stop_shell_process(execution)
+                return
+            if execution.proc.poll() is not None:
+                self._terminate_process_group(execution.proc)
+                return
+            execution.capture_event.wait(0.02)
+
+    @staticmethod
+    def _shell_capture_limit_kind(
+        execution: _ShellProcessExecution,
+    ) -> str | None:
+        if execution.stdout_capture.truncated:
+            return "subprocess_stdout_chars"
+        if execution.stderr_capture.truncated:
+            return "subprocess_stderr_chars"
+        return None
+
+    @staticmethod
+    def _shell_capture_error(execution: _ShellProcessExecution) -> bool:
+        return (
+            execution.stdout_capture.error is not None
+            or execution.stderr_capture.error is not None
+        )
+
+    def _stop_shell_process(self, execution: _ShellProcessExecution) -> None:
+        self._kill_process_tree(execution.ps_process, execution.proc)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            execution.proc.wait(timeout=1.0)
+
+    def _cleanup_shell_process(self, execution: _ShellProcessExecution) -> bool:
+        return self._cleanup_shell_process_parts(
+            execution.proc,
+            ps_process=execution.ps_process,
+            job=execution.job,
+            capture_threads=execution.capture_threads,
+        )
+
+    def _cleanup_shell_process_parts(
+        self,
+        proc: subprocess.Popen[bytes],
+        *,
+        ps_process: psutil.Process | None,
+        job: WindowsJobObject | None,
+        capture_threads: tuple[threading.Thread, ...],
+    ) -> bool:
+        if proc.poll() is None:
+            self._kill_process_tree(ps_process, proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=1.0)
+        for thread in capture_threads:
+            if thread.ident is not None:
+                thread.join(timeout=1.0)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
+        for thread in capture_threads:
+            if thread.ident is not None and thread.is_alive():
+                thread.join(timeout=0.25)
+        if job is not None:
+            job.close()
+        return any(
+            thread.ident is not None and thread.is_alive()
+            for thread in capture_threads
+        )
+
+    def _finish_shell_execution(
+        self,
+        execution: _ShellProcessExecution,
+        *,
+        argv: list[str],
+        timeout: float,
+    ) -> CommandResult:
+        if execution.cleanup_failed:
+            raise RuntimeError("shell output reader did not terminate after process cleanup")
+        for capture in (execution.stdout_capture, execution.stderr_capture):
+            if capture.error is not None:
+                raise capture.error
+        execution.limit_kind = (
+            execution.limit_kind or self._shell_capture_limit_kind(execution)
+        )
+        wall_seconds = time.monotonic() - execution.started_at
+        if execution.ps_process is not None:
+            final_cpu_seconds, execution.peak_memory = self._sample_process_tree(
+                execution.ps_process,
+                execution.peak_memory,
+                require_complete=execution.require_complete_metrics,
             )
-            result = CommandResult(
-                argv=list(argv),
-                returncode=proc.returncode if proc.returncode is not None else -9,
-                stdout=stdout,
-                stderr=stderr,
-                stdout_truncated=stdout_truncated,
-                stderr_truncated=stderr_truncated,
+            execution.cpu_seconds = max(
+                execution.cpu_seconds,
+                final_cpu_seconds,
+            )
+        metrics = CommandMetrics(
+            wall_seconds=wall_seconds,
+            cpu_seconds=execution.cpu_seconds,
+            peak_memory_bytes=execution.peak_memory,
+            killed=execution.timed_out or execution.limit_kind is not None,
+            limit_kind=(
+                "subprocess_timeout"
+                if execution.timed_out
+                else execution.limit_kind
+            ),
+        )
+        result = CommandResult(
+            argv=list(argv),
+            returncode=(
+                execution.proc.returncode
+                if execution.proc.returncode is not None
+                else -9
+            ),
+            stdout=execution.stdout_capture.text,
+            stderr=execution.stderr_capture.text,
+            stdout_truncated=execution.stdout_capture.truncated,
+            stderr_truncated=execution.stderr_capture.truncated,
+            metrics=metrics,
+        )
+        if execution.timed_out:
+            raise SubprocessTimeoutExpired(
+                f"subprocess timed out after {timeout}s",
                 metrics=metrics,
+                result=result,
             )
-            if timed_out:
-                raise SubprocessTimeoutExpired(
-                    f"subprocess timed out after {timeout}s",
-                    metrics=metrics,
-                    result=result,
-                )
-            if limit_kind is not None:
-                raise SubprocessLimitExceeded(
-                    f"subprocess exceeded {limit_kind}",
-                    metrics=metrics,
-                    result=result,
-                )
-            return result
+        if execution.limit_kind is not None:
+            raise SubprocessLimitExceeded(
+                f"subprocess exceeded {execution.limit_kind}",
+                metrics=metrics,
+                result=result,
+            )
+        return result
 
     def _prepare_run_cwd(
         self,
@@ -1582,28 +2477,6 @@ class LocalShellProvider:
 
     def _argv0_has_path(self, value: str) -> bool:
         return "/" in value or "\\" in value or Path(value).is_absolute()
-
-    def _output_limit_kind(
-        self,
-        stdout_file: Any,
-        stderr_file: Any,
-        stdout_limit: int,
-        stderr_limit: int,
-    ) -> str | None:
-        if os.fstat(stdout_file.fileno()).st_size > stdout_limit:
-            return "subprocess_stdout_bytes"
-        if os.fstat(stderr_file.fileno()).st_size > stderr_limit:
-            return "subprocess_stderr_bytes"
-        return None
-
-    def _read_limited_output(self, handle: Any, limit: int) -> tuple[str, bool]:
-        handle.flush()
-        handle.seek(0)
-        data = handle.read(limit + 1)
-        truncated = len(data) > limit
-        if truncated:
-            data = data[:limit]
-        return data.decode("utf-8", errors="replace"), truncated
 
     def _limit_kind(
         self,
@@ -1758,6 +2631,54 @@ class LocalHumanProvider:
         raise ValueError(f"unsupported human external effect operation: {operation}")
 
 
+class _JsonRpcSocketDeadline:
+    """Abort one exact pinned socket when its absolute request deadline passes."""
+
+    def __init__(self, sock: Any, deadline: float) -> None:
+        self.sock = sock
+        self.deadline = deadline
+        self.expired = threading.Event()
+        self._timer: threading.Timer | None = None
+
+    def __enter__(self) -> _JsonRpcSocketDeadline:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            self._expire()
+            raise TimeoutError("JSON-RPC pinned request timed out")
+        timer = threading.Timer(remaining, self._expire)
+        timer.name = f"{_JSONRPC_DEADLINE_THREAD_PREFIX}-{id(self.sock):x}"
+        timer.daemon = True
+        self._timer = timer
+        timer.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        timer = self._timer
+        if timer is None:
+            return
+        timer.cancel()
+        # A cancelled Timer wakes immediately. Joining is deliberate: no
+        # request may return while its watchdog can still close a reused fd.
+        timer.join()
+
+    def require_time_remaining(self) -> None:
+        if not self.expired.is_set() and time.monotonic() < self.deadline:
+            return
+        self._expire()
+        raise TimeoutError("JSON-RPC pinned request timed out")
+
+    def _expire(self) -> None:
+        self.expired.set()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except BaseException:
+            pass
+        try:
+            self.sock.close()
+        except BaseException:
+            pass
+
+
 class HttpJsonRpcProvider:
     """HTTP JSON-RPC client provider used by the default substrate."""
 
@@ -1808,28 +2729,26 @@ class HttpJsonRpcProvider:
         )
         try:
             with opener.open(request, timeout=timeout_s) as response:
+                # Retain one sentinel byte so the primitive can derive the
+                # limit outcome without trusting provider-owned metadata.
                 body = response.read(max_response_bytes + 1)
                 too_large = len(body) > max_response_bytes
-                if too_large:
-                    body = body[:max_response_bytes]
                 return JsonRpcTransportResult(
                     status_code=int(response.status),
                     body=body,
                     elapsed_s=time.monotonic() - started,
-                    response_bytes=len(body),
+                    response_bytes=min(len(body), max_response_bytes),
                     too_large=too_large,
                 )
         except urlerror.HTTPError as exc:
             try:
                 body = exc.read(max_response_bytes + 1)
                 too_large = len(body) > max_response_bytes
-                if too_large:
-                    body = body[:max_response_bytes]
                 return JsonRpcTransportResult(
                     status_code=int(exc.code),
                     body=body,
                     elapsed_s=time.monotonic() - started,
-                    response_bytes=len(body),
+                    response_bytes=min(len(body), max_response_bytes),
                     too_large=too_large,
                     error=str(exc),
                 )
@@ -1876,6 +2795,8 @@ class HttpJsonRpcProvider:
         last_error: str | None = None
         deadline = started + timeout_s
         for address in resolved_addresses:
+            request_dispatch_started = False
+            deadline_guard: _JsonRpcSocketDeadline | None = None
             remaining_timeout = deadline - time.monotonic()
             if remaining_timeout <= 0:
                 last_error = "TimeoutError: JSON-RPC pinned request timed out"
@@ -1888,22 +2809,34 @@ class HttpJsonRpcProvider:
                     scheme=parsed.scheme,
                     timeout_s=remaining_timeout,
                 ) as sock:
-                    sock.sendall(request_head + request_body)
-                    response = http.client.HTTPResponse(sock)
-                    response.begin()
-                    body = response.read(max_response_bytes + 1)
-                    too_large = len(body) > max_response_bytes
-                    if too_large:
-                        body = body[:max_response_bytes]
-                    return JsonRpcTransportResult(
-                        status_code=int(response.status),
-                        body=body,
-                        elapsed_s=time.monotonic() - started,
-                        response_bytes=len(body),
-                        too_large=too_large,
-                    )
+                    deadline_guard = _JsonRpcSocketDeadline(sock, deadline)
+                    with deadline_guard:
+                        handshake = getattr(sock, "do_handshake", None)
+                        if callable(handshake):
+                            handshake()
+                        request_dispatch_started = True
+                        sock.sendall(request_head + request_body)
+                        response = http.client.HTTPResponse(sock)
+                        response.begin()
+                        # Retain one sentinel byte for primitive-side validation.
+                        body = response.read(max_response_bytes + 1)
+                        deadline_guard.require_time_remaining()
+                        too_large = len(body) > max_response_bytes
+                        return JsonRpcTransportResult(
+                            status_code=int(response.status),
+                            body=body,
+                            elapsed_s=time.monotonic() - started,
+                            response_bytes=min(len(body), max_response_bytes),
+                            too_large=too_large,
+                        )
             except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+                last_error = (
+                    "TimeoutError: JSON-RPC pinned request timed out"
+                    if deadline_guard is not None and deadline_guard.expired.is_set()
+                    else f"{type(exc).__name__}: {exc}"
+                )
+                if request_dispatch_started:
+                    break
                 continue
         return JsonRpcTransportResult(
             status_code=None,
@@ -1927,7 +2860,13 @@ class HttpJsonRpcProvider:
         try:
             if scheme == "https":
                 context = ssl.create_default_context()
-                return context.wrap_socket(raw, server_hostname=host)
+                # The caller performs the handshake under the same absolute
+                # socket watchdog as request dispatch and response parsing.
+                return context.wrap_socket(
+                    raw,
+                    server_hostname=host,
+                    do_handshake_on_connect=False,
+                )
             return raw
         except Exception:
             raw.close()
@@ -1985,6 +2924,7 @@ class SdkMcpProvider:
 
     supports_executable_snapshots = True
     supports_runtime_environment_snapshots = True
+    supports_subprocess_limits = True
 
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self.workspace_root = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
@@ -1997,7 +2937,9 @@ class SdkMcpProvider:
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
     ) -> McpToolListResult:
+        deadline = time.monotonic() + timeout_s
         with self._stdio_dispatch_snapshot(
             server,
             executable_snapshot,
@@ -2005,12 +2947,17 @@ class SdkMcpProvider:
         ) as selected_snapshot:
             try:
                 return _run_mcp_async(
-                    self._alist_tools(
-                        server,
-                        timeout_s=timeout_s,
-                        max_response_bytes=max_response_bytes,
-                        executable_snapshot=selected_snapshot,
-                        runtime_environment=runtime_environment,
+                    _mcp_await_with_deadline(
+                        self._alist_tools(
+                            server,
+                            deadline=deadline,
+                            max_response_bytes=max_response_bytes,
+                            executable_snapshot=selected_snapshot,
+                            runtime_environment=runtime_environment,
+                            limits=limits,
+                        ),
+                        deadline=deadline,
+                        stage="tools/list",
                     )
                 )
             except BaseExceptionGroup as exc:
@@ -2027,7 +2974,9 @@ class SdkMcpProvider:
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
     ) -> McpProviderCallResult:
+        deadline = time.monotonic() + timeout_s
         with self._stdio_dispatch_snapshot(
             server,
             executable_snapshot,
@@ -2035,14 +2984,19 @@ class SdkMcpProvider:
         ) as selected_snapshot:
             try:
                 return _run_mcp_async(
-                    self._acall_tool(
-                        server,
-                        tool,
-                        arguments,
-                        timeout_s=timeout_s,
-                        max_response_bytes=max_response_bytes,
-                        executable_snapshot=selected_snapshot,
-                        runtime_environment=runtime_environment,
+                    _mcp_await_with_deadline(
+                        self._acall_tool(
+                            server,
+                            tool,
+                            arguments,
+                            deadline=deadline,
+                            max_response_bytes=max_response_bytes,
+                            executable_snapshot=selected_snapshot,
+                            runtime_environment=runtime_environment,
+                            limits=limits,
+                        ),
+                        deadline=deadline,
+                        stage=f"tools/call {tool.mcp_name}",
                     )
                 )
             except BaseExceptionGroup as exc:
@@ -2059,9 +3013,11 @@ class SdkMcpProvider:
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
     ) -> McpProviderCallResult:
         """Validate and invoke through one MCP session and one wall-clock deadline."""
 
+        deadline = time.monotonic() + timeout_s
         with self._stdio_dispatch_snapshot(
             server,
             executable_snapshot,
@@ -2069,22 +3025,45 @@ class SdkMcpProvider:
         ) as selected_snapshot:
             try:
                 return _run_mcp_async(
-                    asyncio.wait_for(
+                    _mcp_await_with_deadline(
                         self._avalidate_and_call(
                             server,
                             tool,
                             arguments,
-                            timeout_s=timeout_s,
+                            deadline=deadline,
                             max_response_bytes=max_response_bytes,
                             executable_snapshot=selected_snapshot,
                             runtime_environment=runtime_environment,
+                            limits=limits,
                         ),
-                        timeout=timeout_s,
+                        deadline=deadline,
+                        stage=f"validated tools/call {tool.mcp_name}",
                     )
                 )
             except BaseExceptionGroup as exc:
-                self._raise_mcp_transport_limit_error(exc)
+                message = self._mcp_transport_limit_message(exc)
+                if message is not None:
+                    return self._mcp_transport_failure_result(
+                        server,
+                        tool,
+                        arguments,
+                        message=message,
+                        started_at=deadline - timeout_s,
+                        max_response_bytes=max_response_bytes,
+                    )
                 raise
+            except RuntimeError as exc:
+                message = self._mcp_transport_limit_message(exc)
+                if message is None:
+                    raise
+                return self._mcp_transport_failure_result(
+                    server,
+                    tool,
+                    arguments,
+                    message=message,
+                    started_at=deadline - timeout_s,
+                    max_response_bytes=max_response_bytes,
+                )
 
     def resolve_stdio_executable(
         self,
@@ -2192,6 +3171,12 @@ class SdkMcpProvider:
 
     @staticmethod
     def _raise_mcp_transport_limit_error(error: BaseException) -> None:
+        message = SdkMcpProvider._mcp_transport_limit_message(error)
+        if message is not None:
+            raise RuntimeError(message) from error
+
+    @staticmethod
+    def _mcp_transport_limit_message(error: BaseException) -> str | None:
         pending: list[BaseException] = [error]
         seen: set[int] = set()
         while pending:
@@ -2200,40 +3185,100 @@ class SdkMcpProvider:
                 continue
             seen.add(id(current))
             message = str(current)
+            if isinstance(
+                current,
+                (SubprocessLimitExceeded, SubprocessTimeoutExpired),
+            ):
+                return None
             if message.startswith(
                 (
                     "MCP stdio frame exceeded max_response_bytes=",
+                    "MCP stdio stdout exceeded max_output_bytes=",
+                    "MCP stdio stderr exceeded max_output_bytes=",
+                    "MCP stdio request frame exceeded max_request_bytes=",
+                    "MCP stdio stdin exceeded max_output_bytes=",
                     "MCP HTTP response exceeded max_response_bytes=",
                     "MCP HTTP SSE frame exceeded max_response_bytes=",
                     "MCP HTTP response uses unsupported Content-Encoding=",
                 )
             ):
-                raise RuntimeError(message) from error
+                return message
             if isinstance(current, BaseExceptionGroup):
                 pending.extend(current.exceptions)
             if current.__cause__ is not None:
                 pending.append(current.__cause__)
             if current.__context__ is not None:
                 pending.append(current.__context__)
+        return None
+
+    @staticmethod
+    def _mcp_transport_failure_result(
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+        *,
+        message: str,
+        started_at: float,
+        max_response_bytes: int,
+    ) -> McpProviderCallResult:
+        list_request_bytes = len(
+            dumps({"method": "tools/list", "server_id": server.server_id}).encode(
+                "utf-8"
+            )
+        )
+        call_request_bytes = len(
+            dumps({"name": tool.mcp_name, "arguments": arguments}).encode("utf-8")
+        )
+        error_type = "McpTransportLimitError"
+        if message.startswith("MCP stdio frame exceeded"):
+            error_type = "McpStdioFrameTooLarge"
+        elif message.startswith("MCP stdio stdout exceeded"):
+            error_type = "McpStdioStdoutTooLarge"
+        elif message.startswith("MCP stdio stderr exceeded"):
+            error_type = "McpStdioStderrTooLarge"
+        elif message.startswith("MCP HTTP SSE frame exceeded"):
+            error_type = "McpHttpSseFrameTooLarge"
+        elif message.startswith("MCP HTTP response exceeded"):
+            error_type = "McpHttpResponseTooLarge"
+        elif message.startswith("MCP HTTP response uses unsupported Content-Encoding="):
+            error_type = "McpHttpContentEncodingDenied"
+        return McpProviderCallResult(
+            error="bounded MCP transport failure",
+            error_type=error_type,
+            correlation_id=new_id("corr"),
+            response_bytes=max_response_bytes,
+            duration_s=max(0.0, time.monotonic() - started_at),
+            list_request_bytes=list_request_bytes,
+            list_response_bytes=0,
+            call_request_bytes=call_request_bytes,
+            call_response_bytes=max_response_bytes,
+            call_started=True,
+        )
 
     async def _alist_tools(
         self,
         server: McpServerSpec,
         *,
-        timeout_s: float,
+        deadline: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
     ) -> McpToolListResult:
         started = time.monotonic()
         async with self._session(
             server,
-            timeout_s=timeout_s,
+            deadline=deadline,
             max_response_bytes=max_response_bytes,
             executable_snapshot=executable_snapshot,
             runtime_environment=runtime_environment,
+            limits=limits,
         ) as session:
-            result = await asyncio.wait_for(session.list_tools(), timeout=timeout_s)
+            result = await _mcp_await_with_deadline(
+                session.list_tools(),
+                deadline=deadline,
+                stage="tools/list response",
+            )
         tools = [
             McpProviderTool(
                 name=str(getattr(item, "name", "")),
@@ -2259,20 +3304,26 @@ class SdkMcpProvider:
         tool: McpToolSpec,
         arguments: dict[str, Any],
         *,
-        timeout_s: float,
+        deadline: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
     ) -> McpProviderCallResult:
         started = time.monotonic()
         async with self._session(
             server,
-            timeout_s=timeout_s,
+            deadline=deadline,
             max_response_bytes=max_response_bytes,
             executable_snapshot=executable_snapshot,
             runtime_environment=runtime_environment,
+            limits=limits,
         ) as session:
-            result = await asyncio.wait_for(session.call_tool(tool.mcp_name, arguments), timeout=timeout_s)
+            result = await _mcp_await_with_deadline(
+                session.call_tool(tool.mcp_name, arguments),
+                deadline=deadline,
+                stage=f"tools/call response {tool.mcp_name}",
+            )
         content = _jsonable_mcp_value(getattr(result, "content", None))
         structured = _jsonable_mcp_value(_mcp_structured_content(result))
         raw_payload = {"content": content, "structured_content": structured}
@@ -2300,10 +3351,11 @@ class SdkMcpProvider:
         tool: McpToolSpec,
         arguments: dict[str, Any],
         *,
-        timeout_s: float,
+        deadline: float,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
     ) -> McpProviderCallResult:
         started = time.monotonic()
         list_request_bytes = len(
@@ -2314,12 +3366,17 @@ class SdkMcpProvider:
         )
         async with self._session(
             server,
-            timeout_s=timeout_s,
+            deadline=deadline,
             max_response_bytes=max_response_bytes,
             executable_snapshot=executable_snapshot,
             runtime_environment=runtime_environment,
+            limits=limits,
         ) as session:
-            live_result = await session.list_tools()
+            live_result = await _mcp_await_with_deadline(
+                session.list_tools(),
+                deadline=deadline,
+                stage="validated tools/list response",
+            )
             live_tools = [
                 McpProviderTool(
                     name=str(getattr(item, "name", "")),
@@ -2359,7 +3416,11 @@ class SdkMcpProvider:
                     call_request_bytes=call_request_bytes,
                     call_started=False,
                 )
-            result = await session.call_tool(tool.mcp_name, arguments)
+            result = await _mcp_await_with_deadline(
+                session.call_tool(tool.mcp_name, arguments),
+                deadline=deadline,
+                stage=f"validated tools/call response {tool.mcp_name}",
+            )
         content = _jsonable_mcp_value(getattr(result, "content", None))
         structured = _jsonable_mcp_value(_mcp_structured_content(result))
         raw_payload = {"content": content, "structured_content": structured}
@@ -2392,11 +3453,17 @@ class SdkMcpProvider:
         self,
         server: McpServerSpec,
         *,
-        timeout_s: float,
+        deadline: float | None = None,
+        timeout_s: float | None = None,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
     ):
+        if deadline is None:
+            deadline = time.monotonic() + (
+                server.timeout_s if timeout_s is None else timeout_s
+            )
         try:
             from mcp import ClientSession
             from mcp.client.stdio import StdioServerParameters
@@ -2450,10 +3517,17 @@ class SdkMcpProvider:
                 async with _strict_stdio_client(
                     params,
                     max_frame_bytes=max_response_bytes,
+                    max_request_bytes=server.max_request_bytes,
                     cwd_fd=cwd_fd,
+                    deadline=deadline,
+                    limits=limits,
                 ) as (read, write):
                     async with ClientSession(read, write) as session:
-                        await asyncio.wait_for(session.initialize(), timeout=timeout_s)
+                        await _mcp_await_with_deadline(
+                            session.initialize(),
+                            deadline=deadline,
+                            stage="stdio initialize",
+                        )
                         yield session
             return
         if server.transport == "streamable_http":
@@ -2461,16 +3535,21 @@ class SdkMcpProvider:
                 raise RuntimeError("MCP streamable_http transport is missing HTTP configuration")
             async with self._http_client(
                 server,
-                timeout_s=timeout_s,
+                timeout_s=_mcp_remaining_timeout(deadline, stage="HTTP client setup"),
                 max_response_bytes=max_response_bytes,
                 runtime_environment=runtime_environment,
+                deadline=deadline,
             ) as http_client:
                 async with streamable_http_client(
                     server.http.url,
                     http_client=http_client,
                 ) as (read, write, _):
                     async with ClientSession(read, write) as session:
-                        await asyncio.wait_for(session.initialize(), timeout=timeout_s)
+                        await _mcp_await_with_deadline(
+                            session.initialize(),
+                            deadline=deadline,
+                            stage="HTTP initialize",
+                        )
                         yield session
             return
         raise RuntimeError(f"unsupported MCP transport: {server.transport}")
@@ -2483,6 +3562,7 @@ class SdkMcpProvider:
         timeout_s: float,
         max_response_bytes: int,
         runtime_environment: Mapping[str, str] | None = None,
+        deadline: float | None = None,
     ):
         try:
             import httpx
@@ -2491,13 +3571,24 @@ class SdkMcpProvider:
                 "MCP provider requires httpx from the optional MCP dependency; "
                 "install with `uv sync --extra mcp --all-groups`"
             ) from exc
-        timeout = httpx.Timeout(timeout_s, read=timeout_s)
+        selected_deadline = (
+            time.monotonic() + timeout_s if deadline is None else deadline
+        )
+        remaining = _mcp_remaining_timeout(
+            selected_deadline,
+            requested=timeout_s,
+            stage="HTTP client setup",
+        )
+        timeout = httpx.Timeout(remaining, read=remaining)
         headers = self._resolved_http_headers(
             server,
             runtime_environment=runtime_environment,
         )
         headers["Accept-Encoding"] = "identity"
-        transport = _McpPolicyAsyncHTTPTransport(max_response_bytes=max_response_bytes)
+        transport = _McpPolicyAsyncHTTPTransport(
+            max_response_bytes=max_response_bytes,
+            deadline=selected_deadline,
+        )
         try:
             async with httpx.AsyncClient(
                 headers=headers,
@@ -2710,10 +3801,49 @@ class SdkMcpProvider:
         )
 
 
+def _mcp_remaining_timeout(
+    deadline: float,
+    *,
+    requested: float | None = None,
+    stage: str,
+) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"MCP absolute deadline exhausted during {stage}")
+    if requested is None:
+        return remaining
+    return min(remaining, max(0.0, requested))
+
+
+async def _mcp_await_with_deadline(
+    awaitable: Any,
+    *,
+    deadline: float,
+    stage: str,
+) -> Any:
+    try:
+        timeout = _mcp_remaining_timeout(deadline, stage=stage)
+    except BaseException:
+        if asyncio.iscoroutine(awaitable):
+            awaitable.close()
+        raise
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"MCP absolute deadline exhausted during {stage}"
+        ) from exc
+
+
 class _McpPolicyAsyncHTTPTransport:
     """MCP address policy plus pre-materialization HTTP response bounds."""
 
-    def __init__(self, *, max_response_bytes: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_response_bytes: int,
+        deadline: float | None = None,
+    ) -> None:
         try:
             import httpcore
             import httpx  # noqa: F401
@@ -2725,6 +3855,7 @@ class _McpPolicyAsyncHTTPTransport:
         if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
             raise ValidationError("MCP HTTP max_response_bytes must be a positive integer")
         self.max_response_bytes = max_response_bytes
+        self.deadline = float("inf") if deadline is None else deadline
         self.limit_error: RuntimeError | None = None
         self._pool = httpcore.AsyncConnectionPool(
             ssl_context=ssl.create_default_context(),
@@ -2734,7 +3865,7 @@ class _McpPolicyAsyncHTTPTransport:
             http1=True,
             http2=False,
             retries=0,
-            network_backend=_McpPolicyNetworkBackend(),
+            network_backend=_McpPolicyNetworkBackend(deadline=self.deadline),
         )
 
     async def __aenter__(self) -> "_McpPolicyAsyncHTTPTransport":
@@ -2751,6 +3882,16 @@ class _McpPolicyAsyncHTTPTransport:
         import httpx
 
         request.headers["Accept-Encoding"] = "identity"
+        extensions = dict(request.extensions)
+        timeout_extension = dict(extensions.get("timeout", {}))
+        for timeout_kind in ("connect", "pool", "read", "write"):
+            requested = timeout_extension.get(timeout_kind)
+            timeout_extension[timeout_kind] = _mcp_remaining_timeout(
+                self.deadline,
+                requested=requested,
+                stage=f"HTTP {timeout_kind}",
+            )
+        extensions["timeout"] = timeout_extension
         core_request = httpcore.Request(
             method=request.method,
             url=httpcore.URL(
@@ -2761,7 +3902,7 @@ class _McpPolicyAsyncHTTPTransport:
             ),
             headers=request.headers.raw,
             content=request.stream,
-            extensions=request.extensions,
+            extensions=extensions,
         )
         with _map_mcp_httpcore_exceptions():
             core_response = await self._pool.handle_async_request(core_request)
@@ -2783,6 +3924,7 @@ class _McpPolicyAsyncHTTPTransport:
                 max_response_bytes=self.max_response_bytes,
                 is_sse=content_type == "text/event-stream",
                 fail=self._limit_failure,
+                deadline=self.deadline,
             ),
             extensions=core_response.extensions,
         )
@@ -2891,6 +4033,7 @@ def _bounded_mcp_http_stream(
     max_response_bytes: int,
     is_sse: bool,
     fail: Callable[[str], RuntimeError],
+    deadline: float = float("inf"),
 ) -> Any:
     import httpx
 
@@ -2898,8 +4041,18 @@ def _bounded_mcp_http_stream(
 
     class BoundedMcpHttpStream(httpx.AsyncByteStream):
         async def __aiter__(self):
-            with _map_mcp_httpcore_exceptions():
-                async for chunk in stream:
+            iterator = stream.__aiter__()
+            while True:
+                try:
+                    with _map_mcp_httpcore_exceptions():
+                        chunk = await _mcp_await_with_deadline(
+                            anext(iterator),
+                            deadline=deadline,
+                            stage="HTTP response body",
+                        )
+                except StopAsyncIteration:
+                    return
+                else:
                     message = limiter.feed(chunk)
                     if message is not None:
                         raise fail(message)
@@ -2915,7 +4068,7 @@ def _bounded_mcp_http_stream(
 class _McpPolicyNetworkBackend:
     """Resolve, validate, then connect to the exact MCP HTTP address."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, deadline: float | None = None) -> None:
         try:
             import httpcore
         except ModuleNotFoundError as exc:
@@ -2924,6 +4077,7 @@ class _McpPolicyNetworkBackend:
                 "install with `uv sync --extra mcp --all-groups`"
             ) from exc
         self._backend = httpcore.AnyIOBackend()
+        self.deadline = float("inf") if deadline is None else deadline
 
     async def connect_tcp(
         self,
@@ -2934,16 +4088,30 @@ class _McpPolicyNetworkBackend:
         socket_options: Any = None,
     ) -> Any:
         host_text = host.decode("idna") if isinstance(host, bytes) else str(host)
-        addresses = _allowed_mcp_connect_addresses(host_text, port)
+        addresses = await run_blocking_once(
+            _allowed_mcp_connect_addresses,
+            host_text,
+            port,
+            deadline=self.deadline,
+        )
         last_exc: Exception | None = None
         for address in addresses:
             try:
-                return await self._backend.connect_tcp(
+                selected_timeout = _mcp_remaining_timeout(
+                    self.deadline,
+                    requested=timeout,
+                    stage=f"TCP connect to {address}",
+                )
+                stream = await self._backend.connect_tcp(
                     address,
                     port,
-                    timeout=timeout,
+                    timeout=selected_timeout,
                     local_address=local_address,
                     socket_options=socket_options,
+                )
+                return _McpDeadlineNetworkStream(
+                    stream,
+                    deadline=self.deadline,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -2957,13 +4125,88 @@ class _McpPolicyNetworkBackend:
         timeout: float | None = None,
         socket_options: Any = None,
     ) -> Any:
-        return await self._backend.connect_unix_socket(path, timeout=timeout, socket_options=socket_options)
+        selected_timeout = _mcp_remaining_timeout(
+            self.deadline,
+            requested=timeout,
+            stage="Unix socket connect",
+        )
+        stream = await self._backend.connect_unix_socket(
+            path,
+            timeout=selected_timeout,
+            socket_options=socket_options,
+        )
+        return _McpDeadlineNetworkStream(stream, deadline=self.deadline)
 
     async def sleep(self, seconds: float) -> None:
-        await self._backend.sleep(seconds)
+        selected = _mcp_remaining_timeout(
+            self.deadline,
+            requested=seconds,
+            stage="HTTP transport backoff",
+        )
+        await self._backend.sleep(selected)
+        if selected < seconds:
+            raise TimeoutError(
+                "MCP absolute deadline exhausted during HTTP transport backoff"
+            )
 
 
-def _allowed_mcp_connect_addresses(host: str, port: int) -> list[str]:
+class _McpDeadlineNetworkStream:
+    """Clamp every socket and TLS operation to one transport deadline."""
+
+    def __init__(self, stream: Any, *, deadline: float) -> None:
+        self._stream = stream
+        self.deadline = deadline
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return await self._stream.read(
+            max_bytes,
+            timeout=_mcp_remaining_timeout(
+                self.deadline,
+                requested=timeout,
+                stage="HTTP socket read",
+            ),
+        )
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        await self._stream.write(
+            buffer,
+            timeout=_mcp_remaining_timeout(
+                self.deadline,
+                requested=timeout,
+                stage="HTTP socket write",
+            ),
+        )
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> "_McpDeadlineNetworkStream":
+        stream = await self._stream.start_tls(
+            ssl_context,
+            server_hostname=server_hostname,
+            timeout=_mcp_remaining_timeout(
+                self.deadline,
+                requested=timeout,
+                stage="TLS handshake",
+            ),
+        )
+        return _McpDeadlineNetworkStream(stream, deadline=self.deadline)
+
+    def get_extra_info(self, info: str) -> Any:
+        return self._stream.get_extra_info(info)
+
+
+def _allowed_mcp_connect_addresses(
+    host: str,
+    port: int,
+    *,
+    deadline: float | None = None,
+) -> list[str]:
     normalized = host.strip("[]").lower()
     if normalized in _MCP_FORBIDDEN_HOSTS:
         raise ValidationError("MCP HTTP host is not allowed")
@@ -2972,16 +4215,31 @@ def _allowed_mcp_connect_addresses(host: str, port: int) -> list[str]:
     if literal is not None:
         _validate_mcp_connect_ip(literal, allow_local=allow_local)
         return [host.strip("[]")]
-    try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise ValidationError(f"MCP host could not be resolved: {host}") from exc
+    infos = _bounded_mcp_getaddrinfo(host, port, deadline=deadline)
     addresses = sorted({info[4][0] for info in infos})
     if not addresses:
         raise ValidationError(f"MCP host resolved no addresses: {host}")
     for address in addresses:
         _validate_mcp_connect_ip(ipaddress.ip_address(address), allow_local=allow_local)
     return addresses
+
+
+def _bounded_mcp_getaddrinfo(
+    host: str,
+    port: int,
+    *,
+    deadline: float | None,
+) -> list[Any]:
+    """Run the Host resolver behind a bounded, saturation-safe daemon slot."""
+    try:
+        return _bounded_provider_getaddrinfo(
+            host,
+            port,
+            deadline=deadline,
+            operation="MCP",
+        )
+    except socket.gaierror as error:
+        raise ValidationError(f"MCP host could not be resolved: {host}") from error
 
 
 def _ip_address_or_none(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -3107,147 +4365,678 @@ def _find_windows_mcp_command(
     return None
 
 
-@contextlib.asynccontextmanager
-async def _strict_stdio_client(
-    server: Any,
-    *,
-    max_frame_bytes: int,
-    cwd_fd: int | None = None,
-):
+@dataclass(frozen=True)
+class _McpStdioConfig:
+    max_frame_bytes: int
+    request_limit_bytes: int
+    stdout_limit_bytes: int
+    stderr_limit_bytes: int
+    deadline: float
+    limits: SubprocessLimits | None
+
+
+def _mcp_stdio_dependencies() -> tuple[Any, Any, Any]:
     try:
         import anyio
         import anyio.lowlevel
         import mcp.types as mcp_types
-        from mcp.os.posix.utilities import terminate_posix_process_tree
-        from mcp.os.win32.utilities import create_windows_process, terminate_windows_process_tree
         from mcp.shared.message import SessionMessage
     except ModuleNotFoundError as exc:
         raise ValidationError(
             "MCP stdio transport requires the optional MCP dependency; "
             "install with `uv sync --extra mcp --all-groups`"
         ) from exc
-    read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
-    write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
-    reader_errors: list[RuntimeError] = []
-    process = None
+    return anyio, mcp_types, SessionMessage
+
+
+def _validated_mcp_stdio_config(
+    *,
+    max_frame_bytes: int,
+    max_request_bytes: int | None,
+    deadline: float | None,
+    limits: SubprocessLimits | None,
+    stdout_limit_bytes: int | None,
+    stderr_limit_bytes: int | None,
+) -> _McpStdioConfig:
+    selected_request_limit = (
+        max_frame_bytes if max_request_bytes is None else max_request_bytes
+    )
+    selected_stdout_limit = (
+        max_frame_bytes * _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER
+        if stdout_limit_bytes is None
+        else stdout_limit_bytes
+    )
+    selected_stderr_limit = (
+        max_frame_bytes if stderr_limit_bytes is None else stderr_limit_bytes
+    )
+    for field_name, value in (
+        ("max_frame_bytes", max_frame_bytes),
+        ("max_request_bytes", selected_request_limit),
+        ("stdout limit", selected_stdout_limit),
+        ("stderr limit", selected_stderr_limit),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValidationError(f"MCP stdio {field_name} must be a positive integer")
+    if limits is not None:
+        _validate_mcp_stdio_subprocess_limits(limits)
+    return _McpStdioConfig(
+        max_frame_bytes=max_frame_bytes,
+        request_limit_bytes=selected_request_limit,
+        stdout_limit_bytes=selected_stdout_limit,
+        stderr_limit_bytes=selected_stderr_limit,
+        deadline=(
+            time.monotonic() + _TOOL_DEFAULTS.shell_timeout_s
+            if deadline is None
+            else deadline
+        ),
+        limits=limits,
+    )
+
+
+def _validate_mcp_stdio_subprocess_limits(limits: SubprocessLimits) -> None:
+    for field_name, value in (
+        ("wall_seconds", limits.wall_seconds),
+        ("cpu_seconds", limits.cpu_seconds),
+        ("memory_bytes", limits.memory_bytes),
+    ):
+        if value is None:
+            continue
+        if (
+            isinstance(value, bool)
+            or type(value) not in {int, float}
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValidationError(
+                f"MCP stdio SubprocessLimits.{field_name} must be positive and finite"
+            )
+
+
+async def _spawn_mcp_stdio_process(
+    anyio: Any,
+    server: Any,
+    *,
+    cwd_fd: int | None,
+    config: _McpStdioConfig,
+) -> tuple[Any, int | None, WindowsJobObject | None]:
     # ``server.command`` is already the verified absolute snapshot path. Do
     # not let the SDK run a second PATH/PATHEXT lookup after authorization.
-    command = server.command
-    try:
-        if _MCP_WINDOWS:
-            if cwd_fd is not None:
-                raise _McpStdioDispatchNotStarted(
-                    "Windows MCP stdio cannot receive a POSIX cwd handle"
-                )
-            process = await create_windows_process(command, list(server.args), dict(server.env or {}), sys.stderr, server.cwd)
-        else:
-            process = await anyio.open_process(
-                [command, *list(server.args)],
-                env=dict(server.env or {}),
-                stderr=sys.stderr,
-                cwd=server.cwd,
-                start_new_session=True,
-                pass_fds=(() if cwd_fd is None else (cwd_fd,)),
-            )
-    except (OSError, ValidationError):
-        await read_stream.aclose()
-        await write_stream.aclose()
-        await read_stream_writer.aclose()
-        await write_stream_reader.aclose()
-        raise
+    if _MCP_WINDOWS:
+        return await _spawn_windows_mcp_stdio_process(anyio, server, cwd_fd, config)
+    return await _spawn_posix_mcp_stdio_process(anyio, server, cwd_fd, config)
 
-    async def stdout_reader() -> None:
-        assert process is not None and process.stdout
+
+async def _spawn_windows_mcp_stdio_process(
+    anyio: Any,
+    server: Any,
+    cwd_fd: int | None,
+    config: _McpStdioConfig,
+) -> tuple[Any, None, WindowsJobObject]:
+    if cwd_fd is not None:
+        raise _McpStdioDispatchNotStarted(
+            "Windows MCP stdio cannot receive a POSIX cwd handle"
+        )
+    try:
+        windows_job = WindowsJobObject.create(config.limits)
+    except OSError as exc:
+        raise _McpStdioDispatchNotStarted(
+            "MCP stdio could not create the required Windows Job Object"
+        ) from exc
+    process = None
+    try:
+        process = await _mcp_await_with_deadline(
+            anyio.open_process(
+                [server.command, *list(server.args)],
+                env=dict(server.env or {}),
+                stderr=subprocess.PIPE,
+                cwd=server.cwd,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                ),
+            ),
+            deadline=config.deadline,
+            stage="stdio process spawn",
+        )
+        windows_job.assign_pid(process.pid)
+        return process, None, windows_job
+    except BaseException as exc:
+        if process is not None:
+            with contextlib.suppress(Exception):
+                process.kill()
+            with anyio.move_on_after(0.25):
+                await process.wait()
+        windows_job.close()
+        if isinstance(exc, TimeoutError):
+            raise
+        if process is None:
+            raise _McpStdioDispatchNotStarted(
+                "MCP stdio process creation failed before dispatch"
+            ) from exc
+        raise _McpStdioDispatchStarted(
+            "MCP stdio child could not attach to the required Windows Job Object"
+        ) from exc
+
+
+async def _spawn_posix_mcp_stdio_process(
+    anyio: Any,
+    server: Any,
+    cwd_fd: int | None,
+    config: _McpStdioConfig,
+) -> tuple[Any, int, None]:
+    process = await _mcp_await_with_deadline(
+        anyio.open_process(
+            [server.command, *list(server.args)],
+            env=dict(server.env or {}),
+            stderr=subprocess.PIPE,
+            cwd=server.cwd,
+            start_new_session=True,
+            pass_fds=(() if cwd_fd is None else (cwd_fd,)),
+        ),
+        deadline=config.deadline,
+        stage="stdio process spawn",
+    )
+    process_group_id = process.pid
+    try:
+        if os.getpgid(process.pid) != process_group_id:
+            raise OSError("spawned MCP process is not its process-group leader")
+    except OSError as exc:
+        await _terminate_mcp_stdio_process(
+            process,
+            process_group_id=process_group_id,
+            windows_job=None,
+        )
+        raise _McpStdioDispatchStarted(
+            "MCP stdio child could not establish an isolated process group"
+        ) from exc
+    return process, process_group_id, None
+
+
+async def _close_mcp_stdio_streams(*streams: Any) -> None:
+    for stream in streams:
+        with contextlib.suppress(Exception):
+            await stream.aclose()
+
+
+def _mcp_stdio_ps_process(
+    process: Any,
+    *,
+    require_complete: bool,
+) -> psutil.Process | None:
+    try:
+        return psutil.Process(process.pid)
+    except (psutil.Error, OSError) as exc:
+        if require_complete:
+            raise ValidationError(
+                "MCP stdio cannot enforce CPU/memory SubprocessLimits because "
+                "complete process metrics are unavailable"
+            ) from exc
+        return None
+
+
+class _StrictMcpStdioTransport:
+    def __init__(
+        self,
+        *,
+        anyio: Any,
+        mcp_types: Any,
+        session_message_type: Any,
+        server: Any,
+        config: _McpStdioConfig,
+        process: Any,
+        process_group_id: int | None,
+        windows_job: WindowsJobObject | None,
+        ps_process: psutil.Process | None,
+        require_complete_metrics: bool,
+        read_stream_writer: Any,
+        read_stream: Any,
+        write_stream: Any,
+        write_stream_reader: Any,
+    ) -> None:
+        self.anyio = anyio
+        self.mcp_types = mcp_types
+        self.session_message_type = session_message_type
+        self.server = server
+        self.config = config
+        self.process = process
+        self.process_group_id = process_group_id
+        self.windows_job = windows_job
+        self.ps_process = ps_process
+        self.require_complete_metrics = require_complete_metrics
+        self.read_stream_writer = read_stream_writer
+        self.read_stream = read_stream
+        self.write_stream = write_stream
+        self.write_stream_reader = write_stream_reader
+        self.transport_errors: list[BaseException] = []
+        self.failure_event = anyio.Event()
+        self.termination_lock = anyio.Lock()
+        self.terminated = False
+        self.started_at = time.monotonic()
+        self.peak_memory = 0
+        self.cpu_seconds = 0.0
+        self.stdout_bytes = 0
+        self.stderr_bytes = 0
+        self.stdin_bytes = 0
+
+    def record_failure(self, error: BaseException) -> None:
+        if not self.transport_errors:
+            self.transport_errors.append(error)
+        self.failure_event.set()
+
+    async def _send_stdout_failure(self, error: BaseException) -> None:
+        self.record_failure(error)
+        with self.anyio.move_on_after(0.05):
+            await self.read_stream_writer.send(error)
+
+    async def stdout_reader(self) -> None:
+        assert self.process.stdout
         try:
-            async with read_stream_writer:
+            async with self.read_stream_writer:
                 buffer = bytearray()
                 while True:
-                    # Ask the byte stream for only the remaining frame capacity
-                    # plus one sentinel byte. The transport buffer therefore
-                    # never grows beyond max_frame_bytes + 1 before rejection,
-                    # even when AnyIO's default receive chunk is much larger.
-                    read_size = _mcp_stdio_read_size(len(buffer), max_frame_bytes)
+                    read_size = _mcp_stdio_read_size(
+                        len(buffer),
+                        self.config.max_frame_bytes,
+                    )
                     try:
-                        chunk = await process.stdout.receive(max_bytes=read_size)
-                    except anyio.EndOfStream:
+                        chunk = await self.process.stdout.receive(max_bytes=read_size)
+                    except self.anyio.EndOfStream:
                         break
                     if not chunk:
                         break
-                    buffer.extend(chunk)
-                    while True:
-                        newline = buffer.find(b"\n")
-                        if newline < 0:
-                            if len(buffer) > max_frame_bytes:
-                                error = RuntimeError(
-                                    "MCP stdio frame exceeded "
-                                    f"max_response_bytes={max_frame_bytes}"
-                                )
-                                reader_errors.append(error)
-                                await read_stream_writer.send(error)
-                                return
-                            break
-                        if newline > max_frame_bytes:
-                            error = RuntimeError(
-                                "MCP stdio frame exceeded "
-                                f"max_response_bytes={max_frame_bytes}"
+                    self.stdout_bytes += len(chunk)
+                    if self.stdout_bytes > self.config.stdout_limit_bytes:
+                        await self._send_stdout_failure(
+                            RuntimeError(
+                                "MCP stdio stdout exceeded max_output_bytes="
+                                f"{self.config.stdout_limit_bytes}"
                             )
-                            reader_errors.append(error)
-                            await read_stream_writer.send(error)
-                            return
-                        line = bytes(buffer[:newline])
-                        del buffer[: newline + 1]
-                        try:
-                            message = mcp_types.JSONRPCMessage.model_validate_json(line)
-                        except Exception as exc:
-                            await read_stream_writer.send(exc)
-                            continue
-                        await read_stream_writer.send(SessionMessage(message))
-        except anyio.ClosedResourceError:
-            await anyio.lowlevel.checkpoint()
+                        )
+                        return
+                    buffer.extend(chunk)
+                    if not await self._drain_stdout_frames(buffer):
+                        return
+        except self.anyio.ClosedResourceError:
+            await self.anyio.lowlevel.checkpoint()
 
-    async def stdin_writer() -> None:
-        assert process is not None and process.stdin
+    async def _drain_stdout_frames(self, buffer: bytearray) -> bool:
+        while True:
+            newline = buffer.find(b"\n")
+            if newline < 0:
+                if len(buffer) > self.config.max_frame_bytes:
+                    await self._send_stdout_failure(self._frame_limit_error())
+                    return False
+                return True
+            if newline > self.config.max_frame_bytes:
+                await self._send_stdout_failure(self._frame_limit_error())
+                return False
+            line = bytes(buffer[:newline])
+            del buffer[: newline + 1]
+            try:
+                message = self.mcp_types.JSONRPCMessage.model_validate_json(line)
+            except Exception as exc:
+                await self.read_stream_writer.send(exc)
+                continue
+            await self.read_stream_writer.send(self.session_message_type(message))
+
+    def _frame_limit_error(self) -> RuntimeError:
+        return RuntimeError(
+            "MCP stdio frame exceeded "
+            f"max_response_bytes={self.config.max_frame_bytes}"
+        )
+
+    async def stderr_reader(self) -> None:
+        assert self.process.stderr
         try:
-            async with write_stream_reader:
-                async for session_message in write_stream_reader:
-                    raw = session_message.message.model_dump_json(by_alias=True, exclude_none=True)
-                    await process.stdin.send(
-                        (raw + "\n").encode(
-                            encoding=server.encoding,
-                            errors=server.encoding_error_handler,
+            while True:
+                try:
+                    chunk = await self.process.stderr.receive(
+                        max_bytes=min(
+                            _MCP_STDIO_READ_CHUNK_BYTES,
+                            self.config.stderr_limit_bytes + 1,
                         )
                     )
-        except anyio.ClosedResourceError:
-            await anyio.lowlevel.checkpoint()
+                except self.anyio.EndOfStream:
+                    return
+                if not chunk:
+                    return
+                self.stderr_bytes += len(chunk)
+                if self.stderr_bytes > self.config.stderr_limit_bytes:
+                    self.record_failure(
+                        RuntimeError(
+                            "MCP stdio stderr exceeded max_output_bytes="
+                            f"{self.config.stderr_limit_bytes}"
+                        )
+                    )
+                    return
+        except self.anyio.ClosedResourceError:
+            await self.anyio.lowlevel.checkpoint()
 
-    async with anyio.create_task_group() as task_group, process:
-        task_group.start_soon(stdout_reader)
-        task_group.start_soon(stdin_writer)
+    async def stdin_writer(self) -> None:
+        assert self.process.stdin
         try:
+            async with self.write_stream_reader:
+                async for session_message in self.write_stream_reader:
+                    encoded = self._encode_request(session_message)
+                    if len(encoded) > self.config.request_limit_bytes:
+                        self.record_failure(
+                            RuntimeError(
+                                "MCP stdio request frame exceeded max_request_bytes="
+                                f"{self.config.request_limit_bytes}"
+                            )
+                        )
+                        return
+                    self.stdin_bytes += len(encoded)
+                    aggregate_limit = (
+                        self.config.request_limit_bytes
+                        * _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER
+                    )
+                    if self.stdin_bytes > aggregate_limit:
+                        self.record_failure(
+                            RuntimeError(
+                                "MCP stdio stdin exceeded "
+                                f"max_output_bytes={aggregate_limit}"
+                            )
+                        )
+                        return
+                    await self.process.stdin.send(encoded)
+        except self.anyio.ClosedResourceError:
+            await self.anyio.lowlevel.checkpoint()
+
+    def _encode_request(self, session_message: Any) -> bytes:
+        raw = session_message.message.model_dump_json(by_alias=True, exclude_none=True)
+        return (raw + "\n").encode(
+            encoding=self.server.encoding,
+            errors=self.server.encoding_error_handler,
+        )
+
+    def _selected_limit_kind(self, wall_seconds: float) -> tuple[bool, str | None]:
+        timed_out = time.monotonic() >= self.config.deadline
+        limits = self.config.limits
+        if timed_out or limits is None:
+            return timed_out, None
+        if limits.wall_seconds is not None and wall_seconds > limits.wall_seconds:
+            return False, "subprocess_wall_seconds"
+        if limits.cpu_seconds is not None and self.cpu_seconds > limits.cpu_seconds:
+            return False, "subprocess_cpu_seconds"
+        if limits.memory_bytes is not None and self.peak_memory > limits.memory_bytes:
+            return False, "subprocess_memory_bytes"
+        return False, None
+
+    def _record_resource_failure(
+        self,
+        *,
+        wall_seconds: float,
+        timed_out: bool,
+        limit_kind: str | None,
+    ) -> None:
+        metrics = CommandMetrics(
+            wall_seconds=wall_seconds,
+            cpu_seconds=self.cpu_seconds,
+            peak_memory_bytes=self.peak_memory,
+            killed=True,
+            limit_kind=("subprocess_timeout" if timed_out else limit_kind),
+        )
+        if timed_out:
+            self.record_failure(
+                SubprocessTimeoutExpired(
+                    "MCP stdio subprocess exceeded the absolute deadline",
+                    metrics=metrics,
+                )
+            )
+            return
+        self.record_failure(
+            SubprocessLimitExceeded(
+                f"MCP stdio subprocess exceeded {limit_kind}",
+                metrics=metrics,
+            )
+        )
+
+    async def resource_monitor(self) -> None:
+        while True:
+            if self.failure_event.is_set():
+                await self._terminate()
+                return
+            wall_seconds = time.monotonic() - self.started_at
             try:
-                yield read_stream, write_stream
-            except BaseException as exc:
-                if reader_errors:
-                    raise reader_errors[0] from exc
-                raise
+                if self.ps_process is not None:
+                    self.cpu_seconds, self.peak_memory = _sample_mcp_process_tree(
+                        self.ps_process,
+                        self.peak_memory,
+                        require_complete=self.require_complete_metrics,
+                    )
+            except ValidationError as exc:
+                self.record_failure(exc)
+                continue
+            timed_out, limit_kind = self._selected_limit_kind(wall_seconds)
+            if timed_out or limit_kind is not None:
+                self._record_resource_failure(
+                    wall_seconds=wall_seconds,
+                    timed_out=timed_out,
+                    limit_kind=limit_kind,
+                )
+                continue
+            if self.process.returncode is not None:
+                return
+            await self.anyio.sleep(0.01)
+
+    async def _terminate(self) -> None:
+        async with self.termination_lock:
+            if self.terminated:
+                return
+            await _terminate_mcp_stdio_process(
+                self.process,
+                process_group_id=self.process_group_id,
+                windows_job=self.windows_job,
+            )
+            self.windows_job = None
+            self.terminated = True
+
+    @contextlib.asynccontextmanager
+    async def run(self):
+        body_error: BaseException | None = None
+        try:
+            async with self.process:
+                async with self.anyio.create_task_group() as task_group:
+                    for task in (
+                        self.stdout_reader,
+                        self.stderr_reader,
+                        self.stdin_writer,
+                        self.resource_monitor,
+                    ):
+                        task_group.start_soon(task)
+                    try:
+                        yield self.read_stream, self.write_stream
+                    except BaseException as exc:
+                        body_error = exc
+                    finally:
+                        # Once the task group is cancelled, ordinary awaits in
+                        # this scope are cancellation points. Shield cleanup so
+                        # every SDK stream and subprocess pipe is deterministically
+                        # closed before the asyncio loop can disappear.
+                        with self.anyio.CancelScope(shield=True):
+                            if self.process.stdin:
+                                with contextlib.suppress(Exception):
+                                    await self.process.stdin.aclose()
+                            await self._terminate()
+                            task_group.cancel_scope.cancel()
+                            await _close_mcp_stdio_streams(
+                                self.process.stdout,
+                                self.process.stderr,
+                                self.read_stream,
+                                self.write_stream,
+                                self.read_stream_writer,
+                                self.write_stream_reader,
+                            )
+        except BaseException as exc:
+            if body_error is None:
+                body_error = exc
         finally:
-            if process.stdin:
-                with contextlib.suppress(Exception):
-                    await process.stdin.aclose()
-            try:
-                with anyio.fail_after(2.0):
-                    await process.wait()
-            except TimeoutError:
-                if _MCP_WINDOWS:
-                    await terminate_windows_process_tree(process)
-                else:
-                    await terminate_posix_process_tree(process)
-            except ProcessLookupError:
-                pass
-            await read_stream.aclose()
-            await write_stream.aclose()
-            await read_stream_writer.aclose()
-            await write_stream_reader.aclose()
+            if self.windows_job is not None:
+                self.windows_job.close()
+        self._raise_transport_error(body_error)
+
+    def _raise_transport_error(self, body_error: BaseException | None) -> None:
+        if self.transport_errors:
+            if body_error is not None:
+                raise self.transport_errors[0] from body_error
+            raise self.transport_errors[0]
+        if body_error is not None:
+            raise body_error
+
+
+@contextlib.asynccontextmanager
+async def _strict_stdio_client(
+    server: Any,
+    *,
+    max_frame_bytes: int,
+    max_request_bytes: int | None = None,
+    cwd_fd: int | None = None,
+    deadline: float | None = None,
+    limits: SubprocessLimits | None = None,
+    stdout_limit_bytes: int | None = None,
+    stderr_limit_bytes: int | None = None,
+):
+    anyio, mcp_types, session_message_type = _mcp_stdio_dependencies()
+    config = _validated_mcp_stdio_config(
+        max_frame_bytes=max_frame_bytes,
+        max_request_bytes=max_request_bytes,
+        deadline=deadline,
+        limits=limits,
+        stdout_limit_bytes=stdout_limit_bytes,
+        stderr_limit_bytes=stderr_limit_bytes,
+    )
+    read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
+    write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
+    streams = (read_stream, write_stream, read_stream_writer, write_stream_reader)
+    windows_job: WindowsJobObject | None = None
+    try:
+        process, process_group_id, windows_job = await _spawn_mcp_stdio_process(
+            anyio,
+            server,
+            cwd_fd=cwd_fd,
+            config=config,
+        )
+    except BaseException:
+        if windows_job is not None:
+            windows_job.close()
+        await _close_mcp_stdio_streams(*streams)
+        raise
+
+    require_complete_metrics = bool(
+        limits is not None
+        and (limits.cpu_seconds is not None or limits.memory_bytes is not None)
+    )
+    try:
+        ps_process = _mcp_stdio_ps_process(
+            process,
+            require_complete=require_complete_metrics,
+        )
+    except BaseException:
+        await _terminate_mcp_stdio_process(
+            process,
+            process_group_id=process_group_id,
+            windows_job=windows_job,
+        )
+        await _close_mcp_stdio_streams(*streams)
+        raise
+
+    transport = _StrictMcpStdioTransport(
+        anyio=anyio,
+        mcp_types=mcp_types,
+        session_message_type=session_message_type,
+        server=server,
+        config=config,
+        process=process,
+        process_group_id=process_group_id,
+        windows_job=windows_job,
+        ps_process=ps_process,
+        require_complete_metrics=require_complete_metrics,
+        read_stream_writer=read_stream_writer,
+        read_stream=read_stream,
+        write_stream=write_stream,
+        write_stream_reader=write_stream_reader,
+    )
+    async with transport.run() as client_streams:
+        yield client_streams
+
+
+def _sample_mcp_process_tree(
+    process: psutil.Process,
+    peak_memory: int,
+    *,
+    require_complete: bool,
+) -> tuple[float, int]:
+    cpu_seconds = 0.0
+    memory_bytes = 0
+    processes = [process]
+    if require_complete:
+        try:
+            processes.extend(process.children(recursive=True))
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            pass
+        except (psutil.Error, OSError) as exc:
+            raise ValidationError(
+                "MCP stdio cannot enforce CPU/memory SubprocessLimits because "
+                "complete process metrics are unavailable"
+            ) from exc
+    for item in processes:
+        try:
+            times = item.cpu_times()
+            cpu_seconds += float(times.user) + float(times.system)
+            memory_bytes += int(item.memory_info().rss)
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            continue
+        except (psutil.Error, OSError) as exc:
+            if require_complete:
+                raise ValidationError(
+                    "MCP stdio cannot enforce CPU/memory SubprocessLimits because "
+                    "complete process metrics are unavailable"
+                ) from exc
+    return cpu_seconds, max(peak_memory, memory_bytes)
+
+
+async def _terminate_mcp_stdio_process(
+    process: Any,
+    *,
+    process_group_id: int | None,
+    windows_job: WindowsJobObject | None,
+) -> None:
+    try:
+        import anyio
+    except ModuleNotFoundError:  # pragma: no cover - imported by caller
+        return
+    if _MCP_WINDOWS:
+        if windows_job is not None:
+            # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is the fail-closed tree kill.
+            windows_job.close()
+        with contextlib.suppress(Exception):
+            process.terminate()
+    elif process_group_id is not None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process_group_id, signal.SIGTERM)
+        await anyio.sleep(0.05)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process_group_id, signal.SIGKILL)
+    else:
+        with contextlib.suppress(Exception):
+            process.terminate()
+    with anyio.move_on_after(0.25):
+        await process.wait()
+    if process.returncode is None:
+        with contextlib.suppress(Exception):
+            process.kill()
+        with anyio.move_on_after(0.25):
+            await process.wait()
+    # AnyIO's asyncio receive wrapper marks stdout/stderr closed without
+    # closing BaseSubprocessTransport itself. Close that transport while the
+    # loop is alive so pipe finalizers cannot fire after asyncio.run() exits.
+    raw_process = getattr(process, "_process", None)
+    raw_transport = getattr(raw_process, "_transport", None)
+    if raw_transport is not None:
+        with contextlib.suppress(Exception):
+            raw_transport.close()
+        await anyio.lowlevel.checkpoint()
 
 
 def _mcp_stdio_read_size(buffered_bytes: int, max_frame_bytes: int) -> int:
@@ -3453,12 +5242,16 @@ class LocalResourceProviderSubstrate:
         *,
         git_config: GitDefaults | None = None,
     ):
-        self.workspace_root = Path(workspace_root).resolve()
+        requested_root = Path(workspace_root).resolve()
+        self.filesystem = LocalFilesystemProvider(requested_root, namespace=namespace)
+        # Use the filesystem provider's descriptor-canonical root everywhere.
+        # On Darwin Path.resolve() preserves a caller's case spelling even
+        # when APFS resolves it to a differently spelled directory entry.
+        self.workspace_root = self.filesystem.root
         self.workspace_display = str(self.workspace_root)
         self._declared_git_config = git_config
         self._bound_runtime_git_config: GitDefaults | None = None
         self._git_config_binding_lock = threading.RLock()
-        self.filesystem = LocalFilesystemProvider(self.workspace_root, namespace=namespace)
         self.clock = LocalClockProvider()
         self.shell = LocalShellProvider(self.workspace_root, git_config=git_config)
         self.git = LocalGitProvider(self.workspace_root, config=git_config)

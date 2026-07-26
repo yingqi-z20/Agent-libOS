@@ -13,6 +13,7 @@ from benchmarks.builtin_tool_skills import (
     report_all_correct,
     run_evaluation,
 )
+from experiments.evaluation_output import AtomicJsonOutput
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -95,12 +96,11 @@ def main(argv: list[str] | None = None) -> None:
             "OPENAI_API_KEY and OPENAI_LANGUAGE_MODEL or OPENAI_MODEL are required"
         )
 
-    with tempfile.TemporaryDirectory(prefix="agent-libos-builtin-skill-eval-") as temp_dir:
-        report = run_evaluation(temp_dir, scenario_ids=args.scenario)
-    rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     output = Path(args.output).resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(rendered, encoding="utf-8")
+    with AtomicJsonOutput(output) as artifact:
+        with tempfile.TemporaryDirectory(prefix="agent-libos-builtin-skill-eval-") as temp_dir:
+            report = run_evaluation(temp_dir, scenario_ids=args.scenario)
+        rendered = artifact.commit(report)
     print(rendered, end="")
 
     if args.require_all_correct and not report_all_correct(report):

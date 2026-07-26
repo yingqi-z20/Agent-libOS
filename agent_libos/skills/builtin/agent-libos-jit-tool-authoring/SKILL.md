@@ -15,7 +15,7 @@ This checks basic name/schema/source/test sizes and creates a process-owned `pro
 
 Use `[A-Za-z0-9_-]{1,64}` and avoid process tool names. A multiplexed image hard-reserves `run_jit_tool`; direct mode currently permits that spelling as a real JIT name, but do not use it because a later switch to multiplexed exposure will reject the collision. Describe behavior, not implementation.
 
-Use portable schemas: normally a root object, explicit bounded `properties`, every property in `required`, and `additionalProperties:false`. Model optional values as required nullable unions. Describe the exact JSON return; forbid `undefined`, functions, instances, streams, and cycles. Strict provider projection makes implicit optional properties unreliable.
+Use the closed, bounded JIT JSON Schema 2020-12 dialect: the root must be an object, the complete schema tree has maximum structural depth 32 and at most 1,024 nodes, and values must be finite JSON without cycles. The only supported keywords are `$comment`, `additionalProperties`, `allOf`, `anyOf`, `const`, `contains`, `default`, `dependentRequired`, `dependentSchemas`, `deprecated`, `description`, `else`, `enum`, `examples`, `exclusiveMaximum`, `exclusiveMinimum`, `if`, `items`, `maxContains`, `maximum`, `maxItems`, `maxLength`, `maxProperties`, `minContains`, `minimum`, `minItems`, `minLength`, `minProperties`, `multipleOf`, `not`, `oneOf`, `prefixItems`, `properties`, `propertyNames`, `readOnly`, `required`, `then`, `title`, `type`, and `writeOnly`. In particular, references (`$ref`, `$dynamicRef`, `$recursiveRef`), regexes (`pattern`, `patternProperties`), `uniqueItems`, `format`, and every other unlisted keyword are rejected before candidate persistence or execution. Normally use a root object, explicit bounded `properties`, every property in `required`, and `additionalProperties:false`. Model optional values as required nullable unions. Describe the exact JSON return; forbid `undefined`, functions, instances, streams, and cycles. Strict provider projection makes implicit optional properties unreliable.
 
 Export `function run(args, libos)` or `async function run(args, libos)` with those names. Imports, re-exports, references, import-equals, dynamic/package loading are rejected. A `Deno` global may exist, but has no ambient read/write/net/env/run/FFI permission; do not depend on it. The supported libOS boundary is:
 
@@ -46,7 +46,15 @@ Tests are JSON objects of this form:
 }
 ```
 
-`expected` is exact JSON equality. Ordered mocks have `name`, optional exact `args`, and `result`/`payload` or `ok:false,error`. Mismatches reject at the call and leftovers fail validation. Because source can catch thrown mock rejection, never catch unexpected/order errors to pass; catch only intentional denial represented in `expected`.
+Every test object must include `expected`; the `tests` list itself may be empty.
+Comparison uses exact JSON semantics: finite integers and floats are one JSON
+number type, booleans are distinct from numbers, object keys must match, and array
+order matters. A missing `expected` rejects before source execution. Ordered mocks have
+`name`, optional exact `args`, and `result`/`payload` or `ok:false`. An `error` field on a denial mock is optional and ignored: candidate code receives the
+fixed text-free Host error envelope, never spec-authored diagnostic text.
+Mismatches reject at the call and leftovers fail validation. Because source can
+catch thrown mock rejection, never catch unexpected/order errors to pass; catch
+only intentional denial represented in `expected`.
 
 Tests do not exercise declared schemas. Empty tests prove only the Deno validation path. Cover boundaries, branches, syscall order/args, and intentional denials.
 
@@ -104,6 +112,10 @@ Success returns `tool_id`, `name`, `scope`. `ephemeral_process` is ownership sco
 ## Failure and recovery
 
 - Invalid name/schema/source/test: correct and repropose; do not weaken contracts/tests.
+- A validation timeout or enforced subprocess/cumulative resource limit is
+  recorded as a rejected candidate with bounded observation and audit before
+  the limit exception is returned. Replenish/adjust only legitimate Host budget,
+  then create a new proposal; do not revalidate the interrupted candidate.
 - Import, dynamic-code, Deno permission, unknown syscall, or unavailable Deno failure: remove the unsupported dependency or use the proper existing libOS primitive. Do not fall back to shell/network/filesystem access.
 - `ok:false`: preserve errors/warnings/logs, create a new candidate, and validate that ID. There is no model-facing candidate edit or discard operation.
 - Syscall authority/provider/data-flow/budget denial: preserve it; JIT cannot change it. Request only exact authority when intended.

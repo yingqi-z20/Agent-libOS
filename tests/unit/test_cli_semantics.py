@@ -38,8 +38,8 @@ class _FakeRuntime:
         self.workflow_manifests.append(kwargs["authority_manifest"])
         return _WorkflowResult()
 
-    def shutdown(self, **_kwargs: Any) -> None:
-        return None
+    def shutdown(self, **_kwargs: Any) -> dict[str, bool]:
+        return {"ok": True}
 
 
 def test_cli_preserves_absent_and_explicit_empty_authority_manifests(

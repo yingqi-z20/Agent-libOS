@@ -67,6 +67,17 @@ class ProcessTransitionService:
         allowed_statuses: Iterable[ProcessStatus | str] | None = None,
         reason: str | None = None,
     ) -> AgentProcess:
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValidationError(
+                "process transition expected_revision must be a non-negative integer"
+            )
+        if expected_state_generation is not None and (
+            type(expected_state_generation) is not int
+            or expected_state_generation < 0
+        ):
+            raise ValidationError(
+                "process transition expected_state_generation must be a non-negative integer"
+            )
         selected_status = ProcessStatus(status)
         validate_process_state(selected_status, wait_state, outcome)
         selected_allowed = tuple(allowed_statuses or ())

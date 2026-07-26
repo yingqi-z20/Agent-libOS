@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any, Iterable, Iterator
 from urllib.parse import quote
 
@@ -28,6 +30,7 @@ from agent_libos.models import (
 )
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.substrate import (
+    FilesystemCompareAndSwapProvider,
     FilesystemProvider,
     HierarchicalPathLock,
     LocalFilesystemProvider,
@@ -56,6 +59,7 @@ class FileReadResult:
     content: str
     bytes_read: int
     truncated: bool
+    content_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,27 @@ class DeleteResult:
     kind: str
     deleted: bool
     recursive: bool = False
+
+
+@dataclass(frozen=True)
+class _TextWritePlan:
+    pid: str
+    target: ResolvedPath
+    relative: str
+    resource: str
+    text: str
+    encoding: str
+    overwrite: bool
+    expected_content_sha256: str | None
+    compare_and_swap_provider: FilesystemCompareAndSwapProvider | None
+    flow_context: DataFlowContext
+    sink: DataSink
+    data_flow_payload: dict[str, Any]
+    target_label_generation: int
+    decision: CapabilityDecision
+    authority_context: dict[str, Any]
+    bytes_to_write: int
+    effect_context: dict[str, Any]
 
 
 class FilesystemAdapter:
@@ -335,10 +360,21 @@ class FilesystemAdapter:
             truncated = self._is_truncated_read(target_state.size_bytes, len(raw), max_bytes)
             selected = raw[:max_bytes]
             content = self._decode_text_prefix(selected, encoding, truncated=truncated)
-            result = FileReadResult(
-                path=relative, content=content, bytes_read=len(selected), truncated=truncated
+            content_sha256 = (
+                None if truncated else hashlib.sha256(selected).hexdigest()
             )
-            result_payload = {"bytes_read": len(selected), "truncated": truncated}
+            result = FileReadResult(
+                path=relative,
+                content=content,
+                bytes_read=len(selected),
+                truncated=truncated,
+                content_sha256=content_sha256,
+            )
+            result_payload = {
+                "bytes_read": len(selected),
+                "truncated": truncated,
+                "content_sha256": content_sha256,
+            }
             completed = protected.complete(
                 result,
                 self._protected_filesystem_evidence(
@@ -484,7 +520,45 @@ class FilesystemAdapter:
         cwd: str | os.PathLike[str] | None = None,
         *,
         source_oids: Iterable[str] | None = None,
+        source_context: DataFlowContext | None = None,
+        expected_content_sha256: str | None = None,
     ) -> FileWriteResult:
+        expected_content_sha256 = self._validate_expected_content_sha256(
+            expected_content_sha256
+        )
+        if source_context is not None and not isinstance(source_context, DataFlowContext):
+            raise ValidationError("trusted filesystem source_context must use DataFlowContext")
+        compare_and_swap_provider = self._compare_and_swap_provider(
+            expected_content_sha256
+        )
+        plan = self._prepare_text_write(
+            pid=pid,
+            path=path,
+            text=text,
+            encoding=encoding,
+            overwrite=overwrite,
+            cwd=cwd,
+            source_oids=tuple(source_oids or ()),
+            source_context=source_context,
+            expected_content_sha256=expected_content_sha256,
+            compare_and_swap_provider=compare_and_swap_provider,
+        )
+        return self._execute_text_write(plan)
+
+    def _prepare_text_write(
+        self,
+        *,
+        pid: str,
+        path: str | os.PathLike[str],
+        text: str,
+        encoding: str,
+        overwrite: bool,
+        cwd: str | os.PathLike[str] | None,
+        source_oids: tuple[str, ...],
+        source_context: DataFlowContext | None,
+        expected_content_sha256: str | None,
+        compare_and_swap_provider: FilesystemCompareAndSwapProvider | None,
+    ) -> _TextWritePlan:
         target, relative = self._resolve(path, cwd=cwd)
         resource = self.resource_for(relative)
         self._reject_definite_permission_denial(
@@ -498,16 +572,32 @@ class FilesystemAdapter:
                 primitive="runtime.filesystem.write_text",
                 operation="write_text",
                 right=CapabilityRight.WRITE.value,
-                extra={"encoding": encoding, "overwrite": overwrite},
+                extra={
+                    "encoding": encoding,
+                    "overwrite": overwrite,
+                    "expected_content_sha256": expected_content_sha256,
+                },
             ),
         )
-        flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
+        source_contexts = [self._data_flow().current_context()]
+        if source_oids:
+            source_contexts.append(
+                self._data_flow().context_from_source_oids(
+                    pid,
+                    source_oids,
+                    include_current=False,
+                )
+            )
+        if source_context is not None:
+            source_contexts.append(source_context)
+        flow_context = DataFlowContext.aggregate(source_contexts)
         sink = DataSink(resource)
         data_flow_payload = {
             "path": relative,
             "text": text,
             "encoding": encoding,
             "overwrite": overwrite,
+            "expected_content_sha256": expected_content_sha256,
         }
         target_label_generation = self._data_flow().store.get_file_label_binding_generation(
             relative
@@ -529,6 +619,7 @@ class FilesystemAdapter:
             encoding=encoding,
             overwrite=overwrite,
             source_oids=source_oids,
+            expected_content_sha256=expected_content_sha256,
         )
         bytes_to_write = len(text.encode(encoding))
         effect_context = {
@@ -536,30 +627,49 @@ class FilesystemAdapter:
             "resource": resource,
             "encoding": encoding,
             "overwrite": overwrite,
+            "expected_content_sha256": expected_content_sha256,
             "created": None,
         }
+        return _TextWritePlan(
+            pid=pid,
+            target=target,
+            relative=relative,
+            resource=resource,
+            text=text,
+            encoding=encoding,
+            overwrite=overwrite,
+            expected_content_sha256=expected_content_sha256,
+            compare_and_swap_provider=compare_and_swap_provider,
+            flow_context=flow_context,
+            sink=sink,
+            data_flow_payload=data_flow_payload,
+            target_label_generation=target_label_generation,
+            decision=decision,
+            authority_context=authority_context,
+            bytes_to_write=bytes_to_write,
+            effect_context=effect_context,
+        )
+
+    def _execute_text_write(self, plan: _TextWritePlan) -> FileWriteResult:
         intent: dict[str, Any] = {}
         mutation_attempted = False
         missing_parent_paths: list[str] = []
 
         def prepare() -> None:
             intent["record"] = self._record_mutation_intent(
-                pid=pid,
+                pid=plan.pid,
                 action="primitive.filesystem.write_text.intent",
-                target=resource,
-                decision={"path": relative, "bytes_to_write": bytes_to_write},
+                target=plan.resource,
+                decision={
+                    "path": plan.relative,
+                    "bytes_to_write": plan.bytes_to_write,
+                },
             )
 
         def write_provider() -> None:
             nonlocal mutation_attempted
             mutation_attempted = True
-            self.provider.write_text(
-                target,
-                text,
-                encoding=encoding,
-                newline="\n",
-                overwrite=overwrite,
-            )
+            self._provider_write_text(plan)
 
         def settle_ambiguous_write(error: BaseException, _phase: str) -> None:
             if not mutation_attempted or isinstance(error, ProviderEffectNotStarted):
@@ -568,85 +678,101 @@ class FilesystemAdapter:
             # prove whether bytes reached the workspace.  Persist the intended
             # labels conservatively so a later read cannot wash the source.
             self._bind_written_path_set(
-                pid=pid,
-                context=flow_context,
+                pid=plan.pid,
+                context=plan.flow_context,
                 parent_paths=missing_parent_paths,
-                final_path=relative,
-                final_content=text.encode(encoding),
+                final_path=plan.relative,
+                final_content=plan.text.encode(plan.encoding),
             )
 
         invocation = ProtectedOperationInvocation(
-            pid=pid,
-            actor=pid,
-            target=resource,
-            decisions=(decision,),
-            canonical_args=authority_context,
-            observation=effect_context,
-            preflight_usage=ResourceUsage(external_write_bytes=bytes_to_write),
+            pid=plan.pid,
+            actor=plan.pid,
+            target=plan.resource,
+            decisions=(plan.decision,),
+            canonical_args=plan.authority_context,
+            observation=plan.effect_context,
+            preflight_usage=ResourceUsage(
+                external_write_bytes=plan.bytes_to_write
+            ),
             resource_source="primitive.filesystem.write_text",
-            resource_context=effect_context,
+            resource_context=plan.effect_context,
             prepare=prepare,
             failure_evidence=lambda error, phase: self._protected_failure_evidence(
-                pid,
-                resource,
+                plan.pid,
+                plan.resource,
                 "primitive.filesystem.write_text.failed",
-                effect_context,
+                plan.effect_context,
                 error,
                 phase,
                 intent.get("record"),
             ),
             failure_settlement=settle_ambiguous_write,
-            data_sink=sink,
-            data_flow_context=flow_context,
-            data_flow_payload=data_flow_payload,
+            data_sink=plan.sink,
+            data_flow_context=plan.flow_context,
+            data_flow_payload=plan.data_flow_payload,
             data_flow_operation="filesystem.write_text",
-            data_flow_target_state_version=target_label_generation,
+            data_flow_target_state_version=plan.target_label_generation,
             data_flow_target_state_version_resolver=lambda: (
-                self._data_flow().store.get_file_label_binding_generation(relative)
+                self._data_flow().store.get_file_label_binding_generation(plan.relative)
             ),
         )
         with (
             self._file_label_io_lock.hold(
-                HierarchicalPathLock.creation_scope(relative)
+                HierarchicalPathLock.creation_scope(plan.relative)
             ),
             self._protected().start(
                 "primitive.filesystem.write_text", invocation, provider=self.provider
             ) as protected,
         ):
             target_state = protected.call(
-                ProviderPhase("state", information_flow=True), self.provider.state, target
+                ProviderPhase(
+                    "state",
+                    # A CAS mismatch is certified mutation-not-started and must
+                    # restore finite write authority.  Defer classification of
+                    # this advisory state observation until either explicit
+                    # state rejection or a successful mutation completes.
+                    information_flow=plan.expected_content_sha256 is None,
+                    commits_authority=plan.expected_content_sha256 is None,
+                ),
+                self.provider.state,
+                plan.target,
             )
             created = not target_state.exists
-            effect_context.update({"created": created, "state_observed": True})
+            plan.effect_context.update({"created": created, "state_observed": True})
             if created:
                 missing_parent_paths.extend(
                     protected.call(
-                        ProviderPhase("parent_state", information_flow=True),
+                        ProviderPhase(
+                            "parent_state",
+                            information_flow=plan.expected_content_sha256 is None,
+                            commits_authority=plan.expected_content_sha256 is None,
+                        ),
                         self._missing_parent_paths,
-                        relative,
+                        plan.relative,
                     )
                 )
             if target_state.exists and target_state.kind != "file":
-                error = CapabilityDenied(f"path is not a file: {relative}")
+                error = CapabilityDenied(f"path is not a file: {plan.relative}")
                 self._complete_state_rejection(
                     protected,
-                    pid=pid,
-                    target=resource,
+                    pid=plan.pid,
+                    target=plan.resource,
                     audit_action="primitive.filesystem.write_text.rejected",
-                    context=effect_context,
+                    context=plan.effect_context,
                     error=error,
                     intent_record=intent.get("record"),
                     resource_source="primitive.filesystem.write_text",
                 )
                 raise error
-            if target_state.exists and not overwrite:
-                error = FileExistsError(f"file already exists: {relative}")
+            if target_state.exists and not plan.overwrite:
+                error = FileExistsError(f"file already exists: {plan.relative}")
                 self._complete_state_rejection(
                     protected,
-                    pid=pid,
-                    target=resource,
+                    pid=plan.pid,
+                    target=plan.resource,
                     audit_action="primitive.filesystem.write_text.rejected",
-                    context=effect_context,
+                    context=plan.effect_context,
                     error=error,
                     intent_record=intent.get("record"),
                     resource_source="primitive.filesystem.write_text",
@@ -656,37 +782,87 @@ class FilesystemAdapter:
                 ProviderPhase("write", state_mutation=True, information_flow=True),
                 write_provider,
             )
-            result = FileWriteResult(path=relative, bytes_written=bytes_to_write, created=created)
-            result_payload = {"bytes_written": bytes_to_write, "created": created}
+            result = FileWriteResult(
+                path=plan.relative,
+                bytes_written=plan.bytes_to_write,
+                created=created,
+            )
+            result_payload = {
+                "bytes_written": plan.bytes_to_write,
+                "created": created,
+            }
             completed = protected.complete(
                 result,
                 self._protected_filesystem_evidence(
-                    pid,
-                    resource,
+                    plan.pid,
+                    plan.resource,
                     EventType.EXTERNAL_WRITE,
                     "primitive.filesystem.write_text",
-                    {"adapter": "filesystem", "path": relative, **result_payload},
-                    {"path": relative, **result_payload},
+                    {
+                        "adapter": "filesystem",
+                        "path": plan.relative,
+                        **result_payload,
+                    },
+                    {"path": plan.relative, **result_payload},
                     result_payload,
                     intent.get("record"),
                 ),
-                classification_context=effect_context,
+                classification_context=plan.effect_context,
                 classification_result=result_payload,
                 settle_success=lambda: self._bind_written_path_set(
-                    pid=pid,
-                    context=flow_context,
+                    pid=plan.pid,
+                    context=plan.flow_context,
                     parent_paths=missing_parent_paths,
-                    final_path=relative,
-                    final_content=text.encode(encoding),
+                    final_path=plan.relative,
+                    final_content=plan.text.encode(plan.encoding),
                 ),
                 resource=ResourceSettlement(
-                    usage=ResourceUsage(external_write_bytes=bytes_to_write),
+                    usage=ResourceUsage(
+                        external_write_bytes=plan.bytes_to_write
+                    ),
                     source="primitive.filesystem.write_text",
-                    context=effect_context,
+                    context=plan.effect_context,
                 ),
             )
-            self._data_flow().observe_ingress(self._data_flow().file_context(relative))
+            self._data_flow().observe_ingress(
+                self._data_flow().file_context(plan.relative)
+            )
             return completed
+
+    def _provider_write_text(self, plan: _TextWritePlan) -> None:
+        provider = plan.compare_and_swap_provider
+        if provider is None:
+            self.provider.write_text(
+                plan.target,
+                plan.text,
+                encoding=plan.encoding,
+                newline="\n",
+                overwrite=plan.overwrite,
+            )
+            return
+        expected_content_sha256 = plan.expected_content_sha256
+        if expected_content_sha256 is None:
+            raise RuntimeError("filesystem CAS write plan is missing its precondition")
+        provider.write_text_compare_and_swap(
+            plan.target,
+            plan.text,
+            encoding=plan.encoding,
+            newline="\n",
+            overwrite=plan.overwrite,
+            expected_content_sha256=expected_content_sha256,
+        )
+
+    def _compare_and_swap_provider(
+        self,
+        expected_content_sha256: str | None,
+    ) -> FilesystemCompareAndSwapProvider | None:
+        if expected_content_sha256 is None:
+            return None
+        if not isinstance(self.provider, FilesystemCompareAndSwapProvider):
+            raise ValidationError(
+                "filesystem provider does not support content compare-and-swap"
+            )
+        return self.provider
 
     def read_directory(
         self,
@@ -716,11 +892,12 @@ class FilesystemAdapter:
         estimated_metadata_bytes = self._directory_metadata_preflight_bytes(limit)
         with ExitStack() as stack:
             stack.enter_context(self._file_label_io_lock.hold(relative))
-            label_snapshot, label_state_version = (
-                self._data_flow().directory_label_snapshot(relative)
+            label_watch = stack.enter_context(
+                self._data_flow().watch_directory_labels(relative)
             )
-            external_context = self._data_flow().external_file_context()
-            directory_base_context = label_snapshot.get(relative, external_context)
+            initial_base_context, base_label_state = self._data_flow().file_snapshot(
+                relative
+            )
             invocation = ProtectedOperationInvocation(
                 pid=pid,
                 actor=pid,
@@ -731,7 +908,7 @@ class FilesystemAdapter:
                 preflight_usage=ResourceUsage(external_read_bytes=estimated_metadata_bytes),
                 resource_source="primitive.filesystem.read_directory",
                 resource_context={**effect_context, "estimated_metadata_bytes": estimated_metadata_bytes},
-                data_flow_ingress_context=directory_base_context,
+                data_flow_ingress_context=initial_base_context,
                 failure_evidence=lambda error, phase: self._protected_failure_evidence(
                     pid, resource, "primitive.filesystem.read_directory.failed", effect_context, error, phase
                 ),
@@ -768,7 +945,21 @@ class FilesystemAdapter:
                 raise error
             children = protected.call(
                 ProviderPhase("list", information_flow=True),
-                lambda: list(self.provider.list_directory(target, limit=limit + 1)),
+                self._provider_list_directory,
+                target,
+                max_entries=limit + 1,
+            )
+            child_paths = tuple(child.path for child in children)
+            label_snapshot, label_state_version = (
+                self._data_flow().directory_label_snapshot(
+                    relative,
+                    child_paths,
+                )
+            )
+            external_context = self._data_flow().external_file_context()
+            directory_base_context = label_snapshot.get(
+                relative,
+                initial_base_context,
             )
             directory_context = DataFlowContext.aggregate(
                 [
@@ -779,16 +970,29 @@ class FilesystemAdapter:
                     ),
                 ]
             )
+            current_snapshot, current_label_state = (
+                self._data_flow().directory_label_snapshot(
+                    relative,
+                    child_paths,
+                )
+            )
+            base_label_changed = (
+                self._data_flow().file_state_version(relative)
+                != base_label_state
+            )
             if (
-                self._data_flow().directory_label_state_version(relative)
-                != label_state_version
+                label_watch.changed
+                or base_label_changed
+                or current_label_state != label_state_version
             ):
                 self._data_flow().observe_ingress(
                     DataFlowContext.aggregate(
-                        (
+                        [
                             directory_context,
-                            self._data_flow().file_context(relative),
-                        )
+                            initial_base_context,
+                            label_watch.context,
+                            *current_snapshot.values(),
+                        ]
                     )
                 )
                 raise CapabilityDenied(
@@ -1712,9 +1916,41 @@ class FilesystemAdapter:
 
     def _provider_read_bytes(self, target: ResolvedPath, *, max_bytes: int) -> bytes:
         try:
-            return self.provider.read_bytes(target, max_bytes=max_bytes)
+            result = self.provider.read_bytes(target, max_bytes=max_bytes)
         except TypeError as exc:
             raise ValidationError("filesystem provider must support max_bytes-limited reads") from exc
+        if type(result) is not bytes:
+            raise ValidationError("filesystem provider read_bytes must return bytes")
+        if len(result) > max_bytes:
+            raise ValidationError(
+                "filesystem provider read_bytes exceeded the requested max_bytes limit"
+            )
+        return result
+
+    def _provider_list_directory(
+        self,
+        target: ResolvedPath,
+        *,
+        max_entries: int,
+    ) -> list[Any]:
+        entries = self.provider.list_directory(target, limit=max_entries)
+        iterator: Iterator[Any] | None = None
+        try:
+            iterator = iter(entries)
+            return list(islice(iterator, max_entries))
+        finally:
+            try:
+                if iterator is not None:
+                    self._close_provider_iterable(iterator)
+            finally:
+                if entries is not iterator:
+                    self._close_provider_iterable(entries)
+
+    @staticmethod
+    def _close_provider_iterable(value: Any) -> None:
+        close = getattr(value, "close", None)
+        if callable(close):
+            close()
 
     def _directory_metadata_bytes(self, entries: Iterable[Any]) -> int:
         payload = [getattr(entry, "__dict__", {"entry": str(entry)}) for entry in entries]
@@ -1821,6 +2057,7 @@ class FilesystemAdapter:
         encoding: str,
         overwrite: bool,
         source_oids: Iterable[str] | None = None,
+        expected_content_sha256: str | None = None,
     ) -> tuple[CapabilityDecision, dict[str, Any]]:
         return self._require_write_operation(
             pid=pid,
@@ -1833,10 +2070,25 @@ class FilesystemAdapter:
             extra_context={
                 "encoding": encoding,
                 "overwrite": overwrite,
+                "expected_content_sha256": expected_content_sha256,
                 **self._content_context(text, encoding),
             },
             source_oids=source_oids,
         )
+
+    @staticmethod
+    def _validate_expected_content_sha256(value: str | None) -> str | None:
+        if value is None or value == "missing":
+            return value
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValidationError(
+                "expected_content_sha256 must be 'missing' or 64 lowercase hexadecimal characters"
+            )
+        return value
 
     def _reject_definite_permission_denial(
         self,
@@ -2203,12 +2455,8 @@ class FilesystemAdapter:
         return repr(preview), len(text) > selected_limit
 
     def _decode_text_prefix(self, data: bytes, encoding: str, *, truncated: bool) -> str:
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError as exc:
-            if truncated and exc.end == len(data):
-                return data[: exc.start].decode(encoding)
-            raise
+        decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+        return decoder.decode(data, final=not truncated)
 
     def _bounded_positive_int(self, value: int, *, label: str, hard_limit: int) -> int:
         if isinstance(value, bool):

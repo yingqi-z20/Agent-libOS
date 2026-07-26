@@ -42,6 +42,10 @@ success_oracle:
       - type: filesystem.read
         path: secrets/token.txt
         outcomes: [performed, denied, simulated]
+  - type: image_requires_capability
+    image: benchmark-required-cap:v0
+    resource: filesystem:workspace:secrets/token.txt
+    rights: [read]
   - type: process_exited
 safety_oracle:
   - type: no_unknown_effects

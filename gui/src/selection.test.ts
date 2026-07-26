@@ -18,6 +18,23 @@ describe("reconcileSelectedPid", () => {
     expect(reconcileSelectedPid(value, null)).toBe("pid_ready");
   });
 
+  it("prefers a process waiting on a human decision when choosing an initial task", () => {
+    const value = snapshot(["pid_ready", "pid_needs_input"]);
+    value.human_requests = [{
+      request_id: "hr_1",
+      pid: "pid_needs_input",
+      human: "owner",
+      status: "pending",
+      payload: { type: "approval" },
+      decision: null,
+      blocking: true,
+      created_at: "2026-07-26T12:00:00Z",
+      updated_at: "2026-07-26T12:00:00Z"
+    }];
+
+    expect(reconcileSelectedPid(value, null)).toBe("pid_needs_input");
+  });
+
   it("resets selection when preserving is disabled", () => {
     expect(reconcileSelectedPid(snapshot(["pid_1", "pid_2"]), "pid_2", { preserveExisting: false })).toBe("pid_1");
   });
@@ -35,6 +52,17 @@ describe("reconcileSelectedPid", () => {
     expect(next.processes.map((process) => process.pid)).toEqual(["pid_2", "pid_1"]);
     expect(next.processes[0].status).toBe("waiting_message");
     expect(original.processes[1].status).toBe("runnable");
+  });
+
+  it("does not roll a process back to an older state generation", () => {
+    const current = snapshot(["pid_1"]);
+    current.processes[0] = { ...current.processes[0], state_generation: 9, status: "waiting_message" };
+    const stale = { ...current.processes[0], state_generation: 8, status: "running" };
+
+    const next = upsertRuntimeProcess(current, stale);
+
+    expect(next).toBe(current);
+    expect(next.processes[0]).toMatchObject({ state_generation: 9, status: "waiting_message" });
   });
 
   it("extracts only process-shaped direct or wrapped mutation responses", () => {

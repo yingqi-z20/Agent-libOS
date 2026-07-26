@@ -8,7 +8,7 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import ToolSpec
+from agent_libos.models import AgentImage, ToolSpec
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.modules.context import ModuleContext, ModuleRuntimeView
 from agent_libos.modules.schema import ModuleManifest, ModuleProvides
@@ -74,6 +74,42 @@ def test_module_context_rejects_direct_tool_buffer_mutation() -> None:
     context.tools.append(_CountingTool("bypassed", calls))  # type: ignore[arg-type]
 
     with pytest.raises(ValidationError, match="added through register_tool"):
+        context.registered_summary()
+
+
+@pytest.mark.parametrize(
+    ("surface", "expected_registration_method"),
+    [
+        ("images", "register_image"),
+        ("syscalls", "register_syscall"),
+        ("provider_hooks", "register_provider_hook"),
+        ("startup_hooks", "add_startup_hook"),
+        (
+            "durable_object_release_finalizers",
+            "bind_durable_object_release_finalizer",
+        ),
+    ],
+)
+def test_module_context_rejects_direct_registration_buffer_mutation(
+    surface: str,
+    expected_registration_method: str,
+) -> None:
+    context = _context(declared_tools=())
+    if surface == "images":
+        context.images.append(AgentImage(image_id="hidden:v0", name="hidden"))
+    elif surface == "syscalls":
+        context.syscalls["hidden.call"] = lambda _session, _args: None
+    elif surface == "provider_hooks":
+        context.provider_hooks["hidden_provider"].append(lambda _host: None)
+    elif surface == "startup_hooks":
+        context.startup_hooks["hidden_startup"] = lambda _host: None
+    else:
+        context.durable_object_release_finalizers["hidden.finalizer"] = (
+            lambda *_args: {},
+            lambda *_args: None,
+        )
+
+    with pytest.raises(ValidationError, match=expected_registration_method):
         context.registered_summary()
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+import os
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
@@ -23,17 +25,40 @@ _OUTPUT_PATH_DESCRIPTION = (
 
 
 def normalize_process_path_argument(path: str, cwd: str) -> str:
-    """Normalize separators without stripping cwd-relative path segments."""
+    """Normalize only host path separators without changing path identity."""
 
     del cwd
-    return str(path).replace("\\", "/")
+    normalized = str(path)
+    has_windows_drive = os.name == "nt" and bool(os.path.splitdrive(normalized)[0])
+    if os.path.isabs(normalized) or has_windows_drive:
+        raise ValueError("path must be relative to the process working directory")
+    if os.name == "nt":
+        return normalized.replace("\\", "/")
+    return normalized
 
 
-class WriteTextFileArgs(BaseModel):
+class _WorkspaceFilesystemArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("path", check_fields=False)
+    @classmethod
+    def validate_relative_path(cls, value: str) -> str:
+        return normalize_process_path_argument(value, "")
+
+
+class WriteTextFileArgs(_WorkspaceFilesystemArgs):
     path: str = Field(description=_FILE_PATH_DESCRIPTION)
     content: str = Field(description="Exact text content to encode and write using `encoding`.")
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     overwrite: bool = Field(default=True, description="Whether to overwrite an existing file.")
+    expected_content_sha256: str | None = Field(
+        default=None,
+        pattern=r"^(?:missing|[0-9a-f]{64})$",
+        description=(
+            "Optional compare-and-swap precondition: 'missing' requires creation, "
+            "or provide the full-content SHA-256 returned by read_text_file."
+        ),
+    )
 
 
 class WriteTextFileOutput(BaseModel):
@@ -42,7 +67,7 @@ class WriteTextFileOutput(BaseModel):
     created: bool
 
 
-class ReadTextFileArgs(BaseModel):
+class ReadTextFileArgs(_WorkspaceFilesystemArgs):
     path: str = Field(description=_FILE_PATH_DESCRIPTION)
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     max_bytes: int = Field(
@@ -59,6 +84,11 @@ class ReadTextFileOutput(BaseModel):
     encoding: str = Field(description="Encoding that successfully decoded this returned text prefix.")
     bytes_read: int
     truncated: bool
+    content_sha256: str | None = Field(
+        description=(
+            "Stable SHA-256 of the complete raw file bytes, or null when the read was truncated."
+        )
+    )
 
 
 class DirectoryEntryOutput(BaseModel):
@@ -69,7 +99,7 @@ class DirectoryEntryOutput(BaseModel):
     modified_at: str
 
 
-class ReadDirectoryArgs(BaseModel):
+class ReadDirectoryArgs(_WorkspaceFilesystemArgs):
     path: str = Field(description=_DIRECTORY_PATH_DESCRIPTION)
     limit: int = Field(
         default=_TOOL_DEFAULTS.directory_entry_limit,
@@ -86,7 +116,7 @@ class ReadDirectoryOutput(BaseModel):
     truncated: bool = Field(description="Whether entries were omitted; this tool has no cursor or offset.")
 
 
-class WriteDirectoryArgs(BaseModel):
+class WriteDirectoryArgs(_WorkspaceFilesystemArgs):
     path: str = Field(description=_DIRECTORY_PATH_DESCRIPTION)
     parents: bool = Field(default=True, description="Whether to create missing parent directories.")
     exist_ok: bool = Field(default=True, description="Whether an existing directory is accepted.")
@@ -97,12 +127,12 @@ class WriteDirectoryOutput(BaseModel):
     created: bool
 
 
-class DeleteFileArgs(BaseModel):
+class DeleteFileArgs(_WorkspaceFilesystemArgs):
     path: str = Field(description=_FILE_PATH_DESCRIPTION)
     missing_ok: bool = Field(default=False, description="Whether a missing file should be treated as success.")
 
 
-class DeleteDirectoryArgs(BaseModel):
+class DeleteDirectoryArgs(_WorkspaceFilesystemArgs):
     path: str = Field(description=_DIRECTORY_PATH_DESCRIPTION)
     recursive: bool = Field(default=False, description="Whether to delete a non-empty directory recursively.")
     missing_ok: bool = Field(default=False, description="Whether a missing directory should be treated as success.")
@@ -161,6 +191,7 @@ class ReadTextFileTool(SyncAgentTool[ReadTextFileArgs]):
             encoding=args.encoding,
             bytes_read=result.bytes_read,
             truncated=result.truncated,
+            content_sha256=result.content_sha256,
         )
 
 
@@ -235,6 +266,7 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
                 text=args.content,
                 encoding=args.encoding,
                 overwrite=args.overwrite,
+                expected_content_sha256=args.expected_content_sha256,
                 cwd=cwd,
             )
         except FileExistsError as exc:

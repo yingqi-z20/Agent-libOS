@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ExplainOperationResponse, OperationEvidence, OperationSummary } from "../api/types";
-import { buildOperationChildren, filterOperationEvidence, mergeEvidencePage } from "./ExplainPanel";
+import { buildOperationChildren, filterOperationEvidence, mergeEvidencePage, operationIdForRefresh } from "./ExplainPanel";
 
 describe("ExplainPanel", () => {
   it("builds explicit causal children without using timestamps", () => {
@@ -52,6 +52,13 @@ describe("ExplainPanel", () => {
 
     expect(merged.evidence).toHaveLength(1);
     expect(merged.evidence[0].roles).toEqual(["audit", "decision"]);
+  });
+
+  it("preserves an exact selected operation even when it is not on the refreshed first page", () => {
+    const firstPage = [operation("op_new", null, "runtime")];
+    expect(operationIdForRefresh("op_selected", firstPage, false)).toBe("op_selected");
+    expect(operationIdForRefresh(null, firstPage, true)).toBeNull();
+    expect(operationIdForRefresh(null, firstPage, false)).toBe("op_new");
   });
 });
 

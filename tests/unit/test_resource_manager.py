@@ -15,9 +15,28 @@ from agent_libos.models import (
     ResourceUsage,
 )
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
+from tests.support.public_errors import assert_public_error_message
 
 
 class TestResourceManager:
+    def test_invalid_resource_usage_does_not_echo_unknown_field_names(self) -> None:
+        runtime = Runtime.open("local")
+        sentinel = "secret-unknown-resource-field"
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="resource validation")
+
+            with pytest.raises(ValidationError) as caught:
+                runtime.resources.preflight(
+                    pid,
+                    {sentinel: 1},
+                    source="test",
+                )
+
+            assert str(caught.value) == "resource usage contains unknown fields"
+            assert sentinel not in str(caught.value)
+        finally:
+            runtime.close()
+
     def test_hierarchical_charge_rolls_back_every_process_when_parent_update_fails(self) -> None:
         runtime = Runtime.open("local")
         try:
@@ -84,12 +103,15 @@ class TestResourceManager:
             child = runtime.process.spawn_child(parent, goal='remaining child cleanup')
             original_finalize = runtime.process._finalize_terminal_process
             finalized: list[str] = []
+            fail_parent = True
+            failure_text = 'injected parent cleanup failure'
 
             def fail_parent_once(process: object, preserve_oids: set[str]) -> None:
+                nonlocal fail_parent
                 selected_pid = str(getattr(process, 'pid'))
                 finalized.append(selected_pid)
-                if selected_pid == parent:
-                    raise RuntimeError('injected parent cleanup failure')
+                if selected_pid == parent and fail_parent:
+                    raise RuntimeError(failure_text)
                 original_finalize(process, preserve_oids)
 
             monkeypatch.setattr(runtime.process, '_finalize_terminal_process', fail_parent_once)
@@ -98,9 +120,36 @@ class TestResourceManager:
             runtime.resources.kill_if_exceeded(parent, reason='test best-effort descendant cleanup')
 
             assert finalized == [parent, child]
-            assert any(
+            parent_cleanup = runtime.process.terminal_cleanup_state(parent)
+            child_cleanup = runtime.process.terminal_cleanup_state(child)
+            assert parent_cleanup['state'] == 'failed'
+            assert parent_cleanup['failed_phase'] == 'process_finalize'
+            assert parent_cleanup['completed_phases'] == ['terminal_notify']
+            assert parent_cleanup['last_error']['error_type'] == 'RuntimeError'
+            assert len(parent_cleanup['last_error']['exception_text']['sha256']) == 64
+            assert child_cleanup['state'] == 'completed'
+            warnings = [
+                record
+                for record in runtime.audit.trace()
+                if record.action == 'resource.limit_finalize_failed'
+            ]
+            assert len(warnings) == 1
+            warning = warnings[0].decision['errors'][0]
+            assert warning['phase'] == 'process_finalize'
+            assert warning['code'] == 'killed_process_finalization_failed'
+            assert warning['correlation_id'].startswith('corr_')
+            assert warning['error_type'] == 'RuntimeError'
+            assert len(warning['exception_text']['sha256']) == 64
+            assert failure_text not in str(warnings[0].decision)
+
+            fail_parent = False
+            repaired = runtime.process.retry_terminal_cleanup(parent)
+            assert repaired['state'] == 'completed'
+            assert repaired['attempt_count'] == 2
+            assert finalized == [parent, child, parent]
+            assert not any(
                 record.action == 'resource.limit_finalize_failed'
-                and 'injected parent cleanup failure' in str(record.decision)
+                and failure_text in str(record.decision)
                 for record in runtime.audit.trace()
             )
         finally:
@@ -122,21 +171,165 @@ class TestResourceManager:
             )
             notified: list[str] = []
             runtime.process.bind_object_task_terminal_notifier(notified.append)
+            original_finalize = runtime.process._finalize_terminal_process
+            failure_text = 'injected killed finalizer failure'
 
             def fail_finalize(process: object, preserve_oids: set[str]) -> None:
-                raise RuntimeError('injected killed finalizer failure')
+                raise RuntimeError(failure_text)
 
             monkeypatch.setattr(runtime.process, '_finalize_terminal_process', fail_finalize)
 
-            with pytest.raises(RuntimeError, match='process_finalize.*injected killed finalizer failure'):
+            with pytest.raises(RuntimeError) as caught:
                 runtime.process.finalize_killed_processes([pid], reason='test independent phases')
 
+            correlation_id = assert_public_error_message(
+                str(caught.value),
+                code='killed_process_finalization_failed',
+                error_type='RuntimeError',
+                forbidden=[failure_text],
+            )
+            failures = caught.value.finalization_failures  # type: ignore[attr-defined]
+            assert len(failures) == 1
+            assert failures[0]['pid'] == pid
+            assert failures[0]['phase'] == 'terminal_cleanup'
+            assert failures[0]['error_type'] == 'ProcessTerminalCleanupRequired'
+            assert failures[0]['correlation_id'] == correlation_id
+            assert failure_text not in str(failures)
             assert notified == [pid]
-            assert any(
+            matching_events = [
                 event.type == EventType.PROCESS_EXITED
                 and event.source == pid
                 and event.payload.get('reason') == 'test independent phases'
                 for event in runtime.events.list()
+            ]
+            assert sum(matching_events) == 1
+            cleanup = runtime.process.terminal_cleanup_state(pid)
+            assert cleanup['state'] == 'failed'
+            assert cleanup['failed_phase'] == 'process_finalize'
+            assert cleanup['completed_phases'] == ['terminal_notify']
+            assert cleanup['last_error']['error_type'] == 'RuntimeError'
+            assert len(cleanup['last_error']['exception_text']['sha256']) == 64
+
+            monkeypatch.setattr(
+                runtime.process,
+                '_finalize_terminal_process',
+                original_finalize,
+            )
+            repaired = runtime.process.retry_terminal_cleanup(pid)
+            assert repaired['state'] == 'completed'
+            assert repaired['attempt_count'] == 2
+            assert notified == [pid]
+
+            runtime.process.finalize_killed_processes(
+                [pid],
+                reason='test independent phases',
+            )
+            runtime.process.finalize_killed_processes(
+                [pid],
+                reason='test independent phases',
+            )
+            assert sum(
+                event.type == EventType.PROCESS_EXITED
+                and event.source == pid
+                and event.payload.get('reason') == 'test independent phases'
+                for event in runtime.events.list()
+            ) == 1
+
+            with pytest.raises(RuntimeError) as collision:
+                runtime.process.finalize_killed_processes(
+                    [pid],
+                    reason='conflicting terminal identity',
+                )
+            assert_public_error_message(
+                str(collision.value),
+                code='killed_process_finalization_failed',
+                error_type='RuntimeError',
+                forbidden=['conflicting terminal identity'],
+            )
+            collision_failures = collision.value.finalization_failures  # type: ignore[attr-defined]
+            assert collision_failures[0]['phase'] == 'exit_event'
+            assert collision_failures[0]['error_type'] == 'ValidationError'
+            assert sum(
+                event.type == EventType.PROCESS_EXITED
+                and event.source == pid
+                for event in runtime.events.list()
+            ) == 1
+        finally:
+            runtime.close()
+
+    def test_killed_process_finalization_sanitizes_base_exceptions_and_continues(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pids = [
+                runtime.process.spawn(goal='interrupted killed cleanup'),
+                runtime.process.spawn(goal='remaining killed cleanup'),
+            ]
+            for pid in pids:
+                process = runtime.process.get(pid)
+                runtime.process_transitions.transition(
+                    pid,
+                    ProcessStatus.KILLED,
+                    expected_revision=process.revision,
+                    outcome=KilledProcessOutcome(code='test_fixture'),
+                )
+
+            original_emit = runtime.process._emit_killed_process_exit_event
+            secret = 'private:///terminal-interrupt-token'
+
+            def interrupt_first(process: object, *, reason: str) -> None:
+                if getattr(process, 'pid') == pids[0]:
+                    raise KeyboardInterrupt(secret)
+                original_emit(process, reason=reason)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(
+                runtime.process,
+                '_emit_killed_process_exit_event',
+                interrupt_first,
+            )
+
+            with pytest.raises(BaseExceptionGroup) as caught:
+                runtime.process.finalize_killed_processes(
+                    pids,
+                    reason='base exception cleanup',
+                )
+
+            group = caught.value
+            failures = group.finalization_failures  # type: ignore[attr-defined]
+            assert failures[0]['pid'] == pids[0]
+            assert failures[0]['phase'] == 'exit_event'
+            assert failures[0]['error_type'] == 'KeyboardInterrupt'
+            assert secret not in repr(group)
+            assert secret not in repr(group.exceptions)
+            assert secret not in repr(failures)
+            assert all(
+                runtime.process.terminal_cleanup_state(pid)['state'] == 'completed'
+                for pid in pids
+            )
+            assert any(
+                event.type == EventType.PROCESS_EXITED
+                and event.source == pids[1]
+                for event in runtime.events.list()
+            )
+
+            monkeypatch.setattr(
+                runtime.process,
+                '_emit_killed_process_exit_event',
+                original_emit,
+            )
+            runtime.process.finalize_killed_processes(
+                pids,
+                reason='base exception cleanup',
+            )
+            assert all(
+                sum(
+                    event.type == EventType.PROCESS_EXITED
+                    and event.source == pid
+                    for event in runtime.events.list()
+                ) == 1
+                for pid in pids
             )
         finally:
             runtime.close()
@@ -167,7 +360,10 @@ class TestResourceManager:
             usage = ResourceUsage(tool_calls=1)
             usage.tool_calls = 0.5
 
-            with pytest.raises(ValidationError, match="integer"):
+            with pytest.raises(
+                ValidationError,
+                match="resource usage values are invalid",
+            ):
                 runtime.resources.charge(pid, usage, source="test")
         finally:
             runtime.close()
@@ -179,7 +375,10 @@ class TestResourceManager:
             usage = ResourceUsage(tool_calls=1)
             usage.tool_calls = float("nan")
 
-            with pytest.raises(ValidationError, match="finite"):
+            with pytest.raises(
+                ValidationError,
+                match="resource usage values are invalid",
+            ):
                 runtime.resources.charge(pid, usage, source="test")
         finally:
             runtime.close()

@@ -38,6 +38,9 @@ Writes text from one named Object to a governed file. Inputs are exact `name`, o
 - Export `encoding` is independent. The tool does not reuse an import's recorded encoding; equal Unicode text can produce different bytes.
 - Prefer `overwrite=false` for new destinations and uncertain retries. Use true only for an intended replacement. Missing parent directories may be created; returned `created` describes only the final file.
 - Export needs namespace/Object read, exact-file write, and allowed label egress. Object read or finite grant consumption may precede a later write/approval failure.
+- The Host revalidates the exact source Object snapshot immediately before
+  egress. If its version/content changes after lookup, export fails before the
+  file write rather than writing a stale snapshot.
 - Success returns `oid`, `namespace`, `name`, canonical `path`, `bytes_written`, and `created`. It returns no text, digest, fsync evidence, or comparison with an original source.
 
 Activation grants no authority. For binary/byte-exact transfer, use an explicitly visible Host byte tool and its Skill; if none exists, stop.
@@ -72,6 +75,9 @@ A round trip can preserve stored Unicode text while changing encoded bytes. It c
 - Unsupported export payload: read it and explicitly create an authorized text projection. Do not claim arbitrary JSON serialization.
 - Existing destination: with `overwrite=false`, inspect and compare. Finish without writing if it is already correct; otherwise obtain clear replacement intent.
 - Ambiguous export: inspect the exact destination before retrying and retain `overwrite=false` unless replacement was intended. Timeout is not evidence that no file was written.
+- Source snapshot conflict: re-read the exact Object version/content and retry
+  only after deciding that the new snapshot is the intended export. The failed
+  stale-snapshot attempt does not create or replace the destination.
 - Authority/approval/label denial: correct authority or destination; never reroute to evade policy.
 - Runtime reopen: recover imported content from the authoritative file or a checkpoint/image that captured it; do not infer vanished payload from durable OID metadata.
 

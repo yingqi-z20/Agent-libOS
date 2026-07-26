@@ -135,6 +135,29 @@ def test_static_check_rejects_provider_call_outside_sdk_phase(tmp_path: Path) ->
     assert any("outside an active ProtectedOperation phase" in error for error in errors)
 
 
+def test_static_check_rejects_locally_aliased_provider_call(tmp_path: Path) -> None:
+    source = tmp_path / "aliased_provider.py"
+    source.write_text(
+        "class UnsafePrimitive:\n"
+        "    def unsafe(self):\n"
+        "        provider = self.provider\n"
+        "        forwarded = provider\n"
+        "        return forwarded.call()\n",
+        encoding="utf-8",
+    )
+
+    errors = scan_source(
+        source,
+        relative=Path("agent_libos/primitives/aliased_provider.py"),
+    )
+
+    assert any(
+        "provider method call is called outside an active ProtectedOperation phase"
+        in error
+        for error in errors
+    )
+
+
 def test_static_check_rejects_protected_provider_helper_called_directly(tmp_path: Path) -> None:
     source = tmp_path / "bad_helper.py"
     source.write_text(
@@ -172,6 +195,31 @@ def test_static_check_accepts_callback_invoked_only_inside_sdk_phase(tmp_path: P
     assert scan_source(
         source,
         relative=Path("agent_libos/primitives/safe_gateway.py"),
+    ) == []
+
+
+def test_static_check_accepts_callback_forwarded_through_scoped_gateway(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "safe_forwarding_gateway.py"
+    source.write_text(
+        "class SafePrimitive:\n"
+        "    def protected_gateway(self, callback):\n"
+        "        def dispatch():\n"
+        "            return callback()\n"
+        "        return self.operation.call(ProviderPhase('call'), dispatch)\n"
+        "    def scoped_gateway(self, callback):\n"
+        "        return self.protected_gateway(callback)\n"
+        "    def public(self):\n"
+        "        def provider_phase():\n"
+        "            return self.provider.call()\n"
+        "        return self.scoped_gateway(provider_phase)\n",
+        encoding="utf-8",
+    )
+
+    assert scan_source(
+        source,
+        relative=Path("agent_libos/primitives/safe_forwarding_gateway.py"),
     ) == []
 
 

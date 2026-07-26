@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { AlertTriangle, Bot, CheckCircle2, MessageSquare, Radio, UserRound } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, ArrowDown, Bot, CheckCircle2, MessageSquare, Radio, UserRound } from "lucide-react";
 import type { AuditRecord, HumanRequest, LlmCall, ProcessMessage, RuntimeEvent } from "../api/types";
 import { useI18n, type TranslationKey } from "../i18n";
 import { CollapsibleJson } from "./CollapsibleJson";
@@ -26,6 +26,7 @@ const timelineFilterLabels: Record<TimelineFilter, TranslationKey> = {
   event: "timeline.filter.event",
   audit: "timeline.filter.audit"
 };
+export const TIMELINE_LATEST_THRESHOLD_PX = 96;
 
 export function Timeline({
   pid,
@@ -52,65 +53,161 @@ export function Timeline({
   );
   const counts = useMemo(() => countTimelineItemsByKind(items), [items]);
   const filteredItems = useMemo(() => filterTimelineItems(items, filter), [filter, items]);
+  const timelineRef = useRef<HTMLElement>(null);
+  const followedPidRef = useRef(pid);
+  const followLatestRef = useRef(true);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const latestItemKey = filteredItems.length > 0
+    ? timelineItemKey(filteredItems[filteredItems.length - 1])
+    : null;
+  const itemsRevision = useMemo(
+    () => filteredItems.map(timelineItemRevision).join("\n"),
+    [filteredItems]
+  );
+
+  useEffect(() => {
+    const processChanged = followedPidRef.current !== pid;
+    followedPidRef.current = pid;
+    if (processChanged) followLatestRef.current = true;
+
+    const container = timelineRef.current;
+    if (!container) return;
+    if (followLatestRef.current) {
+      container.scrollTop = container.scrollHeight;
+      setShowJumpToLatest(false);
+      return;
+    }
+
+    const nearLatest = isTimelineNearLatest(container);
+    followLatestRef.current = nearLatest;
+    setShowJumpToLatest(!nearLatest);
+  }, [filter, filteredItems.length, itemsRevision, latestItemKey, pid]);
+
+  function scrollToLatest() {
+    const container = timelineRef.current;
+    if (!container) return;
+    const reducedMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: reducedMotion ? "auto" : "smooth"
+    });
+    followLatestRef.current = true;
+    setShowJumpToLatest(false);
+  }
 
   if (!pid) return <div className="empty">{t("timeline.selectProcess")}</div>;
   if (items.length === 0) return <div className="empty">{t("timeline.empty")}</div>;
 
   return (
-    <section className="timeline" aria-label={t("timeline.label")}>
-      <div className="timelineFilter" role="group" aria-label={t("timeline.filterLabel")}>
-        {timelineFilters.map((option) => {
-          const count = option === "all"
-            ? items.length
-            : option === "activity"
-              ? counts.message + counts.human + counts.llm
-              : counts[option];
-          const active = filter === option;
-          return (
-            <button
-              type="button"
-              key={option}
-              className={active ? "active" : ""}
-              aria-pressed={active}
-              onClick={() => setFilter(option)}
-            >
-              {t(timelineFilterLabel(option))}
-              <span className="timelineFilterCount">{count}</span>
-            </button>
-          );
-        })}
-      </div>
-      <div className="timelineEntries">
-        {filteredItems.length === 0 ? (
-          <div className="empty timelineEmpty">{t("timeline.filterEmpty")}</div>
-        ) : filteredItems.map((entry, index) => (
-          <article className={`timelineItem ${entry.kind}`} key={`${entry.kind}-${entry.time}-${index}`}>
-            <div className="timelineIcon">{icon(entry)}</div>
-            <div className="timelineBody">
-              <div className="timelineHeader">
-                <strong>{title(entry, t)}</strong>
-                <time>{formatTime(entry.time)}</time>
+    <div className="timelineShell" style={{ minHeight: 0, overflow: "hidden", position: "relative" }}>
+      <section
+        ref={timelineRef}
+        className="timeline"
+        aria-label={t("timeline.label")}
+        role="region"
+        tabIndex={0}
+        style={{ height: "100%" }}
+        onScroll={(event) => {
+          const nearLatest = isTimelineNearLatest(event.currentTarget);
+          followLatestRef.current = nearLatest;
+          setShowJumpToLatest(!nearLatest);
+        }}
+      >
+        <div className="timelineFilter" role="group" aria-label={t("timeline.filterLabel")}>
+          {timelineFilters.map((option) => {
+            const count = option === "all"
+              ? items.length
+              : option === "activity"
+                ? counts.message + counts.human + counts.llm
+                : counts[option];
+            const active = filter === option;
+            return (
+              <button
+                type="button"
+                key={option}
+                className={active ? "active" : ""}
+                aria-pressed={active}
+                onClick={() => setFilter(option)}
+              >
+                {t(timelineFilterLabel(option))}
+                <span className="timelineFilterCount">{count}</span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="timelineEntries" role="log" aria-live="polite" aria-relevant="additions text">
+          {filteredItems.length === 0 ? (
+            <div className="empty timelineEmpty">{t("timeline.filterEmpty")}</div>
+          ) : filteredItems.map((entry) => (
+            <article className={`timelineItem ${entry.kind}`} key={timelineItemKey(entry)}>
+              <div className="timelineIcon">{icon(entry)}</div>
+              <div className="timelineBody">
+                <div className="timelineHeader">
+                  <strong>{title(entry, t)}</strong>
+                  <time>{formatTime(entry.time)}</time>
+                </div>
+                <p className="timelineSummary" title={summary(entry, t)}>{summary(entry, t)}</p>
+                {evidenceRef(entry) && onExplainEvidence ? (
+                  <button
+                    type="button"
+                    className="timelineExplain"
+                    onClick={() => {
+                      const ref = evidenceRef(entry);
+                      if (ref) onExplainEvidence(ref.kind, ref.id);
+                    }}
+                  >
+                    {t("timeline.explain")}
+                  </button>
+                ) : null}
+                <div className="timelineJsonOperation" role="group" aria-live="off">
+                  <CollapsibleJson value={entry.item} />
+                </div>
               </div>
-              <p className="timelineSummary" title={summary(entry, t)}>{summary(entry, t)}</p>
-              {evidenceRef(entry) && onExplainEvidence ? (
-                <button
-                  type="button"
-                  className="timelineExplain"
-                  onClick={() => {
-                    const ref = evidenceRef(entry);
-                    if (ref) onExplainEvidence(ref.kind, ref.id);
-                  }}
-                >
-                  {t("timeline.explain")}
-                </button>
-              ) : null}
-              <CollapsibleJson value={entry.item} />
-            </div>
-          </article>
-        ))}
-      </div>
-    </section>
+            </article>
+          ))}
+        </div>
+      </section>
+      {showJumpToLatest ? (
+        <button
+          type="button"
+          className="jumpToLatest timelineJumpToLatest"
+          style={{ bottom: 12 }}
+          onClick={scrollToLatest}
+        >
+          <ArrowDown size={14} aria-hidden="true" />{t("user.jumpToLatest")}
+        </button>
+      ) : null}
+    </div>
   );
+}
+
+export function isTimelineNearLatest(
+  metrics: Pick<HTMLElement, "clientHeight" | "scrollHeight" | "scrollTop">,
+  threshold = TIMELINE_LATEST_THRESHOLD_PX
+): boolean {
+  return metrics.scrollHeight - metrics.scrollTop - metrics.clientHeight < threshold;
+}
+
+export function timelineItemKey(entry: TimelineItem): string {
+  if (entry.kind === "message") return `message-${entry.item.message_id}`;
+  if (entry.kind === "human") return `human-${entry.item.request_id}`;
+  if (entry.kind === "llm") return `llm-${entry.item.call_id}`;
+  if (entry.kind === "event") return `event-${entry.item.event_id}`;
+  return `audit-${entry.item.record_id}`;
+}
+
+export function timelineItemRevision(entry: TimelineItem): string {
+  const key = timelineItemKey(entry);
+  if (entry.kind === "message") return `${key}:${entry.item.status}:${contentRevision(entry.item.subject)}:${contentRevision(entry.item.body)}`;
+  if (entry.kind === "human") return `${key}:${entry.item.status}:${entry.item.updated_at}`;
+  if (entry.kind === "llm") {
+    return `${key}:${entry.item.status}:${entry.item.completed_at ?? ""}:${contentRevision(entry.item.response_content)}:${entry.item.error ?? ""}`;
+  }
+  return key;
+}
+
+function contentRevision(value: string): string {
+  return `${value.length}:${value.slice(0, 64)}:${value.slice(-64)}`;
 }
 
 export function evidenceRef(entry: TimelineItem): { kind: string; id: string } | null {

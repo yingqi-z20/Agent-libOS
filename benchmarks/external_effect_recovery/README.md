@@ -3,13 +3,17 @@
 This benchmark populates a large file-backed SQLite history, closes the writer,
 reopens the persisted runtime store, first probes the typed
 `ExternalEffectRecoveryQuery`, and then assembles a real `Runtime` over that
-store so `ProtectedOperationSDK.recover_prepared()` processes the backlog. It
-fails on structural regressions: query work must remain proportional to pending
-pages, raw rows may include only one look-ahead row per non-final page, initial
-and resumed queries must use the matching recovery index, the handler must
-leave no pending prepared rows, and Runtime diagnostics may retain at most one
-page of effect IDs. A guarded legacy-list method also makes the benchmark fail
-if startup falls back to loading complete external-effect history. Connection
+store so `ProtectedOperationSDK.recover_prepared()` processes the backlog. Each
+pending effect is seeded with its matching durable operation/evidence binding,
+as required by production prepared-operation recovery. It fails on structural
+regressions: external-effect page-query work must remain proportional to
+pending pages, raw page rows may include only one look-ahead row per non-final
+page, initial and resumed queries must use the matching recovery index, the
+handler must leave no pending prepared rows, and Runtime diagnostics may retain
+at most one page of effect IDs. Per-effect operation/evidence identity checks
+remain proportional to pending records and are separate from these page-scan
+work units. A guarded legacy-list method also makes the benchmark fail if
+startup falls back to loading complete external-effect history. Connection
 tracing covers the read-only preflight connection, the main connection from its
 creation through full schema initialization, and the complete Runtime handler
 window, including statements issued through `_query`, `_execute`, the
@@ -22,6 +26,12 @@ shapes are recognized. The gate also verifies the exact recovery-index columns
 and search constraints and uses SQL aggregation to prove every expected seeded
 identity reaches its expected final classification without materializing the
 history in Python.
+
+Because tracing temporarily replaces the process-global SQLite connection
+callable, complete benchmark invocations are serialized by a re-entrant lock.
+The wrapper traces only the canonical benchmark database identity and delegates
+unrelated SQLite connections unchanged; restoration and temporary-resource
+cleanup remain inside the serialized scope.
 
 Elapsed seed and recovery times are recorded for diagnostics only. They are
 never pass/fail thresholds, so slow or noisy CI hosts do not create brittle
@@ -59,7 +69,7 @@ By default the command writes
 `.benchmark_runs/external-effect-recovery-scale.json`; use `--output PATH` to
 select another file. The same JSON object is printed to stdout. It has
 `schema_version: 3`, the selected population/page sizes, expected and observed
-page/query/row/work-unit counts, startup and handler statement counts,
+external-effect page/query/row/work-unit counts, startup and handler statement counts,
 convergence counts, required index and query plans, timing fields, and
 `timing_is_informational_only: true`. CLI artifacts also require an
 `artifact_metadata` object with nested `schema_version: 1`:
@@ -80,6 +90,10 @@ The run id and hashes support identity and comparison; they are not a digital
 signature or an attestation against a party that can rewrite the artifact. A
 structural-contract failure raises and the command exits nonzero instead of
 writing a favorable result.
+
+The CLI reserves this path before seeding, commits complete JSON by atomic
+replace, and leaves a failed-invocation marker (plus a retained prior artifact,
+when present) rather than stale favorable evidence after an unsuccessful rerun.
 
 See the repository [benchmark guide](../../docs/benchmark.md#recovery-scale-gates)
 for how this gate relates to the runtime-safety and practical-workflow suites.

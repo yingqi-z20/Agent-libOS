@@ -11,6 +11,8 @@ from agent_libos_dojo.runner import (
     ARMS,
     BENCHMARK_VERSION,
     CASE_MODES,
+    LOGICAL_MODEL_INVOCATION_UNIT,
+    MAX_QUERY_INVOCATIONS_PER_TRAJECTORY,
     RunOptions,
     catalog,
     plan_pilot,
@@ -55,7 +57,17 @@ def main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--injection-task", action="append", dest="injection_tasks")
     run_parser.add_argument("--repetitions", type=int, default=1)
     run_parser.add_argument("--max-output-tokens", type=int, default=4096)
-    run_parser.add_argument("--max-quanta", type=int, default=16)
+    run_parser.add_argument(
+        "--max-quanta",
+        type=int,
+        default=16,
+        help=(
+            "Maximum harness-level logical model invocations per query "
+            "(minimum 2); this excludes retries and API fallbacks inside one "
+            "LLMClient call, and AgentDojo may issue up to three queries per "
+            "trajectory."
+        ),
+    )
     run_parser.add_argument(
         "--libos-prompt-mode",
         choices=sorted(PROMPT_MODES),
@@ -117,8 +129,22 @@ def main(argv: list[str] | None = None) -> None:
                 {
                     "real_llm_calls": False,
                     "planned_cases": len(cases),
-                    "max_provider_calls_per_case": options.max_quanta,
-                    "max_output_tokens_per_call": options.max_output_tokens,
+                    "max_query_invocations_per_trajectory": (
+                        MAX_QUERY_INVOCATIONS_PER_TRAJECTORY
+                    ),
+                    "logical_model_invocation_unit": (
+                        LOGICAL_MODEL_INVOCATION_UNIT
+                    ),
+                    "max_logical_model_invocations_per_query": (
+                        options.max_quanta
+                    ),
+                    "max_logical_model_invocations_per_trajectory": (
+                        options.max_quanta
+                        * MAX_QUERY_INVOCATIONS_PER_TRAJECTORY
+                    ),
+                    "max_output_tokens_per_logical_model_invocation": (
+                        options.max_output_tokens
+                    ),
                     "libos_prompt_mode": options.libos_prompt_mode,
                     "observed_token_budget": options.observed_token_budget,
                     "cases": [

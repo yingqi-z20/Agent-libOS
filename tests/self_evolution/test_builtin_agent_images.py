@@ -157,6 +157,9 @@ def test_builtin_prompts_use_real_tool_names_and_current_jit_contract() -> None:
     assert "follow the AgentImage's final reporting contract" in ACTION_PROTOCOL
     assert "Do not prepend that working-directory path" in ACTION_PROTOCOL
     assert "do not call the effect merely to elicit a denial" in ACTION_PROTOCOL
+    assert '{"limit":5}' in ACTION_PROTOCOL
+    assert '{"limit":"5"}' in ACTION_PROTOCOL
+    assert "correct the reported field/type" in ACTION_PROTOCOL
 
 
 @pytest.mark.parametrize(

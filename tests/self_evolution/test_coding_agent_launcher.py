@@ -28,6 +28,37 @@ ASYNC_RUNTIME_ENTRYPOINTS = (
 
 class TestCodingAgentLauncher:
 
+    def test_default_runtime_database_is_outside_writable_workspace(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        args = run_coding_agent.build_parser().parse_args(
+            ["--goal", "edit", "--workspace", str(tmp_path), "--no-run"]
+        )
+
+        selected = run_coding_agent._resolve_db_path(args, tmp_path)
+
+        assert not run_coding_agent._path_is_within(selected, tmp_path)
+
+    def test_explicit_runtime_database_inside_workspace_is_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        args = run_coding_agent.build_parser().parse_args(
+            [
+                "--goal",
+                "edit",
+                "--workspace",
+                str(tmp_path),
+                "--db",
+                str(tmp_path / "runtime.sqlite"),
+                "--no-run",
+            ]
+        )
+
+        with pytest.raises(SystemExit, match="must stay outside"):
+            run_coding_agent._resolve_db_path(args, tmp_path)
+
     def test_default_edit_preset_pregrants_workspace_write_not_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args = run_coding_agent.build_parser().parse_args(['--goal', 'edit the workspace', '--workspace', tmp, '--no-run'])

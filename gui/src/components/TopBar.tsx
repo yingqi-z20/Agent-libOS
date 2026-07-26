@@ -1,13 +1,15 @@
-import { Bot, CirclePlus, Database, FolderOpen, Gauge, Pause, Play, RefreshCw, StepForward, UserRound } from "lucide-react";
+import { AlertTriangle, Bot, CirclePlus, Database, FolderOpen, Gauge, LoaderCircle, Pause, Play, RefreshCw, StepForward, UserRound } from "lucide-react";
+import { useId } from "react";
 import type { SchedulerStatus, StreamConnectionStatus } from "../api/types";
 import { useI18n } from "../i18n";
-import { parseOptionalQuanta } from "../quanta";
 import { LanguageSwitch } from "./LanguageSwitch";
 
 export function TopBar({
   db,
   scheduler,
+  maxQuantaInput,
   maxQuanta,
+  quantaValid = true,
   selectedPid,
   onMaxQuantaChange,
   onOpenDb,
@@ -17,6 +19,8 @@ export function TopBar({
   onPause,
   onAutoRunChange,
   onRefresh,
+  pendingHumanCount = 0,
+  onOpenPending,
   onShowUser,
   busy,
   streamStatus,
@@ -24,9 +28,12 @@ export function TopBar({
 }: {
   db: string;
   scheduler: SchedulerStatus | null;
-  maxQuanta: number | null;
+  maxQuantaInput?: string;
+  /** @deprecated Use maxQuantaInput so invalid drafts are not erased. */
+  maxQuanta?: number | null;
+  quantaValid?: boolean;
   selectedPid: string | null;
-  onMaxQuantaChange(value: number | null): void;
+  onMaxQuantaChange(value: string): void;
   onOpenDb(): void;
   onSpawn(): void;
   onRun(): void;
@@ -34,12 +41,15 @@ export function TopBar({
   onPause(): void;
   onAutoRunChange(value: boolean): void;
   onRefresh(): void;
+  pendingHumanCount?: number;
+  onOpenPending?: () => void;
   onShowUser?: () => void;
   busy: boolean;
   streamStatus: StreamConnectionStatus;
   lastUpdatedAt: Date | null;
 }) {
   const { formatTime, t } = useI18n();
+  const quantaErrorId = useId();
   const schedulerLabel = scheduler?.running ? t("top.running") : scheduler?.paused ? t("top.paused") : t("top.idle");
 
   return (
@@ -64,7 +74,7 @@ export function TopBar({
       </div>
 
       <div className="operatorCommandBar" role="group" aria-label={t("top.runtimeControls")}>
-        <button type="button" className="primary spawnProcessButton" disabled={busy} onClick={onSpawn}>
+        <button type="button" className="primary spawnProcessButton" disabled={busy || !quantaValid} onClick={onSpawn}>
           <CirclePlus size={15} />{t("top.spawn")}
         </button>
         <label className="switchControl">
@@ -76,28 +86,37 @@ export function TopBar({
           <Gauge size={14} aria-hidden="true" />
           <span>{t("top.quanta")}</span>
           <input
-            type="number"
-            min={1}
-            step={1}
+            type="text"
+            inputMode="numeric"
             disabled={busy}
-            value={maxQuanta ?? ""}
+            value={maxQuantaInput ?? maxQuanta?.toString() ?? ""}
+            aria-invalid={!quantaValid || undefined}
+            aria-errormessage={!quantaValid ? quantaErrorId : undefined}
             placeholder={t("scheduler.unlimitedPlaceholder")}
-            title={t("scheduler.unlimitedHint")}
-            onChange={(event) => onMaxQuantaChange(parseOptionalQuanta(event.currentTarget.value))}
+            title={quantaValid ? t("scheduler.unlimitedHint") : t("scheduler.invalidQuanta")}
+            onChange={(event) => onMaxQuantaChange(event.currentTarget.value)}
           />
+          {!quantaValid ? <small id={quantaErrorId} className="inlineError" role="alert">{t("scheduler.invalidQuanta")}</small> : null}
         </label>
         <div className="operatorRunGroup">
-          <button type="button" title={t("top.runSelected")} disabled={busy || !selectedPid || scheduler?.running} onClick={onRun}><Play size={15} />{t("user.run")}</button>
-          <button type="button" title={t("top.stepSelected")} disabled={busy || !selectedPid || scheduler?.running} onClick={onStep}><StepForward size={15} />{t("top.step")}</button>
+          <button type="button" title={t("top.runSelected")} disabled={busy || !quantaValid || !selectedPid || scheduler?.running} onClick={onRun}><Play size={15} />{t("user.run")}</button>
+          <button type="button" title={t("top.stepSelected")} disabled={busy || !quantaValid || !selectedPid || scheduler?.running} onClick={onStep}><StepForward size={15} />{t("top.step")}</button>
           <button type="button" title={t("top.pauseScheduler")} disabled={busy || !scheduler?.running} onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
           <button type="button" className="iconOnly softButton" aria-label={t("top.refreshSnapshot")} title={t("top.refreshSnapshot")} disabled={busy} onClick={onRefresh}><RefreshCw size={15} /></button>
         </div>
       </div>
 
       <div className="operatorTopMeta">
-        <span className={`schedulerPill ${scheduler?.running ? "running" : scheduler?.paused ? "paused" : "idle"}`}>
-          <span className="statusDot" />{schedulerLabel}
-        </span>
+        {busy ? (
+          <span className="operatorBusyStatus" role="status">
+            <LoaderCircle className="spin" size={14} aria-hidden="true" />
+            <span>{t("user.working")}</span>
+          </span>
+        ) : (
+          <span className={`schedulerPill ${scheduler?.running ? "running" : scheduler?.paused ? "paused" : "idle"}`}>
+            <span className="statusDot" />{schedulerLabel}
+          </span>
+        )}
         <span
           className={`connectionBadge ${streamStatus}`}
           role="status"
@@ -105,6 +124,19 @@ export function TopBar({
         >
           <span className="statusDot" />{t(`connection.${streamStatus}`)}
         </span>
+        {pendingHumanCount > 0 && onOpenPending ? (
+          <button
+            type="button"
+            className="pendingInboxButton compact"
+            aria-label={`${t("user.pendingRequests")}: ${pendingHumanCount}`}
+            title={t("user.pendingRequests")}
+            onClick={onOpenPending}
+          >
+            <AlertTriangle size={14} aria-hidden="true" />
+            <span>{t("user.pendingRequests")}</span>
+            <strong>{pendingHumanCount}</strong>
+          </button>
+        ) : null}
         <LanguageSwitch />
         {onShowUser ? (
           <button type="button" className="secondary userViewButton" aria-label={t("top.userPage")} title={t("top.userPage")} onClick={onShowUser}>

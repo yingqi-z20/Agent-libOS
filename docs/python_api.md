@@ -153,6 +153,56 @@ methods detect an active event loop and direct the caller to their async
 counterparts. `max_quanta=None` uses the active Runtime configuration; it does
 not mean an unbounded run unless that configuration is itself unbounded.
 
+The complete all-process drain signatures are:
+
+```python
+runtime.run_until_idle(
+    max_quanta=None,
+    *,
+    pids=None,
+    process_human_queue=True,
+    cancel_inflight_on_budget_exhaustion=True,
+    human=None,
+    human_auto_approve=None,
+    human_auto_policy=None,
+    human_auto_answer=None,
+)
+await runtime.arun_until_idle(
+    max_quanta=None,
+    *,
+    pids=None,
+    process_human_queue=True,
+    cancel_inflight_on_budget_exhaustion=True,
+    human=None,
+    human_auto_approve=None,
+    human_auto_policy=None,
+    human_auto_answer=None,
+)
+```
+
+`pids` must be `None` or a nonempty iterable of distinct canonical PID strings;
+it restricts both scheduler admission and the outer Human-queue drain rather
+than widening to all processes. With `process_human_queue=True`, the Runtime
+alternates runnable-process batches with pending requests for the selected
+Human (`human`, or the configured default) until neither side makes progress.
+Setting it to `False` disables that outer queue drain. When the shared quantum
+budget is exhausted, `cancel_inflight_on_budget_exhaustion=True` applies the
+configured bounded drain and then cancels still-pending admitted futures;
+`False` lets already admitted quanta finish, while still admitting no new
+ordinary quantum. Cancellation never rolls back a provider effect that may
+already have started.
+
+The three `human_auto_*` values are an immutable policy supplied by trusted
+Host code for this invocation and its scheduler/JIT descendants.
+`human_auto_approve` answers boolean approvals and, absent an explicit policy,
+maps permission requests to `always_allow` or `always_deny`;
+`human_auto_policy` selects `always_allow`, `always_deny`, or `ask_each_time`
+for permission-policy requests; `human_auto_answer` supplies typed question
+answers. Because these inputs can produce durable Human and permission-policy
+decisions, they must not be derived from model output. They do not bypass
+Capability, Task Authority, data-flow, or provider checks: each decision still
+uses the ordinary Human transition, validation, event, and audit paths.
+
 `run_workflow` returns `WorkflowRunResult`. Expected tool failures and wait
 states are represented in that result rather than necessarily raised. Direct
 manager and primitive calls retain their typed exception contracts.
@@ -207,7 +257,7 @@ authoritative for imported model types.
 | `get_image(image_id)` | detached `AgentImage` copy | Host read; missing ids raise `KeyError`, not `NotFound` |
 | `register_skill_from_path(path, *, actor="runtime", replace=False, source_type="runtime")` | Skill summary `dict` | Host-filesystem/Host-authorized facade; capability enforcement is disabled |
 | `discover_skills(text=None)` / `inspect_skill(skill_id)` | summaries / summary `dict` | Host registry reads; capability enforcement is disabled |
-| `activate_skill(pid, skill_id)` / `unload_skill(pid, skill_id)` | Skill summary `dict` | Host-authorized target-process mutation; these facades deliberately disable capability enforcement |
+| `activate_skill(pid, skill_id, *, expected_package_sha256=None)` / `unload_skill(pid, skill_id)` | Skill summary `dict` | Host-authorized target-process mutation; these facades deliberately disable capability enforcement. Supply the discovery hash to compare-and-swap content; omission is for trusted Host compatibility only. |
 | `trust_skill_source(*, source_type, source, package_sha256, actor="runtime")` | trust summary `dict` | Host trust mutation; capability enforcement is disabled |
 | `register_sink_trust(spec, *, actor, replace=False)` / `unregister_sink_trust(pattern, *, actor)` | `SinkTrustSpec` | Host-only control plane, but the supplied actor must hold Sink-registry mutation authority |
 | `inspect_sink_trust(pattern)` / `list_sink_trust(*, active_only=True, generation=None)` | optional spec / tuple of specs | Host-only registry reads |
@@ -284,6 +334,20 @@ cannot silently abandon an owned store or partially assembled component graph.
 - Supported extension boundaries are explicit: the provider substrate,
   Protected Operation SDK, trusted Runtime Modules, Skills, and tool/syscall
   schemas. An arbitrary importable internal class is not an extension point.
+- Provider protocol evolution is additive through exported, runtime-checkable
+  auxiliary protocols. In particular, the 0.3 Git provider contract retains
+  its original `run(...)` signature; subprocess-aware providers may opt in via
+  `GitSubprocessScopeProvider` and `GitLimitedRunProvider`. Hosts must test the
+  auxiliary protocol and require its `supports_subprocess_limits` flag before
+  making a budgeted call. A process with a configured Git subprocess budget
+  fails closed when its provider does not implement the scoped supervision
+  extension.
+- The 0.3 `McpProvider` contract likewise retains the original
+  `validate_and_call(...)`, `list_tools(...)`, and `call_tool(...)` signatures.
+  An MCP provider whose three methods also accept `limits=` opts in through
+  `McpSubprocessLimitsProvider`. The Runtime never passes that keyword to a
+  legacy provider; when a stdio operation has a configured subprocess budget,
+  a provider without the extension is rejected before provider dispatch.
 - Persisted Runtime state has a strict schema generation. Opening an older,
   newer, incomplete, or hand-built schema may raise `UnsupportedStoreVersion`;
   no general automatic migration guarantee is implied by Python API

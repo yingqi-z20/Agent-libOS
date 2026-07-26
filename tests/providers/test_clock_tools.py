@@ -60,6 +60,18 @@ class TestClockTool:
         assert result.payload['timezone'] == 'Asia/Shanghai'
         assert '+08:00' in result.payload['iso8601']
 
+    @pytest.mark.parametrize('timezone_name', ['/etc/passwd', '../UTC'])
+    def test_clock_primitive_normalizes_invalid_zoneinfo_keys(
+        self,
+        timezone_name: str,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='invalid timezone')
+
+        with pytest.raises(ValidationError, match='unknown timezone'):
+            self.runtime.clock.now(pid, tz=timezone_name)
+
+        assert 'primitive.clock.now' not in self._audit_actions()
+
     def test_sleep_tool_uses_clock_primitive(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='sleep briefly')
         self.runtime.capability.grant(pid, 'clock:sleep', [CapabilityRight.READ], issued_by='test')
@@ -128,8 +140,10 @@ class TestClockTool:
         assert not slept.ok
         assert now.payload['error']['code'] == 'permission_denied'
         assert slept.payload['error']['code'] == 'permission_denied'
-        assert 'clock:now' in (now.error or '')
-        assert 'clock:sleep' in (slept.error or '')
+        assert (now.error or '').startswith('permission_denied: CapabilityDenied')
+        assert (slept.error or '').startswith('permission_denied: CapabilityDenied')
+        assert 'clock:now' not in (now.error or '')
+        assert 'clock:sleep' not in (slept.error or '')
         assert 'primitive.clock.now' not in self._audit_actions()
         assert 'primitive.clock.sleep' not in self._audit_actions()
 

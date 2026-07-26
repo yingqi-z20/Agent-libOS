@@ -12,17 +12,32 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
     CapabilityRight,
+    EventType,
+    ObjectType,
     ProcessMessage,
     ProcessMessageKind,
     ProcessMessageStatus,
+    ProcessSignal,
     ProcessStatus,
 )
 from agent_libos.models.exceptions import ProcessError, ProcessMessageWaitRequired, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
+from agent_libos.skills import get_builtin_skill_catalog
+from tests.support.public_errors import assert_public_error_message
 
 
 def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
     runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+
+
+def _activate_action(skill_id: str) -> dict[str, str]:
+    package = get_builtin_skill_catalog().get(skill_id)
+    assert package is not None
+    return {
+        'action': 'activate_skill',
+        'skill_id': skill_id,
+        'expected_package_sha256': package.package_sha256,
+    }
 
 
 class TestProcessMessage:
@@ -120,7 +135,12 @@ class TestProcessMessage:
             second = runtime.process.spawn(image='base-agent:v0', goal='second')
             denied = runtime.tools.call(first, 'send_process_message', {'recipient_pid': second, 'body': 'no'})
             assert not denied.ok
-            assert 'can only message' in (denied.error or '')
+            assert_public_error_message(
+                denied.error,
+                code='execution_error',
+                error_type='ProcessError',
+                forbidden=('can only message', second),
+            )
             assert runtime.messages.unread(second) == []
         finally:
             runtime.close()
@@ -166,6 +186,7 @@ class TestProcessMessage:
             child = runtime.spawn_child_process(parent, 'child')
             parent_session = LibOSSyscallSession(runtime, parent)
 
+            runtime.process.signal_child(parent, child, ProcessSignal.TERMINATE)
             runtime.process.exit(parent, message='done')
 
             with pytest.raises(ProcessError, match='cannot issue syscalls'):
@@ -270,6 +291,65 @@ class TestProcessMessage:
             assert len(result.payload['messages']) == count
             assert len(result.payload['acked_message_ids']) == count
             assert runtime.messages.unread(pid) == []
+        finally:
+            runtime.close()
+
+    def test_default_read_limit_reports_full_matching_mailbox_tail(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='page complete mailbox evidence')
+            count = runtime.config.tools.message_read_limit + 5
+            for index in range(count):
+                runtime.messages.post(sender='test', recipient_pid=pid, subject=f'msg-{index}')
+
+            result = runtime.tools.call(pid, 'read_process_messages', {})
+
+            assert result.ok, result.error
+            assert len(result.payload['messages']) == runtime.config.tools.message_read_limit
+            assert result.payload['has_more'] is True
+            assert result.payload['omitted_count'] == 5
+            assert len(runtime.messages.unread(pid)) == 5
+        finally:
+            runtime.close()
+
+    def test_message_ack_waits_for_tool_result_persistence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='persist before consuming mailbox')
+            message = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                subject='must remain recoverable',
+                body='body visible only in the failed result',
+            )
+            original_create_object = runtime.memory.create_object
+
+            def fail_tool_result(*args, **kwargs):
+                if kwargs.get('object_type') == ObjectType.TOOL_RESULT:
+                    raise RuntimeError('injected ToolResult persistence failure')
+                return original_create_object(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.memory, 'create_object', fail_tool_result)
+            with pytest.raises(RuntimeError, match='injected ToolResult persistence failure'):
+                runtime.tools.call(pid, 'read_process_messages', {})
+
+            stored = runtime.store.get_process_message(message.message_id)
+            assert stored is not None
+            assert stored.status == ProcessMessageStatus.UNREAD
+            assert stored.acked_at is None
+            assert not any(
+                event.type == EventType.PROCESS_MESSAGE_ACKED
+                and message.message_id in event.payload.get('message_ids', [])
+                for event in runtime.events.list(target=pid)
+            )
+            assert not any(
+                record.action == 'process.message.ack'
+                and message.message_id in record.decision.get('message_ids', [])
+                for record in runtime.audit.trace(target=f'process:{pid}')
+            )
         finally:
             runtime.close()
 
@@ -405,6 +485,192 @@ class TestProcessMessage:
         finally:
             runtime.close()
 
+    def test_ack_audit_failure_rolls_back_message_and_acked_event(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='atomic message ack evidence')
+            message = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                subject='must remain unread',
+            )
+            original_record = runtime.audit.record
+
+            def fail_ack_audit(*args, **kwargs):
+                action = kwargs.get('action')
+                if action is None and len(args) > 1:
+                    action = args[1]
+                if action == 'process.message.ack':
+                    raise RuntimeError('injected process message ack audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_ack_audit)
+            with pytest.raises(
+                RuntimeError,
+                match='injected process message ack audit failure',
+            ):
+                runtime.messages.ack(pid, [message.message_id])
+
+            stored = runtime.store.get_process_message(message.message_id)
+            assert stored is not None
+            assert stored.status == ProcessMessageStatus.UNREAD
+            assert stored.acked_at is None
+            assert [
+                event
+                for event in runtime.events.list(target=pid)
+                if event.type == EventType.PROCESS_MESSAGE_ACKED
+            ] == []
+            assert [
+                record
+                for record in runtime.audit.trace(target=f'process:{pid}')
+                if record.action == 'process.message.ack'
+            ] == []
+        finally:
+            runtime.close()
+
+    def test_multi_message_ack_cas_failure_rolls_back_entire_batch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='all or none message ack')
+            messages = [
+                runtime.messages.post(
+                    sender='test',
+                    recipient_pid=pid,
+                    subject=f'message {index}',
+                )
+                for index in range(2)
+            ]
+            original_ack = runtime.messages.store.ack_process_message
+            calls = 0
+
+            def fail_second_cas(message_id: str, **kwargs) -> bool:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    return False
+                return original_ack(message_id, **kwargs)
+
+            monkeypatch.setattr(
+                runtime.messages.store,
+                'ack_process_message',
+                fail_second_cas,
+            )
+            with pytest.raises(ProcessError, match='changed while acknowledging'):
+                runtime.messages.ack(
+                    pid,
+                    [message.message_id for message in messages],
+                )
+
+            assert calls == 2
+            stored = [runtime.store.get_process_message(message.message_id) for message in messages]
+            assert all(message is not None for message in stored)
+            assert all(message.status == ProcessMessageStatus.UNREAD for message in stored if message)
+            assert all(message.acked_at is None for message in stored if message)
+            assert [
+                event
+                for event in runtime.events.list(target=pid)
+                if event.type == EventType.PROCESS_MESSAGE_ACKED
+            ] == []
+            assert [
+                record
+                for record in runtime.audit.trace(target=f'process:{pid}')
+                if record.action == 'process.message.ack'
+            ] == []
+        finally:
+            runtime.close()
+
+    def test_concurrent_double_ack_only_one_call_claims_message(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        first_selected = threading.Event()
+        second_started = threading.Event()
+        second_finished = threading.Event()
+        results: dict[str, list[str]] = {}
+        errors: list[BaseException] = []
+        threads: list[threading.Thread] = []
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='double message ack')
+            message = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                subject='claim once',
+            )
+            original_list = runtime.messages.list
+
+            def coordinated_list(*args, **kwargs):
+                selected = original_list(*args, **kwargs)
+                if threading.current_thread().name == 'first-message-ack' and selected:
+                    first_selected.set()
+                    assert second_started.wait(timeout=5)
+                    # The fixed ACK holds the store transaction here, so the
+                    # second call cannot select until the first commits.
+                    second_finished.wait(timeout=0.2)
+                return selected
+
+            monkeypatch.setattr(runtime.messages, 'list', coordinated_list)
+
+            def ack_message(name: str) -> None:
+                try:
+                    if name == 'second':
+                        second_started.set()
+                    acked = runtime.messages.ack(pid, [message.message_id])
+                    results[name] = [item.message_id for item in acked]
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    if name == 'second':
+                        second_finished.set()
+
+            first = threading.Thread(
+                target=ack_message,
+                args=('first',),
+                name='first-message-ack',
+                daemon=True,
+            )
+            threads.append(first)
+            first.start()
+            assert first_selected.wait(timeout=5)
+            second = threading.Thread(
+                target=ack_message,
+                args=('second',),
+                name='second-message-ack',
+                daemon=True,
+            )
+            threads.append(second)
+            second.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert errors == []
+            assert sorted(results.values(), key=len) == [[], [message.message_id]]
+            acked_events = [
+                event
+                for event in runtime.events.list(target=pid)
+                if event.type == EventType.PROCESS_MESSAGE_ACKED
+            ]
+            ack_audits = [
+                record
+                for record in runtime.audit.trace(target=f'process:{pid}')
+                if record.action == 'process.message.ack'
+            ]
+            assert len(acked_events) == 1
+            assert acked_events[0].payload['message_ids'] == [message.message_id]
+            assert len(ack_audits) == 1
+            assert ack_audits[0].decision['message_ids'] == [message.message_id]
+        finally:
+            for thread in threads:
+                thread.join(timeout=5)
+            runtime.close()
+
     def test_blocking_receive_rejects_empty_message_id_filter(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -414,6 +680,45 @@ class TestProcessMessage:
                 runtime.messages.receive(pid, block=True, message_ids=[])
 
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
+    def test_wait_audit_failure_rolls_back_wait_registration_and_evidence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='rollback message wait evidence',
+            )
+            before_process = runtime.process.get(pid)
+            before_audit = runtime.store.list_audit()
+            before_events = runtime.store.list_events()
+            original_record = runtime.messages.audit.record
+
+            def fail_after_wait_audit(*args: object, **kwargs: object) -> object:
+                record = original_record(*args, **kwargs)
+                if kwargs.get('action') == 'process.message.wait':
+                    raise RuntimeError('injected process message wait audit failure')
+                return record
+
+            monkeypatch.setattr(
+                runtime.messages.audit,
+                'record',
+                fail_after_wait_audit,
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match='injected process message wait audit failure',
+            ):
+                runtime.messages.receive(pid, block=True, channel='control')
+
+            assert runtime.process.get(pid) == before_process
+            assert runtime.store.list_audit() == before_audit
+            assert runtime.store.list_events() == before_events
         finally:
             runtime.close()
 
@@ -532,6 +837,69 @@ class TestProcessMessage:
         finally:
             if ack_thread is not None:
                 ack_thread.join(timeout=5)
+            runtime.close()
+
+    def test_ack_racing_observe_labels_preserves_carrier_metadata(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        ack_selected = threading.Event()
+        observer_started = threading.Event()
+        observer_finished = threading.Event()
+        observer_errors: list[BaseException] = []
+        observed: list[str] = []
+        observer: threading.Thread | None = None
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='ack while observing labels')
+            message = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                subject='preserve carrier',
+            )
+            stale_messages = runtime.messages.list(pid)
+            original_list = runtime.messages.list
+
+            def coordinated_list(*args, **kwargs):
+                selected = original_list(*args, **kwargs)
+                if selected and not ack_selected.is_set():
+                    ack_selected.set()
+                    assert observer_started.wait(timeout=5)
+                    # A transactionally selected ACK keeps label observation
+                    # out of this window. The column-scoped CAS also cannot
+                    # overwrite metadata once observation commits.
+                    observer_finished.wait(timeout=0.2)
+                return selected
+
+            monkeypatch.setattr(runtime.messages, 'list', coordinated_list)
+
+            def observe() -> None:
+                try:
+                    assert ack_selected.wait(timeout=5)
+                    observer_started.set()
+                    observed.extend(runtime.messages.observe_labels(pid, stale_messages))
+                except BaseException as exc:
+                    observer_errors.append(exc)
+                finally:
+                    observer_finished.set()
+
+            observer = threading.Thread(target=observe, daemon=True)
+            observer.start()
+            acked = runtime.messages.ack(pid, [message.message_id])
+            observer.join(timeout=5)
+
+            assert not observer.is_alive()
+            assert observer_errors == []
+            assert [item.message_id for item in acked] == [message.message_id]
+            assert len(observed) == 1
+            stored = runtime.store.get_process_message(message.message_id)
+            assert stored is not None
+            assert stored.status == ProcessMessageStatus.ACKED
+            assert stored.acked_at is not None
+            assert stored.metadata['label_carrier_oid'] == observed[0]
+        finally:
+            if observer is not None:
+                observer.join(timeout=5)
             runtime.close()
 
     def test_observe_labels_racing_exit_cannot_revive_terminal_process(
@@ -816,7 +1184,7 @@ class TestProcessMessage:
     def test_interrupt_allows_message_skill_discovery_and_activation_before_ack(self, message_action: str) -> None:
         client = PlannedActionClient([
             {'action': 'discover_skills', 'text': 'messages', 'limit': 4},
-            {'action': 'activate_skill', 'skill_id': 'agent-libos-child-processes'},
+            _activate_action('agent-libos-child-processes'),
             {'action': message_action},
         ])
         runtime = Runtime.open('local')
@@ -853,10 +1221,7 @@ class TestProcessMessage:
             }
 
             activated = runtime.run_process_once(pid)
-            assert activated['action'] == {
-                'action': 'activate_skill',
-                'skill_id': 'agent-libos-child-processes',
-            }
+            assert activated['action'] == _activate_action('agent-libos-child-processes')
             assert activated['result']['ok']
             assert not activated['result'].get('interrupted_by_message', False)
             assert message.message_id in {
@@ -881,7 +1246,7 @@ class TestProcessMessage:
 
     def test_interrupt_keeps_unrelated_skill_activation_blocked(self) -> None:
         client = PlannedActionClient([
-            {'action': 'activate_skill', 'skill_id': 'agent-libos-runtime-session'},
+            _activate_action('agent-libos-runtime-session'),
         ])
         runtime = Runtime.open('local')
         runtime.llm.client = client
@@ -949,7 +1314,7 @@ class TestProcessMessage:
         client = PlannedActionClient([
             {'action': 'get_current_time', 'timezone': 'UTC'},
             {'action': 'discover_skills', 'text': 'messages', 'limit': 4},
-            {'action': 'activate_skill', 'skill_id': 'agent-libos-child-processes'},
+            _activate_action('agent-libos-child-processes'),
             {'action': 'read_process_messages'},
         ])
         runtime = Runtime.open('local')
@@ -972,10 +1337,7 @@ class TestProcessMessage:
             assert discovered['result']['ok']
 
             activated = runtime.run_process_once(pid)
-            assert activated['action'] == {
-                'action': 'activate_skill',
-                'skill_id': 'agent-libos-child-processes',
-            }
+            assert activated['action'] == _activate_action('agent-libos-child-processes')
             activation_prompt = client.user_prompts[2]
             assert message.body not in activation_prompt
             assert message.message_id not in activation_prompt

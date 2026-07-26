@@ -23,6 +23,10 @@ from agent_libos.storage.repositories import (
     RuntimePublicationRepository,
 )
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 
 if TYPE_CHECKING:
     from agent_libos.tools.broker import ToolBroker
@@ -322,7 +326,7 @@ class ImagePackageInstaller:
             rights = [CapabilityRight(right) for right in grant.get("rights", [])]
             grant_method = (
                 self._filesystem.grant_directory
-                if grant.get("recursive")
+                if grant["recursive"]
                 else self._filesystem.grant_path
             )
             with self._processes.transaction():
@@ -331,7 +335,7 @@ class ImagePackageInstaller:
                     target,
                     rights,
                     issued_by=f"image.package:{image.image_id}",
-                    delegable=bool(grant.get("delegable", False)),
+                    delegable=grant["delegable"],
                     metadata=(
                         {
                             "runtime_publication_id": publication_id,
@@ -543,15 +547,23 @@ class ImagePackageInstaller:
         except FileNotFoundError:
             return
         except Exception as exc:
+            envelope = public_error_envelope(
+                exc,
+                code="image_workspace_cleanup_failed",
+            )
             self._audit.record(
                 actor=actor,
                 action="image.workspace.cleanup_failed",
                 target=f"workspace:{workspace_root}",
                 decision={
                     "reason": reason,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
+                    "error": envelope,
+                    "internal_error": internal_exception_observation(
+                        exc,
+                        correlation_id=envelope["correlation_id"],
+                    ),
                 },
+                correlation_id=envelope["correlation_id"],
             )
             if strict:
                 raise

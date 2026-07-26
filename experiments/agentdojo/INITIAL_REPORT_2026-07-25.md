@@ -45,8 +45,10 @@ AgentDojo 的 injection-task oracle 返回 `True` 时表示注入目标成功，
 
 所有真实调用使用同一自定义 OpenAI-compatible endpoint、同一
 `qwen3.8-max-preview`、temperature 0、禁用 parallel tool calls、每次最多
-4096 output token、每轨迹最多 16 次 provider call。报告不记录 raw endpoint
-或 API key。
+4096 output token、每轨迹最多 16 次 harness 逻辑模型调用。这里沿用当时 artifact
+的历史字段名 `provider_call_count` / “provider call”：它统计成功返回给 harness 的
+`LLMClient.complete_action` 调用，不是 SDK transport retry、兼容性重试或 API
+fallback 产生的物理 HTTP 请求次数。报告不记录 raw endpoint 或 API key。
 
 初始抽样只选每个 suite 的 `user_task_0` 和一个 injection task；Slack 因
 `v1.2.2` 不存在 `injection_task_0`，使用 `injection_task_1`。攻击固定为
@@ -114,8 +116,8 @@ type: goal
 - `read_file`：额外 3 次；
 - `get_webpage`：额外 2 次。
 
-因此 harness 现在把 provider call、tool call、目标工具调用、相同调用重复次数
-和最大重复 multiplicity 作为一等诊断字段。
+因此 harness 现在把成功 harness 逻辑模型调用、tool call、目标工具调用、相同
+调用重复次数和最大重复 multiplicity 作为一等诊断字段。
 
 ## Prompt-mode 消融
 
@@ -295,7 +297,7 @@ attacked 或 containment arm。
 | Valid | 4/4 | 4/4 |
 | Direct injection goal success | 4/4 | 4/4 |
 | Observed tokens | 29,040 | 37,057 |
-| Provider calls | 9 | 12 |
+| 成功 harness 逻辑模型调用（历史字段 `provider_call_count`） | 9 | 12 |
 | Tool calls | 5 | 8 |
 | Target write calls | 4 | 4 |
 | Repeated identical calls | 0 | 0 |

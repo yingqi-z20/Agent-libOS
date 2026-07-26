@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 import inspect
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -33,9 +33,13 @@ from agent_libos.models import (
     ObjectHandle,
     ObjectMetadata,
     ObjectNamespace,
+    ObjectNamespaceCursor,
+    ObjectNamespacePage,
     ObjectLifecycleState,
     ObjectOwnerKind,
     ObjectPayloadRecoverySummary,
+    ObjectRefCursor,
+    ObjectRefPage,
     PersistedObjectState,
     ObjectTask,
     ObjectTaskRecoveryCursor,
@@ -80,6 +84,7 @@ from agent_libos.storage.contracts import (
     AuthorityRecoveryBackendProtocol,
     CheckpointPublicationWriterBackendProtocol,
     OperationEvidenceBackendProtocol,
+    ObjectQueryBackendProtocol,
     ObjectRecoveryBackendProtocol,
     ProcessBackendProtocol,
     ProcessScaffoldCleanup,
@@ -102,6 +107,104 @@ if TYPE_CHECKING:
 # Keep doubled OR predicates plus fixed parameters below SQLite's historical
 # 999-variable default while remaining comfortably inside PostgreSQL limits.
 _SNAPSHOT_SQL_VALUE_BATCH_SIZE = 400
+
+
+def _exact_backend_cas_result(value: Any, *, operation: str) -> bool:
+    """Reject truthy non-booleans at typed backend mutation boundaries."""
+
+    if type(value) is not bool:
+        raise ValidationError(
+            f"{operation} backend returned a non-boolean CAS result"
+        )
+    return value
+
+
+def _exact_positive_capability_use_count(value: Any, *, operation: str) -> int:
+    """Keep booleans and coercible scalar values out of authority mutations."""
+
+    if type(value) is not int or value < 1:
+        raise ValidationError(
+            f"capability {operation} count must be a positive integer"
+        )
+    return value
+
+
+def _exact_backend_capability_result(
+    value: Any,
+    *,
+    operation: str,
+) -> Capability | None:
+    """Reject malformed custom-backend capability mutation projections."""
+
+    if value is not None and not isinstance(value, Capability):
+        raise ValidationError(
+            f"{operation} backend returned a non-capability result"
+        )
+    return value
+
+
+def _backend_mutation_scope(
+    backend: object,
+    transaction: Callable[[], AbstractContextManager[Any]],
+) -> AbstractContextManager[Any]:
+    """Open a transaction unless the caller already owns the backend frame."""
+
+    probe = getattr(backend, "probe_runtime_assembly_readiness", None)
+    readiness = probe() if callable(probe) else None
+    if readiness is StoreAssemblyReadiness.ACTIVE_TRANSACTION:
+        return nullcontext()
+    return transaction()
+
+
+def _transactional_backend_cas_result(
+    backend: object,
+    transaction: Callable[[], AbstractContextManager[Any]],
+    mutation: Callable[[], Any],
+    *,
+    operation: str,
+) -> bool:
+    """Validate CAS results transactionally without hiding lost-ACK writes.
+
+    A non-boolean return is a backend contract violation and rolls the outer
+    transaction back. Backend exceptions retain their existing ambiguity
+    semantics: the backend owns rollback versus commit-before-error, so the
+    facade lets the outer frame close normally before re-raising the original
+    failure for the runtime's reconciliation path.
+    """
+
+    failure: BaseException | None = None
+    with _backend_mutation_scope(backend, transaction):
+        try:
+            result = mutation()
+        except BaseException as exc:
+            failure = exc
+        else:
+            return _exact_backend_cas_result(result, operation=operation)
+    if failure is None:  # pragma: no cover - context-manager contract defense
+        raise RuntimeError(f"{operation} backend mutation produced no result")
+    raise failure.with_traceback(failure.__traceback__)
+
+
+def _transactional_backend_cas_result_rollback_on_error(
+    backend: object,
+    transaction: Callable[[], AbstractContextManager[Any]],
+    mutation: Callable[[], Any],
+    *,
+    operation: str,
+) -> bool:
+    """Rollback backend body failures while retaining commit-exit ambiguity.
+
+    Use this for mutations whose backend performs its own in-transaction
+    readback: an exception from the body proves that the candidate write is
+    invalid and must not be committed. A failure raised by the transaction
+    context while committing still propagates with its original ambiguity.
+    """
+
+    with _backend_mutation_scope(backend, transaction):
+        return _exact_backend_cas_result(
+            mutation(),
+            operation=operation,
+        )
 
 
 def _snapshot_value_batches(values: Iterable[str]) -> Iterator[tuple[str, ...]]:
@@ -246,6 +349,7 @@ class ProcessRepository(_RepositoryFacade):
             "update_process_message_metadata",
             "get_process_message",
             "list_process_messages",
+            "count_process_messages",
             "get_process_activity_summaries",
             "insert_object_task",
             "update_object_task",
@@ -334,6 +438,26 @@ class ProcessRepository(_RepositoryFacade):
 
     def get_human_request(self, request_id: str) -> HumanRequest | None:
         return self._process_backend.get_human_request(request_id)
+
+    def ack_process_message(
+        self,
+        message_id: str,
+        *,
+        recipient_pid: str,
+        acked_at: str,
+        updated_at: str,
+    ) -> bool:
+        return _transactional_backend_cas_result(
+            self._process_backend,
+            self.transaction,
+            lambda: self._process_backend.ack_process_message(
+                message_id,
+                recipient_pid=recipient_pid,
+                acked_at=acked_at,
+                updated_at=updated_at,
+            ),
+            operation="ack process message",
+        )
 
     def get_object_task(self, task_id: str) -> ObjectTask | None:
         return self._process_backend.get_object_task(task_id)
@@ -617,18 +741,104 @@ class ProcessRepository(_RepositoryFacade):
         wait_state: ProcessWaitState | None = None,
         outcome: ProcessOutcome | None = None,
     ) -> bool:
-        return bool(
-            self._process_backend.complete_execution(
+        return _transactional_backend_cas_result(
+            self._process_backend,
+            self.transaction,
+            lambda: self._process_backend.complete_execution(
                 token,
                 status=status,
                 status_message=status_message,
                 wait_state=wait_state,
                 outcome=outcome,
-            )
+            ),
+            operation="complete execution",
         )
 
     def release_execution(self, token: ProcessExecutionToken) -> bool:
-        return self._process_backend.release_execution(token)
+        return _transactional_backend_cas_result(
+            self._process_backend,
+            self.transaction,
+            lambda: self._process_backend.release_execution(token),
+            operation="release execution",
+        )
+
+    def get_process_terminal_cleanup(self, pid: str) -> dict[str, Any] | None:
+        cleanup = self._process_backend.get_process_terminal_cleanup(pid)
+        return dict(cleanup) if cleanup is not None else None
+
+    def list_process_terminal_cleanups(
+        self,
+        *,
+        after: ProcessCursor | None,
+        limit: int,
+        include_completed: bool = False,
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(cleanup)
+            for cleanup in self._process_backend.list_process_terminal_cleanups(
+                after=after,
+                limit=limit,
+                include_completed=include_completed,
+            )
+        ]
+
+    def claim_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        owner_id: str,
+        lease_id: str,
+        expected_lease_id: str | None,
+    ) -> dict[str, Any] | None:
+        cleanup = self._process_backend.claim_process_terminal_cleanup(
+            pid,
+            owner_id=owner_id,
+            lease_id=lease_id,
+            expected_lease_id=expected_lease_id,
+        )
+        return dict(cleanup) if cleanup is not None else None
+
+    def complete_process_terminal_cleanup_phase(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+        phase: str,
+    ) -> dict[str, Any] | None:
+        cleanup = self._process_backend.complete_process_terminal_cleanup_phase(
+            pid,
+            lease_id=lease_id,
+            phase=phase,
+        )
+        return dict(cleanup) if cleanup is not None else None
+
+    def fail_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+        phase: str,
+        error: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        cleanup = self._process_backend.fail_process_terminal_cleanup(
+            pid,
+            lease_id=lease_id,
+            phase=phase,
+            error=error,
+        )
+        return dict(cleanup) if cleanup is not None else None
+
+    def finish_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+    ) -> dict[str, Any] | None:
+        cleanup = self._process_backend.finish_process_terminal_cleanup(
+            pid,
+            lease_id=lease_id,
+        )
+        return dict(cleanup) if cleanup is not None else None
 
     def recover_stale_executions(
         self,
@@ -727,6 +937,7 @@ class ObjectRepository(_RepositoryFacade):
     def __init__(self, backend: TransactionBackendProtocol) -> None:
         super().__init__(backend)
         self._object_backend = cast(SnapshotCheckpointBackendProtocol, backend)
+        self._object_query_backend = cast(ObjectQueryBackendProtocol, backend)
         self._object_recovery_backend = cast(ObjectRecoveryBackendProtocol, backend)
 
     def get_object(self, oid: str) -> AgentObject | None:
@@ -737,6 +948,32 @@ class ObjectRepository(_RepositoryFacade):
         oid: str,
     ) -> PersistedObjectState | None:
         return self._object_recovery_backend.get_persisted_object_state(oid)
+
+    def query_object_refs_page(
+        self,
+        namespace: str,
+        *,
+        after: ObjectRefCursor | None,
+        limit: int,
+    ) -> ObjectRefPage:
+        return self._object_query_backend.query_object_refs_page(
+            namespace,
+            after=after,
+            limit=limit,
+        )
+
+    def query_child_namespaces_page(
+        self,
+        parent_namespace: str,
+        *,
+        after: ObjectNamespaceCursor | None,
+        limit: int,
+    ) -> ObjectNamespacePage:
+        return self._object_query_backend.query_child_namespaces_page(
+            parent_namespace,
+            after=after,
+            limit=limit,
+        )
 
     def recover_missing_runtime_object_payloads(
         self,
@@ -824,9 +1061,6 @@ class AuthorityRepository(_RepositoryFacade):
             "delete_resource_reservation",
             "delete_resource_reservations_for_process",
             "insert_capability",
-            "consume_capability_uses",
-            "reserve_capability_uses",
-            "commit_capability_use_reservation",
             "restore_capability_use_reservation",
             "get_capability_use_reservation",
             "update_capability",
@@ -869,8 +1103,103 @@ class AuthorityRepository(_RepositoryFacade):
     def get_capability(self, cap_id: str) -> Capability | None:
         return self._authority_recovery_backend.get_capability(cap_id)
 
-    def list_capabilities(self, subject: str | None = None) -> list[Capability]:
-        return self._authority_recovery_backend.list_capabilities(subject)
+    def list_capabilities(
+        self,
+        subject: str | None = None,
+        *,
+        limit: int | None = None,
+    ) -> list[Capability]:
+        return self._authority_recovery_backend.list_capabilities(
+            subject,
+            limit=limit,
+        )
+
+    def query_capabilities(
+        self,
+        subject: str | None = None,
+        *,
+        active_only: bool,
+        after_cap_id: str | None,
+        limit: int,
+    ) -> list[Capability]:
+        return self._authority_recovery_backend.query_capabilities(
+            subject,
+            active_only=active_only,
+            after_cap_id=after_cap_id,
+            limit=limit,
+        )
+
+    def consume_capability_uses(
+        self,
+        cap_id: str,
+        count: int = 1,
+    ) -> Capability | None:
+        selected_count = _exact_positive_capability_use_count(
+            count,
+            operation="consume",
+        )
+        with _backend_mutation_scope(
+            self._authority_recovery_backend,
+            self.transaction,
+        ):
+            result = self._delegate(
+                "consume_capability_uses",
+                cap_id,
+                selected_count,
+            )
+            return _exact_backend_capability_result(
+                result,
+                operation="consume capability uses",
+            )
+
+    def reserve_capability_uses(
+        self,
+        cap_id: str,
+        reservation_id: str,
+        *,
+        count: int = 1,
+        reserved_by: str,
+        reason: str,
+        created_at: str,
+    ) -> Capability | None:
+        selected_count = _exact_positive_capability_use_count(
+            count,
+            operation="reservation",
+        )
+        with _backend_mutation_scope(
+            self._authority_recovery_backend,
+            self.transaction,
+        ):
+            result = self._delegate(
+                "reserve_capability_uses",
+                cap_id,
+                reservation_id,
+                count=selected_count,
+                reserved_by=reserved_by,
+                reason=reason,
+                created_at=created_at,
+            )
+            return _exact_backend_capability_result(
+                result,
+                operation="reserve capability uses",
+            )
+
+    def commit_capability_use_reservation(
+        self,
+        reservation_id: str,
+        *,
+        updated_at: str,
+    ) -> bool:
+        return _transactional_backend_cas_result(
+            self._authority_recovery_backend,
+            self.transaction,
+            lambda: self._delegate(
+                "commit_capability_use_reservation",
+                reservation_id,
+                updated_at=updated_at,
+            ),
+            operation="commit capability use reservation",
+        )
 
     def delete_publication_capability(self, cap_id: str) -> None:
         """Delete one publication-owned capability and its use reservations."""
@@ -989,13 +1318,16 @@ class ResourceRepository(_RepositoryFacade):
         selected_status = (
             status.value if isinstance(status, ResourceUsageReservationStatus) else status
         )
-        return bool(
-            self._resource_backend.settle_resource_usage_reservation(
+        return _transactional_backend_cas_result(
+            self._resource_backend,
+            self.transaction,
+            lambda: self._resource_backend.settle_resource_usage_reservation(
                 reservation_id,
                 status=selected_status,
                 settled_usage=settled_usage,
                 updated_at=updated_at,
-            )
+            ),
+            operation="settle resource usage reservation",
         )
 
     @staticmethod
@@ -1044,23 +1376,58 @@ class RuntimePublicationRepository(_RepositoryFacade):
             selected_kind = parse_runtime_publication_kind(kind)
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
-        return self._validated_record(
-            self._publication_backend.insert_runtime_publication(
+        selected_plan = deepcopy(dict(plan))
+        with self.transaction():
+            inserted = self._validated_record(
+                self._publication_backend.insert_runtime_publication(
+                    publication_id=publication_id,
+                    kind=selected_kind,
+                    pid=pid,
+                    owner_instance_id=owner_instance_id,
+                    plan=selected_plan,
+                    phase=phase,
+                ),
+                expected_publication_id=publication_id,
+            )
+            self._require_insert_binding(
+                inserted,
                 publication_id=publication_id,
                 kind=selected_kind,
                 pid=pid,
                 owner_instance_id=owner_instance_id,
-                plan=plan,
+                plan=selected_plan,
                 phase=phase,
             )
-        )
+            readback = self._publication_backend.get_runtime_publication(
+                publication_id
+            )
+            if readback is None:
+                raise ValidationError(
+                    "runtime publication backend did not persist the inserted record"
+                )
+            persisted = self._validated_record(
+                readback,
+                expected_publication_id=publication_id,
+            )
+            if persisted != inserted:
+                raise ValidationError(
+                    "runtime publication insert result and durable readback differ"
+                )
+            return inserted
 
     def get_runtime_publication(
         self,
         publication_id: str,
     ) -> RuntimePublicationRecord | None:
         record = self._publication_backend.get_runtime_publication(publication_id)
-        return self._validated_record(record) if record is not None else None
+        return (
+            self._validated_record(
+                record,
+                expected_publication_id=publication_id,
+            )
+            if record is not None
+            else None
+        )
 
     def list_runtime_publications(
         self,
@@ -1077,13 +1444,64 @@ class RuntimePublicationRepository(_RepositoryFacade):
         ]
 
     @staticmethod
-    def _validated_record(record: Mapping[str, Any]) -> RuntimePublicationRecord:
+    def _validated_record(
+        record: Mapping[str, Any],
+        *,
+        expected_publication_id: str | None = None,
+    ) -> RuntimePublicationRecord:
         try:
-            return validate_runtime_publication_record(record)
+            validated = validate_runtime_publication_record(record)
         except (TypeError, ValueError) as exc:
             raise ValidationError(
                 f"invalid runtime publication repository record: {exc}"
             ) from exc
+        if (
+            expected_publication_id is not None
+            and validated["publication_id"] != expected_publication_id
+        ):
+            raise ValidationError(
+                "runtime publication repository returned "
+                f"publication {validated['publication_id']!r} for "
+                f"request {expected_publication_id!r}"
+            )
+        return validated
+
+    @staticmethod
+    def _require_insert_binding(
+        record: RuntimePublicationRecord,
+        *,
+        publication_id: str,
+        kind: RuntimePublicationKind,
+        pid: str,
+        owner_instance_id: str,
+        plan: Mapping[str, Any],
+        phase: str,
+    ) -> None:
+        expected = {
+            "publication_id": publication_id,
+            "kind": kind,
+            "pid": pid,
+            "owner_instance_id": owner_instance_id,
+            "state": "planning",
+            "phase": phase,
+            "plan": dict(plan),
+            "receipt": {"phases": [], "artifacts": []},
+            "error": None,
+            "operation_reconciled": False,
+            "payload_delivery_state": None,
+            "payload_delivery_attempt_id": None,
+            "payload_delivery_started_at": None,
+        }
+        drifted = [
+            field_name
+            for field_name, expected_value in expected.items()
+            if record[field_name] != expected_value
+        ]
+        if drifted:
+            raise ValidationError(
+                "runtime publication insert binding drifted: "
+                + ", ".join(drifted)
+            )
 
     def query_runtime_publication_operation_reconciliation(
         self,
@@ -1160,12 +1578,17 @@ class RuntimePublicationRepository(_RepositoryFacade):
         expected_phase: str,
         expected_operation_id: str | None,
     ) -> bool:
-        return self._publication_backend.mark_runtime_publication_operation_reconciled(
-            publication_id,
-            expected_kind=expected_kind,
-            expected_state=expected_state,
-            expected_phase=expected_phase,
-            expected_operation_id=expected_operation_id,
+        return _transactional_backend_cas_result(
+            self._publication_backend,
+            self.transaction,
+            lambda: self._publication_backend.mark_runtime_publication_operation_reconciled(
+                    publication_id,
+                    expected_kind=expected_kind,
+                    expected_state=expected_state,
+                    expected_phase=expected_phase,
+                    expected_operation_id=expected_operation_id,
+            ),
+            operation="reconcile runtime publication operation",
         )
 
     def runtime_publication_exists_for_pid(
@@ -1191,9 +1614,17 @@ class RuntimePublicationRepository(_RepositoryFacade):
         allow_orphaned_claim_takeover: bool = False,
         claimed_state: RuntimePublicationState | str = "rollback_pending",
     ) -> RuntimePublicationRecord | None:
-        return cast(
-            RuntimePublicationRecord | None,
-            self._publication_backend.claim_runtime_publication_recovery(
+        with self.transaction():
+            before_raw = self._publication_backend.get_runtime_publication(
+                publication_id
+            )
+            if before_raw is None:
+                return None
+            before = self._validated_record(
+                before_raw,
+                expected_publication_id=publication_id,
+            )
+            claimed_raw = self._publication_backend.claim_runtime_publication_recovery(
                 publication_id,
                 claimant_instance_id=claimant_instance_id,
                 expected_owner_instance_id=expected_owner_instance_id,
@@ -1202,8 +1633,191 @@ class RuntimePublicationRepository(_RepositoryFacade):
                 max_attempts=max_attempts,
                 allow_orphaned_claim_takeover=allow_orphaned_claim_takeover,
                 claimed_state=claimed_state,
-            ),
+            )
+            if claimed_raw is None:
+                after_raw = self._publication_backend.get_runtime_publication(
+                    publication_id
+                )
+                after = (
+                    None
+                    if after_raw is None
+                    else self._validated_record(
+                        after_raw,
+                        expected_publication_id=publication_id,
+                    )
+                )
+                if after != before:
+                    raise ValidationError(
+                        "runtime publication recovery claim returned no record "
+                        "after mutating durable state"
+                    )
+                return None
+            claimed = self._validated_record(
+                claimed_raw,
+                expected_publication_id=publication_id,
+            )
+            readback_raw = self._publication_backend.get_runtime_publication(
+                publication_id
+            )
+            if readback_raw is None:
+                raise ValidationError(
+                    "runtime publication recovery claim lost its durable record"
+                )
+            readback = self._validated_record(
+                readback_raw,
+                expected_publication_id=publication_id,
+            )
+            if readback != claimed:
+                raise ValidationError(
+                    "runtime publication recovery claim and durable readback differ"
+                )
+            self._require_claim_binding(
+                before,
+                claimed,
+                claimant_instance_id=claimant_instance_id,
+                expected_owner_instance_id=expected_owner_instance_id,
+                expected_state=expected_state,
+                classification=classification,
+                max_attempts=max_attempts,
+                claimed_state=claimed_state,
+            )
+            return claimed
+
+    @classmethod
+    def _require_claim_binding(
+        cls,
+        before: RuntimePublicationRecord,
+        claimed: RuntimePublicationRecord,
+        *,
+        claimant_instance_id: str,
+        expected_owner_instance_id: str,
+        expected_state: RuntimePublicationState | str,
+        classification: str,
+        max_attempts: int | None,
+        claimed_state: RuntimePublicationState | str,
+    ) -> None:
+        cls._require_claim_immutable_binding(
+            before,
+            claimed,
+            expected_owner_instance_id=expected_owner_instance_id,
+            expected_state=expected_state,
         )
+        recovery, attempt = cls._validated_claim_lease(
+            claimed,
+            claimant_instance_id=claimant_instance_id,
+            classification=classification,
+        )
+        cls._require_claim_state_binding(
+            claimed,
+            recovery,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            claimed_state=claimed_state,
+        )
+
+    @staticmethod
+    def _require_claim_immutable_binding(
+        before: RuntimePublicationRecord,
+        claimed: RuntimePublicationRecord,
+        *,
+        expected_owner_instance_id: str,
+        expected_state: RuntimePublicationState | str,
+    ) -> None:
+        immutable_fields = (
+            "publication_id",
+            "kind",
+            "pid",
+            "plan",
+            "created_at",
+            "payload_delivery_state",
+            "payload_delivery_attempt_id",
+            "payload_delivery_started_at",
+        )
+        drifted = [
+            field_name
+            for field_name in immutable_fields
+            if before[field_name] != claimed[field_name]
+        ]
+        if drifted:
+            raise ValidationError(
+                "runtime publication recovery claim changed immutable binding: "
+                + ", ".join(drifted)
+            )
+        if (
+            before["owner_instance_id"] != expected_owner_instance_id
+            or before["state"] != expected_state
+        ):
+            raise ValidationError(
+                "runtime publication recovery claim ignored its owner/state fence"
+            )
+
+    @staticmethod
+    def _validated_claim_lease(
+        claimed: RuntimePublicationRecord,
+        *,
+        claimant_instance_id: str,
+        classification: str,
+    ) -> tuple[Mapping[str, Any], int]:
+        recovery = claimed["receipt"].get("recovery")
+        if not isinstance(recovery, Mapping):
+            raise ValidationError(
+                "runtime publication recovery claim is missing its durable lease"
+            )
+        attempt = recovery.get("attempt")
+        lease_id = recovery.get("lease_id")
+        if (
+            claimed["owner_instance_id"] != claimant_instance_id
+            or recovery.get("claimant_instance_id") != claimant_instance_id
+            or recovery.get("classification") != classification
+            or type(attempt) is not int
+            or attempt < 1
+            or type(lease_id) is not str
+            or not lease_id
+        ):
+            raise ValidationError(
+                "runtime publication recovery claim returned an invalid lease binding"
+            )
+        return recovery, attempt
+
+    @staticmethod
+    def _require_claim_state_binding(
+        claimed: RuntimePublicationRecord,
+        recovery: Mapping[str, Any],
+        *,
+        attempt: int,
+        max_attempts: int | None,
+        claimed_state: RuntimePublicationState | str,
+    ) -> None:
+        exhausted = (
+            max_attempts is not None
+            and type(max_attempts) is int
+            and attempt > max_attempts
+        )
+        expected_claimed_state = "manual" if exhausted else claimed_state
+        expected_phase = (
+            "recovery_attempts_exhausted" if exhausted else "recovery_claimed"
+        )
+        expected_disposition = "manual" if exhausted else "retryable"
+        if (
+            claimed["state"] != expected_claimed_state
+            or claimed["phase"] != expected_phase
+            or recovery.get("disposition") != expected_disposition
+            or claimed["error"] is not None
+            or claimed["operation_reconciled"] is not False
+        ):
+            raise ValidationError(
+                "runtime publication recovery claim returned an invalid state binding"
+            )
+        phases = claimed["receipt"].get("phases")
+        if not isinstance(phases, list) or not any(
+            isinstance(phase, Mapping)
+            and phase.get("phase") == "recovery_claimed"
+            and all(phase.get(key) == value for key, value in recovery.items())
+            for phase in phases
+        ):
+            raise ValidationError(
+                "runtime publication recovery claim lease is absent from its transcript"
+            )
 
     def advance_runtime_publication(
         self,
@@ -1217,15 +1831,20 @@ class RuntimePublicationRepository(_RepositoryFacade):
         expected_phase: str | None = None,
         recovery_lease_id: str | None = None,
     ) -> bool:
-        return self._publication_backend.advance_runtime_publication(
-            publication_id,
-            state=state,
-            phase=phase,
-            receipt=receipt,
-            error=error,
-            expected_states=expected_states,
-            expected_phase=expected_phase,
-            recovery_lease_id=recovery_lease_id,
+        return _transactional_backend_cas_result(
+            self._publication_backend,
+            self.transaction,
+            lambda: self._publication_backend.advance_runtime_publication(
+                publication_id,
+                state=state,
+                phase=phase,
+                receipt=receipt,
+                error=error,
+                expected_states=expected_states,
+                expected_phase=expected_phase,
+                recovery_lease_id=recovery_lease_id,
+            ),
+            operation="advance runtime publication",
         )
 
     def update_runtime_publication_plan(
@@ -1235,10 +1854,15 @@ class RuntimePublicationRepository(_RepositoryFacade):
         *,
         expected_states: Iterable[RuntimePublicationState | str] | None = None,
     ) -> bool:
-        return self._publication_backend.update_runtime_publication_plan(
-            publication_id,
-            update,
-            expected_states=expected_states,
+        return _transactional_backend_cas_result(
+            self._publication_backend,
+            self.transaction,
+            lambda: self._publication_backend.update_runtime_publication_plan(
+                publication_id,
+                update,
+                expected_states=expected_states,
+            ),
+            operation="update runtime publication plan",
         )
 
     def record_runtime_publication_artifact(
@@ -1248,10 +1872,15 @@ class RuntimePublicationRepository(_RepositoryFacade):
         *,
         expected_states: Iterable[RuntimePublicationState | str] | None = None,
     ) -> bool:
-        return self._publication_backend.record_runtime_publication_artifact(
-            publication_id,
-            artifact,
-            expected_states=expected_states,
+        return _transactional_backend_cas_result(
+            self._publication_backend,
+            self.transaction,
+            lambda: self._publication_backend.record_runtime_publication_artifact(
+                publication_id,
+                artifact,
+                expected_states=expected_states,
+            ),
+            operation="record runtime publication artifact",
         )
 
 
@@ -1353,16 +1982,21 @@ class CheckpointRestorePublicationWriter:
         expected_phase: str | None = None,
         recovery_lease_id: str | None = None,
     ) -> bool:
-        return self.__backend.advance_runtime_publication(
-            publication_id,
-            state=state,
-            phase=phase,
-            receipt=receipt,
-            error=error,
-            expected_states=expected_states,
-            expected_phase=expected_phase,
-            recovery_lease_id=recovery_lease_id,
-            _checkpoint_restore_writer_token=self.__token,
+        return _transactional_backend_cas_result(
+            self.__backend,
+            self.__backend.transaction,
+            lambda: self.__backend.advance_runtime_publication(
+                publication_id,
+                state=state,
+                phase=phase,
+                receipt=receipt,
+                error=error,
+                expected_states=expected_states,
+                expected_phase=expected_phase,
+                recovery_lease_id=recovery_lease_id,
+                _checkpoint_restore_writer_token=self.__token,
+            ),
+            operation="advance checkpoint restore publication",
         )
 
     def record_runtime_publication_artifact(
@@ -1372,11 +2006,16 @@ class CheckpointRestorePublicationWriter:
         *,
         expected_states: Iterable[RuntimePublicationState | str] | None = None,
     ) -> bool:
-        return self.__backend.record_runtime_publication_artifact(
-            publication_id,
-            artifact,
-            expected_states=expected_states,
-            _checkpoint_restore_writer_token=self.__token,
+        return _transactional_backend_cas_result(
+            self.__backend,
+            self.__backend.transaction,
+            lambda: self.__backend.record_runtime_publication_artifact(
+                publication_id,
+                artifact,
+                expected_states=expected_states,
+                _checkpoint_restore_writer_token=self.__token,
+            ),
+            operation="record checkpoint restore publication artifact",
         )
 
     def mark_runtime_publication_operation_reconciled(
@@ -1388,13 +2027,18 @@ class CheckpointRestorePublicationWriter:
         expected_phase: str,
         expected_operation_id: str | None,
     ) -> bool:
-        return self.__backend.mark_runtime_publication_operation_reconciled(
-            publication_id,
-            expected_kind=expected_kind,
-            expected_state=expected_state,
-            expected_phase=expected_phase,
-            expected_operation_id=expected_operation_id,
-            _checkpoint_restore_writer_token=self.__token,
+        return _transactional_backend_cas_result(
+            self.__backend,
+            self.__backend.transaction,
+            lambda: self.__backend.mark_runtime_publication_operation_reconciled(
+                    publication_id,
+                    expected_kind=expected_kind,
+                    expected_state=expected_state,
+                    expected_phase=expected_phase,
+                    expected_operation_id=expected_operation_id,
+                    _checkpoint_restore_writer_token=self.__token,
+            ),
+            operation="reconcile checkpoint restore publication operation",
         )
 
     def transition_payload_delivery(
@@ -1408,42 +2052,62 @@ class CheckpointRestorePublicationWriter:
         owner_instance_id: str | None = None,
         recovery_lease_id: str | None = None,
     ) -> bool:
-        return self.__backend.transition_checkpoint_restore_payload_delivery(
-            publication_id,
-            expected_delivery_state=expected_delivery_state,
-            delivery_state=delivery_state,
-            expected_attempt=expected_attempt,
-            delivery_attempt=delivery_attempt,
-            owner_instance_id=owner_instance_id,
-            recovery_lease_id=recovery_lease_id,
-            _checkpoint_restore_writer_token=self.__token,
+        return _transactional_backend_cas_result_rollback_on_error(
+            self.__backend,
+            self.__backend.transaction,
+            lambda: self.__backend.transition_checkpoint_restore_payload_delivery(
+                    publication_id,
+                    expected_delivery_state=expected_delivery_state,
+                    delivery_state=delivery_state,
+                    expected_attempt=expected_attempt,
+                    delivery_attempt=delivery_attempt,
+                    owner_instance_id=owner_instance_id,
+                    recovery_lease_id=recovery_lease_id,
+                    _checkpoint_restore_writer_token=self.__token,
+            ),
+            operation="transition checkpoint payload delivery",
         )
 
     def begin_checkpoint_payload_delivery_attempt(
         self,
         attempt: CheckpointPayloadDeliveryAttempt,
     ) -> bool:
-        return self.__backend.begin_checkpoint_payload_delivery_attempt(
-            attempt,
-            _checkpoint_restore_writer_token=self.__token,
+        return _transactional_backend_cas_result(
+            self.__backend,
+            self.__backend.transaction,
+            lambda: self.__backend.begin_checkpoint_payload_delivery_attempt(
+                attempt,
+                _checkpoint_restore_writer_token=self.__token,
+            ),
+            operation="begin checkpoint payload delivery attempt",
         )
 
     def ack_checkpoint_payload_delivery_attempt(
         self,
         attempt: CheckpointPayloadDeliveryAttempt,
     ) -> bool:
-        return self.__backend.ack_checkpoint_payload_delivery_attempt(
-            attempt,
-            _checkpoint_restore_writer_token=self.__token,
+        return _transactional_backend_cas_result(
+            self.__backend,
+            self.__backend.transaction,
+            lambda: self.__backend.ack_checkpoint_payload_delivery_attempt(
+                attempt,
+                _checkpoint_restore_writer_token=self.__token,
+            ),
+            operation="ack checkpoint payload delivery attempt",
         )
 
     def abort_checkpoint_payload_delivery_attempt(
         self,
         attempt: CheckpointPayloadDeliveryAttempt,
     ) -> bool:
-        return self.__backend.abort_checkpoint_payload_delivery_attempt(
-            attempt,
-            _checkpoint_restore_writer_token=self.__token,
+        return _transactional_backend_cas_result(
+            self.__backend,
+            self.__backend.transaction,
+            lambda: self.__backend.abort_checkpoint_payload_delivery_attempt(
+                attempt,
+                _checkpoint_restore_writer_token=self.__token,
+            ),
+            operation="abort checkpoint payload delivery attempt",
         )
 
 
@@ -1465,6 +2129,18 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
         *,
         process_namespace: str,
     ) -> tuple[SnapshotRows, dict[str, Any]]:
+        with self.transaction():
+            return self._capture_process_exec_snapshot_rows(
+                pid,
+                process_namespace=process_namespace,
+            )
+
+    def _capture_process_exec_snapshot_rows(
+        self,
+        pid: str,
+        *,
+        process_namespace: str,
+    ) -> tuple[SnapshotRows, dict[str, Any]]:
         from agent_libos.models.snapshot import SnapshotRows
 
         process_rows = self._select_rows("processes", "pid = ?", (pid,))
@@ -1473,7 +2149,7 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
         object_rows = self._owned_object_rows(pid)
         object_oids = [str(row["oid"]) for row in object_rows]
         namespace_rows = self._owned_namespace_rows(pid, process_namespace)
-        rows = SnapshotRows.from_mapping(
+        rows = SnapshotRows.from_trusted_durable_mapping(
             {
                 "processes": process_rows,
                 "object_namespaces": namespace_rows,
@@ -1586,7 +2262,7 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                     (pid,),
                 )
             ]
-            process_restored = bool(
+            process_restored = _exact_backend_cas_result(
                 self._snapshot_backend.restore_process_for_exec(
                     before_process_row,
                     expected_revision=current_process.revision,
@@ -1595,7 +2271,8 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                     ),
                     capability_ids=capability_ids,
                     fence_execution=fence_execution,
-                )
+                ),
+                operation="restore process for exec",
             )
             if not process_restored:
                 raise ProcessRevisionConflict(
@@ -1651,9 +2328,14 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
         checkpoint: Checkpoint,
         snapshot: ProcessSnapshot,
     ) -> None:
+        selected_snapshot = self._validated_checkpoint_pair(
+            checkpoint,
+            snapshot,
+            expected_checkpoint_id=checkpoint.checkpoint_id,
+        )
         self._snapshot_backend.insert_checkpoint(
             checkpoint,
-            snapshot.to_mapping(),
+            selected_snapshot.to_mapping(),
         )
 
     def get_checkpoint_snapshot(
@@ -1666,7 +2348,98 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
         if found is None:
             return None
         checkpoint, snapshot = found
-        return cast(Checkpoint, checkpoint), ProcessSnapshot.from_mapping(snapshot)
+        try:
+            selected_snapshot = ProcessSnapshot.from_mapping(snapshot)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"invalid checkpoint repository snapshot: {exc}"
+            ) from exc
+        selected_checkpoint = self._validated_checkpoint_pair(
+            checkpoint,
+            selected_snapshot,
+            expected_checkpoint_id=checkpoint_id,
+        )
+        return cast(Checkpoint, checkpoint), selected_checkpoint
+
+    @staticmethod
+    def _validated_checkpoint_pair(
+        checkpoint: Any,
+        snapshot: ProcessSnapshot,
+        *,
+        expected_checkpoint_id: str,
+    ) -> ProcessSnapshot:
+        from agent_libos.models.snapshot import (
+            ProcessSnapshot,
+            SNAPSHOT_SCHEMA_VERSION,
+        )
+
+        if type(checkpoint) is not Checkpoint:
+            raise ValidationError(
+                "checkpoint repository backend returned an invalid checkpoint record"
+            )
+        if type(expected_checkpoint_id) is not str or not expected_checkpoint_id:
+            raise ValidationError("checkpoint id must be exact non-empty text")
+        if not isinstance(snapshot, ProcessSnapshot):
+            raise ValidationError(
+                "checkpoint repository backend returned an invalid snapshot record"
+            )
+        try:
+            canonical_snapshot = ProcessSnapshot.from_mapping(snapshot.to_mapping())
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"invalid checkpoint repository snapshot: {exc}"
+            ) from exc
+        header = canonical_snapshot.header
+        if header.schema_version != SNAPSHOT_SCHEMA_VERSION:
+            raise ValidationError(
+                f"unsupported snapshot version: {header.schema_version}"
+            )
+        identity_fields = (
+            (
+                "checkpoint_id",
+                checkpoint.checkpoint_id,
+                header.checkpoint_id,
+                str,
+            ),
+            ("pid", checkpoint.pid, header.root_pid, str),
+            ("reason", checkpoint.reason, header.reason, str),
+            ("created_at", checkpoint.created_at, header.created_at, str),
+            ("created_by", checkpoint.created_by, header.created_by, str),
+            (
+                "snapshot_version",
+                checkpoint.snapshot_version,
+                header.schema_version,
+                int,
+            ),
+        )
+        for field_name, checkpoint_value, snapshot_value, expected_type in identity_fields:
+            if (
+                type(checkpoint_value) is not expected_type
+                or type(snapshot_value) is not expected_type
+                or checkpoint_value != snapshot_value
+            ):
+                raise ValidationError(
+                    "checkpoint snapshot changed: row and snapshot header binding differ: "
+                    f"{field_name}"
+                )
+        if checkpoint.checkpoint_id != expected_checkpoint_id:
+            raise ValidationError(
+                "checkpoint repository returned "
+                f"checkpoint {checkpoint.checkpoint_id!r} for "
+                f"request {expected_checkpoint_id!r}"
+            )
+        if (
+            type(checkpoint.effect_ledger_seq) is not int
+            or checkpoint.effect_ledger_seq < 0
+            or (
+                checkpoint.metadata is not None
+                and type(checkpoint.metadata) is not dict
+            )
+        ):
+            raise ValidationError(
+                "checkpoint repository returned invalid checkpoint metadata"
+            )
+        return canonical_snapshot
 
     def list_checkpoints(
         self,
@@ -1680,6 +2453,20 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
         )
 
     def capture_checkpoint_rows(
+        self,
+        process_rows: Iterable[Mapping[str, Any]],
+        *,
+        object_oids: Iterable[str],
+        namespace_names: Iterable[str],
+    ) -> tuple[SnapshotRows, dict[str, Any]]:
+        with self.transaction():
+            return self._capture_checkpoint_rows(
+                process_rows,
+                object_oids=object_oids,
+                namespace_names=namespace_names,
+            )
+
+    def _capture_checkpoint_rows(
         self,
         process_rows: Iterable[Mapping[str, Any]],
         *,
@@ -1731,7 +2518,7 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
             for row in selected_process_rows
             for skill_id in loads(row.get("loaded_skills_json"), {}).keys()
         }
-        rows = SnapshotRows.from_mapping(
+        rows = SnapshotRows.from_trusted_durable_mapping(
             {
                 "processes": selected_process_rows,
                 "object_namespaces": self._rows_by_values(
@@ -1866,10 +2653,10 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                 for request in requests:
                     if request.created_at <= checkpoint.created_at:
                         continue
-                    cursor.execute(
+                    updated = cursor.execute(
                         "UPDATE human_requests "
                         "SET status = ?, decision_json = ?, updated_at = ? "
-                        "WHERE request_id = ?",
+                        "WHERE request_id = ? AND status = ? AND created_at > ?",
                         (
                             HumanRequestStatus.CANCELLED.value,
                             dumps(
@@ -1881,9 +2668,12 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                             ),
                             utc_now(),
                             request.request_id,
+                            HumanRequestStatus.PENDING.value,
+                            checkpoint.created_at,
                         ),
                     )
-                    cancelled.append(str(request.request_id))
+                    if updated.rowcount == 1:
+                        cancelled.append(str(request.request_id))
         return cancelled
 
     def supersede_messages_after_checkpoint(
@@ -1920,6 +2710,59 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                     superseded.append(str(message.message_id))
         return superseded
 
+    def _iter_checkpoint_object_tasks(
+        self,
+        *,
+        statuses: Iterable[ObjectTaskStatus],
+        checkpoint_created_at: str,
+        terminal_after: bool,
+        pids: Iterable[str],
+        object_oids: Iterable[str],
+    ) -> Iterator[ObjectTask]:
+        """Page only task rows intersecting one checkpoint's process/Object scope."""
+
+        seen: set[str] = set()
+        for scope_kind, values in (
+            ("scope_pids", sorted({str(pid) for pid in pids})),
+            ("owner_oids", sorted({str(oid) for oid in object_oids})),
+        ):
+            for batch in _snapshot_value_batches(values):
+                after: ObjectTaskRecoveryCursor | None = None
+                while True:
+                    query_scope = {
+                        "scope_pids": (),
+                        "owner_oids": (),
+                        scope_kind: batch,
+                    }
+                    page = self._snapshot_backend.query_checkpoint_object_tasks(
+                        statuses=statuses,
+                        checkpoint_created_at=checkpoint_created_at,
+                        terminal_after=terminal_after,
+                        after=after,
+                        **query_scope,
+                    )
+                    if not isinstance(page, ObjectTaskRecoveryPage):
+                        raise ValidationError(
+                            "checkpoint task query returned an invalid page"
+                        )
+                    if after is not None and any(
+                        (task.created_at, task.task_id)
+                        <= (after.created_at, after.task_id)
+                        for task in page.records
+                    ):
+                        raise ValidationError(
+                            "checkpoint task query did not advance its cursor"
+                        )
+                    for task in page.records:
+                        task_id = str(task.task_id)
+                        if task_id in seen:
+                            continue
+                        seen.add(task_id)
+                        yield task
+                    if page.next_cursor is None:
+                        break
+                    after = page.next_cursor
+
     def supersede_object_tasks_after_checkpoint(
         self,
         pids: Iterable[str],
@@ -1928,34 +2771,23 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
     ) -> list[str]:
         scoped_pids = {str(pid) for pid in pids}
         scoped_oids = {str(oid) for oid in object_oids}
-        terminal_statuses = {
+        terminal_statuses = (
             ObjectTaskStatus.SUCCEEDED,
             ObjectTaskStatus.FAILED,
             ObjectTaskStatus.CANCELLED,
             ObjectTaskStatus.ABANDONED,
             ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN,
-        }
+        )
         superseded: list[str] = []
         now = utc_now()
         with self.transaction() as cursor:
-            for task in self._snapshot_backend.list_object_tasks(
-                include_terminal=True
+            for task in self._iter_checkpoint_object_tasks(
+                statuses=terminal_statuses,
+                checkpoint_created_at=checkpoint.created_at,
+                terminal_after=True,
+                pids=scoped_pids,
+                object_oids=scoped_oids,
             ):
-                terminal_at = task.completed_at or task.updated_at
-                if (
-                    task.status not in terminal_statuses
-                    or terminal_at <= checkpoint.created_at
-                ):
-                    continue
-                if not (
-                    str(task.creator_pid) in scoped_pids
-                    or (
-                        task.runner_pid is not None
-                        and str(task.runner_pid) in scoped_pids
-                    )
-                    or str(task.owner_oid) in scoped_oids
-                ):
-                    continue
                 wait = {
                     **task.wait,
                     "superseded_by_restore": checkpoint.checkpoint_id,
@@ -2251,6 +3083,10 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                         "checkpoint fork process left durable quarantine before "
                         f"publication: {target['pid']}"
                     )
+                self._snapshot_backend.ensure_process_terminal_cleanup_intent(
+                    str(target["pid"]),
+                    str(target["status"]),
+                )
         return tuple(sorted(target_pids))
 
     def checkpoint_fork_process_rows_match(
@@ -2426,6 +3262,10 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                 row,
                 before_insert=before_insert,
             )
+            self._snapshot_backend.ensure_process_terminal_cleanup_intent(
+                str(row["pid"]),
+                str(row["status"]),
+            )
             self._snapshot_backend.set_llm_context_generation(
                 str(row["pid"]),
                 new_id("llmctx"),
@@ -2441,29 +3281,19 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
         restored: list[str] = []
         now = utc_now()
         with self.transaction() as cursor:
-            for task in self._snapshot_backend.list_object_tasks(
-                include_terminal=True
+            for task in self._iter_checkpoint_object_tasks(
+                statuses=(ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN,),
+                checkpoint_created_at=checkpoint.created_at,
+                terminal_after=False,
+                pids=snapshot_pids,
+                object_oids=snapshot_oids,
             ):
-                if task.status != ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN:
-                    continue
-                terminal_at = task.completed_at or task.updated_at
-                if terminal_at > checkpoint.created_at:
-                    continue
                 if task.wait.get("previous_status") != ObjectTaskStatus.SUCCEEDED.value:
                     continue
                 previous_result_oid = task.wait.get("previous_result_oid")
                 if (
                     not isinstance(previous_result_oid, str)
                     or previous_result_oid not in snapshot_oids
-                ):
-                    continue
-                if not (
-                    str(task.creator_pid) in snapshot_pids
-                    or (
-                        task.runner_pid is not None
-                        and str(task.runner_pid) in snapshot_pids
-                    )
-                    or str(task.owner_oid) in snapshot_oids
                 ):
                     continue
                 if self._snapshot_backend.get_object(previous_result_oid) is None:
@@ -2548,11 +3378,16 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                         before_insert=before_insert,
                     )
             for row in rows.processes:
+                published = _checkpoint_fork_quarantine_process_row(row)
                 self._insert_backend_row(
                     cursor,
                     "processes",
-                    _checkpoint_fork_quarantine_process_row(row),
+                    published,
                     before_insert=before_insert,
+                )
+                self._snapshot_backend.ensure_process_terminal_cleanup_intent(
+                    str(published["pid"]),
+                    str(published["status"]),
                 )
 
     def tool_id_used_outside_scope(
@@ -2604,9 +3439,14 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
         *,
         excluding_pid: str,
     ) -> bool:
-        return self._snapshot_backend.delete_tool_if_unreferenced(
-            tool_id,
-            excluding_pid=excluding_pid,
+        return _transactional_backend_cas_result(
+            self._snapshot_backend,
+            self.transaction,
+            lambda: self._snapshot_backend.delete_tool_if_unreferenced(
+                tool_id,
+                excluding_pid=excluding_pid,
+            ),
+            operation="delete unreferenced tool",
         )
 
     def _select_rows(
@@ -2658,6 +3498,15 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
         item = dict(row)
         if before_insert is not None:
             before_insert(cursor, table, item)
+        # Snapshot values retain domain-native booleans so their JSON form is
+        # unambiguous.  The shared SQL schema deliberately stores capability
+        # flags as INTEGER for SQLite/PostgreSQL parity, however, and psycopg
+        # correctly refuses to bind a Python bool to an INTEGER column.  Keep
+        # the observer boundary semantic, then normalize only at persistence.
+        if table == "capabilities":
+            for column in ("delegable", "revocable"):
+                if type(item.get(column)) is bool:
+                    item[column] = int(item[column])
         self._snapshot_backend.insert_table_row(table, item)
 
     def _upsert_backend_row(
@@ -3076,13 +3925,23 @@ class EvidenceRepository(_RepositoryFacade):
         *,
         expected_states: Iterable[str] | None = None,
     ) -> bool:
-        return self._operation_backend.update_operation(
-            record,
-            expected_states=expected_states,
+        return _transactional_backend_cas_result(
+            self._operation_backend,
+            self.transaction,
+            lambda: self._operation_backend.update_operation(
+                record,
+                expected_states=expected_states,
+            ),
+            operation="update operation",
         )
 
     def insert_operation_evidence(self, link: OperationEvidenceLink) -> bool:
-        return self._operation_backend.insert_operation_evidence(link)
+        return _transactional_backend_cas_result(
+            self._operation_backend,
+            self.transaction,
+            lambda: self._operation_backend.insert_operation_evidence(link),
+            operation="insert operation evidence",
+        )
 
     def list_operation_evidence(
         self,
@@ -3378,10 +4237,15 @@ class PayloadRetentionRepository(_RepositoryFacade):
         expected_payload_sha256: str,
         expected_tier: PayloadRetentionTier,
     ) -> bool:
-        return self._retention_backend.update_llm_call_payload_retention(
-            record,
-            expected_payload_sha256=expected_payload_sha256,
-            expected_tier=expected_tier,
+        return _transactional_backend_cas_result(
+            self._retention_backend,
+            self.transaction,
+            lambda: self._retention_backend.update_llm_call_payload_retention(
+                record,
+                expected_payload_sha256=expected_payload_sha256,
+                expected_tier=expected_tier,
+            ),
+            operation="update LLM call payload retention",
         )
 
     def scan_external_effect_payloads_for_retention(
@@ -3406,12 +4270,17 @@ class PayloadRetentionRepository(_RepositoryFacade):
         expected_effect_state: str,
         expected_transaction_state: str,
     ) -> bool:
-        return self._retention_backend.update_external_effect_payload_retention(
-            record,
-            expected_payload_sha256=expected_payload_sha256,
-            expected_tier=expected_tier,
-            expected_effect_state=expected_effect_state,
-            expected_transaction_state=expected_transaction_state,
+        return _transactional_backend_cas_result(
+            self._retention_backend,
+            self.transaction,
+            lambda: self._retention_backend.update_external_effect_payload_retention(
+                record,
+                expected_payload_sha256=expected_payload_sha256,
+                expected_tier=expected_tier,
+                expected_effect_state=expected_effect_state,
+                expected_transaction_state=expected_transaction_state,
+            ),
+            operation="update external effect payload retention",
         )
 
 
@@ -3482,6 +4351,7 @@ class ProtectedEffectRepository:
 
 _MIGRATED_BACKEND_PROTOCOLS: tuple[tuple[str, type[Any]], ...] = (
     ("authority-recovery", AuthorityRecoveryBackendProtocol),
+    ("object-query", ObjectQueryBackendProtocol),
     ("object-recovery", ObjectRecoveryBackendProtocol),
     ("process", ProcessBackendProtocol),
     ("resource", ResourceBackendProtocol),

@@ -1,8 +1,11 @@
 # Startup Runtime Modules
 
-Runtime Modules are trusted Python extensions loaded before `Runtime.open()`
-returns. They are for extending the runtime composition root, not for giving an
-AgentProcess extra authority.
+Configured startup Runtime Modules are trusted Python extensions loaded during
+runtime assembly before `Runtime.open()` returns. A trusted Host may also call
+`runtime.modules.load_module_manifest(...)` to load an additional module into
+an already-open Runtime. Both paths extend the Host composition root; neither
+gives an AgentProcess extra authority or exposes module loading as
+model-controlled installation.
 
 ## Boundary
 
@@ -18,6 +21,10 @@ Modules are part of the host trusted computing base:
   development.
 - Loading a module never grants filesystem, shell, Object Memory, human,
   process, checkpoint, Skill, image, or JSON-RPC capabilities to a process.
+- Module load, hook, and rollback failures keep raw exception text in memory
+  only. Durable module rows, audit decisions, and warning-policy results carry
+  a correlated text-free error envelope plus byte-count/SHA-256 diagnostic
+  fingerprints, so exception-authored secrets and paths are not published.
 - Import-string entrypoints are resolved to a concrete source file under the
   manifest directory without importing package code, then trusted source bytes
   are loaded fresh under an isolated module name so a previous `sys.modules`
@@ -26,9 +33,21 @@ Modules are part of the host trusted computing base:
   package hash do not reuse module globals, while the namespace remains
   available for registered tools and hooks that perform runtime relative
   imports.
-- Module source files are hashed with a configured per-file size limit
-  (`AgentLibOSConfig.modules.source_max_bytes`) before import. Multi-file
-  package hashes also respect `package_max_bytes` and `max_package_files`.
+- Manifest and source files are read to EOF through one identity-stable,
+  non-reparse descriptor with a configured byte cap before parsing, hashing,
+  or import. Unix opens the lexical path from the filesystem root one component
+  at a time with no-follow directory descriptors, retains the root-to-parent
+  chain, and revalidates every parent/name edge after the target access. The
+  only POSIX alias expansion is Darwin's fixed root aliases (`/etc`, `/tmp`,
+  and `/var`) to their `/private` targets; arbitrary ancestor symlinks fail;
+  Windows uses replacement-blocking `CreateFileW` handles and verifies file
+  identity with `GetFileInformationByHandle`; it holds a no-delete handle chain
+  from the absolute root through the selected parent so name-based Win32
+  enumeration cannot be redirected by renaming an ancestor. Multi-file package
+  traversal keeps every parent directory guarded, is path-count bounded, and
+  hashes only the bytes read from guarded file descriptors. Source files respect
+  `AgentLibOSConfig.modules.source_max_bytes`; package snapshots also respect
+  `package_max_bytes` and `max_package_files`.
 - A module that performs direct Python/OS I/O is outside the runtime-mediated
   data-flow guarantee. Module syscalls and providers that handle process data
   must declare a protected-operation direction and use the common SDK gate;
@@ -70,6 +89,94 @@ metadata:
   owner: local
 ```
 
+The unwrapped mapping above is the canonical authoring form. For compatibility,
+the loader also accepts the same mapping beneath a sole top-level `module` key:
+
+```yaml
+module:
+  schema_version: 1
+  module_id: example-module:v0
+  name: Example module
+  entrypoint: ./example_module.py:register_module
+  provides: {}
+  sha256: "<sha256 of example_module.py bytes>"
+```
+
+The wrapper must be the only top-level key and its value must be a mapping.
+After removing that optional wrapper, Manifest V1 is closed: the only allowed
+fields are `schema_version`, `module_id`, `name`, `version`, `entrypoint`,
+`provides`, `sha256`, and `metadata`. Unknown fields are rejected rather than
+ignored. `provides` is also closed; its only allowed fields are `tools`,
+`images`, `syscalls`, `provider_hooks`, `startup_hooks`, and
+`durable_object_release_finalizers`.
+
+The field contract is:
+
+| Field | Required | V1 contract |
+| --- | --- | --- |
+| `schema_version` | yes | Integer `1`; booleans are not integers for this field. |
+| `module_id` | yes | Non-empty identifier matching `[A-Za-z0-9][A-Za-z0-9_.:/@+-]*`. |
+| `name` | yes | Non-empty display string. |
+| `version` | no | Defaults to `v0` when omitted. Authors should otherwise supply a non-empty string; the current compatibility parser also normalizes an explicit falsy decoded value to `v0`. |
+| `entrypoint` | yes | Non-empty `<module-or-path>:<callable>` reference resolved relative to the manifest directory. |
+| `provides` | yes | Mapping, including `{}` when the entrypoint buffers no declared registration. |
+| `sha256` | yes | Exactly 64 hexadecimal characters; normalized to lowercase. |
+| `metadata` | no | A mapping containing only finite JSON values. Omission and explicit `null` both normalize to `{}`. |
+
+Every `provides` child is optional. An omitted child or an explicit `null`
+normalizes to an empty list; a present child must be a list of unique,
+non-empty strings. Syscall, provider-hook, startup-hook, and durable-finalizer
+names must match `[A-Za-z][A-Za-z0-9_.:-]*`. Tool and image declarations use
+the general non-empty identifier-string validation because their concrete
+registries perform the surface-specific validation during preflight.
+
+With the default `ModuleDefaults`, the manifest string and inventory limits
+are:
+
+| Value | Default limit |
+| --- | ---: |
+| `module_id` | 128 characters |
+| `name` | 128 characters |
+| `version` | 64 characters |
+| `entrypoint` | 512 characters |
+| each `provides` item | 128 characters |
+| `provides.tools` | 128 items |
+| `provides.images` | 128 items |
+| `provides.syscalls` | 128 items |
+| `provides.provider_hooks` | 64 items |
+| `provides.startup_hooks` | 64 items |
+| `provides.durable_object_release_finalizers` | 64 items, sharing `max_declared_startup_hooks` |
+
+These are Host-configurable positive limits. Strings are trimmed before length
+checking and control characters are rejected. Duplicate mapping keys are
+rejected at every YAML or JSON mapping level, and YAML mapping keys must be
+strings. `metadata` has no separate item-count allowance: it is bounded by the
+whole-manifest and parser limits below and must remain JSON-serializable with
+no NaN or infinity.
+
+Default file and package limits are:
+
+| Config/default | Enforced boundary |
+| --- | --- |
+| `manifest_max_bytes = 262144` | Maximum manifest file bytes read by normal `resolve`, `verify`, and load paths. |
+| `manifest_hard_limit_bytes = 1048576` | Maximum UTF-8 bytes accepted by `parse_manifest`; configuration requires it to be at least `manifest_max_bytes`. |
+| `source_max_bytes = 1048576` | Maximum bytes for a direct entrypoint source or any selected Python source file. |
+| `package_max_bytes = 8388608` | Maximum aggregate bytes of Python files included in a package snapshot; configuration requires it to be at least `source_max_bytes`. |
+| `max_package_files = 256` | Maximum directory entries visited while collecting a package, not merely the number of `.py` files finally hashed. |
+
+Package traversal charges a visited path before deciding whether to descend,
+prune it, or include its bytes. There is no separate Module package-depth
+setting; every descended directory consumes the same `max_package_files`
+budget, so the path-count ceiling also bounds recursive depth. Only the sorted
+`.py` snapshot is executed and represented in the package digest.
+
+Manifest decoding also has fixed structural ceilings independent of
+`ModuleDefaults`. YAML allows at most 64 levels, 32,768 expanded nodes, 60,000
+parse events, 64 aliases, 4,300 integer digits, and 1 MiB of expanded scalar
+text. JSON allows at most 256 levels, 100,000 decoded nodes, and 4,300 integer
+digits. Both formats reject non-finite numbers; the YAML loader additionally
+has a fixed 1 MiB UTF-8 input ceiling.
+
 The manifest may also use an import-string entrypoint such as
 `example_package.module:register_module`. Import strings and file entrypoints
 are resolved relative to the manifest directory; file entrypoints cannot escape
@@ -87,14 +194,18 @@ are imported from the verified in-memory snapshot under a synthetic package
 name, so bundled helpers should use package-relative imports such as
 `from .helper import make_tool`. The manifest directory is not added to
 `sys.path`, and local helpers are not imported through their original absolute
-package name.
+package name. If import or source verification is interrupted by any
+`BaseException`, including cancellation or `KeyboardInterrupt`, the synthetic
+namespace and its temporary importer are removed before the interruption is
+propagated.
 
 The package reader rejects symlinks, hard links, non-regular selected entries,
-path escapes, and likely secret material. During recursive multi-file package
-collection it prunes cache/VCS directories rather than treating their mere
-presence as a package error; those pruned files are not executed or covered by
-the digest. A direct single-file entrypoint is verified as that file and does
-not recursively apply the package-directory pruning rule. Run
+path escapes, directory replacement during traversal, and likely secret
+material. During recursive multi-file package collection it prunes cache/VCS
+directories rather than treating their mere presence as a package error; those
+pruned files are not executed or covered by the digest. A direct single-file
+entrypoint is verified as that file and does not recursively apply the
+package-directory pruning rule. Run
 `uv run agent-libos modules verify <module.yaml>` after authoring a module to
 get the current `manifest_sha256`, `source_sha256`, `trust_key`, and the file
 list covered by the source digest.
@@ -144,7 +255,12 @@ There are two deliberately different context lifecycles:
    `register_tool`, `register_image`, `register_syscall`,
    `register_provider_hook`, `add_startup_hook`, and
    `bind_durable_object_release_finalizer`. Every registered name/id must appear
-   in the corresponding manifest `provides` list.
+   in the corresponding manifest `provides` list. The registry verifies that
+   each public registration buffer still contains exactly the objects admitted
+   through those methods, so direct list/dict mutation cannot bypass
+   `provides` before preflight or application. A tool's concrete publication
+   name must also equal the name admitted when `register_tool` ran; mutating a
+   tool implementation after admission fails and rolls back its publication.
 2. After buffered registrations pass preflight and are applied, each declared
    provider/startup hook receives a `ModuleHookContext`. The context is backed
    by `ModuleHookServices`, and every supported registration or installed
@@ -201,10 +317,14 @@ A failed module rollback therefore cannot erase a successful module or registry
 publication that raced with it. Module list limits must be positive
 integers no larger than `ModuleDefaults.discover_limit`.
 
-`Runtime.open()` runs all configured startup hooks before returning. If host code
-manually calls `runtime.modules.load_module_manifest()` after startup has already
-completed, that module's provider and startup hooks run immediately; failure
-rolls back the newly loaded module.
+`Runtime.open()` loads the internal core module plus manifests selected through
+`AgentLibOSConfig.modules.manifest_paths` and its explicit `module_manifests`
+argument, and runs all of their startup hooks before returning. This timing is a
+guarantee for configured startup modules, not a ban on trusted Host
+reconfiguration. If Host code calls
+`runtime.modules.load_module_manifest(...)` after startup has completed, that
+module's provider and startup hooks run immediately; failure rolls back the
+newly loaded module.
 
 ## Registration Surfaces
 

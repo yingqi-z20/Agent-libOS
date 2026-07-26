@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from agent_libos import Runtime
+from agent_libos.models import ProcessStatus
+from agent_libos.skills import BUILTIN_SKILL_IDS, get_builtin_skill_catalog
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from benchmarks.builtin_tool_skills import (
     EVALUATION_REPETITIONS,
     EVALUATION_VARIANTS,
     HELD_OUT_SCENARIOS,
+    REAL_LLM_ROUTING_CATALOG,
     WITH_SKILLS,
     WITHOUT_SKILLS,
     aggregate_runs,
@@ -33,6 +37,25 @@ def test_held_out_catalog_has_adjacent_skill_near_misses() -> None:
         and scenario.expected_probe_tool not in scenario.goal
         for scenario in HELD_OUT_SCENARIOS
     )
+
+
+def test_real_llm_routing_catalog_covers_every_builtin_skill() -> None:
+    expected = set(BUILTIN_SKILL_IDS)
+    actual = {
+        scenario.expected_skill_id
+        for scenario in REAL_LLM_ROUTING_CATALOG
+    }
+
+    assert len(REAL_LLM_ROUTING_CATALOG) == len(BUILTIN_SKILL_IDS) == 26
+    assert actual == expected
+    assert len(
+        {scenario.scenario_id for scenario in REAL_LLM_ROUTING_CATALOG}
+    ) == len(REAL_LLM_ROUTING_CATALOG)
+    for scenario in REAL_LLM_ROUTING_CATALOG:
+        assert scenario.expected_skill_id not in scenario.intent
+        assert scenario.adjacent_skill_ids
+        assert scenario.expected_skill_id not in scenario.adjacent_skill_ids
+        assert set(scenario.adjacent_skill_ids) <= expected
 
 
 def test_aggregate_runs_records_routing_invalid_calls_and_overhead() -> None:
@@ -359,7 +382,22 @@ def test_scenario_probes_and_oracles_run_offline_without_llm(
     [
         (
             "git_read",
-            {"entries": [{"path": {"text": "tracked-intent.txt"}}], "state": {"token": "a" * 64}},
+            {
+                "entries": [
+                    {
+                        "path": {
+                            "display": "tracked-intent.txt",
+                            "path_b64": "dHJhY2tlZC1pbnRlbnQudHh0",
+                            "lossy": False,
+                        },
+                        "kind": "untracked",
+                        "index_status": "?",
+                        "worktree_status": "?",
+                    }
+                ],
+                "state": {"token": "a" * 64},
+                "truncated": False,
+            },
         ),
         (
             "shell_git_read",
@@ -369,7 +407,7 @@ def test_scenario_probes_and_oracles_run_offline_without_llm(
                 "stdout": "?? tracked-intent.txt\n",
             },
         ),
-        ("mcp_registry_read", {"servers": []}),
+        ("mcp_registry_read", {"servers": [], "has_more": False}),
     ],
 )
 def test_read_only_task_oracles_validate_structured_results_without_network(
@@ -389,6 +427,55 @@ def test_read_only_task_oracles_validate_structured_results_without_network(
     )
 
     assert outcome["passed"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"entries": []},
+        {"entries": [{"path": {"display": "unrelated.txt"}}]},
+        {"truncated": True},
+        {"state": {"token": "short"}},
+        {"state": {"token": "g" * 64}},
+    ],
+)
+def test_git_fixture_oracle_fails_closed_on_inexact_evidence(
+    mutation: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "entries": [
+            {
+                "path": {
+                    "display": "tracked-intent.txt",
+                    "path_b64": "dHJhY2tlZC1pbnRlbnQudHh0",
+                    "lossy": False,
+                },
+                "kind": "untracked",
+                "index_status": "?",
+                "worktree_status": "?",
+            }
+        ],
+        "state": {"token": "a" * 64},
+        "truncated": False,
+    }
+    payload.update(mutation)
+
+    assert evaluation_runner._git_read_outcome(payload)["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"servers": []},
+        {"servers": [], "has_more": True},
+        {"servers": [{}], "has_more": False},
+        {"servers": [], "has_more": False, "refreshed": False},
+    ],
+)
+def test_empty_mcp_registry_oracle_requires_exact_complete_evidence(
+    payload: dict[str, object],
+) -> None:
+    assert evaluation_runner._mcp_registry_outcome(payload)["passed"] is False
 
 
 def test_workspace_oracle_requires_exact_persisted_content(tmp_path: Path) -> None:
@@ -476,6 +563,80 @@ def test_require_all_correct_rejects_dispatch_and_exit_without_task_outcome() ->
     assert report_all_correct(
         {"runs": [{**treatment, "task_outcome_success": True}, baseline]}
     ) is True
+
+
+@pytest.mark.real_llm
+@pytest.mark.timeout(1800)
+def test_real_llm_routes_every_builtin_skill_and_rejects_adjacent_near_misses(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(
+        "local",
+        substrate=LocalResourceProviderSubstrate(tmp_path),
+    )
+    try:
+        catalog = get_builtin_skill_catalog()
+        template = runtime.get_image("coding-agent:v0")
+        metadata = dict(template.metadata)
+        metadata.pop("completion_gate", None)
+        metadata["tool_projection"] = "skills"
+        image = replace(
+            template,
+            image_id="complete-builtin-skill-routing-evaluator:v0",
+            name="complete-builtin-skill-routing-evaluator",
+            default_tools=[
+                tool_name
+                for package in catalog.list()
+                for tool_name in package.allowed_tools
+            ],
+            default_skills=[],
+            metadata=metadata,
+        )
+        runtime.register_image(image, actor="builtin-tool-skill-evaluation")
+
+        failures: list[dict[str, object]] = []
+        for scenario in REAL_LLM_ROUTING_CATALOG:
+            pid = runtime.process.spawn(
+                image=image.image_id,
+                goal=(
+                    "Machine-only Skill routing audit. Intent: "
+                    f"{scenario.intent}. Discover the smallest applicable built-in "
+                    "Skill, activate exactly that one, then immediately call "
+                    "process_exit with a structured payload naming the selected "
+                    "Skill. Do not call a domain tool and do not ask a Human."
+                ),
+            )
+            results = runtime.run_process_until_idle(pid, max_quanta=6)
+            actions = evaluation_runner._action_sequence(results)
+            activated = [
+                str(action.get("skill_id") or "")
+                for action in actions
+                if action.get("action") == "activate_skill"
+            ]
+            process = runtime.process.get(pid)
+            passed = (
+                process.status == ProcessStatus.EXITED
+                and activated == [scenario.expected_skill_id]
+                and set(activated).isdisjoint(scenario.adjacent_skill_ids)
+            )
+            if not passed:
+                failures.append(
+                    {
+                        "scenario_id": scenario.scenario_id,
+                        "expected_skill_id": scenario.expected_skill_id,
+                        "adjacent_skill_ids": list(scenario.adjacent_skill_ids),
+                        "activated_skill_ids": activated,
+                        "status": process.status.value,
+                        "actions": [
+                            str(action.get("action") or "")
+                            for action in actions
+                        ],
+                    }
+                )
+
+        assert failures == []
+    finally:
+        runtime.close()
 
 
 @pytest.mark.real_llm

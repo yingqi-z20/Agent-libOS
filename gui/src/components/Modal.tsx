@@ -19,6 +19,25 @@ const focusableSelector = [
   "[tabindex]:not([tabindex='-1'])"
 ].join(",");
 
+let openModalCount = 0;
+let bodyOverflowBeforeModal = "";
+
+function lockDocumentScroll() {
+  if (openModalCount === 0) {
+    bodyOverflowBeforeModal = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  openModalCount += 1;
+
+  return () => {
+    openModalCount = Math.max(0, openModalCount - 1);
+    if (openModalCount === 0) {
+      document.body.style.overflow = bodyOverflowBeforeModal;
+      bodyOverflowBeforeModal = "";
+    }
+  };
+}
+
 /** Accessible modal shell shared by destructive confirmations and editors. */
 export function Modal({
   title,
@@ -36,8 +55,12 @@ export function Modal({
     const previouslyFocused = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
+    const unlockDocumentScroll = lockDocumentScroll();
     dialogRef.current?.focus();
-    return () => previouslyFocused?.focus();
+    return () => {
+      unlockDocumentScroll();
+      previouslyFocused?.focus();
+    };
   }, []);
 
   function onKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {

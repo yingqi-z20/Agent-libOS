@@ -44,8 +44,8 @@ order effects from provider drift, caching, load, or other time-varying state.
 The ambient bridge also mirrors AgentDojo's native pre-validation conversion of
 string-encoded list arguments before Pydantic validation. This matters for
 OpenAI-compatible providers that occasionally return an array-valued argument
-as a JSON string; the raw provider call remains in the trace while the executed
-argument projection records the converted list.
+as a JSON string; the successful logical completion remains in the trace while
+the executed argument projection records the converted list.
 At the iteration boundary, the ambient arm likewise matches AgentDojo's native
 loop: the final allowed model response is recorded, but any visible tool call in
 that response is not executed. The trace records these calls under
@@ -61,14 +61,25 @@ control arm now retains every query transcript as well; older artifacts kept
 only its final query messages even though provider counts and usage were
 cumulative.
 
-New traces declare `query_evidence_schema_version=1` and bind every provider
-request, transcript, token subtotal, and attempted/executed tool subtotal to a
-sequential query invocation. They also classify attempted calls into executed-successful,
+New traces declare `query_evidence_schema_version=1` and bind every recorded
+harness-level logical model invocation, transcript, token subtotal, and
+attempted/executed tool subtotal to a sequential query invocation. One logical
+model invocation is one harness call to
+`LLMClient.complete_action`/`acomplete_action`; provider SDK transport retries,
+compatibility retries, and Responses/Chat/JSON fallback attempts inside that
+call are neither counted nor claimed as independently observed provider
+requests. Traces also classify attempted tool calls into executed-successful,
 executed-failed, and unexecuted outcomes. Suppressed iteration-boundary calls
 are paired by function plus canonical arguments; repeated failed-call metrics
 are reported separately from repeated attempts. Rows whose native evidence
 cannot prove a complete pairing remain explicit and are excluded from the
 outcome subtotal rather than treated as successes.
+
+For compatibility with the existing result schema, `provider_call_count` and
+the `provider_calls` trace list retain their historical names. They count
+successful logical completions returned to the harness, not lower-level HTTP
+attempts. The verifier binds that count and its usage subtotal back to the
+per-query trace before applying the logical-invocation ceilings.
 
 AgentDojo's injection-task oracle returns `True` when the attack goal succeeds.
 The report therefore names this field `attack_success`; it is the targeted ASR
@@ -98,10 +109,16 @@ uv run --frozen agent-libos-dojo verify \
 The default pilot is 24 trajectories: four suites × three case modes (clean
 user utility, attacked user utility/security, and injection goal as a direct
 user request) × two arms. It uses one repetition, `injecagent`, temperature 0,
-at most 16 provider calls per trajectory, at most 4096 output tokens per call,
-an observed aggregate token stop at 20M, and the `minimal_runtime` ambient
-prompt mode. The token stop is checked between trajectories, so a run can
-overshoot by at most the final in-flight trajectory.
+at most 16 harness-level logical model invocations per query, at most three
+query invocations and therefore at most 48 logical model invocations per
+trajectory, at most 4096 output tokens per logical invocation, an observed
+aggregate token stop at 20M, and the
+`minimal_runtime` ambient prompt mode. The token stop is checked between
+trajectories rather than being a hard provider-side cap, so a run can overshoot
+by the observed tokens of at most the final in-flight trajectory. The 16/48
+limits bound harness calls, not physical provider requests: retry and fallback
+behavior inside one `LLMClient` call is governed by the recorded effective LLM
+configuration.
 
 Real runs take OpenAI configuration from the explicit `--env-file` path. If an
 ambient `OPENAI_*` value is absent from that file or differs from it, the run
@@ -135,8 +152,12 @@ Each run contains:
 paired-surface consistency (including realized provider API and compatibility
 fallback parity), proves that the hidden terminal carrier stayed off the
 provider surface, and rebuilds schema-v1 per-query totals and native tool-call
-outcome projections from each trace. Any disagreement with the result row is a
-verification failure. It also scans all ordinary run files for the exact API
+outcome projections from each trace. It rejects missing or inconsistent logical
+invocation metadata, more than three query invocations, a recorded logical
+completion count above the per-query limit, or a total above the derived
+per-trajectory limit. These checks do not reinterpret logical invocations as
+physical retry attempts. Any disagreement with the result row is a verification
+failure. It also scans all ordinary run files for the exact API
 key and base URL from the selected dotenv file. Verification rejects symbolic
 links, special files, files above 256 MiB, and artifact trees above 2 GiB before
 parsing them. Source provenance likewise rejects symlinks rather than binding

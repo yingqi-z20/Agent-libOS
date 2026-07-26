@@ -5,9 +5,13 @@ import base64
 import contextlib
 import hashlib
 import importlib
+import inspect
 import os
 import subprocess
+import sys
 import threading
+import time
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -24,6 +28,9 @@ from agent_libos.models import (
     GitPullRequestStatus,
     ObjectMetadata,
     ObjectType,
+    ProcessStatus,
+    ResourceBudget,
+    ResourceUsage,
     SinkTrustLevel,
     SinkTrustRule,
 )
@@ -31,18 +38,72 @@ from agent_libos.models.exceptions import (
     CapabilityDenied,
     GitError,
     HumanApprovalRequired,
+    ResourceLimitExceeded,
     ValidationError,
 )
 from agent_libos.primitives.git import GitPrimitive
 from agent_libos.substrate import (
+    GitCommandResult,
+    GitLimitedRunProvider,
+    GitProvider,
     GitProviderEffectNotStarted,
+    GitSubprocessScopeProvider,
     LocalGitProvider,
     LocalResourceProviderSubstrate,
     LocalShellProvider,
+    SubprocessLimitExceeded,
+    SubprocessLimits,
 )
 
 
 _T = TypeVar("_T")
+
+
+class _LegacyGitProvider:
+    """1.0.0-shape adapter with no subprocess supervision extensions."""
+
+    _EXTENSION_ATTRIBUTES = frozenset(
+        {
+            "run_with_limits",
+            "subprocess_scope",
+            "supports_subprocess_limits",
+        }
+    )
+
+    def __init__(self, delegate: LocalGitProvider) -> None:
+        self._delegate = delegate
+        self.run_calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._EXTENSION_ATTRIBUTES:
+            raise AttributeError(name)
+        return getattr(self._delegate, name)
+
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        worktree: str | Path | None = None,
+        timeout: float | None = None,
+        stdin: bytes | None = None,
+        max_output_bytes: int | None = None,
+        read_only: bool = True,
+        remote: str | None = None,
+        expected_remote_fingerprint: str | None = None,
+        verify_after: bool = True,
+    ) -> GitCommandResult:
+        self.run_calls += 1
+        return self._delegate.run(
+            args,
+            worktree=worktree,
+            timeout=timeout,
+            stdin=stdin,
+            max_output_bytes=max_output_bytes,
+            read_only=read_only,
+            remote=remote,
+            expected_remote_fingerprint=expected_remote_fingerprint,
+            verify_after=verify_after,
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -114,6 +175,90 @@ def _open_runtime(root: Path, *, git: GitDefaults | None = None) -> Runtime:
         substrate=LocalResourceProviderSubstrate(root, git_config=selected_git),
         module_manifests=(),
     )
+
+
+def test_git_provider_preserves_0_3_4_run_contract() -> None:
+    expected_parameters = [
+        "self",
+        "args",
+        "worktree",
+        "timeout",
+        "stdin",
+        "max_output_bytes",
+        "read_only",
+        "remote",
+        "expected_remote_fingerprint",
+        "verify_after",
+    ]
+
+    assert list(inspect.signature(GitProvider.run).parameters) == expected_parameters
+    assert inspect.signature(LocalGitProvider.run) == inspect.signature(GitProvider.run)
+    assert inspect.signature(_LegacyGitProvider.run) == inspect.signature(GitProvider.run)
+    assert "supports_subprocess_limits" not in GitProvider.__annotations__
+    assert "subprocess_scope" not in vars(GitProvider)
+    substrate_exports = importlib.import_module("agent_libos.substrate")
+    assert {
+        "GitLimitedRunProvider",
+        "GitSubprocessScopeProvider",
+    } <= set(substrate_exports.__all__)
+
+
+def test_runtime_accepts_legacy_git_provider_without_optional_extensions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    substrate = LocalResourceProviderSubstrate(root)
+    legacy = _LegacyGitProvider(substrate.git)
+    substrate.git = legacy
+    runtime = Runtime.open(
+        ":memory:",
+        config=_runtime_config(),
+        substrate=substrate,
+        module_manifests=(),
+    )
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="use legacy Git provider")
+        _grant_git_authority(runtime, pid)
+
+        assert runtime.git.diff(pid).sha256
+        assert legacy.run_calls > 0
+        assert not isinstance(legacy, GitSubprocessScopeProvider)
+        assert not isinstance(legacy, GitLimitedRunProvider)
+    finally:
+        runtime.close()
+
+
+def test_budgeted_git_execution_rejects_legacy_provider_before_run(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    substrate = LocalResourceProviderSubstrate(root)
+    legacy = _LegacyGitProvider(substrate.git)
+    substrate.git = legacy
+    runtime = Runtime.open(
+        ":memory:",
+        config=_runtime_config(),
+        substrate=substrate,
+        module_manifests=(),
+    )
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject unsupervised legacy Git",
+            resource_budget=ResourceBudget(max_subprocess_wall_seconds=10.0),
+        )
+        _grant_git_authority(runtime, pid)
+
+        with pytest.raises(
+            ValidationError,
+            match="must support SubprocessLimits",
+        ):
+            runtime.git.status(pid)
+        assert legacy.run_calls == 0
+    finally:
+        runtime.close()
 
 
 def _grant_git_authority(runtime: Runtime, pid: str, *, remote: str | None = None) -> None:
@@ -641,6 +786,29 @@ def test_active_external_filter_is_rejected_before_status_can_execute_it(tmp_pat
         runtime.close()
 
 
+def test_ignored_attribute_tree_does_not_activate_external_filter(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    ignored = root / "ignored-environment"
+    ignored.mkdir()
+    (root / ".gitignore").write_text("ignored-environment/\n", encoding="utf-8")
+    (ignored / ".gitattributes").write_text(
+        "*.txt filter=hostile\n",
+        encoding="utf-8",
+    )
+    (ignored / "payload.txt").write_text("ignored\n", encoding="utf-8")
+    sentinel = tmp_path / "filter-ran"
+    _git(root, "config", "filter.hostile.clean", f"touch {sentinel}")
+    _git(root, "config", "filter.hostile.smudge", "cat")
+
+    result = LocalGitProvider(root).run(["status", "--porcelain=v2", "-z"])
+
+    assert result.returncode == 0
+    assert not sentinel.exists()
+
+
 def test_index_only_filter_is_rejected_before_status_can_execute_it(
     tmp_path: Path,
 ) -> None:
@@ -911,6 +1079,43 @@ def test_rebase_rejects_filter_activated_by_an_intermediate_replayed_commit(
     assert _git(root, "branch", "--show-current").strip() == b"topic"
 
 
+def test_provider_rejects_branch_merge_options_before_typed_merge(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "side")
+    (root / "side.txt").write_text("side\n", encoding="utf-8")
+    _git(root, "add", "--", "side.txt")
+    _git(root, "commit", "-q", "-m", "side")
+    side_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "switch", "-q", "main")
+    (root / "main.txt").write_text("main\n", encoding="utf-8")
+    _git(root, "add", "--", "main.txt")
+    _git(root, "commit", "-q", "-m", "main")
+    before_oid = _git(root, "rev-parse", "HEAD").strip()
+    _git(root, "config", "branch.main.mergeOptions", "--no-commit")
+
+    provider = LocalGitProvider(root)
+    with pytest.raises(GitError) as exc_info:
+        provider.run(
+            ["merge", "--no-edit", "--no-gpg-sign", side_oid],
+            read_only=False,
+        )
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+    assert _git(root, "rev-parse", "HEAD").strip() == before_oid
+    assert _git(root, "status", "--porcelain") == b""
+    merge_head = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert merge_head.returncode == 1
+
+
 def test_repository_hook_is_disabled_for_typed_commit(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
@@ -1131,6 +1336,47 @@ def test_sha256_repository_object_ids_are_supported_when_host_git_supports_them(
         runtime.close()
 
 
+def test_show_returns_complete_per_parent_merge_diffs(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "side")
+    (root / "side.txt").write_text("side\n", encoding="utf-8")
+    _git(root, "add", "--", "side.txt")
+    _git(root, "commit", "-q", "-m", "side")
+    _git(root, "switch", "-q", "main")
+    (root / "main.txt").write_text("main\n", encoding="utf-8")
+    _git(root, "add", "--", "main.txt")
+    _git(root, "commit", "-q", "-m", "main")
+    _git(root, "merge", "-q", "--no-ff", "side", "-m", "merge side")
+    merge_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="inspect a merge")
+        _grant_git_authority(runtime, pid)
+
+        shown = runtime.git.show(pid, merge_oid)
+
+        assert len(shown["commit"].parents) == 2
+        assert [item["parent_oid"] for item in shown["parent_diffs"]] == shown[
+            "commit"
+        ].parents
+        assert shown["patch_base_oid"] == shown["commit"].parents[0]
+        assert shown["patch"] == shown["parent_diffs"][0]["patch"]
+        assert shown["patch_b64"] == shown["parent_diffs"][0]["patch_b64"]
+        assert not shown["parent_diffs_truncated"]
+        assert all(not item["truncated"] for item in shown["parent_diffs"])
+        assert all(item["bytes"] > 0 for item in shown["parent_diffs"])
+        assert {
+            path.display for path in shown["parent_diffs"][0]["changed_paths"]
+        } == {"side.txt"}
+        assert {
+            path.display for path in shown["parent_diffs"][1]["changed_paths"]
+        } == {"main.txt"}
+    finally:
+        runtime.close()
+
+
 def test_diff_truncation_and_hard_output_limit_are_explicit(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
@@ -1166,6 +1412,256 @@ def test_diff_truncation_and_hard_output_limit_are_explicit(tmp_path: Path) -> N
         assert len(diff.sha256) == 64
     finally:
         second.close()
+
+
+def test_high_output_git_failure_charges_bounded_subprocess_metrics(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    (root / "tracked.txt").write_text(
+        "initial\n" + ("large changed line\n" * 12_000),
+        encoding="utf-8",
+    )
+    git_config = replace(
+        DEFAULT_CONFIG.git,
+        output_max_bytes=65_536,
+        output_hard_limit_bytes=131_072,
+        patch_max_bytes=65_536,
+        patch_hard_limit_bytes=131_072,
+    )
+    runtime = _open_runtime(root, git=git_config)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="account for bounded high-output Git",
+        )
+        _grant_git_authority(runtime, pid)
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.diff(pid, max_bytes=65_536)
+
+        assert exc_info.value.code == GitErrorCode.OUTPUT_TOO_LARGE.value
+        assert exc_info.value.details["effect"] == "none"
+        assert exc_info.value.details["limit_kind"] == "subprocess_stdout_bytes"
+        assert exc_info.value.details["metrics"]["wall_seconds"] > 0
+        usage = runtime.process.get(pid).resource_usage
+        assert usage.subprocess_wall_seconds > 0
+        assert usage.subprocess_peak_memory_bytes > 0
+    finally:
+        runtime.close()
+
+
+def test_git_subprocess_budget_terminates_process_before_unbounded_dispatch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="enforce Git subprocess budget",
+            resource_budget=ResourceBudget(max_subprocess_wall_seconds=1e-6),
+        )
+        _grant_git_authority(runtime, pid)
+
+        with pytest.raises(ResourceLimitExceeded):
+            runtime.git.status(pid)
+
+        process = runtime.process.get(pid)
+        assert process.status is ProcessStatus.KILLED
+        assert process.resource_usage.subprocess_wall_seconds > 0
+        assert any(
+            record.action == "resource.limit_exceeded"
+            for record in runtime.audit.trace()
+        )
+    finally:
+        runtime.close()
+
+
+def test_git_approval_retry_rechecks_exhausted_budget_before_provider_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="recheck Git budget after approval wait",
+            resource_budget=ResourceBudget(max_subprocess_wall_seconds=10.0),
+        )
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+        )
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.WRITE],
+            effect="ask",
+            issued_by="git-provider-test",
+        )
+        runtime.filesystem.grant_directory(
+            pid,
+            ".",
+            [CapabilityRight.READ, CapabilityRight.WRITE],
+            issued_by="git-provider-test",
+        )
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.worktree(pid, "create", state)
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+
+        remaining = runtime.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_wall_seconds",
+            "subprocess_wall_seconds",
+        )
+        assert remaining is not None and remaining > 0
+        runtime.resources.charge(
+            pid,
+            ResourceUsage(subprocess_wall_seconds=remaining),
+            source="test.git.approval_budget_exhaustion",
+            kill_on_exceed=False,
+        )
+        assert runtime.process.get(pid).status is ProcessStatus.RUNNABLE
+        assert runtime.resources.remaining_cumulative(
+            pid,
+            "max_subprocess_wall_seconds",
+            "subprocess_wall_seconds",
+        ) <= 0
+
+        def forbidden_invoke(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("Git provider dispatch started with an exhausted budget")
+
+        monkeypatch.setattr(runtime.git.provider, "_invoke", forbidden_invoke)
+        with pytest.raises(ResourceLimitExceeded):
+            runtime.git.worktree(pid, "create", state)
+    finally:
+        runtime.close()
+
+
+def test_local_git_provider_enforces_process_tree_memory_limit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    assert isinstance(provider, GitSubprocessScopeProvider)
+    assert isinstance(provider, GitLimitedRunProvider)
+    if not provider.supports_subprocess_limits:
+        pytest.skip("Host platform cannot enforce Git SubprocessLimits")
+
+    bounded = provider.run_with_limits(
+        ["status", "--porcelain=v2", "-z"],
+        limits=SubprocessLimits(wall_seconds=5.0),
+    )
+    assert bounded.returncode == 0
+
+    with provider.subprocess_scope(
+        limits=SubprocessLimits(memory_bytes=1),
+    ) as scope:
+        with pytest.raises(SubprocessLimitExceeded) as exc_info:
+            provider.repository_state()
+
+    assert exc_info.value.metrics.limit_kind == "subprocess_memory_bytes"
+    assert exc_info.value.metrics.killed
+    assert scope.metrics.peak_memory_bytes > 1
+
+
+def test_local_git_provider_rejects_non_finite_timeout_policy(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(
+        root,
+        config=replace(DEFAULT_CONFIG.git, local_timeout_s=float("nan")),
+    )
+
+    with pytest.raises(GitError) as exc_info:
+        provider.repository_state()
+
+    assert exc_info.value.code == GitErrorCode.TIMEOUT.value
+    assert "invalid Git timeout" in str(exc_info.value)
+
+
+def test_local_git_provider_supervises_unread_stdin_under_deadline(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(
+        root,
+        config=replace(DEFAULT_CONFIG.git, executable=sys.executable),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(GitError) as exc_info:
+        provider._invoke(
+            ["-c", "import time; time.sleep(10)"],
+            timeout=0.05,
+            stdin=b"x" * 1_048_576,
+            max_output_bytes=4096,
+            read_only=True,
+            operation="test-unread-stdin",
+        )
+
+    assert time.monotonic() - started < 2.0
+    assert exc_info.value.code == GitErrorCode.TIMEOUT.value
+    assert exc_info.value.details["metrics"]["killed"] is True
+
+
+def test_local_git_provider_reaps_child_when_stdin_delivery_raises_baseexception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(
+        root,
+        config=replace(DEFAULT_CONFIG.git, executable=sys.executable),
+    )
+    git_substrate = importlib.import_module("agent_libos.substrate.git")
+    real_popen = git_substrate.subprocess.Popen
+    spawned: list[subprocess.Popen[bytes]] = []
+
+    class InterruptingStdin:
+        def __init__(self, stream: Any) -> None:
+            self._stream = stream
+
+        def write(self, _payload: bytes) -> int:
+            raise KeyboardInterrupt("simulated stdin interruption")
+
+        def close(self) -> None:
+            self._stream.close()
+
+    def launch(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = real_popen(*args, **kwargs)
+        assert process.stdin is not None
+        process.stdin = InterruptingStdin(process.stdin)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(git_substrate.subprocess, "Popen", launch)
+    with pytest.raises(KeyboardInterrupt, match="simulated stdin interruption"):
+        provider._invoke(
+            ["-c", "import time; time.sleep(10)"],
+            timeout=5.0,
+            stdin=b"payload",
+            max_output_bytes=4096,
+            read_only=True,
+            operation="test-stdin-interruption",
+        )
+
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None
 
 
 def test_stage_commit_and_state_token_cas(tmp_path: Path) -> None:
@@ -2413,6 +2909,125 @@ def test_local_branch_switch_stash_integrate_restore_reset_and_clean(tmp_path: P
         runtime.close()
 
 
+def test_typed_merge_disables_configured_autostash(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "side")
+    (root / "tracked.txt").write_text("side\n", encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "side")
+    side_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "switch", "-q", "main")
+    before_oid = _git(root, "rev-parse", "HEAD").strip()
+    (root / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    _git(root, "config", "merge.autoStash", "true")
+
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="merge without autostash")
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.integrate(pid, "merge", state, ref=side_oid)
+
+        assert exc_info.value.code == GitErrorCode.DIRTY_WORKTREE.value
+        assert _git(root, "rev-parse", "HEAD").strip() == before_oid
+        assert (root / "tracked.txt").read_text(encoding="utf-8") == "dirty\n"
+        stash = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "refs/stash"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert stash.returncode == 1
+        assert not any(
+            entry.kind.value == "unmerged"
+            for entry in runtime.git.status(pid).entries
+        )
+    finally:
+        runtime.close()
+
+
+def test_typed_merge_rejects_a_non_terminal_success(
+    tmp_path: Path,
+) -> None:
+    class NonTerminalMergeProvider(LocalGitProvider):
+        def __init__(self, workspace_root: Path) -> None:
+            super().__init__(workspace_root)
+            self.merge_args: tuple[str, ...] | None = None
+
+        def run(
+            self,
+            args: Sequence[str],
+            *,
+            worktree: str | Path | None = None,
+            timeout: float | None = None,
+            stdin: bytes | None = None,
+            max_output_bytes: int | None = None,
+            read_only: bool = True,
+            remote: str | None = None,
+            expected_remote_fingerprint: str | None = None,
+            verify_after: bool = True,
+        ) -> GitCommandResult:
+            selected = list(args)
+            if selected and selected[0] == "merge":
+                self.merge_args = tuple(selected)
+                selected = [item for item in selected if item != "--commit"]
+                selected.insert(1, "--no-commit")
+            return super().run(
+                selected,
+                worktree=worktree,
+                timeout=timeout,
+                stdin=stdin,
+                max_output_bytes=max_output_bytes,
+                read_only=read_only,
+                remote=remote,
+                expected_remote_fingerprint=expected_remote_fingerprint,
+                verify_after=verify_after,
+            )
+
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "side")
+    (root / "side.txt").write_text("side\n", encoding="utf-8")
+    _git(root, "add", "--", "side.txt")
+    _git(root, "commit", "-q", "-m", "side")
+    side_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "switch", "-q", "main")
+    (root / "main.txt").write_text("main\n", encoding="utf-8")
+    _git(root, "add", "--", "main.txt")
+    _git(root, "commit", "-q", "-m", "main")
+    before_oid = _git(root, "rev-parse", "HEAD").strip()
+    substrate = LocalResourceProviderSubstrate(root)
+    provider = NonTerminalMergeProvider(root)
+    substrate.git = provider
+    runtime = Runtime.open(
+        ":memory:",
+        config=_runtime_config(),
+        substrate=substrate,
+        module_manifests=(),
+    )
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="reject partial merge")
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.integrate(pid, "merge", state, ref=side_oid)
+
+        assert exc_info.value.code == GitErrorCode.CONFLICT.value
+        assert provider.merge_args is not None
+        assert {"--commit", "--no-squash"} <= set(provider.merge_args)
+        assert "--no-autostash" not in provider.merge_args
+        assert _git(root, "rev-parse", "HEAD").strip() == before_oid
+        assert _git(root, "rev-parse", "--verify", "MERGE_HEAD").strip() == side_oid.encode(
+            "ascii"
+        )
+    finally:
+        runtime.close()
+
+
 def test_patch_artifact_round_trip_and_lineage(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
@@ -2709,6 +3324,50 @@ def test_list_worktrees_rejects_managed_root_symlink_drift(tmp_path: Path) -> No
         runtime.close()
 
 
+@pytest.mark.parametrize(
+    "lease_oid",
+    ("0" * 40, "0" * 64),
+    ids=("sha1-zero-oid", "sha256-zero-oid"),
+)
+def test_push_rejects_all_zero_force_with_lease_before_remote_preflight(
+    tmp_path: Path,
+    lease_oid: str,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject an invalid force-with-lease sentinel",
+        )
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.push(
+                pid,
+                "origin",
+                "refs/heads/main",
+                "a" * 64,
+                local_ref="main",
+                force_with_lease_oid=lease_oid,
+            )
+
+        assert exc_info.value.code == GitErrorCode.INVALID_REF.value
+        assert runtime.store.list_external_effects(pid=pid) == []
+        assert not any(
+            record.actor == pid and record.action == "primitive.git.push"
+            for record in runtime.audit.trace(actor=pid)
+        )
+        assert not any(
+            event.type == EventType.EXTERNAL_WRITE
+            and event.source == pid
+            and event.target == "git_remote:workspace:origin"
+            for event in runtime.events.list()
+        )
+    finally:
+        runtime.close()
+
+
 def test_file_remote_push_and_fetch_use_only_configured_remote(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     remote = tmp_path / "remote.git"
@@ -2791,6 +3450,53 @@ def test_file_remote_push_preserves_annotated_tag_object(tmp_path: Path) -> None
         assert pushed.created_oid == pushed.details["local_oid"] == local_tag_oid
         assert remote_tag_oid == local_tag_oid
         assert _git(remote, "cat-file", "-t", remote_tag_oid).strip() == b"tag"
+    finally:
+        runtime.close()
+
+
+def test_remote_git_mutation_timeout_is_unknown_and_not_retryable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    _init_repository(root)
+    remote.mkdir()
+    _git(remote, "init", "--bare", "-q")
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nsleep 2\nexit 0\n", encoding="utf-8")
+    hook.chmod(0o700)
+    _git(root, "remote", "add", "origin", remote.as_uri())
+    git_config = replace(
+        DEFAULT_CONFIG.git,
+        allow_file_remotes=True,
+        remote_timeout_s=0.05,
+    )
+    runtime = _open_runtime(root, git=git_config)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="retain ambiguous remote timeout",
+        )
+        _grant_git_authority(runtime, pid, remote="origin")
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.push(
+                pid,
+                "origin",
+                "refs/heads/main",
+                state,
+                local_ref="refs/heads/main",
+            )
+
+        assert exc_info.value.code == GitErrorCode.TIMEOUT.value
+        assert exc_info.value.retryable is False
+        assert exc_info.value.details["effect"] == "unknown"
+        assert exc_info.value.details["limit_kind"] == "subprocess_timeout"
+        assert exc_info.value.details["metrics"]["killed"] is True
+        effect = runtime.store.list_external_effects(pid=pid)[-1]
+        assert effect.provider == "git"
+        assert effect.transaction_state == "unknown"
     finally:
         runtime.close()
 
@@ -3181,7 +3887,12 @@ def test_non_fast_forward_push_and_exact_force_with_lease(tmp_path: Path) -> Non
         runtime.close()
 
 
-def test_fast_forward_pull_from_configured_bare_remote(tmp_path: Path) -> None:
+@pytest.mark.parametrize("strategy", ["ff_only", "merge"])
+def test_fast_forward_pull_from_configured_bare_remote(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    strategy: str,
+) -> None:
     root = tmp_path / "repo"
     remote = tmp_path / "remote.git"
     other = tmp_path / "other"
@@ -3203,22 +3914,48 @@ def test_fast_forward_pull_from_configured_bare_remote(tmp_path: Path) -> None:
     _git(other, "commit", "-q", "-m", "remote change")
     _git(other, "push", "-q", "origin", "main:refs/heads/main")
     remote_oid = _git(other, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "config", "merge.autoStash", "true")
 
     git_config = replace(DEFAULT_CONFIG.git, allow_file_remotes=True)
     runtime = _open_runtime(root, git=git_config)
     try:
         pid = runtime.process.spawn(image="base-agent:v0", goal="fast-forward pull")
         _grant_git_authority(runtime, pid, remote="origin")
+        merge_args: list[tuple[str, ...]] = []
+        original_run = runtime.git.provider.run
+
+        def record_merge_args(
+            args: Sequence[str],
+            **kwargs: Any,
+        ) -> GitCommandResult:
+            if args and args[0] == "merge":
+                merge_args.append(tuple(args))
+            return original_run(args, **kwargs)
+
+        monkeypatch.setattr(runtime.git.provider, "run", record_merge_args)
         state = runtime.git.status(pid).state.token
         pulled = runtime.git.pull(
             pid,
             "origin",
             state,
             branch="main",
-            strategy="ff_only",
+            strategy=strategy,
         )
         assert pulled.created_oid == remote_oid
         assert (root / "remote.txt").read_text(encoding="utf-8") == "from remote\n"
+        assert len(merge_args) == 1
+        # merge --no-autostash was introduced after the supported Git 2.26
+        # floor; the provider-level config pin supplies the same safety policy.
+        assert "--no-autostash" not in merge_args[0]
+        assert "merge.autoStash=false" in runtime.git.provider._repo_prefix(
+            runtime.git.provider.repository_layout()
+        )
+        if strategy == "ff_only":
+            assert "--ff-only" in merge_args[0]
+        else:
+            assert {"--commit", "--no-squash", "--no-gpg-sign"} <= set(
+                merge_args[0]
+            )
     finally:
         runtime.close()
 
@@ -3629,6 +4366,202 @@ def test_simulated_pull_request_create_review_close_and_merge_requires_approval(
         assert closed["pull_request"].status is GitPullRequestStatus.CLOSED
     finally:
         runtime.close()
+
+
+def test_pull_request_create_preflights_metadata_count_before_snapshot_refs(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+    git_config = replace(
+        DEFAULT_CONFIG.git,
+        status_entry_limit=1,
+        status_entry_hard_limit=1,
+    )
+    runtime = _open_runtime(root, git=git_config)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="bound PR metadata count")
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+        first = runtime.git.create_pull_request(
+            pid,
+            "First feature",
+            "first body",
+            "main",
+            "feature",
+            state,
+        )
+        refs_before = _git(
+            root,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/agent-libos/pull-requests",
+        ).splitlines()
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.create_pull_request(
+                pid,
+                "Second feature",
+                "second body",
+                "main",
+                "feature",
+                first["operation"].after.token,
+            )
+
+        assert exc_info.value.code == GitErrorCode.OUTPUT_TOO_LARGE.value
+        assert _git(
+            root,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/agent-libos/pull-requests",
+        ).splitlines() == refs_before
+        assert len(runtime.git.provider.list_pull_request_metadata(limit=1)) == 1
+        complete = runtime.git.list_pull_requests(pid, limit=1)
+        assert [item.pr_id for item in complete["pull_requests"]] == [
+            first["pull_request"].pr_id
+        ]
+        assert complete["truncated"] is False
+        runtime.git.status(pid)
+    finally:
+        runtime.close()
+
+
+def test_pull_request_list_is_truncated_only_above_requested_limit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="list bounded PR metadata",
+        )
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+        first = runtime.git.create_pull_request(
+            pid,
+            "First feature",
+            "first body",
+            "main",
+            "feature",
+            state,
+        )
+        second = runtime.git.create_pull_request(
+            pid,
+            "Second feature",
+            "second body",
+            "main",
+            "feature",
+            first["operation"].after.token,
+        )
+
+        limited = runtime.git.list_pull_requests(pid, limit=1)
+        assert len(limited["pull_requests"]) == 1
+        assert limited["truncated"] is True
+
+        complete = runtime.git.list_pull_requests(pid, limit=2)
+        assert {item.pr_id for item in complete["pull_requests"]} == {
+            first["pull_request"].pr_id,
+            second["pull_request"].pr_id,
+        }
+        assert complete["truncated"] is False
+    finally:
+        runtime.close()
+
+
+def test_pull_request_create_preflights_aggregate_bytes_before_snapshot_refs(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+    git_config = replace(
+        DEFAULT_CONFIG.git,
+        output_max_bytes=65_536,
+        output_hard_limit_bytes=65_536,
+        patch_max_bytes=65_536,
+        patch_hard_limit_bytes=65_536,
+    )
+    runtime = _open_runtime(root, git=git_config)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="bound PR metadata bytes")
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+        first = runtime.git.create_pull_request(
+            pid,
+            "First large feature",
+            "a" * 35_000,
+            "main",
+            "feature",
+            state,
+        )
+        refs_before = _git(
+            root,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/agent-libos/pull-requests",
+        ).splitlines()
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.create_pull_request(
+                pid,
+                "Second large feature",
+                "b" * 35_000,
+                "main",
+                "feature",
+                first["operation"].after.token,
+            )
+
+        assert exc_info.value.code == GitErrorCode.OUTPUT_TOO_LARGE.value
+        assert _git(
+            root,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/agent-libos/pull-requests",
+        ).splitlines() == refs_before
+        assert len(runtime.git.provider.list_pull_request_metadata(limit=10)) == 1
+        runtime.git.status(pid)
+    finally:
+        runtime.close()
+
+
+def test_pull_request_metadata_listing_rejects_collection_over_hard_count(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(
+        root,
+        config=replace(
+            DEFAULT_CONFIG.git,
+            status_entry_limit=1,
+            status_entry_hard_limit=1,
+        ),
+    )
+    directory = root / ".git" / "agent-libos" / "pull_requests"
+    directory.mkdir(parents=True)
+    (directory / "pr_a.json").write_bytes(b"{}")
+    (directory / "pr_b.json").write_bytes(b"{}")
+
+    with pytest.raises(GitError) as exc_info:
+        provider.list_pull_request_metadata(limit=1)
+
+    assert exc_info.value.code == GitErrorCode.OUTPUT_TOO_LARGE.value
 
 
 def test_pull_request_metadata_persists_and_restores_data_flow_lineage(

@@ -7,7 +7,14 @@ allowed-tools: git_restore git_integrate git_stash git_reset git_clean
 
 Activate `agent-libos-git-inspection` first. Read untruncated status, worktree and staged diffs, HEAD/history, and the exact selected `worktree_id`; retain its latest `state.token` and relevant full OIDs. These tools can rewrite HEAD, index, worktree, stash, or untracked content. They do not provide a general Git command, automatic backup, rollback, integration continue/skip, or permission to erase unrelated state.
 
-All calls are side-effecting and non-idempotent. Success returns a `GitOperationResult` with post-state digest `after.token`, operation-specific `created_oid`, reconciliation paths, and `details`. Tokens are not consumed and can remain equal across a verified no-op. `created_oid` can mean a resulting/selected OID rather than a newly allocated object. Capability grants are necessary but remain subject to data-flow policy and state revalidation. Always verify through inspection.
+All calls are side-effecting and non-idempotent. Every call requires an
+`expected_state_token` from a fresh observation of the selected worktree.
+Success returns a `GitOperationResult` with post-state digest `after.token`,
+operation-specific `created_oid`, reconciliation paths, and `details`. Tokens
+are not consumed and can remain equal across a verified no-op. `created_oid`
+can mean a resulting/selected OID rather than a newly allocated object.
+Capability grants are necessary but remain subject to data-flow policy and
+state revalidation. Always verify through inspection.
 
 ## Tool guide
 
@@ -32,11 +39,11 @@ Every restore is classified destructive and requires repository write/delete/adm
 - `operation="merge"`, `"rebase"`, `"cherry_pick"`, or `"revert"` requires one exact `ref` resolving to a commit and no `abort_kind`.
 - `operation="abort"` requires `ref=null` and an `abort_kind` exactly matching `merge`, `rebase`, `cherry_pick`, or `revert`.
 
-Merge has no strategy/ff selector on this tool: graph and validated effective configuration determine whether it fast-forwards or creates a merge commit. Rebase uses no autostash. Cherry-pick and revert accept only one commit and have no merge-mainline selector. There is no continue, skip, multi-ref, interactive rebase, custom strategy, conflict favoring, or message option.
+Merge has no model-selectable strategy/ff control: graph and safe effective configuration can make it fast-forward, create a merge commit, report already up to date, or reject the requested topology. Repository `branch.*.mergeOptions` is rejected because it could silently turn the typed operation into squash, no-commit, or another unrequested mode. The Runtime explicitly supplies `--commit` and `--no-squash`, while the hardened provider pins `merge.autoStash=false`; neither merge nor rebase automatically stashes dirty state. Cherry-pick and revert accept only one commit and have no merge-mainline selector. There is no continue, skip, multi-ref, interactive rebase, custom strategy, conflict favoring, or message option.
 
-All integration variants require repository write and selected-worktree filesystem read/write/delete. Rebase and every abort are destructive and additionally require repository delete/admin plus one-use approval. Merge, cherry-pick, and revert can still ask under ordinary policy. Dirty changes are not automatically stashed and may block or coexist according to Git; inspect them first.
+All integration variants require repository write and selected-worktree filesystem read/write/delete. Rebase and every abort are destructive and additionally require repository delete/admin plus one-use approval. Merge, cherry-pick, and revert can still ask under ordinary policy. Dirty changes are never automatically stashed and may block or coexist according to Git; inspect them first.
 
-On success, `created_oid` is the final HEAD, which may equal an existing commit after fast-forward/no-op. Merge commits, cherry-picks, reverts, and rebases that create commits require usable Host/repository identity; the tool has no identity override. After a conflict, the Host effect may already have written index/worktree/control metadata.
+On success, `created_oid` is the final HEAD, which may equal an existing commit after fast-forward/no-op. A successful merge is additionally checked to have no `MERGE_HEAD`, no unmerged status entries, an unchanged shared stash tip, and the selected commit as an ancestor of final HEAD; failure of that terminal check is a possibly dispatched error requiring reconciliation. Merge commits, cherry-picks, reverts, and rebases that create commits require usable Host/repository identity; the tool has no identity override. After a conflict, the Host effect may already have written index/worktree/control metadata.
 
 The built-in read schemas do **not** expose `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, rebase directories, or sequencer state, and the state digest does not certify their absence. An ordinary edit → stage → commit can finish a known one-step merge/cherry-pick/revert, but `git_commit` itself does not guard against doing so. Continue only when the active kind is known from the operation just attempted and finishing it is explicitly intended; otherwise stop. Rebase usually needs unavailable continue/skip controls, so stop or explicitly abort the known kind rather than invoking shell Git.
 
@@ -80,7 +87,7 @@ Clean requires repository write/delete/admin, filesystem read/delete, and mandat
 3. Map exact before/after semantics in writing. For restore use the destination/source truth table. For reset name what remains in index/worktree. For stash retain the source state and expected stash OID/index. For integration decide what conflict outcome is acceptable.
 4. Obtain a fresh token after the last observation. Request approval only for the exact paths, OID, mode/operation, broadening flags, and old token.
 5. If approval pauses before dispatch, repeat the identical call after approval while state is unchanged. Do not turn a refusal into `force`, a broader path list, hard reset, clean, or stash clear.
-6. After success, re-read status, both diffs, HEAD/log, and refs. Inspect every changed path and run task-specific tests. For stash, verify both the checkout and retained/deleted evidence that the typed surface can actually expose.
+6. After success, re-read status, both diffs, HEAD/log, and refs. For a merge commit, call `git_show` and inspect every required untruncated per-parent diff, not only its top-level first-parent view. Inspect every changed path and run task-specific tests. For stash, verify both the checkout and retained/deleted evidence that the typed surface can actually expose.
 
 ## Failure and recovery
 
@@ -99,7 +106,7 @@ Clean requires repository write/delete/admin, filesystem read/delete, and mandat
 Finish only when the exact requested state is proven:
 
 - Restore: selected index/worktree destinations match the intended index/HEAD/source commit; every unselected change remains.
-- Integrate: final HEAD/parents or fast-forward target match intent, no unresolved entries remain, and relevant tests pass. State separately that hidden operation-control state is not readable; only claim it cleared when a successful typed completion/abort of the known operation plus subsequent Git behavior establishes that conclusion. Abort, if chosen, must restore the expected pre-operation state.
+- Integrate: final HEAD/parents or fast-forward target match intent, every required merge parent diff is complete, no unresolved entries remain, and relevant tests pass. State separately that hidden operation-control state is not generally readable; typed merge success now verifies its own terminal `MERGE_HEAD`/ancestry/stash conditions, while other kinds may only be claimed cleared when a successful typed completion/abort of the known operation plus subsequent Git behavior establishes that conclusion. Abort, if chosen, must restore the expected pre-operation state.
 - Stash: the intended tracked/untracked/index state was saved/applied, retained or deleted as requested, exact observable OIDs agree, and no unrelated entry was addressed by a shifted ordinal.
 - Reset: HEAD equals exact target; index/worktree preservation or rewrite matches soft/mixed/hard semantics; old HEAD evidence is retained in the report.
 - Clean: only reviewed eligible candidates are absent; tracked changes and excluded untracked/ignored/directory content remain.

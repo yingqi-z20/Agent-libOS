@@ -12,7 +12,7 @@ from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Literal
 
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
 from jsonschema.validators import validator_for as jsonschema_validator_for
@@ -46,10 +46,22 @@ from agent_libos.ports import (
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.runtime.image_artifact import ImageArtifactLoader
 from agent_libos.skills.schema import JitToolSpec
 from agent_libos.storage import ExtensionRepository
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.secure_host_files import (
+    SecureDirectoryGuard,
+    SecureFileChanged,
+    SecureFileLimitExceeded,
+    SecureFileReadUnavailable,
+    StablePathSnapshot,
+    open_secure_directory,
+    open_secure_file,
+    read_stable_file_limited,
+    stable_identity_available,
+)
 from agent_libos.utils.serde import bounded_json_loads, dumps, loads
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
@@ -90,6 +102,13 @@ _CACHE_PACKAGE_SEGMENTS = {
 }
 _PACKAGE_BOOT_KIND = "image_package"
 _CHECKPOINT_BOOT_KIND = "checkpoint_commit"
+_PACKAGE_FILE_READ_CHUNK_BYTES = 64 * 1024
+_INVALID_BOOT_CODE = "image_boot_artifact_invalid"
+_INVALID_BOOT_MESSAGE = "Image boot artifact failed identity validation."
+
+
+class _InvalidImageBootArtifact(ValidationError):
+    """A shape-valid persisted image is not bound to its immutable boot artifact."""
 
 
 @dataclass(frozen=True)
@@ -97,6 +116,7 @@ class ImageRegistrationResult:
     image: AgentImage
     replaced: bool
     source: str | None = None
+    disposition: Literal["created", "replaced", "rehydrated"] = "created"
 
 
 class ImageRegistryPrimitive:
@@ -159,7 +179,6 @@ class ImageRegistryPrimitive:
 
     @contextmanager
     def atomic_image_registrations(self, image_ids: Iterable[str]) -> Iterator[None]:
-        """Publish a batch of image cache/store mutations atomically."""
         """Atomically update one or more durable image rows and cache entries."""
 
         transaction_store = self.store or self.audit.store
@@ -190,6 +209,50 @@ class ImageRegistryPrimitive:
         require_capability: bool = False,
         source: str | None = None,
     ) -> ImageRegistrationResult:
+        return self._register(
+            image,
+            actor=actor,
+            replace=replace,
+            require_capability=require_capability,
+            source=source,
+            module_replay_actor=None,
+        )
+
+    def register_module_image(
+        self,
+        image: AgentImage | dict[str, Any],
+        *,
+        actor: str,
+    ) -> ImageRegistrationResult:
+        """Register a trusted module image or rehydrate its exact durable row.
+
+        Runtime modules buffer image declarations and reach this method only
+        through the Host-owned module registry.  Rehydration is deliberately
+        separate from the general registration API and is provenance-bound to
+        the module actor that created the durable row.
+        """
+
+        if not actor.startswith("module:"):
+            raise ValidationError("module image registration requires a module actor")
+        return self._register(
+            image,
+            actor=actor,
+            replace=False,
+            require_capability=False,
+            source=None,
+            module_replay_actor=actor,
+        )
+
+    def _register(
+        self,
+        image: AgentImage | dict[str, Any],
+        *,
+        actor: str,
+        replace: bool,
+        require_capability: bool,
+        source: str | None,
+        module_replay_actor: str | None,
+    ) -> ImageRegistrationResult:
         candidate = self._coerce_image(image)
         authority_decision = self._authorize_registry_mutation(
             actor,
@@ -198,6 +261,7 @@ class ImageRegistryPrimitive:
             require_capability=require_capability,
         )
         self._validate_image(candidate)
+        self._validate_boot_artifact_identity(candidate)
         with self._atomic_image_registration(candidate.image_id):
             with self.capabilities.authority_transaction(
                 [authority_decision],
@@ -207,14 +271,44 @@ class ImageRegistryPrimitive:
                 # This check must share the cache/store registration critical
                 # section. Otherwise concurrent replace=False callers can both
                 # pass and a later rollback can corrupt the cache/store pair.
-                existing = self.images.get(candidate.image_id)
-                if existing is not None and not replace:
+                # A persisted image that was quarantined during reopen is still
+                # an existing registry entry.  Using only the executable cache
+                # here would let replace=False callers overwrite that durable
+                # row with WRITE authority while reporting a fresh register.
+                persisted = self.store.get_image(candidate.image_id) if self.store is not None else None
+                existing = persisted[0] if persisted is not None else self.images.get(candidate.image_id)
+                persisted_registered_by = (
+                    persisted[1].get("registered_by") if persisted is not None else None
+                )
+                trusted_idempotent_reload = (
+                    module_replay_actor is not None
+                    and persisted is not None
+                    and candidate.image_id not in self.images
+                    and existing == candidate
+                    and not replace
+                    and not require_capability
+                    and persisted_registered_by == module_replay_actor
+                )
+                if existing is not None and not replace and not trusted_idempotent_reload:
                     raise ValidationError(f"agent image already exists: {candidate.image_id}")
+                if trusted_idempotent_reload:
+                    # Runtime startup may reinstall the exact built-in manifest
+                    # after durable rows have been loaded. Rehydrate only the
+                    # executable cache; do not rewrite registry provenance or
+                    # emit a second registration event/audit record.
+                    self.images[candidate.image_id] = candidate
+                    return ImageRegistrationResult(
+                        image=deepcopy(candidate),
+                        replaced=False,
+                        source=source,
+                        disposition="rehydrated",
+                    )
                 self.images[candidate.image_id] = candidate
                 now = utc_now()
                 if self.store is not None:
                     self.store.upsert_image(candidate, registered_by=actor, source=source, created_at=now)
-                action = "image.replace" if existing is not None else "image.register"
+                replaced_existing = existing is not None
+                action = "image.replace" if replaced_existing else "image.register"
                 self.events.emit(
                     EventType.IMAGE_REGISTERED,
                     source=actor,
@@ -223,7 +317,7 @@ class ImageRegistryPrimitive:
                         "image_id": candidate.image_id,
                         "name": candidate.name,
                         "version": candidate.version,
-                        "replaced": existing is not None,
+                        "replaced": replaced_existing,
                         "source": source,
                         "boot_kind": candidate.boot.get("kind", "fresh"),
                     },
@@ -239,7 +333,7 @@ class ImageRegistryPrimitive:
                     "default_tools": list(candidate.default_tools),
                     "required_capabilities": len(candidate.required_capabilities),
                     "required_modules": len(candidate.required_modules),
-                    "replaced": existing is not None,
+                    "replaced": replaced_existing,
                     "source": source,
                     "boot_kind": candidate.boot.get("kind", "fresh"),
                 },
@@ -248,8 +342,9 @@ class ImageRegistryPrimitive:
         # the top level; its nested lists and mappings remain mutable.
         return ImageRegistrationResult(
             image=deepcopy(candidate),
-            replaced=existing is not None,
+            replaced=replaced_existing,
             source=source,
+            disposition="replaced" if replaced_existing else "created",
         )
 
     def validate_package_path(self, path: str | Path) -> dict[str, Any]:
@@ -364,7 +459,7 @@ class ImageRegistryPrimitive:
                 actor=actor,
                 operation="image package registration",
             ):
-                existing = self.images.get(image.image_id)
+                existing = self._registered_image(image.image_id)
                 if existing is not None and not replace:
                     raise ValidationError(f"agent image already exists: {image.image_id}")
                 created_at = utc_now()
@@ -430,21 +525,156 @@ class ImageRegistryPrimitive:
     def _read_host_package(self, path: str | Path) -> tuple[dict[str, bytes], str]:
         manifest_path = self._resolve_host_image_manifest(path)
         root = manifest_path.parent
-        root_resolved = root.resolve()
+        # Preserve the lexical path so secure component-wise opening can reject
+        # symlinked ancestors instead of canonicalizing them out of existence.
+        root_resolved = Path(os.path.abspath(root))
         files: dict[str, bytes] = {}
-        for file in sorted(root_resolved.rglob("*")):
-            stat_result = file.lstat()
-            if stat.S_ISLNK(stat_result.st_mode):
-                raise ValidationError(f"image package symlinks are not supported: {file}")
-            if not stat.S_ISREG(stat_result.st_mode):
-                if file.exists() and not stat.S_ISDIR(stat_result.st_mode):
-                    raise ValidationError(f"image package path is not a regular file or directory: {file}")
-                continue
-            relative = file.relative_to(root_resolved).as_posix()
-            self._validate_package_relative_path(relative)
-            if ".git" in Path(relative).parts:
-                raise ValidationError("image packages must not include .git directories")
-            files[relative] = self._read_package_file_limited(file)
+        total_bytes = 0
+        visited_paths = 0
+
+        def visit(directory: SecureDirectoryGuard) -> None:
+            nonlocal total_bytes, visited_paths
+            opened_directory = self._validate_host_package_directory_snapshot(
+                directory.snapshot(),
+                path=directory.path,
+                after_read=False,
+            )
+            try:
+                linked_directory = self._validate_host_package_directory_snapshot(
+                    directory.linked_snapshot(),
+                    path=directory.path,
+                    after_read=False,
+                )
+            except OSError as exc:
+                raise ValidationError(
+                    "image package directory changed during enumeration: "
+                    f"{directory.path}"
+                ) from exc
+            if linked_directory != opened_directory:
+                raise ValidationError(
+                    "image package directory changed during enumeration: "
+                    f"{directory.path}"
+                )
+            try:
+                entries = directory.scandir()
+            except OSError as exc:
+                raise ValidationError(
+                    "image package directory changed during enumeration: "
+                    f"{directory.path}"
+                ) from exc
+            with entries:
+                for entry in entries:
+                    file = directory.path / entry.name
+                    visited_paths += 1
+                    if visited_paths > self.config.image.package_max_files:
+                        raise ValidationError(
+                            "image package exceeds package_max_files="
+                            f"{self.config.image.package_max_files}"
+                        )
+                    try:
+                        relative = file.relative_to(root_resolved).as_posix()
+                    except ValueError as exc:
+                        raise ValidationError(
+                            f"image package path escapes package root: {file}"
+                        ) from exc
+                    self._validate_package_relative_path(relative)
+                    try:
+                        before = directory.lstat_child(entry.name)
+                    except OSError as exc:
+                        raise ValidationError(
+                            f"image package path changed during enumeration: {file}"
+                        ) from exc
+                    if before.is_reparse_point or stat.S_ISLNK(before.mode):
+                        raise ValidationError(
+                            f"image package symlinks are not supported: {file}"
+                        )
+                    if stat.S_ISDIR(before.mode):
+                        try:
+                            child = directory.open_child_directory(entry.name)
+                        except OSError as exc:
+                            raise ValidationError(
+                                "image package directory changed during enumeration: "
+                                f"{file}"
+                            ) from exc
+                        with child:
+                            visit(child)
+                        continue
+                    if not stat.S_ISREG(before.mode):
+                        raise ValidationError(
+                            "image package path is not a regular file or directory: "
+                            f"{file}"
+                        )
+                    if before.links > 1:
+                        raise ValidationError(
+                            f"image package hard links are not supported: {file}"
+                        )
+                    is_manifest = (
+                        relative == self.config.image.package_manifest_name
+                    )
+                    file_max_bytes = (
+                        self.config.image.package_manifest_max_bytes
+                        if is_manifest
+                        else self.config.image.package_file_max_bytes
+                    )
+                    limit_name = (
+                        "package_manifest_max_bytes"
+                        if is_manifest
+                        else "package_file_max_bytes"
+                    )
+                    reported_max_bytes = file_max_bytes
+                    remaining_package_bytes = (
+                        self.config.image.package_max_bytes - total_bytes
+                    )
+                    if remaining_package_bytes < file_max_bytes:
+                        file_max_bytes = max(remaining_package_bytes, 0)
+                        limit_name = "package_max_bytes"
+                        reported_max_bytes = self.config.image.package_max_bytes
+                    content = self._read_package_file_limited(
+                        file,
+                        max_bytes=file_max_bytes,
+                        limit_name=limit_name,
+                        reported_max_bytes=reported_max_bytes,
+                        parent=directory,
+                        relative_name=entry.name,
+                    )
+                    total_bytes += len(content)
+                    files[relative] = content
+            after_directory = self._validate_host_package_directory_snapshot(
+                directory.snapshot(),
+                path=directory.path,
+                after_read=True,
+            )
+            try:
+                linked_after = self._validate_host_package_directory_snapshot(
+                    directory.linked_snapshot(),
+                    path=directory.path,
+                    after_read=True,
+                )
+            except OSError as exc:
+                raise ValidationError(
+                    "image package directory changed during enumeration: "
+                    f"{directory.path}"
+                ) from exc
+            if (
+                after_directory != opened_directory
+                or linked_after != after_directory
+            ):
+                raise ValidationError(
+                    "image package directory changed during enumeration: "
+                    f"{directory.path}"
+                )
+
+        try:
+            root_guard = open_secure_directory(root_resolved)
+        except OSError as exc:
+            raise ValidationError(
+                f"cannot securely open image package directory: {root_resolved}"
+            ) from exc
+        with root_guard:
+            # The guard reports the actual descriptor path after expanding
+            # Darwin's fixed root aliases (for example /var -> /private/var).
+            root_resolved = root_guard.path
+            visit(root_guard)
         if self.config.image.package_manifest_name not in files:
             raise ValidationError(f"image package is missing {self.config.image.package_manifest_name}")
         self._validate_package_size(files)
@@ -466,30 +696,126 @@ class ImageRegistryPrimitive:
             raise ValidationError(f"image package manifest is not a regular file: {selected}")
         return selected
 
-    def _read_package_file_limited(self, path: Path) -> bytes:
-        before = path.lstat()
-        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+    def _host_package_file_snapshot(
+        self,
+        snapshot: StablePathSnapshot,
+        *,
+        path: Path,
+        after_read: bool,
+    ) -> StablePathSnapshot:
+        if snapshot.is_reparse_point or not stat.S_ISREG(snapshot.mode):
             raise ValidationError(f"image package path is not a regular file: {path}")
-        if before.st_nlink > 1:
+        if snapshot.links > 1:
             raise ValidationError(f"image package hard links are not supported: {path}")
-        size = before.st_size
-        if size > self.config.image.package_file_max_bytes:
-            raise ValidationError(f"image package file exceeds package_file_max_bytes={self.config.image.package_file_max_bytes}: {path}")
+        if snapshot.links < 1:
+            message = "changed during read" if after_read else "is not linked"
+            raise ValidationError(f"image package file {message}: {path}")
+        if not stable_identity_available(snapshot):
+            raise ValidationError(
+                "secure Host image package file identity is unavailable on this platform"
+            )
+        if snapshot.size < 0:
+            raise ValidationError(f"image package file has an invalid size: {path}")
+        return snapshot
+
+    def _validate_host_package_directory_snapshot(
+        self,
+        snapshot: StablePathSnapshot,
+        *,
+        path: Path,
+        after_read: bool,
+    ) -> StablePathSnapshot:
+        if snapshot.is_reparse_point or not stat.S_ISDIR(snapshot.mode):
+            raise ValidationError(
+                f"image package directory is not a regular directory: {path}"
+            )
+        if snapshot.links < 1:
+            message = "changed during enumeration" if after_read else "is not linked"
+            raise ValidationError(f"image package directory {message}: {path}")
+        if not stable_identity_available(snapshot):
+            raise ValidationError(
+                "secure Host image package directory identity is unavailable on this platform"
+            )
+        if snapshot.size < 0:
+            raise ValidationError(
+                f"image package directory has an invalid size: {path}"
+            )
+        return snapshot
+
+    @staticmethod
+    def _host_package_file_limit_error(
+        path: Path,
+        *,
+        limit_name: str,
+        max_bytes: int,
+    ) -> ValidationError:
+        return ValidationError(
+            f"image package file exceeds {limit_name}={max_bytes}: {path}"
+        )
+
+    def _read_package_file_limited(
+        self,
+        path: Path,
+        *,
+        max_bytes: int | None = None,
+        limit_name: str = "package_file_max_bytes",
+        reported_max_bytes: int | None = None,
+        parent: SecureDirectoryGuard | None = None,
+        relative_name: str | None = None,
+    ) -> bytes:
+        selected_max_bytes = (
+            self.config.image.package_file_max_bytes
+            if max_bytes is None
+            else max_bytes
+        )
+        if (
+            isinstance(selected_max_bytes, bool)
+            or not isinstance(selected_max_bytes, int)
+            or selected_max_bytes < 0
+        ):
+            raise ValidationError("image package file read limit must be non-negative")
+        displayed_max_bytes = (
+            selected_max_bytes
+            if reported_max_bytes is None
+            else reported_max_bytes
+        )
         try:
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            secure_file = open_secure_file(
+                path,
+                parent=parent,
+                relative_name=relative_name,
+            )
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise ValidationError(f"image package symlinks are not supported: {path}") from exc
-            raise
-        with os.fdopen(fd, "rb") as handle:
-            opened = os.fstat(handle.fileno())
-            if not stat.S_ISREG(opened.st_mode):
-                raise ValidationError(f"image package path is not a regular file: {path}")
-            if opened.st_nlink > 1:
-                raise ValidationError(f"image package hard links are not supported: {path}")
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-                raise ValidationError(f"image package file changed during read: {path}")
-            return handle.read()
+            if exc.errno in {errno.ENOENT, errno.ENOTDIR, getattr(errno, "ESTALE", -1)}:
+                raise ValidationError(f"image package file changed during read: {path}") from exc
+            raise ValidationError(f"cannot securely open image package file: {path}") from exc
+        try:
+            return read_stable_file_limited(
+                secure_file,
+                max_bytes=selected_max_bytes,
+                chunk_bytes=_PACKAGE_FILE_READ_CHUNK_BYTES,
+                validate_snapshot=lambda snapshot, after_read: self._host_package_file_snapshot(
+                    snapshot,
+                    path=path,
+                    after_read=after_read,
+                ),
+            )
+        except SecureFileLimitExceeded as exc:
+            raise self._host_package_file_limit_error(
+                path,
+                limit_name=limit_name,
+                max_bytes=displayed_max_bytes,
+            ) from exc
+        except SecureFileReadUnavailable as exc:
+            raise ValidationError(
+                f"cannot securely read image package file to EOF: {path}"
+            ) from exc
+        except (SecureFileChanged, OSError) as exc:
+            raise ValidationError(
+                f"image package file changed during read: {path}"
+            ) from exc
 
     def _read_workspace_package(self, pid: str, path: str) -> tuple[dict[str, bytes], str]:
         cwd = self.process_working_directory(pid)
@@ -531,11 +857,19 @@ class ImageRegistryPrimitive:
         files: dict[str, bytes],
     ) -> None:
         visited_dirs: set[str] = set()
+        visited_paths = 0
+        pending: list[tuple[str, int]] = [(workspace_package_root, 0)]
 
-        def visit(directory: str) -> None:
+        while pending:
+            directory, depth = pending.pop()
             normalized_dir = directory.strip("/")
             if normalized_dir in visited_dirs:
-                return
+                continue
+            if depth > self.config.image.package_max_files:
+                raise ValidationError(
+                    "image package tree depth exceeds package_max_files="
+                    f"{self.config.image.package_max_files}"
+                )
             visited_dirs.add(normalized_dir)
             listing = self.filesystem.read_directory(
                 pid,
@@ -546,13 +880,19 @@ class ImageRegistryPrimitive:
             if listing.truncated:
                 raise ValidationError(f"image package exceeds package_max_files={self.config.image.package_max_files}")
             for entry in listing.entries:
+                visited_paths += 1
+                if visited_paths > self.config.image.package_max_files:
+                    raise ValidationError(
+                        "image package exceeds package_max_files="
+                        f"{self.config.image.package_max_files}"
+                    )
                 relative = self._workspace_package_relative_path(workspace_package_root, entry.path)
                 if relative is None:
                     continue
                 if ".git" in Path(relative).parts:
                     raise ValidationError("image packages must not include .git directories")
                 if entry.kind == "directory":
-                    visit(entry.path)
+                    pending.append((entry.path, depth + 1))
                     continue
                 if entry.kind != "file":
                     raise ValidationError(f"image package path is not a regular file: {relative}")
@@ -572,8 +912,6 @@ class ImageRegistryPrimitive:
                 files[relative] = read.content
                 if len(files) > self.config.image.package_max_files:
                     raise ValidationError(f"image package exceeds package_max_files={self.config.image.package_max_files}")
-
-        visit(workspace_package_root)
 
     def _workspace_package_relative_path(self, workspace_package_root: str, workspace_path: str) -> str | None:
         root = workspace_package_root.strip("/")
@@ -927,12 +1265,22 @@ class ImageRegistryPrimitive:
             rights = self._string_list(item.get("rights"), "workspace.grants[].rights")
             if not rights or any(right not in allowed_rights for right in rights):
                 raise ValidationError("workspace grants may include only read, write, and delete rights")
+            recursive = item.get("recursive", False)
+            if type(recursive) is not bool:
+                raise ValidationError(
+                    "workspace.grants[].recursive must be a boolean"
+                )
+            delegable = item.get("delegable", False)
+            if type(delegable) is not bool:
+                raise ValidationError(
+                    "workspace.grants[].delegable must be a boolean"
+                )
             grants.append(
                 {
                     "path": grant_path,
                     "rights": sorted(set(rights)),
-                    "recursive": bool(item.get("recursive", False)),
-                    "delegable": bool(item.get("delegable", False)),
+                    "recursive": recursive,
+                    "delegable": delegable,
                 }
             )
         return grants
@@ -1079,8 +1427,32 @@ class ImageRegistryPrimitive:
             # Persisted images may depend on startup modules that are not loaded
             # in this Runtime.open() invocation. Keep the manifest inspectable
             # and defer concrete tool resolution to spawn/exec.
-            self._validate_persisted_image(image)
+            try:
+                self._validate_persisted_image(image)
+            except _InvalidImageBootArtifact:
+                # Retain the durable row for bounded diagnostics, but never put
+                # an unbootable manifest in the executable image cache.
+                self.images.pop(image.image_id, None)
+                continue
             self.images[image.image_id] = image
+
+    def registered_image(self, image_id: str) -> AgentImage | None:
+        """Return the durable registry entry, including quarantined images.
+
+        The executable cache intentionally omits images whose boot artifacts
+        fail validation.  Registry conflict and authority decisions must still
+        treat those durable rows as existing entries.
+        """
+
+        found = self._registered_image(image_id)
+        return deepcopy(found) if found is not None else None
+
+    def _registered_image(self, image_id: str) -> AgentImage | None:
+        if self.store is not None:
+            persisted = self.store.get_image(image_id)
+            if persisted is not None:
+                return persisted[0]
+        return self.images.get(image_id)
 
     def list_images(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
@@ -1090,10 +1462,15 @@ class ImageRegistryPrimitive:
             if limit is not None:
                 images = images[:limit]
             return [self._image_summary(image, {}) for image in images]
-        return [
-            self._image_summary(self._validate_persisted_image(image), metadata)
-            for image, metadata in self.store.list_images(limit=limit)
-        ]
+        summaries: list[dict[str, Any]] = []
+        for image, metadata in self.store.list_images(limit=limit):
+            try:
+                validated = self._validate_persisted_image(image)
+            except _InvalidImageBootArtifact:
+                summaries.append(self._invalid_boot_summary(image, metadata))
+                continue
+            summaries.append(self._image_summary(validated, metadata))
+        return summaries
 
     def inspect(self, image_id: str) -> dict[str, Any]:
         image = self.images.get(image_id)
@@ -1102,7 +1479,10 @@ class ImageRegistryPrimitive:
             persisted = self.store.get_image(image_id)
             if persisted is not None:
                 image, metadata = persisted
-                image = self._validate_persisted_image(image)
+                try:
+                    image = self._validate_persisted_image(image)
+                except _InvalidImageBootArtifact:
+                    return self._invalid_boot_inspection(image, metadata)
         if image is None:
             raise NotFound(f"agent image not found: {image_id}")
         artifact = None
@@ -1139,7 +1519,20 @@ class ImageRegistryPrimitive:
         # Persisted images can outlive code upgrades or manual DB repairs. Keep
         # startup/module tool resolution deferred, but fail closed on malformed
         # model fields before the image reaches spawn or prompt selection.
-        self._validate_image(image, validate_tools=False)
+        self._validate_image(
+            image,
+            validate_tools=False,
+            validate_boot=False,
+        )
+        try:
+            self._validate_boot(image.boot)
+            self._validate_boot_artifact_identity(image)
+        except _InvalidImageBootArtifact:
+            raise
+        except ValidationError as exc:
+            raise _InvalidImageBootArtifact(
+                "persisted image boot reference is invalid"
+            ) from exc
         return image
 
     def commit_from_checkpoint(
@@ -1156,11 +1549,15 @@ class ImageRegistryPrimitive:
     ) -> ImageRegistrationResult:
         if self.store is None:
             raise ValidationError("checkpoint image commit requires a runtime store")
-        checkpoint, snapshot = self.checkpoint.load_checkpoint_artifact(checkpoint_id)
         authority_decision = self._authorize_registry_mutation(
             actor,
             image_id,
             replace=replace,
+            require_capability=require_capability,
+        )
+        checkpoint, snapshot = self.checkpoint.load_checkpoint_artifact_for_read(
+            checkpoint_id,
+            actor=actor,
             require_capability=require_capability,
         )
         checkpoint_scope = (
@@ -1180,7 +1577,7 @@ class ImageRegistryPrimitive:
                 actor=actor,
                 operation="checkpoint image commit",
             ):
-                if image_id in self.images and not replace:
+                if self._registered_image(image_id) is not None and not replace:
                     raise ValidationError(f"agent image already exists: {image_id}")
                 return self._commit_from_checkpoint_locked(
                     actor=actor,
@@ -1194,10 +1591,28 @@ class ImageRegistryPrimitive:
                     metadata=metadata,
                 )
 
-    def preflight_checkpoint_commit(self, checkpoint_id: str) -> None:
-        """Reject an incompatible source checkpoint before operation evidence."""
+    def preflight_checkpoint_commit(
+        self,
+        *,
+        actor: str,
+        checkpoint_id: str,
+        image_id: str,
+        replace: bool = False,
+        require_capability: bool = True,
+    ) -> None:
+        """Authorize both targets before decoding the source checkpoint."""
 
-        self.checkpoint.preflight_checkpoint(checkpoint_id)
+        self._authorize_registry_mutation(
+            actor,
+            image_id,
+            replace=replace,
+            require_capability=require_capability,
+        )
+        self.checkpoint.preflight_checkpoint_read(
+            checkpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
 
     def _commit_from_checkpoint_locked(
         self,
@@ -1400,6 +1815,7 @@ class ImageRegistryPrimitive:
         image: AgentImage,
         *,
         validate_tools: bool = True,
+        validate_boot: bool = True,
         additional_tool_names: Iterable[str] = (),
     ) -> None:
         additional_tools = frozenset(additional_tool_names)
@@ -1455,7 +1871,8 @@ class ImageRegistryPrimitive:
         for spec in image.required_capabilities:
             self._validate_capability_spec(spec)
         self._validate_module_specs(image.required_modules)
-        self._validate_boot(image.boot)
+        if validate_boot:
+            self._validate_boot(image.boot)
         self.tools.initial_tool_projection(image)
 
     @staticmethod
@@ -1565,8 +1982,36 @@ class ImageRegistryPrimitive:
         artifact_sha256 = boot.get("artifact_sha256")
         if not isinstance(artifact_id, str) or not artifact_id:
             raise ValidationError(f"{kind} boot requires artifact_id")
-        if not isinstance(artifact_sha256, str) or not artifact_sha256:
-            raise ValidationError(f"{kind} boot requires artifact_sha256")
+        self._validate_identifier(
+            artifact_id,
+            "boot.artifact_id",
+            self.config.image.id_max_chars,
+        )
+        if (
+            not isinstance(artifact_sha256, str)
+            or _SHA256_PATTERN.fullmatch(artifact_sha256) is None
+        ):
+            raise ValidationError(
+                f"{kind} boot requires a lowercase SHA-256 artifact_sha256"
+            )
+
+    def _validate_boot_artifact_identity(self, image: AgentImage) -> None:
+        kind = str(image.boot.get("kind", "fresh"))
+        if kind == "fresh":
+            return
+        if self.store is None:
+            raise ValidationError(
+                f"{kind} boot requires runtime store artifact persistence"
+            )
+        try:
+            ImageArtifactLoader(self.store, self.config).load(
+                image,
+                expected_kind=kind,
+            )
+        except (NotFound, RuntimeError, TypeError, ValueError) as exc:
+            raise _InvalidImageBootArtifact(
+                f"{kind} boot artifact reference is invalid"
+            ) from exc
 
     def _capability_specs(self, value: Any) -> list[dict[str, Any]]:
         if value is None:
@@ -1867,4 +2312,34 @@ class ImageRegistryPrimitive:
             "required_capabilities_count": len(image.required_capabilities),
             "required_modules_count": len(image.required_modules),
             **metadata,
+        }
+
+    def _invalid_boot_summary(
+        self,
+        image: AgentImage,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            **self._image_summary(image, metadata),
+            "boot_status": "invalid",
+            "invalid_boot": {
+                "code": _INVALID_BOOT_CODE,
+                "message": _INVALID_BOOT_MESSAGE,
+            },
+        }
+
+    def _invalid_boot_inspection(
+        self,
+        image: AgentImage,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "image": self._image_to_dict(image),
+            "registry": dict(metadata),
+            "artifact": None,
+            "boot_status": "invalid",
+            "invalid_boot": {
+                "code": _INVALID_BOOT_CODE,
+                "message": _INVALID_BOOT_MESSAGE,
+            },
         }

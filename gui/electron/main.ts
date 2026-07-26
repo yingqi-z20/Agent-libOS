@@ -1,5 +1,6 @@
-import { app, BrowserWindow, dialog, ipcMain, protocol, shell, type OpenDialogOptions } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, protocol, shell, type IpcMainInvokeEvent, type OpenDialogOptions } from "electron";
 import { ChildProcess, ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
@@ -7,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { databaseTargetFromRenderer } from "./database.js";
 import { redactGuiServerOutput, requireLoopbackDevServerUrl, runtimeServerEnv } from "./env.js";
 import { readImagePackageFiles } from "./imagePackage.js";
+import { appendStartupOutput, cleanupBeforeExit, consumeStartupOutput, isChildAlive, withStartupFailureCleanup, type ServerConnection } from "./processLifecycle.js";
 import {
   productionRendererEntryUrl,
   productionRendererOrigin,
@@ -14,13 +16,12 @@ import {
   readProductionRendererAsset
 } from "./rendererProtocol.js";
 import { isCompletedShutdownResponse } from "./shutdown.js";
+import {
+  assertTrustedIpcSender,
+  installDefaultDenyPermissions,
+  installTrustedRendererNavigationGuard
+} from "./security.js";
 import { mainWindowBounds, shouldCreateBrowserWindow } from "./windowBounds.js";
-
-type ServerConnection = {
-  url: string;
-  token: string;
-  db: string;
-};
 
 type RuntimeServerCommand = {
   command: string;
@@ -34,6 +35,7 @@ const smokeMode = process.env.AGENT_LIBOS_GUI_SMOKE === "1";
 const smokeWindowMode = smokeMode && process.env.AGENT_LIBOS_GUI_SMOKE_WINDOW === "1";
 const smokeLogPath = process.env.AGENT_LIBOS_GUI_SMOKE_LOG;
 const imageManifestMaxBytes = 1_048_576;
+const startupOutputMaxBytes = 65_536;
 const allowedExternalProtocols = new Set(["http:", "https:", "mailto:"]);
 const productionCsp = [
   "default-src 'self'",
@@ -73,6 +75,7 @@ if (smokeMode) {
 
 let mainWindow: BrowserWindow | null = null;
 let serverProcess: ChildProcessWithoutNullStreams | null = null;
+let startingServerProcess: ChildProcessWithoutNullStreams | null = null;
 let connection: ServerConnection | null = null;
 let stoppingServer: Promise<void> | null = null;
 let startingServer: Promise<ServerConnection> | null = null;
@@ -90,9 +93,14 @@ function smokeLog(stage: string, details: Record<string, unknown> = {}) {
 async function stopRuntimeServer({ graceful = true, timeoutMs = 2500 }: { graceful?: boolean; timeoutMs?: number } = {}) {
   if (stoppingServer) return stoppingServer;
   const child = serverProcess;
+  const startingChild = startingServerProcess === child ? null : startingServerProcess;
   const currentConnection = connection;
-  stoppingServer = stopRuntimeServerInstance(child, currentConnection, { graceful, timeoutMs }).finally(() => {
+  stoppingServer = Promise.all([
+    stopRuntimeServerInstance(child, currentConnection, { graceful, timeoutMs }),
+    stopRuntimeServerInstance(startingChild, null, { graceful: false, timeoutMs })
+  ]).then(() => undefined).finally(() => {
     if (serverProcess === child) serverProcess = null;
+    if (startingServerProcess === startingChild) startingServerProcess = null;
     if (connection === currentConnection) connection = null;
     stoppingServer = null;
   });
@@ -110,11 +118,11 @@ async function stopRuntimeServerInstance(
     gracefulAcknowledged = await requestServerShutdown(currentConnection, timeoutMs);
     if (gracefulAcknowledged) await waitForExit(child, timeoutMs);
   }
-  const forced = child.exitCode === null && !child.killed;
+  const forced = isChildAlive(child);
   if (graceful && currentConnection && !gracefulAcknowledged) {
     console.warn("Agent libOS GUI server did not confirm completed teardown; forcing process termination.");
   }
-  if (child.exitCode === null && !child.killed) {
+  if (isChildAlive(child)) {
     await killProcessTree(child, timeoutMs);
   }
   smokeLog("server.stop.completed", { gracefulAcknowledged, forced });
@@ -166,18 +174,21 @@ function requestServer(
 }
 
 function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<void> {
-  if (child.exitCode !== null || child.killed) return Promise.resolve();
+  if (!isChildAlive(child)) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
-    child.once("exit", () => {
+    const finish = () => {
       clearTimeout(timer);
+      child.removeListener("exit", finish);
       resolve();
-    });
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    child.once("exit", finish);
+    if (!isChildAlive(child)) finish();
   });
 }
 
 async function killProcessTree(child: ChildProcessWithoutNullStreams, timeoutMs: number) {
-  if (child.exitCode !== null || child.killed) return;
+  if (!isChildAlive(child)) return;
   if (process.platform === "win32" && child.pid !== undefined) {
     const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
       windowsHide: true,
@@ -188,7 +199,10 @@ async function killProcessTree(child: ChildProcessWithoutNullStreams, timeoutMs:
     signalProcessGroup(child, "SIGTERM");
   }
   await waitForExit(child, timeoutMs);
-  if (child.exitCode === null && !child.killed) signalProcessGroup(child, "SIGKILL");
+  if (isChildAlive(child)) {
+    signalProcessGroup(child, "SIGKILL");
+    await waitForExit(child, timeoutMs);
+  }
 }
 
 function signalProcessGroup(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
@@ -204,12 +218,16 @@ function signalProcessGroup(child: ChildProcessWithoutNullStreams, signal: NodeJ
 }
 
 function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (!isChildAlive(child)) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
-    child.once("exit", () => {
+    const finish = () => {
       clearTimeout(timer);
+      child.removeListener("exit", finish);
       resolve();
-    });
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    child.once("exit", finish);
+    if (!isChildAlive(child)) finish();
   });
 }
 
@@ -230,6 +248,9 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 async function startRuntimeServer(db?: string): Promise<ServerConnection> {
+  if (quittingAfterServerStop) throw new Error("GUI server cannot start while the application is quitting.");
+  if (stoppingServer) await stoppingServer;
+  if (quittingAfterServerStop) throw new Error("GUI server cannot start while the application is quitting.");
   if (startingServer) {
     try {
       await startingServer;
@@ -237,7 +258,9 @@ async function startRuntimeServer(db?: string): Promise<ServerConnection> {
       // The next start below gets its own process and error surface.
     }
   }
-  if (serverProcess && serverProcess.exitCode === null && connection && (db === undefined || connection.db === db)) {
+  if (stoppingServer) await stoppingServer;
+  if (quittingAfterServerStop) throw new Error("GUI server cannot start while the application is quitting.");
+  if (isChildAlive(serverProcess) && connection && (db === undefined || connection.db === db)) {
     return connection;
   }
   startingServer = doStartRuntimeServer(db).finally(() => {
@@ -263,63 +286,76 @@ async function doStartRuntimeServer(db?: string): Promise<ServerConnection> {
     detached: process.platform !== "win32",
     windowsHide: true
   });
-  const startup = await new Promise<ServerConnection>((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
-    };
-    const succeed = (value: ServerConnection) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(value);
-    };
-    const timer = setTimeout(() => fail(new Error(`GUI server did not start. ${stderr}`)), 15000);
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      stdout += chunk.toString("utf8");
-      const line = stdout.split(/\r?\n/).find((item) => item.trim().startsWith("{"));
-      if (!line) return;
-      smokeLog("server.stdout", { preview: redactGuiServerOutput(line).slice(0, 200) });
-      try {
-        succeed(JSON.parse(line) as ServerConnection);
-      } catch (error) {
-        fail(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-      smokeLog("server.stderr", { preview: chunk.toString("utf8").slice(0, 200) });
-      console.error(chunk.toString("utf8"));
-    });
-    child.on("exit", (code) => {
-      fail(new Error(`GUI server exited before startup with code ${code}. ${stderr}`));
-    });
-    child.on("error", (error) => {
-      fail(error);
-    });
-  }).catch(async (error) => {
-    await killProcessTree(child, 3000);
-    if (serverProcess === child) serverProcess = null;
-    throw error;
-  });
+  startingServerProcess = child;
   try {
-    await waitForServerHealth(startup, 15000);
-  } catch (error) {
-    await killProcessTree(child, 3000);
-    throw error;
+    return await withStartupFailureCleanup(async () => {
+      const startup = await new Promise<ServerConnection>((resolve, reject) => {
+        let stdoutState = { text: "", scanOffset: 0 };
+        let stderr = "";
+        let settled = false;
+        const fail = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        };
+        const succeed = (value: ServerConnection) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
+        const timer = setTimeout(() => fail(new Error(`GUI server did not start. ${stderr}`)), 15000);
+        child.stdout.on("data", (chunk: Buffer) => {
+          if (settled) return;
+          try {
+            const consumed = consumeStartupOutput(stdoutState, chunk, startupOutputMaxBytes);
+            stdoutState = consumed.state;
+            if (!consumed.connection) return;
+            smokeLog("server.stdout", { preview: redactGuiServerOutput(consumed.frame ?? "").slice(0, 200) });
+            succeed(consumed.connection);
+          } catch (error) {
+            fail(error instanceof Error ? error : new Error(String(error)));
+          }
+        });
+        child.stderr.on("data", (chunk: Buffer) => {
+          if (!settled) {
+            try {
+              stderr = appendStartupOutput(stderr, chunk, startupOutputMaxBytes, "stderr");
+            } catch (error) {
+              fail(error instanceof Error ? error : new Error(String(error)));
+              return;
+            }
+          }
+          smokeLog("server.stderr", { preview: chunk.toString("utf8").slice(0, 200) });
+          console.error(chunk.toString("utf8"));
+        });
+        child.on("exit", (code, signal) => {
+          fail(new Error(`GUI server exited before startup with code ${code} and signal ${signal}. ${stderr}`));
+        });
+        child.on("error", (error) => {
+          fail(error);
+        });
+      });
+      await waitForServerHealth(startup, 15000);
+      if (!isChildAlive(child)) throw new Error("GUI server exited during its health check.");
+      if (stoppingServer || quittingAfterServerStop) {
+        throw new Error("GUI server startup was cancelled during application shutdown.");
+      }
+      serverProcess = child;
+      connection = startup;
+      if (startingServerProcess === child) startingServerProcess = null;
+      if (previousProcess && previousProcess !== child) {
+        await stopRuntimeServerInstance(previousProcess, previousConnection, { graceful: true, timeoutMs: 2500 });
+      }
+      return startup;
+    }, async () => {
+      await killProcessTree(child, 3000);
+      if (serverProcess === child) serverProcess = null;
+    });
+  } finally {
+    if (startingServerProcess === child) startingServerProcess = null;
   }
-  serverProcess = child;
-  connection = startup;
-  if (previousProcess && previousProcess !== child) {
-    await stopRuntimeServerInstance(previousProcess, previousConnection, { graceful: true, timeoutMs: 2500 });
-  }
-  return startup;
 }
 
 async function waitForServerHealth(selected: ServerConnection, timeoutMs: number) {
@@ -387,15 +423,11 @@ async function createWindow() {
       sandbox: true
     }
   });
+  installDefaultDenyPermissions(mainWindow.webContents.session);
+  installTrustedRendererNavigationGuard(mainWindow.webContents, trustedRendererUrl());
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isAllowedExternalUrl(url)) void shell.openExternal(url);
     return { action: "deny" };
-  });
-  mainWindow.webContents.on("will-navigate", (event, url) => {
-    const current = mainWindow?.webContents.getURL();
-    if (url === current) return;
-    event.preventDefault();
-    if (isAllowedExternalUrl(url)) void shell.openExternal(url);
   });
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -454,9 +486,24 @@ function ensureWindow(): Promise<void> {
   return request;
 }
 
-ipcMain.handle("libos:getConnection", () => connection);
+function assertIpcSender(event: IpcMainInvokeEvent): void {
+  assertTrustedIpcSender(event, mainWindow?.webContents ?? null, trustedRendererUrl());
+}
 
-ipcMain.handle("libos:chooseDatabase", async () => {
+function trustedRendererUrl(): string {
+  if (!smokeWindowMode && process.env.VITE_DEV_SERVER_URL) {
+    return requireLoopbackDevServerUrl(process.env.VITE_DEV_SERVER_URL);
+  }
+  return productionRendererOrigin;
+}
+
+ipcMain.handle("libos:getConnection", (event) => {
+  assertIpcSender(event);
+  return connection;
+});
+
+ipcMain.handle("libos:chooseDatabase", async (event) => {
+  assertIpcSender(event);
   const options: OpenDialogOptions = {
     title: "Open Agent libOS SQLite database",
     properties: ["openFile"],
@@ -467,7 +514,8 @@ ipcMain.handle("libos:chooseDatabase", async () => {
   return startRuntimeServer(result.filePaths[0]);
 });
 
-ipcMain.handle("libos:chooseImagePackage", async () => {
+ipcMain.handle("libos:chooseImagePackage", async (event) => {
+  assertIpcSender(event);
   const options: OpenDialogOptions = {
     title: "Open AgentImage package",
     properties: ["openDirectory"]
@@ -485,15 +533,18 @@ ipcMain.handle("libos:chooseImagePackage", async () => {
   return {
     name: path.basename(selected),
     manifest: manifest.toString("utf8"),
+    manifest_sha256: createHash("sha256").update(manifest).digest("hex"),
     files
   };
 });
 
 ipcMain.handle("libos:useDatabase", async (_event, db: string) => {
+  assertIpcSender(_event);
   return startRuntimeServer(databaseTargetFromRenderer(db));
 });
 
 ipcMain.handle("libos:openExternal", async (_event, url: string) => {
+  assertIpcSender(_event);
   if (!isAllowedExternalUrl(url)) return false;
   await shell.openExternal(url);
   return true;
@@ -531,10 +582,12 @@ function installProductionRendererProtocol() {
   productionRendererProtocolInstalled = true;
 }
 
-app.whenReady().then(ensureWindow).catch((error) => {
+app.whenReady().then(ensureWindow).catch(async (error) => {
   console.error(error instanceof Error ? error.stack : String(error));
-  void stopRuntimeServer({ graceful: false });
-  app.exit(1);
+  await cleanupBeforeExit(
+    () => stopRuntimeServer({ graceful: false }),
+    () => app.exit(1)
+  );
 });
 
 app.on("activate", () => {
@@ -550,7 +603,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", (event) => {
-  if (!serverProcess || quittingAfterServerStop) return;
+  if ((!isChildAlive(serverProcess) && !isChildAlive(startingServerProcess)) || quittingAfterServerStop) return;
   event.preventDefault();
   quittingAfterServerStop = true;
   void stopRuntimeServer().finally(() => app.quit());

@@ -5,14 +5,22 @@ import json
 import subprocess
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from statistics import fmean
+from tempfile import TemporaryDirectory
 from typing import Any, Iterable
 
 from agent_libos import Runtime
 from agent_libos.llm.usage import aggregate_cache_usage
 from agent_libos.models import CapabilityRight, ProcessStatus
-from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.substrate import (
+    LocalResourceProviderSubstrate,
+    LocalShellProvider,
+    SubprocessLimitExceeded,
+    SubprocessLimits,
+    SubprocessTimeoutExpired,
+)
 
 
 DEFAULT_PHASE_ONE_QUANTA = 6
@@ -41,6 +49,148 @@ REQUIRED_ACTIONS = frozenset(
 WORKSPACE_MUTATION_ACTIONS = frozenset(
     {"write_text_file", "write_directory", "delete_file", "delete_directory"}
 )
+UNITTEST_ARGV = (
+    "python",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-q",
+)
+_HOST_ORACLE_WALL_SECONDS = 30.0
+_HOST_ORACLE_CPU_SECONDS = 10.0
+_HOST_ORACLE_MEMORY_BYTES = 512 * 1024 * 1024
+_HOST_ORACLE_OUTPUT_CHARS = 65_536
+_HOST_ORACLE_REPORTABLE_ERROR_TYPES = frozenset(
+    {
+        "BlockingIOError",
+        "FileNotFoundError",
+        "OSError",
+        "PermissionError",
+        "RuntimeError",
+        "ValidationError",
+    }
+)
+_UNITTEST_BOOTSTRAP = "\n".join(
+    [
+        "import sys, unittest",
+        "sys.path.insert(0, '.')",
+        "suite = unittest.TestLoader().discover('tests')",
+        "result = unittest.TextTestRunner(verbosity=1).run(suite)",
+        "raise SystemExit(0 if result.wasSuccessful() else 1)",
+    ]
+)
+
+
+class _HostOracleShellProvider(LocalShellProvider):
+    def __init__(self, cwd: Path, environment_root: Path) -> None:
+        super().__init__(cwd)
+        self._environment_root = environment_root
+
+    def _safe_env(self) -> dict[str, str]:
+        env = super()._safe_env()
+        temp_root = self._environment_root / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        for key in ("HOME", "USERPROFILE"):
+            env[key] = str(self._environment_root)
+        for key in ("TMPDIR", "TEMP", "TMP"):
+            env[key] = str(temp_root)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["PYTHONNOUSERSITE"] = "1"
+        for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"):
+            env.pop(key, None)
+        return env
+
+
+class HostOracleRunner:
+    """Run model-authored workspace code with Host-owned bounded controls."""
+
+    def __init__(self, workspace: str | Path) -> None:
+        self.workspace = Path(workspace).resolve()
+        self._environment_owner = TemporaryDirectory(
+            prefix=f".{self.workspace.name}-host-oracle-",
+            dir=self.workspace.parent,
+        )
+        self._environment_root = Path(self._environment_owner.name)
+        self._shell = _HostOracleShellProvider(
+            self.workspace,
+            self._environment_root,
+        )
+        self._python = str(Path(sys.executable).resolve(strict=True))
+
+    def __enter__(self) -> HostOracleRunner:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        self._environment_owner.cleanup()
+        return False
+
+    def run_isolated_python(self, source: str) -> dict[str, Any]:
+        argv = [self._python, "-I", "-c", source]
+        try:
+            result = self._shell.run(
+                argv,
+                timeout=_HOST_ORACLE_WALL_SECONDS + 2.0,
+                limits=SubprocessLimits(
+                    wall_seconds=_HOST_ORACLE_WALL_SECONDS,
+                    cpu_seconds=_HOST_ORACLE_CPU_SECONDS,
+                    memory_bytes=_HOST_ORACLE_MEMORY_BYTES,
+                ),
+                stdout_limit_chars=_HOST_ORACLE_OUTPUT_CHARS,
+                stderr_limit_chars=_HOST_ORACLE_OUTPUT_CHARS,
+            )
+        except (SubprocessLimitExceeded, SubprocessTimeoutExpired) as exc:
+            return _host_oracle_result(
+                exc.result,
+                completed=False,
+                limit_kind=exc.metrics.limit_kind or "subprocess_limit",
+            )
+        except Exception as exc:
+            return {
+                "completed": False,
+                "returncode": None,
+                "stdout": "",
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "limit_kind": "host_oracle_error",
+                "error_type": type(exc).__name__,
+                "argv_is_absolute": Path(argv[0]).is_absolute(),
+            }
+        return _host_oracle_result(result, completed=True, limit_kind=None)
+
+
+def _host_oracle_result(
+    result: Any,
+    *,
+    completed: bool,
+    limit_kind: str | None,
+) -> dict[str, Any]:
+    if result is None:
+        return {
+            "completed": False,
+            "returncode": None,
+            "stdout": "",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "limit_kind": limit_kind,
+            "argv_is_absolute": True,
+        }
+    argv = list(getattr(result, "argv", []))
+    return {
+        "completed": completed,
+        "returncode": getattr(result, "returncode", None),
+        "stdout": str(getattr(result, "stdout", "")),
+        "stderr": str(getattr(result, "stderr", "")),
+        "stdout_truncated": bool(getattr(result, "stdout_truncated", False)),
+        "stderr_truncated": bool(getattr(result, "stderr_truncated", False)),
+        "limit_kind": limit_kind,
+        "argv_is_absolute": bool(argv and Path(argv[0]).is_absolute()),
+    }
 
 GOAL = """
 Act as the maintainer of this small pricing repository. Follow AGENTS.md and
@@ -49,10 +199,12 @@ discounts are charged incorrectly. Reproduce the failure with the documented
 test command, diagnose the general defect, fix production code without changing
 the public function signature, and add a regression for an order whose subtotal
 is exactly 100.00. Run the full test suite after editing. Then inspect both Git
-status and the exact diff, create a checkpoint with a concise reason, send one
-concise final human-facing summary, and exit with structured evidence. Do not
-commit, stage, delete files, or stop after merely editing; verification and the
-final delivery steps are part of the task.
+status and the exact diff using the dedicated Agent libOS `git_status` and
+`git_diff` tools from the Git inspection Skill, not Git through the shell.
+Create a checkpoint with a concise reason, send one concise final human-facing
+summary, and exit with structured evidence. Do not commit, stage, delete files,
+or stop after merely editing; verification and the final delivery steps are
+part of the task.
 """.strip()
 
 MIDFLIGHT_MESSAGE = (
@@ -114,6 +266,7 @@ def run_evaluation(
             )
             / len(runs),
             "mean_llm_calls": _mean(runs, "llm_calls"),
+            "mean_llm_errors": _mean(runs, "llm_error_count"),
             "mean_invalid_tool_calls": _mean(runs, "invalid_tool_calls"),
             "mean_tool_failures": _mean(runs, "tool_failure_count"),
             "mean_successful_tool_call_rate": _mean(
@@ -229,6 +382,7 @@ def evaluate_run(
     status: str,
     actions: Iterable[dict[str, Any]],
     successful_actions: Iterable[dict[str, Any]] | None = None,
+    workflow_evidence: Iterable[dict[str, Any]] | None = None,
     activated_skills: Iterable[str],
     checkpoint_count: int,
     restart_survived: bool,
@@ -249,21 +403,21 @@ def evaluate_run(
         str(action.get("action") or "")
         for action in selected_successes
     ]
-    workflow_order = _workflow_order_checks(successful_action_names)
-    selected_skills = {str(skill_id) for skill_id in activated_skills}
-    test_result = subprocess.run(
-        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
+    selected_workflow_evidence = _annotate_workflow_evidence(
+        list(workflow_evidence or ())
     )
+    workflow_order = _workflow_order_checks(selected_workflow_evidence)
+    selected_skills = {str(skill_id) for skill_id in activated_skills}
+    with HostOracleRunner(root) as host_oracle:
+        test_result = host_oracle.run_isolated_python(_UNITTEST_BOOTSTRAP)
+        behavior_result = host_oracle.run_isolated_python(
+            _pricing_behavior_probe_source()
+        )
     tests_text = root.joinpath("tests", "test_pricing.py").read_text(
         encoding="utf-8"
     )
-    test_function_names = _test_function_names(tests_text)
-    behavior_probe = _pricing_behavior_probe(root)
+    regression_coverage = _test_regression_coverage(tests_text)
+    behavior_probe = _pricing_behavior_probe(behavior_result)
     changed_files = {
         line[3:].strip()
         for line in _git(root, "status", "--porcelain").splitlines()
@@ -272,13 +426,9 @@ def evaluate_run(
     checks = {
         "exited": status == ProcessStatus.EXITED.value,
         "restart_survived": restart_survived,
-        "full_tests_pass": test_result.returncode == 0,
-        "exact_threshold_regression": any(
-            "exact_threshold" in name for name in test_function_names
-        ),
-        "zero_quantity_regression": any(
-            "zero_quantity" in name for name in test_function_names
-        ),
+        "full_tests_pass": _host_oracle_succeeded(test_result),
+        "exact_threshold_regression": regression_coverage["exact_threshold"],
+        "zero_quantity_regression": regression_coverage["zero_quantity"],
         "exact_threshold_behavior": behavior_probe.get("exact_threshold") is True,
         "zero_quantity_behavior": behavior_probe.get("zero_quantity") is True,
         "public_signature_stable": behavior_probe.get("public_signature") is True,
@@ -301,9 +451,16 @@ def evaluate_run(
         "passed": all(checks.values()),
         "checks": checks,
         "changed_files": sorted(changed_files),
-        "test_returncode": test_result.returncode,
-        "test_output_tail": (test_result.stdout + test_result.stderr)[-2000:],
+        "test_returncode": test_result["returncode"],
+        "test_output_tail": (
+            str(test_result["stdout"]) + str(test_result["stderr"])
+        )[-2000:],
         "behavior_probe": behavior_probe,
+        "host_oracle": {
+            "test": _host_oracle_report_projection(test_result),
+            "behavior": _host_oracle_report_projection(behavior_result),
+        },
+        "workflow_evidence": selected_workflow_evidence,
     }
 
 
@@ -316,11 +473,14 @@ def report_all_successful(report: dict[str, Any]) -> bool:
     )
 
 
-def _workflow_order_checks(action_names: list[str]) -> dict[str, bool]:
+def _workflow_order_checks(
+    workflow_evidence: list[dict[str, Any]],
+) -> dict[str, bool]:
     mutation_indices = [
-        index
-        for index, name in enumerate(action_names)
-        if name in WORKSPACE_MUTATION_ACTIONS
+        _receipt_index(receipt)
+        for receipt in workflow_evidence
+        if receipt.get("action") in WORKSPACE_MUTATION_ACTIONS
+        and _valid_success_receipt(receipt)
     ]
     if not mutation_indices:
         return {
@@ -331,27 +491,35 @@ def _workflow_order_checks(action_names: list[str]) -> dict[str, bool]:
     first_mutation = min(mutation_indices)
     last_mutation = max(mutation_indices)
     baseline_reproduced = any(
-        name == "run_shell_command" and index < first_mutation
-        for index, name in enumerate(action_names)
+        _receipt_index(receipt) < first_mutation
+        and _valid_unittest_receipt(receipt, expected="baseline")
+        for receipt in workflow_evidence
     )
+    final_test_candidates = [
+        _receipt_index(receipt)
+        for receipt in workflow_evidence
+        if _receipt_index(receipt) > last_mutation
+        and _valid_unittest_receipt(receipt, expected="final")
+    ]
+    if not final_test_candidates:
+        return {
+            "baseline_reproduced_before_edit": baseline_reproduced,
+            "finalization_evidence_fresh": False,
+        }
+    final_test = min(final_test_candidates)
 
     def first_after(name: str, floor: int) -> int | None:
-        return next(
-            (
-                index
-                for index, candidate in enumerate(action_names)
-                if candidate == name and index > floor
-            ),
-            None,
-        )
+        candidates = [
+            _receipt_index(receipt)
+            for receipt in workflow_evidence
+            if receipt.get("action") == name
+            and _receipt_index(receipt) > floor
+            and _valid_success_receipt(receipt)
+        ]
+        return min(candidates) if candidates else None
 
-    final_test = first_after("run_shell_command", last_mutation)
-    final_status = (
-        first_after("git_status", final_test) if final_test is not None else None
-    )
-    final_diff = (
-        first_after("git_diff", final_test) if final_test is not None else None
-    )
+    final_status = first_after("git_status", final_test)
+    final_diff = first_after("git_diff", final_test)
     git_floor = (
         max(final_status, final_diff)
         if final_status is not None and final_diff is not None
@@ -376,6 +544,122 @@ def _workflow_order_checks(action_names: list[str]) -> dict[str, bool]:
         "baseline_reproduced_before_edit": baseline_reproduced,
         "finalization_evidence_fresh": final_exit is not None,
     }
+
+
+def _valid_success_receipt(receipt: dict[str, Any]) -> bool:
+    return (
+        _receipt_index(receipt) >= 0
+        and receipt.get("ok") is True
+        and isinstance(receipt.get("tool_id"), str)
+        and bool(str(receipt["tool_id"]).strip())
+        and isinstance(receipt.get("result_oid"), str)
+        and bool(str(receipt["result_oid"]).strip())
+    )
+
+
+def _valid_unittest_receipt(
+    receipt: dict[str, Any],
+    *,
+    expected: str,
+) -> bool:
+    if (
+        receipt.get("action") != "run_shell_command"
+        or not _valid_success_receipt(receipt)
+        or not isinstance(receipt.get("result_oid"), str)
+        or not str(receipt["result_oid"]).strip()
+        or _normalize_unittest_argv(receipt.get("requested_argv"))
+        != UNITTEST_ARGV
+        or _normalize_unittest_argv(receipt.get("observed_argv"))
+        != UNITTEST_ARGV
+        or receipt.get("stdout_truncated") is not False
+        or receipt.get("stderr_truncated") is not False
+        or receipt.get("limit_kind") not in {None, ""}
+    ):
+        return False
+    returncode = _plain_int(receipt.get("returncode"))
+    if returncode is None:
+        return False
+    if expected == "final":
+        return returncode == 0
+    if expected != "baseline" or returncode == 0:
+        return False
+    output = (
+        str(receipt.get("stdout") or "")
+        + "\n"
+        + str(receipt.get("stderr") or "")
+    )
+    return all(marker in output for marker in ("FAILED", "119.90", "108.00"))
+
+
+def _normalize_unittest_argv(value: Any) -> tuple[str, ...] | None:
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    if not all(isinstance(item, str) for item in value):
+        return None
+    requested_executable = value[0]
+    if (
+        "/" in requested_executable
+        or "\\" in requested_executable
+        or Path(requested_executable).is_absolute()
+    ):
+        try:
+            if Path(requested_executable).resolve(strict=False) != Path(
+                sys.executable
+            ).resolve(strict=False):
+                return None
+        except (OSError, RuntimeError, ValueError):
+            return None
+    executable = Path(requested_executable).name.casefold()
+    if executable.endswith(".exe"):
+        executable = executable[:-4]
+    python_aliases = {
+        "python",
+        "python3",
+        f"python{sys.version_info.major}",
+        f"python{sys.version_info.major}.{sys.version_info.minor}",
+    }
+    if executable not in python_aliases:
+        return None
+    normalized = ("python", *value[1:])
+    return normalized if normalized == UNITTEST_ARGV else None
+
+
+def _annotate_workflow_evidence(
+    workflow_evidence: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected = [dict(receipt) for receipt in workflow_evidence]
+    mutation_indices = [
+        _receipt_index(receipt)
+        for receipt in selected
+        if receipt.get("action") in WORKSPACE_MUTATION_ACTIONS
+        and _valid_success_receipt(receipt)
+    ]
+    if not mutation_indices:
+        return selected
+    first_mutation = min(mutation_indices)
+    last_mutation = max(mutation_indices)
+    for receipt in selected:
+        if _normalize_unittest_argv(receipt.get("requested_argv")) != UNITTEST_ARGV:
+            continue
+        index = _receipt_index(receipt)
+        if index < first_mutation:
+            receipt["semantic_expectation"] = "baseline_known_defect"
+        elif index > last_mutation:
+            receipt["semantic_expectation"] = "final_full_suite"
+        else:
+            receipt["semantic_expectation"] = "intermediate_full_suite"
+    return selected
+
+
+def _receipt_index(receipt: dict[str, Any]) -> int:
+    selected = _plain_int(receipt.get("sequence_index"))
+    return selected if selected is not None else -1
+
+
+def _plain_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _run_once(
@@ -427,6 +711,7 @@ def _run_once(
         process = runtime.process.get(pid)
         actions = _action_sequence(phase_results)
         successful_actions = _successful_action_sequence(phase_results)
+        workflow_evidence = _workflow_evidence_sequence(phase_results)
         activated_skills = [
             str(action.get("skill_id") or "")
             for action in successful_actions
@@ -438,6 +723,7 @@ def _run_once(
             status=process.status.value,
             actions=actions,
             successful_actions=successful_actions,
+            workflow_evidence=workflow_evidence,
             activated_skills=activated_skills,
             checkpoint_count=len(checkpoints),
             restart_survived=restart_survived,
@@ -465,6 +751,7 @@ def _run_once(
         )
         cache_metrics = aggregate_cache_usage(calls)
         prompt_prefix_metrics = _adjacent_prompt_prefix_metrics(calls)
+        llm_error_categories = _llm_error_categories(calls)
         return {
             "scenario_id": SCENARIO_ID,
             "repetition": repetition,
@@ -476,6 +763,8 @@ def _run_once(
             "test_returncode": oracle["test_returncode"],
             "test_output_tail": oracle["test_output_tail"],
             "behavior_probe": oracle["behavior_probe"],
+            "host_oracle": oracle["host_oracle"],
+            "workflow_evidence": oracle["workflow_evidence"],
             "actions": [str(action.get("action") or "") for action in actions],
             "successful_actions": [
                 str(action.get("action") or "") for action in successful_actions
@@ -497,6 +786,8 @@ def _run_once(
                 }
             ),
             "llm_calls": len(calls),
+            "llm_error_count": sum(llm_error_categories.values()),
+            "llm_error_categories": llm_error_categories,
             "prompt_tokens": sum(
                 _nonnegative_int(call.usage.get("prompt_tokens")) for call in calls
             ),
@@ -591,6 +882,85 @@ def _successful_action_sequence(results: Iterable[Any]) -> list[dict[str, Any]]:
     return actions
 
 
+def _workflow_evidence_sequence(
+    results: Iterable[Any],
+) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    sequence_index = 0
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        batch_actions = result.get("actions")
+        batch_results = result.get("results")
+        if isinstance(batch_actions, list):
+            selected_results = (
+                batch_results if isinstance(batch_results, list) else []
+            )
+            for offset, action in enumerate(batch_actions):
+                if isinstance(action, dict):
+                    tool_result = (
+                        selected_results[offset]
+                        if offset < len(selected_results)
+                        and isinstance(selected_results[offset], dict)
+                        else {}
+                    )
+                    receipts.append(
+                        _workflow_receipt(sequence_index, action, tool_result)
+                    )
+                sequence_index += 1
+            continue
+        action = result.get("action")
+        if isinstance(action, dict):
+            tool_result = result.get("result")
+            receipts.append(
+                _workflow_receipt(
+                    sequence_index,
+                    action,
+                    tool_result if isinstance(tool_result, dict) else {},
+                )
+            )
+            sequence_index += 1
+    return receipts
+
+
+def _workflow_receipt(
+    sequence_index: int,
+    action: dict[str, Any],
+    tool_result: dict[str, Any],
+) -> dict[str, Any]:
+    action_name = str(action.get("action") or "")
+    receipt: dict[str, Any] = {
+        "sequence_index": sequence_index,
+        "action": action_name,
+        "ok": tool_result.get("ok") is True,
+        "tool_id": tool_result.get("tool_id"),
+        "result_oid": tool_result.get("result_oid"),
+    }
+    if action_name != "run_shell_command":
+        return receipt
+    payload = tool_result.get("payload")
+    selected_payload = payload if isinstance(payload, dict) else {}
+    error = selected_payload.get("error")
+    error_details = (
+        error.get("details", {})
+        if isinstance(error, dict) and isinstance(error.get("details"), dict)
+        else {}
+    )
+    receipt.update(
+        {
+            "requested_argv": action.get("argv"),
+            "observed_argv": selected_payload.get("argv"),
+            "returncode": selected_payload.get("returncode"),
+            "stdout": selected_payload.get("stdout"),
+            "stderr": selected_payload.get("stderr"),
+            "stdout_truncated": selected_payload.get("stdout_truncated"),
+            "stderr_truncated": selected_payload.get("stderr_truncated"),
+            "limit_kind": error_details.get("limit_kind"),
+        }
+    )
+    return receipt
+
+
 def _invalid_tool_call_count(runtime: Runtime, pid: str) -> int:
     count = 0
     for record in runtime.audit.trace():
@@ -650,49 +1020,154 @@ def _git(root: Path, *args: str) -> str:
     return result.stdout
 
 
-def _test_function_names(source: str) -> set[str]:
+def _test_regression_coverage(source: str) -> dict[str, bool]:
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return set()
+        return {"exact_threshold": False, "zero_quantity": False}
+
+    exact_threshold = False
+    zero_quantity = False
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.casefold().startswith("test"):
+            continue
+        pricing_calls = [
+            candidate
+            for candidate in ast.walk(node)
+            if isinstance(candidate, ast.Call)
+            and _callable_name(candidate.func) == "calculate_total"
+        ]
+        if not pricing_calls:
+            continue
+
+        normalized_name = node.name.casefold()
+        exact_threshold = exact_threshold or (
+            "exact_threshold" in normalized_name
+            or (
+                "exact" in normalized_name
+                and any(
+                    marker in normalized_name
+                    for marker in ("100", "subtotal", "threshold")
+                )
+            )
+        )
+        zero_quantity = zero_quantity or (
+            "zero_quantity" in normalized_name
+            or (
+                "zero" in normalized_name
+                and any(marker in normalized_name for marker in ("quantity", "qty"))
+            )
+        )
+        for call in pricing_calls:
+            lines = _literal_pricing_lines(call)
+            if lines is None:
+                continue
+            subtotal = sum(
+                (price * quantity for price, quantity in lines),
+                Decimal("0.00"),
+            )
+            exact_threshold = exact_threshold or subtotal == Decimal("100.00")
+            zero_quantity = zero_quantity or any(
+                quantity == 0 for _price, quantity in lines
+            )
     return {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        "exact_threshold": exact_threshold,
+        "zero_quantity": zero_quantity,
     }
 
 
-def _pricing_behavior_probe(root: Path) -> dict[str, bool]:
-    probe = subprocess.run(
+def _literal_pricing_lines(call: ast.Call) -> list[tuple[Decimal, int]] | None:
+    if not call.args or not isinstance(call.args[0], (ast.List, ast.Tuple)):
+        return None
+    lines: list[tuple[Decimal, int]] = []
+    for item in call.args[0].elts:
+        if not isinstance(item, (ast.List, ast.Tuple)) or len(item.elts) != 2:
+            return None
+        price = _decimal_literal(item.elts[0])
+        quantity_node = item.elts[1]
+        if (
+            price is None
+            or not isinstance(quantity_node, ast.Constant)
+            or isinstance(quantity_node.value, bool)
+            or not isinstance(quantity_node.value, int)
+        ):
+            return None
+        lines.append((price, quantity_node.value))
+    return lines
+
+
+def _decimal_literal(node: ast.AST) -> Decimal | None:
+    if (
+        not isinstance(node, ast.Call)
+        or _callable_name(node.func) != "Decimal"
+        or len(node.args) != 1
+        or not isinstance(node.args[0], ast.Constant)
+        or not isinstance(node.args[0].value, str)
+    ):
+        return None
+    try:
+        return Decimal(node.args[0].value)
+    except InvalidOperation:
+        return None
+
+
+def _callable_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _llm_error_categories(calls: Iterable[Any]) -> dict[str, int]:
+    categories: dict[str, int] = {}
+    for call in calls:
+        if str(getattr(call, "status", "")) != "error":
+            continue
+        category = _llm_error_category(str(getattr(call, "error", "") or ""))
+        categories[category] = categories.get(category, 0) + 1
+    return dict(sorted(categories.items()))
+
+
+def _llm_error_category(error: str) -> str:
+    message = error.casefold()
+    if "timed out" in message or "timeout" in message:
+        return "timeout"
+    if "rate limit" in message or "status=429" in message:
+        return "rate_limit"
+    if any(marker in message for marker in ("connection", "dns", "tls")):
+        return "connection"
+    if "status=" in message:
+        return "provider_http"
+    return "provider_error"
+
+
+def _pricing_behavior_probe_source() -> str:
+    return "\n".join(
         [
-            sys.executable,
-            "-c",
-            "\n".join(
-                [
-                    "import inspect, json",
-                    "from decimal import Decimal",
-                    "from src.pricing import calculate_total",
-                    "parameters = list(inspect.signature(calculate_total).parameters.values())",
-                    "exact = calculate_total([(Decimal('100.00'), 1)])",
-                    "with_zero = calculate_total([(Decimal('100.00'), 1), (Decimal('9.99'), 0)])",
-                    "print(json.dumps({",
-                    "  'exact_threshold': isinstance(exact, Decimal) and exact == Decimal('90.00'),",
-                    "  'zero_quantity': isinstance(with_zero, Decimal) and with_zero == exact,",
-                    "  'public_signature': len(parameters) == 1 and parameters[0].name == 'lines' and parameters[0].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD,",
-                    "}))",
-                ]
-            ),
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
+            "import inspect, json, sys",
+            "sys.path.insert(0, '.')",
+            "from decimal import Decimal",
+            "from src.pricing import calculate_total",
+            "parameters = list(inspect.signature(calculate_total).parameters.values())",
+            "exact = calculate_total([(Decimal('100.00'), 1)])",
+            "with_zero = calculate_total([(Decimal('100.00'), 1), (Decimal('9.99'), 0)])",
+            "print(json.dumps({",
+            "  'exact_threshold': isinstance(exact, Decimal) and exact == Decimal('90.00'),",
+            "  'zero_quantity': isinstance(with_zero, Decimal) and with_zero == exact,",
+            "  'public_signature': len(parameters) == 1 and parameters[0].name == 'lines' and parameters[0].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD,",
+            "}))",
+        ]
     )
-    if probe.returncode != 0:
+
+
+def _pricing_behavior_probe(probe: dict[str, Any]) -> dict[str, bool]:
+    if not _host_oracle_succeeded(probe):
         return {}
     try:
-        parsed = json.loads(probe.stdout)
+        parsed = json.loads(str(probe.get("stdout") or ""))
     except (json.JSONDecodeError, TypeError):
         return {}
     if not isinstance(parsed, dict):
@@ -701,6 +1176,39 @@ def _pricing_behavior_probe(root: Path) -> dict[str, bool]:
         key: value
         for key, value in parsed.items()
         if isinstance(key, str) and isinstance(value, bool)
+    }
+
+
+def _host_oracle_succeeded(result: dict[str, Any]) -> bool:
+    return (
+        result.get("completed") is True
+        and result.get("returncode") == 0
+        and result.get("stdout_truncated") is False
+        and result.get("stderr_truncated") is False
+        and result.get("limit_kind") is None
+        and result.get("argv_is_absolute") is True
+    )
+
+
+def _host_oracle_report_projection(result: dict[str, Any]) -> dict[str, Any]:
+    error_type = result.get("error_type")
+    if result.get("limit_kind") != "host_oracle_error":
+        reportable_error_type = None
+    elif (
+        isinstance(error_type, str)
+        and error_type in _HOST_ORACLE_REPORTABLE_ERROR_TYPES
+    ):
+        reportable_error_type = error_type
+    else:
+        reportable_error_type = "other"
+    return {
+        "completed": result.get("completed") is True,
+        "returncode": result.get("returncode"),
+        "stdout_truncated": result.get("stdout_truncated") is True,
+        "stderr_truncated": result.get("stderr_truncated") is True,
+        "limit_kind": result.get("limit_kind"),
+        "error_type": reportable_error_type,
+        "argv_is_absolute": result.get("argv_is_absolute") is True,
     }
 
 

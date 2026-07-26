@@ -29,6 +29,10 @@ from agent_libos.process_execution import (
 from agent_libos.runtime.snapshots import ExecRollbackState, SnapshotCodec
 from agent_libos.storage import OperationRepositoryProtocol, UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 
 
 class ImageBootService:
@@ -140,10 +144,19 @@ class ImageBootService:
             process,
             execution_token=execution_token,
         )
+        changing_image = image_id != process.image_id
+        if changing_image:
+            self._launch.require_image_boot_authority(
+                pid,
+                image_id,
+                consume=False,
+            )
         image = self._launch.require_image(image_id)
-        if image_id != process.image_id:
-            self._launch.require_image_boot_authority(pid, image_id)
         self.preflight(image)
+        if changing_image:
+            # Missing or invalid targets must not spend finite read authority.
+            # Reauthorize and consume only after immutable boot validation.
+            self._launch.require_image_boot_authority(pid, image_id)
         publication_id = new_id("publication")
         previous_state: ExecRollbackState | None = None
         admission_token: ProcessExecutionToken | None = None
@@ -1060,6 +1073,14 @@ class ImageBootService:
         image_id: str,
         error: BaseException,
     ) -> None:
+        envelope = public_error_envelope(
+            error,
+            code="image_boot_failed",
+        )
+        observation = internal_exception_observation(
+            error,
+            correlation_id=envelope["correlation_id"],
+        )
         try:
             with self._unit_of_work.transaction():
                 restored = self._processes.get_process(pid)
@@ -1098,9 +1119,11 @@ class ImageBootService:
                     decision={
                         "image": image_id,
                         "phase": "process.exec",
-                        "error": str(error),
+                        "error": envelope,
+                        "internal_error": observation,
                         "rolled_back": True,
                     },
+                    correlation_id=envelope["correlation_id"],
                 )
         except BaseException as terminal_error:
             try:
@@ -1974,9 +1997,16 @@ class ImageBootService:
     def preflight_id(self, image_id: str) -> None:
         self.preflight(self._launch.require_image(image_id))
 
-    def preflight_exec(self, image_id: str) -> None:
-        """Validate the complete replacement image before opening evidence."""
+    def preflight_exec(self, pid: str, image_id: str) -> None:
+        """Authorize the target before resolving and validating its manifest."""
 
+        process = self._process.get(pid)
+        if image_id != process.image_id:
+            self._launch.require_image_boot_authority(
+                pid,
+                image_id,
+                consume=False,
+            )
         self.preflight_id(image_id)
 
     def preflight(self, image: AgentImage) -> None:
@@ -2314,6 +2344,14 @@ class ImageBootService:
         *,
         phase: str,
     ) -> None:
+        envelope = public_error_envelope(
+            exc,
+            code="image_boot_failed",
+        )
+        observation = internal_exception_observation(
+            exc,
+            correlation_id=envelope["correlation_id"],
+        )
         process = self._processes.get_process(pid)
         if process is not None:
             self._process.transitions.transition(
@@ -2323,13 +2361,19 @@ class ImageBootService:
                 expected_status=process.status,
                 expected_state_generation=process.state_generation,
                 outcome=FailedProcessOutcome(code=f"image_boot_{phase}_failed"),
-                status_message=str(exc),
+                status_message=envelope["message"],
             )
         self._audit.record(
             actor="runtime",
             action="image.boot.failed",
             target=f"process:{pid}",
-            decision={"image": image_id, "phase": phase, "error": str(exc)},
+            decision={
+                "image": image_id,
+                "phase": phase,
+                "error": envelope,
+                "internal_error": observation,
+            },
+            correlation_id=envelope["correlation_id"],
         )
 
     def _record_spawn_authority(

@@ -1,23 +1,53 @@
 :root {
   color-scheme: light;
-  color: #182230;
-  background: #f5f6fa;
-  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+  color: #211a2b;
+  background: #f7f4fb;
+  font-family: var(--font-ui);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --accent: #5b5bd6;
-  --accent-hover: #4b4bc2;
-  --accent-soft: #ededff;
-  --accent-subtle: #f6f5ff;
+  --font-ui: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", sans-serif;
+  --color-canvas: #f7f4fb;
+  --color-panel: #ffffff;
+  --color-subtle: #faf7fd;
+  --color-text: #211a2b;
+  --color-text-secondary: #53495e;
+  --color-text-tertiary: #746a7f;
+  --color-text-disabled: #8c8296;
+  --color-border: #e7e0ec;
+  --color-control-border: #91869c;
+  --color-accent: #7c3aed;
+  --color-accent-hover: #6d28d9;
+  --color-accent-fg: #6d28d9;
+  --color-accent-strong: #5b21b6;
+  --color-accent-border: #d8b4fe;
+  --color-focus: rgb(124 58 237 / 26%);
+  --color-success-fg: #067647;
+  --color-success-bg: #ecfdf3;
+  --color-success-border: #abefc6;
+  --color-warning-fg: #b54708;
+  --color-warning-bg: #fffaeb;
+  --color-warning-border: #fedf89;
+  --color-danger-fg: #b42318;
+  --color-danger-bg: #fef3f2;
+  --color-danger-border: #fecdca;
+  --color-code-bg: #1b1326;
+  --color-code-fg: #f7f2ff;
+  --control-sm: 32px;
+  --control-md: 36px;
+  --control-touch: 44px;
+  --accent: var(--color-accent);
+  --accent-hover: var(--color-accent-hover);
+  --accent-soft: #f3e8ff;
+  --accent-subtle: #faf5ff;
   --success: #087e63;
   --success-soft: #e8f7f2;
-  --panel: #ffffff;
-  --surface: #f5f6fa;
-  --surface-raised: #fafbfc;
-  --border: #e4e7ec;
-  --border-strong: #d0d5dd;
-  --muted: #667085;
-  --muted-light: #98a2b3;
+  --panel: var(--color-panel);
+  --surface: var(--color-canvas);
+  --surface-raised: var(--color-subtle);
+  --border: var(--color-border);
+  --border-strong: var(--color-control-border);
+  --muted: var(--color-text-tertiary);
+  --muted-light: var(--color-text-tertiary);
   --danger: #d92d20;
   --danger-soft: #fef3f2;
   --warning: #b54708;
@@ -25,9 +55,9 @@
   --radius-sm: 8px;
   --radius-md: 12px;
   --radius-lg: 18px;
-  --shadow-sm: 0 1px 2px rgb(16 24 40 / 5%);
-  --shadow-md: 0 8px 24px rgb(16 24 40 / 8%);
-  --shadow-lg: 0 24px 70px rgb(16 24 40 / 14%);
+  --shadow-sm: 0 1px 2px rgb(49 24 67 / 6%);
+  --shadow-md: 0 8px 24px rgb(49 24 67 / 9%);
+  --shadow-lg: 0 24px 70px rgb(49 24 67 / 15%);
 }
 
 * {
@@ -40,7 +70,7 @@ body {
   min-height: 100vh;
   min-height: 100dvh;
   overflow: hidden;
-  color: #182230;
+  color: var(--color-text);
   background: var(--surface);
   -webkit-font-smoothing: antialiased;
 }
@@ -58,7 +88,7 @@ button {
   height: 36px;
   border: 1px solid var(--border-strong);
   background: #ffffff;
-  color: #344054;
+  color: var(--color-text-secondary);
   border-radius: var(--radius-sm);
   padding: 0 12px;
   font-weight: 600;
@@ -69,9 +99,9 @@ button {
 }
 
 button:hover:not(:disabled) {
-  border-color: #98a2b3;
-  background: #f9fafb;
-  box-shadow: 0 2px 5px rgb(16 24 40 / 8%);
+  border-color: #a498ad;
+  background: #fcfaff;
+  box-shadow: 0 2px 5px rgb(49 24 67 / 9%);
 }
 
 button:active:not(:disabled) {
@@ -85,7 +115,7 @@ textarea:focus-visible,
 select:focus-visible,
 summary:focus-visible,
 [tabindex]:focus-visible {
-  outline: 3px solid rgb(91 91 214 / 24%);
+  outline: 3px solid var(--color-accent);
   outline-offset: 2px;
 }
 
@@ -96,16 +126,16 @@ button:disabled {
 }
 
 button.primary {
-  background: linear-gradient(135deg, #6565dd, #5454cb);
+  background: linear-gradient(135deg, #7c3aed, #6d28d9);
   color: white;
-  border-color: #5454cb;
-  box-shadow: 0 2px 5px rgb(79 70 229 / 22%);
+  border-color: #6d28d9;
+  box-shadow: 0 2px 6px rgb(109 40 217 / 28%);
 }
 
 button.primary:hover:not(:disabled) {
-  border-color: #4545b8;
-  background: linear-gradient(135deg, #5959d1, #4747bb);
-  box-shadow: 0 4px 10px rgb(79 70 229 / 24%);
+  border-color: #5b21b6;
+  background: linear-gradient(135deg, #6d28d9, #5b21b6);
+  box-shadow: 0 4px 12px rgb(109 40 217 / 30%);
 }
 
 button.warning {
@@ -126,9 +156,9 @@ button.secondary {
 }
 
 button.softButton {
-  background: #f8f9fc;
-  border-color: #e7e8f0;
-  color: #475467;
+  background: var(--color-subtle);
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
   box-shadow: none;
 }
 
@@ -199,7 +229,8 @@ button.secondary:disabled {
   font-size: 12px;
 }
 
-.llmProfileSelect label {
+.llmProfileSelect label,
+.llmProfileSelectField {
   display: grid;
   gap: 5px;
   min-width: 0;
@@ -236,28 +267,33 @@ input, textarea, select {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   background: #ffffff;
-  color: #182230;
+  color: var(--color-text);
   padding: 8px 10px;
   box-shadow: 0 1px 2px rgb(16 24 40 / 4%);
   transition: border-color 150ms ease, box-shadow 150ms ease;
 }
 
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--color-accent);
+}
+
 input:hover:not(:disabled),
 textarea:hover:not(:disabled),
 select:hover:not(:disabled) {
-  border-color: #98a2b3;
+  border-color: #a498ad;
 }
 
 input:focus,
 textarea:focus,
 select:focus {
-  border-color: #8585e6;
-  box-shadow: 0 0 0 3px rgb(91 91 214 / 10%);
+  border-color: #a855f7;
+  box-shadow: 0 0 0 3px rgb(124 58 237 / 12%);
 }
 
 input::placeholder,
 textarea::placeholder {
-  color: #98a2b3;
+  color: #667085;
 }
 
 textarea {
@@ -1867,6 +1903,15 @@ textarea {
   gap: 8px;
 }
 
+.llmProfileFormFields {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
 @media (max-width: 1280px) {
   .workspace {
     grid-template-columns: 260px minmax(360px, 1fr) 350px;
@@ -2114,12 +2159,12 @@ html {
 }
 
 ::selection {
-  background: #dcdcff;
-  color: #292967;
+  background: #e9d5ff;
+  color: #4c1d95;
 }
 
 * {
-  scrollbar-color: #c8ccd5 transparent;
+  scrollbar-color: #cfc3d8 transparent;
   scrollbar-width: thin;
 }
 
@@ -2145,7 +2190,7 @@ html {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  color: #7777dd;
+  color: var(--color-accent-fg);
   font-size: 10px;
   font-weight: 750;
   letter-spacing: 0.09em;
@@ -2162,9 +2207,9 @@ html {
   justify-content: center;
   border: 1px solid rgb(255 255 255 / 52%);
   border-radius: 11px;
-  background: linear-gradient(145deg, #6f6fe3, #4e4ec5);
+  background: linear-gradient(145deg, #7c3aed, #5b21b6);
   color: #fff;
-  box-shadow: 0 5px 15px rgb(79 70 229 / 22%), inset 0 1px 0 rgb(255 255 255 / 24%);
+  box-shadow: 0 5px 16px rgb(109 40 217 / 28%), inset 0 1px 0 rgb(255 255 255 / 24%);
 }
 
 .toolbarButton {
@@ -2175,24 +2220,37 @@ html {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  color: #5b5bd6;
+  color: var(--color-accent-fg);
   font-size: 12px;
   white-space: nowrap;
 }
 
 .userAppShell {
   background:
-    radial-gradient(circle at 72% -15%, rgb(107 99 230 / 8%), transparent 34%),
-    #f5f6fa;
+    radial-gradient(circle at 72% -15%, rgb(124 58 237 / 13%), transparent 36%),
+    radial-gradient(circle at 8% 92%, rgb(168 85 247 / 6%), transparent 28%),
+    var(--color-canvas);
 }
 
 .userPage {
   height: 100vh;
   height: 100dvh;
   display: grid;
-  grid-template-rows: 64px minmax(0, 1fr);
-  color: #182230;
+  grid-template-rows: 64px auto minmax(0, 1fr);
+  color: var(--color-text);
   background: transparent;
+}
+
+/* User notices participate in the page layout so they never cover the task
+   switcher, composer, or other controls when a snapshot warning wraps. */
+.userPage > .appNotices {
+  position: static;
+  z-index: 25;
+  justify-self: end;
+  width: min(680px, calc(100% - 24px));
+  max-height: min(32vh, 260px);
+  margin: 8px 12px 0;
+  overflow-y: auto;
 }
 
 .userTopBar {
@@ -2203,9 +2261,9 @@ html {
   justify-content: space-between;
   gap: 18px;
   padding: 10px 18px;
-  border-bottom: 1px solid rgb(228 231 236 / 86%);
-  background: rgb(255 255 255 / 88%);
-  box-shadow: 0 1px 0 rgb(16 24 40 / 2%);
+  border-bottom: 1px solid rgb(231 224 236 / 90%);
+  background: rgb(255 253 255 / 90%);
+  box-shadow: 0 1px 0 rgb(49 24 67 / 3%);
   backdrop-filter: blur(18px);
 }
 
@@ -2258,7 +2316,7 @@ html {
   min-width: 62px;
   height: 36px;
   border-color: transparent;
-  background: #f6f7fa;
+  background: #faf7fd;
   box-shadow: none;
 }
 
@@ -2331,10 +2389,10 @@ html {
 .userMainPanel {
   min-width: 0;
   min-height: 0;
-  border: 1px solid rgb(228 231 236 / 92%);
+  border: 1px solid rgb(231 224 236 / 95%);
   border-radius: var(--radius-lg);
   background: rgb(255 255 255 / 94%);
-  box-shadow: 0 7px 28px rgb(16 24 40 / 6%);
+  box-shadow: 0 7px 28px rgb(49 24 67 / 8%);
 }
 
 .userSidebar {
@@ -2376,7 +2434,7 @@ html {
   min-width: 0;
   height: 40px;
   padding-inline: 11px 30px;
-  background: #fafbfc;
+  background: #fcfaff;
 }
 
 .taskSummaryCard,
@@ -2393,7 +2451,7 @@ html {
   gap: 12px;
   padding: 13px;
   background:
-    linear-gradient(155deg, rgb(248 248 255 / 96%), #fff 60%);
+    linear-gradient(155deg, rgb(250 245 255 / 98%), #fff 64%);
 }
 
 .taskSummaryHeader,
@@ -2493,7 +2551,7 @@ html {
 
 .taskRuntime svg {
   grid-row: 1 / 3;
-  color: #7777dd;
+  color: var(--color-accent);
 }
 
 .taskRuntime span,
@@ -2525,7 +2583,7 @@ html {
   gap: 2px;
   padding: 9px 10px;
   border-radius: 9px;
-  background: #f6f7fa;
+  background: #faf7fd;
 }
 
 .metricGrid strong {
@@ -2600,15 +2658,21 @@ html {
 }
 
 .sidebarDisclosure > summary,
-.newTaskSettings > summary,
 .operatorDisclosure > summary {
   list-style: none;
   cursor: pointer;
 }
 
 .sidebarDisclosure > summary::-webkit-details-marker,
-.newTaskSettings > summary::-webkit-details-marker,
 .operatorDisclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Author layout rules on disclosure bodies must not override the browser's
+   closed <details> behavior. Keeping closed controls out of layout also keeps
+   them out of keyboard and assistive-technology navigation. */
+.sidebarDisclosure:not([open]) > :not(summary),
+.operatorDisclosure:not([open]) > :not(summary) {
   display: none;
 }
 
@@ -2626,7 +2690,7 @@ html {
 }
 
 .sidebarDisclosure > summary:hover {
-  background: #f7f7fb;
+  background: var(--accent-subtle);
 }
 
 .sidebarDisclosure > summary > span {
@@ -2711,15 +2775,15 @@ details[open] > summary .disclosureChevron {
   gap: 6px;
   margin: 2px 12px 14px;
   padding: 22px 16px;
-  border: 1px dashed #d6d8e2;
+  border: 1px dashed #dcd0e5;
   border-radius: var(--radius-md);
-  background: #fafafd;
+  background: #fcf9ff;
   color: var(--muted);
   text-align: center;
 }
 
 .sidebarEmpty svg {
-  color: #8585e6;
+  color: #a855f7;
 }
 
 .sidebarEmpty strong {
@@ -2761,8 +2825,8 @@ details[open] > summary .disclosureChevron {
 
 .userMainPanel.taskComposerMode {
   background:
-    radial-gradient(circle at 88% 2%, rgb(101 101 221 / 9%), transparent 30%),
-    radial-gradient(circle at 10% 90%, rgb(18 183 106 / 6%), transparent 24%),
+    radial-gradient(circle at 88% 2%, rgb(124 58 237 / 13%), transparent 32%),
+    radial-gradient(circle at 10% 90%, rgb(168 85 247 / 7%), transparent 26%),
     rgb(255 255 255 / 93%);
 }
 
@@ -2771,7 +2835,9 @@ details[open] > summary .disclosureChevron {
   flex: 1;
   overflow-y: auto;
   display: grid;
-  align-content: center;
+  /* Preserve the centered welcome state while keeping the first field
+     reachable when expanded settings make the canvas taller than its pane. */
+  align-content: safe center;
   justify-items: center;
   gap: 20px;
   padding: clamp(24px, 5vh, 54px) clamp(20px, 5vw, 64px);
@@ -2795,11 +2861,11 @@ details[open] > summary .disclosureChevron {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #ddddff;
+  border: 1px solid #e2cfff;
   border-radius: 15px;
-  background: linear-gradient(145deg, #f2f1ff, #fff);
-  color: #5b5bd6;
-  box-shadow: 0 5px 16px rgb(91 91 214 / 10%);
+  background: linear-gradient(145deg, #f3e8ff, #fff);
+  color: var(--color-accent);
+  box-shadow: 0 5px 18px rgb(124 58 237 / 14%);
 }
 
 .newTaskHero > div {
@@ -2830,10 +2896,10 @@ details[open] > summary .disclosureChevron {
   display: grid;
   gap: 16px;
   padding: clamp(18px, 3vw, 26px);
-  border: 1px solid #e2e2ef;
+  border: 1px solid #e6dced;
   border-radius: 20px;
   background: rgb(255 255 255 / 96%);
-  box-shadow: 0 18px 50px rgb(35 35 80 / 9%);
+  box-shadow: 0 18px 52px rgb(74 33 94 / 11%);
 }
 
 .newTaskGoalField {
@@ -2847,7 +2913,7 @@ details[open] > summary .disclosureChevron {
 .newTaskGoalField textarea {
   min-height: 124px;
   padding: 14px 15px;
-  border-color: #d7d7e4;
+  border-color: #dcd1e4;
   border-radius: 13px;
   font-size: 15px;
   line-height: 1.55;
@@ -2879,9 +2945,9 @@ button.promptChip {
   max-width: 100%;
   justify-content: flex-start;
   padding: 6px 10px;
-  border-color: #e5e5f0;
+  border-color: #e7deed;
   border-radius: 999px;
-  background: #fafafd;
+  background: #fcf9ff;
   color: #5d6472;
   box-shadow: none;
   font-size: 10px;
@@ -2891,29 +2957,9 @@ button.promptChip {
 }
 
 button.promptChip:hover:not(:disabled) {
-  border-color: #c9c9f4;
-  background: #f5f4ff;
-  color: #4e4ec5;
-}
-
-.newTaskSettings {
-  overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: #fbfbfd;
-}
-
-.newTaskSettings > summary {
-  min-height: 56px;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
-}
-
-.newTaskSettings > summary:hover {
-  background: #f8f8fc;
+  border-color: var(--color-accent-border);
+  background: var(--accent-soft);
+  color: var(--color-accent-fg);
 }
 
 .settingsSummaryIcon {
@@ -2925,54 +2971,6 @@ button.promptChip:hover:not(:disabled) {
   border-radius: 9px;
   background: var(--accent-soft);
   color: var(--accent);
-}
-
-.newTaskSettings > summary > span:nth-child(2) {
-  display: grid;
-  gap: 2px;
-}
-
-.newTaskSettings summary strong {
-  color: #344054;
-  font-size: 11px;
-}
-
-.newTaskSettings summary small {
-  color: var(--muted);
-  font-size: 10px;
-}
-
-.newTaskSettingsGrid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 11px 14px;
-  padding: 14px;
-  border-top: 1px solid var(--border);
-  background: #fff;
-}
-
-.newTaskSettingsGrid .settingsSpan {
-  grid-column: 1 / -1;
-}
-
-.newTaskSettingsGrid .imageSelect {
-  grid-template-columns: 110px minmax(0, 1fr) minmax(0, 1fr);
-}
-
-.newTaskSettingsGrid .llmProfileSelect,
-.newTaskSettingsGrid .taskAuthorityField,
-.newTaskSettingsGrid .fieldStack {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.newTaskSettingsGrid .settingsToggle {
-  align-self: end;
-  min-height: 38px;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: #fafbfc;
 }
 
 .newTaskActions {
@@ -3106,8 +3104,8 @@ button.promptChip:hover:not(:disabled) {
   gap: 13px;
   padding: 22px clamp(18px, 4vw, 50px);
   background:
-    linear-gradient(rgb(250 251 252 / 92%), rgb(248 249 252 / 92%)),
-    radial-gradient(circle at 50% 0, rgb(91 91 214 / 4%), transparent 36%);
+    linear-gradient(rgb(253 251 255 / 92%), rgb(249 246 252 / 94%)),
+    radial-gradient(circle at 50% 0, rgb(124 58 237 / 7%), transparent 38%);
 }
 
 .userEmpty {
@@ -3134,10 +3132,10 @@ button.promptChip:hover:not(:disabled) {
   align-items: center;
   justify-content: center;
   margin-bottom: 3px;
-  border: 1px solid #e1e1ef;
+  border: 1px solid #e6dced;
   border-radius: 15px;
   background: #fff;
-  color: #7777dd;
+  color: var(--color-accent);
   box-shadow: var(--shadow-sm);
 }
 
@@ -3154,9 +3152,9 @@ button.promptChip:hover:not(:disabled) {
 
 .conversationBubble.user {
   justify-self: end;
-  border-color: #ccccf7;
+  border-color: #d8b4fe;
   border-radius: 14px 14px 5px 14px;
-  background: #f1f0ff;
+  background: #f3e8ff;
 }
 
 .conversationBubble.assistant {
@@ -3211,12 +3209,12 @@ button.promptChip:hover:not(:disabled) {
 }
 
 .markdownMessage a {
-  color: #4f4fc7;
+  color: var(--color-accent-fg);
 }
 
 .markdownMessage code {
-  background: #f0f0f7;
-  color: #35356f;
+  background: #f2ecf7;
+  color: #4c1d6f;
 }
 
 .markdownMessage pre {
@@ -3278,11 +3276,11 @@ button.promptChip:hover:not(:disabled) {
   min-height: 32px;
   gap: 6px;
   padding: 0 12px;
-  border-color: #d6d6f4;
+  border-color: #dfcff1;
   border-radius: 999px;
   background: rgb(255 255 255 / 94%);
-  box-shadow: 0 5px 18px rgb(16 24 40 / 13%);
-  color: #4f4fc7;
+  box-shadow: 0 5px 18px rgb(49 24 67 / 14%);
+  color: var(--color-accent-fg);
   font-size: 10px;
   transform: translateX(-50%);
   backdrop-filter: blur(10px);
@@ -3339,13 +3337,13 @@ button.promptChip:hover:not(:disabled) {
 
 .loadingScreen {
   background:
-    radial-gradient(circle at 20% 15%, rgb(91 91 214 / 11%), transparent 34%),
-    radial-gradient(circle at 80% 80%, rgb(18 183 106 / 7%), transparent 30%),
-    #f5f6fa;
+    radial-gradient(circle at 20% 15%, rgb(124 58 237 / 15%), transparent 36%),
+    radial-gradient(circle at 80% 80%, rgb(168 85 247 / 8%), transparent 30%),
+    var(--color-canvas);
 }
 
 .loadingCard {
-  border-color: #e2e2ed;
+  border-color: #e6dced;
   border-radius: 20px;
   box-shadow: var(--shadow-lg);
 }
@@ -3496,16 +3494,6 @@ button.promptChip:hover:not(:disabled) {
     padding: 24px 14px;
   }
 
-  .newTaskSettingsGrid,
-  .newTaskSettingsGrid .settingsSpan {
-    grid-template-columns: 1fr;
-    grid-column: 1;
-  }
-
-  .newTaskSettingsGrid .imageSelect {
-    grid-template-columns: 1fr;
-  }
-
   .newTaskActions {
     align-items: stretch;
     flex-direction: column;
@@ -3604,8 +3592,8 @@ button.promptChip:hover:not(:disabled) {
   height: 100vh;
   height: 100dvh;
   display: grid;
-  grid-template-rows: 68px minmax(0, 1fr);
-  background: #f5f6fa;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--color-canvas);
 }
 
 .topBar {
@@ -3618,8 +3606,8 @@ button.promptChip:hover:not(:disabled) {
   gap: 10px;
   padding: 9px 12px;
   border-bottom: 1px solid var(--border);
-  background: rgb(255 255 255 / 92%);
-  box-shadow: 0 1px 0 rgb(16 24 40 / 3%);
+  background: rgb(255 253 255 / 93%);
+  box-shadow: 0 1px 0 rgb(49 24 67 / 4%);
   overflow-x: auto;
   scrollbar-width: none;
   backdrop-filter: blur(18px);
@@ -3677,7 +3665,7 @@ button.promptChip:hover:not(:disabled) {
   padding: 5px 5px 5px 9px;
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: #fafbfc;
+  background: #fcfaff;
   color: #667085;
 }
 
@@ -3746,6 +3734,7 @@ button.promptChip:hover:not(:disabled) {
   display: inline-flex;
   align-items: center;
   padding: 2px;
+  border: 1px solid var(--color-control-border);
   border-radius: 999px;
   background: #d0d5dd;
   transition: background-color 150ms ease;
@@ -3761,7 +3750,7 @@ button.promptChip:hover:not(:disabled) {
 }
 
 .switchControl > input:checked + .switchVisual {
-  background: #6565dd;
+  background: var(--color-accent);
 }
 
 .switchControl > input:checked + .switchVisual > span {
@@ -3769,7 +3758,7 @@ button.promptChip:hover:not(:disabled) {
 }
 
 .switchControl > input:focus-visible + .switchVisual {
-  outline: 3px solid rgb(91 91 214 / 22%);
+  outline: 3px solid var(--color-focus);
   outline-offset: 2px;
 }
 
@@ -3858,7 +3847,7 @@ button.promptChip:hover:not(:disabled) {
   height: 34px;
   padding: 4px 5px;
   border-color: transparent;
-  background: #f6f7fa;
+  background: #faf7fd;
   box-shadow: none;
   font-size: 10px;
 }
@@ -3872,7 +3861,7 @@ button.promptChip:hover:not(:disabled) {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(255px, 288px) minmax(430px, 1fr) minmax(350px, 400px);
-  background: #eef0f5;
+  background: #f1ecf5;
 }
 
 .leftPane,
@@ -3888,7 +3877,7 @@ button.promptChip:hover:not(:disabled) {
 .leftPane {
   display: flex;
   flex-direction: column;
-  background: #f8f9fb;
+  background: #faf7fc;
 }
 
 .centerPane {
@@ -3897,11 +3886,29 @@ button.promptChip:hover:not(:disabled) {
   background: #fff;
 }
 
+.centerPane > .paneHeader {
+  grid-row: 1;
+}
+
+.centerPane > .humanRequests {
+  grid-row: 2;
+}
+
+.centerPane > .timelineShell,
+.centerPane > .empty {
+  min-height: 0;
+  grid-row: 3;
+}
+
+.centerPane > .composer {
+  grid-row: 4;
+}
+
 .rightPane {
   display: flex;
   flex-direction: column;
   border-right: 0;
-  background: #fbfbfd;
+  background: #fdfaff;
 }
 
 .paneHeader,
@@ -3953,10 +3960,10 @@ button.promptChip:hover:not(:disabled) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #ddddf6;
+  border: 1px solid #e0cff5;
   border-radius: 999px;
-  background: #f4f3ff;
-  color: #5b5bd6;
+  background: var(--accent-soft);
+  color: var(--color-accent-fg);
   font-size: 10px;
   font-weight: 750;
 }
@@ -4002,7 +4009,7 @@ button.promptChip:hover:not(:disabled) {
 }
 
 .operatorDisclosure > summary:hover {
-  background: #fafafd;
+  background: var(--accent-subtle);
 }
 
 .operatorDisclosure > summary > span:nth-child(2) {
@@ -4069,7 +4076,7 @@ button.promptChip:hover:not(:disabled) {
   padding: 7px 9px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: #fafbfc;
+  background: #fcfaff;
 }
 
 .spawnBox .taskAuthorityHint {
@@ -4142,13 +4149,13 @@ button.promptChip:hover:not(:disabled) {
 }
 
 .processNode.selected {
-  border-color: #d2d2f6;
-  background: #f0efff;
-  color: #4242ad;
+  border-color: var(--color-accent-border);
+  background: var(--accent-soft);
+  color: var(--color-accent-strong);
 }
 
 .processNode.selected svg {
-  color: #5b5bd6;
+  color: var(--color-accent);
 }
 
 .processNode .pid {
@@ -4220,9 +4227,9 @@ button.promptChip:hover:not(:disabled) {
 }
 
 .timelineFilter button.active {
-  border-color: #cfcff6;
-  background: #ededff;
-  color: #4b4bb6;
+  border-color: var(--color-accent-border);
+  background: var(--accent-soft);
+  color: var(--color-accent-strong);
 }
 
 .timelineFilterCount {
@@ -4235,13 +4242,18 @@ button.promptChip:hover:not(:disabled) {
 
 .timelineFilter button.active .timelineFilterCount {
   background: #fff;
-  color: #4b4bb6;
+  color: var(--color-accent-strong);
 }
 
 .timelineItem {
+  grid-template-columns: 28px minmax(0, 1fr);
   gap: 10px;
   padding: 10px 0;
   border-bottom: 1px solid #f0f1f4;
+}
+
+.timelineBody {
+  min-width: 0;
 }
 
 .timelineIcon {
@@ -4404,9 +4416,9 @@ button.promptChip:hover:not(:disabled) {
 }
 
 .tabs button.active {
-  border-color: #d4d4f5;
-  background: #ededff;
-  color: #4949b8;
+  border-color: var(--color-accent-border);
+  background: var(--accent-soft);
+  color: var(--color-accent-strong);
 }
 
 .tabPanel {
@@ -4414,7 +4426,7 @@ button.promptChip:hover:not(:disabled) {
   flex: 1;
   overflow-y: auto;
   padding: 14px;
-  background: #fbfbfd;
+  background: #fdfaff;
 }
 
 .processOverview,
@@ -4474,7 +4486,7 @@ button.promptChip:hover:not(:disabled) {
   background: #101828;
 }
 
-@media (max-width: 1400px) {
+@media (max-width: 1480px) {
   .operatorBrand > div > span,
   .operatorDbChip > div > span,
   .userViewButton span {
@@ -4527,6 +4539,51 @@ button.promptChip:hover:not(:disabled) {
   .rightPane {
     grid-column: 1 / -1;
     border-top: 1px solid var(--border);
+  }
+}
+
+@media (min-width: 721px) and (max-width: 1120px) {
+  .spawnBox.operatorDisclosure[open],
+  .quickActions.operatorDisclosure[open] {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .spawnBox.operatorDisclosure[open] {
+    max-height: calc(100% - 96px);
+  }
+
+  .quickActions.operatorDisclosure[open] {
+    max-height: calc(100% - 164px);
+  }
+
+  .spawnBox.operatorDisclosure[open] > summary,
+  .quickActions.operatorDisclosure[open] > summary {
+    flex: 0 0 auto;
+  }
+
+  .spawnBox.operatorDisclosure[open] > .operatorDisclosureBody,
+  .quickActions.operatorDisclosure[open] > .operatorDisclosureBody {
+    min-height: 0;
+    flex: none;
+    overflow-y: auto;
+  }
+
+  .spawnBox.operatorDisclosure[open] > .operatorDisclosureBody {
+    max-height: 345px;
+  }
+
+  .quickActions.operatorDisclosure[open] > .operatorDisclosureBody {
+    max-height: 210px;
+  }
+
+  .spawnBox.operatorDisclosure[open] + .processTreeShell {
+    display: none;
+  }
+
+  .workspace :is(.timeline, .tabPanel, .processTree, .operatorDisclosureBody) {
+    overscroll-behavior: auto;
   }
 }
 
@@ -4617,5 +4674,1283 @@ button.promptChip:hover:not(:disabled) {
 
   .operatorComposerField {
     grid-column: 1 / -1;
+  }
+}
+
+/* Interaction and visual hardening -------------------------------------- */
+
+/* Disabled controls must remain visibly distinct even when they do not use
+   a semantic button variant. Keep the text contrast legible while removing
+   the affordances that imply the control can be activated. */
+button:disabled,
+button.softButton:disabled {
+  border-color: var(--color-border);
+  background: #f2f4f7;
+  color: var(--color-text-disabled);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+button:disabled svg {
+  opacity: 0.65;
+}
+
+input:disabled,
+textarea:disabled,
+select:disabled {
+  border-color: var(--color-border);
+  background: #f2f4f7;
+  color: var(--color-text-disabled);
+  -webkit-text-fill-color: var(--color-text-disabled);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+input[aria-invalid="true"],
+textarea[aria-invalid="true"],
+select[aria-invalid="true"] {
+  border-color: var(--color-danger-fg);
+  box-shadow: 0 0 0 3px rgb(180 35 24 / 12%);
+}
+
+.eyebrow {
+  color: var(--color-accent-fg);
+}
+
+/* Collapsed JSON is a secondary summary. Only expanded code receives the
+   dark code-reader treatment. */
+.jsonPreview {
+  border-color: var(--color-border);
+  background: #f2f4f7;
+  color: var(--color-text-secondary);
+}
+
+.jsonBlock,
+.timelineBody pre,
+.preview {
+  border-color: #344054;
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+}
+
+.toast.inlineToast {
+  position: static;
+  inset: auto;
+  width: auto;
+  max-width: none;
+  transform: none;
+}
+
+.humanApprovalContext {
+  grid-column: 1 / -1;
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+  padding: 11px;
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-sm);
+  background: #fffcf5;
+}
+
+.humanApprovalContext > strong {
+  color: #93370d;
+  font-size: 12px;
+}
+
+.humanApprovalContext > p {
+  margin: 0;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+button.timelineExplain {
+  min-height: var(--control-sm);
+  height: var(--control-sm);
+  padding-inline: 9px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--color-accent-fg);
+  box-shadow: none;
+  font-size: 11px;
+}
+
+button.timelineExplain:hover:not(:disabled) {
+  border-color: #d7d7f8;
+  background: var(--accent-soft);
+  box-shadow: none;
+}
+
+.markdownImagePlaceholder {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px dashed #c7cad4;
+  border-radius: 6px;
+  background: var(--color-subtle);
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.auditPanel {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.auditPanel > button {
+  justify-self: start;
+}
+
+.detailTabSelect {
+  display: none;
+}
+
+.pendingInboxButton {
+  min-height: 34px;
+  height: 34px;
+  gap: 6px;
+  padding: 0 9px;
+  border-color: var(--color-warning-border);
+  border-radius: 999px;
+  background: var(--color-warning-bg);
+  color: var(--color-warning-fg);
+  box-shadow: none;
+  white-space: nowrap;
+}
+
+.pendingInboxButton:hover:not(:disabled) {
+  border-color: #fdb022;
+  background: #fef0c7;
+  box-shadow: none;
+}
+
+.pendingInboxButton strong {
+  min-width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding-inline: 5px;
+  border-radius: 999px;
+  background: #fff;
+  font-size: 10px;
+}
+
+.pendingInboxButton.compact {
+  min-height: 30px;
+  height: 30px;
+  padding-inline: 7px;
+  font-size: 10px;
+}
+
+.badge.human {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: 1px solid var(--color-warning-border);
+  background: var(--color-warning-bg);
+  color: var(--color-warning-fg);
+}
+
+.sidebarQuanta .inlineError {
+  grid-column: 1 / -1;
+  padding: 6px 8px;
+  font-size: 11px;
+}
+
+.operatorQuanta {
+  flex-wrap: wrap;
+  max-width: 190px;
+}
+
+.operatorQuanta .inlineError {
+  flex-basis: 100%;
+  padding: 2px 0 0 19px;
+  border: 0;
+  background: transparent;
+  font-size: 10px;
+  line-height: 1.25;
+  white-space: normal;
+}
+
+.fieldHint {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.actionHintError {
+  color: var(--color-danger-fg) !important;
+  font-weight: 600;
+}
+
+/* Keep the live-follow action in the flex flow immediately above the
+   composer. Its offset no longer assumes a fixed composer height. */
+.userMainPanel > .jumpToLatest {
+  position: relative;
+  z-index: 8;
+  left: auto;
+  bottom: auto;
+  align-self: center;
+  min-height: var(--control-sm);
+  margin: -44px auto 10px;
+  transform: none;
+}
+
+.timelineJumpToLatest {
+  position: absolute;
+  z-index: 8;
+  left: 50%;
+  bottom: 14px;
+  margin: 0;
+  transform: translateX(-50%);
+}
+
+.userConversation,
+.timeline,
+.tabPanel,
+.userSidebar,
+.operatorDisclosureBody {
+  overscroll-behavior: contain;
+}
+
+/* The inspector is always narrow even on a large desktop. Respond to the
+   pane width instead of the viewport width so cards and form actions wrap. */
+.rightPane {
+  container: inspector / inline-size;
+}
+
+.centerPane {
+  container: activity / inline-size;
+}
+
+.userMainPanel {
+  container: user-main / inline-size;
+}
+
+.rightPane .resourceGrid {
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+}
+
+.imageRowActions {
+  flex-wrap: wrap;
+}
+
+@container inspector (max-width: 840px) {
+  .detailTabSelect {
+    flex: 0 0 auto;
+    display: grid;
+    gap: 5px;
+    padding: 10px;
+    border-bottom: 1px solid var(--color-border);
+    background: #fff;
+    color: var(--color-text-tertiary);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .detailTabSelect select {
+    width: 100%;
+  }
+
+  .details > .tabs {
+    display: none;
+  }
+}
+
+@container inspector (max-width: 420px) {
+  .rightPane .resourceGrid,
+  .adminFormGrid,
+  .factGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .imageRow {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .imageRow > div,
+  .imageRow > span,
+  .imageRowActions {
+    grid-column: 1;
+  }
+
+  .imageRowActions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+    flex-shrink: 1;
+  }
+
+  .imageRowActions button:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+}
+
+@container activity (max-width: 560px) {
+  .humanCard {
+    grid-template-columns: 1fr;
+  }
+
+  .humanCard > * {
+    grid-column: 1;
+  }
+}
+
+@container user-main (max-width: 560px) {
+  .userRequestCard {
+    grid-template-columns: 1fr;
+  }
+
+  .userRequestCard > * {
+    grid-column: 1;
+  }
+}
+
+/* The operator view is dense, but 8–10px text is not serviceable on ordinary
+   laptop displays. These scoped minimums preserve hierarchy without turning
+   the console into a low-density dashboard. */
+.appShell button,
+.appShell input,
+.appShell textarea,
+.appShell select {
+  font-size: 12px;
+}
+
+.appShell :is(
+  .operatorBrand > div > span,
+  .operatorDbChip span,
+  .switchControl,
+  .operatorQuanta,
+  .schedulerPill,
+  .operatorTopMeta .connectionBadge,
+  .paneTitle p,
+  .operatorDisclosure summary small,
+  .spawnBox .fieldStack,
+  .spawnBox .taskAuthorityField,
+  .spawnBox .taskAuthorityHint,
+  .processNode .subtle,
+  .timelineFilter button,
+  .timelineHeader time,
+  .timelineSummary,
+  .operatorComposerField span,
+  .actionGroupLabel,
+  .dangerZone span,
+  .tabs button
+) {
+  font-size: 11px;
+}
+
+.appShell :is(.paneTitle h1, .paneTitle h2) {
+  font-size: 15px;
+}
+
+.operatorRunGroup button,
+.operatorQuanta input,
+.operatorTopMeta .languageSwitch select {
+  min-height: var(--control-md);
+  height: var(--control-md);
+}
+
+.noticeAction,
+.noticeDismiss,
+.collapseToggle {
+  min-height: var(--control-sm);
+  height: var(--control-sm);
+}
+
+.ratingStars button {
+  width: 36px;
+  min-height: 36px;
+  height: 36px;
+}
+
+.operatorBusyStatus {
+  min-height: 27px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid #d9d6fe;
+  border-radius: 999px;
+  background: var(--accent-subtle);
+  color: var(--color-accent-fg);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.details[inert] {
+  opacity: 0.72;
+  cursor: progress;
+}
+
+.operatorComposerField textarea {
+  field-sizing: content;
+}
+
+.operatorDisclosure > summary:focus-visible {
+  outline-offset: -3px;
+}
+
+/* Notices stay below the active toolbar at every layout mode. */
+.userAppShell .appNotices {
+  top: 76px;
+}
+
+.appNotices:not([data-has-visible]) {
+  width: 0;
+  height: 0;
+  max-height: 0;
+  margin: 0;
+  overflow: visible;
+}
+
+.appShell .appNotices {
+  top: 80px;
+}
+
+@media (max-width: 1120px) {
+  .appShell .appNotices {
+    top: 132px;
+  }
+}
+
+@media (max-width: 820px) {
+  .userTopActions .connectionBadge,
+  .userTopActions .languageSwitch {
+    display: inline-flex;
+  }
+
+  .userAppShell .appNotices {
+    top: 112px;
+  }
+
+  .pendingInboxButton > span {
+    display: none;
+  }
+
+}
+
+@media (max-width: 720px) {
+  .operatorTopMeta,
+  .operatorTopMeta .schedulerPill {
+    display: inline-flex;
+  }
+
+  .operatorTopMeta {
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .operatorTopMeta .connectionBadge,
+  .operatorTopMeta .languageSwitch {
+    display: inline-flex;
+  }
+
+  .operatorCommandBar {
+    min-width: 0;
+    max-width: 100%;
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    overflow: visible;
+  }
+
+  .operatorRunGroup {
+    flex-wrap: wrap;
+  }
+
+  .appShell .appNotices {
+    top: 188px;
+  }
+
+  .workspace {
+    display: grid;
+    width: 100%;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    gap: 8px;
+    padding: 8px;
+    background: var(--color-canvas);
+  }
+
+  .leftPane,
+  .centerPane,
+  .rightPane {
+    overflow: hidden;
+    border: 1px solid var(--color-border);
+    border-radius: 14px;
+  }
+
+  .leftPane {
+    height: min(56vh, 520px);
+    min-height: 360px;
+  }
+
+  .spawnBox.operatorDisclosure[open] {
+    min-height: 0;
+    max-height: calc(100% - 96px);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .spawnBox.operatorDisclosure[open] > summary {
+    flex: 0 0 auto;
+  }
+
+  .spawnBox.operatorDisclosure[open] > .operatorDisclosureBody {
+    min-height: 0;
+    max-height: max(180px, calc(min(56vh, 520px) - 164px));
+    flex: none;
+    overflow-y: auto;
+  }
+
+  .spawnBox.operatorDisclosure[open] + .processTreeShell {
+    display: none;
+  }
+
+  .centerPane {
+    height: 76vh;
+    min-height: 520px;
+  }
+
+  .rightPane {
+    min-height: 620px;
+  }
+
+  .details {
+    min-height: 500px;
+  }
+
+  .timeline,
+  .tabPanel,
+  .operatorDisclosureBody {
+    overscroll-behavior: auto;
+  }
+
+  .spawnBox,
+  .rightPane .tabPanel {
+    scroll-margin-top: calc(var(--app-header-height, 165px) + 12px);
+  }
+
+  .appShell .inlineAction button {
+    min-width: var(--control-touch);
+  }
+}
+
+@media (max-width: 520px) {
+  .userTopActions {
+    width: 100%;
+  }
+
+  .userTopActions .connectionBadge {
+    width: auto;
+    min-width: var(--control-touch);
+    justify-content: center;
+    padding: 0 10px;
+    font-size: 11px;
+  }
+
+  .userTopActions .languageSwitch {
+    margin-left: auto;
+  }
+
+  .pendingInboxButton {
+    min-width: var(--control-touch);
+    height: var(--control-touch);
+  }
+
+  .switchControl {
+    min-height: var(--control-touch);
+  }
+
+  .userTopActions .toolbarButton,
+  .userViewButton {
+    width: var(--control-touch);
+    min-width: var(--control-touch);
+  }
+
+  .userAppShell .appNotices {
+    top: 116px;
+  }
+
+  .userComposer,
+  .composer {
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+
+  .modalBackdrop {
+    align-items: flex-end;
+    padding: 10px;
+  }
+
+  .modal {
+    width: 100%;
+    max-height: calc(100dvh - 20px);
+    border-radius: 16px;
+  }
+
+  .llmProfileManager,
+  .llmProfileFormGrid {
+    grid-template-columns: 1fr;
+  }
+
+  button,
+  .iconOnly,
+  input:not([type="checkbox"]):not([type="radio"]),
+  textarea,
+  select {
+    min-height: var(--control-touch);
+  }
+
+  button.promptChip {
+    min-height: var(--control-touch);
+    padding: 10px 12px;
+  }
+
+  .iconOnly {
+    width: var(--control-touch);
+    height: var(--control-touch);
+  }
+
+  .operatorDbChip,
+  .operatorDbChip .iconOnly,
+  .operatorRunGroup button,
+  .operatorTopMeta .connectionBadge,
+  .operatorTopMeta .languageSwitch,
+  .operatorTopMeta .languageSwitch select {
+    min-height: var(--control-touch);
+    height: var(--control-touch);
+  }
+
+  .operatorDbChip .iconOnly {
+    width: var(--control-touch);
+  }
+
+  .operatorRunGroup .iconOnly {
+    width: var(--control-touch);
+  }
+
+  .appShell .operatorQuanta input,
+  .appShell .pendingInboxButton.compact,
+  .appShell .collapseToggle,
+  .appShell .launchProcessButton,
+  .appShell button.timelineExplain,
+  .appShell .timelineJumpToLatest,
+  .timelineFilter button,
+  .composer > button {
+    min-height: var(--control-touch);
+    height: var(--control-touch);
+  }
+
+  .operatorComposerField textarea {
+    min-height: var(--control-touch);
+  }
+
+  .appShell .processSearch .iconOnly,
+  .appShell .noticeDismiss,
+  .appShell .ratingStars button {
+    width: var(--control-touch);
+    min-width: var(--control-touch);
+    min-height: var(--control-touch);
+    height: var(--control-touch);
+  }
+
+  .appShell .noticeAction,
+  .appShell .inlineToggle {
+    min-height: var(--control-touch);
+    height: auto;
+  }
+
+  .appShell :is(.operatorAuthorityToggle, .taskAuthorityToggle, .toggle, .rightsPicker label, .adminDisclosure > summary) {
+    min-height: var(--control-touch);
+  }
+
+  .composer > .iconOnly {
+    width: var(--control-touch);
+  }
+
+  .timelineFilter {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+  }
+
+  .timelineFilter button {
+    flex: 0 0 auto;
+  }
+}
+
+@media (min-width: 521px) and (max-width: 720px) {
+  .appShell button,
+  .appShell input:not([type="checkbox"]):not([type="radio"]),
+  .appShell textarea,
+  .appShell select,
+  .appShell :is(.operatorAuthorityToggle, .taskAuthorityToggle, .toggle, .rightsPicker label, .adminDisclosure > summary) {
+    min-height: var(--control-touch);
+  }
+
+  .appShell .iconOnly,
+  .appShell .processSearch .iconOnly,
+  .appShell .noticeDismiss,
+  .appShell .ratingStars button {
+    width: var(--control-touch);
+    min-width: var(--control-touch);
+    height: var(--control-touch);
+  }
+
+  .appShell .operatorTopMeta .languageSwitch,
+  .appShell .operatorTopMeta .languageSwitch select {
+    min-height: var(--control-touch);
+    height: var(--control-touch);
+  }
+
+  .appShell .userViewButton {
+    width: var(--control-touch);
+    min-width: var(--control-touch);
+  }
+
+  .appShell :is(.operatorRunGroup button, .timelineFilter button, .composer > button, .noticeAction) {
+    min-height: var(--control-touch);
+    height: var(--control-touch);
+  }
+}
+
+@media (max-width: 420px) {
+  .operatorDbChip {
+    width: var(--control-touch);
+    min-width: var(--control-touch);
+    height: var(--control-touch);
+    gap: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+
+  .operatorDbChip > svg,
+  .operatorDbChip > div {
+    display: none;
+  }
+
+  .operatorDbChip .iconOnly {
+    border-color: var(--color-border);
+    background: var(--color-subtle);
+  }
+}
+
+/* The notice stack tracks the measured header height through a shell custom
+   property maintained by App. This remains correct when locale, zoom, errors,
+   or pending-request controls make either toolbar wrap to extra rows. */
+.userAppShell .appNotices,
+.appShell .appNotices {
+  top: calc(var(--app-header-height, 68px) + 8px);
+}
+
+/* On desktop and tablet, persistent runtime notices reserve a narrow row
+   instead of covering pane headings and inspector controls. Mobile keeps the
+   measured fixed stack because the operator workspace becomes page-scrolled. */
+@media (min-width: 721px) {
+  .appShell {
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .appShell > .topBar {
+    grid-row: 1;
+  }
+
+  .appShell > .appNotices {
+    position: static;
+    z-index: auto;
+    grid-row: 2;
+    justify-self: end;
+    width: min(680px, calc(100% - 24px));
+    max-height: min(32vh, 260px);
+    margin: 8px 12px 0;
+    overflow-y: auto;
+  }
+
+  .appShell > .workspace {
+    grid-row: 3;
+  }
+}
+
+@media (max-width: 720px) {
+  .appShell > .appNotices {
+    position: static;
+    z-index: auto;
+    width: calc(100% - 16px);
+    max-height: min(34vh, 260px);
+    margin: 8px 8px 0;
+    overflow-y: auto;
+  }
+}
+
+.appShell > .appNotices:not([data-has-visible]),
+.userAppShell > .appNotices:not([data-has-visible]) {
+  width: 0;
+  height: 0;
+  max-height: 0;
+  margin: 0;
+  overflow: visible;
+}
+
+/* View switches move focus to the destination landmark. Keep that cue visible
+   without turning the entire workspace edge into the dominant accent. */
+.workspace:focus-visible,
+.userMainPanel:focus-visible,
+.modal:focus-visible {
+  outline: 2px solid rgb(124 58 237 / 42%);
+  outline-offset: -3px;
+}
+
+.switchControl > input:focus-visible + .switchVisual {
+  outline: 3px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.conversationBubble time,
+.bubbleRole,
+.composerField span,
+.processNode .subtle,
+.timelineHeader time,
+.timelineSummary,
+.collapseMeta,
+.empty,
+.llmProfileListItem small,
+.imageRow span {
+  color: var(--color-text-tertiary);
+}
+
+@media (pointer: coarse) {
+  .appShell button,
+  .appShell input:not([type="checkbox"]):not([type="radio"]),
+  .appShell textarea,
+  .appShell select,
+  .appShell :is(.operatorAuthorityToggle, .taskAuthorityToggle, .toggle, .rightsPicker label, .adminDisclosure > summary) {
+    min-height: var(--control-touch);
+  }
+
+  .appShell .iconOnly,
+  .appShell .processSearch .iconOnly,
+  .appShell .noticeDismiss,
+  .appShell .ratingStars button,
+  .appShell .userViewButton {
+    width: var(--control-touch);
+    min-width: var(--control-touch);
+    height: var(--control-touch);
+  }
+
+  .appShell .operatorTopMeta .languageSwitch,
+  .appShell .operatorTopMeta .languageSwitch select,
+  .appShell :is(.operatorRunGroup button, .timelineFilter button, .composer > button, .noticeAction) {
+    min-height: var(--control-touch);
+    height: var(--control-touch);
+  }
+
+  .appShell .inlineAction button {
+    min-width: var(--control-touch);
+  }
+}
+
+@media (forced-colors: active) {
+  .switchVisual {
+    border-color: ButtonText;
+    forced-color-adjust: auto;
+  }
+
+  .switchControl > input:checked + .switchVisual {
+    border-color: Highlight;
+    background: Highlight;
+  }
+
+  .processNode.selected,
+  .timelineFilter button.active,
+  .tabs button.active {
+    border: 2px solid Highlight;
+    forced-color-adjust: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .userMainPanel > .jumpToLatest,
+  .timelineJumpToLatest {
+    scroll-behavior: auto;
+  }
+}
+
+/* New-task settings ---------------------------------------------------- */
+
+.taskSettingsLauncher {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px 16px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: linear-gradient(145deg, #fbfbff, #fff);
+  box-shadow: var(--shadow-sm);
+}
+
+.taskSettingsLauncherCopy {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 3px;
+}
+
+.taskSettingsLauncherCopy > span:last-child {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.taskSettingsLauncherCopy strong {
+  color: #344054;
+  font-size: 12px;
+}
+
+.taskSettingsLauncherCopy small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.taskSettingsLauncher > button {
+  min-height: 40px;
+  grid-column: 2;
+  grid-row: 1;
+  white-space: nowrap;
+}
+
+.taskSettingsSummary {
+  min-width: 0;
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 9px;
+  padding-top: 11px;
+  border-top: 1px solid var(--color-border);
+}
+
+.taskSettingsPrimarySummary {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.taskSettingsSummaryItem {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 7px 9px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+
+.taskSettingsSummaryItem > :first-child {
+  color: var(--muted-light);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+.taskSettingsSummaryItem > :last-child {
+  min-width: 0;
+  overflow: hidden;
+  color: #344054;
+  font-size: 11px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.taskSettingsBadges {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.taskSettingsBadge {
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--color-accent-border);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--color-accent-strong);
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.taskSettingsBadge.muted {
+  border-color: var(--color-border);
+  background: var(--color-subtle);
+  color: var(--muted);
+}
+
+.modal.taskSettingsModal {
+  width: min(940px, calc(100vw - 48px));
+  max-height: calc(100dvh - 64px);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.taskSettingsModal > h2 {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 22px 24px 0;
+  color: #1d2939;
+  font-size: 20px;
+}
+
+.taskSettingsModal > p,
+.taskSettingsForm > p:first-child {
+  flex: 0 0 auto;
+  margin: 6px 0 0;
+  padding: 0 24px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.taskSettingsForm {
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.taskSettingsSections {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 14px;
+  padding: 18px 24px 20px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.taskSettingsSection {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 15px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: #fdfaff;
+}
+
+.taskSettingsSectionHeader {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.taskSettingsSectionHeader h3,
+.taskSettingsSectionHeader p,
+.taskSettingsSection > h3 {
+  margin: 0;
+}
+
+.taskSettingsSectionHeader h3,
+.taskSettingsSection > h3 {
+  color: #344054;
+  font-size: 13px;
+}
+
+.taskSettingsSection > h3 {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.taskSettingsSectionHeader p {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.taskSettingsGrid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.taskSettingsField,
+.taskSettingsFieldWide {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  color: #475467;
+  font-size: 11px;
+}
+
+.taskSettingsFieldWide {
+  grid-column: 1 / -1;
+}
+
+.taskSettingsField :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea),
+.taskSettingsFieldWide :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.taskSettingsField :is(.imageSelect, .llmProfileSelect, .llmProfileSelectRow, .taskAuthorityField),
+.taskSettingsFieldWide :is(.imageSelect, .llmProfileSelect, .llmProfileSelectRow, .taskAuthorityField) {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.taskSettingsInlineError {
+  margin: 0;
+  color: var(--color-danger-fg);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.taskSettingsActions,
+.taskSettingsModal > .modalActions {
+  min-width: 0;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 0;
+  padding: 14px 24px max(14px, env(safe-area-inset-bottom));
+  border-top: 1px solid #e4e7ec;
+  background: rgb(255 255 255 / 96%);
+  box-shadow: 0 -8px 22px rgb(16 24 40 / 4%);
+}
+
+.taskSettingsModal > .modalActions > .taskSettingsActions {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  box-shadow: none;
+}
+
+.taskSettingsActions button,
+.taskSettingsModal > .modalActions button {
+  min-width: 108px;
+}
+
+@media (max-width: 820px) {
+  .modal.taskSettingsModal {
+    width: min(720px, calc(100vw - 32px));
+    max-height: calc(100dvh - 32px);
+  }
+
+  .taskSettingsSections {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 520px) {
+  .modalBackdrop:has(> .taskSettingsModal) {
+    padding: 0;
+  }
+
+  .modal.taskSettingsModal {
+    width: 100%;
+    max-width: none;
+    max-height: calc(100dvh - max(8px, env(safe-area-inset-top)));
+    border-radius: 18px 18px 0 0;
+  }
+
+  .taskSettingsLauncher {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .taskSettingsLauncher > button {
+    width: 100%;
+    min-height: var(--control-touch);
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .taskSettingsPrimarySummary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .taskSettingsModal > h2 {
+    padding: 18px 16px 0;
+    font-size: 18px;
+  }
+
+  .taskSettingsModal > p,
+  .taskSettingsForm > p:first-child {
+    padding-inline: 16px;
+  }
+
+  .taskSettingsSections {
+    gap: 12px;
+    padding: 14px 16px 16px;
+    scrollbar-gutter: auto;
+  }
+
+  .taskSettingsSection {
+    padding: 13px;
+  }
+
+  .taskSettingsField .imageSelect,
+  .taskSettingsFieldWide .imageSelect,
+  .taskSettingsSection .imageSelect {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .taskSettingsField :is(button, input:not([type="checkbox"]):not([type="radio"]), select, textarea),
+  .taskSettingsFieldWide :is(button, input:not([type="checkbox"]):not([type="radio"]), select, textarea),
+  .taskSettingsField :is(.taskAuthorityToggle, .switchControl),
+  .taskSettingsFieldWide :is(.taskAuthorityToggle, .switchControl),
+  .taskSettingsSection :is(.taskAuthorityToggle, .switchControl) {
+    min-height: var(--control-touch);
+  }
+
+  .taskSettingsActions,
+  .taskSettingsModal > .modalActions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 12px 16px max(12px, env(safe-area-inset-bottom));
+  }
+
+  .taskSettingsActions button,
+  .taskSettingsModal > .modalActions button {
+    width: 100%;
+    min-width: 0;
+    min-height: var(--control-touch);
   }
 }

@@ -31,8 +31,8 @@ Success returns a normal `GitOperationResult`: use `after.token` for the success
 
 Fetch exactly one remote branch into `refs/remotes/<remote>/<branch>`, then integrate that fetched commit in the selected worktree. Supply `remote`, a fresh local token, and a deliberate strategy:
 
-- `ff_only` runs a fast-forward-only merge and is the safest default. It fails rather than create a merge commit or rewrite local commits.
-- `merge` integrates with a merge when needed. No merge-strategy selector is exposed, signing is disabled, and dirty state is not automatically stashed.
+- `ff_only` runs a fast-forward-only merge with autostash disabled and is the safest default. It fails rather than create a merge commit or rewrite local commits.
+- `merge` integrates with a merge when needed. Repository `branch.*.mergeOptions` is rejected; no merge-strategy selector is exposed, signing and autostash are disabled, and the command explicitly rules out squash or a non-terminal no-commit result.
 - `rebase` rebases without autostash. It rewrites local commit topology and is destructive, so it requires exact repository delete/admin authority and mandatory one-use Human approval.
 
 `branch` is a **short remote branch name** such as `main` or `feature/x`, never `refs/heads/...`; the implementation itself constructs `refs/heads/<branch>` and `refs/remotes/<remote>/<branch>`. If `branch` is null, the tool uses the current **local short branch name**; it does not resolve configured upstream/merge settings. Detached `HEAD` requires an explicit short branch. The argument selects the remote branch to fetch, while integration always acts on the currently checked-out local branch/worktree state. Confirm that this pairing matches user intent before dispatch.
@@ -63,9 +63,9 @@ Branch deletion verification may require a separately authorized pruning fetch s
 
 ## Failure and recovery
 
-All three tools are effectful and declared non-idempotent. The model-facing error omits some provider settlement details. Treat only a clearly pre-dispatch validation, permission/approval, remote-fingerprint, or stale-state rejection as effect-not-started; conservatively reconcile every other failure before retrying, including plain `command_failed`.
+All three tools are effectful and declared non-idempotent. The model-facing error omits some provider settlement details. A clearly pre-dispatch validation, permission/approval, initial state-token CAS, or initial remote-fingerprint rejection certifies only that the invocation did not start its fetch/push/integration write; read-only preflight/provider observations may already exist. Conservatively reconcile every other failure before retrying, including plain `command_failed` and an unqualified `stale_state` from pull.
 
-- A local `STALE_STATE` or remote-fingerprint mismatch before dispatch means preconditions changed. Re-list remotes/status/refs, reevaluate intent, and submit a fresh token. Do not patch around CAS.
+- An initial local `stale_state` CAS or remote-fingerprint mismatch before the first remote dispatch means preconditions changed without this invocation fetching or pushing. Re-list remotes/status/refs, reevaluate intent, and submit a fresh token. For pull, however, repository drift can be detected after fetch and before integration; the Runtime-side error details then record `fetch_completed=true` and conservatively set `effect="unknown"`, while the model-facing projection may omit those details. A bare pull `stale_state` therefore does not prove that no effect started: reconcile the tracking ref and checkout as described below.
 - When mandatory approval is requested before dispatch, retry the exact operation only after approval and only while its token, remote fingerprint, refs, lease, and arguments remain current. Changed state requires a new inspection and decision.
 - A fetch failure after possible dispatch may have updated some configured remote-tracking refs. Re-list local refs before considering another fetch; with prune, also check whether local refs disappeared.
 - Any pull error after possible dispatch may mean the tracking-ref fetch completed even though the model surface does not expose `fetch_completed`. Inspect that ref, `HEAD`, status, index, and conflict evidence. The typed reads do not expose hidden merge/rebase control files; use `agent-libos-git-integration-recovery` only for the exact operation known to have started, and never blindly pull again.

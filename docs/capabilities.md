@@ -32,6 +32,18 @@ The inspection projection exposes `issued_by` as `issuer` and also derives
 use-count, and delegation fields. Those objects are presentation conveniences,
 not additional persisted authority.
 
+Model-facing and paged GUI presentation is count- and byte-bounded.
+`list_capabilities` accepts an exclusive `after_cap_id` cursor and returns
+`has_more`/`next_cursor`; its `limit` is only a maximum because the byte budget
+may end a page sooner. A large record may replace `metadata` with `{}` and add
+`metadata_projection={omitted:true,bytes,sha256}`. If more space is required it
+also replaces `constraints` with `{}`, clears derived `rules`, and adds the
+analogous `constraints_projection` receipt. Those empty containers are
+placeholders, not proof of empty stored metadata or policy. The hashes bind the
+canonical omitted JSON for comparison; they neither reveal it nor authorize an
+operation. `inspect_capability` and delegation/revocation receipts use the same
+bounded projection.
+
 One-shot authority is not encoded as a policy string. It is an `allow`
 capability with `uses_remaining=1`; committed primitive use consumes it and
 revokes the capability when the count reaches zero. If one-shot Object Memory
@@ -42,11 +54,13 @@ a persistent object handle.
 paths that need compensation opt out with `consume=False`, reserve the exact
 use before their effect, and then commit or restore that reservation token.
 This covers Human and provider effects, Skill mutations, and ObjectTask owner
-Object authority. ObjectTask's separate `process:spawn` admission check uses
-ordinary immediate consumption before runner bootstrap; a later bootstrap or
-publication failure does not refund that finite spawn use. An explicit revoke
-invalidates outstanding tokens, so late cleanup cannot reactivate revoked
-authority.
+Object authority. ObjectTask's separate `process:spawn` admission check first
+reserves finite authority. It commits that reservation atomically with task
+publication; a failure before publication restores the exact still-live use
+only after runner cleanup is confirmed. If cleanup is uncertain, the
+reservation remains fail-closed, and a post-publication failure is never
+refunded. An explicit revoke invalidates outstanding tokens, so late cleanup
+cannot reactivate revoked authority.
 Provider subsystems do not manage these tokens directly: the
 [`Protected Operation SDK`](protected_operation_sdk.md) reserves every distinct
 finite decision in the same transaction as local prepare state and the effect
@@ -70,10 +84,10 @@ Capability issuance itself commits the new row, process attachment, event,
 audit, and issuer reservation as one transaction.
 
 Capability mutation admission is enforced at the durable authority-service
-boundary, not only at selected Runtime façade methods. The 48 public
-`CapabilityManager` methods have a machine-checked read/mutation/mixed
-classification; all five public finite-use lease methods and all eight public
-capability-mutation service methods are mutation guarded as well. Mixed
+boundary, not only at selected Runtime façade methods. Every public
+`CapabilityManager` method has a machine-checked read/mutation/mixed
+classification; every public finite-use lease and capability-mutation service
+method is mutation guarded as well. Mixed
 authorization methods remain readable for diagnosis when `audit=false`, while
 their evidence-writing `audit=true` branch is mutation admission. Therefore a
 recovery-required `CLOSE_FAILED` runtime cannot be bypassed through
@@ -299,7 +313,11 @@ Image-package boot is also not an external authority grant. Its
 `workspace.grants` entries apply only to the package workspace seed after it is
 materialized into that process's private directory under the configured
 `image.materialized_workspace_root` (`agent_outputs/image_workspaces/` by
-default); they cannot name arbitrary host or workspace paths.
+default); they cannot name arbitrary host or workspace paths. The optional
+`recursive` and `delegable` fields default to `false`; when present, each must
+be a YAML boolean. Strings, numbers, and null are rejected during package
+registration before artifact publication, workspace materialization, or
+capability issuance.
 
 ## Permission Policy And Human Approval
 
@@ -318,6 +336,18 @@ Approved responses cannot install `always_deny`, rejected responses cannot
 install `always_allow`, and the JSON `approved` boolean must agree with the
 terminal status. Approved ordinary questions require a non-empty string
 `answer` rather than implicit coercion.
+
+Complete GUI, CLI, Host, automatic, and terminal-provider Human decisions are
+validated as finite, acyclic JSON with string object keys. The default response
+limits are 131072 serialized bytes, 32 nested containers, and 4096 JSON values.
+A direct invalid decision is rejected before request, process, Capability,
+event, or audit mutation. A terminal-provider answer is necessarily validated
+after its protected provider read is recorded, but before it can decide the
+request, resume the process, or grant authority. An invalid or oversized value
+is represented in that read evidence only by a bounded rejection marker; the
+Human request remains pending and the process remains waiting, allowing the
+Host to correct the input and service that exact request without a duplicate
+question.
 
 Model-facing `request_permission` is not a raw grant API. It first checks the
 canonical resource/right request against the live Task Authority request
@@ -361,6 +391,9 @@ operation has received and reserved authority, so an approval prompt cannot be
 used as an existence or metadata oracle.
 
 `human_output` requires `human:<name>` write and reserves finite-use authority.
+Its optional channel is normalized before dispatch: omission or the exact empty
+string selects `runtime.terminal_channel`; every other value is trimmed and
+must remain 1..128 characters, so whitespace-only input is invalid.
 Before provider delivery, one transaction marks its request `delivered` and
 persists a structured pending external-effect intent. The success event, audit
 record, and effect finalization are settlement evidence and are written only
@@ -646,6 +679,17 @@ the mutation one-shot remains consumed and the same effect id is finalized as
 outcome. Ordinary state/read/mutation exceptions likewise cannot prove what was
 observed or changed and finalize or retain a conservative unknown outcome.
 
+Conditional text writes are the narrow exception to the preceding state-probe
+rule. A complete `read_text` returns `content_sha256`; truncated reads return no
+token. When `write_text` receives that digest, or the literal `missing`, its
+pre-mutation state/parent checks are advisory phases that neither disclose
+content nor commit finite authority. A provider-certified content conflict
+therefore abandons the pending intent and restores the write reservation,
+without changing bytes or file-label bindings. A successful conditional write
+commits authority at the actual write phase. Providers without the optional
+filesystem compare-and-swap extension reject conditional writes before any of
+these phases begin.
+
 The default `LocalFilesystemProvider` stores no preimage or undo log and
 exposes no compensation operation. Successful writes, directory creation, and
 file or directory deletion are therefore classified as
@@ -840,9 +884,11 @@ uses the wildcard read resource `git_pr:workspace:*`.
 
 Remote capability constraints can bind `git_remote`,
 `git_url_fingerprint`, `git_allowed_refs`, `git_expected_state_token`, and
-`git_old_oid`. The primitive derives these values from the pinned repository
-and existing remote. A scoped deny is evaluated before remote metadata lookup,
-so denied authority cannot enumerate a configured remote or its URL hash.
+`git_old_oid`. The primitive validates and canonicalizes remote/ref/state/OID
+inputs before placing them in capability context; the URL fingerprint is a
+Host observation of the registered remote rather than a model-supplied value.
+A scoped deny is evaluated before remote metadata lookup, so denied authority
+cannot enumerate a configured remote or its URL hash.
 
 All mutations require an opaque state token from a previous Git read. The
 primitive checks it after ordinary authority and again under the cross-process
@@ -852,13 +898,15 @@ safe preflight cannot enumerate every path. A Git write grant therefore cannot
 rewrite files without matching filesystem rights, while filesystem authority
 cannot directly access `.git` metadata.
 
-Reset, clean, amend, every restore, ref-rewriting integration, forced branch
-creation, branch/tag/stash/worktree deletion, fetch prune, remote-ref deletion,
-force-with-lease, simulated-PR merge, and patch deletion require the applicable
-`delete` and `admin` rights and a one-use Human approval bound to exact
-canonical arguments, state token,
-and old OIDs. A broad allowed capability without that approval binding cannot
-satisfy a mandatory approval. Ordinary commit, merge, fast-forward pull, and
+The destructive action matrix is explicit. Reset, clean, amend, every restore,
+rebase, every integration abort, branch/tag/stash/worktree/ref deletion, branch
+rename, forced branch creation, stash pop, stash including untracked files,
+forced switch/tag, fetch prune, remote-ref deletion, force-with-lease,
+simulated-PR merge, and a patch application whose preview deletes files require
+the applicable `delete` and `admin` rights and a one-use Human approval bound to
+exact canonical arguments, state token, and relevant old OIDs. A broad allowed
+capability without that approval binding cannot satisfy a mandatory approval.
+Ordinary commit, integration merge/cherry-pick/revert, non-rebase pull, and
 non-forced push follow the capability record's normal `allow`/`ask`/`deny`
 effect.
 

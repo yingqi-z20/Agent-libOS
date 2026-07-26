@@ -9,7 +9,12 @@ import pytest
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ResourceBudget
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
-from agent_libos.substrate import LocalFilesystemProvider, LocalResourceProviderSubstrate, ResolvedPath
+from agent_libos.substrate import (
+    DirectoryEntrySnapshot,
+    LocalFilesystemProvider,
+    LocalResourceProviderSubstrate,
+    ResolvedPath,
+)
 from tests.security.test_shell_primitive import FakeShellProvider, RecordingShellSubstrate
 
 
@@ -33,7 +38,9 @@ class TestResourceConstraints:
             result = runtime.tools.call(pid, "run_shell_command", {"argv": ["git", "status"]})
 
             assert not result.ok
-            assert "max_tool_calls" in (result.error or "")
+            assert result.error == (
+                "Tool call resource budget was exceeded before execution."
+            )
             assert provider.calls == []
         finally:
             runtime.close()
@@ -77,7 +84,9 @@ class TestResourceConstraints:
 
                 assert not result.ok
                 if sys.platform == "win32":
-                    assert "SubprocessLimits" in (result.error or "")
+                    assert (result.error or "").startswith(
+                        "validation_error: ValidationError"
+                    )
                     assert runtime.process.get(pid).status.value == "runnable"
                 else:
                     assert runtime.process.get(pid).status.value == "killed"
@@ -103,7 +112,9 @@ class TestResourceConstraints:
             result = runtime.tools.call(pid, "run_shell_command", {"argv": ["git", "status"]})
 
             assert not result.ok
-            assert "SubprocessLimits" in (result.error or "")
+            assert (result.error or "").startswith(
+                "validation_error: ValidationError"
+            )
             assert provider.calls == []
         finally:
             runtime.close()
@@ -180,6 +191,55 @@ class TestResourceConstraints:
             finally:
                 runtime.close()
 
+    def test_filesystem_read_rejects_provider_limit_contract_violations(
+        self,
+    ) -> None:
+        for provider_type in (OversizedFilesystemProvider, NonBytesFilesystemProvider):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                provider = provider_type(temp_dir)
+                substrate = LocalResourceProviderSubstrate(temp_dir)
+                substrate.filesystem = provider
+                Path(temp_dir, "payload.bin").write_bytes(b"trusted")
+                runtime = Runtime.open("local", substrate=substrate)
+                try:
+                    pid = runtime.process.spawn(image="base-agent:v0", goal="reject dishonest read")
+                    runtime.filesystem.grant_path(
+                        pid,
+                        "payload.bin",
+                        [CapabilityRight.READ],
+                        issued_by="test",
+                    )
+
+                    with pytest.raises(ValidationError, match="filesystem provider"):
+                        runtime.filesystem.read_bytes(pid, "payload.bin", max_bytes=4)
+                finally:
+                    runtime.close()
+
+    def test_directory_listing_consumes_only_sentinel_and_closes_provider_iterator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = InfiniteListFilesystemProvider(temp_dir)
+            substrate = LocalResourceProviderSubstrate(temp_dir)
+            substrate.filesystem = provider
+            Path(temp_dir, "items").mkdir()
+            runtime = Runtime.open("local", substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image="base-agent:v0", goal="bounded directory list")
+                runtime.filesystem.grant_directory(
+                    pid,
+                    "items",
+                    [CapabilityRight.READ],
+                    issued_by="test",
+                )
+
+                result = runtime.filesystem.read_directory(pid, "items", limit=2)
+
+                assert result.count == 2
+                assert result.truncated
+                assert provider.iterator.yield_count == 3
+                assert provider.iterator.closed
+            finally:
+                runtime.close()
+
     def test_directory_listing_preflights_metadata_budget_before_provider_read(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = RecordingListFilesystemProvider(temp_dir)
@@ -233,6 +293,53 @@ class RecordingLimitedFilesystemProvider(LocalFilesystemProvider):
     def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
         self.read_limits.append(max_bytes)
         return super().read_bytes(path, max_bytes=max_bytes)
+
+
+class OversizedFilesystemProvider(LocalFilesystemProvider):
+    def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
+        assert max_bytes is not None
+        return b"x" * (max_bytes + 1)
+
+
+class NonBytesFilesystemProvider(LocalFilesystemProvider):
+    def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
+        del path, max_bytes
+        return "not-bytes"  # type: ignore[return-value]
+
+
+class _InfiniteDirectoryIterator:
+    def __init__(self) -> None:
+        self.yield_count = 0
+        self.closed = False
+
+    def __iter__(self) -> _InfiniteDirectoryIterator:
+        return self
+
+    def __next__(self) -> DirectoryEntrySnapshot:
+        self.yield_count += 1
+        if self.yield_count > 4:
+            raise AssertionError("directory iterator was consumed without a bound")
+        index = self.yield_count
+        return DirectoryEntrySnapshot(
+            name=f"item-{index}",
+            path=f"items/item-{index}",
+            kind="file",
+            size_bytes=index,
+            modified_at="2026-01-01T00:00:00Z",
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class InfiniteListFilesystemProvider(LocalFilesystemProvider):
+    def __init__(self, root: str | Path):
+        super().__init__(root)
+        self.iterator = _InfiniteDirectoryIterator()
+
+    def list_directory(self, path: ResolvedPath, *, limit: int | None = None):
+        del path, limit
+        return self.iterator
 
 
 class RecordingListFilesystemProvider(LocalFilesystemProvider):

@@ -9,8 +9,10 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
+from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from benchmarks.long_horizon_agent import (
+    HostOracleRunner,
     evaluate_run,
     prepare_workspace,
     report_all_successful,
@@ -21,12 +23,26 @@ from benchmarks.long_horizon_agent.runner import (
     REQUIRED_SKILLS,
     GOAL,
     MIDFLIGHT_MESSAGE,
+    UNITTEST_ARGV,
     _action_sequence,
     _adjacent_prompt_prefix_metrics,
     _grant_authority,
+    _host_oracle_report_projection,
     _successful_action_sequence,
+    _workflow_evidence_sequence,
     _workflow_order_checks,
 )
+from experiments import run_long_horizon_evaluation as long_horizon_cli
+
+
+def _activate_action(skill_id: str) -> dict[str, str]:
+    package = get_builtin_skill_catalog().get(skill_id)
+    assert package is not None
+    return {
+        "action": "activate_skill",
+        "skill_id": skill_id,
+        "expected_package_sha256": package.package_sha256,
+    }
 
 
 def test_fixture_starts_with_a_real_failure_and_clean_git_state(tmp_path: Path) -> None:
@@ -103,10 +119,7 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
             {"path": "AGENTS.md", "max_bytes": 8_000},
         )
         results.append(runtime.run_process_once(pid))
-        activate_action = {
-            "action": "activate_skill",
-            "skill_id": "agent-libos-command-execution",
-        }
+        activate_action = _activate_action("agent-libos-command-execution")
         activate_result = runtime.llm.dispatch(pid, activate_action)
         results.append(
             {"ok": True, "action": activate_action, "result": activate_result}
@@ -141,20 +154,10 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
             assert result["ok"] is True, result
             return result
 
-        dispatch(
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-child-processes",
-            }
-        )
+        dispatch(_activate_action("agent-libos-child-processes"))
         message_result = dispatch({"action": "read_process_messages"})
         message_id = message_result["payload"]["messages"][0]["message_id"]
-        dispatch(
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-workspace-editing",
-            }
-        )
+        dispatch(_activate_action("agent-libos-workspace-editing"))
         dispatch(
             {
                 "action": "write_text_file",
@@ -185,12 +188,7 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
                 ],
             }
         )
-        dispatch(
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-git-inspection",
-            }
-        )
+        dispatch(_activate_action("agent-libos-git-inspection"))
         dispatch({"action": "git_status"})
         dispatch(
             {
@@ -199,12 +197,7 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
                 "paths": ["src/pricing.py", "tests/test_pricing.py"],
             }
         )
-        dispatch(
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-checkpoints",
-            }
-        )
+        dispatch(_activate_action("agent-libos-checkpoints"))
         dispatch(
             {
                 "action": "create_checkpoint",
@@ -307,6 +300,7 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
             status=process.status.value,
             actions=actions,
             successful_actions=successful_actions,
+            workflow_evidence=_workflow_evidence_sequence(results),
             activated_skills=activated_skills,
             checkpoint_count=len(checkpoints),
             restart_survived=True,
@@ -351,6 +345,7 @@ class FollowUpPricingTests(unittest.TestCase):
         workspace,
         status="exited",
         actions=actions,
+        workflow_evidence=_ordered_workflow_evidence(),
         activated_skills=[],
         checkpoint_count=1,
         restart_survived=True,
@@ -359,6 +354,7 @@ class FollowUpPricingTests(unittest.TestCase):
         workspace,
         status="exited",
         actions=actions,
+        workflow_evidence=_ordered_workflow_evidence(),
         activated_skills=sorted(REQUIRED_SKILLS),
         checkpoint_count=1,
         restart_survived=True,
@@ -418,8 +414,8 @@ class FollowUpPricingTests(unittest.TestCase):
 
 
 def test_workflow_order_requires_baseline_and_fresh_finalization_evidence() -> None:
-    fresh = [action["action"] for action in _ordered_workflow_actions()]
-    stale = [
+    fresh = _ordered_workflow_evidence()
+    stale_names = [
         "run_shell_command",
         "git_diff",
         "write_text_file",
@@ -429,6 +425,7 @@ def test_workflow_order_requires_baseline_and_fresh_finalization_evidence() -> N
         "human_output",
         "process_exit",
     ]
+    stale = _workflow_evidence_for_names(stale_names)
 
     assert _workflow_order_checks(fresh) == {
         "baseline_reproduced_before_edit": True,
@@ -474,6 +471,210 @@ def test_oracle_requires_executable_regressions_not_comment_markers(
     assert result["checks"]["exact_threshold_regression"] is False
     assert result["checks"]["zero_quantity_regression"] is False
     assert result["passed"] is False
+
+
+def test_oracle_accepts_semantic_regressions_without_reserved_names(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    prepare_workspace(workspace)
+    workspace.joinpath("src", "pricing.py").write_text(
+        _fixed_pricing_source(),
+        encoding="utf-8",
+    )
+    workspace.joinpath("tests", "test_pricing.py").write_text(
+        '''from decimal import Decimal
+import unittest
+
+from src.pricing import calculate_total
+
+
+class PricingTests(unittest.TestCase):
+    def test_subtotal_exactly_100_gets_discount(self) -> None:
+        self.assertEqual(
+            calculate_total([(Decimal("100.00"), 1)]),
+            Decimal("90.00"),
+        )
+
+    def test_zero_qty_line_does_not_change_total(self) -> None:
+        self.assertEqual(
+            calculate_total([(Decimal("120.00"), 1), (Decimal("50.00"), 0)]),
+            Decimal("108.00"),
+        )
+''',
+        encoding="utf-8",
+    )
+
+    result = evaluate_run(
+        workspace,
+        status="exited",
+        actions=_ordered_workflow_actions(),
+        workflow_evidence=_ordered_workflow_evidence(),
+        activated_skills=sorted(REQUIRED_SKILLS),
+        checkpoint_count=1,
+        restart_survived=True,
+    )
+
+    assert result["checks"]["exact_threshold_regression"] is True
+    assert result["checks"]["zero_quantity_regression"] is True
+    assert result["passed"] is True
+
+
+def test_action_labels_without_bound_receipts_cannot_pass_workflow_oracle(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    prepare_workspace(workspace)
+    workspace.joinpath("src", "pricing.py").write_text(
+        _fixed_pricing_source(),
+        encoding="utf-8",
+    )
+    workspace.joinpath("tests", "test_pricing.py").write_text(
+        _complete_pricing_tests(),
+        encoding="utf-8",
+    )
+
+    result = evaluate_run(
+        workspace,
+        status="exited",
+        actions=_ordered_workflow_actions(),
+        activated_skills=sorted(REQUIRED_SKILLS),
+        checkpoint_count=1,
+        restart_survived=True,
+    )
+
+    assert result["checks"]["baseline_reproduced_before_edit"] is False
+    assert result["checks"]["finalization_evidence_fresh"] is False
+    assert result["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "failed_check"),
+    [
+        ("requested_argv", ["python", "-c", "print('not tests')"], "baseline_reproduced_before_edit"),
+        ("returncode", 0, "baseline_reproduced_before_edit"),
+        ("stderr_truncated", True, "baseline_reproduced_before_edit"),
+    ],
+)
+def test_workflow_oracle_rejects_inexact_baseline_receipts(
+    field: str,
+    value: object,
+    failed_check: str,
+) -> None:
+    evidence = _ordered_workflow_evidence()
+    evidence[1][field] = value
+
+    checks = _workflow_order_checks(evidence)
+
+    assert checks[failed_check] is False
+
+
+def test_host_oracle_uses_isolated_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OPENAI_API_KEY", "host-secret-canary")
+    monkeypatch.setenv("PYTHONPATH", "/host/injected/path")
+
+    with HostOracleRunner(workspace) as oracle:
+        result = oracle.run_isolated_python(
+            "import json, os; print(json.dumps({"
+            "'secret': os.getenv('OPENAI_API_KEY'), "
+            "'pythonpath': os.getenv('PYTHONPATH'), "
+            "'home': os.getenv('HOME')}))"
+        )
+        assert result["completed"] is True
+        assert result["returncode"] == 0
+        assert result["limit_kind"] is None
+
+        payload = json.loads(result["stdout"])
+        assert payload["secret"] is None
+        assert payload["pythonpath"] is None
+        assert payload["home"] != str(Path.home())
+        assert result["argv_is_absolute"] is True
+
+
+def test_host_oracle_fails_closed_on_output_limit(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with HostOracleRunner(workspace) as oracle:
+        result = oracle.run_isolated_python("print('x' * 70000)")
+
+    assert result["completed"] is False
+    assert result["limit_kind"] == "subprocess_stdout_chars"
+    assert len(result["stdout"]) <= 65_536
+
+
+def test_host_oracle_projects_only_known_host_error_types(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def fail_run(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("host diagnostic detail must not reach the report")
+
+    with HostOracleRunner(workspace) as oracle:
+        monkeypatch.setattr(oracle._shell, "run", fail_run)
+        result = oracle.run_isolated_python("print('unreachable')")
+
+    known = _host_oracle_report_projection(result)
+    unknown = _host_oracle_report_projection(
+        {**result, "error_type": "WorkspaceSuppliedErrorName"}
+    )
+
+    assert result["limit_kind"] == "host_oracle_error"
+    assert known["error_type"] == "RuntimeError"
+    assert unknown["error_type"] == "other"
+    assert "host diagnostic detail" not in json.dumps(known)
+
+
+@pytest.mark.parametrize("output_position", ["inside", "ancestor"])
+def test_long_horizon_cli_rejects_output_artifact_tree_overlap_before_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_position: str,
+) -> None:
+    artifacts_root = tmp_path / "retained"
+    output = (
+        artifacts_root / "report.json"
+        if output_position == "inside"
+        else tmp_path / "report.json"
+    )
+    selected_artifacts = (
+        artifacts_root
+        if output_position == "inside"
+        else output / "retained"
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+    calls = 0
+
+    def unexpected_run(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {}
+
+    monkeypatch.setattr(long_horizon_cli, "run_evaluation", unexpected_run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        long_horizon_cli.main(
+            [
+                "--confirm-real-llm",
+                "--output",
+                str(output),
+                "--artifacts-root",
+                str(selected_artifacts),
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert calls == 0
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(
@@ -681,6 +882,46 @@ def _ordered_workflow_actions() -> list[dict[str, str]]:
             "process_exit",
         )
     ]
+
+
+def _ordered_workflow_evidence() -> list[dict[str, Any]]:
+    return _workflow_evidence_for_names(
+        [action["action"] for action in _ordered_workflow_actions()]
+    )
+
+
+def _workflow_evidence_for_names(names: list[str]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    shell_index = 0
+    for index, name in enumerate(names):
+        receipt: dict[str, Any] = {
+            "sequence_index": index,
+            "action": name,
+            "ok": True,
+            "tool_id": f"tool:{name}",
+            "result_oid": f"result:{index}",
+        }
+        if name == "run_shell_command":
+            baseline = shell_index == 0
+            receipt.update(
+                {
+                    "requested_argv": list(UNITTEST_ARGV),
+                    "observed_argv": list(UNITTEST_ARGV),
+                    "returncode": 1 if baseline else 0,
+                    "stdout": "",
+                    "stderr": (
+                        "FAILED (failures=1): Decimal('119.90') != Decimal('108.00')"
+                        if baseline
+                        else "OK"
+                    ),
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                    "limit_kind": None,
+                }
+            )
+            shell_index += 1
+        evidence.append(receipt)
+    return evidence
 
 
 class _SingleActionClient:

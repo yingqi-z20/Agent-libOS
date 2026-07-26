@@ -79,7 +79,10 @@ def test_legacy_unknown_stage_settles_only_current_response_envelope(
             {"text": "hello"},
         )
         assert not result.ok
-        expected_response_bytes = 128 + runtime.config.mcp.max_response_bytes
+        expected_response_bytes = (
+            runtime.mcp.provider.list_response_bytes
+            + runtime.config.mcp.max_response_bytes
+        )
 
     reservation = runtime.store.list_resource_usage_reservations(pid=pid)[0]
     assert reservation["status"] == "settled"
@@ -119,8 +122,11 @@ def test_static_provider_error_envelope_is_durable(
     durable = runtime.store.get_object(result.result_handle.oid)
     serialized = dumps({"result": to_jsonable(result), "durable": to_jsonable(durable)})
     assert secret not in serialized
-    public_error = durable.payload["failure"]["error"]["details"]
-    assert result.payload["error"]["details"] == public_error
+    public_error = durable.payload["failure"]["error"]
+    assert result.payload["error"]["details"] == {
+        key: public_error[key]
+        for key in ("code", "error_type", "correlation_id")
+    }
     assert public_error["code"] == "mcp_provider_error"
     assert public_error["error_type"] == "RuntimeError"
     assert public_error["correlation_id"]
@@ -215,23 +221,28 @@ class _StageFailingMcpProvider:
     def __init__(self, failure_stage: str, *, secret: str = "provider-secret") -> None:
         self.failure_stage = failure_stage
         self.secret = secret
+        self.list_response_bytes = 0
 
     def list_tools(self, server: object, **_kwargs: object) -> McpToolListResult:
         if self.failure_stage == "list":
             raise RuntimeError(self.secret)
+        tools = [
+            McpProviderTool(
+                name="demo.echo",
+                input_schema={
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            )
+        ]
+        self.list_response_bytes = len(
+            dumps([to_jsonable(tool) for tool in tools]).encode("utf-8")
+        )
         return McpToolListResult(
             server_id=str(getattr(server, "server_id")),
-            tools=[
-                McpProviderTool(
-                    name="demo.echo",
-                    input_schema={
-                        "type": "object",
-                        "properties": {"text": {"type": "string"}},
-                        "additionalProperties": False,
-                    },
-                )
-            ],
-            response_bytes=128,
+            tools=tools,
+            response_bytes=self.list_response_bytes,
             duration_s=0.01,
         )
 

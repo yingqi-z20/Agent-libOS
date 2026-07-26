@@ -1,4 +1,4 @@
-import { useReducer, useRef } from "react";
+import { useId, useReducer, useRef } from "react";
 import type {
   DataReleaseApprovalContext,
   HumanPermissionPolicy,
@@ -7,6 +7,9 @@ import type {
   HumanResponseInput
 } from "../api/types";
 import { useI18n, type TranslationKey } from "../i18n";
+import { CollapsibleJson } from "./CollapsibleJson";
+
+export type HumanResponseOutcome = "accepted" | "settled" | "retryable" | "ambiguous";
 
 export type HumanDecisionDraft = {
   answer: string;
@@ -26,11 +29,13 @@ type HumanResponseBuildResult =
 type HumanRequestCardProps = {
   request: HumanRequest;
   className?: string;
-  onRespond(request: HumanRequest, response: HumanResponseInput): Promise<boolean>;
+  onRespond(request: HumanRequest, response: HumanResponseInput): Promise<HumanResponseOutcome | boolean>;
 };
 
 export type HumanDecisionState = HumanDecisionDraft & {
   submitting: boolean;
+  settled?: boolean;
+  ambiguousDecision?: boolean | null;
   errorKey: TranslationKey | null;
 };
 
@@ -39,6 +44,7 @@ export type HumanDecisionAction =
   | { type: "policy_changed"; policy: HumanPermissionPolicy }
   | { type: "validation_failed"; errorKey: TranslationKey }
   | { type: "submission_started" }
+  | { type: "submission_finished"; outcome: HumanResponseOutcome; approved: boolean }
   | { type: "submission_finished"; accepted: boolean };
 
 export function humanDecisionReducer(state: HumanDecisionState, action: HumanDecisionAction): HumanDecisionState {
@@ -46,10 +52,24 @@ export function humanDecisionReducer(state: HumanDecisionState, action: HumanDec
   if (action.type === "policy_changed") return { ...state, policy: action.policy, errorKey: null };
   if (action.type === "validation_failed") return { ...state, errorKey: action.errorKey };
   if (action.type === "submission_started") return { ...state, submitting: true, errorKey: null };
+  const outcome = "outcome" in action ? action.outcome : action.accepted ? "accepted" : "retryable";
+  const approved = "approved" in action ? action.approved : false;
+  if (outcome === "accepted" || outcome === "settled") {
+    return { ...state, submitting: false, settled: true, ambiguousDecision: null, errorKey: null };
+  }
+  if (outcome === "ambiguous") {
+    return {
+      ...state,
+      submitting: false,
+      ambiguousDecision: approved,
+      errorKey: "human.submitAmbiguous"
+    };
+  }
   return {
     ...state,
     submitting: false,
-    errorKey: action.accepted ? null : "human.submitFailed"
+    ...("ambiguousDecision" in state ? { ambiguousDecision: null } : {}),
+    errorKey: "human.submitFailed"
   };
 }
 
@@ -81,10 +101,18 @@ export function buildHumanResponse(
 
 export function HumanRequestCard({ request, className = "humanCard", onRespond }: HumanRequestCardProps) {
   const { t } = useI18n();
+  const promptId = useId();
   const requestType = request.payload?.type;
   const isPermission = requestType === "permission_request";
   const isQuestion = requestType === "question";
   const isDataReleaseApproval = requestType === "data_release_approval";
+  const isExternalOperationApproval = requestType === "external_operation_approval";
+  const permissionContext = isPermission && (request.payload.requested_permission || request.payload.context)
+    ? {
+        requested_permission: request.payload.requested_permission ?? null,
+        context: request.payload.context ?? null
+      }
+    : null;
   const releaseRequired = request.payload.release_required === true;
   const releaseContext = isDataReleaseApproval
     ? parseDataReleaseApprovalContext(request.payload)
@@ -93,6 +121,8 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
     answer: "",
     policy: "ask_each_time",
     submitting: false,
+    settled: false,
+    ambiguousDecision: null,
     errorKey: null
   });
   const submissionInFlight = useRef(false);
@@ -107,8 +137,11 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
     submissionInFlight.current = true;
     dispatch({ type: "submission_started" });
     try {
-      const accepted = await onRespond(request, built.response).catch(() => false);
-      dispatch({ type: "submission_finished", accepted });
+      const responseOutcome = await onRespond(request, built.response).catch(() => "ambiguous" as const);
+      const outcome = typeof responseOutcome === "boolean"
+        ? responseOutcome ? "accepted" : "retryable"
+        : responseOutcome;
+      dispatch({ type: "submission_finished", outcome, approved });
       // The authoritative snapshot removes a completed request. Keep the draft
       // intact until then so a failed request or refresh never destroys input.
     } finally {
@@ -116,46 +149,65 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
     }
   }
 
-  const approveDisabled = state.submitting
+  const approveDisabled = state.submitting || state.settled || state.ambiguousDecision === false
     || (isQuestion && !state.answer.trim())
     || (isPermission && state.policy === "always_deny")
     || (isDataReleaseApproval && releaseContext === null);
-  const rejectDisabled = state.submitting || (isPermission && state.policy === "always_allow");
+  const rejectDisabled = state.submitting || state.settled || state.ambiguousDecision === true || (isPermission && state.policy === "always_allow");
   const prompt = String(request.payload?.question ?? request.payload?.reason ?? request.payload?.type ?? t("operator.humanRequestFallback"));
   const releaseRequestId = request.release_request_id
     ?? (typeof request.payload.release_request_id === "string" ? request.payload.release_request_id : null);
+  const approveActionLabel = state.ambiguousDecision === true
+    ? t("human.reconcile")
+    : isQuestion
+      ? t("human.submitAnswer")
+      : t("human.approve");
+  const rejectActionLabel = state.ambiguousDecision === false ? t("human.reconcile") : t("human.reject");
+  const requestContextLabel = isDataReleaseApproval && releaseContext
+    ? `${releaseContext.operation} · ${releaseContext.sink} · ${request.request_id}`
+    : `${prompt} · ${request.request_id}`;
 
   if (releaseRequired) {
     return (
-      <div className={`${className} typedHumanRequest withheldHumanRequest`}>
-        <strong className="humanRequestPrompt">{t("human.releaseRequiredTitle")}</strong>
+      <section className={`${className} typedHumanRequest withheldHumanRequest`} role="group" aria-labelledby={promptId}>
+        <strong id={promptId} className="humanRequestPrompt">{t("human.releaseRequiredTitle")}</strong>
         <p className="humanReleaseNotice" role="status">
           {releaseRequestId
             ? t("human.releaseRequiredMessage", { requestId: releaseRequestId })
             : t("human.releaseRequiredMessageNoId")}
         </p>
-      </div>
+      </section>
     );
   }
 
   return (
-    <div
+    <section
       className={`${className} typedHumanRequest${isDataReleaseApproval ? " dataReleaseApprovalCard" : ""}`}
       aria-busy={state.submitting || undefined}
+      role="group"
+      aria-labelledby={promptId}
     >
-      <strong className="humanRequestPrompt">
+      <strong id={promptId} className="humanRequestPrompt">
         {isDataReleaseApproval ? t("human.releaseApprovalTitle") : prompt}
       </strong>
       {isDataReleaseApproval ? (
         <p className="humanReleaseNotice">{t("human.releaseApprovalHint")}</p>
+      ) : null}
+      {permissionContext ? (
+        <section className="humanApprovalContext permissionApprovalContext" aria-label={t("human.approvalContext")}>
+          <strong>{t("human.approvalContext")}</strong>
+          <p>{t("human.approvalContextHint")}</p>
+          <CollapsibleJson value={permissionContext} label={t("human.approvalContext")} defaultExpanded />
+        </section>
       ) : null}
       {isPermission ? (
         <label className="humanDecisionControl">
           <span>{t("human.permissionPolicy")}</span>
           <select
             name="permission-policy"
+            aria-describedby={promptId}
             value={state.policy}
-            disabled={state.submitting}
+            disabled={state.submitting || state.settled || state.ambiguousDecision !== null}
             onChange={(event) => {
               dispatch({ type: "policy_changed", policy: event.currentTarget.value as HumanPermissionPolicy });
             }}
@@ -171,15 +223,16 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
           <span>{t("human.answer")}</span>
           <input
             name="human-answer"
+            aria-describedby={promptId}
             required
             placeholder={t("human.answerPlaceholder")}
             value={state.answer}
-            disabled={state.submitting}
+            disabled={state.submitting || state.settled || state.ambiguousDecision !== null}
             onChange={(event) => {
               dispatch({ type: "answer_changed", answer: event.currentTarget.value });
             }}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && state.answer.trim()) void submit(true);
+              if (event.key === "Enter" && !event.nativeEvent.isComposing && state.answer.trim()) void submit(true);
             }}
           />
         </label>
@@ -192,16 +245,23 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
           {t("human.releaseMetadataInvalid")}
         </span>
       ) : null}
+      {isExternalOperationApproval && request.payload.context ? (
+        <section className="humanApprovalContext" aria-label={t("human.approvalContext")}>
+          <strong>{t("human.approvalContext")}</strong>
+          <p>{t("human.approvalContextHint")}</p>
+          <CollapsibleJson value={request.payload.context} label={t("human.approvalContext")} defaultExpanded />
+        </section>
+      ) : null}
       <div className="humanDecisionActions">
-        <button disabled={approveDisabled} onClick={() => void submit(true)}>
-          {isQuestion ? t("human.submitAnswer") : t("human.approve")}
+        <button aria-label={`${approveActionLabel}: ${requestContextLabel}`} aria-describedby={promptId} disabled={approveDisabled} onClick={() => void submit(true)}>
+          {approveActionLabel}
         </button>
-        <button disabled={rejectDisabled} className="danger" onClick={() => void submit(false)}>
-          {t("human.reject")}
+        <button aria-label={`${rejectActionLabel}: ${requestContextLabel}`} aria-describedby={promptId} disabled={rejectDisabled} className="danger" onClick={() => void submit(false)}>
+          {rejectActionLabel}
         </button>
       </div>
       {state.errorKey ? <span className="humanDecisionError" role="alert">{t(state.errorKey)}</span> : null}
-    </div>
+    </section>
   );
 }
 

@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from agent_libos.llm.usage import LLM_USAGE_COUNTER_MAX
 from agent_libos.models import is_openai_tool_name
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.ids import estimate_tokens
@@ -316,8 +317,8 @@ def _usage_int(usage: Mapping[str, Any], *keys: str) -> int:
             continue
         try:
             candidate = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
-        if candidate >= 0:
+        if 0 <= candidate <= LLM_USAGE_COUNTER_MAX:
             selected = max(selected, candidate)
     return selected

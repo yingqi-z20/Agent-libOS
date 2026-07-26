@@ -1,6 +1,7 @@
 from __future__ import annotations
 import pytest
 import asyncio
+import hashlib
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,12 +9,88 @@ from types import SimpleNamespace
 from typing import Any
 from agent_libos.config import AgentLibOSConfig, LLMDefaults
 import agent_libos.llm.client as llm_client_module
-from agent_libos.llm.client import LLMClient, LLMError
+from agent_libos.llm.client import (
+    LLMClient,
+    LLMError,
+    LLMTransientError,
+    LLM_RESPONSE_CONTENT_MAX_CHARS,
+    LLM_RESPONSE_TOOL_ARGUMENT_MAX_CHARS,
+    LLM_RESPONSE_TOOL_CALL_MAX_COUNT,
+    llm_error_internal_observation,
+)
+from agent_libos.utils.public_errors import public_error_envelope
 
 class TestLLMClient:
 
+    def test_sdk_timeout_is_classified_as_transient_after_sdk_retries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class APITimeoutError(Exception):
+            pass
+
+        async def timeout(**_payload: object) -> object:
+            raise APITimeoutError("Request timed out.")
+
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="chat")
+        monkeypatch.setattr(llm_client_module, "_is_openai_sdk_error", lambda _exc: True)
+
+        with pytest.raises(LLMTransientError) as raised:
+            asyncio.run(
+                client._call_with_compatibility(
+                    timeout,
+                    {"model": "gpt-test"},
+                    api="chat",
+                )
+            )
+        public_error = public_error_envelope(raised.value)
+        observation = llm_error_internal_observation(
+            raised.value,
+            correlation_id=public_error["correlation_id"],
+        )
+        assert str(raised.value) == public_error["message"]
+        assert "Request timed out" not in str(raised.value)
+        assert observation["correlation_id"] == public_error["correlation_id"]
+        assert observation["exception_text"] == {
+            "bytes": len("Request timed out.".encode()),
+            "sha256": hashlib.sha256("Request timed out.".encode()).hexdigest(),
+        }
+        assert isinstance(raised.value.__cause__, APITimeoutError)
+
+    def test_nonretryable_sdk_status_remains_terminal_llm_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class BadRequestError(Exception):
+            status_code = 400
+
+        async def reject(**_payload: object) -> object:
+            raise BadRequestError("invalid request")
+
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="chat")
+        monkeypatch.setattr(llm_client_module, "_is_openai_sdk_error", lambda _exc: True)
+
+        with pytest.raises(LLMError) as raised:
+            asyncio.run(
+                client._call_with_compatibility(
+                    reject,
+                    {"model": "gpt-test"},
+                    api="chat",
+                )
+            )
+
+        assert not isinstance(raised.value, LLMTransientError)
+        assert "invalid request" not in str(raised.value)
+        assert str(raised.value).startswith("llm_error: LLMError (correlation_id=")
+
     def test_real_async_client_is_not_reused_across_closed_event_loops(self) -> None:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), _KeepAliveChatHandler)
+        class PerTestKeepAliveChatHandler(_KeepAliveChatHandler):
+            request_count = 0
+
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            PerTestKeepAliveChatHandler,
+        )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         client = LLMClient(
@@ -31,7 +108,7 @@ class TestLLMClient:
 
             assert first == "ok"
             assert second == "ok"
-            assert _KeepAliveChatHandler.request_count == 2
+            assert PerTestKeepAliveChatHandler.request_count == 2
         finally:
             client.close()
             server.shutdown()
@@ -62,6 +139,240 @@ class TestLLMClient:
         assert completion.tool_calls[0]['name'] == 'write_text_file'
         assert completion.usage['total_tokens'] == 14
         assert completion.reasoning[0]['summary'][0]['text'] == 'choose write_text_file'
+
+    def test_responses_action_rejects_incomplete_function_call(self) -> None:
+        response = SimpleNamespace(
+            id="resp_incomplete",
+            model="gpt-test",
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+            output_text="",
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    status="incomplete",
+                    id="fc_incomplete",
+                    call_id="call_incomplete",
+                    name="process_exit",
+                    arguments="{}",
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="responses")
+        client._async_client = fake
+
+        with pytest.raises(LLMError) as raised:
+            asyncio.run(
+                client.acomplete_action(
+                    messages=[{"role": "user", "content": "exit"}],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "process_exit",
+                                "description": "Exit.",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    ],
+                )
+            )
+        assert "incomplete" not in str(raised.value)
+        assert str(raised.value).startswith("llm_error: LLMError (correlation_id=")
+
+    def test_responses_provider_error_object_is_text_free(self) -> None:
+        secret = "PROVIDER_RESPONSE_ERROR_SECRET"
+        response = SimpleNamespace(error=secret)
+        fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="responses")
+        client._async_client = fake
+
+        with pytest.raises(LLMError) as raised:
+            asyncio.run(
+                client.acomplete_action(
+                    messages=[{"role": "user", "content": "exit"}],
+                    tools=[],
+                )
+            )
+
+        public_error = public_error_envelope(raised.value)
+        observation = llm_error_internal_observation(
+            raised.value,
+            correlation_id=public_error["correlation_id"],
+        )
+        assert str(raised.value) == public_error["message"]
+        assert secret not in str(raised.value)
+        assert observation["exception_text"] == {
+            "bytes": len(secret.encode()),
+            "sha256": hashlib.sha256(secret.encode()).hexdigest(),
+        }
+
+    def test_unexpected_chat_shape_does_not_repr_provider_response(self) -> None:
+        secret = "PROVIDER_RESPONSE_REPR_SECRET"
+
+        class UnexpectedResponse:
+            choices: list[object] = []
+
+            def __repr__(self) -> str:
+                return secret
+
+        fake = FakeAsyncOpenAI(
+            chat=FakeChat(FakeChatCompletions(UnexpectedResponse()))
+        )
+        client = LLMClient(
+            base_url="https://example.com/compatible/v1",
+            model="compat-model",
+            api_key="key",
+            api_mode="chat",
+            allow_custom_base_url=True,
+        )
+        client._async_client = fake
+
+        with pytest.raises(LLMError) as raised:
+            asyncio.run(
+                client.acomplete_action(
+                    messages=[{"role": "user", "content": "exit"}],
+                    tools=[],
+                )
+            )
+
+        assert secret not in str(raised.value)
+        assert str(raised.value).startswith("llm_error: LLMError (correlation_id=")
+
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    def test_provider_response_rejects_oversized_content(self, api: str) -> None:
+        content = "x" * (LLM_RESPONSE_CONTENT_MAX_CHARS + 1)
+        if api == "responses":
+            response = SimpleNamespace(
+                id="resp_oversized",
+                model="gpt-test",
+                status="completed",
+                output_text=content,
+                output=[],
+            )
+            fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        else:
+            response = SimpleNamespace(
+                id="chat_oversized",
+                model="gpt-test",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=content, tool_calls=[]),
+                    )
+                ],
+            )
+            fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(response)))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode=api)
+        client._async_client = fake
+
+        with pytest.raises(LLMError) as raised:
+            asyncio.run(client.acomplete_action(messages=[], tools=[]))
+
+        assert content[:100] not in str(raised.value)
+        assert str(raised.value).startswith("llm_error: LLMError (correlation_id=")
+
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    def test_provider_response_rejects_excess_tool_calls(self, api: str) -> None:
+        if api == "responses":
+            output = [
+                SimpleNamespace(
+                    type="function_call",
+                    status="completed",
+                    id=f"fc_{index}",
+                    call_id=f"call_{index}",
+                    name="process_exit",
+                    arguments="{}",
+                )
+                for index in range(LLM_RESPONSE_TOOL_CALL_MAX_COUNT + 1)
+            ]
+            response = SimpleNamespace(
+                id="resp_many_tools",
+                model="gpt-test",
+                status="completed",
+                output_text="",
+                output=output,
+            )
+            fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        else:
+            calls = [
+                SimpleNamespace(
+                    id=f"call_{index}",
+                    function=SimpleNamespace(
+                        name="process_exit",
+                        arguments="{}",
+                    ),
+                )
+                for index in range(LLM_RESPONSE_TOOL_CALL_MAX_COUNT + 1)
+            ]
+            response = SimpleNamespace(
+                id="chat_many_tools",
+                model="gpt-test",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="tool_calls",
+                        message=SimpleNamespace(content="", tool_calls=calls),
+                    )
+                ],
+            )
+            fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(response)))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode=api)
+        client._async_client = fake
+
+        with pytest.raises(LLMError):
+            asyncio.run(client.acomplete_action(messages=[], tools=[]))
+
+    @pytest.mark.parametrize("api", ["responses", "chat"])
+    def test_provider_response_rejects_oversized_tool_arguments(self, api: str) -> None:
+        arguments = "x" * (LLM_RESPONSE_TOOL_ARGUMENT_MAX_CHARS + 1)
+        if api == "responses":
+            output = [
+                SimpleNamespace(
+                    type="function_call",
+                    status="completed",
+                    id="fc_1",
+                    call_id="call_1",
+                    name="process_exit",
+                    arguments=arguments,
+                )
+            ]
+            response = SimpleNamespace(
+                id="resp_large_arguments",
+                model="gpt-test",
+                status="completed",
+                output_text="",
+                output=output,
+            )
+            fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        else:
+            response = SimpleNamespace(
+                id="chat_large_arguments",
+                model="gpt-test",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="tool_calls",
+                        message=SimpleNamespace(
+                            content="",
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id="call_1",
+                                    function=SimpleNamespace(
+                                        name="process_exit",
+                                        arguments=arguments,
+                                    ),
+                                )
+                            ],
+                        ),
+                    )
+                ],
+            )
+            fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(response)))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode=api)
+        client._async_client = fake
+
+        with pytest.raises(LLMError):
+            asyncio.run(client.acomplete_action(messages=[], tools=[]))
 
     def test_responses_action_request_preserves_native_function_transcript(self) -> None:
         response = SimpleNamespace(
@@ -611,6 +922,58 @@ class TestLLMClient:
         assert completion.usage['total_tokens'] == 9
         assert completion.reasoning == 'select process_exit'
 
+    def test_chat_action_rejects_truncated_tool_call(self) -> None:
+        truncated = SimpleNamespace(
+            id="chatcmpl_truncated",
+            model="compat-model",
+            choices=[
+                SimpleNamespace(
+                    finish_reason="length",
+                    message=SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="tool_truncated",
+                                function=SimpleNamespace(
+                                    name="process_exit",
+                                    arguments="{}",
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(truncated)))
+        client = LLMClient(
+            base_url="https://example.com/compatible/v1",
+            model="compat-model",
+            api_key="key",
+            api_mode="chat",
+            allow_custom_base_url=True,
+            enable_thinking=False,
+        )
+        client._async_client = fake
+
+        with pytest.raises(LLMError) as raised:
+            asyncio.run(
+                client.acomplete_action(
+                    messages=[{"role": "user", "content": "exit"}],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "process_exit",
+                                "description": "Exit.",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    ],
+                )
+            )
+        assert "length" not in str(raised.value)
+        assert str(raised.value).startswith("llm_error: LLMError (correlation_id=")
+
     def test_custom_chat_empty_response_retries_with_thinking_disabled(self) -> None:
         empty = SimpleNamespace(id='chatcmpl_empty', model='compat-model', choices=[SimpleNamespace(finish_reason='length', message=SimpleNamespace(content='', tool_calls=[]))])
         ok = SimpleNamespace(id='chatcmpl_ok', model='compat-model', choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(content='OK', tool_calls=[]))])
@@ -636,6 +999,31 @@ class TestLLMClient:
             allow_custom_base_url=True,
         )
         assert client.base_url == 'https://example.com/compatible/v1'
+
+    def test_ambient_base_url_is_validated_and_frozen(self, monkeypatch) -> None:
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://attacker.invalid/v1")
+        with pytest.raises(LLMError, match="custom endpoint"):
+            LLMClient(model="gpt-test", api_key="key")
+
+        client = LLMClient(
+            model="gpt-test",
+            api_key="key",
+            allow_custom_base_url=True,
+        )
+        assert client.base_url == "https://attacker.invalid/v1"
+        assert client._use_responses_api() is False
+
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://changed.invalid/v1")
+        assert client._client_kwargs()["base_url"] == "https://attacker.invalid/v1"
+
+    def test_absent_ambient_base_url_freezes_default_openai_endpoint(self, monkeypatch) -> None:
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        client = LLMClient(model="gpt-test", api_key="key")
+
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://attacker.invalid/v1")
+
+        assert client._client_kwargs()["base_url"] == "https://api.openai.com/v1"
+        assert client._use_responses_api() is True
 
     def test_api_key_env_can_be_scoped_per_client(self, monkeypatch) -> None:
         monkeypatch.setenv('OPENAI_API_KEY', 'global-key')

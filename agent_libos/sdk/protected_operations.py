@@ -5,6 +5,7 @@ from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
+import inspect
 import sys
 from typing import Any, Awaitable, Callable, Iterable, Mapping, TypeVar
 
@@ -60,6 +61,82 @@ class ResourcePolicy(StrEnum):
     REQUIRED = "required"
 
 
+_EnumT = TypeVar("_EnumT")
+
+
+def _validated_enum(label: str, value: Any, enum_type: type[_EnumT]) -> _EnumT:
+    try:
+        return enum_type(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"protected operation {label} must be a valid {enum_type.__name__}"
+        ) from exc
+
+
+def _require_bool(label: str, value: Any) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"protected operation {label} must be boolean")
+
+
+def _require_bool_fields(value: Any, labels: tuple[str, ...]) -> None:
+    for label in labels:
+        _require_bool(label, getattr(value, label))
+
+
+def _validate_evidence_roles(value: Any) -> None:
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 3
+        or any(not isinstance(role, str) for role in value)
+        or set(value) != {"audit", "effect", "event"}
+    ):
+        raise ValueError(
+            "protected operation evidence_roles must be a duplicate-free tuple "
+            "containing audit, event, and effect"
+        )
+
+
+def _normalize_contract_enums(contract: Any) -> None:
+    for label, enum_type in (
+        ("resource_policy", ResourcePolicy),
+        ("authority_mode", AuthorityMode),
+        ("data_flow_direction", DataFlowDirection),
+        ("minimum_egress_integrity", DataIntegrity),
+        ("post_provider_failure_mode", PostProviderFailureMode),
+        ("classifier_failure_rollback_class", ExternalEffectRollbackClass),
+        ("classifier_failure_rollback_status", ExternalEffectRollbackStatus),
+    ):
+        object.__setattr__(
+            contract,
+            label,
+            _validated_enum(label, getattr(contract, label), enum_type),
+        )
+
+
+def _normalize_optional_policy_name(value: Any, *, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} policy names must be non-empty strings")
+    return value.strip()
+
+
+def _validate_contract_data_flow(contract: Any) -> None:
+    if (
+        contract.data_flow_direction is not DataFlowDirection.NONE
+        and not contract.information_flow
+    ):
+        raise ValueError("data-flow directions require information_flow=True")
+    if (
+        contract.minimum_egress_integrity is not DataIntegrity.UNTRUSTED
+        and contract.data_flow_direction
+        not in {DataFlowDirection.EGRESS, DataFlowDirection.BIDIRECTIONAL}
+    ):
+        raise ValueError(
+            "minimum egress integrity requires an egress data-flow direction"
+        )
+
+
 @dataclass(frozen=True)
 class ProtectedOperationContract:
     name: str
@@ -84,52 +161,30 @@ class ProtectedOperationContract:
     def __post_init__(self) -> None:
         if not self.name or not self.provider or not self.operation:
             raise ValueError("protected operation contract names must be non-empty")
-        if set(self.evidence_roles) != {"audit", "effect", "event"}:
-            raise ValueError(
-                "protected operation contracts must declare audit, event, and effect evidence"
-            )
+        _validate_evidence_roles(self.evidence_roles)
+        _require_bool_fields(
+            self,
+            (
+                "state_mutation",
+                "information_flow",
+                "require_classifier",
+                "preflight_classifier",
+            ),
+        )
+        _normalize_contract_enums(self)
         if self.authority_mode == AuthorityMode.RUNTIME_INTERNAL and not str(
             self.internal_reason or ""
         ).strip():
             raise ValueError("runtime-internal protected operations require an explicit reason")
-        if self.prepared_recovery is not None:
-            if (
-                not isinstance(self.prepared_recovery, str)
-                or not self.prepared_recovery.strip()
-            ):
-                raise ValueError(
-                    "prepared recovery policy names must be non-empty strings"
-                )
-            object.__setattr__(
-                self,
-                "prepared_recovery",
-                self.prepared_recovery.strip(),
-            )
         object.__setattr__(
             self,
-            "data_flow_direction",
-            DataFlowDirection(self.data_flow_direction),
+            "prepared_recovery",
+            _normalize_optional_policy_name(
+                self.prepared_recovery,
+                label="prepared recovery",
+            ),
         )
-        object.__setattr__(
-            self,
-            "minimum_egress_integrity",
-            DataIntegrity(self.minimum_egress_integrity),
-        )
-        if (
-            self.data_flow_direction is not DataFlowDirection.NONE
-            and not self.information_flow
-        ):
-            raise ValueError(
-                "data-flow directions require information_flow=True"
-            )
-        if (
-            self.minimum_egress_integrity is not DataIntegrity.UNTRUSTED
-            and self.data_flow_direction
-            not in {DataFlowDirection.EGRESS, DataFlowDirection.BIDIRECTIONAL}
-        ):
-            raise ValueError(
-                "minimum egress integrity requires an egress data-flow direction"
-            )
+        _validate_contract_data_flow(self)
 
 
 @dataclass(frozen=True)
@@ -142,6 +197,10 @@ class ProviderPhase:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("provider phase name must be non-empty")
+        _require_bool_fields(
+            self,
+            ("state_mutation", "information_flow", "commits_authority"),
+        )
 
 
 @dataclass(frozen=True)
@@ -152,6 +211,12 @@ class ResourceSettlement:
     allow_overage: bool = True
     kill_on_exceed: bool = True
     charge_reserved_maximum: bool = False
+
+    def __post_init__(self) -> None:
+        _require_bool_fields(
+            self,
+            ("allow_overage", "kill_on_exceed", "charge_reserved_maximum"),
+        )
 
 
 @dataclass(frozen=True)
@@ -193,6 +258,18 @@ class ProtectedOperationEvidence:
     parent_record_id: str | None = None
     effect_metadata: Mapping[str, Any] = field(default_factory=dict)
     provider_receipt: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "event_type",
+            _validated_enum("event_type", self.event_type, EventType),
+        )
+        object.__setattr__(
+            self,
+            "event_priority",
+            _validated_enum("event_priority", self.event_priority, EventPriority),
+        )
 
 
 Hook = Callable[[], None]
@@ -277,9 +354,38 @@ class ProtectedOperationInvocation:
     data_flow_allow_recovered_source_snapshots: bool = False
     additional_data_sinks: tuple[DataSink, ...] = ()
 
+    def __post_init__(self) -> None:
+        _require_bool(
+            "data_flow_allow_recovered_source_snapshots",
+            self.data_flow_allow_recovered_source_snapshots,
+        )
+
 
 class ProtectedOperationProtocolError(ValidationError):
     pass
+
+
+def _call_synchronous_hook(
+    label: str,
+    hook: Callable[..., Any],
+    *args: Any,
+) -> Any:
+    """Run a transaction-local hook without silently dropping async work."""
+
+    result = hook(*args)
+    deferred = inspect.isawaitable(result)
+    if inspect.isgenerator(result):
+        result.close()
+        deferred = True
+    elif inspect.isasyncgen(result):
+        deferred = True
+    if deferred:
+        if inspect.iscoroutine(result):
+            result.close()
+        raise ProtectedOperationProtocolError(
+            f"protected operation {label} hook must complete synchronously"
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -347,6 +453,10 @@ class ProtectedOperationSDK:
         selected = str(name).strip()
         if not selected or not callable(handler):
             raise ValidationError("prepared recovery requires a name and callable handler")
+        if inspect.iscoroutinefunction(handler):
+            raise ValidationError(
+                "prepared recovery requires a synchronous handler"
+            )
         existing = self._prepared_recovery_handlers.get(selected)
         if existing is not None and existing != handler:
             raise ValidationError(f"prepared recovery handler conflict: {selected}")
@@ -381,15 +491,88 @@ class ProtectedOperationSDK:
         )
 
     def _recover_prepared_effect(self, effect: ExternalEffectRecord) -> bool:
+        recovery = self._prepared_recovery_metadata(effect)
+        if recovery is None:
+            return False
+        reservation_ids, contract_name, actor, handler = recovery
+        expected_reservation_reason = (
+            f"protected operation reserved authority for {contract_name}"
+        )
+        with self.effects.transaction():
+            operation_id = self._prepared_operation_binding(
+                effect,
+                contract_name=contract_name,
+                actor=actor,
+            )
+            for reservation_id in reservation_ids:
+                capability_id = self._prepared_reservation_capability(
+                    effect,
+                    reservation_id=reservation_id,
+                    actor=actor,
+                    expected_reason=expected_reservation_reason,
+                )
+                self._validate_prepared_reservation_evidence(
+                    effect,
+                    operation_id=operation_id,
+                    reservation_id=reservation_id,
+                    capability_id=capability_id,
+                    contract_name=contract_name,
+                    actor=actor,
+                )
+            if handler is not None:
+                handler_result = _call_synchronous_hook(
+                    "prepared recovery",
+                    handler,
+                    effect,
+                )
+                if handler_result is not None:
+                    raise ValidationError(
+                        "prepared recovery handler must return None"
+                    )
+            for reservation_id in reversed(reservation_ids):
+                restored = self.capabilities.restore_reserved_use(
+                    reservation_id,
+                    restored_by="runtime.recovery",
+                    reason=(
+                        "protected operation recovered before provider dispatch: "
+                        f"{contract_name}"
+                    ),
+                )
+                if restored is None:
+                    raise ValidationError(
+                        "prepared protected operation reservation could not be restored: "
+                        f"{effect.effect_id}"
+                    )
+            abandon_external_effect_intent(
+                self.effects,
+                effect.effect_id,
+                operations=self.operations,
+            )
+        return True
+
+    def _prepared_recovery_metadata(
+        self,
+        effect: ExternalEffectRecord,
+    ) -> tuple[
+        tuple[str, ...],
+        str,
+        str,
+        PreparedRecoveryHandler | None,
+    ] | None:
         protected = effect.provider_metadata.get("protected_operation")
         if not isinstance(protected, Mapping):
-            return False
-        raw_reservations = protected.get("reservation_ids") or ()
+            return None
+        raw_reservations = protected.get("reservation_ids")
         if not isinstance(raw_reservations, (list, tuple)) or any(
             not isinstance(item, str) or not item for item in raw_reservations
         ):
             raise ValidationError(
                 f"prepared protected operation has invalid reservation links: {effect.effect_id}"
+            )
+        reservation_ids = tuple(raw_reservations)
+        if len(set(reservation_ids)) != len(reservation_ids):
+            raise ValidationError(
+                f"prepared protected operation has duplicate reservation links: {effect.effect_id}"
             )
         contract_name = protected.get("contract_name")
         actor = protected.get("actor")
@@ -401,39 +584,140 @@ class ProtectedOperationSDK:
             raise ValidationError(
                 f"prepared protected operation has invalid actor identity: {effect.effect_id}"
             )
-        expected_reservation_reason = (
-            f"protected operation reserved authority for {contract_name}"
-        )
-        for reservation_id in raw_reservations:
-            reservation = self.effects.get_capability_use_reservation(reservation_id)
-            if reservation is None or reservation.get("status") != "reserved":
-                continue
-            if (
-                reservation.get("reserved_by") != actor
-                or reservation.get("reason") != expected_reservation_reason
-            ):
-                raise ValidationError(
-                    f"prepared protected operation reservation binding mismatch: {effect.effect_id}"
-                )
         handler = self._prepared_recovery_handler(effect.effect_id, protected)
-        with self.effects.transaction():
-            if handler is not None:
-                handler(effect)
-            for reservation_id in reversed(tuple(raw_reservations)):
-                self.capabilities.restore_reserved_use(
-                    reservation_id,
-                    restored_by="runtime.recovery",
-                    reason=(
-                        "protected operation recovered before provider dispatch: "
-                        f"{contract_name}"
-                    ),
-                )
-            abandon_external_effect_intent(
-                self.effects,
-                effect.effect_id,
-                operations=self.operations,
+        return reservation_ids, contract_name, actor, handler
+
+    def _prepared_reservation_capability(
+        self,
+        effect: ExternalEffectRecord,
+        *,
+        reservation_id: str,
+        actor: str,
+        expected_reason: str,
+    ) -> str:
+        reservation = self.effects.get_capability_use_reservation(reservation_id)
+        if reservation is None:
+            raise ValidationError(
+                "prepared protected operation reservation is missing: "
+                f"{effect.effect_id}"
             )
-        return True
+        if reservation.get("status") != "reserved":
+            raise ValidationError(
+                "prepared protected operation reservation is not live: "
+                f"{effect.effect_id}"
+            )
+        reservation_count = reservation.get("count")
+        if type(reservation_count) is not int or reservation_count != 1:
+            raise ValidationError(
+                "prepared protected operation reservation count is not exactly one: "
+                f"{effect.effect_id}"
+            )
+        capability_id = reservation.get("cap_id")
+        if not isinstance(capability_id, str) or not capability_id:
+            raise ValidationError(
+                "prepared protected operation reservation capability is invalid: "
+                f"{effect.effect_id}"
+            )
+        if (
+            reservation.get("reserved_by") != actor
+            or reservation.get("reason") != expected_reason
+        ):
+            raise ValidationError(
+                "prepared protected operation reservation binding mismatch: "
+                f"{effect.effect_id}"
+            )
+        return capability_id
+
+    def _prepared_operation_binding(
+        self,
+        effect: ExternalEffectRecord,
+        *,
+        contract_name: str,
+        actor: str,
+    ) -> str:
+        links = self.effects.list_operation_evidence(
+            evidence_types=("external_effect",),
+            evidence_id=effect.effect_id,
+            limit=2,
+        )
+        if len(links) != 1:
+            raise ValidationError(
+                "prepared protected operation effect binding is missing or ambiguous: "
+                f"{effect.effect_id}"
+            )
+        link = links[0]
+        metadata = link.metadata
+        if (
+            link.role != "effect"
+            or not isinstance(metadata, Mapping)
+            or metadata.get("effect_state") != "pending"
+            or metadata.get("provider") != effect.provider
+            or metadata.get("operation") != effect.operation
+        ):
+            raise ValidationError(
+                "prepared protected operation effect binding is invalid: "
+                f"{effect.effect_id}"
+            )
+        operation = self.effects.get_operation(link.operation_id)
+        if (
+            operation is None
+            or operation.name != contract_name
+            or operation.actor != actor
+            or operation.pid != effect.pid
+        ):
+            raise ValidationError(
+                "prepared protected operation identity binding mismatch: "
+                f"{effect.effect_id}"
+            )
+        return operation.operation_id
+
+    def _validate_prepared_reservation_evidence(
+        self,
+        effect: ExternalEffectRecord,
+        *,
+        operation_id: str,
+        reservation_id: str,
+        capability_id: str,
+        contract_name: str,
+        actor: str,
+    ) -> None:
+        links = self.effects.list_operation_evidence(
+            operation_ids=(operation_id,),
+            evidence_types=("capability_reservation",),
+            evidence_id=reservation_id,
+            limit=3,
+        )
+        if len(links) != 2:
+            raise ValidationError(
+                "prepared protected operation reservation evidence is missing or ambiguous: "
+                f"{effect.effect_id}"
+            )
+        by_role = {link.role: link for link in links}
+        if set(by_role) != {"reservation", "effect_reservation"}:
+            raise ValidationError(
+                "prepared protected operation reservation evidence is invalid: "
+                f"{effect.effect_id}"
+            )
+        reservation_metadata = by_role["reservation"].metadata
+        effect_metadata = by_role["effect_reservation"].metadata
+        if (
+            not isinstance(reservation_metadata, Mapping)
+            or reservation_metadata.get("capability_id") != capability_id
+            or reservation_metadata.get("status") != "reserved"
+            or type(reservation_metadata.get("count")) is not int
+            or reservation_metadata.get("count") != 1
+            or not isinstance(effect_metadata, Mapping)
+            or effect_metadata.get("effect_id") != effect.effect_id
+            or effect_metadata.get("capability_id") != capability_id
+            or type(effect_metadata.get("count")) is not int
+            or effect_metadata.get("count") != 1
+            or effect_metadata.get("contract_name") != contract_name
+            or effect_metadata.get("actor") != actor
+        ):
+            raise ValidationError(
+                "prepared protected operation reservation evidence mismatch: "
+                f"{effect.effect_id}"
+            )
 
     def _prepared_recovery_handler(
         self,
@@ -631,7 +915,7 @@ class ProtectedOperation:
                 self._observe_data_flow_ingress(phase)
                 self._expect_settlement_evidence()
                 self._commit_reservations_best_effort()
-                self._finalize_unknown(error, phase.name)
+                self._finalize_unknown(error, phase.name, active_phase=phase)
                 raise
             finally:
                 _CURRENT_BOUNDARY.reset(token)
@@ -674,7 +958,7 @@ class ProtectedOperation:
             self._observe_data_flow_ingress(phase)
             self._expect_settlement_evidence()
             self._commit_reservations_best_effort()
-            self._finalize_unknown(error, phase.name)
+            self._finalize_unknown(error, phase.name, active_phase=phase)
             raise
         finally:
             _CURRENT_BOUNDARY.reset(token)
@@ -733,7 +1017,10 @@ class ProtectedOperation:
             )
             with self.sdk.effects.transaction():
                 if settle_success is not None:
-                    settle_success()
+                    _call_synchronous_hook(
+                        "success settlement",
+                        settle_success,
+                    )
                 event, audit_record = self._persist_evidence(evidence)
                 record_external_effect(
                     self.sdk.effects,
@@ -837,7 +1124,10 @@ class ProtectedOperation:
         try:
             with self.sdk.effects.transaction():
                 if self.invocation.prepare is not None:
-                    self.invocation.prepare()
+                    _call_synchronous_hook(
+                        "prepare",
+                        self.invocation.prepare,
+                    )
                 self._revalidate_authority()
                 self._revalidate_data_flow()
                 self._reserve_decisions()
@@ -860,6 +1150,7 @@ class ProtectedOperation:
                     authority_policy=self.sdk.authority_policy,
                 )
                 self.effect_id = effect.effect_id
+                self._bind_prepared_reservations()
                 if self.invocation.reservation_usage is not None:
                     assert self.sdk.resources is not None
                     self._resource_reservation_id = self.sdk.resources.reserve_usage(
@@ -872,6 +1163,26 @@ class ProtectedOperation:
         except BaseException as error:
             self._persist_rolled_back_data_flow_denial(error)
             raise
+
+    def _bind_prepared_reservations(self) -> None:
+        assert self.effect_id is not None
+        for capability_id, reservation_id in self._reservation_ids_by_capability.items():
+            linked = self.sdk.operations.link_evidence(
+                "capability_reservation",
+                reservation_id,
+                "effect_reservation",
+                metadata={
+                    "effect_id": self.effect_id,
+                    "capability_id": capability_id,
+                    "count": 1,
+                    "contract_name": self.contract.name,
+                    "actor": self.invocation.actor,
+                },
+            )
+            if linked is None:
+                raise ValidationError(
+                    "protected operation could not bind its finite-use reservation"
+                )
 
     def _validate_authority(self) -> None:
         if self.contract.authority_mode == AuthorityMode.RUNTIME_INTERNAL:
@@ -974,11 +1285,17 @@ class ProtectedOperation:
                     reservation = self.sdk.effects.get_capability_use_reservation(
                         reservation_id
                     )
+                    reservation_count = (
+                        reservation.get("count")
+                        if reservation is not None
+                        else None
+                    )
                     if (
                         reservation is None
                         or reservation.get("status") != "reserved"
                         or str(reservation.get("cap_id") or "") != capability_id
-                        or int(reservation.get("count") or 0) != 1
+                        or type(reservation_count) is not int
+                        or reservation_count != 1
                     ):
                         raise CapabilityDenied(
                             "protected operation finite authority reservation changed "
@@ -1381,6 +1698,10 @@ class ProtectedOperation:
                 self._revalidate_provider_registry_binding()
                 self._revalidate_data_sink_identity()
                 self._revalidate_data_flow(use_reserved_release=True)
+                # Preserve a more specific raced authority/data-flow denial,
+                # while still rejecting an over-ceiling phase before dispatch
+                # is persisted or any provider code can run.
+                self._validate_phase_against_contract(phase)
                 mark_external_effect_dispatched(self.sdk.effects, self.effect_id)
                 current = self.sdk.effects.get_external_effect(self.effect_id)
                 if current is None:
@@ -1461,7 +1782,11 @@ class ProtectedOperation:
             )
             self._expect_settlement_evidence()
             self._commit_reservations_best_effort()
-            self._finalize_unknown(error, f"{phase.name}_phase_evidence")
+            self._finalize_unknown(
+                error,
+                f"{phase.name}_phase_evidence",
+                active_phase=phase,
+            )
             raise error
 
     def _activate_boundary(self, phase: ProviderPhase) -> Token[_ActiveBoundary | None]:
@@ -1505,7 +1830,10 @@ class ProtectedOperation:
             return
         with self.sdk.effects.transaction():
             if self.invocation.restore_not_started is not None:
-                self.invocation.restore_not_started()
+                _call_synchronous_hook(
+                    "not-started restoration",
+                    self.invocation.restore_not_started,
+                )
             self._restore_reservations()
             self._release_resource_reservation(reason)
             abandon_external_effect_intent(
@@ -1552,7 +1880,13 @@ class ProtectedOperation:
             phase=phase.name,
         )
 
-    def _finalize_unknown(self, error: BaseException, phase: str) -> None:
+    def _finalize_unknown(
+        self,
+        error: BaseException,
+        phase: str,
+        *,
+        active_phase: ProviderPhase | None = None,
+    ) -> None:
         if self._terminal or self.effect_id is None:
             return
         evidence = self._failure_evidence(error, phase)
@@ -1561,11 +1895,12 @@ class ProtectedOperation:
             if phase in {"caller_failed_after_provider", "protocol_incomplete"}
             else "unknown_after_provider_exception"
         )
+        phase_mutation, phase_flow = self._effect_ceiling(active_phase=active_phase)
         classification = ExternalEffectClassification(
             rollback_class=ExternalEffectRollbackClass.UNKNOWN,
             rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-            state_mutation=self.contract.state_mutation,
-            information_flow=self.contract.information_flow,
+            state_mutation=phase_mutation,
+            information_flow=phase_flow,
             metadata={
                 "outcome": outcome,
                 "phase": phase,
@@ -1640,7 +1975,12 @@ class ProtectedOperation:
             return
         self._failure_settlement_run = True
         with self.sdk.effects.transaction():
-            handler(error, phase)
+            _call_synchronous_hook(
+                "failure settlement",
+                handler,
+                error,
+                phase,
+            )
 
     def _failure_resource_settlement(
         self,
@@ -1870,7 +2210,14 @@ class ProtectedOperation:
         self,
         classification: ExternalEffectClassification,
     ) -> ExternalEffectClassification:
-        """Never let a classifier erase an effect already declared by a phase."""
+        """Preserve effects observed in successfully completed provider phases.
+
+        A contract is a maximum capability/effect declaration, not proof that
+        every successful path exercised that effect.  Explicit completion may
+        therefore narrow the contract, but neither an override nor a provider
+        classifier may erase a phase that actually completed.
+        """
+
         phase_mutation = any(item.state_mutation for item in self._completed_phases)
         phase_flow = any(item.information_flow for item in self._completed_phases)
         return ExternalEffectClassification(
@@ -1879,6 +2226,41 @@ class ProtectedOperation:
             state_mutation=bool(classification.state_mutation or phase_mutation),
             information_flow=bool(classification.information_flow or phase_flow),
             metadata=dict(classification.metadata),
+        )
+
+    def _validate_phase_against_contract(self, phase: ProviderPhase) -> None:
+        """Require every provider phase to stay within its registered ceiling."""
+
+        exceeded: list[str] = []
+        if phase.state_mutation and not self.contract.state_mutation:
+            exceeded.append("state_mutation")
+        if phase.information_flow and not self.contract.information_flow:
+            exceeded.append("information_flow")
+        if exceeded:
+            raise ProtectedOperationProtocolError(
+                "provider phase exceeds protected operation contract ceiling "
+                f"for {self.contract.name}:{phase.name}: {', '.join(exceeded)}"
+            )
+
+    def _effect_ceiling(
+        self,
+        *,
+        active_phase: ProviderPhase | None = None,
+    ) -> tuple[bool, bool]:
+        """Return the conservative ceiling for ambiguous failure settlement."""
+
+        phases = [*self._completed_phases]
+        if active_phase is not None:
+            phases.append(active_phase)
+        return (
+            bool(
+                self.contract.state_mutation
+                or any(item.state_mutation for item in phases)
+            ),
+            bool(
+                self.contract.information_flow
+                or any(item.information_flow for item in phases)
+            ),
         )
 
     def _require_active(self) -> None:

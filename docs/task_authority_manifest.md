@@ -30,6 +30,8 @@ the intersection of the parent manifest, current capability policy, and the
 child manifest ceiling. `CapabilityManager.derive_authority()` and
 `transition_allowed_rights()` are the public transition boundaries used by
 process and checkpoint flows; finite-use authority is never duplicated.
+`compile_root_capabilities()` rejects a manifest with a parent rather than
+recompiling derived authority through root defaults.
 The manifest expiry is a hard upper bound on compiled allow capabilities; an
 individual capability `expires_at` may shorten that lease but cannot extend it.
 Manifest `max_delegation_depth` values are compiled into the durable
@@ -156,12 +158,16 @@ Each entry in `authorized_capabilities` is also closed. It accepts only:
 Unknown capability-entry fields fail validation instead of being discarded.
 When present, `delegable` and `revocable` must be JSON booleans (or Python
 `bool` values through the mapping API). Strings such as `"false"`, numbers,
-and `null` are rejected rather than coerced. Manifest and capability-entry
-`expires_at` values must be non-empty ISO-8601 datetime strings; malformed
-values fail launch validation before a manifest is persisted. `uses_remaining`
+and `null` are rejected rather than coerced. Manifest, authorized-capability,
+and requestable-capability `expires_at` values must be non-empty ISO-8601
+datetime strings; malformed values, including explicit `null`, fail launch
+validation before a manifest is persisted. Omitting `expires_at` remains
+distinct from supplying `null` and means no additional expiry at a root launch
+or inheritance of the parent ceiling at a derived launch. `uses_remaining`
 must be a non-boolean positive integer, and `max_delegation_depth` must be a
-non-boolean non-negative integer. Numeric strings and floats are rejected rather
-than converted or truncated.
+non-boolean non-negative integer. Numeric strings and floats are rejected
+rather than converted or truncated; explicit `null` is rejected for both
+fields, while omission retains the documented default/inheritance behavior.
 
 `approval_policy.requestable_capabilities` is a narrower closed contract. A
 requestable entry requires `resource` and `rights`; `expires_at` is its only

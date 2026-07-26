@@ -18,7 +18,9 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
+    ValidationError,
 )
+from agent_libos.llm.actions import _model_facing_error
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import CommandMetrics, SubprocessTimeoutExpired
 from agent_libos.tools.base import (
@@ -28,6 +30,7 @@ from agent_libos.tools.base import (
     ToolExecutionError,
     ToolPolicy,
 )
+from agent_libos.utils.serde import dumps
 from tests.support.fakes import RecordingActionClient
 from tests.support.runtime import workspace_runtime
 
@@ -52,6 +55,29 @@ class _FailAfterSecretReadTool(SyncAgentTool[_NoArgs]):
             runtime.data_flow.context_from_trusted_source_oids([source.oid])
         )
         raise ToolExecutionError(f"derived failure: {source.payload['value']}")
+
+
+class _DomainFailAfterSecretReadTool(SyncAgentTool[_NoArgs]):
+    description = "Raise a domain exception after observing a labeled Object."
+    args_schema = _NoArgs
+
+    def __init__(self, error_type: type[Exception]) -> None:
+        self._error_type = error_type
+        self.name = f"{error_type.__name__.lower()}_after_secret_read"
+
+    def run(self, args: _NoArgs, ctx: ToolContext) -> None:
+        runtime = ctx.runtime
+        source = runtime.store.get_object_by_name(
+            "hidden-secret",
+            namespace=runtime.memory.resolve_namespace(ctx.pid),
+        )
+        assert source is not None
+        runtime.data_flow.observe_ingress(
+            runtime.data_flow.context_from_trusted_source_oids([source.oid])
+        )
+        raise self._error_type(
+            f"provider/tool diagnostic contains {source.payload['value']}"
+        )
 
 
 class _AsyncFailAfterSecretReadTool(BaseAgentTool[_NoArgs]):
@@ -501,7 +527,8 @@ def test_sync_tool_failure_keeps_worker_labels_and_cannot_be_reexported() -> Non
         result = runtime.tools.call(pid, handle, {})
 
         assert not result.ok
-        assert result.error == "derived failure: DATA_FLOW_SECRET_SENTINEL"
+        assert (result.error or "").startswith("execution_error: ToolExecutionError")
+        assert "DATA_FLOW_SECRET_SENTINEL" not in (result.error or "")
         assert result.result_handle is not None
         stored = runtime.store.get_object(result.result_handle.oid)
         assert stored is not None
@@ -524,6 +551,72 @@ def test_sync_tool_failure_keeps_worker_labels_and_cannot_be_reexported() -> Non
         assert not (root / "failure-leak.txt").exists()
 
 
+@pytest.mark.parametrize("error_type", [ValidationError, CapabilityDenied])
+def test_post_dispatch_domain_exception_text_never_reaches_any_tool_sink(
+    error_type: type[Exception],
+) -> None:
+    secret = "DATA_FLOW_SECRET_SENTINEL"
+    with workspace_runtime() as (runtime, _root):
+        pid = runtime.process.spawn(image="base-agent:v0", goal="opaque tool failure")
+        source = _secret_object(runtime, pid)
+        handle = runtime.tools.register_tool(
+            _DomainFailAfterSecretReadTool(error_type),
+            registered_by="test.host",
+            ephemeral=True,
+        )
+        runtime.tools.configure_process_tools(pid, [handle], assigned_by="test.host")
+
+        result = runtime.tools.call(pid, handle, {})
+
+        assert not result.ok
+        assert result.result_handle is not None
+        durable = runtime.store.get_object(result.result_handle.oid)
+        assert durable is not None
+        failed_events = [
+            event
+            for event in runtime.events.list(target=pid)
+            if event.payload.get("call_id") == result.call_id
+            and event.type is EventType.TOOL_FAILED
+        ]
+        failed_audit = [
+            record
+            for record in runtime.audit.trace(actor=pid)
+            if record.action == "tool.call"
+            and record.decision.get("tool") == handle.name
+            and record.decision.get("ok") is False
+        ]
+        assert len(failed_events) == 1
+        assert len(failed_audit) == 1
+        action_feedback = _model_facing_error(result)
+        failure = durable.payload["failure"]
+        correlation_id = failure["error"]["correlation_id"]
+        assert correlation_id.startswith("corr_")
+        assert failed_audit[0].correlation_id == correlation_id
+        for observation in (
+            failure["internal_error"],
+            failed_events[0].payload["error"],
+            failed_audit[0].decision["error"],
+        ):
+            assert observation["correlation_id"] == correlation_id
+            assert observation["error_type"] == error_type.__name__
+            assert observation["exception_text"]["bytes"] > 0
+            assert len(observation["exception_text"]["sha256"]) == 64
+        serialized = dumps(
+            {
+                "payload": result.payload,
+                "error": result.error,
+                "action_feedback": action_feedback,
+                "durable": durable.payload,
+                "events": [event.payload for event in failed_events],
+                "audit": [record.decision for record in failed_audit],
+            }
+        )
+        assert action_feedback == result.error
+        assert source.oid in durable.provenance.parent_oids
+        assert secret not in serialized
+        assert "provider/tool diagnostic contains" not in serialized
+
+
 def test_async_tool_failure_keeps_child_task_labels() -> None:
     with workspace_runtime() as (runtime, _root):
         pid = runtime.process.spawn(image="base-agent:v0", goal="async labeled failure")
@@ -538,7 +631,8 @@ def test_async_tool_failure_keeps_child_task_labels() -> None:
         result = runtime.tools.call(pid, handle, {})
 
         assert not result.ok
-        assert result.error == "async derived failure: DATA_FLOW_SECRET_SENTINEL"
+        assert (result.error or "").startswith("execution_error: ToolExecutionError")
+        assert "DATA_FLOW_SECRET_SENTINEL" not in (result.error or "")
         assert result.result_handle is not None
         stored = runtime.store.get_object(result.result_handle.oid)
         assert stored is not None
@@ -560,7 +654,7 @@ def test_async_tool_timeout_keeps_cancelled_child_task_labels() -> None:
         result = runtime.tools.call(pid, handle, {})
 
         assert not result.ok
-        assert result.error == "Tool `async_timeout_after_secret_read` timed out."
+        assert (result.error or "").startswith("timeout: TimeoutError")
         assert result.result_handle is not None
         stored = runtime.store.get_object(result.result_handle.oid)
         assert stored is not None
@@ -836,15 +930,36 @@ def test_jit_deferred_lifecycle_failure_persists_labeled_failure_carrier(
 
         assert not result.ok
         assert result.result_handle is not None
+        assert (result.error or "").startswith(
+            "lifecycle_error: CapabilityDenied"
+        )
         assert sentinel not in (result.error or "")
         assert sentinel not in str(result.payload)
         assert result.payload["policy_decision"] == "lifecycle_error"
+        assert result.payload["error"]["type"] == "CapabilityDenied"
+        assert result.payload["error"]["retryable"] is False
         stored_failure = runtime.store.get_object(result.result_handle.oid)
         assert stored_failure is not None
+        assert stored_failure.type == ObjectType.TOOL_RESULT
         assert stored_failure.metadata.sensitivity == "secret"
         assert source.oid in stored_failure.provenance.parent_oids
-        assert sentinel in str(stored_failure.payload)
+        assert sentinel not in str(stored_failure.payload)
+        failure = stored_failure.payload["failure"]
+        assert stored_failure.payload["ok"] is False
+        assert failure["ok"] is False
+        assert failure["policy_decision"] == "lifecycle_error"
+        assert failure["error"]["type"] == "CapabilityDenied"
+        internal_error = failure["internal_error"]
+        assert internal_error["error_type"] == "CapabilityDenied"
+        assert internal_error["exception_text"]["bytes"] > 0
+        assert len(internal_error["exception_text"]["sha256"]) == 64
         assert runtime.process.get(pid).image_id == "toolmaker-agent:v0"
+        retained_tool_results = [
+            obj
+            for obj in runtime.store.list_objects()
+            if obj.type == ObjectType.TOOL_RESULT
+        ]
+        assert [obj.oid for obj in retained_tool_results] == [result.result_handle.oid]
 
         new_audits = runtime.audit.trace()[audit_start:]
         discarded_success_results = [
@@ -861,6 +976,7 @@ def test_jit_deferred_lifecycle_failure_persists_labeled_failure_carrier(
             and record.decision.get("tool") == "jit_labeled_deferred_failure"
         ]
         assert tool_audits[-1].output_refs == [result.result_handle.oid]
+        assert tool_audits[-1].decision["error"]["error_type"] == "CapabilityDenied"
         assert sentinel not in str(tool_audits[-1].decision)
         failure_events = [
             event
@@ -869,7 +985,12 @@ def test_jit_deferred_lifecycle_failure_persists_labeled_failure_carrier(
             and event.payload.get("call_id") == result.call_id
         ]
         assert failure_events[-1].payload["result_oid"] == result.result_handle.oid
+        assert failure_events[-1].payload["error"]["error_type"] == "CapabilityDenied"
         assert sentinel not in str(failure_events[-1].payload)
+        assert not any(
+            record.action == "process.exec" and record.actor == pid
+            for record in new_audits
+        )
         caller_context = runtime.data_flow.current_context()
         assert caller_context.labels.sensitivity.value == "normal"
         assert caller_context.source_refs == ()

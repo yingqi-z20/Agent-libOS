@@ -4,7 +4,13 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import (
+    RuntimePublicationPending,
+    RuntimeRecoveryRequired,
+)
 from agent_libos.tools.base import ToolContext
 from agent_libos.tools.builtin.checkpoint import (
     CreateCheckpointTool,
@@ -613,6 +619,188 @@ def test_fork_failure_preserves_bounded_retry_safety_receipt() -> None:
         "failure_phases": ["fork_commit_confirmation"],
     }
     assert _RECEIPT_SENTINEL not in str(projection)
+
+
+def test_restore_pending_failure_preserves_bounded_reconciliation_receipt() -> None:
+    class Checkpoint:
+        def restore(self, actor: str, checkpoint_id: str):
+            raise RuntimePublicationPending(
+                publication_id="pub_restore_pending",
+                operation_id="op_restore_pending",
+                state="applying",
+                phase="restore_commit",
+            )
+
+    result = RestoreCheckpointTool().invoke(
+        {"checkpoint_id": "ckpt_pending"},
+        _context(Checkpoint()),
+    )
+
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.retryable is False
+    expected = {
+        "checkpoint_id": "ckpt_pending",
+        "publication_id": "pub_restore_pending",
+        "operation_id": "op_restore_pending",
+        "state": "applying",
+        "phase": "restore_commit",
+        "status": "restore_publication_pending",
+        "main_state_committed": None,
+        "reconciliation_pending": True,
+    }
+    assert result.error.details["checkpoint_restore_receipt"] == expected
+    projection = result.model_projection(limit_bytes=4096)
+    assert projection["error"]["details"]["checkpoint_restore_receipt"] == expected
+
+
+def test_restore_recovery_failure_preserves_publication_state() -> None:
+    class Checkpoint:
+        def restore(self, actor: str, checkpoint_id: str):
+            raise RuntimeRecoveryRequired(
+                publication_id="pub_restore_recovery",
+                operation_id="op_restore_recovery",
+                pid="pid_recovery",
+                state="rollback_pending",
+                phase="restore_compensation",
+            )
+
+    result = RestoreCheckpointTool().invoke(
+        {"checkpoint_id": "ckpt_recovery"},
+        _context(Checkpoint()),
+    )
+
+    assert not result.ok
+    assert result.error is not None
+    receipt = result.error.details["checkpoint_restore_receipt"]
+    assert receipt == {
+        "checkpoint_id": "ckpt_recovery",
+        "publication_id": "pub_restore_recovery",
+        "operation_id": "op_restore_recovery",
+        "state": "rollback_pending",
+        "phase": "restore_compensation",
+        "status": "restore_recovery_required",
+        "main_state_committed": None,
+        "reconciliation_pending": True,
+    }
+    assert result.model_projection(limit_bytes=4096)["error"]["details"][
+        "checkpoint_restore_receipt"
+    ] == receipt
+
+
+def test_grouped_restore_failure_preserves_unique_pending_signal() -> None:
+    class Checkpoint:
+        def restore(self, actor: str, checkpoint_id: str):
+            pending = RuntimePublicationPending(
+                publication_id="pub_grouped",
+                operation_id="op_grouped",
+                state="reconciliation_pending",
+                phase="restore_confirmation",
+            )
+            raise ExceptionGroup(
+                "restore confirmation failed",
+                [RuntimeError("primary"), ExceptionGroup("nested", [pending])],
+            )
+
+    result = RestoreCheckpointTool().invoke(
+        {"checkpoint_id": "ckpt_grouped"},
+        _context(Checkpoint()),
+    )
+
+    assert not result.ok
+    assert result.error is not None
+    receipt = result.error.details["checkpoint_restore_receipt"]
+    assert receipt["publication_id"] == "pub_grouped"
+    assert receipt["operation_id"] == "op_grouped"
+    assert receipt["state"] == "reconciliation_pending"
+    assert receipt["phase"] == "restore_confirmation"
+    assert receipt["reconciliation_pending"] is True
+
+
+def test_grouped_restore_failure_rejects_conflicting_pending_signals() -> None:
+    class Checkpoint:
+        def restore(self, actor: str, checkpoint_id: str):
+            raise ExceptionGroup(
+                "conflicting publications",
+                [
+                    RuntimePublicationPending(
+                        publication_id="pub_one",
+                        operation_id="op_one",
+                        state="applying",
+                        phase="first",
+                    ),
+                    RuntimePublicationPending(
+                        publication_id="pub_two",
+                        operation_id="op_two",
+                        state="rollback_pending",
+                        phase="second",
+                    ),
+                ],
+            )
+
+    result = RestoreCheckpointTool().invoke(
+        {"checkpoint_id": "ckpt_conflicting"},
+        _context(Checkpoint()),
+    )
+
+    assert not result.ok
+    assert result.error is not None
+    assert "checkpoint_restore_receipt" not in result.error.details
+
+
+@pytest.mark.parametrize("shape", ["deep", "wide"])
+def test_grouped_restore_failure_bounds_recovery_signal_traversal(shape: str) -> None:
+    pending = RuntimePublicationPending(
+        publication_id="pub_bounded_tree",
+        operation_id="op_bounded_tree",
+        state="reconciliation_pending",
+        phase="restore_confirmation",
+    )
+    if shape == "deep":
+        grouped: Exception = pending
+        for index in range(1_500):
+            grouped = ExceptionGroup(f"nested {index}", [grouped])
+    else:
+        grouped = ExceptionGroup(
+            "wide restore failure",
+            [*(RuntimeError(f"leaf {index}") for index in range(1_100)), pending],
+        )
+
+    class Checkpoint:
+        def restore(self, actor: str, checkpoint_id: str):
+            raise grouped
+
+    result = RestoreCheckpointTool().invoke(
+        {"checkpoint_id": "ckpt_bounded_tree"},
+        _context(Checkpoint()),
+    )
+
+    assert not result.ok
+    assert result.error is not None
+    assert "checkpoint_restore_receipt" not in result.error.details
+
+
+def test_restore_does_not_convert_control_flow_base_exception_group() -> None:
+    class Checkpoint:
+        def restore(self, actor: str, checkpoint_id: str):
+            raise BaseExceptionGroup(
+                "control flow",
+                [
+                    KeyboardInterrupt(),
+                    RuntimePublicationPending(
+                        publication_id="pub_control",
+                        operation_id="op_control",
+                        state="applying",
+                        phase="control",
+                    ),
+                ],
+            )
+
+    with pytest.raises(BaseExceptionGroup):
+        RestoreCheckpointTool().invoke(
+            {"checkpoint_id": "ckpt_control"},
+            _context(Checkpoint()),
+        )
 
 
 def test_fork_tool_rejects_forged_receipt_fields() -> None:

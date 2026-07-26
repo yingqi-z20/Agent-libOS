@@ -5,7 +5,7 @@ allowed-tools: get_working_directory set_working_directory read_directory read_t
 ---
 # Navigate the workspace
 
-Filesystem tool inputs and outputs use different coordinates. Inputs are relative to this process's current working directory (cwd). Returned `working_directory`, `path`, and directory-entry paths are canonical identities relative to the workspace root. Preserve that distinction throughout the task.
+Filesystem tool inputs and outputs use different coordinates. Inputs must be relative to this process's current working directory (cwd); absolute paths are rejected even when they point inside the workspace, and unknown input fields are rejected. Returned `working_directory`, `path`, and directory-entry paths are canonical identities relative to the workspace root. Path separators follow the Host platform: on POSIX a backslash is an ordinary filename character and is preserved exactly. Preserve these distinctions throughout the task.
 
 ## Tool guide
 
@@ -17,7 +17,7 @@ Filesystem tool inputs and outputs use different coordinates. Inputs are relativ
 
 ### `set_working_directory`
 
-- Input: `path`, resolved relative to the old cwd.
+- Input: `path`, resolved relative to the old cwd. The provider's authorized canonical identity is stored exactly on success; it is not trimmed or re-normalized afterward.
 - Output: the selected workspace-root-relative `working_directory`.
 - The runtime first authorizes and observes an existing directory through filesystem-read authority, then records it as this process's cwd. Success proves that observation and the cwd update; it is not a transaction that freezes the directory for later calls.
 - The new cwd affects later filesystem calls and shell subprocess cwd, and new child processes inherit it by default. It does not change the runtime host process cwd.
@@ -31,7 +31,7 @@ Filesystem tool inputs and outputs use different coordinates. Inputs are relativ
 ### `read_text_file`
 
 - Input: cwd-relative `path`, requested `encoding`, and positive `max_bytes` within the configured hard bound.
-- Output: root-relative `path`, decoded `content`, the `encoding` that successfully decoded it, raw-prefix `bytes_read`, and `truncated`. Confirm the returned encoding matches the requested interpretation.
+- Output: root-relative `path`, decoded `content`, the `encoding` that successfully decoded it, raw-prefix `bytes_read`, `truncated`, and `content_sha256`. A complete read returns the SHA-256 of the complete raw file bytes; a truncated read returns `null`. Confirm the returned encoding matches the requested interpretation.
 - Reading starts at byte zero and has no offset or range. `max_bytes` is a byte bound, not a character bound. When truncation cuts a multibyte character at the end, the incomplete character is omitted from `content`, while `bytes_read` still counts the selected raw byte; therefore encoded content length can be less than `bytes_read`. An invalid sequence elsewhere fails decoding instead of returning lossy text.
 
 ## Recommended workflow

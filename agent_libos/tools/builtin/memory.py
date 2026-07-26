@@ -14,6 +14,20 @@ from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, To
 from agent_libos.tools.observability import json_size_bytes
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
+_CREATE_MEMORY_METADATA_FIELDS = frozenset(
+    {
+        "title",
+        "summary",
+        "tags",
+        "mime_type",
+        "sensitivity",
+        "retention_policy",
+        "trust_level",
+        "integrity",
+        "tenant",
+        "principal",
+    }
+)
 
 # The broker persists a wrapper around the model-facing tool data.  Account for
 # fields whose rendered width can vary slightly between this preflight and the
@@ -34,21 +48,6 @@ _DIRECT_JSON_SCHEMA = {
 DirectJsonValue = Annotated[Any, WithJsonSchema(_DIRECT_JSON_SCHEMA)]
 
 
-def _decode_stringified_json_container(value: Any) -> Any:
-    """Normalize provider-stringified objects/arrays without changing scalar strings."""
-
-    if not isinstance(value, str):
-        return value
-    stripped = value.strip()
-    if not stripped or stripped[0] not in "[{":
-        return value
-    try:
-        decoded = json.loads(stripped)
-    except json.JSONDecodeError:
-        return value
-    return decoded if isinstance(decoded, (dict, list)) else value
-
-
 def _empty_optional_text_is_none(value: Any) -> Any:
     if isinstance(value, str) and not value.strip():
         return None
@@ -61,7 +60,8 @@ class CreateMemoryObjectArgs(BaseModel):
     type: str = Field(description="Agent libOS object type, for example summary, plan, observation, or artifact.")
     payload: DirectJsonValue = Field(
         description=(
-            "Direct JSON value to store. Pass objects/arrays as JSON values, not as a JSON-encoded string."
+            "Direct JSON value to store. JSON strings are stored literally; pass an "
+            "object/array value, not a JSON-encoded string, when a container is intended."
         )
     )
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -73,11 +73,6 @@ class CreateMemoryObjectArgs(BaseModel):
         ),
     )
     immutable: bool = True
-
-    @field_validator("payload", mode="before")
-    @classmethod
-    def decode_stringified_payload_container(cls, value: Any) -> Any:
-        return _decode_stringified_json_container(value)
 
     @field_validator("namespace", mode="before")
     @classmethod
@@ -187,18 +182,14 @@ class AppendMemoryObjectArgs(BaseModel):
     namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
     entry: DirectJsonValue = Field(
         description=(
-            "Direct JSON entry to append. Pass an object/array directly, not as a JSON-encoded string."
+            "Direct JSON entry to append. JSON strings are appended literally; pass an "
+            "object/array value, not a JSON-encoded string, when a container is intended."
         )
     )
     list_field: str = Field(
         default="entries",
         description="Payload list field to append into when the object payload is a JSON object.",
     )
-
-    @field_validator("entry", mode="before")
-    @classmethod
-    def decode_stringified_entry_container(cls, value: Any) -> Any:
-        return _decode_stringified_json_container(value)
 
     @field_validator("namespace", mode="before")
     @classmethod
@@ -300,6 +291,14 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
                 "LLM-created objects cannot assert declassification authority.",
                 code=ToolErrorCode.PERMISSION_DENIED,
             )
+        unknown_metadata_fields = sorted(
+            set(args.metadata) - _CREATE_MEMORY_METADATA_FIELDS
+        )
+        if unknown_metadata_fields:
+            raise ToolExecutionError(
+                f"Unsupported object metadata fields: {unknown_metadata_fields}",
+                code=ToolErrorCode.VALIDATION_ERROR,
+            )
         if args.metadata.get("trust_level", "unknown") not in {"untrusted", "unknown"}:
             raise ToolExecutionError(
                 "LLM-created objects cannot elevate trust_level.",
@@ -344,22 +343,29 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
         parent_oids = list(
             dict.fromkeys([*args.parent_oids, *flow_parent_oids])
         )
-        handle = runtime.memory.create_object(
-            pid=ctx.pid,
-            object_type=ObjectType(args.type),
-            payload=args.payload,
-            metadata=metadata,
-            provenance=Provenance(
-                created_from_action="llm.create_memory_object",
-                parent_oids=parent_oids,
-                source_refs=list(durable_source_refs),
-            ),
-            immutable=args.immutable,
-            name=args.name,
-            namespace=args.namespace,
-        )
-        obj = runtime.memory.get_object(ctx.pid, handle)
-        with runtime.store.locked():
+        # Preserve Object Memory's global lock order (ownership, then store) and
+        # keep Object/capability publication atomic with MemoryView attachment.
+        # The nested create/view transactions use savepoints under this outer
+        # transaction, so a view revision/update failure cannot leave an
+        # unreported Object behind.
+        with runtime.memory.ownership_locked(), runtime.store.transaction(
+            include_object_payloads=True
+        ):
+            handle = runtime.memory.create_object(
+                pid=ctx.pid,
+                object_type=ObjectType(args.type),
+                payload=args.payload,
+                metadata=metadata,
+                provenance=Provenance(
+                    created_from_action="llm.create_memory_object",
+                    parent_oids=parent_oids,
+                    source_refs=list(durable_source_refs),
+                ),
+                immutable=args.immutable,
+                name=args.name,
+                namespace=args.namespace,
+            )
+            obj = runtime.memory.get_object(ctx.pid, handle)
             process = runtime.process.get(ctx.pid)
             if process.memory_view is None:
                 process.memory_view = runtime.memory.create_view(ctx.pid, [handle], mode=ViewMode.READ_ONLY)
@@ -370,10 +376,15 @@ class CreateMemoryObjectTool(SyncAgentTool[CreateMemoryObjectArgs]):
                 )
             elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
                 runtime.store.append_process_memory_roots(ctx.pid, [handle])
-        runtime.data_flow.observe_ingress(
-            runtime.data_flow.context_from_trusted_source_oids([obj.oid])
-        )
-        return CreateMemoryObjectOutput(oid=handle.oid, namespace=obj.namespace, name=obj.name, type=args.type)
+            runtime.data_flow.observe_ingress(
+                runtime.data_flow.context_from_trusted_source_oids([obj.oid])
+            )
+            return CreateMemoryObjectOutput(
+                oid=handle.oid,
+                namespace=obj.namespace,
+                name=obj.name,
+                type=args.type,
+            )
 
 
 class CreateMemoryNamespaceTool(SyncAgentTool[CreateMemoryNamespaceArgs]):
@@ -705,11 +716,14 @@ class ReadMemoryObjectTool(SyncAgentTool[ReadMemoryObjectArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         obj = runtime.memory.get_object_by_name(ctx.pid, args.name, namespace=args.namespace)
-        runtime.data_flow.observe_ingress(
-            runtime.data_flow.context_from_trusted_source_oids([obj.oid])
-        )
         selected = _select_json_pointer(obj.payload, args.json_pointer)
         normalized, rendered, rendered_bytes = _canonical_memory_json(selected)
+        # Normalize a legacy non-finite payload before any JSON-backed
+        # observability work.  The frozen snapshot context uses the same finite
+        # projection while preserving the exact Object version and labels.
+        runtime.data_flow.observe_ingress(
+            runtime.data_flow.context_from_object_snapshot(obj)
+        )
         digest = hashlib.sha256(rendered_bytes).hexdigest()
         if args.expected_sha256 is not None and args.expected_sha256 != digest:
             raise ToolExecutionError(

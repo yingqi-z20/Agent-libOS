@@ -33,11 +33,11 @@ class TestGranularPermission:
         assert read_dir_file.ok, read_dir_file.error
         assert read_dir_file.payload['content'] == 'allowed directory file'
         assert not read_denied.ok
-        assert 'lacks read' in (read_denied.error or '')
+        assert (read_denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert write_exact.ok, write_exact.error
         assert write_dir_file.ok, write_dir_file.error
         assert not write_denied.ok
-        assert 'lacks write' in (write_denied.error or '')
+        assert (write_denied.error or '').startswith('permission_denied: CapabilityDenied')
 
     def test_child_inherits_only_explicit_filesystem_subset(self) -> None:
         allowed_dir = f'agent_outputs/inherit_allowed_{uuid4().hex}'
@@ -56,9 +56,9 @@ class TestGranularPermission:
         assert forked.ok, forked.error
         assert child_read.ok, child_read.error
         assert not child_read_denied.ok
-        assert 'lacks read' in (child_read_denied.error or '')
+        assert (child_read_denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert not child_write_denied.ok
-        assert 'lacks write' in (child_write_denied.error or '')
+        assert (child_write_denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert parent_write_allowed.ok, parent_write_allowed.error
 
     def test_child_cannot_inherit_broader_permission_than_parent_has(self) -> None:
@@ -70,7 +70,7 @@ class TestGranularPermission:
         forked = self.runtime.tools.call(parent, 'fork_child_process', {'goal': 'child', 'inherit_read_dirs': [requested_dir]})
         children = self.runtime.process.list_children(parent)
         assert not forked.ok
-        assert 'cannot inherit' in (forked.error or '')
+        assert (forked.error or '').startswith('permission_denied: CapabilityDenied')
         assert children == []
 
     def _write_fixture(self, content: str, path: str | None=None) -> str:

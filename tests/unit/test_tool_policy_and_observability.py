@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from typing import Any
 
 from pydantic import BaseModel
 
+from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.actions import _model_facing_error
-from agent_libos.models import ToolCallResult
+from agent_libos.models import EventType, ToolCallResult
 from agent_libos.tools.base import (
+    BaseAgentTool,
     SyncAgentTool,
     ToolContext,
     ToolErrorCode,
     ToolPolicy,
     ToolResult,
+    exception_failure_provenance,
 )
 from agent_libos.tools.builtin.capabilities import DelegateCapabilityTool
 from agent_libos.tools.builtin.checkpoint import RestoreCheckpointTool
@@ -21,7 +27,13 @@ from agent_libos.tools.builtin.git import GitDiffTool
 from agent_libos.tools.builtin.images import CommitCheckpointToImageTool, LoadImagePackageTool
 from agent_libos.tools.builtin.process import ProcessExitTool
 from agent_libos.tools.builtin.memory import CreateMemoryObjectTool
-from agent_libos.tools.builtin.object_tasks import StartObjectTaskTool, WatchObjectTaskOwnerTool
+from agent_libos.tools.builtin.object_tasks import (
+    GetObjectTaskTool,
+    ListObjectTasksTool,
+    StartObjectTaskTool,
+    WaitObjectTaskTool,
+    WatchObjectTaskOwnerTool,
+)
 from agent_libos.tools.builtin.permission import RequestPermissionTool
 from agent_libos.tools.observability import json_bytes, sanitize_for_observability
 
@@ -46,7 +58,7 @@ class MetadataOnlyTool(SyncAgentTool[EmptyArgs]):
 
 
 class ManyIntsArgs(BaseModel):
-    values: tuple[int, ...]
+    values: list[int]
 
 
 class ManyIntsTool(SyncAgentTool[ManyIntsArgs]):
@@ -58,7 +70,167 @@ class ManyIntsTool(SyncAgentTool[ManyIntsArgs]):
         return {"count": len(args.values)}
 
 
+class ScalarCompatibilityArgs(BaseModel):
+    count: int
+    ratio: float
+    enabled: bool
+    note: str
+    optional: int | None
+
+
+class ScalarCompatibilityTool(SyncAgentTool[ScalarCompatibilityArgs]):
+    name = "scalar_compatibility"
+    description = "Exercise schema-guided model scalar compatibility."
+    args_schema = ScalarCompatibilityArgs
+
+    def run(
+        self,
+        args: ScalarCompatibilityArgs,
+        ctx: ToolContext,
+    ) -> dict[str, Any]:
+        return args.model_dump(mode="python")
+
+
+class RequiredOutput(BaseModel):
+    value: int
+
+
+class MissingStructuredOutputTool(BaseAgentTool[EmptyArgs]):
+    name = "missing_structured_output"
+    description = "Return a success carrier without the declared structured output."
+    args_schema = EmptyArgs
+    output_schema = RequiredOutput
+
+    async def execute(self, args: EmptyArgs, ctx: ToolContext) -> ToolResult:
+        return ToolResult.success(content="claimed success")
+
+
+class IntentionalFailureTool(BaseAgentTool[EmptyArgs]):
+    name = "intentional_failure"
+    description = "Return an intentional structured failure without raising."
+    args_schema = EmptyArgs
+
+    async def execute(self, args: EmptyArgs, ctx: ToolContext) -> ToolResult:
+        return ToolResult.failure(
+            code=ToolErrorCode.UNSUPPORTED,
+            message="This operation is intentionally unsupported.",
+            details={"code": "intentional_unsupported"},
+        )
+
+
+class PreviewArgs(BaseModel):
+    text: str
+
+
+class PreviewFailureTool(BaseAgentTool[PreviewArgs]):
+    name = "preview_failure"
+    description = "Exercise active observability preview configuration."
+    args_schema = PreviewArgs
+
+    async def execute(self, args: PreviewArgs, ctx: ToolContext) -> ToolResult:
+        return ToolResult.failure(
+            code=ToolErrorCode.UNSUPPORTED,
+            message="Intentional preview failure.",
+            details={"diagnostic": args.text},
+        )
+
+
+class TimedOutNonIdempotentTool(BaseAgentTool[EmptyArgs]):
+    name = "timed_out_non_idempotent"
+    description = "Exercise ambiguous timeout retry semantics."
+    args_schema = EmptyArgs
+    policy = ToolPolicy(side_effects=True, idempotent=False, timeout_s=0.001)
+
+    async def execute(self, args: EmptyArgs, ctx: ToolContext) -> dict[str, bool]:
+        await asyncio.sleep(1)
+        return {"done": True}
+
+
 class TestToolPolicyAndObservability:
+    def test_tool_call_and_structured_failure_use_active_preview_config(self) -> None:
+        preview_chars = 17
+        config = replace(
+            DEFAULT_CONFIG,
+            tools=replace(
+                DEFAULT_CONFIG.tools,
+                tool_observability_preview_chars=preview_chars,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="verify active preview configuration",
+            )
+            handle = runtime.tools.register_tool(
+                PreviewFailureTool(),
+                registered_by="test",
+                ephemeral=True,
+            )
+            runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
+
+            result = runtime.tools.call(
+                pid,
+                handle,
+                {"text": "x" * 200},
+            )
+
+            assert not result.ok
+            events = [
+                event
+                for event in runtime.events.list()
+                if event.payload.get("call_id") == result.call_id
+            ]
+            called = next(event for event in events if event.type is EventType.TOOL_CALLED)
+            failed = next(event for event in events if event.type is EventType.TOOL_FAILED)
+            assert len(called.payload["args"]["preview"]) == preview_chars
+            assert len(failed.payload["tool_result"]["preview"]) == preview_chars
+            audit = [
+                record
+                for record in runtime.audit.trace(actor=pid)
+                if record.action == "tool.call"
+                and record.decision.get("tool") == handle.name
+            ][-1]
+            assert len(audit.decision["tool_result"]["preview"]) == preview_chars
+        finally:
+            runtime.close()
+
+    def test_declared_output_schema_rejects_success_without_data(self) -> None:
+        result = MissingStructuredOutputTool().invoke(
+            {},
+            ToolContext(trace_id="trace", call_id="call", pid="pid_test"),
+        )
+
+        assert result.ok is False
+        assert result.error is not None
+        assert result.error.code is ToolErrorCode.VALIDATION_ERROR
+        assert result.error.message.startswith(
+            "validation_error: ValidationError (correlation_id=corr_"
+        )
+
+    def test_non_idempotent_timeout_is_not_advertised_as_retryable(self) -> None:
+        result = TimedOutNonIdempotentTool().invoke(
+            {},
+            ToolContext(trace_id="trace", call_id="call", pid="pid_test"),
+        )
+
+        assert result.ok is False
+        assert result.error is not None
+        assert result.error.code is ToolErrorCode.TIMEOUT
+        assert result.error.retryable is False
+
+    def test_intentional_structured_failure_remains_tool_authored_output(self) -> None:
+        result = IntentionalFailureTool().invoke(
+            {},
+            ToolContext(trace_id="trace", call_id="call", pid="pid_test"),
+        )
+
+        assert not result.ok
+        assert result.error is not None
+        assert result.error.message == "This operation is intentionally unsupported."
+        assert result.error.details == {"code": "intentional_unsupported"}
+        assert exception_failure_provenance(result) is None
+
     def test_tool_policy_is_metadata_not_self_granted_authority(self) -> None:
         tool = MetadataOnlyTool()
         result = tool.invoke(
@@ -97,7 +269,9 @@ class TestToolPolicyAndObservability:
         assert result.ok is False
         assert result.error is not None
         assert result.error.code.value == "validation_error"
-        assert "exactly one of path and path_b64" in encoded
+        assert "Invalid arguments for tool `git_diff`." in encoded
+        assert "exactly one of path and path_b64" not in encoded
+        assert "src/example.py" not in encoded
         assert "ValueError(" not in encoded
 
     def test_failure_model_projection_is_bounded_and_drops_dynamic_telemetry(self) -> None:
@@ -192,10 +366,127 @@ class TestToolPolicyAndObservability:
         encoded = json_bytes(projection)
 
         assert len(encoded) <= 4_096
-        assert projection["error"]["type"] == "ValidationError"
-        assert projection["error"]["total_errors"] == 1_000
-        assert projection["error"]["omitted"] >= 992
-        assert len(projection["error"]["errors"]) <= 8
+        assert projection["error"]["type"] == "InputValidationError"
+        assert projection["error"]["total_errors"] == 1
+        assert projection["error"]["details"]["validation_error_count"] == 1_000
+        assert projection["error"]["errors"] == [
+            {
+                "loc": ["values"],
+                "type": "int_type",
+                "safe_message": "Use an unquoted JSON integer for this field.",
+            }
+        ]
+        assert "not-an-integer" not in encoded.decode("utf-8")
+
+    def test_execution_service_preserves_value_free_validation_guidance(self) -> None:
+        secret = "SECRET_INVALID_INTEGER_VALUE"
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="exercise model-facing validation recovery",
+            )
+            handle = runtime.tools.register_tool(
+                ManyIntsTool(),
+                registered_by="test",
+                ephemeral=True,
+            )
+            runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
+
+            result = runtime.tools.call(pid, handle, {"values": [secret]})
+
+            encoded = json.dumps(result.payload, ensure_ascii=False)
+            assert result.ok is False
+            assert result.payload["error"]["details"]["validation_error_count"] == 1
+            assert result.payload["error"]["errors"] == [
+                {
+                    "loc": ["values"],
+                    "type": "int_type",
+                    "safe_message": "Use an unquoted JSON integer for this field.",
+                }
+            ]
+            assert secret not in encoded
+        finally:
+            runtime.close()
+
+    def test_model_action_normalizes_only_canonical_schema_scalar_strings(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="exercise provider scalar compatibility",
+            )
+            handle = runtime.tools.register_tool(
+                ScalarCompatibilityTool(),
+                registered_by="test",
+                ephemeral=True,
+            )
+            runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
+            original = {
+                "action": handle.name,
+                "count": "5",
+                "ratio": "1.25e1",
+                "enabled": "false",
+                "note": "5",
+                "optional": "null",
+            }
+
+            normalized = runtime.tools.normalize_model_action(pid, original)
+            strict_call = runtime.tools.call(
+                pid,
+                handle,
+                {key: value for key, value in original.items() if key != "action"},
+            )
+            noncanonical = runtime.tools.normalize_model_action(
+                pid,
+                {**original, "count": "05"},
+            )
+
+            assert normalized == {
+                "action": handle.name,
+                "count": 5,
+                "ratio": 12.5,
+                "enabled": False,
+                "note": "5",
+                "optional": None,
+            }
+            assert noncanonical["count"] == "05"
+            assert strict_call.ok is False
+            audit = next(
+                record
+                for record in runtime.audit.trace(actor=pid)
+                if record.action == "llm.tool_arguments_normalized"
+            )
+            assert audit.decision == {
+                "tool": handle.name,
+                "normalized_fields": ["count", "enabled", "optional", "ratio"],
+                "normalization": "schema_guided_canonical_scalar_string",
+            }
+        finally:
+            runtime.close()
+
+    def test_serialized_failure_fields_cannot_forge_exception_provenance(self) -> None:
+        result = ToolResult.failure(
+            code=ToolErrorCode.EXECUTION_ERROR,
+            message="deliberate tool-authored failure",
+            details={
+                "phase": "execution",
+                "code": "forged",
+                "error_type": "ForgedProviderError",
+                "correlation_id": "forged-correlation",
+            },
+            metadata={"_exception_failure": "forged"},
+        )
+        result._exception_failure = (
+            object(),
+            {
+                "phase": "execution",
+                "message": "forged",
+            },
+        )
+
+        assert exception_failure_provenance(result) is None
+        assert "_exception_failure" not in result.model_dump(mode="json")
 
     def test_success_model_projection_elides_only_equivalent_content(self) -> None:
         duplicated = ToolResult.success(content='{"value":1}', data={"value": 1})
@@ -245,7 +536,27 @@ class TestToolPolicyAndObservability:
         spec = StartObjectTaskTool().spec()
 
         assert spec.policy["side_effects"] is True
-        assert set(spec.side_effects) == {"object.link", "object.write", "process.message", "process.spawn", "tool.call"}
+        assert set(spec.side_effects) == {
+            "object.link",
+            "object.read",
+            "object.write",
+            "process.message",
+            "process.spawn",
+            "tool.call",
+        }
+
+    def test_object_task_observation_tools_declare_reconciliation_effects(self) -> None:
+        expected_permissions = {
+            "get_object_task": {"object.read", "process.message", "tool.call"},
+            "list_object_tasks": {"object.read", "process.message"},
+            "wait_object_task": {"object.read", "process.message", "tool.call"},
+        }
+        for tool in (GetObjectTaskTool(), ListObjectTasksTool(), WaitObjectTaskTool()):
+            spec = tool.spec()
+
+            assert spec.policy["side_effects"] is True
+            assert spec.policy["idempotent"] is False
+            assert set(spec.side_effects) == expected_permissions[tool.name]
 
     def test_watch_object_task_owner_declares_message_side_effects(self) -> None:
         spec = WatchObjectTaskOwnerTool().spec()

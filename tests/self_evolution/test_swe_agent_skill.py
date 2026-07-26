@@ -7,6 +7,7 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ProcessStatus
+from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.sandbox import DenoTypescriptSandbox
 
 
@@ -503,12 +504,72 @@ class TestSWEAgentSkill:
                             },
                         }
                     ],
+                    'expected': {},
                 }
             ],
         )
 
         assert not validation.ok
         assert any('truncated' in error.lower() for error in validation.errors)
+
+    @pytest.mark.real_deno
+    def test_swe_edit_rejects_lost_update_after_concurrent_write(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        target = tmp_path / 'document.txt'
+        target.write_text('alpha\nbeta\n', encoding='utf-8')
+        runtime = Runtime.open(
+            'local',
+            substrate=LocalResourceProviderSubstrate(tmp_path),
+        )
+        try:
+            runtime.register_skill_from_path(
+                PACKAGE_ROOT,
+                actor='cli',
+                source_type='workspace',
+            )
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='edit without losing a concurrent update',
+            )
+            runtime.capability.grant(
+                pid,
+                'skill:swe-agent',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            runtime.filesystem.grant_path(
+                pid,
+                'document.txt',
+                [CapabilityRight.READ, CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            runtime.skills.activate_skill(pid, 'swe-agent', actor=pid)
+            original_read = runtime.filesystem.read_text
+
+            def read_then_race(*args: object, **kwargs: object):
+                result = original_read(*args, **kwargs)
+                target.write_text('concurrent\nbeta\n', encoding='utf-8')
+                return result
+
+            monkeypatch.setattr(runtime.filesystem, 'read_text', read_then_race)
+
+            edited = runtime.tools.call(
+                pid,
+                'swe_edit',
+                {
+                    'path': 'document.txt',
+                    'old_text': 'alpha',
+                    'new_text': 'agent',
+                },
+            )
+
+            assert not edited.ok
+            assert target.read_text(encoding='utf-8') == 'concurrent\nbeta\n'
+        finally:
+            runtime.close()
 
     @pytest.mark.real_deno
     @pytest.mark.parametrize(
@@ -549,6 +610,7 @@ class TestSWEAgentSkill:
             [
                 {
                     'args': args,
+                    'expected': {},
                     'syscalls': [
                         {
                             'name': 'filesystem.read_text',
@@ -565,7 +627,9 @@ class TestSWEAgentSkill:
         )
 
         assert not validation.ok
-        assert any(expected_error in error for error in validation.errors)
+        assert any(
+            expected_error in error for error in validation.errors
+        ), validation.errors
 
     @pytest.mark.real_deno
     def test_swe_edit_line_range_preserves_crlf_convention(self) -> None:
@@ -597,6 +661,7 @@ class TestSWEAgentSkill:
                                 'path': 'windows.txt',
                                 'content': original,
                                 'truncated': False,
+                                'content_sha256': '1' * 64,
                             },
                         },
                         {
@@ -605,6 +670,7 @@ class TestSWEAgentSkill:
                                 'path': 'windows.txt',
                                 'content': updated,
                                 'overwrite': True,
+                                'expected_content_sha256': '1' * 64,
                             },
                             'result': {
                                 'path': 'windows.txt',

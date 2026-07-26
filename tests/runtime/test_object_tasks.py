@@ -23,9 +23,11 @@ from agent_libos.models import (
     ObjectPatch,
     ObjectRight,
     ObjectTask,
+    ObjectTaskNotification,
     ObjectTaskNotificationStatus,
     ObjectTaskStatus,
     ObjectType,
+    ProcessMessage,
     ProcessMessageKind,
     ProcessStatus,
     RelationType,
@@ -35,6 +37,9 @@ from agent_libos.process_execution import bind_process_execution
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
+from agent_libos.utils.ids import utc_now
+from agent_libos.utils.serde import dumps, to_jsonable
+from tests.support.public_errors import assert_public_error_message
 
 
 def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
@@ -54,6 +59,19 @@ def _close_fenced_runtime(runtime: Runtime) -> None:
 
     result = runtime.release_recovery_diagnostics()
     assert result["ok"] is True
+
+
+def _object_task_notification_messages(
+    runtime: Runtime,
+    recipient_pid: str,
+    task_id: str,
+) -> list[ProcessMessage]:
+    return [
+        message
+        for message in runtime.store.list_process_messages(recipient_pid)
+        if message.payload.get("type") == "object_task"
+        and message.payload.get("task_id") == task_id
+    ]
 
 
 class EmptyArgs(BaseModel):
@@ -128,7 +146,10 @@ class TestObjectTasks:
             assert completed.status == ObjectTaskStatus.FAILED
             assert completed.result_oid is None
             assert completed.notification.status == ObjectTaskNotificationStatus.DELIVERED
-            assert "injected completion event failure" in str(completed.error)
+            assert str(completed.error).startswith(
+                "internal_error: RuntimeError (correlation_id=corr_"
+            )
+            assert "injected completion event failure" not in str(completed.error)
             assert not any(
                 event.type == EventType.OBJECT_TASK_COMPLETED
                 and event.payload.get("task_id") == task.task_id
@@ -152,6 +173,8 @@ class TestObjectTasks:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         runtime = Runtime.open("local")
+        secret = "notification-secret-Q7m4Tz9Lp2"
+        private_path = "/Users/private/object-task-notification.sock"
         try:
             pid = runtime.process.spawn(
                 image="base-agent:v0",
@@ -167,7 +190,9 @@ class TestObjectTasks:
                 nonlocal attempts
                 attempts += 1
                 if attempts == 1 and phase == "completed":
-                    raise RuntimeError("injected transient notification failure")
+                    raise RuntimeError(
+                        f"injected failure secret={secret} path={private_path}"
+                    )
                 return original_notify(task, phase=phase)
 
             monkeypatch.setattr(notifications, "notify", fail_once)
@@ -185,6 +210,215 @@ class TestObjectTasks:
                     if message.correlation_id == task.task_id
                 ]
             ) == 1
+            diagnostic = next(
+                record
+                for record in runtime.audit.trace()
+                if record.action == "object_task.notification_failed"
+                and record.target == f"object_task:{task.task_id}"
+            )
+            public_error = (diagnostic.decision or {})["public_error"]
+            assert diagnostic.correlation_id == public_error["correlation_id"]
+            assert_public_error_message(
+                public_error["message"],
+                code="object_task_notification_failed",
+                error_type="RuntimeError",
+                forbidden=(secret, private_path),
+            )
+            internal_error = diagnostic.decision["internal_error"]
+            assert internal_error["error_type"] == "RuntimeError"
+            assert internal_error["exception_text"]["bytes"] > 0
+            assert len(internal_error["exception_text"]["sha256"]) == 64
+            serialized = dumps(
+                {
+                    "task": to_jsonable(completed),
+                    "messages": [
+                        to_jsonable(message)
+                        for message in runtime.messages.list(pid)
+                    ],
+                    "audit": to_jsonable(diagnostic),
+                }
+            )
+            assert secret not in serialized
+            assert private_path not in serialized
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("terminal_status", "terminal_phase"),
+        (
+            (ObjectTaskStatus.SUCCEEDED, "completed"),
+            (ObjectTaskStatus.FAILED, "failed"),
+            (ObjectTaskStatus.CANCELLED, "cancelled"),
+        ),
+    )
+    def test_legacy_terminal_delivery_pointing_at_wait_message_is_reconciled_once(
+        self,
+        terminal_status: ObjectTaskStatus,
+        terminal_phase: str,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="repair legacy task notification",
+            )
+            owner = _owner(runtime, pid)
+            task_id = f"otask-legacy-wait-{terminal_status.value}"
+            waiting_message = runtime.messages.post(
+                sender=f"object_task:{task_id}",
+                recipient_pid=pid,
+                channel="object-task",
+                correlation_id=task_id,
+                payload={
+                    "type": "object_task",
+                    "phase": "waiting",
+                    "task_id": task_id,
+                    "owner_oid": owner.oid,
+                    "tool": "legacy.tool",
+                    "status": ObjectTaskStatus.WAITING_MESSAGE.value,
+                    "result_oid": None,
+                    "error": "waiting",
+                    "wait": {"filters": {"channel": "legacy"}},
+                },
+            )
+            now = utc_now()
+            runtime.store.insert_object_task(
+                ObjectTask(
+                    task_id=task_id,
+                    owner_oid=owner.oid,
+                    creator_pid=pid,
+                    runner_pid=None,
+                    tool="legacy.tool",
+                    tool_id=None,
+                    status=terminal_status,
+                    notification=ObjectTaskNotification(
+                        recipient_pid=pid,
+                        channel="object-task",
+                        message_id=waiting_message.message_id,
+                        status=ObjectTaskNotificationStatus.DELIVERED,
+                    ),
+                    error=(
+                        None
+                        if terminal_status == ObjectTaskStatus.SUCCEEDED
+                        else f"legacy {terminal_status.value}"
+                    ),
+                    wait={"filters": {"channel": "legacy"}},
+                    created_at=now,
+                    updated_at=now,
+                    started_at=now,
+                    completed_at=now,
+                )
+            )
+
+            repaired = runtime.object_tasks.get(task_id)
+            repaired_again = runtime.object_tasks.get(task_id)
+
+            assert repaired.status == terminal_status
+            assert repaired.notification.status == ObjectTaskNotificationStatus.DELIVERED
+            notifications = _object_task_notification_messages(runtime, pid, task_id)
+            assert [message.payload["phase"] for message in notifications] == [
+                "waiting",
+                terminal_phase,
+            ]
+            assert repaired.notification.message_id == notifications[-1].message_id
+            assert repaired_again.notification.message_id == notifications[-1].message_id
+            assert len(_object_task_notification_messages(runtime, pid, task_id)) == 2
+        finally:
+            runtime.close()
+
+    def test_terminal_notification_control_failures_remain_retryable_and_text_free(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="preserve notification control flow",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            notifications = runtime.object_tasks._notifications
+            original_notify = notifications.notify
+
+            for error_type in (KeyboardInterrupt, asyncio.CancelledError):
+                secret = f"notification-control-secret-{error_type.__name__}"
+
+                def interrupt_notification(
+                    task: ObjectTask,
+                    *,
+                    phase: str,
+                    _error_type: type[BaseException] = error_type,
+                    _secret: str = secret,
+                ) -> ObjectTask:
+                    if phase == "completed":
+                        raise _error_type(_secret)
+                    return original_notify(task, phase=phase)
+
+                monkeypatch.setattr(
+                    notifications,
+                    "notify",
+                    interrupt_notification,
+                )
+                task = runtime.object_tasks.start(
+                    pid,
+                    owner,
+                    "get_working_directory",
+                    {},
+                )
+                deadline = time.monotonic() + 2.0
+                while True:
+                    terminal = runtime.store.get_object_task(task.task_id)
+                    if (
+                        terminal is not None
+                        and terminal.status == ObjectTaskStatus.SUCCEEDED
+                        and not runtime.object_tasks._has_active_future(task.task_id)
+                    ):
+                        break
+                    if time.monotonic() >= deadline:
+                        pytest.fail(
+                            "object task notification control failure did not settle"
+                        )
+                    time.sleep(0.01)
+
+                assert terminal.notification.status == (
+                    ObjectTaskNotificationStatus.NONE
+                )
+                assert terminal.notification.error is None
+                serialized = dumps(
+                    {
+                        "task": to_jsonable(terminal),
+                        "events": [
+                            to_jsonable(event)
+                            for event in runtime.events.list()
+                            if event.payload.get("task_id") == task.task_id
+                        ],
+                        "audits": [
+                            to_jsonable(record)
+                            for record in runtime.audit.trace()
+                            if record.target == f"object_task:{task.task_id}"
+                        ],
+                    }
+                )
+                assert secret not in serialized
+                assert not any(
+                    record.action == "object_task.notification_failed"
+                    and record.target == f"object_task:{task.task_id}"
+                    for record in runtime.audit.trace()
+                )
+
+                monkeypatch.setattr(notifications, "notify", original_notify)
+                repaired = notifications.retry_terminal(terminal)
+                assert repaired.notification.status == (
+                    ObjectTaskNotificationStatus.DELIVERED
+                )
+                assert len(
+                    [
+                        message
+                        for message in runtime.messages.list(pid)
+                        if message.correlation_id == task.task_id
+                    ]
+                ) == 1
         finally:
             runtime.close()
 
@@ -203,6 +437,14 @@ class TestObjectTasks:
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.completed_at is not None
             assert completed.result_oid is not None
+            assert [
+                message.payload["phase"]
+                for message in _object_task_notification_messages(
+                    runtime,
+                    pid,
+                    task.task_id,
+                )
+            ] == ["completed"]
             result_oid = str(completed.result_oid)
             completed_at = completed.completed_at
         finally:
@@ -219,6 +461,29 @@ class TestObjectTasks:
             assert recovered.wait["previous_result_oid"] == result_oid
             assert "runtime reopen" in str(recovered.error)
             assert reopened.store.get_object(result_oid) is None
+            recovered_notifications = _object_task_notification_messages(
+                reopened,
+                pid,
+                task.task_id,
+            )
+            assert [
+                message.payload["phase"] for message in recovered_notifications
+            ] == ["completed"]
+            assert recovered.notification.status == (
+                ObjectTaskNotificationStatus.FAILED
+            )
+            assert_public_error_message(
+                recovered.notification.error,
+                code="object_task_notification_failed",
+                error_type="ValidationError",
+            )
+            assert any(
+                record.action == "object_task.notification_failed"
+                and record.target == f"object_task:{task.task_id}"
+                and record.decision.get("phase")
+                == "result_unavailable_after_reopen"
+                for record in reopened.audit.trace()
+            )
             assert any(
                 entry.action == "object_task.result_unavailable_recovered"
                 and task.task_id in entry.decision.get("task_ids", [])
@@ -234,6 +499,14 @@ class TestObjectTasks:
             assert recovered_again.result_oid is None
             assert recovered_again.completed_at == completed_at
             assert recovered_again.wait["previous_result_oid"] == result_oid
+            assert [
+                message.payload["phase"]
+                for message in _object_task_notification_messages(
+                    reopened_again,
+                    pid,
+                    task.task_id,
+                )
+            ] == ["completed"]
             assert len(
                 [
                     entry
@@ -244,6 +517,164 @@ class TestObjectTasks:
             ) == 1
         finally:
             reopened_again.close()
+
+    def test_runtime_reopen_abandoned_notification_does_not_reuse_wait_delivery(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        database = tmp_path / "object-task-abandoned-notification.sqlite"
+        task_id = "otask-reopen-waiting-delivered"
+        runtime = Runtime.open(database)
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="receive recovered task notification",
+            )
+            owner = _owner(runtime, pid)
+            assert runtime.object_tasks.shutdown()
+            waiting_message = runtime.messages.post(
+                sender=f"object_task:{task_id}",
+                recipient_pid=pid,
+                channel="object-task",
+                correlation_id=task_id,
+                subject="Object task waiting: receive_process_messages",
+                payload={
+                    "type": "object_task",
+                    "phase": "waiting",
+                    "task_id": task_id,
+                    "owner_oid": owner.oid,
+                    "tool": "receive_process_messages",
+                    "status": ObjectTaskStatus.WAITING_MESSAGE.value,
+                    "result_oid": None,
+                    "error": "waiting for a process message",
+                    "wait": {"filters": {"channel": "never"}},
+                },
+            )
+            now = utc_now()
+            runtime.store.insert_object_task(
+                ObjectTask(
+                    task_id=task_id,
+                    owner_oid=owner.oid,
+                    creator_pid=pid,
+                    runner_pid=None,
+                    tool="receive_process_messages",
+                    tool_id=None,
+                    status=ObjectTaskStatus.WAITING_MESSAGE,
+                    notification=ObjectTaskNotification(
+                        recipient_pid=pid,
+                        channel="object-task",
+                        message_id=waiting_message.message_id,
+                        status=ObjectTaskNotificationStatus.DELIVERED,
+                    ),
+                    wait={"filters": {"channel": "never"}},
+                    error="waiting for a process message",
+                    created_at=now,
+                    updated_at=now,
+                    started_at=now,
+                )
+            )
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            recovered = reopened.object_tasks.get(task_id)
+            assert recovered.status == ObjectTaskStatus.ABANDONED
+            assert recovered.notification.status == ObjectTaskNotificationStatus.FAILED
+            notifications = _object_task_notification_messages(
+                reopened,
+                pid,
+                task_id,
+            )
+            assert [message.payload["phase"] for message in notifications] == [
+                "waiting",
+            ]
+            assert recovered.notification.message_id is None
+            assert_public_error_message(
+                recovered.notification.error,
+                code="object_task_notification_failed",
+                error_type="ValidationError",
+            )
+            assert any(
+                record.action == "object_task.notification_failed"
+                and record.target == f"object_task:{task_id}"
+                and record.decision.get("phase") == "abandoned"
+                for record in reopened.audit.trace()
+            )
+        finally:
+            reopened.close()
+
+        reopened_again = Runtime.open(database)
+        try:
+            recovered_again = reopened_again.object_tasks.get(task_id)
+            assert recovered_again.status == ObjectTaskStatus.ABANDONED
+            assert [
+                message.payload["phase"]
+                for message in _object_task_notification_messages(
+                    reopened_again,
+                    pid,
+                    task_id,
+                )
+            ] == ["waiting"]
+        finally:
+            reopened_again.close()
+
+    def test_result_unavailable_recovery_marks_terminal_recipient_undelivered(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        database = tmp_path / "object-task-result-terminal-recipient.sqlite"
+        runtime = Runtime.open(database)
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="recover missing task result",
+            )
+            _grant_process_spawn(runtime, pid)
+            recipient = runtime.spawn_child_process(pid, "terminal notification target")
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "get_working_directory",
+                {},
+                notify_pid=recipient,
+            )
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.result_oid is not None
+            runtime.process.exit(recipient, message="recipient exited")
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            recovered = reopened.object_tasks.get(task.task_id, actor_pid=pid)
+            assert recovered.status == ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN
+            assert recovered.notification.status == (
+                ObjectTaskNotificationStatus.UNDELIVERED_TERMINAL
+            )
+            notifications = _object_task_notification_messages(
+                reopened,
+                recipient,
+                task.task_id,
+            )
+            assert [message.payload["phase"] for message in notifications] == [
+                "completed"
+            ]
+            assert any(
+                event.type == EventType.OBJECT_TASK_NOTIFICATION_UNDELIVERED
+                and event.payload.get("task_id") == task.task_id
+                and event.payload.get("status")
+                == ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN.value
+                for event in reopened.events.list()
+            )
+        finally:
+            reopened.close()
 
     def test_cross_actor_task_view_and_cancel_consume_one_shot_authority(self) -> None:
         runtime = Runtime.open("local")
@@ -289,6 +720,321 @@ class TestObjectTasks:
             assert runtime.store.get_capability(read_cap.cap_id).uses_remaining == 0
             with pytest.raises(CapabilityDenied):
                 runtime.object_tasks.get(tasks[1].task_id, actor_pid=actor)
+        finally:
+            runtime.close()
+
+    def test_cross_actor_watch_and_terminal_cancel_each_consume_one_shot_write(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            creator = runtime.process.spawn(image="base-agent:v0", goal="watch creator")
+            actor = runtime.process.spawn(image="base-agent:v0", goal="watch controller")
+            _grant_process_spawn(runtime, creator)
+            owner = _owner(runtime, creator)
+            waiting_task = runtime.object_tasks.start(
+                creator,
+                owner,
+                "receive_process_messages",
+                {"channel": "never-watch-controller"},
+            )
+            waiting_task = runtime.object_tasks.wait(
+                waiting_task.task_id,
+                actor_pid=creator,
+                timeout=2,
+            )
+            assert waiting_task.status == ObjectTaskStatus.WAITING_MESSAGE
+
+            watch_cap = runtime.capability.grant_once(
+                actor,
+                f"object:{owner.oid}",
+                [ObjectRight.WRITE],
+                issued_by="test",
+            )
+            watched = runtime.object_tasks.watch_owner(
+                waiting_task.task_id,
+                actor_pid=actor,
+                enabled=True,
+                events=["updated"],
+            )
+            assert watched.owner_watch.enabled
+            assert runtime.store.get_capability(watch_cap.cap_id).uses_remaining == 0
+            with pytest.raises(CapabilityDenied):
+                runtime.object_tasks.watch_owner(
+                    waiting_task.task_id,
+                    actor_pid=actor,
+                    enabled=False,
+                )
+
+            terminal_task = runtime.object_tasks.start(
+                creator,
+                owner,
+                "get_working_directory",
+                {},
+            )
+            terminal_task = runtime.object_tasks.wait(
+                terminal_task.task_id,
+                actor_pid=creator,
+                timeout=2,
+            )
+            assert terminal_task.status == ObjectTaskStatus.SUCCEEDED
+            cancel_cap = runtime.capability.grant_once(
+                actor,
+                f"object:{owner.oid}",
+                [ObjectRight.WRITE],
+                issued_by="test",
+            )
+            same_terminal = runtime.object_tasks.cancel(
+                terminal_task.task_id,
+                actor_pid=actor,
+            )
+            assert same_terminal.status == ObjectTaskStatus.SUCCEEDED
+            assert runtime.store.get_capability(cancel_cap.cap_id).uses_remaining == 0
+            with pytest.raises(CapabilityDenied):
+                runtime.object_tasks.cancel(
+                    terminal_task.task_id,
+                    actor_pid=actor,
+                )
+        finally:
+            runtime.close()
+
+    def test_cross_actor_wait_consumes_visibility_once_at_entry(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            creator = runtime.process.spawn(image="base-agent:v0", goal="wait creator")
+            actor = runtime.process.spawn(image="base-agent:v0", goal="wait observer")
+            _grant_process_spawn(runtime, creator)
+            owner = _owner(runtime, creator)
+            task = runtime.object_tasks.start(
+                creator,
+                owner,
+                "receive_process_messages",
+                {"channel": "never-wait-observer"},
+            )
+            task = runtime.object_tasks.wait(task.task_id, actor_pid=creator, timeout=2)
+            assert task.status == ObjectTaskStatus.WAITING_MESSAGE
+            read_cap = runtime.capability.grant_once(
+                actor,
+                f"object:{owner.oid}",
+                [ObjectRight.READ],
+                issued_by="test",
+            )
+
+            observed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=actor,
+                timeout=0.01,
+            )
+
+            assert observed.task_id == task.task_id
+            assert runtime.store.get_capability(read_cap.cap_id).uses_remaining == 0
+            with pytest.raises(CapabilityDenied):
+                runtime.object_tasks.wait(
+                    task.task_id,
+                    actor_pid=actor,
+                    timeout=0,
+                )
+        finally:
+            runtime.close()
+
+    def test_cross_actor_list_revalidates_every_resource_and_consumes_shared_grant_once(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            creator = runtime.process.spawn(image="base-agent:v0", goal="list creator")
+            actor = runtime.process.spawn(image="base-agent:v0", goal="list observer")
+            _grant_process_spawn(runtime, creator)
+            owner = _owner(runtime, creator)
+            tasks = [
+                runtime.object_tasks.start(
+                    creator,
+                    owner,
+                    "get_working_directory",
+                    {},
+                )
+                for _ in range(2)
+            ]
+            for task in tasks:
+                runtime.object_tasks.wait(task.task_id, actor_pid=creator, timeout=2)
+            read_cap = runtime.capability.grant_once(
+                actor,
+                f"object:{owner.oid}",
+                [ObjectRight.READ],
+                issued_by="test",
+            )
+
+            visible = runtime.object_tasks.list(actor_pid=actor)
+
+            assert {task.task_id for task in visible} == {task.task_id for task in tasks}
+            assert runtime.store.get_capability(read_cap.cap_id).uses_remaining == 0
+            reservations = [
+                row
+                for row in runtime.store.select_table_rows("capability_use_reservations")
+                if row["cap_id"] == read_cap.cap_id
+            ]
+            assert [row["status"] for row in reservations] == ["committed"]
+            assert runtime.object_tasks.list(actor_pid=actor) == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("operation", ["watch", "cancel"])
+    def test_cross_actor_task_mutation_failure_rolls_back_authority_and_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            creator = runtime.process.spawn(image="base-agent:v0", goal=f"{operation} rollback creator")
+            actor = runtime.process.spawn(image="base-agent:v0", goal=f"{operation} rollback actor")
+            _grant_process_spawn(runtime, creator)
+            owner = _owner(runtime, creator)
+            task = runtime.object_tasks.start(
+                creator,
+                owner,
+                "receive_process_messages",
+                {"channel": f"never-{operation}-rollback"},
+            )
+            task = runtime.object_tasks.wait(task.task_id, actor_pid=creator, timeout=2)
+            assert task.status == ObjectTaskStatus.WAITING_MESSAGE
+            authority = runtime.capability.grant_once(
+                actor,
+                f"object:{owner.oid}",
+                [ObjectRight.WRITE],
+                issued_by="test",
+            )
+            before = runtime.object_tasks.get(task.task_id, actor_pid=creator)
+            before_reservations = runtime.store.select_table_rows(
+                "capability_use_reservations"
+            )
+            original_record = runtime.audit.record
+            failed_action = (
+                "object_task.owner_watch.register"
+                if operation == "watch"
+                else "object_task.cancel"
+            )
+
+            def fail_after_audit(*args, **kwargs):
+                result = original_record(*args, **kwargs)
+                if kwargs.get("action") == failed_action:
+                    raise RuntimeError(f"injected {operation} audit failure")
+                return result
+
+            monkeypatch.setattr(runtime.audit, "record", fail_after_audit)
+
+            with pytest.raises(RuntimeError, match=f"injected {operation} audit failure"):
+                if operation == "watch":
+                    runtime.object_tasks.watch_owner(
+                        task.task_id,
+                        actor_pid=actor,
+                        enabled=True,
+                        events=["updated"],
+                    )
+                else:
+                    runtime.object_tasks.cancel(
+                        task.task_id,
+                        actor_pid=actor,
+                    )
+
+            persisted = runtime.store.get_capability(authority.cap_id)
+            assert persisted is not None and persisted.active
+            assert persisted.uses_remaining == 1
+            assert runtime.store.select_table_rows(
+                "capability_use_reservations"
+            ) == before_reservations
+            after = runtime.object_tasks.get(task.task_id, actor_pid=creator)
+            assert after.status == before.status
+            assert after.owner_watch == before.owner_watch
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("operation", ["read", "watch", "cancel"])
+    @pytest.mark.parametrize("state_change", ["deny", "revoke", "expire"])
+    def test_cross_actor_task_operation_observes_committed_authority_change(
+        self,
+        operation: str,
+        state_change: str,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            creator = runtime.process.spawn(image="base-agent:v0", goal="authority race creator")
+            actor = runtime.process.spawn(image="base-agent:v0", goal="authority race actor")
+            _grant_process_spawn(runtime, creator)
+            owner = _owner(runtime, creator)
+            task = runtime.object_tasks.start(
+                creator,
+                owner,
+                "receive_process_messages",
+                {"channel": f"never-{operation}-{state_change}"},
+            )
+            task = runtime.object_tasks.wait(task.task_id, actor_pid=creator, timeout=2)
+            assert task.status == ObjectTaskStatus.WAITING_MESSAGE
+            right = ObjectRight.READ if operation == "read" else ObjectRight.WRITE
+            authority = runtime.capability.grant_once(
+                actor,
+                f"object:{owner.oid}",
+                [right],
+                issued_by="test",
+                expires_at="2999-01-01T00:00:00Z",
+            )
+            state_changed = threading.Event()
+            operation_started = threading.Event()
+
+            def invalidate_authority() -> str:
+                with runtime.store.transaction():
+                    if state_change == "deny":
+                        runtime.capability.issue_trusted(
+                            actor,
+                            authority.resource,
+                            [right],
+                            issued_by="test",
+                            effect=CapabilityEffect.DENY,
+                        )
+                    elif state_change == "revoke":
+                        runtime.capability.revoke(
+                            authority.cap_id,
+                            revoked_by="test",
+                            reason="task authority race",
+                            require_authority=False,
+                        )
+                    else:
+                        runtime.store.update_capability(
+                            replace(
+                                authority,
+                                expires_at="2000-01-01T00:00:00+00:00",
+                            )
+                        )
+                    state_changed.set()
+                    assert operation_started.wait(timeout=5)
+                return "changed"
+
+            def attempt_operation() -> str:
+                assert state_changed.wait(timeout=5)
+                operation_started.set()
+                try:
+                    if operation == "read":
+                        runtime.object_tasks.get(task.task_id, actor_pid=actor)
+                    elif operation == "watch":
+                        runtime.object_tasks.watch_owner(
+                            task.task_id,
+                            actor_pid=actor,
+                            enabled=True,
+                            events=["updated"],
+                        )
+                    else:
+                        runtime.object_tasks.cancel(task.task_id, actor_pid=actor)
+                except CapabilityDenied:
+                    return "denied"
+                return "allowed"
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                invalidation = pool.submit(invalidate_authority)
+                attempted = pool.submit(attempt_operation)
+                assert invalidation.result(timeout=10) == "changed"
+                assert attempted.result(timeout=10) == "denied"
+
+            after = runtime.object_tasks.get(task.task_id, actor_pid=creator)
+            assert after.status == ObjectTaskStatus.WAITING_MESSAGE
+            assert not after.owner_watch.enabled
+            persisted = runtime.store.get_capability(authority.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 1
         finally:
             runtime.close()
     def test_object_task_runs_visible_tool_links_result_and_notifies_creator(self) -> None:
@@ -399,7 +1145,22 @@ class TestObjectTasks:
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.result_oid is not None
             assert completed.notification.status == ObjectTaskNotificationStatus.FAILED
-            assert "data_flow_policy" in (completed.notification.error or "")
+            correlation_id = assert_public_error_message(
+                completed.notification.error,
+                code="object_task_notification_failed",
+                error_type="CapabilityDenied",
+                forbidden=("data_flow_policy",),
+            )
+            diagnostic = next(
+                record
+                for record in runtime.audit.trace()
+                if record.action == "object_task.notification_failed"
+                and record.target == f"object_task:{task.task_id}"
+                and record.correlation_id == correlation_id
+            )
+            assert diagnostic.decision["internal_error"]["error_type"] == (
+                "CapabilityDenied"
+            )
             assert runtime.messages.unread(recipient) == []
             with pytest.raises(CapabilityDenied):
                 runtime.memory.handle_for_oid(
@@ -416,6 +1177,8 @@ class TestObjectTasks:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         runtime = Runtime.open("local")
+        secret = "notification-secret-J4x8Vq2Lm7"
+        private_path = "/Users/private/object-task-notification.sock"
         try:
             parent = runtime.process.spawn(image="base-agent:v0", goal="parent")
             _grant_process_spawn(runtime, parent)
@@ -430,7 +1193,9 @@ class TestObjectTasks:
             )
 
             def fail_notification(*_args: object, **_kwargs: object) -> object:
-                raise ProcessError("injected object task notification failure")
+                raise ProcessError(
+                    f"injected failure secret={secret} path={private_path}"
+                )
 
             monkeypatch.setattr(runtime.messages, "post", fail_notification)
             task = runtime.object_tasks.start(
@@ -451,9 +1216,36 @@ class TestObjectTasks:
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.result_oid is not None
             assert completed.notification.status == ObjectTaskNotificationStatus.FAILED
-            assert "injected object task notification failure" in (
-                completed.notification.error or ""
+            correlation_id = assert_public_error_message(
+                completed.notification.error,
+                code="object_task_notification_failed",
+                error_type="ProcessError",
+                forbidden=(secret, private_path),
             )
+            diagnostic = next(
+                record
+                for record in runtime.audit.trace()
+                if record.action == "object_task.notification_failed"
+                and record.target == f"object_task:{task.task_id}"
+                and record.correlation_id == correlation_id
+            )
+            serialized = dumps(
+                {
+                    "task": to_jsonable(completed),
+                    "messages": [
+                        to_jsonable(message)
+                        for message in runtime.messages.list(recipient)
+                    ],
+                    "events": [
+                        to_jsonable(event)
+                        for event in runtime.events.list()
+                        if event.payload.get("task_id") == task.task_id
+                    ],
+                    "audit": to_jsonable(diagnostic),
+                }
+            )
+            assert secret not in serialized
+            assert private_path not in serialized
             with pytest.raises(CapabilityDenied):
                 runtime.memory.handle_for_oid(
                     recipient,
@@ -551,7 +1343,7 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
-    def test_object_task_start_consumes_finite_spawn_attempt_before_runner_creation(
+    def test_object_task_start_restores_finite_spawn_attempt_before_runner_creation(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -597,12 +1389,7 @@ class TestObjectTasks:
                 process.pid for process in runtime.store.list_processes()
             } == before_process_ids
             assert runtime.store.list_object_tasks(include_terminal=True) == []
-            assert runtime.store.get_capability(spawn_cap.cap_id).uses_remaining == 0
-            assert any(
-                record.action == "capability.consume"
-                and spawn_cap.cap_id in record.capability_refs
-                for record in runtime.audit.trace()
-            )
+            assert runtime.store.get_capability(spawn_cap.cap_id).uses_remaining == 1
             assert not any(
                 event.type == EventType.OBJECT_TASK_STARTED
                 for event in runtime.store.list_events()
@@ -1393,7 +2180,10 @@ class TestObjectTasks:
             failed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
 
             assert failed.status == ObjectTaskStatus.FAILED
-            assert "result link failed" in (failed.error or "")
+            assert (failed.error or "").startswith(
+                "internal_error: RuntimeError (correlation_id=corr_"
+            )
+            assert "result link failed" not in (failed.error or "")
             assert len(result_oids) == 1
             assert runtime.store.get_object(result_oids[0]) is None
             runner = runtime.store.get_process(str(task.runner_pid))
@@ -1430,7 +2220,10 @@ class TestObjectTasks:
 
             assert failed_success_commit
             assert failed.status == ObjectTaskStatus.FAILED
-            assert "object task success commit failed" in (failed.error or "")
+            assert (failed.error or "").startswith(
+                "internal_error: RuntimeError (correlation_id=corr_"
+            )
+            assert "object task success commit failed" not in (failed.error or "")
             assert runtime.store.list_objects_owned_by(ObjectOwnerKind.OBJECT_TASK, task.task_id) == []
             runner = runtime.store.get_process(str(task.runner_pid))
             assert runner is not None
@@ -1606,7 +2399,12 @@ class TestObjectTasks:
             second_completed = runtime.object_tasks.wait(second.task_id, actor_pid=parent, timeout=2)
 
             assert second_completed.status == ObjectTaskStatus.FAILED
-            assert "cannot grant object task result" in (second_completed.error or "")
+            assert (second_completed.error or "").startswith(
+                "internal_error: CapabilityDenied (correlation_id=corr_"
+            )
+            assert "cannot grant object task result" not in (
+                second_completed.error or ""
+            )
             notify_object_grants = [
                 cap
                 for cap in runtime.capability.list_subject(recipient)
@@ -1678,7 +2476,113 @@ class TestObjectTasks:
             completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
 
             assert completed.status == ObjectTaskStatus.SUCCEEDED
+            notifications = _object_task_notification_messages(
+                runtime,
+                pid,
+                task.task_id,
+            )
+            assert [message.payload["phase"] for message in notifications] == [
+                "waiting",
+                "completed",
+            ]
+            assert waiting.notification.message_id == notifications[0].message_id
+            assert completed.notification.message_id == notifications[1].message_id
             assert any(record.action == "object_task.owner_watch.resume" for record in runtime.audit.trace())
+        finally:
+            runtime.close()
+
+    def test_waiting_object_task_cancel_replaces_wait_notification_with_terminal_notification(
+        self,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="cancel waiting task")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": "cancel-waiting"},
+            )
+            waiting = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+
+            cancelled = runtime.object_tasks.cancel(
+                task.task_id,
+                actor_pid=pid,
+                reason="cancel after wait",
+            )
+
+            assert cancelled.status == ObjectTaskStatus.CANCELLED
+            notifications = _object_task_notification_messages(
+                runtime,
+                pid,
+                task.task_id,
+            )
+            assert [message.payload["phase"] for message in notifications] == [
+                "waiting",
+                "cancelled",
+            ]
+            assert waiting.notification.message_id == notifications[0].message_id
+            assert cancelled.notification.message_id == notifications[1].message_id
+        finally:
+            runtime.close()
+
+    def test_waiting_object_task_failure_has_a_distinct_terminal_notification(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="fail resumed task")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": "fail-on-resume"},
+            )
+            waiting = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+
+            async def fail_resumed_call(*_args: object, **_kwargs: object) -> object:
+                raise RuntimeError("injected resumed task failure")
+
+            monkeypatch.setattr(runtime.object_tasks._tools, "acall", fail_resumed_call)
+            runtime.messages.post(
+                sender=pid,
+                recipient_pid=str(waiting.runner_pid),
+                channel="fail-on-resume",
+                subject="resume and fail",
+            )
+            failed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+
+            assert failed.status == ObjectTaskStatus.FAILED
+            notifications = _object_task_notification_messages(
+                runtime,
+                pid,
+                task.task_id,
+            )
+            assert [message.payload["phase"] for message in notifications] == [
+                "waiting",
+                "failed",
+            ]
+            assert waiting.notification.message_id == notifications[0].message_id
+            assert failed.notification.message_id == notifications[1].message_id
         finally:
             runtime.close()
 
@@ -1757,6 +2661,16 @@ class TestObjectTasks:
             completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
 
             assert completed.status == ObjectTaskStatus.SUCCEEDED
+            notifications = _object_task_notification_messages(
+                runtime,
+                pid,
+                task.task_id,
+            )
+            assert [message.payload["phase"] for message in notifications] == [
+                "waiting",
+                "completed",
+            ]
+            assert completed.notification.message_id == notifications[-1].message_id
             assert any(record.action == "object_task.process_resume" for record in runtime.audit.trace())
         finally:
             runtime.close()
@@ -1806,6 +2720,17 @@ class TestObjectTasks:
             completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
 
             assert completed.status == ObjectTaskStatus.SUCCEEDED
+            notifications = _object_task_notification_messages(
+                runtime,
+                pid,
+                task.task_id,
+            )
+            assert [message.payload["phase"] for message in notifications] == [
+                "waiting",
+                "completed",
+            ]
+            assert waiting.notification.message_id == notifications[0].message_id
+            assert completed.notification.message_id == notifications[1].message_id
             payload = runtime.store.get_object(str(completed.result_oid)).payload
             assert payload["result"]["status"] == "approved"
             assert any(record.action == "object_task.human_resume" for record in runtime.audit.trace())
@@ -1847,6 +2772,105 @@ class TestObjectTasks:
                 ref["oid"] for ref in message["metadata"]["data_flow_context"]["source_refs"]
             ] == [owner.oid]
             assert any(record.action == "object_task.owner_watch.resume" for record in runtime.audit.trace())
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        "owner_watch",
+        (
+            {"enabled": "false"},
+            {"enabled": 0},
+            {"enabled": 1},
+            {"enabled": None},
+            "false",
+            1,
+        ),
+    )
+    def test_object_task_owner_watch_rejects_non_boolean_enablement_before_side_effects(
+        self,
+        owner_watch: object,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="strict watch")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            children_before = tuple(
+                process.pid
+                for process in runtime.store.list_processes()
+                if process.parent_pid == pid
+            )
+            tasks_before = tuple(
+                task.task_id
+                for task in runtime.object_tasks.list()
+            )
+            audit_before = len(runtime.audit.trace())
+
+            with pytest.raises(
+                ValidationError,
+                match=r"owner_watch(?:\.enabled)? must be",
+            ):
+                runtime.object_tasks.start(
+                    pid,
+                    owner,
+                    "get_working_directory",
+                    {},
+                    owner_watch=owner_watch,  # type: ignore[arg-type]
+                )
+
+            assert tuple(
+                process.pid
+                for process in runtime.store.list_processes()
+                if process.parent_pid == pid
+            ) == children_before
+            assert tuple(
+                task.task_id
+                for task in runtime.object_tasks.list()
+            ) == tasks_before
+            assert len(runtime.audit.trace()) == audit_before
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        "grant_result_to_notify",
+        ("false", 0, 1, None),
+    )
+    def test_object_task_rejects_non_boolean_result_grant_before_side_effects(
+        self,
+        grant_result_to_notify: object,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="strict result grant")
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            process_ids_before = tuple(
+                process.pid for process in runtime.store.list_processes()
+            )
+            task_ids_before = tuple(
+                task.task_id for task in runtime.object_tasks.list()
+            )
+            audit_before = len(runtime.audit.trace())
+
+            with pytest.raises(
+                ValidationError,
+                match="grant_result_to_notify must be a boolean",
+            ):
+                runtime.object_tasks.start(
+                    pid,
+                    owner,
+                    "get_working_directory",
+                    {},
+                    grant_result_to_notify=grant_result_to_notify,  # type: ignore[arg-type]
+                )
+
+            assert tuple(
+                process.pid for process in runtime.store.list_processes()
+            ) == process_ids_before
+            assert tuple(
+                task.task_id for task in runtime.object_tasks.list()
+            ) == task_ids_before
+            assert len(runtime.audit.trace()) == audit_before
         finally:
             runtime.close()
 
@@ -2430,6 +3454,277 @@ class TestObjectTasks:
 
             assert result["ok"] is True
         finally:
+            runtime.close()
+
+    def test_object_task_base_exception_fails_only_that_task_and_worker_survives(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        secret = "object-task-secret-R8m2Kx7Qp4Vn9Lc5"
+        private_path = "/Users/private/object-task/provider.sqlite"
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="isolate object task base exception",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            original_acall = runtime.object_tasks._tools.acall
+            calls = 0
+
+            async def raise_keyboard_interrupt_once(
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise KeyboardInterrupt(
+                        f"injected failure secret={secret} path={private_path}"
+                    )
+                return await original_acall(*args, **kwargs)
+
+            monkeypatch.setattr(
+                runtime.object_tasks._tools,
+                "acall",
+                raise_keyboard_interrupt_once,
+            )
+
+            failed_task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "get_working_directory",
+                {},
+            )
+            failed = runtime.object_tasks.wait(
+                failed_task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+
+            assert failed.status == ObjectTaskStatus.FAILED
+            assert (failed.error or "").startswith(
+                "internal_error: KeyboardInterrupt (correlation_id=corr_"
+            )
+            assert failed.notification.status == ObjectTaskNotificationStatus.DELIVERED
+            runner = runtime.process.get(str(failed.runner_pid))
+            assert runner.status in (
+                runtime.process.TERMINAL_STATUSES
+            )
+            assert runtime.object_tasks._thread.is_alive()
+            assert any(
+                record.action == "object_task.failed"
+                and record.target == f"object_task:{failed.task_id}"
+                for record in runtime.audit.trace()
+            )
+            diagnostic = next(
+                record
+                for record in runtime.audit.trace()
+                if record.action == "object_task.failure_diagnostic"
+                and record.target == f"object_task:{failed.task_id}"
+            )
+            correlation_id = (failed.error or "").split(
+                "correlation_id=", 1
+            )[1].removesuffix(")")
+            assert diagnostic.correlation_id == correlation_id
+            assert set(diagnostic.decision or {}) == {
+                "error_type",
+                "exception_text",
+            }
+            assert diagnostic.decision["error_type"] == "KeyboardInterrupt"
+            assert diagnostic.decision["exception_text"]["bytes"] > 0
+            assert len(diagnostic.decision["exception_text"]["sha256"]) == 64
+
+            failed_event = next(
+                event
+                for event in runtime.events.list()
+                if event.type == EventType.OBJECT_TASK_FAILED
+                and event.payload.get("task_id") == failed.task_id
+            )
+            serialized = dumps(
+                {
+                    "task": to_jsonable(failed),
+                    "runner": to_jsonable(runner),
+                    "event": to_jsonable(failed_event),
+                    "audits": [
+                        to_jsonable(record)
+                        for record in runtime.audit.trace()
+                        if record.target == f"object_task:{failed.task_id}"
+                    ],
+                }
+            )
+            assert secret not in serialized
+            assert private_path not in serialized
+
+            succeeding_task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "get_working_directory",
+                {},
+            )
+            succeeded = runtime.object_tasks.wait(
+                succeeding_task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+
+            assert succeeded.status == ObjectTaskStatus.SUCCEEDED
+            assert calls == 2
+        finally:
+            runtime.close()
+
+    def test_object_task_owner_watch_delivery_error_uses_safe_correlated_evidence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        secret = "owner-watch-secret-F4n8Qx2Mz7"
+        private_path = "/Users/private/owner-watch.sock"
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="safe owner watch delivery failure",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": runtime.config.object_tasks.owner_watch_channel},
+                owner_watch=True,
+            )
+            waiting = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+            original_post = runtime.object_tasks._messages.post
+
+            def fail_owner_watch_post(*args: object, **kwargs: object) -> object:
+                if str(kwargs.get("sender", "")).startswith(
+                    "object_task_owner_watch:"
+                ):
+                    raise RuntimeError(
+                        f"delivery failed secret={secret} path={private_path}"
+                    )
+                return original_post(*args, **kwargs)
+
+            monkeypatch.setattr(
+                runtime.object_tasks._messages,
+                "post",
+                fail_owner_watch_post,
+            )
+
+            runtime.memory.update_object(
+                pid,
+                owner,
+                ObjectPatch(payload={"name": "owner", "version": 2}),
+            )
+
+            event = next(
+                item
+                for item in runtime.events.list()
+                if item.type == EventType.OBJECT_TASK_OWNER_CHANGE_UNDELIVERED
+                and item.payload.get("task_id") == task.task_id
+            )
+            audit = next(
+                record
+                for record in runtime.audit.trace()
+                if record.action == "object_task.owner_watch.undelivered"
+                and record.target == f"object_task:{task.task_id}"
+            )
+            assert event.correlation_id is not None
+            assert audit.correlation_id == event.correlation_id
+            assert event.payload["error"] == (
+                "internal_error: RuntimeError "
+                f"(correlation_id={event.correlation_id})"
+            )
+            assert set((audit.decision or {})["internal_error"]) == {
+                "error_type",
+                "exception_text",
+            }
+            assert audit.decision["internal_error"]["error_type"] == "RuntimeError"
+            assert (
+                len(
+                    audit.decision["internal_error"]["exception_text"]["sha256"]
+                )
+                == 64
+            )
+            serialized = dumps(
+                {
+                    "task": to_jsonable(
+                        runtime.object_tasks.get(task.task_id, actor_pid=pid)
+                    ),
+                    "event": to_jsonable(event),
+                    "audit": to_jsonable(audit),
+                }
+            )
+            assert secret not in serialized
+            assert private_path not in serialized
+        finally:
+            runtime.close()
+
+    def test_object_task_shutdown_does_not_report_success_before_executor_drain(
+        self,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            object_tasks=replace(
+                DEFAULT_CONFIG.object_tasks,
+                shutdown_join_timeout_s=0.05,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        executor_started = threading.Event()
+        release_executor = threading.Event()
+        loop_interrupted = threading.Event()
+        transient_future: Future[None] | None = None
+        try:
+            def blocking_executor_work() -> None:
+                executor_started.set()
+                release_executor.wait(timeout=10)
+
+            async def run_executor_work() -> None:
+                await runtime.object_tasks._loop.run_in_executor(
+                    None,
+                    blocking_executor_work,
+                )
+
+            transient_future = asyncio.run_coroutine_threadsafe(
+                run_executor_work(),
+                runtime.object_tasks._loop,
+            )
+            assert executor_started.wait(timeout=2)
+
+            def interrupt_loop() -> None:
+                loop_interrupted.set()
+                raise SystemExit("injected object task loop interruption")
+
+            runtime.object_tasks._loop.call_soon_threadsafe(interrupt_loop)
+            assert loop_interrupted.wait(timeout=2)
+
+            assert runtime.object_tasks.shutdown() is False
+            assert runtime.object_tasks._closed is False
+
+            release_executor.set()
+            deadline = time.monotonic() + 2
+            while runtime.object_tasks._thread.is_alive():
+                if time.monotonic() >= deadline:
+                    pytest.fail("object task executor did not drain after release")
+                time.sleep(0.01)
+
+            assert runtime.object_tasks.shutdown() is True
+            assert runtime.object_tasks._closed is True
+        finally:
+            release_executor.set()
+            if transient_future is not None and transient_future.done():
+                try:
+                    transient_future.exception(timeout=0)
+                except BaseException:
+                    pass
             runtime.close()
 
     def test_runtime_shutdown_keeps_store_open_when_object_task_executor_is_still_running(self) -> None:

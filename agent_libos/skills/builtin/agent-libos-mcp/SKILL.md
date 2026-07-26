@@ -41,6 +41,12 @@ An empty manifest schema is deliberately unpinned: it disables local argument-sc
 
 Every call validates live existence. Only a non-empty manifest schema also receives the local argument and live-equality protections above, so refresh is not routine. Refresh failures may raise safe provider exceptions.
 
+v1 live `tools/list` is deliberately unpaginated. The provider must return one
+complete list within the Host tool-count/byte limits; MCP continuation cursors
+are neither exposed nor followed. An oversized or partial catalog fails closed—
+it is not a first page. Require Host/provider reconfiguration instead of
+assuming omitted tools are absent.
+
 ### `call_mcp_tool`
 
 Call one registered logical tool with an object:
@@ -55,7 +61,16 @@ Call one registered logical tool with an object:
 
 It requires the declared right on `mcp:<server>:<tool>`, not broad discovery. Stdio also requires `write process:spawn` and exact stdio-resource execute for calls and refresh; HTTP registration supplies URL/secrets.
 
+For stdio, configured process wall-time, CPU, and memory budgets are passed as remaining `SubprocessLimits` and enforced across the child process tree. A custom provider that does not explicitly support those limits fails before dispatch; this is not permission to remove the budget or switch transports.
+
+Host/provider compatibility failures are also fail-closed. A custom stdio provider must consume the immutable runtime-environment snapshot; environment-dependent executable resolution must advertise `supports_runtime_environment_snapshots`, and a mutable executable that requires dispatch pinning must advertise `supports_executable_snapshots` and execute the supplied snapshot. Without exact executable identity, data above `normal` cannot receive stdio Sink clearance. Do not work around any of these errors.
+
 Preflight resolves registration, checks egress/tool authority/stdio rights, any pinned schema, budgets, limits, and policy, then validates live existence and—only when the manifest schema is non-empty—live schema equality. Missing/drift is a manifest problem, not permission to call another name.
+
+The configured server timeout is one absolute deadline across the live
+exchange. Startup/DNS, legacy `tools/list` validation, and tool dispatch consume
+the same remaining budget; retries, addresses, and later phases do not receive
+fresh full timeouts.
 
 For ASK, resume identical server/tool/arguments. One-shot approval binds arguments hash and registry digest/generation; changes need new approval. It cannot create stdio rights.
 
@@ -65,11 +80,13 @@ Read IDs, `status`, `ok`, result/error, bytes, and duration:
 | --- | --- | --- |
 | `ok` | Non-error MCP result. | Domain-check and verify mutation. |
 | `mcp_error` | Tool returned `isError`. | It ran and may have mutated; do not replay. |
-| `transport_error` | No reliable result, or an atomic provider reported pre-call live-validation failure. | Dispatch is unproven; mutation uncertain absent explicit not-started evidence. |
+| `transport_error` | No reliable result, a raw stdio/HTTP transport bound was crossed, or an atomic provider reported pre-call live-validation failure. | Dispatch is unproven; mutation uncertain absent explicit not-started evidence. |
 | `invalid_response` | Legacy live validation or provider metadata/response was invalid. | Inspect the exact error/evidence; status alone does not prove phase. |
-| `response_too_large` | The bounded result could not be returned. | The tool may already have run; partial content is not usable evidence. |
+| `response_too_large` | The provider materialized a result and returned a valid bounded `too_large` receipt. | The tool may already have run; partial content is not usable evidence. |
 
 Success `result` has `structured_content` and `content`. Prefer non-null structured data, retaining distinct content. Binary data is bounded/projected.
+
+Raw stdio frame/stdout or HTTP body/SSE-frame overflow is `transport_error`, not `response_too_large`, because no safe materialized result receipt exists. Returned provider trees are also rejected unless they stay within depth 128, `min(100,000,max_response_bytes)` nodes, aggregate string/key bytes and canonical-result bytes within `max_response_bytes`; live lists are limited to the Host `list_limit` (100 by default). A malformed tree, duplicate live name, too many tools, or under-reported byte receipt is a sanitized provider failure, never partial success.
 
 Live absence/schema drift has two observable forms. The legacy path durably records `invalid_response` and raises a validation/provider exception instead of returning that result. An atomic SDK path can return `transport_error` with `error_type:"LiveToolValidationError"`; runtime evidence marks `call_started:false`. Only explicit absence/drift or not-started evidence proves tool dispatch was blocked. Never infer non-dispatch from `invalid_response` or `transport_error` alone.
 
@@ -92,7 +109,11 @@ Live absence/schema drift has two observable forms. The legacy path durably reco
 - Explicit live absence/drift: dispatch was blocked after metadata read, but legacy may raise after recording `invalid_response` while atomic SDK may return `transport_error`/`LiveToolValidationError` with not-started evidence. Stop for Host update; retry cannot repair it.
 - Non-success mutation: completion unknown; never replay. Read back or seek operator reconciliation.
 - Read transient: retry only documented transients, bounded; not drift/malformed/oversized.
-- Provider-not-started safe error: report code/type/correlation ID; it can establish no provider dispatch for that attempt but does not authorize a different transport.
+- Provider-not-started safe error: report code/type/correlation ID. Its
+  certificate is phase-local: only the named phase is proved not started;
+  earlier DNS, startup, metadata/list, or other provider phases and their
+  flow/effect evidence may already exist. It does not authorize a different
+  transport.
 - Registry replace/unregister invalidates tool grants/approvals; re-inspect and obtain new exact authority.
 - Restore/fork may preserve capabilities, not package/roll back registry/provider state; re-inspect consequential calls.
 

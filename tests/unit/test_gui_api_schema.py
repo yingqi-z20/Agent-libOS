@@ -251,6 +251,31 @@ def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path(
     skill_process_mutation.validate(
         {"confirmed": True, "pid": "pid_1", "actor": "pid_1"}
     )
+    skill_activate = _validator_for("skillActivatePayload")
+    package_sha256 = "b" * 64
+    skill_activate.validate(
+        {
+            "confirmed": True,
+            "pid": "pid_1",
+            "actor": "pid_1",
+            "expected_package_sha256": package_sha256,
+        }
+    )
+    assert list(
+        skill_activate.iter_errors(
+            {"confirmed": True, "pid": "pid_1", "actor": "pid_1"}
+        )
+    )
+    for invalid_hash in ("", "b" * 63, "B" * 64, "not-a-sha256"):
+        assert list(
+            skill_activate.iter_errors(
+                {
+                    "confirmed": True,
+                    "pid": "pid_1",
+                    "expected_package_sha256": invalid_hash,
+                }
+            )
+        )
 
     _validator_for("capabilityDelegatePayload").validate(
         {

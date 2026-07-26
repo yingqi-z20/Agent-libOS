@@ -11,13 +11,13 @@ Use this Skill to answer a narrow question: can this model-facing tool-call path
 
 ### `echo`
 
-- Input is a top-level JSON object. The schema permits extra fields and performs no field-specific semantic validation.
+- Input is a top-level strict JSON object. Object keys must be unique strings; numbers must be finite; excessive byte size, nesting, or node count is rejected. The Echo schema permits extra fields and performs no field-specific semantic validation after that protocol validation.
 - Output is the object accepted by the Echo tool. Compare JSON value types and nesting, not textual wire bytes, whitespace, number spelling, or key order.
 - Use a tiny, non-sensitive sentinel containing only the types at issue, for example strings, numbers, booleans, null, lists, and nested objects. Global argument and normalized-result persistence limits apply, and result normalization can serialize the same logical value into structured data and textual content.
 
 `action` is a reserved top-level protocol key and is the one important exception to "unchanged." Before tool dispatch, the model tool-call adapter trims the function `name`, parses `arguments` as an object, removes any top-level `action` argument, and injects the selected function name as the internal `action`. The real function name wins over an `action` supplied in arguments; only a missing function name may use that key as a legacy fallback. Consequently, never use a top-level `action` field as an Echo round-trip sentinel. Nested keys named `action` are ordinary JSON data.
 
-`arguments` supplied as `null`, absent, or an empty string normalize to `{}`. A JSON string must decode to an object; arrays, scalars, booleans, and malformed JSON are rejected before `echo` runs. A nonempty function name is normally required.
+`arguments` supplied as `null`, absent, or an empty string normalize to `{}`. A JSON string is byte-limited before parsing and must decode to an object; duplicate keys, nonstandard `NaN`/infinity values, arrays, scalars, booleans, malformed JSON, excessive nesting, and excessive node counts are rejected before `echo` runs. A provider-supplied object form is canonicalized through the same JSON compatibility, structural, and size checks. A nonempty function name is normally required.
 
 ## Recommended workflow
 
@@ -37,7 +37,7 @@ Echo success does not prove JIT availability. After an Echo transport check, val
 
 ## Failure and recovery
 
-- Missing/empty function name without a fallback, malformed JSON, and non-object arguments fail in protocol normalization before Echo execution. An Echo result cannot diagnose those failures because no Echo result exists; use provider/repair/audit evidence.
+- Missing/empty function name without a fallback, malformed or ambiguous JSON, non-object arguments, and protocol size/structure violations fail in protocol normalization before Echo execution. An Echo result cannot diagnose those failures because no Echo result exists; use provider/repair/audit evidence.
 - Unknown or hidden tool names are projection or process-tool-table failures. Echo success says nothing about them.
 - An oversized argument is rejected before the normal tool-called event. An oversized read-only Echo result fails without a persisted ToolResult. Reduce the diagnostic to the minimum sentinel rather than raising limits or transferring payloads through Echo.
 - Successful Echo calls still create normal audit/event/result evidence. Echo is not a secret-free scratch channel or proof of arbitrary application persistence.

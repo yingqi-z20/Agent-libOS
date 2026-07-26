@@ -30,6 +30,7 @@ from agent_libos.tools.builtin.checkpoint import (
 from agent_libos.tools.builtin.jsonrpc import ListJsonRpcEndpointsTool
 from agent_libos.tools.builtin.mcp import ListMcpServersTool
 from agent_libos.utils.yaml_loader import load_yaml_mapping
+from benchmarks.builtin_tool_skills import REAL_LLM_ROUTING_CATALOG
 
 
 WORKSPACE_EDITING_SKILL = "agent-libos-workspace-editing"
@@ -225,6 +226,281 @@ _HIGH_RISK_SCHEMA_CONTRACTS: dict[str, dict[str, object]] = {
     },
 }
 
+# name | exact input required | exact output required | side-effects/idempotent/confirmation
+#
+# This compact checked-in snapshot is intentionally independent of tool
+# registration.  It prevents a newly registered or changed built-in tool from
+# inheriting coverage merely because the test enumerated the live registry.
+_BUILTIN_TOOL_SCHEMA_CONTRACT_ROWS = """
+echo|||010
+exec_process|image|pid,old_image,new_image,status,goal_oid,preserve_memory,preserve_capabilities,active_tools|100
+get_current_time||iso8601,unix_seconds,timezone|000
+sleep|seconds|requested_seconds,elapsed_seconds|000
+parse_pytest_log|log|failed,errors,assertions,failure_count|010
+append_memory_object|name,entry|oid,namespace,name,version,appended,length|100
+cancel_object_task|task_id|task|100
+create_checkpoint|reason|checkpoint_id,pid,reason|100
+create_memory_namespace|namespace|namespace,parent_namespace,created|100
+create_memory_object|type,payload|oid,namespace,name,type|100
+create_object_from_file|name,path|oid,namespace,name,type,source_path,bytes_read,truncated|100
+delete_directory|path|path,kind,deleted|101
+delete_file|path|path,kind,deleted|101
+delegate_capability|child_pid,resource,rights|capability|100
+diff_checkpoint|checkpoint_id|checkpoint_id,pid,tables,external_effects_since_checkpoint|010
+discover_skills||skills,next_step|010
+activate_skill|skill_id,expected_package_sha256|result|100
+fork_child_process|goal|child_pid,parent_pid,image,mode,status,goal_oid,inherited_capabilities,working_directory,resource_budget,selected_parent_root_oids,memory_root_oids|100
+fork_checkpoint|checkpoint_id|checkpoint_id,source_pid,fork_root_pid,pid_map,object_map|100
+get_object_task|task_id|task|100
+get_working_directory||working_directory|010
+load_image_package|path|image_id,name,version,source_path,replaced,default_tools,package_jit_tools,boot_kind,artifact_id,package_sha256,required_capabilities_count,required_modules_count|100
+list_child_processes||children|010
+list_memory_namespace||namespace,objects,namespaces|010
+list_object_tasks||tasks|100
+merge_child_memory|child_pid|child_pid,merged_oids,skipped_oids,adopted_oids,released_oids,pinned_child_owned_oids,retained_child_owned_oids|100
+process_exit||status|100
+propose_jit_tool|name,description,source_code|candidate_id,name,language|100
+request_permission|resource,rights,reason|request_id,resource,rights,status|100
+read_directory|path|path,entries,count,truncated|010
+read_memory_object|name|oid,namespace,name,type,version,json_pointer,payload_type,shape,serialized_bytes,sha256,representation,page_offset_bytes,page_bytes,truncated,omitted_bytes|010
+read_process_messages||messages,acked_message_ids|100
+receive_process_messages||messages,acked_message_ids|100
+read_text_file|path|path,content,encoding,bytes_read,truncated,content_sha256|010
+register_jit_tool|candidate_id|tool_id,name,scope|100
+signal_child_process|child_pid,signal|child_pid,signal,status,state_generation|100
+set_working_directory|path|working_directory|100
+spawn_child_process|goal|child_pid,parent_pid,image,status,goal_oid,inherited_capabilities,fresh_memory_view,working_directory,resource_budget,selected_parent_root_oids,memory_root_oids|100
+start_object_task|tool|task|100
+validate_jit_tool|candidate_id|ok,errors,warnings,logs|100
+write_object_to_file|name,path|oid,namespace,name,path,bytes_written,created|100
+write_directory|path|path,created|101
+write_text_file|path,content|path,bytes_written,created|101
+ask_human|question|request_id,answer,status|100
+human_output|message|delivered,channel,chars|100
+call_jsonrpc_method|endpoint_id,method_id|endpoint_id,method_id,rpc_method,request_id,status,http_status,ok,response_bytes,duration_s|100
+call_mcp_tool|server_id,tool_id|server_id,tool_id,mcp_name,status,ok,response_bytes,duration_s|100
+compact_process_context||compacted,reason|100
+commit_checkpoint_to_image|checkpoint_id,image_id,name|image_id,name,version,replaced,boot_kind,artifact_id,artifact_sha256,required_capabilities_count,required_modules_count|100
+inspect_capability|cap_id|capability|010
+inspect_checkpoint|checkpoint_id|checkpoint,subtree_pids,modules,counts,processes|010
+inspect_jsonrpc_endpoint|endpoint_id|endpoint|010
+inspect_mcp_server|server_id|server|010
+read_skill_resource|skill_id,path|resource|010
+wait_child_process|child_pid|child_pid,status,ready,state_generation|100
+wait_object_task|task_id|task|100
+watch_object_task_owner|task_id|task|100
+list_capabilities||capabilities,has_more|010
+list_checkpoints||checkpoints,count,has_more|010
+list_jsonrpc_endpoints||endpoints,has_more|010
+list_mcp_servers||servers,has_more|010
+list_mcp_tools|server_id|server_id,transport,tools,refreshed,response_bytes|100
+run_shell_command|argv|argv,returncode,stdout,stderr,stdout_truncated,stderr_truncated|100
+revoke_capability|cap_id|capability|100
+restore_checkpoint|checkpoint_id|checkpoint_id,publication_id,pid,status,main_state_committed,reconciliation_pending,post_commit_failures,restored_pids,previous_pids,cancelled_human_requests,superseded_messages,superseded_object_tasks,external_effects_since_checkpoint|100
+send_process_message|recipient_pid|message_id,recipient_pid,kind,channel,subject|100
+unload_skill|skill_id|result|100
+git_repository_info|||010
+git_status|||010
+git_diff|||010
+git_log|||010
+git_show|ref||010
+git_blame|path||010
+git_list_refs|||010
+git_list_remotes|||010
+git_list_worktrees|||010
+git_stage|paths,expected_state_token||100
+git_unstage|paths,expected_state_token||100
+git_commit|message,expected_state_token||100
+git_restore|paths,expected_state_token||100
+git_branch|operation,name,expected_state_token||100
+git_switch|target,expected_state_token||100
+git_tag|operation,name,expected_state_token||100
+git_integrate|operation,expected_state_token||100
+git_stash|operation,expected_state_token||100
+git_reset|target,expected_state_token||100
+git_clean|expected_state_token||100
+git_worktree|operation,expected_state_token||100
+git_create_patch|||100
+git_apply_patch|patch_oid,expected_state_token||100
+git_fetch|remote,expected_state_token||100
+git_pull|remote,expected_state_token||100
+git_push|remote,remote_ref,expected_state_token||100
+git_create_pull_request|title,base_ref,head_ref,expected_state_token||100
+git_list_pull_requests|||010
+git_inspect_pull_request|pr_id||010
+git_review_pull_request|pr_id,decision,expected_state_token||100
+git_merge_pull_request|pr_id,expected_state_token||100
+git_close_pull_request|pr_id,expected_state_token||100
+"""
+
+_BUILTIN_TOOL_OUTPUT_PROPERTY_ROWS = """
+exec_process|active_tools,goal_oid,new_image,old_image,pid,preserve_capabilities,preserve_memory,status
+get_current_time|iso8601,timezone,unix_seconds
+sleep|elapsed_seconds,requested_seconds
+parse_pytest_log|assertions,errors,failed,failure_count
+append_memory_object|appended,length,list_field,name,namespace,oid,version
+cancel_object_task|task
+create_checkpoint|checkpoint_id,pid,reason
+create_memory_namespace|created,namespace,parent_namespace
+create_memory_object|name,namespace,oid,type
+create_object_from_file|bytes_read,name,namespace,oid,source_path,truncated,type
+delete_directory|deleted,kind,path,recursive
+delete_file|deleted,kind,path,recursive
+delegate_capability|capability
+diff_checkpoint|checkpoint_id,external_effect_summary,external_effects_page,external_effects_since_checkpoint,pid,restore_external_policy,tables
+discover_skills|has_more,next_step,skills,visibility_limited
+activate_skill|result
+fork_child_process|child_pid,goal_oid,image,inherited_capabilities,memory_root_oids,mode,parent_pid,resource_budget,selected_parent_root_oids,status,working_directory
+fork_checkpoint|checkpoint_id,fork_root_pid,main_state_committed,object_map,object_map_page,outcome_diagnostic,pid_map,pid_map_page,post_commit_failures,post_commit_failures_page,reconciliation_pending,source_pid,status,tool_map,tool_map_page
+get_object_task|task
+get_working_directory|working_directory
+load_image_package|artifact_id,boot_kind,default_tools,image_id,name,package_jit_tools,package_sha256,replaced,required_capabilities_count,required_modules_count,source_path,version
+list_child_processes|children
+list_memory_namespace|namespace,namespaces,objects
+list_object_tasks|tasks
+merge_child_memory|adopted_oids,child_pid,merged_oids,pinned_child_owned_oids,released_oids,retained_child_owned_oids,skipped_oids
+process_exit|cleanup,completion_review,error,result_oid,status,terminal_committed
+propose_jit_tool|candidate_id,language,name
+request_permission|request_id,resource,rights,status
+read_directory|count,entries,path,truncated
+read_memory_object|json_pointer,name,namespace,next_cursor,oid,omitted_bytes,page_bytes,page_offset_bytes,payload,payload_type,preview,preview_encoding,representation,serialized_bytes,sha256,shape,truncated,type,version
+read_process_messages|acked_message_ids,continuation,has_more,messages,omitted_count,ready
+receive_process_messages|acked_message_ids,continuation,has_more,messages,omitted_count,ready
+read_text_file|bytes_read,content,content_sha256,encoding,path,truncated
+register_jit_tool|name,scope,tool_id
+signal_child_process|child_pid,outcome,signal,state_generation,status,wait_state
+set_working_directory|working_directory
+spawn_child_process|child_pid,fresh_memory_view,goal_oid,image,inherited_capabilities,memory_root_oids,parent_pid,resource_budget,selected_parent_root_oids,status,working_directory
+start_object_task|task
+validate_jit_tool|errors,logs,ok,warnings
+write_object_to_file|bytes_written,created,name,namespace,oid,path
+write_directory|created,path
+write_text_file|bytes_written,created,path
+ask_human|answer,request_id,status
+human_output|channel,chars,delivered
+call_jsonrpc_method|duration_s,endpoint_id,error,http_status,method_id,ok,request_id,response_bytes,result,rpc_method,status
+call_mcp_tool|duration_s,error,mcp_name,ok,response_bytes,result,server_id,status,tool_id
+compact_process_context|compacted,compacted_tokens,compressor_pids,context_oid,new_version,old_version,preserved_recent_entries,reason,source_tokens
+commit_checkpoint_to_image|artifact_id,artifact_sha256,boot_kind,image_id,name,replaced,required_capabilities_count,required_modules_count,version
+inspect_capability|capability
+inspect_checkpoint|checkpoint,counts,modules,modules_page,processes,processes_page,snapshot_version,subtree_pids,subtree_pids_page
+inspect_jsonrpc_endpoint|endpoint
+inspect_mcp_server|server
+read_skill_resource|resource
+wait_child_process|child_pid,message,outcome,ready,result_oid,state_generation,status,wait_state
+wait_object_task|task
+watch_object_task_owner|task
+list_capabilities|capabilities,has_more,next_cursor
+list_checkpoints|checkpoints,count,has_more
+list_jsonrpc_endpoints|endpoints,has_more
+list_mcp_servers|has_more,servers
+list_mcp_tools|refreshed,response_bytes,server_id,tools,transport
+run_shell_command|argv,returncode,stderr,stderr_truncated,stdout,stdout_truncated
+revoke_capability|capability
+restore_checkpoint|cancelled_human_requests,cancelled_human_requests_page,checkpoint_id,external_effect_summary,external_effects_page,external_effects_since_checkpoint,main_state_committed,pid,post_commit_failures,post_commit_failures_page,previous_pids,previous_pids_page,publication_id,reconciliation_pending,restore_external_policy,restored_pids,restored_pids_page,status,superseded_messages,superseded_messages_page,superseded_object_tasks,superseded_object_tasks_page
+send_process_message|channel,correlation_id,kind,message_id,recipient_pid,reply_to,subject
+unload_skill|result
+"""
+
+_STATUS_OUTPUT_FIELDS = frozenset(
+    {
+        "main_state_committed",
+        "ok",
+        "ready",
+        "reconciliation_pending",
+        "status",
+        "terminal_committed",
+    }
+)
+_EXPECTED_STATUS_OUTPUT_FIELDS: dict[str, set[str]] = {
+    "ask_human": {"status"},
+    "call_jsonrpc_method": {"ok", "status"},
+    "call_mcp_tool": {"ok", "status"},
+    "exec_process": {"status"},
+    "fork_child_process": {"status"},
+    "fork_checkpoint": {
+        "main_state_committed",
+        "reconciliation_pending",
+        "status",
+    },
+    "process_exit": {"status", "terminal_committed"},
+    "read_process_messages": {"ready"},
+    "receive_process_messages": {"ready"},
+    "request_permission": {"status"},
+    "restore_checkpoint": {
+        "main_state_committed",
+        "reconciliation_pending",
+        "status",
+    },
+    "signal_child_process": {"status"},
+    "spawn_child_process": {"status"},
+    "validate_jit_tool": {"ok"},
+    "wait_child_process": {"ready", "status"},
+}
+
+_PAGING_OUTPUT_FIELDS = frozenset(
+    {"continuation", "has_more", "next_cursor", "truncated"}
+)
+_EXPECTED_PAGING_OUTPUT_FIELDS: dict[str, set[str]] = {
+    "create_object_from_file": {"truncated"},
+    "diff_checkpoint": {"external_effects_page"},
+    "discover_skills": {"has_more"},
+    "fork_checkpoint": {
+        "object_map_page",
+        "pid_map_page",
+        "post_commit_failures_page",
+        "tool_map_page",
+    },
+    "inspect_checkpoint": {
+        "modules_page",
+        "processes_page",
+        "subtree_pids_page",
+    },
+    "list_capabilities": {"has_more", "next_cursor"},
+    "list_checkpoints": {"has_more"},
+    "list_jsonrpc_endpoints": {"has_more"},
+    "list_mcp_servers": {"has_more"},
+    "read_directory": {"truncated"},
+    "read_memory_object": {"next_cursor", "truncated"},
+    "read_process_messages": {"continuation", "has_more"},
+    "read_text_file": {"truncated"},
+    "receive_process_messages": {"continuation", "has_more"},
+    "restore_checkpoint": {
+        "cancelled_human_requests_page",
+        "external_effects_page",
+        "post_commit_failures_page",
+        "previous_pids_page",
+        "restored_pids_page",
+        "superseded_messages_page",
+        "superseded_object_tasks_page",
+    },
+}
+
+
+def _builtin_tool_schema_contracts() -> dict[str, dict[str, object]]:
+    contracts: dict[str, dict[str, object]] = {}
+    for raw_row in _BUILTIN_TOOL_SCHEMA_CONTRACT_ROWS.strip().splitlines():
+        name, required_raw, output_required_raw, effect_flags = raw_row.split("|")
+        assert len(effect_flags) == 3
+        assert name not in contracts
+        contracts[name] = {
+            "required": set(filter(None, required_raw.split(","))),
+            "output_required": set(
+                filter(None, output_required_raw.split(","))
+            ),
+            "side_effects": effect_flags[0] == "1",
+            "idempotent": effect_flags[1] == "1",
+            "declared_confirmation_required": effect_flags[2] == "1",
+        }
+    for raw_row in _BUILTIN_TOOL_OUTPUT_PROPERTY_ROWS.strip().splitlines():
+        name, properties_raw = raw_row.split("|")
+        assert name in contracts
+        assert "output_properties" not in contracts[name]
+        contracts[name]["output_properties"] = set(properties_raw.split(","))
+    for contract in contracts.values():
+        contract.setdefault("output_properties", set())
+    return contracts
+
 
 def test_builtin_skill_packages_use_standard_allowed_tools_scalar() -> None:
     root = resources.files("agent_libos.skills.builtin")
@@ -301,6 +577,33 @@ def test_builtin_skill_instructions_route_every_owned_tool() -> None:
         ]
 
         assert missing == [], f"{package.skill_id} does not guide {missing}"
+
+
+def test_builtin_skill_guidance_names_every_required_tool_argument(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(tmp_path / "builtin-required-argument-guidance.sqlite")
+    try:
+        specs = {
+            str(row["name"]): json.loads(row["spec_json"])
+            for row in runtime.tools.list()
+        }
+        missing: dict[str, list[str]] = {}
+        for package in get_builtin_skill_catalog().list():
+            package_missing: list[str] = []
+            for tool_name in package.allowed_tools:
+                for field in specs[tool_name]["input_schema"].get("required", []):
+                    if re.search(
+                        rf"(?<![A-Za-z0-9_]){re.escape(field)}(?![A-Za-z0-9_])",
+                        package.instructions,
+                    ) is None:
+                        package_missing.append(f"{tool_name}.{field}")
+            if package_missing:
+                missing[package.skill_id] = package_missing
+
+        assert missing == {}
+    finally:
+        runtime.close()
 
 
 def test_builtin_skill_descriptions_and_bodies_have_progressive_guidance_structure() -> None:
@@ -393,6 +696,141 @@ def test_effectful_builtin_skills_include_recovery_or_stop_decisions(tmp_path: P
         runtime.close()
 
 
+def test_all_builtin_tool_schemas_match_complete_static_contract(
+    tmp_path: Path,
+) -> None:
+    contracts = _builtin_tool_schema_contracts()
+    assert len(contracts) == 99
+
+    runtime = Runtime.open(tmp_path / "complete-builtin-schema-contract.sqlite")
+    try:
+        specs = {
+            str(row["name"]): json.loads(row["spec_json"])
+            for row in runtime.tools.list()
+        }
+        owned = {
+            tool_name
+            for package in get_builtin_skill_catalog().list()
+            for tool_name in package.allowed_tools
+        }
+        assert set(contracts) == owned == set(specs)
+
+        actual_status_fields: dict[str, set[str]] = {}
+        actual_paging_fields: dict[str, set[str]] = {}
+        for tool_name, contract in contracts.items():
+            spec = specs[tool_name]
+            input_schema = spec["input_schema"]
+            assert input_schema["type"] == "object", tool_name
+            assert set(input_schema.get("required", [])) == contract["required"], (
+                tool_name,
+                input_schema.get("required", []),
+            )
+            assert set(input_schema.get("required", [])) <= set(
+                input_schema.get("properties", {})
+            )
+
+            output_schema = spec["output_schema"]
+            expected_output_required = contract["output_required"]
+            expected_output_properties = contract["output_properties"]
+            if expected_output_properties:
+                assert output_schema["type"] == "object", tool_name
+                assert set(output_schema.get("properties", {})) == (
+                    expected_output_properties
+                ), (tool_name, output_schema.get("properties", {}))
+                assert set(output_schema.get("required", [])) == (
+                    expected_output_required
+                ), (tool_name, output_schema.get("required", []))
+                assert set(output_schema.get("required", [])) <= set(
+                    output_schema.get("properties", {})
+                )
+            else:
+                # Generic provider-owned Git payloads and echo deliberately use
+                # an open output contract. A typed empty model would need its
+                # own explicit snapshot row rather than passing accidentally.
+                assert output_schema == {}, tool_name
+
+            policy = spec["policy"]
+            assert {
+                "side_effects": policy["side_effects"],
+                "idempotent": policy["idempotent"],
+                "declared_confirmation_required": policy[
+                    "declared_confirmation_required"
+                ],
+            } == {
+                "side_effects": contract["side_effects"],
+                "idempotent": contract["idempotent"],
+                "declared_confirmation_required": contract[
+                    "declared_confirmation_required"
+                ],
+            }, tool_name
+
+            output_properties = set(output_schema.get("properties", {}))
+            status_fields = output_properties & _STATUS_OUTPUT_FIELDS
+            if status_fields:
+                actual_status_fields[tool_name] = status_fields
+            paging_fields = {
+                field
+                for field in output_properties
+                if field in _PAGING_OUTPUT_FIELDS or field.endswith("_page")
+            }
+            if paging_fields:
+                actual_paging_fields[tool_name] = paging_fields
+
+        assert actual_status_fields == _EXPECTED_STATUS_OUTPUT_FIELDS
+        assert actual_paging_fields == _EXPECTED_PAGING_OUTPUT_FIELDS
+    finally:
+        runtime.close()
+
+
+def test_skill_lifecycle_schema_exposes_hash_compare_and_swap(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(tmp_path / "skill-lifecycle-hash-schema.sqlite")
+    try:
+        specs = {
+            str(row["name"]): json.loads(row["spec_json"])
+            for row in runtime.tools.list()
+        }
+        discovery_output = specs["discover_skills"]["output_schema"]
+        discovered_skill = discovery_output["$defs"]["DiscoveredSkill"]
+        assert "package_sha256" in discovered_skill["properties"]
+        assert "package_sha256" in discovered_skill["required"]
+        assert discovery_output["properties"]["next_step"]["enum"] == [
+            "activate_skill",
+            "use_loaded_skill",
+            "refine_search",
+        ]
+
+        activation_input = specs["activate_skill"]["input_schema"]
+        assert set(activation_input["required"]) == {
+            "skill_id",
+            "expected_package_sha256",
+        }
+        expected_hash = activation_input["properties"][
+            "expected_package_sha256"
+        ]
+        assert {
+            key: expected_hash[key]
+            for key in ("maxLength", "minLength", "pattern", "type")
+        } == {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string",
+        }
+        assert "discover_skills" in expected_hash["description"]
+        assert "without mutation" in expected_hash["description"]
+        activated_skill = specs["activate_skill"]["output_schema"]["$defs"][
+            "ActivatedSkill"
+        ]
+        assert {
+            "instructions_hash",
+            "package_sha256",
+        } <= set(activated_skill["required"])
+    finally:
+        runtime.close()
+
+
 def test_high_risk_builtin_tool_schemas_match_guidance_contracts(tmp_path: Path) -> None:
     runtime = Runtime.open(tmp_path / "builtin-skill-schema-contract.sqlite")
     try:
@@ -406,7 +844,7 @@ def test_high_risk_builtin_tool_schemas_match_guidance_contracts(tmp_path: Path)
             schema = specs[tool_name]["input_schema"]
             properties = schema["properties"]
             assert catalog.skill_for_tool(tool_name) is not None
-            assert set(contract.get("required", set())) <= set(schema.get("required", []))
+            assert set(contract.get("required", set())) == set(schema.get("required", []))
             assert set(contract.get("fields", set())) <= set(properties)
             assert set(contract.get("forbidden", set())).isdisjoint(properties)
             for field, expected in dict(contract.get("defaults", {})).items():
@@ -715,6 +1153,24 @@ def test_builtin_discovery_obeys_the_same_search_and_page_limit(
         assert intent_result.payload["next_step"] == "activate_skill"
         assert intent_result.payload["skills"][0]["skill_id"] == WORKSPACE_EDITING_SKILL
 
+        split_intent = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {
+                "text": "filesystem read write text file directory",
+                "limit": 5,
+            },
+        )
+        assert split_intent.ok
+        split_ids = {
+            item["skill_id"] for item in split_intent.payload["skills"]
+        }
+        assert {
+            "agent-libos-workspace-navigation",
+            WORKSPACE_EDITING_SKILL,
+        } <= split_ids
+        assert split_intent.payload["next_step"] == "activate_skill"
+
         model_result = runtime.tools.call(
             pid,
             "discover_skills",
@@ -787,6 +1243,118 @@ def test_source_neutral_discovery_ranks_concrete_task_terms(
         runtime.close()
 
 
+def test_every_builtin_skill_has_positive_and_adjacent_negative_routing(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(tmp_path / "complete-builtin-routing-contract.sqlite")
+    try:
+        catalog = get_builtin_skill_catalog()
+        all_tools = [
+            tool_name
+            for package in catalog.list()
+            for tool_name in package.allowed_tools
+        ]
+        template = runtime.get_image("coding-agent:v0")
+        metadata = dict(template.metadata)
+        metadata.pop("completion_gate", None)
+        image = replace(
+            template,
+            image_id="complete-builtin-routing-contract:v0",
+            name="complete-builtin-routing-contract",
+            default_tools=all_tools,
+            default_skills=[],
+            metadata=metadata,
+        )
+        runtime.register_image(image, actor="test.host")
+        pid = runtime.process.spawn(
+            image=image.image_id,
+            goal="select one built-in Skill from each source-neutral intent",
+        )
+
+        cases = {
+            case.expected_skill_id: case
+            for case in REAL_LLM_ROUTING_CATALOG
+        }
+        assert set(cases) == set(BUILTIN_SKILL_IDS)
+        assert len(REAL_LLM_ROUTING_CATALOG) == len(BUILTIN_SKILL_IDS) == 26
+        visible = runtime.skills.discover_skills_result(
+            actor=pid,
+            limit=len(BUILTIN_SKILL_IDS),
+        )
+        assert {item["skill_id"] for item in visible["skills"]} == set(
+            BUILTIN_SKILL_IDS
+        )
+
+        for case in REAL_LLM_ROUTING_CATALOG:
+            assert case.expected_skill_id not in case.intent
+            positive = runtime.skills.discover_skills_result(
+                case.intent,
+                actor=pid,
+                limit=1,
+            )
+            assert positive["skills"][0]["skill_id"] == case.expected_skill_id, (
+                case.scenario_id,
+                positive["skills"],
+            )
+
+            assert case.adjacent_skill_ids
+            for adjacent_skill_id in case.adjacent_skill_ids:
+                assert adjacent_skill_id != case.expected_skill_id
+                adjacent_case = cases[adjacent_skill_id]
+                negative = runtime.skills.discover_skills_result(
+                    adjacent_case.intent,
+                    actor=pid,
+                    limit=1,
+                )
+                assert negative["skills"][0]["skill_id"] == adjacent_skill_id, (
+                    case.scenario_id,
+                    adjacent_skill_id,
+                    negative["skills"],
+                )
+                assert (
+                    negative["skills"][0]["skill_id"]
+                    != case.expected_skill_id
+                )
+
+                stale_activation = runtime.tools.call(
+                    pid,
+                    "activate_skill",
+                    {
+                        "skill_id": case.expected_skill_id,
+                        "expected_package_sha256": negative["skills"][0][
+                            "package_sha256"
+                        ],
+                    },
+                )
+                assert not stale_activation.ok
+                assert (
+                    case.expected_skill_id
+                    not in runtime.process.get(pid).loaded_skills
+                )
+
+            selected = positive["skills"][0]
+            activation = runtime.tools.call(
+                pid,
+                "activate_skill",
+                {
+                    "skill_id": case.expected_skill_id,
+                    "expected_package_sha256": selected["package_sha256"],
+                },
+            )
+            assert activation.ok, (case.scenario_id, activation.error)
+            assert activation.payload["result"]["package_sha256"] == (
+                selected["package_sha256"]
+            )
+            unload = runtime.tools.call(
+                pid,
+                "unload_skill",
+                {"skill_id": case.expected_skill_id},
+            )
+            assert unload.ok, (case.scenario_id, unload.error)
+    finally:
+        runtime.close()
+
+
 def test_model_skill_lifecycle_contract_is_source_neutral(tmp_path: Path) -> None:
     runtime = Runtime.open(tmp_path / "source-neutral-skill-lifecycle.sqlite")
     registered_skill_id = "source-neutral-clock"
@@ -841,17 +1409,31 @@ def test_model_skill_lifecycle_contract_is_source_neutral(tmp_path: Path) -> Non
         builtin_activation = runtime.tools.call(
             pid,
             "activate_skill",
-            {"skill_id": WORKSPACE_EDITING_SKILL},
+            {
+                "skill_id": WORKSPACE_EDITING_SKILL,
+                "expected_package_sha256": builtin_summary["package_sha256"],
+            },
         )
         registered_activation = runtime.tools.call(
             pid,
             "activate_skill",
-            {"skill_id": registered_skill_id},
+            {
+                "skill_id": registered_skill_id,
+                "expected_package_sha256": registered_summary["package_sha256"],
+            },
         )
         assert builtin_activation.ok and registered_activation.ok
         builtin_result = builtin_activation.payload["result"]
         registered_result = registered_activation.payload["result"]
         assert set(builtin_result) == set(registered_result)
+        current_discovery = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {"text": WORKSPACE_EDITING_SKILL, "limit": 1},
+        )
+        assert current_discovery.ok
+        assert current_discovery.payload["skills"][0]["active"] is True
+        assert current_discovery.payload["next_step"] == "use_loaded_skill"
         model_loaded = runtime.tools.model_loaded_skills(pid)
         assert set(model_loaded[WORKSPACE_EDITING_SKILL]) == set(
             model_loaded[registered_skill_id]

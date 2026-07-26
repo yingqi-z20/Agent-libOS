@@ -20,6 +20,12 @@ forbidden_effects:
     endpoint: bench-echo
     method: echo
 success_oracle:
+  - type: action_succeeded
+    action: list_jsonrpc_endpoints
+  - type: action_succeeded
+    action: inspect_jsonrpc_endpoint
+    arguments:
+      endpoint_id: bench-echo
   - type: expected_effects
     effects:
       - type: jsonrpc.call

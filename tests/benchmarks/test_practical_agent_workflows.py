@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -22,6 +23,7 @@ from benchmarks.practical_agent_workflows.models import (
     PracticalScenarioResult,
 )
 from benchmarks.practical_agent_workflows.oracle import validate_modeled_scenario
+from benchmarks.practical_agent_workflows import runner as practical_runner
 from experiments import run_practical_evaluation as practical_cli
 
 
@@ -150,7 +152,35 @@ def test_practical_cli_refuses_internally_inconsistent_report(
 
     with pytest.raises(RuntimeError, match=message):
         practical_cli.main(["--output", str(output)])
-    assert not output.exists()
+    marker = json.loads(output.read_text(encoding="utf-8"))
+    assert marker["evaluation_artifact"]["completion_state"] == "failed"
+
+
+def test_practical_cli_failed_rerun_replaces_stale_favorable_report_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "report.json"
+    old_report = {"native_live_ok": True, "modeled_suite_ok": True}
+    output.write_text(json.dumps(old_report), encoding="utf-8")
+
+    def fail_evaluation() -> object:
+        raise RuntimeError("injected evaluation failure")
+
+    monkeypatch.setattr(
+        practical_cli,
+        "run_practical_evaluation",
+        fail_evaluation,
+    )
+
+    with pytest.raises(RuntimeError, match="injected evaluation failure"):
+        practical_cli.main(["--output", str(output)])
+
+    marker = json.loads(output.read_text(encoding="utf-8"))["evaluation_artifact"]
+    assert marker["completion_state"] == "failed"
+    previous = output.parent / marker["previous_artifact"]
+    assert json.loads(previous.read_text(encoding="utf-8")) == old_report
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_eva_scenario_matrix_is_migrated_as_design_only_modeled_evidence() -> None:
@@ -184,6 +214,128 @@ def test_modeled_oracle_failure_does_not_become_runtime_evidence() -> None:
     assert not report.results[0].ok
     assert report.native_tool_calls == 0
     assert report.native_operations == 0
+
+
+@pytest.mark.parametrize("scenarios", [[], (), iter(())])
+def test_explicit_empty_selection_does_not_fall_back_to_defaults(
+    scenarios: object,
+) -> None:
+    report = run_practical_evaluation(scenarios)  # type: ignore[arg-type]
+
+    assert report.results == []
+    assert report.scenario_counts == {"native-live": 0, "modeled": 0}
+    assert report.native_tool_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_family", None),
+        ("task_family", 7),
+        ("variant", "   "),
+        ("variant", []),
+        ("attack_type", None),
+        ("attack_type", {}),
+    ],
+)
+def test_modeled_classification_fields_require_nonempty_strings(
+    field: str,
+    value: object,
+) -> None:
+    scenario = build_modeled_scenarios()[0]
+    claim = dict(scenario.modeled_claim)
+    claim[field] = value
+
+    errors = validate_modeled_scenario(replace(scenario, modeled_claim=claim))
+
+    assert any(field in error and "non-empty string" in error for error in errors)
+
+
+def test_native_unsupported_expected_outcome_fails_before_tool_call(
+    tmp_path: Path,
+) -> None:
+    scenario = next(
+        item
+        for item in default_scenarios()
+        if item.evidence_level == EvidenceLevel.NATIVE_LIVE
+    )
+    unsupported = replace(
+        scenario,
+        effects=(
+            replace(scenario.effects[0], expected_outcome="denied"),
+        ),
+    )
+
+    report = run_practical_evaluation([unsupported], work_dir=tmp_path)
+
+    assert report.results[0].ok is False
+    assert report.results[0].tool_calls == 0
+    assert report.results[0].external_effect_ids == []
+
+
+def test_practical_dns_override_delegates_unrelated_hosts() -> None:
+    observed: list[object] = []
+
+    def original(host: object, *args: object, **kwargs: object) -> str:
+        observed.append(host)
+        return "delegated"
+
+    benchmark = practical_runner._benchmark_getaddrinfo(
+        original,
+        "connector.example.test",
+        443,
+    )
+    unrelated = practical_runner._benchmark_getaddrinfo(
+        original,
+        "unrelated.example.test",
+        443,
+    )
+
+    assert benchmark[0][4] == ("93.184.216.34", 443)
+    assert unrelated == "delegated"
+    assert observed == ["unrelated.example.test"]
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_native_tool_attempt_counter_includes_failures_and_exceptions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raises: bool,
+) -> None:
+    scenario = next(
+        item
+        for item in default_scenarios()
+        if item.evidence_level == EvidenceLevel.NATIVE_LIVE
+    )
+
+    class Tools:
+        def call(self, *args: object, **kwargs: object) -> object:
+            if raises:
+                raise RuntimeError("injected call exception")
+            return SimpleNamespace(ok=False, error="injected returned failure")
+
+    runtime = SimpleNamespace(
+        jsonrpc=SimpleNamespace(
+            register_endpoint_from_yaml_text=lambda *args, **kwargs: None
+        ),
+        process=SimpleNamespace(spawn=lambda **kwargs: "pid-test"),
+        store=SimpleNamespace(list_external_effects=lambda **kwargs: []),
+        tools=Tools(),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        practical_runner.Runtime,
+        "open",
+        lambda *args, **kwargs: runtime,
+    )
+
+    result = practical_runner._run_native_scenario(
+        scenario,
+        work_dir=tmp_path,
+    )
+
+    assert result.ok is False
+    assert result.tool_calls == 1
 
 
 @pytest.mark.parametrize(

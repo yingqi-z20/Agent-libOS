@@ -24,7 +24,11 @@ from agent_libos.models import (
     JITRehydrationArtifact,
     ObjectHandle,
     ObjectNamespace,
+    ObjectNamespaceCursor,
+    ObjectNamespacePage,
     ObjectPayloadRecoverySummary,
+    ObjectRefCursor,
+    ObjectRefPage,
     PersistedObjectState,
     ObjectTask,
     ObjectTaskRecoveryCursor,
@@ -275,6 +279,49 @@ class ProcessStateRepository(ProcessRestoreEpochRepositoryPort, Protocol):
     ) -> bool: ...
 
     def release_execution(self, token: ProcessExecutionToken) -> bool: ...
+
+    def get_process_terminal_cleanup(self, pid: str) -> dict[str, Any] | None: ...
+
+    def list_process_terminal_cleanups(
+        self,
+        *,
+        after: ProcessCursor | None,
+        limit: int,
+        include_completed: bool = False,
+    ) -> list[dict[str, Any]]: ...
+
+    def claim_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        owner_id: str,
+        lease_id: str,
+        expected_lease_id: str | None,
+    ) -> dict[str, Any] | None: ...
+
+    def complete_process_terminal_cleanup_phase(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+        phase: str,
+    ) -> dict[str, Any] | None: ...
+
+    def fail_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+        phase: str,
+        error: Mapping[str, Any],
+    ) -> dict[str, Any] | None: ...
+
+    def finish_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+    ) -> dict[str, Any] | None: ...
 
     def recover_stale_executions(
         self,
@@ -811,7 +858,21 @@ class AuthorityRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
 
     def get_capability(self, cap_id: str) -> Capability | None: ...
 
-    def list_capabilities(self, subject: str | None = None) -> list[Capability]: ...
+    def list_capabilities(
+        self,
+        subject: str | None = None,
+        *,
+        limit: int | None = None,
+    ) -> list[Capability]: ...
+
+    def query_capabilities(
+        self,
+        subject: str | None = None,
+        *,
+        active_only: bool,
+        after_cap_id: str | None,
+        limit: int,
+    ) -> list[Capability]: ...
 
 
 class ObjectRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
@@ -827,6 +888,26 @@ class ObjectRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
         self,
         oid: str,
     ) -> PersistedObjectState | None: ...
+
+
+class ObjectQueryBackendProtocol(TransactionBackendProtocol, Protocol):
+    """Payload-free, hard-bounded Object directory query surface."""
+
+    def query_object_refs_page(
+        self,
+        namespace: str,
+        *,
+        after: ObjectRefCursor | None,
+        limit: int,
+    ) -> ObjectRefPage: ...
+
+    def query_child_namespaces_page(
+        self,
+        parent_namespace: str,
+        *,
+        after: ObjectNamespaceCursor | None,
+        limit: int,
+    ) -> ObjectNamespacePage: ...
 
 
 class ProcessBackendProtocol(
@@ -875,6 +956,31 @@ class ProcessBackendProtocol(
     def list_child_processes(self, parent_pid: str) -> list[AgentProcess]: ...
 
     def get_human_request(self, request_id: str) -> HumanRequest | None: ...
+
+    def count_process_messages(
+        self,
+        recipient_pid: str | None = None,
+        *,
+        status: ProcessMessageStatus | str | None = None,
+        kind: ProcessMessageKind | str | None = None,
+        sender: str | None = None,
+        channel: str | None = None,
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+        message_ids: list[str] | None = None,
+    ) -> int: ...
+
+    def ack_process_message(
+        self,
+        message_id: str,
+        *,
+        recipient_pid: str,
+        acked_at: str,
+        updated_at: str,
+    ) -> bool:
+        """CAS one process message from unread to acknowledged."""
+
+        ...
 
     def get_object_task(self, task_id: str) -> ObjectTask | None: ...
 
@@ -1028,6 +1134,49 @@ class ProcessBackendProtocol(
     ) -> bool: ...
 
     def release_execution(self, token: ProcessExecutionToken) -> bool: ...
+
+    def get_process_terminal_cleanup(self, pid: str) -> dict[str, Any] | None: ...
+
+    def list_process_terminal_cleanups(
+        self,
+        *,
+        after: ProcessCursor | None,
+        limit: int,
+        include_completed: bool = False,
+    ) -> list[dict[str, Any]]: ...
+
+    def claim_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        owner_id: str,
+        lease_id: str,
+        expected_lease_id: str | None,
+    ) -> dict[str, Any] | None: ...
+
+    def complete_process_terminal_cleanup_phase(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+        phase: str,
+    ) -> dict[str, Any] | None: ...
+
+    def fail_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+        phase: str,
+        error: Mapping[str, Any],
+    ) -> dict[str, Any] | None: ...
+
+    def finish_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+    ) -> dict[str, Any] | None: ...
 
     def recover_stale_executions(
         self,
@@ -1331,6 +1480,12 @@ class SnapshotCheckpointBackendProtocol(
 
     def insert_table_row(self, table: str, row: dict[str, Any]) -> None: ...
 
+    def ensure_process_terminal_cleanup_intent(
+        self,
+        pid: str,
+        status: ProcessStatus | str,
+    ) -> None: ...
+
     def validate_table_identifier(self, table: str) -> str: ...
 
     def validate_column_identifier(self, table: str, column: str) -> str: ...
@@ -1405,6 +1560,19 @@ class SnapshotCheckpointBackendProtocol(
         limit: int | None = None,
     ) -> list[ProcessMessage]: ...
 
+    def count_process_messages(
+        self,
+        recipient_pid: str | None = None,
+        *,
+        status: ProcessMessageStatus | str | None = None,
+        kind: ProcessMessageKind | str | None = None,
+        sender: str | None = None,
+        channel: str | None = None,
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+        message_ids: list[str] | None = None,
+    ) -> int: ...
+
     def list_object_tasks(
         self,
         *,
@@ -1414,6 +1582,18 @@ class SnapshotCheckpointBackendProtocol(
         include_terminal: bool = True,
         limit: int | None = None,
     ) -> list[ObjectTask]: ...
+
+    def query_checkpoint_object_tasks(
+        self,
+        *,
+        statuses: Iterable[str | ObjectTaskStatus],
+        checkpoint_created_at: str,
+        terminal_after: bool,
+        scope_pids: Iterable[str] = (),
+        owner_oids: Iterable[str] = (),
+        after: ObjectTaskRecoveryCursor | None,
+        limit: int | None = None,
+    ) -> ObjectTaskRecoveryPage: ...
 
     def set_llm_context_generation(self, pid: str, generation: str) -> None: ...
 
@@ -1599,6 +1779,7 @@ class OperationEvidenceBackendProtocol(TransactionBackendProtocol, Protocol):
 
 class UnitOfWorkBackendProtocol(
     ProcessBackendProtocol,
+    ObjectQueryBackendProtocol,
     ObjectRecoveryBackendProtocol,
     AuthorityRecoveryBackendProtocol,
     ResourceBackendProtocol,

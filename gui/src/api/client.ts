@@ -1,8 +1,19 @@
-import type { AgentRating, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LLMProfileInput, LLMProfileSummary, McpServerSummary, ModuleSummary, ObjectTask, OperationListResponse, RuntimeHealth, RuntimeSnapshot, SkillSummary, SseMessage, StreamConnectionStatus, WorkflowRunResult } from "./types";
-import { assertRuntimeSnapshot } from "./types";
+import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LLMProfileInput, LLMProfileSummary, McpServerSummary, ModuleSummary, ObjectTask, OperationListResponse, RuntimeHealth, RuntimeSnapshot, SchedulerStatus, SkillSummary, SseMessage, StreamConnectionStatus, WorkflowRunResult } from "./types";
+import { assertRuntimeSnapshot, assertSchedulerStatus } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
+export type RequestOptions = { signal?: AbortSignal; timeoutMs?: number | null };
+const defaultReadRequestTimeoutMs = 30_000;
+export const objectTaskWaitDeadlineMarginMs = 5_000;
+export const capabilityInventoryMaxItems = 10_000;
+export const capabilityInventoryMaxPages = capabilityInventoryMaxItems;
+
+export type CapabilityPageResponse = {
+  items: CapabilitySummary[];
+  next_after: string | null;
+  has_more: boolean;
+};
 
 export class LibOSClient {
   constructor(private connection: GuiConnection) {}
@@ -15,8 +26,8 @@ export class LibOSClient {
     this.connection = connection;
   }
 
-  async snapshot(): Promise<RuntimeSnapshot> {
-    const snapshot = await this.request<unknown>("GET", "/api/snapshot");
+  async snapshot(options: RequestOptions = {}): Promise<RuntimeSnapshot> {
+    const snapshot = await this.request<unknown>("GET", "/api/snapshot", undefined, options);
     assertRuntimeSnapshot(snapshot);
     return snapshot;
   }
@@ -25,24 +36,39 @@ export class LibOSClient {
     return this.request<RuntimeHealth>("GET", "/api/health");
   }
 
-  async listOperations(pid: string, limit = 100, cursor?: string): Promise<OperationListResponse> {
+  async listOperations(pid: string, limit = 100, cursor?: string, options: RequestOptions = {}): Promise<OperationListResponse> {
     const query = new URLSearchParams({ pid, limit: String(limit) });
     if (cursor) query.set("cursor", cursor);
-    return this.request<OperationListResponse>("GET", `/api/operations?${query.toString()}`);
+    return this.request<OperationListResponse>("GET", `/api/operations?${query.toString()}`, undefined, options);
   }
 
-  async explainOperation(operationId: string, evidenceLimit = 200, cursor?: string): Promise<ExplainOperationResponse> {
+  async explainOperation(operationId: string, evidenceLimit = 200, cursor?: string, options: RequestOptions = {}): Promise<ExplainOperationResponse> {
     const query = new URLSearchParams({ evidence_limit: String(evidenceLimit) });
     if (cursor) query.set("cursor", cursor);
     return this.request<ExplainOperationResponse>(
       "GET",
-      `/api/operations/${encodeURIComponent(operationId)}?${query.toString()}`
+      `/api/operations/${encodeURIComponent(operationId)}?${query.toString()}`,
+      undefined,
+      options
     );
   }
 
-  async resolveOperation(kind: string, evidenceId: string): Promise<ExplainOperationResponse> {
+  async resolveOperation(kind: string, evidenceId: string, options: RequestOptions = {}): Promise<ExplainOperationResponse> {
     const query = new URLSearchParams({ kind, id: evidenceId });
-    return this.request<ExplainOperationResponse>("GET", `/api/operations/resolve?${query.toString()}`);
+    return this.request<ExplainOperationResponse>("GET", `/api/operations/resolve?${query.toString()}`, undefined, options);
+  }
+
+  async listProcessAudit(pid: string, limit?: number, beforeRecordId?: string, options: RequestOptions = {}): Promise<AuditRecord[]> {
+    const query = new URLSearchParams();
+    if (limit !== undefined) query.set("limit", String(limit));
+    if (beforeRecordId) query.set("before", beforeRecordId);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return this.request<AuditRecord[]>(
+      "GET",
+      `/api/processes/${encodeURIComponent(pid)}/audit${suffix}`,
+      undefined,
+      options
+    );
   }
 
   async images(): Promise<ImageSummary[]> {
@@ -140,11 +166,22 @@ export class LibOSClient {
     });
   }
 
-  async activateSkill(skillId: string, pid: string, confirmed: boolean, actor?: string) {
+  async activateSkill(
+    skillId: string,
+    pid: string,
+    expectedPackageSha256: string,
+    confirmed: boolean,
+    actor?: string
+  ) {
     return this.request<Record<string, unknown>>(
       "POST",
       `/api/skills/${encodeURIComponent(skillId)}/activate`,
-      { pid, confirmed, ...(actor ? { actor } : {}) }
+      {
+        pid,
+        expected_package_sha256: expectedPackageSha256,
+        confirmed,
+        ...(actor ? { actor } : {})
+      }
     );
   }
 
@@ -157,8 +194,33 @@ export class LibOSClient {
   }
 
   async listCapabilities(subject?: string): Promise<CapabilitySummary[]> {
-    const query = subject ? `?subject=${encodeURIComponent(subject)}` : "";
-    return this.request<CapabilitySummary[]>("GET", `/api/capabilities${query}`);
+    const capabilities = new Map<string, CapabilitySummary>();
+    const seenCursors = new Set<string>();
+    let after: string | undefined;
+    let receivedItems = 0;
+    for (let pageIndex = 0; pageIndex < capabilityInventoryMaxPages; pageIndex += 1) {
+      const page = await this.listCapabilityPage(subject, after);
+      receivedItems += page.items.length;
+      if (receivedItems > capabilityInventoryMaxItems) {
+        throw new Error(`GUI capability inventory exceeds ${capabilityInventoryMaxItems} items.`);
+      }
+      for (const capability of page.items) capabilities.set(capability.cap_id, capability);
+      if (!page.has_more) return Array.from(capabilities.values());
+      if (!page.next_after || page.next_after === after || seenCursors.has(page.next_after)) {
+        throw new Error("GUI capability pagination returned a repeated or missing cursor.");
+      }
+      seenCursors.add(page.next_after);
+      after = page.next_after;
+    }
+    throw new Error(`GUI capability inventory exceeds ${capabilityInventoryMaxPages} pages.`);
+  }
+
+  async listCapabilityPage(subject?: string, after?: string): Promise<CapabilityPageResponse> {
+    const query = new URLSearchParams({ mode: "page" });
+    if (subject) query.set("subject", subject);
+    if (after) query.set("after", after);
+    const payload = await this.request<unknown>("GET", `/api/capabilities?${query.toString()}`);
+    return capabilityPageResponse(payload);
   }
 
   async inspectCapability(capabilityId: string): Promise<CapabilitySummary> {
@@ -192,7 +254,7 @@ export class LibOSClient {
       subject,
       resource,
       right
-    });
+    }, { timeoutMs: defaultReadRequestTimeoutMs });
   }
 
   async inspectJsonRpcEndpoint(endpointId: string): Promise<JsonRpcEndpointSummary> {
@@ -279,11 +341,15 @@ export class LibOSClient {
   }
 
   async setAutoRun(enabled: boolean) {
-    return this.request("POST", "/api/scheduler/auto", { enabled });
+    const status = await this.request<unknown>("POST", "/api/scheduler/auto", { enabled });
+    assertSchedulerStatus(status);
+    return status;
   }
 
   async pauseScheduler() {
-    return this.request("POST", "/api/scheduler/pause", {});
+    const status = await this.request<unknown>("POST", "/api/scheduler/pause", {});
+    assertSchedulerStatus(status);
+    return status;
   }
 
   async spawn(
@@ -419,7 +485,7 @@ export class LibOSClient {
     return this.request<ObjectTask>("POST", `/api/object-tasks/${encodeURIComponent(taskId)}/wait`, {
       ...(pid ? { pid } : {}),
       ...(timeoutS !== undefined ? { timeout_s: timeoutS } : {})
-    });
+    }, { timeoutMs: objectTaskWaitDeadlineMs(timeoutS) });
   }
 
   async watchObjectTaskOwner({
@@ -500,23 +566,36 @@ export class LibOSClient {
     }, maxQuanta));
   }
 
-  async request<T = unknown>(method: string, path: string, body?: JsonBody): Promise<T> {
+  async request<T = unknown>(method: string, path: string, body?: JsonBody, options: RequestOptions = {}): Promise<T> {
+    return this.requestJson<T>(method, path, body, options);
+  }
+
+  async requestJson<T = unknown>(method: string, path: string, body?: JsonBody, options: RequestOptions = {}): Promise<T> {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.connection.token}`,
       Accept: "application/json"
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    const response = await fetch(`${this.connection.url}${path}`, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body)
-    });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      const message = payload?.error?.message ?? `HTTP ${response.status}`;
-      throw new ApiError(message, response.status, payload);
+    const timeoutMs = options.timeoutMs === undefined
+      ? isReadOnlyHttpMethod(method) ? defaultReadRequestTimeoutMs : null
+      : options.timeoutMs;
+    const abort = requestAbortContext(options.signal, timeoutMs);
+    try {
+      const response = await fetch(`${this.connection.url}${path}`, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: abort.signal
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message = payload?.error?.message ?? `HTTP ${response.status}`;
+        throw new ApiError(message, response.status, payload);
+      }
+      return payload as T;
+    } finally {
+      abort.cleanup();
     }
-    return payload as T;
   }
 
   async stream(
@@ -529,7 +608,13 @@ export class LibOSClient {
     onStatus?.("connecting");
     while (!signal.aborted) {
       try {
-        nextCursor = await this.readStreamUntilClosed(onMessage, signal, nextCursor, onStatus);
+        nextCursor = await this.readStreamUntilClosed(
+          onMessage,
+          signal,
+          nextCursor,
+          onStatus,
+          (cursor) => { nextCursor = cursor; }
+        );
       } catch (error) {
         if (signal.aborted) return;
         if (error instanceof SseHttpError) {
@@ -547,7 +632,8 @@ export class LibOSClient {
     onMessage: (message: SseMessage) => void,
     signal: AbortSignal,
     cursor: string,
-    onStatus?: (status: StreamConnectionStatus) => void
+    onStatus?: (status: StreamConnectionStatus) => void,
+    onCursor?: (cursor: string) => void
   ) {
     const response = await fetch(`${this.connection.url}/api/events/stream?cursor=${encodeURIComponent(cursor)}`, {
       headers: { Authorization: `Bearer ${this.connection.token}` },
@@ -570,7 +656,10 @@ export class LibOSClient {
           buffer = buffer.slice(boundary.index + boundary.length);
           const parsed = parseSseFrame(frame);
           if (parsed) {
-            if (parsed.id) nextCursor = parsed.id;
+            if (parsed.id) {
+              nextCursor = parsed.id;
+              onCursor?.(nextCursor);
+            }
             onMessage(parsed);
           }
           boundary = findSseBoundary(buffer);
@@ -639,4 +728,72 @@ class SseHttpError extends Error {
   constructor(readonly status: number) {
     super(`SSE connection failed: ${status}`);
   }
+}
+
+export function objectTaskWaitDeadlineMs(timeoutS?: number): number | null {
+  if (timeoutS === undefined) return null;
+  if (!Number.isFinite(timeoutS) || timeoutS < 0) {
+    throw new Error("GUI object-task wait timeout must be a finite non-negative number.");
+  }
+  const deadlineMs = Math.ceil(timeoutS * 1_000) + objectTaskWaitDeadlineMarginMs;
+  if (!Number.isSafeInteger(deadlineMs)) {
+    throw new Error("GUI object-task wait timeout exceeds the supported deadline range.");
+  }
+  return deadlineMs;
+}
+
+function capabilityPageResponse(payload: unknown): CapabilityPageResponse {
+  if (!isJsonObject(payload) || !Array.isArray(payload.items) || typeof payload.has_more !== "boolean") {
+    throw new Error("GUI capability page response is malformed.");
+  }
+  const nextAfter = payload.next_after;
+  if (nextAfter !== null && typeof nextAfter !== "string") {
+    throw new Error("GUI capability page cursor is malformed.");
+  }
+  const items = payload.items.map((item) => {
+    if (
+      !isJsonObject(item)
+      || typeof item.cap_id !== "string"
+      || !item.cap_id
+      || typeof item.subject !== "string"
+      || typeof item.resource !== "string"
+      || !Array.isArray(item.rights)
+      || item.rights.some((right) => typeof right !== "string")
+    ) {
+      throw new Error("GUI capability page contains a malformed capability.");
+    }
+    return item as CapabilitySummary;
+  });
+  return { items, next_after: nextAfter, has_more: payload.has_more };
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isReadOnlyHttpMethod(method: string): boolean {
+  return ["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
+}
+
+function requestAbortContext(external: AbortSignal | undefined, timeoutMs: number | null): {
+  signal: AbortSignal;
+  cleanup(): void;
+} {
+  if (timeoutMs !== null && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)) {
+    throw new Error("GUI request timeout must be a positive safe integer.");
+  }
+  const controller = new AbortController();
+  const abortFromExternal = () => controller.abort(external?.reason);
+  if (external?.aborted) abortFromExternal();
+  else external?.addEventListener("abort", abortFromExternal, { once: true });
+  const timer = timeoutMs === null ? null : setTimeout(() => {
+    controller.abort(new DOMException(`GUI request timed out after ${timeoutMs}ms`, "TimeoutError"));
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    cleanup() {
+      if (timer !== null) clearTimeout(timer);
+      external?.removeEventListener("abort", abortFromExternal);
+    }
+  };
 }

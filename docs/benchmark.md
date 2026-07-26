@@ -389,9 +389,14 @@ new interrupted run's metadata with an older run's results, and an interrupted
 write, truncated copy, or missing runner cannot be reported as a favorable
 partial sample.
 
-The output directory has one writer and is not a concurrency lock. Sequential
-reuse is safe under the binding above, but concurrent benchmark processes must
-use different output directories.
+The output directory is protected by an exclusive
+`.runtime-safety-output.lock` acquired before the in-progress manifest is
+written. A concurrent benchmark process targeting the same directory fails
+closed instead of interleaving artifacts; different output directories can run
+concurrently. Normal context exit removes only the lock whose ownership token
+still matches. A process crash can leave that lock behind, so an operator must
+inspect the directory and confirm that no writer remains before removing a
+stale lock. Sequential reuse is safe under the artifact binding above.
 
 `write_run_outputs(...)` also supports direct programmatic/test callers. If no
 metadata file exists, that helper generates a run id and writes a

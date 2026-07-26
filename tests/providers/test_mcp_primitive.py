@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+from dataclasses import replace
 import hashlib
 import os
 from pathlib import Path
@@ -41,7 +42,7 @@ from agent_libos.models import (
     SinkTrustRule,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProviderHostError, ResourceLimitExceeded, ValidationError
-from agent_libos.substrate import ProviderEffectNotStarted
+from agent_libos.substrate import ProviderEffectNotStarted, SubprocessLimits
 from agent_libos.substrate import LocalResourceProviderSubstrate, SdkMcpProvider
 from agent_libos.primitives.mcp import McpPrimitive, _model_facing_mcp_call_payload
 import agent_libos.sdk.protected_operations as protected_operations
@@ -51,6 +52,21 @@ from agent_libos.substrate.local import (
     _bounded_mcp_content,
 )
 from agent_libos.utils.serde import dumps, to_jsonable
+
+
+def _provider_tool_list_bytes(tools: list[McpProviderTool]) -> int:
+    return len(dumps([to_jsonable(tool) for tool in tools]).encode("utf-8"))
+
+
+def _provider_call_bytes(content: Any, structured_content: Any) -> int:
+    return len(
+        dumps(
+            {
+                "content": content,
+                "structured_content": structured_content,
+            }
+        ).encode("utf-8")
+    )
 
 
 def _grant_stdio_spawn(
@@ -73,6 +89,354 @@ def _grant_stdio_spawn(
 
 
 class TestMcpPrimitive:
+
+    def test_posix_stdio_post_spawn_group_failure_is_not_certified_not_started(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import agent_libos.substrate.local as local_substrate
+
+        terminated: list[int] = []
+
+        class FakeProcess:
+            pid = 43210
+            returncode = None
+
+        class FakeAnyio:
+            @staticmethod
+            async def open_process(*_args: Any, **_kwargs: Any) -> FakeProcess:
+                return FakeProcess()
+
+        async def terminate(
+            process: FakeProcess,
+            **_kwargs: Any,
+        ) -> None:
+            terminated.append(process.pid)
+
+        monkeypatch.setattr(local_substrate.os, "getpgid", lambda _pid: 99999)
+        monkeypatch.setattr(local_substrate, "_terminate_mcp_stdio_process", terminate)
+        server = SimpleNamespace(command="/trusted/mcp", args=[], env={}, cwd=None)
+        config = SimpleNamespace(deadline=time.monotonic() + 1.0)
+
+        with pytest.raises(ValidationError, match="child.*process group") as caught:
+            asyncio.run(
+                local_substrate._spawn_posix_mcp_stdio_process(
+                    FakeAnyio(),
+                    server,
+                    None,
+                    config,
+                )
+            )
+
+        assert not isinstance(caught.value, ProviderEffectNotStarted)
+        assert terminated == [43210]
+
+    def test_windows_stdio_post_spawn_job_failure_is_not_certified_not_started(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import anyio
+        import agent_libos.substrate.local as local_substrate
+
+        class FakeProcess:
+            pid = 54321
+            returncode = None
+            killed = False
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                return -9
+
+        process = FakeProcess()
+
+        class FailingJob:
+            closed = False
+
+            def assign_pid(self, _pid: int) -> None:
+                raise OSError("injected job assignment failure")
+
+            def close(self) -> None:
+                self.closed = True
+
+        job = FailingJob()
+
+        async def open_process(*_args: Any, **_kwargs: Any) -> FakeProcess:
+            return process
+
+        monkeypatch.setattr(anyio, "open_process", open_process)
+        monkeypatch.setattr(
+            local_substrate.WindowsJobObject,
+            "create",
+            classmethod(lambda _cls, _limits=None: job),
+        )
+        server = SimpleNamespace(command="C:/trusted/mcp.exe", args=[], env={}, cwd=None)
+        config = SimpleNamespace(deadline=time.monotonic() + 1.0, limits=None)
+
+        with pytest.raises(ValidationError, match="child.*Windows Job Object") as caught:
+            asyncio.run(
+                local_substrate._spawn_windows_mcp_stdio_process(
+                    anyio,
+                    server,
+                    None,
+                    config,
+                )
+            )
+
+        assert not isinstance(caught.value, ProviderEffectNotStarted)
+        assert process.killed
+        assert job.closed
+    def test_provider_receipts_cannot_underreport_canonical_response_bytes(self) -> None:
+        runtime = Runtime.open(":memory:")
+        try:
+            tool = McpToolSpec(
+                tool_id="echo",
+                mcp_name="demo.echo",
+                right="read",
+                rollback_class="no_rollback_required",
+                state_mutation=False,
+                information_flow=True,
+            )
+            server = McpServerSpec(
+                schema_version=1,
+                server_id="receipt-boundary",
+                transport="stdio",
+                tools=[tool],
+                timeout_s=1,
+                max_request_bytes=4096,
+                max_response_bytes=4096,
+                stdio=McpStdioTransportSpec(command="python3"),
+            )
+            live_tools = [
+                McpProviderTool(
+                    name="demo.echo",
+                    description="Echo",
+                    input_schema={"type": "object"},
+                )
+            ]
+            list_bytes = len(dumps([to_jsonable(item) for item in live_tools]).encode("utf-8"))
+            content = [{"type": "text", "text": "hello"}]
+            structured = {"echo": "hello"}
+            call_bytes = len(
+                dumps(
+                    {
+                        "content": content,
+                        "structured_content": structured,
+                    }
+                ).encode("utf-8")
+            )
+
+            accepted_list = runtime.mcp._validated_tool_list_result(
+                server,
+                McpToolListResult(
+                    server_id=server.server_id,
+                    tools=live_tools,
+                    response_bytes=list_bytes,
+                    duration_s=0.01,
+                ),
+            )
+            accepted_call = runtime.mcp._validated_provider_call_result(
+                server,
+                McpProviderCallResult(
+                    content=content,
+                    structured_content=structured,
+                    response_bytes=call_bytes,
+                    duration_s=0.01,
+                    call_response_bytes=call_bytes,
+                    call_started=True,
+                ),
+            )
+
+            assert accepted_list.response_bytes == list_bytes
+            assert accepted_call.response_bytes == call_bytes
+            with pytest.raises(ProviderHostError):
+                runtime.mcp._validated_tool_list_result(
+                    server,
+                    McpToolListResult(
+                        server_id=server.server_id,
+                        tools=live_tools,
+                        response_bytes=list_bytes - 1,
+                        duration_s=0.01,
+                    ),
+                )
+            with pytest.raises(ProviderHostError):
+                runtime.mcp._validated_provider_call_result(
+                    server,
+                    McpProviderCallResult(
+                        content=content,
+                        structured_content=structured,
+                        response_bytes=call_bytes - 1,
+                        duration_s=0.01,
+                        call_response_bytes=call_bytes - 1,
+                        call_started=True,
+                    ),
+                )
+            endpoint_limited_server = replace(
+                server,
+                max_response_bytes=call_bytes - 1,
+            )
+            with pytest.raises(ProviderHostError):
+                runtime.mcp._validated_provider_call_result(
+                    endpoint_limited_server,
+                    McpProviderCallResult(
+                        content=content,
+                        structured_content=structured,
+                        response_bytes=call_bytes - 1,
+                        duration_s=0.01,
+                    ),
+                )
+            with pytest.raises(ProviderHostError):
+                runtime.mcp._validated_provider_call_result(
+                    server,
+                    McpProviderCallResult(
+                        content={"content_omitted": True},
+                        response_bytes=server.max_response_bytes - 1,
+                        duration_s=0.01,
+                        too_large=True,
+                    ),
+                )
+        finally:
+            runtime.close()
+
+    def test_provider_results_enforce_tool_count_and_json_shape_limits(self) -> None:
+        runtime = Runtime.open(":memory:")
+        try:
+            tool = McpToolSpec(
+                tool_id="echo",
+                mcp_name="demo.echo",
+                right="read",
+                rollback_class="no_rollback_required",
+                state_mutation=False,
+                information_flow=True,
+            )
+            server = McpServerSpec(
+                schema_version=1,
+                server_id="shape-boundary",
+                transport="stdio",
+                tools=[tool],
+                timeout_s=1,
+                max_request_bytes=65_536,
+                max_response_bytes=1_048_576,
+                stdio=McpStdioTransportSpec(command="python3"),
+            )
+            too_many_tools = [
+                McpProviderTool(name=f"tool-{index}")
+                for index in range(runtime.config.mcp.list_limit + 1)
+            ]
+            tool_bytes = len(
+                dumps([to_jsonable(item) for item in too_many_tools]).encode("utf-8")
+            )
+            nested: Any = "leaf"
+            for _ in range(130):
+                nested = {"child": nested}
+            nested_bytes = len(
+                dumps(
+                    {
+                        "content": nested,
+                        "structured_content": None,
+                    }
+                ).encode("utf-8")
+            )
+            node_heavy = [None] * 100_001
+            node_heavy_bytes = _provider_call_bytes(node_heavy, None)
+            string_heavy = "x" * (server.max_response_bytes + 1)
+
+            with pytest.raises(ProviderHostError):
+                runtime.mcp._validated_tool_list_result(
+                    server,
+                    McpToolListResult(
+                        server_id=server.server_id,
+                        tools=too_many_tools,
+                        response_bytes=tool_bytes,
+                        duration_s=0.01,
+                    ),
+                )
+            with pytest.raises(ProviderHostError):
+                runtime.mcp._validated_provider_call_result(
+                    server,
+                    McpProviderCallResult(
+                        content=nested,
+                        response_bytes=nested_bytes,
+                        duration_s=0.01,
+                    ),
+                )
+            with pytest.raises(ProviderHostError):
+                runtime.mcp._validated_provider_call_result(
+                    server,
+                    McpProviderCallResult(
+                        content=node_heavy,
+                        response_bytes=node_heavy_bytes,
+                        duration_s=0.01,
+                    ),
+                )
+            with pytest.raises(ProviderHostError):
+                runtime.mcp._validated_provider_call_result(
+                    server,
+                    McpProviderCallResult(
+                        content=string_heavy,
+                        response_bytes=server.max_response_bytes,
+                        duration_s=0.01,
+                    ),
+                )
+        finally:
+            runtime.close()
+
+    def test_underreported_provider_call_fails_closed_and_settles_max_mcp_envelope(
+        self,
+    ) -> None:
+        runtime = Runtime.open(":memory:")
+        provider = _UnderreportingCallMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="reject underreported MCP call",
+                resource_budget=ResourceBudget(max_mcp_bytes=2_200_000),
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("underreported-call"),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp:underreported-call:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            with pytest.raises(ProviderHostError):
+                runtime.mcp.call_tool(
+                    pid,
+                    "underreported-call",
+                    "echo",
+                    {"text": "hello"},
+                )
+
+            expected_list_bytes = _provider_tool_list_bytes(
+                [
+                    McpProviderTool(
+                        name="demo.echo",
+                        description="Echo",
+                        input_schema=provider.live_schema,
+                    )
+                ]
+            )
+            usage = runtime.process.get(pid).resource_usage
+            assert usage.mcp_response_bytes == (
+                expected_list_bytes + runtime.config.mcp.max_response_bytes
+            )
+            reservation = runtime.store.list_resource_usage_reservations(pid=pid)[0]
+            assert reservation["status"] == "settled"
+            assert reservation["settled_usage"].mcp_response_bytes == (
+                expected_list_bytes + runtime.config.mcp.max_response_bytes
+            )
+        finally:
+            runtime.close()
+
     def test_model_facing_result_prefers_strictly_equivalent_structured_content(
         self,
     ) -> None:
@@ -334,12 +698,19 @@ class TestMcpPrimitive:
             assert provider.call_args == []
             process = runtime.process.get(pid)
             assert process.resource_usage.mcp_request_bytes == 28
-            assert process.resource_usage.mcp_response_bytes == 32
+            expected_call_bytes = _provider_call_bytes(
+                [{"type": "text", "text": "ok"}],
+                {"echo": {"text": "hello"}},
+            )
+            assert process.resource_usage.mcp_response_bytes == 13 + expected_call_bytes
             reservations = runtime.store.list_resource_usage_reservations(pid=pid)
             assert len(reservations) == 1
             assert reservations[0]['status'] == 'settled'
             assert reservations[0]['settled_usage'].mcp_request_bytes == 28
-            assert reservations[0]['settled_usage'].mcp_response_bytes == 32
+            assert (
+                reservations[0]['settled_usage'].mcp_response_bytes
+                == 13 + expected_call_bytes
+            )
         finally:
             runtime.close()
 
@@ -948,7 +1319,10 @@ class TestMcpPrimitive:
 
         class FakeProcess:
             stdout = FakeReceiveStream()
+            stderr = FakeReceiveStream()
             stdin = FakeSendStream()
+            pid = 12345
+            returncode = 0
 
             async def __aenter__(self) -> "FakeProcess":
                 return self
@@ -959,6 +1333,19 @@ class TestMcpPrimitive:
             async def wait(self) -> int:
                 return 0
 
+            def terminate(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+        class FakeJob:
+            def assign_pid(self, _pid: int) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
         async def create_windows_process(
             command: str,
             _args: list[str],
@@ -967,6 +1354,10 @@ class TestMcpPrimitive:
             _cwd: str,
         ) -> FakeProcess:
             captured.append(command)
+            return FakeProcess()
+
+        async def open_process(argv: list[str], **_kwargs: Any) -> FakeProcess:
+            captured.append(argv[0])
             return FakeProcess()
 
         async def terminate_process(_process: Any) -> None:
@@ -988,6 +1379,12 @@ class TestMcpPrimitive:
         monkeypatch.setitem(sys.modules, "mcp.os.win32.utilities", mcp_windows_module)
         monkeypatch.setitem(sys.modules, "mcp.shared.message", mcp_shared_module)
         monkeypatch.setattr(local_substrate, "_MCP_WINDOWS", True)
+        monkeypatch.setattr(anyio, "open_process", open_process)
+        monkeypatch.setattr(
+            local_substrate.WindowsJobObject,
+            "create",
+            classmethod(lambda _cls, _limits=None: FakeJob()),
+        )
         server = SimpleNamespace(
             command=str(selected.resolve()),
             args=[],
@@ -1213,6 +1610,112 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    def test_stdio_dispatch_receives_remaining_subprocess_limits(self) -> None:
+        class CapturingProvider(_RecordingMcpProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.limits: list[SubprocessLimits | None] = []
+
+            def list_tools(self, server: Any, **kwargs: Any) -> McpToolListResult:
+                self.limits.append(kwargs.get('limits'))
+                return super().list_tools(server, **kwargs)
+
+            def call_tool(
+                self,
+                server: Any,
+                tool: Any,
+                arguments: dict[str, Any],
+                **kwargs: Any,
+            ) -> McpProviderCallResult:
+                self.limits.append(kwargs.get('limits'))
+                return super().call_tool(server, tool, arguments, **kwargs)
+
+        runtime = Runtime.open(':memory:')
+        provider = CapturingProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                goal='bounded MCP stdio subprocess',
+                resource_budget=ResourceBudget(
+                    max_subprocess_wall_seconds=3.0,
+                    max_subprocess_cpu_seconds=2.0,
+                    max_subprocess_memory_bytes=128 * 1024 * 1024,
+                ),
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('stdio-subprocess-limits'),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:stdio-subprocess-limits:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            assert runtime.mcp.call_tool(
+                pid,
+                'stdio-subprocess-limits',
+                'echo',
+                {'text': 'hello'},
+            ).ok
+
+            assert len(provider.limits) == 2
+            for limits in provider.limits:
+                assert isinstance(limits, SubprocessLimits)
+                assert limits.wall_seconds == pytest.approx(3.0)
+                assert limits.cpu_seconds == pytest.approx(2.0)
+                assert limits.memory_bytes == 128 * 1024 * 1024
+        finally:
+            runtime.close()
+
+    def test_budgeted_stdio_dispatch_rejects_provider_without_limit_support(
+        self,
+    ) -> None:
+        class UnsupportedProvider(_RecordingMcpProvider):
+            supports_subprocess_limits = False
+
+        runtime = Runtime.open(':memory:')
+        provider = UnsupportedProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                goal='fail closed MCP subprocess budget',
+                resource_budget=ResourceBudget(
+                    max_subprocess_wall_seconds=1.0,
+                ),
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest('unsupported-subprocess-limits'),
+                actor='cli',
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                'mcp:unsupported-subprocess-limits:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            with pytest.raises(
+                ValidationError,
+                match='explicitly support SubprocessLimits',
+            ):
+                runtime.mcp.call_tool(
+                    pid,
+                    'unsupported-subprocess-limits',
+                    'echo',
+                    {'text': 'hello'},
+                )
+
+            assert provider.list_calls == []
+            assert provider.call_args == []
+        finally:
+            runtime.close()
+
     def test_legacy_provider_does_not_start_call_after_list_exhausts_deadline(self) -> None:
         runtime = Runtime.open("local")
 
@@ -1434,7 +1937,7 @@ class TestMcpPrimitive:
             monkeypatch.setattr(
                 runtime.mcp,
                 '_validate_runtime_resolution',
-                lambda _spec: ('93.184.216.34',),
+                lambda _spec, **_kwargs: ('93.184.216.34',),
             )
 
             result = runtime.mcp.call_tool(
@@ -2924,7 +3427,7 @@ class TestMcpPrimitive:
             ("tool", "unknown MCP tool fields"),
             ("http", "unknown MCP HTTP fields"),
             ("header", "unknown MCP header Authorization fields"),
-            ("non-string", "unknown MCP server fields"),
+            ("non-string", "YAML mapping keys must be strings"),
         ],
     )
     def test_manifest_validation_rejects_unknown_fields(
@@ -3316,12 +3819,30 @@ class TestMcpPrimitive:
             assert 'mcp-provider-secret' not in str(effect.provider_metadata)
             process = runtime.process.get(pid)
             assert process.resource_usage.mcp_response_bytes == (
-                128 + runtime.config.mcp.max_response_bytes
+                _provider_tool_list_bytes(
+                    [
+                        McpProviderTool(
+                            name="demo.echo",
+                            description="Echo",
+                            input_schema=provider.live_schema,
+                        )
+                    ]
+                )
+                + runtime.config.mcp.max_response_bytes
             )
             reservation = runtime.store.list_resource_usage_reservations(pid=pid)[0]
             assert reservation['status'] == 'settled'
             assert reservation['settled_usage'].mcp_response_bytes == (
-                128 + runtime.config.mcp.max_response_bytes
+                _provider_tool_list_bytes(
+                    [
+                        McpProviderTool(
+                            name="demo.echo",
+                            description="Echo",
+                            input_schema=provider.live_schema,
+                        )
+                    ]
+                )
+                + runtime.config.mcp.max_response_bytes
             )
         finally:
             runtime.close()
@@ -3508,7 +4029,16 @@ class TestMcpPrimitive:
             expected_response_bytes = {
                 "live_result_tools": max_response_bytes,
                 "refresh_response_bytes": max_response_bytes,
-                "legacy_call_content": 128 + max_response_bytes,
+                "legacy_call_content": _provider_tool_list_bytes(
+                    [
+                        McpProviderTool(
+                            name="demo.echo",
+                            description="Echo",
+                            input_schema=provider.live_schema,
+                        )
+                    ]
+                )
+                + max_response_bytes,
                 "validated_call_content": max_response_bytes * 2,
             }[provider_mode]
             process = runtime.process.get(pid)
@@ -3662,7 +4192,7 @@ class TestMcpPrimitive:
             monkeypatch.setattr(
                 runtime.mcp,
                 '_validate_runtime_resolution',
-                lambda _spec: (_ for _ in ()).throw(ProviderEffectNotStarted('resolution did not start')),
+                lambda _spec, **_kwargs: (_ for _ in ()).throw(ProviderEffectNotStarted('resolution did not start')),
             )
 
             with pytest.raises(ProviderHostError, match='mcp_provider_not_started') as raised:
@@ -3675,6 +4205,79 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    def test_http_resolution_timeout_is_bounded_and_commits_observed_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        monkeypatch.setenv('AGENT_LIBOS_MCP_TEST_TOKEN', 'token')
+        resolver_started = threading.Event()
+        release_resolver = threading.Event()
+        resolver_completed = threading.Event()
+
+        def slow_getaddrinfo(*_args: Any, **_kwargs: Any) -> list[Any]:
+            resolver_started.set()
+            release_resolver.wait(timeout=3.0)
+            try:
+                return [
+                    (
+                        socket.AF_INET,
+                        socket.SOCK_STREAM,
+                        socket.IPPROTO_TCP,
+                        '',
+                        ('93.184.216.34', 443),
+                    )
+                ]
+            finally:
+                resolver_completed.set()
+
+        monkeypatch.setattr(socket, 'getaddrinfo', slow_getaddrinfo)
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='bounded MCP DNS resolution',
+            )
+            manifest = _http_manifest(
+                'resolution-timeout',
+                'https://deadline.example.test/tools',
+            ).replace('timeout_s: 5', 'timeout_s: 0.2')
+            runtime.mcp.register_server_from_yaml_text(
+                manifest,
+                actor='cli',
+                require_capability=False,
+            )
+            cap = runtime.capability.grant_once(
+                pid,
+                'mcp:resolution-timeout:echo',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+
+            started = time.monotonic()
+            with pytest.raises(ProviderHostError, match='mcp_dns_timeout'):
+                runtime.mcp.call_tool(
+                    pid,
+                    'resolution-timeout',
+                    'echo',
+                    {'text': 'hello'},
+                )
+            elapsed = time.monotonic() - started
+
+            assert resolver_started.wait(timeout=1.0)
+            assert not resolver_completed.is_set()
+            assert elapsed < 1.5
+            committed = runtime.store.get_capability(cap.cap_id)
+            assert committed is not None and committed.uses_remaining == 0
+            assert provider.list_calls == []
+            assert provider.call_args == []
+        finally:
+            release_resolver.set()
+            runtime.close()
+
+        assert resolver_completed.wait(timeout=1.0)
+
     def test_http_live_validation_not_started_after_dns_keeps_information_flow(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -3684,7 +4287,7 @@ class TestMcpPrimitive:
         runtime.mcp.provider = provider
         monkeypatch.setenv('AGENT_LIBOS_MCP_TEST_TOKEN', 'token')
         monkeypatch.setattr(
-            'agent_libos.primitives.mcp.socket.getaddrinfo',
+            'agent_libos.substrate.local.socket.getaddrinfo',
             lambda *_args, **_kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443))],
         )
         try:
@@ -4009,7 +4612,7 @@ class TestMcpPrimitive:
             monkeypatch.setattr(
                 runtime.mcp,
                 "_validate_runtime_resolution",
-                lambda _spec: ("93.184.216.34",),
+                lambda _spec, **_kwargs: ("93.184.216.34",),
             )
             result = runtime.mcp.call_tool(
                 pid,
@@ -4089,7 +4692,15 @@ class TestMcpPrimitive:
             assert effect.provider_metadata["result"]["ok"] is False
             assert effect.provider_metadata["result"]["status"] == "invalid_response"
             process = runtime.process.get(pid)
-            assert process.resource_usage.mcp_response_bytes == 128
+            assert process.resource_usage.mcp_response_bytes == _provider_tool_list_bytes(
+                [
+                    McpProviderTool(
+                        name="demo.echo",
+                        description="Echo",
+                        input_schema=provider.live_schema,
+                    )
+                ]
+            )
         finally:
             runtime.close()
 
@@ -4216,8 +4827,11 @@ class TestMcpPrimitive:
             durable = runtime.store.get_object(result.result_handle.oid)
             observed = dumps({"result": to_jsonable(result), "durable": to_jsonable(durable)})
             assert secret not in observed
-            public_error = durable.payload["failure"]["error"]["details"]
-            assert result.payload["error"]["details"] == public_error
+            public_error = durable.payload["failure"]["error"]
+            assert result.payload["error"]["details"] == {
+                key: public_error[key]
+                for key in ("code", "error_type", "correlation_id")
+            }
             assert public_error["code"] == "mcp_provider_error"
             assert public_error["error_type"] == "RuntimeError"
             assert public_error["correlation_id"]
@@ -4377,14 +4991,22 @@ export async function run(args, libos) {
             )
 
             assert not result.ok
-            assert result.error == "candidate sandbox failure"
+            assert (result.error or "").startswith(
+                "execution_error: SandboxError"
+            )
             assert result.result_handle is not None
             durable = runtime.store.get_object(result.result_handle.oid)
             durable_error = durable.payload["failure"]["error"]
-            assert durable_error == {
-                "type": "SandboxError",
-                "message": "candidate sandbox failure",
-            }
+            assert durable_error["type"] == "SandboxError"
+            assert durable_error["error_type"] == "SandboxError"
+            assert durable_error["code"] == "execution_error"
+            assert durable_error["message"] == result.error
+            assert durable_error["correlation_id"].startswith("corr_")
+            internal_error = durable.payload["failure"]["internal_error"]
+            assert internal_error["error_type"] == "SandboxError"
+            assert internal_error["correlation_id"] == durable_error["correlation_id"]
+            assert internal_error["exception_text"]["bytes"] > 0
+            assert len(internal_error["exception_text"]["sha256"]) == 64
             audit = [
                 record
                 for record in runtime.audit.trace()
@@ -4401,6 +5023,7 @@ export async function run(args, libos) {
                 }
             )
             assert secret not in observed
+            assert "candidate sandbox failure" not in observed
             for value in forged.values():
                 assert value not in observed
         finally:
@@ -4418,7 +5041,7 @@ export async function run(args, libos) {
         def fake_getaddrinfo(*_args: Any, **_kwargs: Any) -> list[Any]:
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.1", 443))]
 
-        monkeypatch.setattr("agent_libos.primitives.mcp.socket.getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr("agent_libos.substrate.local.socket.getaddrinfo", fake_getaddrinfo)
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="mcp dns")
             runtime.mcp.register_server_from_yaml_text(
@@ -4521,7 +5144,15 @@ export async function run(args, libos) {
             result = runtime.mcp.list_tools("demo", actor=pid, refresh=True)
 
             assert result["refreshed"] is True
-            assert result["response_bytes"] == 128
+            assert result["response_bytes"] == _provider_tool_list_bytes(
+                [
+                    McpProviderTool(
+                        name="demo.echo",
+                        description="Echo",
+                        input_schema=provider.live_schema,
+                    )
+                ]
+            )
             assert provider.list_calls == ["demo"]
             process = runtime.process.get(pid)
             assert process.resource_usage.mcp_request_bytes > 0
@@ -4921,6 +5552,8 @@ tools:
 
 
 class _RecordingMcpProvider:
+    supports_subprocess_limits = True
+
     def __init__(self, *, live_schema: dict[str, Any] | None = None) -> None:
         self.live_schema = live_schema or {
             "type": "object",
@@ -4932,19 +5565,28 @@ class _RecordingMcpProvider:
 
     def list_tools(self, server: Any, **_kwargs: Any) -> McpToolListResult:
         self.list_calls.append(server.server_id)
+        tools = [
+            McpProviderTool(
+                name="demo.echo",
+                description="Echo",
+                input_schema=self.live_schema,
+            )
+        ]
         return McpToolListResult(
             server_id=server.server_id,
-            tools=[McpProviderTool(name="demo.echo", description="Echo", input_schema=self.live_schema)],
-            response_bytes=128,
+            tools=tools,
+            response_bytes=_provider_tool_list_bytes(tools),
             duration_s=0.01,
         )
 
     def call_tool(self, server: Any, tool: Any, arguments: dict[str, Any], **_kwargs: Any) -> McpProviderCallResult:
         self.call_args.append((server.server_id, tool.tool_id, dict(arguments)))
+        structured_content = {"echo": dict(arguments)}
+        content = [{"type": "text", "text": "ok"}]
         return McpProviderCallResult(
-            structured_content={"echo": dict(arguments)},
-            content=[{"type": "text", "text": "ok"}],
-            response_bytes=64,
+            structured_content=structured_content,
+            content=content,
+            response_bytes=_provider_call_bytes(content, structured_content),
             duration_s=0.02,
         )
 
@@ -4968,6 +5610,24 @@ class _RecordingMcpProvider:
             rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
             state_mutation=bool(context["state_mutation"]),
             information_flow=bool(context["information_flow"]),
+        )
+
+
+class _UnderreportingCallMcpProvider(_RecordingMcpProvider):
+    def call_tool(
+        self,
+        server: Any,
+        tool: Any,
+        arguments: dict[str, Any],
+        **_kwargs: Any,
+    ) -> McpProviderCallResult:
+        self.call_args.append((server.server_id, tool.tool_id, dict(arguments)))
+        return McpProviderCallResult(
+            structured_content={"echo": dict(arguments)},
+            content=[{"type": "text", "text": "ok"}],
+            response_bytes=1,
+            duration_s=0.02,
+            call_started=True,
         )
 
 
@@ -5008,6 +5668,12 @@ class _MalformedLegacyMcpProvider(_RecordingMcpProvider):
     def list_tools(self, server: Any, **kwargs: Any) -> McpToolListResult:
         if self.mode in {"live_result_tools", "refresh_response_bytes"}:
             self.list_calls.append(server.server_id)
+            tools = [
+                McpProviderTool(
+                    name="demo.echo",
+                    input_schema=self.live_schema,
+                )
+            ]
             return _ExplodingMcpToolListResult(
                 explode_field=(
                     "tools"
@@ -5016,13 +5682,8 @@ class _MalformedLegacyMcpProvider(_RecordingMcpProvider):
                 ),
                 secret=self.secret,
                 server_id=server.server_id,
-                tools=[
-                    McpProviderTool(
-                        name="demo.echo",
-                        input_schema=self.live_schema,
-                    )
-                ],
-                response_bytes=128,
+                tools=tools,
+                response_bytes=_provider_tool_list_bytes(tools),
                 duration_s=0.01,
             )
         return super().list_tools(server, **kwargs)
@@ -5060,15 +5721,18 @@ class _ValidatedCallMcpProvider(_RecordingMcpProvider):
         **_kwargs: Any,
     ) -> McpProviderCallResult:
         self.validate_calls += 1
+        structured_content = {"echo": dict(arguments)}
+        content = [{"type": "text", "text": "ok"}]
+        response_bytes = _provider_call_bytes(content, structured_content)
         return McpProviderCallResult(
-            structured_content={"echo": dict(arguments)},
-            content=[{"type": "text", "text": "ok"}],
-            response_bytes=19,
+            structured_content=structured_content,
+            content=content,
+            response_bytes=response_bytes,
             duration_s=0.02,
             list_request_bytes=11,
             list_response_bytes=13,
             call_request_bytes=17,
-            call_response_bytes=19,
+            call_response_bytes=response_bytes,
             call_started=True,
         )
 
@@ -5143,15 +5807,18 @@ class _PathEnvironmentRaceSdkMcpProvider(SdkMcpProvider):
                 runtime_environment=kwargs.get('runtime_environment'),
             )
         ).resolve()
+        structured_content = {'echo': dict(arguments)}
+        content = [{'type': 'text', 'text': 'ok'}]
+        response_bytes = _provider_call_bytes(content, structured_content)
         return McpProviderCallResult(
-            structured_content={'echo': dict(arguments)},
-            content=[{'type': 'text', 'text': 'ok'}],
-            response_bytes=19,
+            structured_content=structured_content,
+            content=content,
+            response_bytes=response_bytes,
             duration_s=0.02,
             list_request_bytes=11,
             list_response_bytes=13,
             call_request_bytes=17,
-            call_response_bytes=19,
+            call_response_bytes=response_bytes,
             call_started=True,
         )
 
@@ -5196,15 +5863,18 @@ class _AlternatingExternalExecutableMcpProvider(SdkMcpProvider):
         **_kwargs: Any,
     ) -> McpProviderCallResult:
         self.validate_calls += 1
+        structured_content = {'echo': dict(arguments)}
+        content = [{'type': 'text', 'text': 'ok'}]
+        response_bytes = _provider_call_bytes(content, structured_content)
         return McpProviderCallResult(
-            structured_content={'echo': dict(arguments)},
-            content=[{'type': 'text', 'text': 'ok'}],
-            response_bytes=19,
+            structured_content=structured_content,
+            content=content,
+            response_bytes=response_bytes,
             duration_s=0.02,
             list_request_bytes=11,
             list_response_bytes=13,
             call_request_bytes=17,
-            call_response_bytes=19,
+            call_response_bytes=response_bytes,
             call_started=True,
         )
 
@@ -5243,15 +5913,18 @@ class _EnvironmentMutatingSdkMcpProvider(SdkMcpProvider):
                 name: resolved[name]
                 for name in (server.stdio.env if server.stdio is not None else {})
             }
+        structured_content = {'echo': dict(arguments)}
+        content = [{'type': 'text', 'text': 'ok'}]
+        response_bytes = _provider_call_bytes(content, structured_content)
         return McpProviderCallResult(
-            structured_content={'echo': dict(arguments)},
-            content=[{'type': 'text', 'text': 'ok'}],
-            response_bytes=19,
+            structured_content=structured_content,
+            content=content,
+            response_bytes=response_bytes,
             duration_s=0.02,
             list_request_bytes=11,
             list_response_bytes=13,
             call_request_bytes=17,
-            call_response_bytes=19,
+            call_response_bytes=response_bytes,
             call_started=True,
         )
 

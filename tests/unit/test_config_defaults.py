@@ -2,20 +2,30 @@ from __future__ import annotations
 import pytest
 import asyncio
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from pydantic import ValidationError as PydanticValidationError
 
+import agent_libos.config.loader as config_loader
 from agent_libos.config import (
     AgentLibOSConfig,
+    CapabilityDefaults,
     DEFAULT_CONFIG,
+    GitDefaults,
     LLMDefaults,
     LLMProfile,
+    ObjectMemoryDefaults,
     RuntimeDefaults,
     ShellCommandRule,
+    SkillDefaults,
+    ToolDefaults,
     load_config_from_project_root,
     load_config_file,
     load_config_from_cwd,
+)
+from agent_libos.utils.yaml_loader import (
+    YAML_MAX_NESTING_DEPTH,
+    YAML_MAX_UTF8_BYTES,
 )
 from agent_libos.tools.builtin.jsonrpc import ListJsonRpcEndpointsArgs, ListJsonRpcEndpointsTool
 from agent_libos.tools.builtin.memory import ListMemoryNamespaceTool
@@ -33,6 +43,174 @@ from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import SQLiteStore, display_store_target, open_store, redact_store_target
 
 class TestConfigDefaults:
+
+    @pytest.mark.parametrize(
+        ("defaults_type", "head_field_names"),
+        (
+            (
+                RuntimeDefaults,
+                (
+                    "local_store_target", "runtime_db_filename", "store_backend",
+                    "store_dsn", "workspace_namespace", "default_image_id",
+                    "coding_image_id", "default_human", "terminal_channel",
+                    "run_until_idle_max_quanta", "launcher_max_quanta",
+                    "launch_authority_mode", "publication_recovery_max_attempts",
+                    "publication_reconciliation_page_size",
+                    "publication_reconciliation_page_hard_limit",
+                    "publication_artifact_lookup_hard_limit",
+                    "resource_usage_reservation_recovery_page_size",
+                    "resource_usage_reservation_recovery_page_hard_limit",
+                    "capability_use_reservation_recovery_page_size",
+                    "capability_use_reservation_recovery_page_hard_limit",
+                    "object_payload_recovery_page_size",
+                    "object_payload_recovery_page_hard_limit",
+                    "object_task_recovery_page_size",
+                    "object_task_recovery_page_hard_limit",
+                    "jit_rehydration_page_size", "jit_rehydration_page_hard_limit",
+                    "external_effect_recovery_page_size",
+                    "external_effect_recovery_page_hard_limit",
+                    "operation_recovery_page_size",
+                    "operation_recovery_page_hard_limit", "payload_retention_enabled",
+                    "payload_retention_summary_after_seconds",
+                    "payload_retention_hash_only_after_seconds",
+                    "payload_retention_page_size", "payload_retention_page_hard_limit",
+                ),
+            ),
+            (
+                CapabilityDefaults,
+                (
+                    "default_delegation_depth", "max_rights_per_capability",
+                    "max_constraints_bytes", "list_limit",
+                    "decision_explain_preview_chars",
+                ),
+            ),
+            (
+                ToolDefaults,
+                (
+                    "version", "default_timeout_s", "standard_timeout_s",
+                    "interactive_timeout_s", "default_text_encoding",
+                    "tool_observability_preview_chars", "tool_call_args_hard_limit_bytes",
+                    "tool_result_payload_hard_limit_bytes", "filesystem_read_max_bytes",
+                    "filesystem_read_hard_limit_bytes", "directory_entry_limit",
+                    "directory_entry_hard_limit", "executable_snapshot_sibling_limit",
+                    "memory_payload_chars", "memory_payload_hard_limit_chars",
+                    "memory_payload_hard_limit_bytes", "memory_append_entry_max_bytes",
+                    "message_subject_max_chars", "message_body_max_chars",
+                    "message_payload_max_bytes", "message_id_max_chars",
+                    "message_read_limit", "message_read_hard_limit",
+                    "message_filter_ids_hard_limit", "message_filter_json_max_bytes",
+                    "message_wait_status_max_chars", "human_request_payload_max_bytes",
+                    "human_output_max_chars", "human_request_list_limit",
+                    "object_file_max_bytes", "object_file_hard_limit_bytes",
+                    "shell_timeout_s", "sandbox_timeout_s", "jit_source_max_chars",
+                    "jit_tests_max_count", "jit_test_case_max_bytes",
+                    "jit_validation_timeout_s", "jit_validation_log_max_chars",
+                    "deno_executable", "deno_timeout_s", "deno_timeout_hard_limit_s",
+                    "deno_max_rpc_calls", "deno_max_stdout_bytes",
+                    "deno_max_stderr_bytes", "deno_jsr_allowlist",
+                    "static_tool_id_digest_chars", "approval_preview_chars",
+                    "clock_timezone", "max_sleep_seconds", "sleep_timeout_grace_s",
+                ),
+            ),
+            (
+                GitDefaults,
+                (
+                    "enabled", "executable", "minimum_version", "repository_resource",
+                    "worktree_root", "trusted_metadata_roots", "local_timeout_s",
+                    "remote_timeout_s", "timeout_hard_limit_s", "lock_timeout_s",
+                    "status_entry_limit", "status_entry_hard_limit", "log_entry_limit",
+                    "log_entry_hard_limit", "output_max_bytes",
+                    "output_hard_limit_bytes", "patch_max_bytes",
+                    "patch_hard_limit_bytes", "state_content_hard_limit_bytes",
+                    "allowed_remote_schemes", "allow_scp_style_ssh",
+                    "allow_file_remotes", "inherit_credential_helpers",
+                    "inherit_ssh_agent", "protect_git_metadata",
+                ),
+            ),
+            (
+                ObjectMemoryDefaults,
+                (
+                    "object_schema_version", "materialize_budget_tokens", "query_limit",
+                    "context_policy", "metadata_sensitivity",
+                    "metadata_retention_policy", "process_namespace_prefix",
+                ),
+            ),
+            (
+                SkillDefaults,
+                (
+                    "schema_version", "registry_resource", "trust_resource",
+                    "global_dirs", "workspace_dirs", "resource_dirs",
+                    "trusted_global_package_sha256", "global_requires_trust",
+                    "skill_md_max_bytes", "skill_md_hard_limit_bytes",
+                    "resource_read_max_bytes", "package_max_bytes", "max_package_files",
+                    "max_prompt_instruction_chars", "max_jit_source_chars",
+                    "discover_limit", "id_max_chars", "name_max_chars",
+                    "description_max_chars", "version_max_chars", "max_tools",
+                    "max_actions", "max_jit_tools", "max_required_capabilities",
+                ),
+            ),
+        ),
+    )
+    def test_new_defaults_preserve_head_positional_constructor_abi(
+        self,
+        defaults_type: type[object],
+        head_field_names: tuple[str, ...],
+    ) -> None:
+        default_instance = defaults_type()
+        positional_values = tuple(
+            getattr(default_instance, name) for name in head_field_names
+        )
+
+        reconstructed = defaults_type(*positional_values)
+
+        assert tuple(field.name for field in fields(defaults_type))[
+            : len(head_field_names)
+        ] == head_field_names
+        for name, expected in zip(head_field_names, positional_values, strict=True):
+            assert getattr(reconstructed, name) == expected
+
+    @pytest.mark.parametrize(
+        "timezone_key",
+        (
+            "",
+            " UTC",
+            "UTC ",
+            "Asia /Shanghai",
+            "/etc/passwd",
+            "../UTC",
+            "Asia//Shanghai",
+            "Asia\\Shanghai",
+            "Mars/Olympus_Mons",
+        ),
+    )
+    def test_tool_clock_timezone_rejects_invalid_or_unknown_iana_keys(
+        self,
+        timezone_key: str,
+    ) -> None:
+        with pytest.raises(ValueError, match="tools.clock_timezone"):
+            AgentLibOSConfig(
+                tools=replace(DEFAULT_CONFIG.tools, clock_timezone=timezone_key),
+            )
+
+    @pytest.mark.parametrize("timezone_key", ("UTC", "utc", "Asia/Shanghai"))
+    def test_tool_clock_timezone_accepts_runtime_supported_keys(
+        self,
+        timezone_key: str,
+    ) -> None:
+        config = AgentLibOSConfig(
+            tools=replace(DEFAULT_CONFIG.tools, clock_timezone=timezone_key),
+        )
+
+        assert config.tools.clock_timezone == timezone_key
+
+    def test_script_clock_timezone_uses_the_same_key_validation(self) -> None:
+        with pytest.raises(ValueError, match="scripts.clock_demo_timezone"):
+            AgentLibOSConfig(
+                scripts=replace(
+                    DEFAULT_CONFIG.scripts,
+                    clock_demo_timezone="../UTC",
+                ),
+            )
 
     def test_default_profile_map_is_immutable(self) -> None:
         with pytest.raises(TypeError, match="immutable"):
@@ -136,6 +314,39 @@ class TestConfigDefaults:
         assert ListJsonRpcEndpointsArgs.model_validate({"limit": 150}).limit == 150
         assert ListMcpServersArgs.model_validate({"limit": 150}).limit == 150
 
+    def test_object_memory_scan_and_metadata_bounds_have_independent_defaults(self) -> None:
+        memory = DEFAULT_CONFIG.memory
+
+        assert memory.query_scan_page_size == 128
+        assert memory.query_scan_ceiling == 1_024
+        assert memory.query_scan_ceiling > memory.query_limit
+        assert memory.metadata_text_max_chars == 32_000
+        assert memory.metadata_collection_max_items == 128
+        assert memory.metadata_collection_item_max_chars == 2_048
+        assert memory.metadata_max_bytes == 131_072
+
+    @pytest.mark.parametrize("invalid", (True, 0, -1))
+    def test_object_memory_query_scan_ceiling_rejects_bool_and_nonpositive_values(
+        self,
+        invalid: object,
+    ) -> None:
+        with pytest.raises(ValueError):
+            replace(
+                DEFAULT_CONFIG,
+                memory=replace(DEFAULT_CONFIG.memory, query_scan_ceiling=invalid),
+            )
+
+    def test_object_memory_query_scan_ceiling_is_separate_from_page_size(self) -> None:
+        with pytest.raises(ValueError, match="query_scan_ceiling"):
+            replace(
+                DEFAULT_CONFIG,
+                memory=replace(
+                    DEFAULT_CONFIG.memory,
+                    query_scan_page_size=10,
+                    query_scan_ceiling=9,
+                ),
+            )
+
     def test_shell_policy_labels_are_not_configurable_and_rules_require_an_executable(
         self,
         tmp_path: Path,
@@ -216,6 +427,28 @@ class TestConfigDefaults:
         assert config.runtime.run_until_idle_max_quanta == 3
         assert config.tools.filesystem_read_max_bytes == 123
         assert config.scheduler.max_workers == 2
+
+    def test_load_config_file_preserves_yaml_merge_override_semantics(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "merged-config.yaml"
+        path.write_text(
+            """llm:
+  profiles:
+    default: &base_profile
+      model: base-model
+    worker:
+      <<: *base_profile
+      model: worker-model
+""",
+            encoding="utf-8",
+        )
+
+        config = load_config_file(path)
+
+        assert config.llm.profiles["default"].model == "base-model"
+        assert config.llm.profiles["worker"].model == "worker-model"
 
     @pytest.mark.parametrize(
         ("body", "field"),
@@ -485,6 +718,8 @@ class TestConfigDefaults:
             "external_effect_recovery_page_hard_limit",
             "operation_recovery_page_size",
             "operation_recovery_page_hard_limit",
+            "process_terminal_cleanup_recovery_page_size",
+            "process_terminal_cleanup_recovery_page_hard_limit",
             "payload_retention_summary_after_seconds",
             "payload_retention_hash_only_after_seconds",
             "payload_retention_page_size",
@@ -526,6 +761,8 @@ class TestConfigDefaults:
             "external_effect_recovery_page_hard_limit",
             "operation_recovery_page_size",
             "operation_recovery_page_hard_limit",
+            "process_terminal_cleanup_recovery_page_size",
+            "process_terminal_cleanup_recovery_page_hard_limit",
             "payload_retention_summary_after_seconds",
             "payload_retention_hash_only_after_seconds",
             "payload_retention_page_size",
@@ -581,6 +818,8 @@ class TestConfigDefaults:
                     "  external_effect_recovery_page_hard_limit: 500",
                     "  operation_recovery_page_size: 50",
                     "  operation_recovery_page_hard_limit: 100",
+                    "  process_terminal_cleanup_recovery_page_size: 16",
+                    "  process_terminal_cleanup_recovery_page_hard_limit: 32",
                     "  payload_retention_enabled: true",
                     "  payload_retention_summary_after_seconds: 60",
                     "  payload_retention_hash_only_after_seconds: null",
@@ -611,6 +850,11 @@ class TestConfigDefaults:
         assert configured.runtime.external_effect_recovery_page_hard_limit == 500
         assert configured.runtime.operation_recovery_page_size == 50
         assert configured.runtime.operation_recovery_page_hard_limit == 100
+        assert configured.runtime.process_terminal_cleanup_recovery_page_size == 16
+        assert (
+            configured.runtime.process_terminal_cleanup_recovery_page_hard_limit
+            == 32
+        )
         assert configured.runtime.payload_retention_summary_after_seconds == 60
         assert configured.runtime.payload_retention_hash_only_after_seconds is None
         assert configured.runtime.payload_retention_page_size == 25
@@ -694,6 +938,61 @@ class TestConfigDefaults:
 
         with pytest.raises(ValueError, match='root must be a mapping'):
             load_config_file(path)
+
+    def test_load_config_file_uses_shared_yaml_parser_boundaries(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        duplicate = tmp_path / "duplicate.yaml"
+        duplicate.write_text(
+            "runtime:\n  default_image_id: first:v0\n"
+            "runtime:\n  default_image_id: second:v0\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="duplicate YAML key"):
+            load_config_file(duplicate)
+
+        non_string_key = tmp_path / "non-string-key.yaml"
+        non_string_key.write_text(
+            "runtime:\n  1: value\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="mapping keys must be strings"):
+            load_config_file(non_string_key)
+
+        nested = tmp_path / "nested.yaml"
+        nested.write_text(
+            "runtime:\n  default_image_id: "
+            + "[" * YAML_MAX_NESTING_DEPTH
+            + "value"
+            + "]" * YAML_MAX_NESTING_DEPTH,
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="YAML_MAX_NESTING_DEPTH"):
+            load_config_file(nested)
+
+        oversized = tmp_path / "oversized.yaml"
+        oversized.write_bytes(b"#" * (YAML_MAX_UTF8_BYTES + 1))
+        with pytest.raises(ValueError, match="YAML_MAX_UTF8_BYTES"):
+            load_config_file(oversized)
+
+    def test_load_config_file_maps_shared_yaml_validation_to_value_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text("runtime: {}\n", encoding="utf-8")
+        parser_error = ValidationError("bounded YAML failure")
+
+        def fail_parser(_text: str) -> dict[str, object]:
+            raise parser_error
+
+        monkeypatch.setattr(config_loader, "load_yaml_mapping", fail_parser)
+        with pytest.raises(ValueError, match="bounded YAML failure") as raised:
+            load_config_file(path)
+
+        assert raised.value.__cause__ is parser_error
 
     def test_load_config_file_rejects_unknown_fields_and_invalid_values(self, tmp_path: Path) -> None:
         unknown = tmp_path / 'unknown.yaml'
@@ -862,6 +1161,38 @@ class TestConfigDefaults:
 
         with pytest.raises(ValueError, match="default_profile_id"):
             AgentLibOSConfig(llm=LLMDefaults(default_profile_id="missing", profiles={"default": LLMProfile()}))
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://user:password@gateway.example/v1",
+            "https://gateway.example/v1#private",
+            "https://gateway.example/v1?api_key=private",
+            "https://gateway.example/v1?ACCESS-TOKEN=private",
+            "https://gateway.example/v1?x-amz-signature=private",
+        ],
+    )
+    def test_llm_config_rejects_base_url_credential_components(
+        self,
+        base_url: str,
+    ) -> None:
+        with pytest.raises(ValueError, match="base_url"):
+            AgentLibOSConfig(
+                llm=LLMDefaults(
+                    profiles={"default": LLMProfile(base_url=base_url)},
+                )
+            )
+
+    def test_llm_config_allows_non_sensitive_base_url_query_parameters(self) -> None:
+        base_url = "https://gateway.example/openai/v1?api-version=2026-01-01&tenant=public"
+
+        config = AgentLibOSConfig(
+            llm=LLMDefaults(
+                profiles={"default": LLMProfile(base_url=base_url)},
+            )
+        )
+
+        assert config.llm.profiles["default"].base_url == base_url
 
     def test_runtime_default_run_until_idle_is_unbounded(self) -> None:
         runtime = Runtime(SQLiteStore(':memory:'), llm_client=ScriptedActionClient())
@@ -1045,7 +1376,7 @@ class TestConfigDefaults:
             )
         )
 
-        assert display_store_target(config=config) == 'postgresql://agent:***@localhost/agent_libos'
+        assert display_store_target(config=config) == 'postgresql://***@localhost/agent_libos'
 
     def test_explicit_local_store_target_overrides_configured_postgres_backend(self) -> None:
         config = AgentLibOSConfig(
@@ -1065,8 +1396,37 @@ class TestConfigDefaults:
         dsn = 'postgresql://agent:secret@localhost:5432/agent_libos?sslmode=disable'
         config = AgentLibOSConfig(runtime=RuntimeDefaults(store_backend='postgres', store_dsn=dsn))
 
-        assert redact_store_target(dsn) == 'postgresql://agent:***@localhost:5432/agent_libos?sslmode=disable'
-        assert display_store_target(dsn, config=config) == 'postgresql://agent:***@localhost:5432/agent_libos?sslmode=disable'
+        assert redact_store_target(dsn) == 'postgresql://***@localhost:5432/agent_libos?sslmode=disable'
+        assert display_store_target(dsn, config=config) == 'postgresql://***@localhost:5432/agent_libos?sslmode=disable'
+
+    @pytest.mark.parametrize(
+        ("dsn", "expected"),
+        [
+            (
+                "postgresql://credential@localhost/db?sslmode=require#private",
+                "postgresql://***@localhost/db?sslmode=require",
+            ),
+            (
+                "postgresql://localhost/db?password=query-secret&application_name=agent",
+                "postgresql://localhost/db?password=***&application_name=agent",
+            ),
+            (
+                "postgresql://localhost/db?ACCESS_TOKEN=query-secret&sslmode=require",
+                "postgresql://localhost/db?ACCESS_TOKEN=***&sslmode=require",
+            ),
+        ],
+    )
+    def test_store_target_redaction_covers_userinfo_sensitive_query_and_fragment(
+        self,
+        dsn: str,
+        expected: str,
+    ) -> None:
+        redacted = redact_store_target(dsn)
+
+        assert redacted == expected
+        assert "credential" not in redacted
+        assert "query-secret" not in redacted
+        assert "private" not in redacted
 
     def test_spawn_without_image_uses_configured_default_image(self) -> None:
         config = AgentLibOSConfig(

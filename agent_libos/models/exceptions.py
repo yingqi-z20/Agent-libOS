@@ -51,6 +51,25 @@ class ProcessRevisionConflict(ProcessError):
     pass
 
 
+class ProcessTerminalCleanupRequired(ProcessError):
+    """A terminal outcome committed, but its durable cleanup is incomplete."""
+
+    def __init__(
+        self,
+        *,
+        pid: str,
+        phase: str,
+        attempt: int,
+    ) -> None:
+        self.pid = str(pid)
+        self.phase = str(phase)
+        self.attempt = int(attempt)
+        super().__init__(
+            "process terminal cleanup remains incomplete: "
+            f"{self.pid} phase={self.phase} attempt={self.attempt}"
+        )
+
+
 class RuntimePublicationPending(ProcessError):
     """A linked runtime publication still owns an operation's final outcome."""
 
@@ -102,6 +121,12 @@ class ResourceLimitExceeded(ProcessError):
 
 
 class ValidationError(LibOSError):
+    pass
+
+
+class SkillPackageChanged(ValidationError):
+    """A hash-pinned Skill activation no longer matches visible content."""
+
     pass
 
 

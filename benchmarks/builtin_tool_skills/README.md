@@ -7,6 +7,12 @@ intent has a nearby but incorrect boundary and is repeated as exactly three
 pairs to reduce single-sample variance. Both arms receive the same neutral goal;
 the goal does not tell the treatment arm which Skill to activate.
 
+The same opt-in pytest module also runs a complete 26-case activation catalog:
+one source-neutral positive intent and at least one adjacent negative boundary
+for every distributed built-in Skill. That catalog checks routing and
+activation only. The five paired scenarios remain the deeper effect-verified
+comparison and must not be described as exhaustive product coverage.
+
 The treatment image is derived from `coding-agent`, has all 99 catalog-owned
 tools in its authority ceiling, and starts with Skills-based projection. The
 baseline exposes all non-lifecycle tools immediately and omits the four Skill
@@ -31,6 +37,12 @@ The JSON report records per-run and aggregate:
 The estimate is for comparisons only; provider tokenization remains the source
 of truth for billed prompt usage.
 
+The fresh-state read oracles fail closed on incomplete evidence. Git must
+return exactly the one untracked `tracked-intent.txt` fixture with normalized
+status fields, `truncated: false`, and a 64-hex state token. MCP must return
+exactly `servers: []` and `has_more: false`; merely returning a list shape is
+not sufficient.
+
 Run it only with explicit real-LLM credentials and confirmation:
 
 ```bash
@@ -44,6 +56,11 @@ Run it only with explicit real-LLM credentials and confirmation:
 successful probe result, passes its observable-state oracle, chooses the
 correct route, and exits. Merely dispatching the expected tool and then calling
 `process_exit` is not sufficient.
+
+The output path is reserved before paid work begins and the completed JSON is
+published with an atomic replace. A failed rerun leaves a small non-favorable
+failure marker at the requested path and retains the previous complete report
+beside it for recovery.
 
 Preview the fixed three-pair plan without reading credentials or making provider
 calls:

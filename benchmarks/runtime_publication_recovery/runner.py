@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import contextlib
 import math
+import os
 import re
+import sys
 import threading
 import time
 from collections import Counter
@@ -11,6 +12,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from agent_libos.config import AgentLibOSConfig, RuntimeDefaults
 from agent_libos.models import CheckpointPayloadDeliveryAttempt
@@ -24,6 +26,7 @@ from agent_libos.utils.serde import dumps
 
 
 _MISSING_CLASS_ATTRIBUTE = object()
+_GLOBAL_PATCH_SCOPE_LOCK = threading.RLock()
 _PUBLICATION_DOMAIN_SELECT = " ".join(
     """
     SELECT publication_id, kind, state, operation_reconciled
@@ -511,6 +514,22 @@ def run_publication_scale_benchmark(
     unreconciled_records: int,
     page_size: int,
 ) -> PublicationScaleResult:
+    """Run one benchmark inside the serialized global-patch scope."""
+
+    with _GLOBAL_PATCH_SCOPE_LOCK:
+        return _run_publication_scale_benchmark_locked(
+            total_records=total_records,
+            unreconciled_records=unreconciled_records,
+            page_size=page_size,
+        )
+
+
+def _run_publication_scale_benchmark_locked(
+    *,
+    total_records: int,
+    unreconciled_records: int,
+    page_size: int,
+) -> PublicationScaleResult:
     _validate_shape(
         total_records=total_records,
         unreconciled_records=unreconciled_records,
@@ -562,6 +581,8 @@ def run_publication_scale_benchmark(
             sql: str,
             params: Any = (),
         ) -> list[Any]:
+            if not _store_targets_database(selected_store, database_path):
+                return original_query(selected_store, sql, params)
             shape = _publication_select_shape(sql)
             if shape == "unreviewed":
                 raise AssertionError(
@@ -591,6 +612,8 @@ def run_publication_scale_benchmark(
             return rows
 
         def tracked_reconcile(manager: ProcessManager) -> list[str]:
+            if not _manager_targets_database(manager, database_path):
+                return original_reconcile(manager)
             reconciled = original_reconcile(manager)
             handler_samples.append(tuple(reconciled))
             return reconciled
@@ -615,6 +638,8 @@ def run_publication_scale_benchmark(
             connection.set_trace_callback(trace_publication_statement)
 
         def tracked_connect(*args: Any, **kwargs: Any) -> Any:
+            if not _connect_targets_database(args, kwargs, database_path):
+                return original_connect(*args, **kwargs)
             return _connect_with_trace_installed(
                 original_connect,
                 args,
@@ -641,16 +666,43 @@ def run_publication_scale_benchmark(
                 expected_records=payload_delivery_records,
             )
         finally:
-            sqlite_storage.sqlite3.connect = original_connect
-            _restore_class_attribute(
-                SQLiteStore,
-                "_query",
-                original_query_local,
+            _run_cleanup_steps(
+                [
+                    (
+                        "restore sqlite connect",
+                        lambda: setattr(
+                            sqlite_storage.sqlite3,
+                            "connect",
+                            original_connect,
+                        ),
+                    ),
+                    (
+                        "restore SQLiteStore._query",
+                        lambda: _restore_class_attribute(
+                            SQLiteStore,
+                            "_query",
+                            original_query_local,
+                        ),
+                    ),
+                    (
+                        "restore ProcessManager reconciliation",
+                        lambda: setattr(
+                            ProcessManager,
+                            "reconcile_terminal_publications",
+                            original_reconcile,
+                        ),
+                    ),
+                    *[
+                        (
+                            "detach publication trace callback",
+                            lambda connection=connection: _detach_trace_callback(
+                                connection
+                            ),
+                        )
+                        for connection in traced_connections
+                    ],
+                ]
             )
-            ProcessManager.reconcile_terminal_publications = original_reconcile
-            for traced_connection in traced_connections:
-                with contextlib.suppress(Exception):
-                    traced_connection.set_trace_callback(None)
 
         selected_store = runtime.store
         if not isinstance(selected_store, SQLiteStore):
@@ -1077,18 +1129,118 @@ def run_publication_scale_benchmark(
         _assert_structural_contract(result)
         return result
     finally:
-        _restore_class_attribute(
-            SQLiteStore,
-            "_query",
-            original_query_local,
-        )
-        sqlite_storage.sqlite3.connect = original_connect
-        ProcessManager.reconcile_terminal_publications = original_reconcile
+        cleanup_steps: list[tuple[str, Callable[[], Any]]] = [
+            (
+                "restore SQLiteStore._query",
+                lambda: _restore_class_attribute(
+                    SQLiteStore,
+                    "_query",
+                    original_query_local,
+                ),
+            ),
+            (
+                "restore sqlite connect",
+                lambda: setattr(
+                    sqlite_storage.sqlite3,
+                    "connect",
+                    original_connect,
+                ),
+            ),
+            (
+                "restore ProcessManager reconciliation",
+                lambda: setattr(
+                    ProcessManager,
+                    "reconcile_terminal_publications",
+                    original_reconcile,
+                ),
+            ),
+        ]
         if runtime is not None:
-            runtime.close()
+            cleanup_steps.append(("close Runtime", runtime.close))
         if store is not None:
-            store.close()
-        temporary_directory.cleanup()
+            cleanup_steps.append(("close SQLiteStore", store.close))
+        cleanup_steps.append(
+            ("remove temporary benchmark directory", temporary_directory.cleanup)
+        )
+        _run_cleanup_steps(cleanup_steps)
+
+
+def _connect_targets_database(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    database_path: Path,
+) -> bool:
+    raw_database = args[0] if args else kwargs.get("database")
+    return _database_path_matches(raw_database, database_path)
+
+
+def _store_targets_database(store: SQLiteStore, database_path: Path) -> bool:
+    return _database_path_matches(getattr(store, "path", None), database_path)
+
+
+def _manager_targets_database(
+    manager: ProcessManager,
+    database_path: Path,
+) -> bool:
+    publications = getattr(manager, "publications", None)
+    backend = getattr(publications, "_publication_backend", None)
+    return isinstance(backend, SQLiteStore) and _store_targets_database(
+        backend,
+        database_path,
+    )
+
+
+def _database_path_matches(raw_database: Any, database_path: Path) -> bool:
+    if isinstance(raw_database, os.PathLike):
+        raw_database = os.fspath(raw_database)
+    if not isinstance(raw_database, str) or raw_database == ":memory:":
+        return False
+    if raw_database.startswith("file:"):
+        parsed = urlsplit(raw_database)
+        raw_database = unquote(parsed.path or parsed.netloc)
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:/", raw_database):
+            raw_database = raw_database[1:]
+    try:
+        selected = Path(raw_database).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return os.path.normcase(str(selected)) == os.path.normcase(
+        str(database_path.resolve(strict=False))
+    )
+
+
+def _run_cleanup_steps(steps: list[tuple[str, Callable[[], Any]]]) -> None:
+    primary = sys.exception()
+    failures: list[BaseException] = []
+    for label, callback in steps:
+        try:
+            callback()
+        except BaseException as exc:
+            exc.add_note(f"cleanup step failed: {label}")
+            failures.append(exc)
+    if not failures:
+        return
+    if primary is not None:
+        for failure in failures:
+            primary.add_note(
+                f"secondary cleanup failure: {type(failure).__name__}: {failure}"
+            )
+        return
+    if all(isinstance(failure, Exception) for failure in failures):
+        raise ExceptionGroup(
+            "publication benchmark cleanup failed",
+            [failure for failure in failures if isinstance(failure, Exception)],
+        )
+    raise BaseExceptionGroup("publication benchmark cleanup failed", failures)
+
+
+def _detach_trace_callback(connection: Any) -> None:
+    try:
+        connection.set_trace_callback(None)
+    except sqlite_storage.sqlite3.ProgrammingError as exc:
+        if "closed" in str(exc).casefold():
+            return
+        raise
 
 
 def _validate_shape(

@@ -8,7 +8,8 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,10 +107,22 @@ def main(argv: list[str] | None = None) -> int:
     _validate_args(parser, args)
 
     commands = _commands_for(args)
-    for command in commands:
-        status = _run(command, max_seconds=args.max_lane_seconds)
-        if status != 0:
-            return status
+    with tempfile.TemporaryDirectory(prefix="agent-libos-invariant-receipts-") as receipt_dir:
+        for index, command in enumerate(commands):
+            receipt_path: Path | None = None
+            if _is_pytest_command(command):
+                receipt_path = Path(receipt_dir) / f"command-{index}.json"
+                command = _with_invariant_receipt(command, receipt_path)
+            status = _run(command, max_seconds=args.max_lane_seconds)
+            if status != 0:
+                return status
+            if receipt_path is not None:
+                status = _validate_invariant_receipt(
+                    receipt_path,
+                    lane=None if args.lane == "all" else args.lane,
+                )
+                if status != 0:
+                    return status
     return 0
 
 
@@ -233,6 +246,51 @@ def _pytest_env(args: argparse.Namespace) -> dict[str, str] | None:
     return env or None
 
 
+def _is_pytest_command(command: Command) -> bool:
+    return len(command.argv) >= 3 and command.argv[1:3] == ["-m", "pytest"]
+
+
+def _with_invariant_receipt(command: Command, path: Path) -> Command:
+    if not _is_pytest_command(command):
+        return command
+    argv = list(command.argv)
+    argv[3:3] = ["-p", "scripts.check_test_invariants"]
+    env = dict(command.env or {})
+    from scripts.check_test_invariants import INVARIANT_EXECUTION_RECEIPT_ENV
+
+    env[INVARIANT_EXECUTION_RECEIPT_ENV] = str(path)
+    return replace(command, argv=argv, env=env)
+
+
+def _validate_invariant_receipt(path: Path, *, lane: str | None) -> int:
+    from scripts import check_test_invariants as checker
+
+    try:
+        executed = checker.load_execution_receipt(path)
+        manifest = checker._load_manifest(checker.MANIFEST)
+    except (OSError, ValueError) as exc:
+        print(f"invariant execution evidence failed: {exc}", file=sys.stderr)
+        return 1
+    errors: list[str] = []
+    checker._check_invariant_execution(
+        manifest,
+        executed,
+        errors,
+        lane=lane,
+    )
+    if errors:
+        for error in errors:
+            print(f"invariant execution evidence failed: {error}", file=sys.stderr)
+        return 1
+    selected = lane or "all deterministic"
+    print(
+        f"==> validated non-skipped invariant execution evidence for {selected} "
+        f"({len(executed)} passed pytest nodes)",
+        flush=True,
+    )
+    return 0
+
+
 def _run(command: Command, *, max_seconds: float) -> int:
     print(f"==> {command.name}", flush=True)
     env = os.environ.copy()
@@ -250,6 +308,10 @@ def _run(command: Command, *, max_seconds: float) -> int:
             file=sys.stderr,
         )
         return PROCESS_TIMEOUT_EXIT_CODE
+    # A successful root command is not sufficient release evidence when a test
+    # or build helper left descendants in the dedicated group.  Reuse the same
+    # bounded tree cleanup as the timeout path before reporting the root code.
+    _terminate_process_tree(process)
     elapsed = time.perf_counter() - started
     print(f"==> {command.name} finished in {elapsed:.2f}s", flush=True)
     return returncode
@@ -265,10 +327,11 @@ def _process_group_options() -> dict[str, object]:
 
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
     parent_exited = process.poll() is not None
-    if parent_exited and not (
-        os.name == "posix" and _posix_process_group_exists(process.pid)
-    ):
-        return
+    if parent_exited:
+        if os.name == "posix" and not _posix_process_group_exists(process.pid):
+            return
+        if os.name not in {"posix", "nt"}:
+            return
     if os.name == "posix":
         try:
             os.killpg(process.pid, signal.SIGTERM)

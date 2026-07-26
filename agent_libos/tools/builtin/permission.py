@@ -68,17 +68,25 @@ class RequestPermissionTool(SyncAgentTool[RequestPermissionArgs]):
                 f"Unknown capability right: {exc}",
                 code=ToolErrorCode.VALIDATION_ERROR,
             ) from exc
-        key = self._pending_key(ctx.pid, args, rights)
+        selected_human = self._selected_human(runtime, args)
+        key = self._pending_key(ctx.pid, args, rights, human=selected_human)
         request_id = ctx.metadata.get("human_resume_request_id")
         if isinstance(request_id, str) and request_id:
-            self._validate_resume_request(runtime, ctx.pid, args, rights, request_id)
+            self._validate_resume_request(
+                runtime,
+                ctx.pid,
+                args,
+                rights,
+                request_id,
+                human=selected_human,
+            )
         else:
             with self._lock:
                 request_id = self._pending_by_key.get(key)
                 if request_id is None:
                     request_id = runtime.human.request_permission(
                         pid=ctx.pid,
-                        human=args.human,
+                        human=selected_human,
                         resource=args.resource,
                         rights=rights,
                         reason=args.reason,
@@ -113,9 +121,11 @@ class RequestPermissionTool(SyncAgentTool[RequestPermissionArgs]):
         args: RequestPermissionArgs,
         rights: list[str],
         request_id: str,
+        *,
+        human: str,
     ) -> None:
         request = runtime.human.get(request_id)
-        if request.pid != pid or request.human != args.human:
+        if request.pid != pid or request.human != human:
             raise ToolExecutionError(
                 "Human resume request does not belong to this request_permission call.",
                 code=ToolErrorCode.PERMISSION_DENIED,
@@ -137,10 +147,25 @@ class RequestPermissionTool(SyncAgentTool[RequestPermissionArgs]):
                 code=ToolErrorCode.PERMISSION_DENIED,
             )
 
-    def _pending_key(self, pid: str, args: RequestPermissionArgs, rights: list[str]) -> str:
+    @staticmethod
+    def _selected_human(runtime: Any, args: RequestPermissionArgs) -> str:
+        fields_set = getattr(args, "model_fields_set", set())
+        selected = args.human.strip()
+        if "human" not in fields_set or not selected:
+            return runtime.config.runtime.default_human
+        return selected
+
+    def _pending_key(
+        self,
+        pid: str,
+        args: RequestPermissionArgs,
+        rights: list[str],
+        *,
+        human: str,
+    ) -> str:
         payload = {
             "pid": pid,
-            "human": args.human,
+            "human": human,
             "resource": args.resource,
             "rights": rights,
             "reason": args.reason,

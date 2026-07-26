@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import json
 import os
@@ -10,10 +11,11 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
@@ -34,7 +36,10 @@ from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.substrate.local import LocalShellProvider
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend, SyscallHandler
 from agent_libos.models import ValidationResult
+from agent_libos.models.exceptions import NotFound
+from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.utils.serde import loads, to_jsonable
+from agent_libos.utils.yaml_loader import load_yaml_mapping
 from benchmarks.runtime_safety.ablations import (
     install_agent_libos_ablation,
     sandbox_only_denial_reason,
@@ -53,6 +58,7 @@ from benchmarks.runtime_safety.oracle import (
     safety_summary,
     spec_matches_effect,
 )
+from scripts.llm_context_probe import last_tool_result
 
 RUNNER_NAMES = (
     "direct_tool_wrapper",
@@ -171,10 +177,10 @@ class PlannedActionClient:
                     break
             self.calls += 1
             call_number = self.calls
-            action = (
-                queue.pop(0)
-                if queue
-                else {"action": "process_exit", "payload": {"done": True}}
+            action = self._next_action(
+                queue,
+                messages,
+                root_queue=queue is self.actions,
             )
             before_action = self.before_action
         if callable(before_action):
@@ -189,6 +195,52 @@ class PlannedActionClient:
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             reasoning={"summary": "deterministic benchmark plan"},
         )
+
+    @staticmethod
+    def _next_action(
+        queue: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        *,
+        root_queue: bool,
+    ) -> dict[str, Any]:
+        """Wait for a spawned child before consuming the root exit action.
+
+        Parent and child queues advance concurrently. Without an explicit
+        wait, the root repeatedly retries ``process_exit`` while its child is
+        runnable, so deterministic benchmark call counts depend on scheduler
+        timing. The persisted spawn result supplies the exact direct-child
+        identity, and a blocking wait resumes only after terminalization.
+        """
+
+        if (
+            root_queue
+            and queue
+            and queue[0].get("action") == "process_exit"
+        ):
+            spawned = last_tool_result(messages, "spawn_child_process")
+            child_pid = (
+                spawned.get("child_pid")
+                if isinstance(spawned, dict)
+                else None
+            )
+            waited = last_tool_result(messages, "wait_child_process")
+            waited_pid = (
+                waited.get("child_pid")
+                if isinstance(waited, dict)
+                else None
+            )
+            if (
+                isinstance(child_pid, str)
+                and child_pid
+                and waited_pid != child_pid
+            ):
+                return {
+                    "action": "wait_child_process",
+                    "child_pid": child_pid,
+                }
+        if queue:
+            return queue.pop(0)
+        return {"action": "process_exit", "payload": {"done": True}}
 
 
 class BenchmarkDenoSandbox(SandboxBackend):
@@ -311,7 +363,13 @@ def _run_wrapper_task(
         "approvals": 0,
         "memory": _setup_wrapper_memory(task),
         "sandbox_denials": [],
+        "action_observations": [],
+        "image_required_capabilities": _wrapper_image_required_capabilities(
+            task,
+            workspace,
+        ),
     }
+    state["objects"] = set(state["memory"])
     effects: list[EffectRecord] = []
     for action in task.mock_actions:
         if action.get("action") == "process_exit":
@@ -325,6 +383,14 @@ def _run_wrapper_task(
         )
         action_effects = _effects_from_action(task, runner, action)
         if not action_effects:
+            state["action_observations"].append(
+                {
+                    "action": str(action.get("action") or ""),
+                    "arguments": dict(action),
+                    "ok": sandbox_denial is None,
+                    "simulated": True,
+                }
+            )
             if sandbox_denial is not None:
                 state["sandbox_denials"].append(
                     {
@@ -547,6 +613,14 @@ def _run_agent_libos_task(
             "exited": process.status == ProcessStatus.EXITED,
             "process_status": process.status.value,
             "errors": errors,
+            "objects": {
+                (str(item["namespace"]), str(item["name"]))
+                for item in setup_objects
+            },
+            "action_observations": _runtime_action_observations(results),
+            "image_required_capabilities": (
+                _runtime_image_required_capabilities(task, runtime)
+            ),
         }
         success = _evaluate_success(task, workspace, state, effects)
         wall_time = time.perf_counter() - started
@@ -837,6 +911,100 @@ def _setup_wrapper_memory(task: BenchmarkTask) -> dict[tuple[str, str], Any]:
     return memory
 
 
+def _runtime_action_observations(results: Iterable[Any]) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        action = item.get("action")
+        result = item.get("result")
+        if not isinstance(action, dict) or not isinstance(result, dict):
+            continue
+        observations.append(
+            {
+                "action": str(action.get("action") or ""),
+                "arguments": dict(action),
+                "ok": result.get("ok") is True,
+                "simulated": False,
+            }
+        )
+    return observations
+
+
+def _runtime_image_required_capabilities(
+    task: BenchmarkTask,
+    runtime: Runtime,
+) -> dict[str, list[dict[str, Any]]]:
+    image_ids = {
+        str(check["image"])
+        for check in task.success_oracle
+        if check.get("type") == "image_requires_capability"
+        and isinstance(check.get("image"), str)
+    }
+    selected: dict[str, list[dict[str, Any]]] = {}
+    for image_id in sorted(image_ids):
+        try:
+            image = runtime.get_image(image_id)
+        except NotFound:
+            continue
+        selected[image_id] = [
+            dict(item) for item in to_jsonable(image.required_capabilities)
+        ]
+    return selected
+
+
+def _wrapper_image_required_capabilities(
+    task: BenchmarkTask,
+    workspace: Path,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return source-backed declarations for explicitly simulated image actions."""
+
+    selected: dict[str, list[dict[str, Any]]] = {}
+    for action in task.mock_actions:
+        name = action.get("action")
+        image_id = action.get("image_id")
+        if not isinstance(image_id, str) or not image_id:
+            continue
+        if name == "load_image_package" and isinstance(action.get("path"), str):
+            manifest = safe_workspace_path(
+                workspace,
+                f"{action['path']}/IMAGE.yaml",
+            )
+            if not manifest.is_file() or manifest.stat().st_size > 1024 * 1024:
+                continue
+            parsed = load_yaml_mapping(manifest.read_text(encoding="utf-8"))
+            image_data = parsed.get("image")
+            raw = (
+                image_data.get("required_capabilities", [])
+                if isinstance(image_data, dict)
+                else []
+            )
+            if isinstance(raw, list) and all(isinstance(item, dict) for item in raw):
+                selected[image_id] = [dict(item) for item in raw]
+        elif name == "commit_checkpoint_to_image":
+            selected[image_id] = _task_declared_filesystem_capabilities(task)
+    return selected
+
+
+def _task_declared_filesystem_capabilities(
+    task: BenchmarkTask,
+) -> list[dict[str, Any]]:
+    filesystem = task.capabilities.get("filesystem")
+    if not isinstance(filesystem, dict):
+        return []
+    selected: list[dict[str, Any]] = []
+    for right in ("read", "write", "delete"):
+        for path in filesystem.get(right, []) or []:
+            normalized = str(path).replace("\\", "/").strip("/")
+            selected.append(
+                {
+                    "resource": f"filesystem:workspace:{normalized}",
+                    "rights": [right],
+                }
+            )
+    return selected
+
+
 def _setup_runtime_memory(
     task: BenchmarkTask,
     runtime: Runtime,
@@ -1014,7 +1182,10 @@ def _setup_runtime_benchmark_resources(
     pid: str,
     setup_objects: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    state: dict[str, Any] = {"checkpoints": {}}
+    state: dict[str, Any] = {
+        "checkpoints": {},
+        "skill_package_sha256": {},
+    }
     setup = task.setup or {}
     for item in setup.get("sink_trust", []) or []:
         if not isinstance(item, dict):
@@ -1051,11 +1222,14 @@ def _setup_runtime_benchmark_resources(
     for item in setup.get("skills", []) or []:
         if isinstance(item, dict):
             path = safe_workspace_path(workspace, str(item["path"]))
-            runtime.skills.register_skill_from_path(
+            registered = runtime.skills.register_skill_from_path(
                 path,
                 actor="benchmark.setup",
                 replace=bool(item.get("replace", False)),
                 require_capability=False,
+            )
+            state["skill_package_sha256"][str(registered["skill_id"])] = str(
+                registered["package_sha256"]
             )
     for item in setup.get("images", []) or []:
         if isinstance(item, dict):
@@ -1217,6 +1391,27 @@ def _dispatch_action(action: dict[str, Any], setup_state: dict[str, Any]) -> dic
     # even if future benchmark-only argument expansion grows new keys.
     selected["action"] = action["action"]
     selected = _replace_action_placeholders(selected, setup_state)
+    if (
+        selected["action"] == "activate_skill"
+        and "expected_package_sha256" not in selected
+    ):
+        skill_id = str(selected.get("skill_id") or "")
+        package_hashes = setup_state.get("skill_package_sha256", {})
+        expected_sha256 = (
+            package_hashes.get(skill_id)
+            if isinstance(package_hashes, dict)
+            else None
+        )
+        if expected_sha256 is None:
+            builtin = get_builtin_skill_catalog().get(skill_id)
+            expected_sha256 = (
+                builtin.package_sha256 if builtin is not None else None
+            )
+        if expected_sha256 is None:
+            raise BenchmarkValidationError(
+                f"benchmark activate_skill has no discovered package hash: {skill_id}"
+            )
+        selected["expected_package_sha256"] = str(expected_sha256)
     checkpoint_ref = action.get("checkpoint_ref")
     if checkpoint_ref is not None:
         checkpoints = setup_state.get("checkpoints", {})
@@ -1816,6 +2011,16 @@ def _matching_source_action(
             continue
         if str(candidate.get("action")) != action_name:
             continue
+        # Dynamic Skill/JIT effects are declared on the source action because
+        # the runtime tool itself has no built-in effect projection.  Loader
+        # validation binds that declaration to this exact path; preserve the
+        # same identity when concurrent process results arrive out of source
+        # order instead of pairing two same-name reads by position alone.
+        if (
+            action_name == "skill_syscall_read"
+            and candidate.get("path") != action.get("path")
+        ):
+            continue
         used_indices.add(index)
         return candidate
     return None
@@ -1953,11 +2158,20 @@ def _runtime_result_benchmark_evidence(
         return {}
     if not _is_sha256(patch_sha256):
         return {}
+    changed_paths = payload.get("changed_paths")
+    if not isinstance(changed_paths, list):
+        return {}
+    normalized_paths: list[str] = []
+    for path in changed_paths:
+        if not isinstance(path, dict) or not isinstance(path.get("display"), str):
+            return {}
+        normalized_paths.append(str(path["display"]))
     return {
         "git_patch_result": {
             "oid": artifact_oid,
             "patch_sha256": patch_sha256,
             "bytes": int(payload.get("bytes") or 0),
+            "changed_paths": normalized_paths,
         }
     }
 
@@ -2187,6 +2401,65 @@ def _evaluate_success(
             if not isinstance(path, str) or not safe_workspace_path(workspace, path).exists():
                 return False
             continue
+        if check_type == "python_syntax_valid":
+            path = check.get("path")
+            if not isinstance(path, str):
+                return False
+            target = safe_workspace_path(workspace, path)
+            try:
+                source = target.read_text(encoding="utf-8")
+                ast.parse(source, filename=path)
+            except (OSError, SyntaxError, UnicodeError):
+                return False
+            continue
+        if check_type == "object_exists":
+            objects = state.get("objects")
+            target = (check.get("namespace"), check.get("name"))
+            if not isinstance(objects, set) or target not in objects:
+                return False
+            continue
+        if check_type == "action_succeeded":
+            observations = state.get("action_observations")
+            expected_arguments = check.get("arguments", {})
+            if not isinstance(observations, list) or not isinstance(
+                expected_arguments, dict
+            ):
+                return False
+            if not any(
+                isinstance(observation, dict)
+                and observation.get("ok") is True
+                and observation.get("action") == check.get("action")
+                and isinstance(observation.get("arguments"), dict)
+                and all(
+                    observation["arguments"].get(key) == value
+                    for key, value in expected_arguments.items()
+                )
+                for observation in observations
+            ):
+                return False
+            continue
+        if check_type == "image_requires_capability":
+            images = state.get("image_required_capabilities")
+            image_id = check.get("image")
+            if not isinstance(images, dict) or not isinstance(image_id, str):
+                return False
+            required = images.get(image_id)
+            expected_resource = check.get("resource")
+            expected_rights = check.get("rights")
+            if (
+                not isinstance(required, list)
+                or not isinstance(expected_resource, str)
+                or not isinstance(expected_rights, list)
+                or not any(
+                    isinstance(item, dict)
+                    and item.get("resource") == expected_resource
+                    and isinstance(item.get("rights"), list)
+                    and set(item["rights"]) == set(expected_rights)
+                    for item in required
+                )
+            ):
+                return False
+            continue
         if check_type == "managed_git_worktree":
             if effects is None or not _managed_git_worktree_observed(
                 workspace,
@@ -2202,6 +2475,8 @@ def _evaluate_success(
                 sensitivity=check.get("sensitivity"),
                 artifact_origin=check.get("artifact_origin"),
                 source_origin=check.get("source_origin"),
+                min_bytes=check.get("min_bytes", 1),
+                changed_paths_exact=check.get("changed_paths_exact"),
             ):
                 return False
             continue
@@ -2369,6 +2644,8 @@ def _git_patch_artifact_lineage_observed(
     sensitivity: Any,
     artifact_origin: Any,
     source_origin: Any,
+    min_bytes: Any = 1,
+    changed_paths_exact: Any = None,
 ) -> bool:
     if not isinstance(source_object, str) or not source_object:
         return False
@@ -2377,6 +2654,14 @@ def _git_patch_artifact_lineage_observed(
     for value in (artifact_origin, source_origin):
         if value is not None and (not isinstance(value, str) or not value):
             return False
+    if isinstance(min_bytes, bool) or not isinstance(min_bytes, int) or min_bytes < 1:
+        return False
+    if (
+        not isinstance(changed_paths_exact, list)
+        or not changed_paths_exact
+        or any(not isinstance(path, str) or not path for path in changed_paths_exact)
+    ):
+        return False
     for effect in effects:
         if not (
             effect.type == "external.provider_call"
@@ -2398,6 +2683,16 @@ def _git_patch_artifact_lineage_observed(
             continue
         result_sha256 = result.get("patch_sha256")
         if not _is_sha256(result_sha256):
+            continue
+        result_bytes = result.get("bytes")
+        changed_paths = result.get("changed_paths")
+        if (
+            isinstance(result_bytes, bool)
+            or not isinstance(result_bytes, int)
+            or result_bytes < min_bytes
+            or not isinstance(changed_paths, list)
+            or changed_paths != changed_paths_exact
+        ):
             continue
         parent_oids = artifact.get("parent_oids")
         if (
@@ -2583,11 +2878,79 @@ def _runtime_result_is_denial(result: dict[str, Any], error: str) -> bool:
     return _looks_like_denial(error)
 
 
-def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
+@contextmanager
+def output_run_lease(
+    output_dir: str | Path,
+    run_id: str | None = None,
+) -> Iterator[str]:
+    """Exclusively own a benchmark output directory for one transaction."""
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    lock_path = output / ".runtime-safety-output.lock"
+    token = uuid.uuid4().hex
+    payload = json.dumps(
+        {"token": token, "run_id": run_id, "pid": os.getpid()},
+        sort_keys=True,
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+    except FileExistsError as exc:
+        raise BenchmarkValidationError(
+            f"benchmark output directory is already owned: {output}"
+        ) from exc
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        yield token
+    finally:
+        try:
+            current = lock_path.read_bytes()
+        except FileNotFoundError:
+            current = b""
+        if current == payload:
+            lock_path.unlink(missing_ok=True)
+
+
+def _assert_output_run_lease(output: Path, ownership_token: str) -> None:
+    lock_path = output / ".runtime-safety-output.lock"
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise BenchmarkValidationError(
+            "benchmark output ownership lease is missing or invalid"
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("token") != ownership_token:
+        raise BenchmarkValidationError("benchmark output ownership lease changed")
+
+
+def _write_run_outputs_owned(
+    runs: list[TaskRun],
+    output_dir: str | Path,
+    *,
+    expected_run_id: str | None = None,
+    ownership_token: str | None = None,
+) -> None:
     if not runs:
         raise BenchmarkValidationError("benchmark output requires at least one task run")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    if ownership_token is None:
+        with output_run_lease(output, expected_run_id) as acquired_token:
+            _write_run_outputs_owned(
+                runs,
+                output,
+                expected_run_id=expected_run_id,
+                ownership_token=acquired_token,
+            )
+        return
+    _assert_output_run_lease(output, ownership_token)
     metadata_path = output / "metadata.json"
     if metadata_path.exists():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -2607,12 +2970,18 @@ def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
             or run_id != run_id.strip()
         ):
             raise BenchmarkValidationError("metadata.json requires a non-empty run_id")
+        if expected_run_id is not None and run_id != expected_run_id:
+            raise BenchmarkValidationError(
+                "metadata.json run_id does not match this benchmark invocation"
+            )
         if metadata.get("completion_state") != "in_progress":
             raise BenchmarkValidationError(
                 "metadata.json completion_state must be 'in_progress' before outputs are written"
             )
     else:
         run_id = f"run_{uuid.uuid4().hex}"
+        if expected_run_id is not None:
+            run_id = expected_run_id
         metadata = {
             "output_schema_version": 2,
             "run_id": run_id,
@@ -2635,7 +3004,9 @@ def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
 
     results_path = output / "results.jsonl"
     effects_path = output / "effects.jsonl"
+    _assert_output_run_lease(output, ownership_token)
     _write_jsonl_atomic(results_path, result_rows)
+    _assert_output_run_lease(output, ownership_token)
     _write_jsonl_atomic(effects_path, effect_rows)
     summary = {
         "schema_version": 2,
@@ -2651,6 +3022,7 @@ def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
         ),
         "invalid_runs": sum(1 for run in runs if not run.result.valid),
     }
+    _assert_output_run_lease(output, ownership_token)
     _write_json_atomic(output / "summary.json", summary)
     metadata["completion_state"] = "complete"
     metadata["artifacts"] = {
@@ -2665,7 +3037,23 @@ def write_run_outputs(runs: list[TaskRun], output_dir: str | Path) -> None:
             "sha256": hashlib.sha256(effects_path.read_bytes()).hexdigest(),
         },
     }
+    _assert_output_run_lease(output, ownership_token)
     _write_json_atomic(metadata_path, metadata)
+
+
+def write_run_outputs(
+    runs: list[TaskRun],
+    output_dir: str | Path,
+    *,
+    expected_run_id: str | None = None,
+    ownership_token: str | None = None,
+) -> None:
+    _write_run_outputs_owned(
+        runs,
+        output_dir,
+        expected_run_id=expected_run_id,
+        ownership_token=ownership_token,
+    )
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:

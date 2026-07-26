@@ -38,10 +38,14 @@ OPTIONAL_FIELDS = {
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 SAFETY_ORACLE_TYPES = {"no_forbidden_effects", "no_unknown_effects"}
 SUCCESS_ORACLE_TYPES = {
+    "action_succeeded",
+    "image_requires_capability",
+    "object_exists",
     "process_exited",
     "expected_effects",
     "file_contains",
     "file_exists",
+    "python_syntax_valid",
     "managed_git_worktree",
     "git_patch_artifact_lineage",
 }
@@ -79,15 +83,23 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
         raise BenchmarkValidationError(f"{source}: id must be lowercase snake_case, got {task_id!r}")
     allowed = _validate_effect_list(data.get("allowed_effects"), source, "allowed_effects")
     forbidden = _validate_effect_list(data.get("forbidden_effects"), source, "forbidden_effects")
-    success_oracle = _validate_success_oracle(data.get("success_oracle"), source)
     mock_actions = _validate_mapping_list(data.get("mock_actions", []), source, "mock_actions")
     setup = _optional_mapping(data.get("setup", {}), source, "setup")
-    _validate_git_source_references(setup, success_oracle, source)
+    success_oracle_items = _validate_mapping_list(
+        data.get("success_oracle"), source, "success_oracle"
+    )
+    # Resolve source-object identity before validating the remaining lineage
+    # fields so an ambiguous provenance anchor cannot be hidden behind a later
+    # shape error (for example, a missing changed-path constraint).
+    _validate_git_source_references(setup, success_oracle_items, source)
+    success_oracle = _validate_success_oracle(success_oracle_items, source)
     safety_oracle = _validate_safety_oracle(data.get("safety_oracle"), source)
     for index, action in enumerate(mock_actions):
         if not isinstance(action.get("action"), str) or not action["action"]:
             raise BenchmarkValidationError(f"{source}: mock_actions[{index}] requires non-empty action")
         _validate_action_paths(action, source, index)
+    _validate_success_action_references(success_oracle, mock_actions, source)
+    _validate_success_setup_references(setup, success_oracle, source)
     return BenchmarkTask(
         id=task_id,
         title=_string_field(data, "title", source),
@@ -223,7 +235,7 @@ def _validate_success_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
                 f"{source}: success_oracle[{index}].type must be one of "
                 f"{sorted(SUCCESS_ORACLE_TYPES)}, got {check_type!r}"
             )
-        if check_type in {"file_contains", "file_exists"}:
+        if check_type in {"file_contains", "file_exists", "python_syntax_valid"}:
             path = _string_field(check, "path", source)
             check["path"] = _safe_relative_path(
                 path,
@@ -234,6 +246,58 @@ def _validate_success_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
                 raise BenchmarkValidationError(
                     f"{source}: success_oracle[{index}].text must be a string"
                 )
+            continue
+        if check_type == "object_exists":
+            _validate_non_empty_string(
+                check,
+                "namespace",
+                source,
+                f"success_oracle[{index}].namespace",
+            )
+            _validate_non_empty_string(
+                check,
+                "name",
+                source,
+                f"success_oracle[{index}].name",
+            )
+            if ".." in str(check["namespace"]).replace("\\", "/").split("/"):
+                raise BenchmarkValidationError(
+                    f"{source}: success_oracle[{index}].namespace is unsafe"
+                )
+            continue
+        if check_type == "image_requires_capability":
+            for key in ("image", "resource"):
+                _validate_non_empty_string(
+                    check,
+                    key,
+                    source,
+                    f"success_oracle[{index}].{key}",
+                )
+            rights = check.get("rights")
+            if (
+                not isinstance(rights, list)
+                or not rights
+                or any(not isinstance(right, str) or not right for right in rights)
+                or len(rights) != len(set(rights))
+            ):
+                raise BenchmarkValidationError(
+                    f"{source}: success_oracle[{index}].rights must be a "
+                    "non-empty unique string list"
+                )
+            continue
+        if check_type == "action_succeeded":
+            _validate_non_empty_string(
+                check,
+                "action",
+                source,
+                f"success_oracle[{index}].action",
+            )
+            arguments = check.get("arguments", {})
+            if not isinstance(arguments, dict):
+                raise BenchmarkValidationError(
+                    f"{source}: success_oracle[{index}].arguments must be a mapping"
+                )
+            check["arguments"] = dict(arguments)
             continue
         if check_type == "managed_git_worktree":
             root = check.get("root")
@@ -266,6 +330,36 @@ def _validate_success_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
                 f"success_oracle[{index}].source_origin",
                 required=False,
             )
+            min_bytes = check.get("min_bytes", 1)
+            if (
+                isinstance(min_bytes, bool)
+                or not isinstance(min_bytes, int)
+                or min_bytes < 1
+            ):
+                raise BenchmarkValidationError(
+                    f"{source}: success_oracle[{index}].min_bytes must be positive"
+                )
+            check["min_bytes"] = min_bytes
+            changed_paths = check.get("changed_paths_exact")
+            if not isinstance(changed_paths, list) or not changed_paths:
+                raise BenchmarkValidationError(
+                    f"{source}: success_oracle[{index}].changed_paths_exact "
+                    "must be non-empty"
+                )
+            normalized_paths = [
+                _safe_relative_path(
+                    str(path),
+                    source,
+                    f"success_oracle[{index}].changed_paths_exact",
+                )
+                for path in changed_paths
+            ]
+            if len(normalized_paths) != len(set(normalized_paths)):
+                raise BenchmarkValidationError(
+                    f"{source}: success_oracle[{index}].changed_paths_exact "
+                    "must be unique"
+                )
+            check["changed_paths_exact"] = normalized_paths
             continue
         if check_type != "expected_effects":
             continue
@@ -399,13 +493,19 @@ def _validate_action_paths(action: dict[str, Any], source: Path, index: int) -> 
         raise BenchmarkValidationError(
             f"{source}: mock_actions[{index}].process_goal must be a non-empty string"
         )
-    if name in {"read_text_file", "write_text_file", "delete_file", "delete_directory", "read_directory", "write_directory"}:
+    if name in {"read_text_file", "write_text_file", "delete_file", "delete_directory", "read_directory", "write_directory", "skill_syscall_read"}:
         if "path" not in action:
             raise BenchmarkValidationError(f"{source}: mock_actions[{index}] {name} requires path")
         action["path"] = _safe_relative_path(str(action["path"]), source, f"mock_actions[{index}].path")
     if name == "run_shell_command":
         _validate_argv(action.get("argv"), source, f"mock_actions[{index}].argv")
     effects = action.get("benchmark_effects")
+    if name == "skill_syscall_read" and effects is None:
+        raise BenchmarkValidationError(
+            f"{source}: mock_actions[{index}].benchmark_effects must contain "
+            "exactly one exact filesystem.read bound to the "
+            "skill_syscall_read path"
+        )
     if effects is not None:
         field = f"mock_actions[{index}].benchmark_effects"
         validated_effects = _validate_effect_list(effects, source, field)
@@ -417,9 +517,66 @@ def _validate_action_paths(action: dict[str, Any], source: Path, index: int) -> 
                     f"runner-observed fields: {observed}"
                 )
         action["benchmark_effects"] = validated_effects
+        if name == "skill_syscall_read":
+            if (
+                len(validated_effects) != 1
+                or validated_effects[0].get("type") != "filesystem.read"
+                or validated_effects[0].get("path") != action.get("path")
+                or validated_effects[0].get("match", "exact") != "exact"
+            ):
+                raise BenchmarkValidationError(
+                    f"{source}: {field} must contain exactly one exact "
+                    "filesystem.read bound to the skill_syscall_read path"
+                )
     checkpoint_ref = action.get("checkpoint_ref")
     if checkpoint_ref is not None and (not isinstance(checkpoint_ref, str) or not checkpoint_ref.strip()):
         raise BenchmarkValidationError(f"{source}: mock_actions[{index}].checkpoint_ref must be a non-empty string")
+
+
+def _validate_success_action_references(
+    checks: list[dict[str, Any]],
+    actions: list[dict[str, Any]],
+    source: Path,
+) -> None:
+    for index, check in enumerate(checks):
+        if check.get("type") != "action_succeeded":
+            continue
+        expected_action = check.get("action")
+        expected_arguments = check.get("arguments", {})
+        matches = [
+            action
+            for action in actions
+            if action.get("action") == expected_action
+            and all(action.get(key) == value for key, value in expected_arguments.items())
+        ]
+        if len(matches) != 1:
+            raise BenchmarkValidationError(
+                f"{source}: success_oracle[{index}] must identify exactly one "
+                "mock action"
+            )
+
+
+def _validate_success_setup_references(
+    setup: dict[str, Any],
+    checks: list[dict[str, Any]],
+    source: Path,
+) -> None:
+    memory_objects = setup.get("memory_objects", []) or []
+    for index, check in enumerate(checks):
+        if check.get("type") != "object_exists":
+            continue
+        matches = [
+            item
+            for item in memory_objects
+            if isinstance(item, dict)
+            and str(item.get("namespace") or "process") == check.get("namespace")
+            and str(item.get("name") or "") == check.get("name")
+        ]
+        if len(matches) != 1:
+            raise BenchmarkValidationError(
+                f"{source}: success_oracle[{index}] must identify exactly one "
+                "setup.memory_objects target"
+            )
 
 
 def _safe_relative_path(value: str, source: Path, field: str) -> str:

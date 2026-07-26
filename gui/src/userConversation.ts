@@ -59,12 +59,13 @@ export function deriveUserConversation(snapshot: RuntimeSnapshot | null, pid: st
   for (const request of snapshot.human_requests) {
     if (request.pid !== pid) continue;
     if (isHumanOutput(request)) {
+      const protectedOutput = isProtectedOutput(request);
       items.push({
         id: `assistant:${request.request_id}`,
         role: "assistant",
         time: request.updated_at || request.created_at,
-        text: String(request.payload.message ?? ""),
-        protected: isProtectedOutput(request),
+        text: protectedOutput ? "" : String(request.payload.message ?? ""),
+        protected: protectedOutput,
         request
       });
       continue;
@@ -129,7 +130,7 @@ function isProtectedOutput(request: HumanRequest): boolean {
 }
 
 export function isHumanUserMessage(message: ProcessMessage): boolean {
-  return message.sender.startsWith("human:") || message.payload?.source === "human_input";
+  return message.sender.startsWith("human:");
 }
 
 export function isHumanDecision(request: HumanRequest): boolean {

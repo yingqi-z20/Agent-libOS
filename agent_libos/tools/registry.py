@@ -130,8 +130,14 @@ class ToolRegistry:
             and row.get("registered_by") != registered_by
         ):
             return False
+        implementation_present = handle.tool_id in self._implementations
         implementation = self._implementations.get(handle.tool_id)
+        jit_source_present = handle.tool_id in self._jit_sources
         jit_source = self._jit_sources.get(handle.tool_id)
+        loaded_handle_present = handle.tool_id in self._handles
+        loaded_handle = self._handles.get(handle.tool_id)
+        name_binding_present = handle.name in self._tool_ids_by_name
+        name_binding = self._tool_ids_by_name.get(handle.name)
         try:
             with self.unit_of_work.transaction():
                 self._implementations.pop(handle.tool_id, None)
@@ -150,13 +156,26 @@ class ToolRegistry:
                     decision={"name": handle.name},
                 )
         except BaseException:
-            if implementation is not None:
+            if implementation_present:
+                assert implementation is not None
                 self._implementations[handle.tool_id] = implementation
-            if jit_source is not None:
+            else:
+                self._implementations.pop(handle.tool_id, None)
+            if jit_source_present:
+                assert jit_source is not None
                 self._jit_sources[handle.tool_id] = jit_source
-            self._handles[handle.tool_id] = handle
-            if row is not None and not bool(row.get("ephemeral")):
-                self._tool_ids_by_name[handle.name] = handle.tool_id
+            else:
+                self._jit_sources.pop(handle.tool_id, None)
+            if loaded_handle_present:
+                assert loaded_handle is not None
+                self._handles[handle.tool_id] = loaded_handle
+            else:
+                self._handles.pop(handle.tool_id, None)
+            if name_binding_present:
+                assert name_binding is not None
+                self._tool_ids_by_name[handle.name] = name_binding
+            else:
+                self._tool_ids_by_name.pop(handle.name, None)
             raise
         return True
 
@@ -183,7 +202,17 @@ class ToolRegistry:
 
     def resolve(self, tool: ToolHandle | str, *, pid: str | None = None) -> ToolHandle:
         if isinstance(tool, ToolHandle):
-            return tool
+            handle = self._handles.get(tool.tool_id)
+            if (
+                handle is None
+                or handle != tool
+                or (
+                    tool.tool_id not in self._implementations
+                    and tool.tool_id not in self._jit_sources
+                )
+            ):
+                raise NotFound(f"tool not found: {tool.tool_id}")
+            return handle
         process_tool_id: str | None = None
         process_tool_ids: set[str] = set()
         if pid is not None:
@@ -271,7 +300,8 @@ class ToolRegistry:
         tool: ToolHandle | str,
     ) -> ToolHandle | None:
         if isinstance(tool, ToolHandle):
-            return tool
+            loaded = self._handles.get(tool.tool_id)
+            return loaded if loaded == tool else None
         if tool in self._handles:
             return self._handles[tool]
         tool_id = self._tool_ids_by_name.get(str(tool))

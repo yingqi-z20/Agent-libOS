@@ -13,12 +13,15 @@ export function previewImageManifest(text: string): ImageManifestPreview {
   const parsed = parseJsonPreview(text);
   if (parsed) return { ...parsed, bytes };
   return {
-    image_id: yamlValue(text, "image_id"),
-    name: yamlValue(text, "name"),
-    version: yamlValue(text, "version"),
-    default_tools_count: yamlListCount(text, "default_tools"),
-    required_capabilities_count: yamlListCount(text, "required_capabilities"),
-    required_modules_count: yamlListCount(text, "required_modules"),
+    // YAML is intentionally not approximated with regular expressions. The
+    // backend's bounded, unique-key YAML loader is the authority; confirmation
+    // binds the exact manifest SHA-256 supplied by Electron instead.
+    image_id: null,
+    name: null,
+    version: null,
+    default_tools_count: null,
+    required_capabilities_count: null,
+    required_modules_count: null,
     bytes
   };
 }
@@ -51,26 +54,4 @@ function unwrapImage(value: unknown): Record<string, unknown> | null {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function yamlValue(text: string, key: string): string | null {
-  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = text.match(new RegExp(`^\\s*${escaped}\\s*:\\s*["']?([^"'#\\n]+)`, "m"));
-  return match?.[1]?.trim() || null;
-}
-
-function yamlListCount(text: string, key: string): number | null {
-  const lines = text.split(/\r?\n/);
-  const header = new RegExp(`^(\\s*)${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*:\\s*$`);
-  const start = lines.findIndex((line) => header.test(line));
-  if (start < 0) return null;
-  const baseIndent = (lines[start].match(/^\s*/) ?? [""])[0].length;
-  let count = 0;
-  for (const line of lines.slice(start + 1)) {
-    if (!line.trim()) continue;
-    const indent = (line.match(/^\s*/) ?? [""])[0].length;
-    if (indent <= baseIndent) break;
-    if (line.trimStart().startsWith("-")) count += 1;
-  }
-  return count;
 }

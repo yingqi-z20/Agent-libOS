@@ -4,6 +4,7 @@ import base64
 import binascii
 import errno
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -30,7 +31,13 @@ from agent_libos.models import (
     ToolCandidateStatus,
     is_openai_tool_name,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    HumanApprovalRequired,
+    NotFound,
+    SkillPackageChanged,
+    ValidationError,
+)
 from agent_libos.ports import AuditPort, EventPort, RuntimePublicationReceiptRecorder
 from agent_libos.skills.builtin_catalog import (
     BUILTIN_SKILL_PREFIX,
@@ -40,6 +47,17 @@ from agent_libos.skills.builtin_catalog import (
 from agent_libos.skills.schema import ActionSchema, JitToolSpec, LoadedSkill, SkillPackage, SkillResource
 from agent_libos.storage import UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.secure_host_files import (
+    SecureDirectoryGuard,
+    SecureFileChanged,
+    SecureFileLimitExceeded,
+    SecureFileReadUnavailable,
+    StablePathSnapshot,
+    open_secure_directory,
+    open_secure_file,
+    read_stable_file_limited,
+    stable_identity_available,
+)
 from agent_libos.utils.serde import bounded_json_loads, dumps, to_jsonable
 from agent_libos.utils.skill_search import (
     skill_metadata_exact_match,
@@ -48,6 +66,7 @@ from agent_libos.utils.skill_search import (
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SKILL_NAME_MAX_CHARS = 64
 _TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
 _SOURCE_TYPES = {"workspace", "global", "runtime"}
@@ -61,6 +80,7 @@ _AGENT_LIBOS_METADATA_KEYS = {
 _BUILTIN_PROJECTION_RECEIPT_ACTION = "skill.builtin_projection.receipt"
 _BUILTIN_PROJECTION_RECEIPT_SCHEMA_VERSION = 1
 _BUILTIN_PROJECTION_RECEIPT_FIELD = "builtin_projection_receipt_id"
+_SKILL_PACKAGE_READ_CHUNK_BYTES = 64 * 1024
 
 
 @dataclass(slots=True)
@@ -75,6 +95,47 @@ class _DeferredJitRegistryFinalization:
             str(handle.tool_id) for handle in handles.values()
         )
         self.retired_tool_ids.update(str(tool_id) for tool_id in retired_tool_ids)
+
+
+@dataclass(slots=True)
+class _SkillPackageTraversalBudget:
+    """Aggregate directory/depth budget shared by one package traversal."""
+
+    max_directories: int
+    max_depth: int
+    directories: int = 0
+
+    def charge_directory(self, *, depth: int) -> None:
+        if depth > self.max_depth:
+            raise ValidationError(
+                "skill package exceeds max_package_depth="
+                f"{self.max_depth}"
+            )
+        if self.directories >= self.max_directories:
+            raise ValidationError(
+                "skill package exceeds max_package_directories="
+                f"{self.max_directories}"
+            )
+        self.directories += 1
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceSkillManifest:
+    """Bounded immutable SKILL.md snapshot used for pre-authorization."""
+
+    requested_path: str
+    cwd: str
+    package_root: str
+    skill_md_path: str
+    workspace_package_root: str
+    raw_skill: bytes
+    frontmatter: dict[str, Any]
+    body: str
+    total_bytes: int
+
+    @property
+    def skill_id(self) -> str:
+        return str(self.frontmatter["name"])
 
 
 def _with_registry_lifecycle_lock(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -178,6 +239,7 @@ class SkillManager:
             "valid": True,
         }
 
+    @_with_registry_lifecycle_lock
     def register_skill_package(
         self,
         package: SkillPackage,
@@ -286,8 +348,8 @@ class SkillManager:
         replace: bool = False,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        absolute, source_id = self._normalize_global_path(path)
-        package, _source = self._load_package_from_host_path(absolute)
+        package, source = self._load_package_from_host_path(path)
+        absolute, source_id = self._normalize_global_source(source)
         return self.register_skill_package(
             package,
             actor=actor,
@@ -299,8 +361,8 @@ class SkillManager:
         )
 
     def global_package_info(self, path: str | Path) -> dict[str, Any]:
-        absolute, source_id = self._normalize_global_path(path)
-        package, _source = self._load_package_from_host_path(absolute)
+        package, source = self._load_package_from_host_path(path)
+        absolute, source_id = self._normalize_global_source(source)
         return {
             "path": str(absolute),
             "source": source_id,
@@ -309,6 +371,7 @@ class SkillManager:
             "bytes": sum(resource.size_bytes for resource in package.resources),
         }
 
+    @_with_registry_lifecycle_lock
     def register_skill_from_workspace_path(
         self,
         pid: str,
@@ -317,17 +380,57 @@ class SkillManager:
         replace: bool = False,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        package, source = self._load_package_from_workspace(pid, path)
-        return self.register_skill_package(
+        if not require_capability:
+            _package, _source, registration = self._load_and_register_workspace_skill(
+                pid,
+                path,
+                replace=replace,
+            )
+            return registration
+        manifest = self._read_workspace_skill_manifest(pid, path)
+        decisions = self._require_skill_right(
+            pid,
+            manifest.skill_id,
+            CapabilityRight.WRITE,
+        )
+        with self.capabilities.authority_transaction(
+            decisions,
+            actor=pid,
+            operation="workspace Skill package registration",
+        ):
+            _package, _source, registration = self._load_and_register_workspace_skill(
+                pid,
+                path,
+                replace=replace,
+                manifest=manifest,
+            )
+        return registration
+
+    def _load_and_register_workspace_skill(
+        self,
+        pid: str,
+        path: str,
+        *,
+        replace: bool,
+        manifest: _WorkspaceSkillManifest | None = None,
+    ) -> tuple[SkillPackage, str, dict[str, Any]]:
+        package, source = self._load_package_from_workspace(
+            pid,
+            path,
+            manifest=manifest,
+        )
+        registration = self.register_skill_package(
             package,
             actor=pid,
             replace=replace,
-            require_capability=require_capability,
+            require_capability=False,
             source_type="workspace",
             source=source,
             package_sha256=package.package_sha256,
         )
+        return package, source, registration
 
+    @_with_registry_lifecycle_lock
     def activate_skill_from_workspace_path(
         self,
         pid: str,
@@ -336,11 +439,27 @@ class SkillManager:
         replace: bool = False,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        package, source = self._load_package_from_workspace(pid, path)
-        if require_capability:
-            decisions = self._require_skill_rights(pid, package.skill_id, [CapabilityRight.WRITE, CapabilityRight.EXECUTE])
-        else:
-            decisions = []
+        if not require_capability:
+            package, source, _registration = self._load_and_register_workspace_skill(
+                pid,
+                path,
+                replace=replace,
+            )
+            result = self.activate_skill(
+                pid,
+                package.skill_id,
+                actor=pid,
+                require_capability=False,
+                expected_package_sha256=package.package_sha256,
+            )
+            return {**result, "source": source, "registered": True}
+
+        manifest = self._read_workspace_skill_manifest(pid, path)
+        decisions = self._require_skill_rights(
+            pid,
+            manifest.skill_id,
+            [CapabilityRight.WRITE, CapabilityRight.EXECUTE],
+        )
         write_uses = self._decision_consume_ids(
             decision
             for decision in decisions
@@ -353,66 +472,93 @@ class SkillManager:
         )
         shared_one_time_authority = write_uses & execute_uses
         if shared_one_time_authority:
-            activation_error: Exception | None = None
-            result: dict[str, Any] | None = None
-            deferred_jit = _DeferredJitRegistryFinalization()
-            with self._lifecycle_lock:
-                try:
-                    with self.capabilities.authority_transaction(
-                        decisions,
-                        actor=pid,
-                        operation="workspace skill registration and activation",
-                    ):
-                        self.register_skill_package(
-                            package,
-                            actor=pid,
-                            replace=replace,
-                            require_capability=False,
-                            source_type="workspace",
-                            source=source,
-                            package_sha256=package.package_sha256,
-                        )
-                        try:
-                            result = self.activate_skill(
-                                pid,
-                                package.skill_id,
-                                actor=pid,
-                                require_capability=False,
-                                _deferred_jit_finalization=deferred_jit,
-                            )
-                        except Exception as exc:
-                            activation_error = exc
-                except BaseException as exc:
-                    try:
-                        self._forget_jit_tool_ids(deferred_jit.published_tool_ids)
-                    except Exception as cleanup_exc:
-                        exc.add_note(
-                            "failed to discard workspace Skill JIT publications "
-                            "after authority rollback: "
-                            f"{type(cleanup_exc).__name__}: {cleanup_exc}"
-                        )
-                    raise
-                self._forget_jit_tool_ids(deferred_jit.retired_tool_ids)
-            if activation_error is not None:
-                raise activation_error
-            assert result is not None
-        else:
-            self.register_skill_package(
-                package,
-                actor=pid,
+            result, source = self._activate_workspace_skill_with_shared_authority(
+                pid,
+                path,
                 replace=replace,
-                require_capability=require_capability,
-                source_type="workspace",
-                source=source,
-                package_sha256=package.package_sha256,
+                manifest=manifest,
+                decisions=decisions,
             )
+        else:
+            write_decisions = [
+                decision
+                for decision in decisions
+                if decision.right == CapabilityRight.WRITE.value
+            ]
+            with self.capabilities.authority_transaction(
+                write_decisions,
+                actor=pid,
+                operation="workspace Skill package registration",
+            ):
+                package, source, _registration = self._load_and_register_workspace_skill(
+                    pid,
+                    path,
+                    replace=replace,
+                    manifest=manifest,
+                )
             result = self.activate_skill(
                 pid,
                 package.skill_id,
                 actor=pid,
-                require_capability=require_capability,
+                require_capability=True,
+                expected_package_sha256=package.package_sha256,
             )
         return {**result, "source": source, "registered": True}
+
+    def _activate_workspace_skill_with_shared_authority(
+        self,
+        pid: str,
+        path: str,
+        *,
+        replace: bool,
+        manifest: _WorkspaceSkillManifest,
+        decisions: list[CapabilityDecision],
+    ) -> tuple[dict[str, Any], str]:
+        activation_error: Exception | None = None
+        result: dict[str, Any] | None = None
+        source = manifest.package_root
+        deferred_jit = _DeferredJitRegistryFinalization()
+        with self._lifecycle_lock:
+            try:
+                with self.capabilities.authority_transaction(
+                    decisions,
+                    actor=pid,
+                    operation="workspace skill registration and activation",
+                ):
+                    package, source, _registration = (
+                        self._load_and_register_workspace_skill(
+                            pid,
+                            path,
+                            replace=replace,
+                            manifest=manifest,
+                        )
+                    )
+                    try:
+                        result = self.activate_skill(
+                            pid,
+                            package.skill_id,
+                            actor=pid,
+                            require_capability=False,
+                            expected_package_sha256=package.package_sha256,
+                            _deferred_jit_finalization=deferred_jit,
+                        )
+                    except Exception as exc:
+                        activation_error = exc
+            except BaseException as exc:
+                try:
+                    self._forget_jit_tool_ids(deferred_jit.published_tool_ids)
+                except Exception as cleanup_exc:
+                    exc.add_note(
+                        "failed to discard workspace Skill JIT publications "
+                        "after authority rollback: "
+                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                    )
+                raise
+            self._forget_jit_tool_ids(deferred_jit.retired_tool_ids)
+        if activation_error is not None:
+            raise activation_error
+        assert result is not None
+        return result, source
 
     def discover_skills(
         self,
@@ -541,8 +687,8 @@ class SkillManager:
             if exact_match:
                 registered_has_more = False
                 host_has_more = False
-        except Exception:
-            self._restore_skill_rights(reservations)
+        except BaseException as exc:
+            self._restore_skill_rights_after_failure(reservations, exc)
             raise
         self._commit_skill_rights(reservations)
         scope = "all_visible_sources" if include_registered else "visibility_limited"
@@ -573,7 +719,7 @@ class SkillManager:
         for skill, metadata in rows:
             summary = {
                 **self._skill_summary(skill, metadata),
-                "active": self._loaded_skill_is_trusted(process, skill.skill_id),
+                "active": self._loaded_skill_matches_package(process, skill),
             }
             score = self._skill_discovery_score(summary, text)
             if score is None:
@@ -643,10 +789,7 @@ class SkillManager:
             assert metadata is not None
             summary = {
                 **self._skill_summary(skill, metadata),
-                "active": self._loaded_skill_is_trusted(
-                    process,
-                    skill.skill_id,
-                ),
+                "active": self._loaded_skill_matches_package(process, skill),
             }
             score = self._skill_discovery_score(summary, text)
             if score is None:
@@ -690,6 +833,26 @@ class SkillManager:
         except ValidationError:
             return False
 
+    def _loaded_skill_matches_package(
+        self,
+        process: Any | None,
+        skill: SkillPackage,
+    ) -> bool:
+        """Return whether the trusted loaded snapshot is this catalog content."""
+
+        if not self._loaded_skill_is_trusted(process, skill.skill_id):
+            return False
+        assert process is not None
+        loaded = process.loaded_skills.get(skill.skill_id)
+        if not isinstance(loaded, dict):
+            return False
+        loaded_sha256 = loaded.get("package_sha256")
+        return (
+            isinstance(loaded_sha256, str)
+            and bool(loaded_sha256)
+            and loaded_sha256 == skill.package_sha256
+        )
+
     def _builtin_supported_by_process(self, skill: SkillPackage, process: Any) -> bool:
         image = self._images.get(process.image_id)
         if image is None:
@@ -728,33 +891,48 @@ class SkillManager:
         actor: str | None = None,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        skill, metadata = self._get_skill(skill_id)
+        decisions: list[CapabilityDecision] = []
         reservations: dict[str, str] = {}
         if (
             require_capability
             and actor is not None
-            and metadata.get("source_type") != "builtin"
+            and self._builtin_catalog.metadata(skill_id) is None
         ):
             decisions = self._require_skill_right(actor, skill_id, CapabilityRight.READ)
             reservations = self._reserve_skill_rights(decisions, used_by="skill")
         try:
-            result = {
-                **self._skill_summary(skill, metadata),
-                "instructions": self._prompt_instructions(skill),
-                "allowed_tools": list(skill.allowed_tools),
-                "actions": [asdict(action) for action in skill.actions],
-                "jit_tools": [self._jit_summary(tool) for tool in skill.jit_tools],
-                "required_capabilities": list(skill.required_capabilities),
-                "metadata": dict(skill.metadata),
-                "resources": [self._resource_summary(resource) for resource in skill.resources],
-                "license": skill.license,
-                "compatibility": skill.compatibility,
-                "diagnostics": list(skill.diagnostics),
-            }
-        except Exception:
-            self._restore_skill_rights(reservations)
+            # Keep reauthorization, lookup, response construction, and
+            # finite-use settlement under one store transaction.  This
+            # preserves durable restored-reservation evidence on failure while
+            # preventing unlimited-grant revoke races from reopening the
+            # absent-vs-inaccessible identity oracle.
+            with self.capabilities.store.transaction():
+                for decision in decisions:
+                    self._reauthorize_skill_read_decision(
+                        decision,
+                        reservations,
+                    )
+                skill, metadata = self._get_skill(skill_id)
+                result = {
+                    **self._skill_summary(skill, metadata),
+                    "instructions": self._prompt_instructions(skill),
+                    "allowed_tools": list(skill.allowed_tools),
+                    "actions": [asdict(action) for action in skill.actions],
+                    "jit_tools": [self._jit_summary(tool) for tool in skill.jit_tools],
+                    "required_capabilities": list(skill.required_capabilities),
+                    "metadata": dict(skill.metadata),
+                    "resources": [
+                        self._resource_summary(resource)
+                        for resource in skill.resources
+                    ],
+                    "license": skill.license,
+                    "compatibility": skill.compatibility,
+                    "diagnostics": list(skill.diagnostics),
+                }
+                self._commit_skill_rights(reservations)
+        except BaseException as exc:
+            self._restore_skill_rights_after_failure(reservations, exc)
             raise
-        self._commit_skill_rights(reservations)
         return result
 
     def prompt_context(self, pid: str) -> list[dict[str, Any]]:
@@ -827,13 +1005,23 @@ class SkillManager:
         *,
         actor: str | None = None,
         require_capability: bool = True,
+        expected_package_sha256: str | None = None,
         publication_id: str | None = None,
         receipt_recorder: RuntimePublicationReceiptRecorder | None = None,
         _deferred_jit_finalization: _DeferredJitRegistryFinalization | None = None,
     ) -> dict[str, Any]:
+        self._validate_expected_package_sha256(expected_package_sha256)
         selected_actor = actor or pid
-        skill, metadata = self._get_skill(skill_id)
-        if metadata.get("source_type") == "builtin":
+        known_builtin = self._builtin_catalog.metadata(skill_id) is not None
+        if known_builtin:
+            # Built-in catalog identities and packages are immutable public
+            # runtime assets.  Target state remains protected inside the
+            # projection authority transaction below.
+            skill, metadata = self._get_skill(skill_id)
+            self._require_expected_package_sha256(
+                skill,
+                expected_package_sha256,
+            )
             return self._activate_builtin_projection(
                 pid,
                 skill,
@@ -845,10 +1033,10 @@ class SkillManager:
             )
         return self._activate_registered_skill(
             pid,
-            skill,
-            metadata,
+            skill_id,
             actor=selected_actor,
             require_capability=require_capability,
+            expected_package_sha256=expected_package_sha256,
             publication_id=publication_id,
             receipt_recorder=receipt_recorder,
             deferred_jit_finalization=_deferred_jit_finalization,
@@ -857,11 +1045,11 @@ class SkillManager:
     def _activate_registered_skill(
         self,
         pid: str,
-        skill: SkillPackage,
-        metadata: dict[str, Any],
+        skill_id: str,
         *,
         actor: str,
         require_capability: bool,
+        expected_package_sha256: str | None,
         publication_id: str | None,
         receipt_recorder: RuntimePublicationReceiptRecorder | None,
         deferred_jit_finalization: _DeferredJitRegistryFinalization | None,
@@ -870,7 +1058,7 @@ class SkillManager:
         if require_capability:
             decisions = self._require_skill_right(
                 selected_actor,
-                skill.skill_id,
+                skill_id,
                 CapabilityRight.EXECUTE,
             )
             admin_decision = self._require_process_admin_if_cross_actor(selected_actor, pid)
@@ -878,29 +1066,44 @@ class SkillManager:
                 decisions.append(admin_decision)
         else:
             decisions = []
-        process = self.processes.get_process(pid)
         jit_handles: dict[str, Any] = {}
         retired_jit_ids: set[str] = set()
-        if process is None:
-            raise NotFound(f"process not found: {pid}")
-        preflight_loaded = process.loaded_skills.get(skill.skill_id)
-        preflight_jit_ids = self._loaded_tool_id_map(preflight_loaded, "jit_tool_ids")
-        self._validate_loadable(
-            pid,
-            skill,
-            process.tool_table,
-            replacing_jit_tool_ids=preflight_jit_ids,
-        )
         # Candidate creation is durable state, so it must be enrolled in the
         # same authority transaction as registration and process publication.
         # This also lets a recovery-fence commit rejection roll it back without
-        # attempting a new mutation through the now-stale admission lease.
+        # attempting a new mutation through the now-stale admission lease.  In
+        # addition, mutable registry lookup happens only after reauthorization
+        # and finite-use reservation, preventing a revoke/consume race from
+        # restoring an absent-vs-inaccessible identity oracle.
         with self._activation_authority_scope(
             decisions,
             actor=selected_actor,
             jit_state=lambda: (jit_handles, retired_jit_ids),
             deferred_jit_finalization=deferred_jit_finalization,
         ):
+            skill, metadata = self._get_skill(skill_id)
+            self._require_expected_package_sha256(
+                skill,
+                expected_package_sha256,
+            )
+            if metadata.get("source_type") == "builtin":
+                raise ValidationError(
+                    f"registered Skill activation resolved a built-in id: {skill_id}"
+                )
+            process = self.processes.get_process(pid)
+            if process is None:
+                raise NotFound(f"process not found: {pid}")
+            preflight_loaded = process.loaded_skills.get(skill.skill_id)
+            preflight_jit_ids = self._loaded_tool_id_map(
+                preflight_loaded,
+                "jit_tool_ids",
+            )
+            self._validate_loadable(
+                pid,
+                skill,
+                process.tool_table,
+                replacing_jit_tool_ids=preflight_jit_ids,
+            )
             prepared_jit_tools = self._prepare_jit_tools(
                 pid, skill, publication_id=publication_id, receipt_recorder=receipt_recorder
             )
@@ -1062,23 +1265,26 @@ class SkillManager:
     ) -> dict[str, Any]:
         """Load trusted guidance while revealing only image-owned bindings."""
 
-        self._prompt_instructions(skill)
-        process = self.processes.get_process(pid)
-        if process is None:
-            raise NotFound(f"process not found: {pid}")
-        tool_ids = self._builtin_projection_tool_ids(skill, process)
-        self._validate_existing_builtin_projection(skill.skill_id, process)
         decisions: list[CapabilityDecision] = []
         if require_capability:
             admin_decision = self._require_process_admin_if_cross_actor(actor, pid)
             if admin_decision is not None:
                 decisions.append(admin_decision)
-        before_schemas = self._tools.openai_tool_schemas(pid)
         with self.capabilities.authority_transaction(
             decisions,
             actor=actor,
             operation="built-in Skill projection activation",
         ):
+            # Reauthorization and finite-use reservation above must precede
+            # every target-sensitive read, including process existence,
+            # image compatibility, tool bindings, and prior projection state.
+            self._prompt_instructions(skill)
+            process = self.processes.get_process(pid)
+            if process is None:
+                raise NotFound(f"process not found: {pid}")
+            tool_ids = self._builtin_projection_tool_ids(skill, process)
+            self._validate_existing_builtin_projection(skill.skill_id, process)
+            before_schemas = self._tools.openai_tool_schemas(pid)
             with self.unit_of_work.transaction():
                 process = self.processes.get_process(pid)
                 if process is None:
@@ -1290,22 +1496,16 @@ class SkillManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         selected_actor = actor or pid
-        process = self.processes.get_process(pid)
-        if process is None:
-            raise NotFound(f"process not found: {pid}")
-        loaded_for_auth = process.loaded_skills.get(skill_id)
-        if loaded_for_auth is None:
-            raise NotFound(f"skill is not loaded in process {pid}: {skill_id}")
-        builtin_projection = self._loaded_builtin_projection_is_trusted(
+        self._validate_local_unload_state(
+            selected_actor,
+            pid,
             skill_id,
-            loaded_for_auth,
-            process,
+            require_capability=require_capability,
         )
-        decisions = self._unload_authority_decisions(
-            actor=selected_actor,
-            pid=pid,
-            skill_id=skill_id,
-            builtin_projection=builtin_projection,
+        decisions = self._unload_identity_authority_decisions(
+            selected_actor,
+            pid,
+            skill_id,
             require_capability=require_capability,
         )
         removed: list[str] = []
@@ -1317,6 +1517,13 @@ class SkillManager:
                 actor=selected_actor,
                 operation="skill unload",
             ):
+                # Resolve target existence, loaded state, and projection
+                # provenance only after the complete exact/cross-process
+                # authority bundle has been revalidated and reserved.
+                process, builtin_projection = self._resolve_unload_target_state(
+                    pid,
+                    skill_id,
+                )
                 with self.unit_of_work.transaction():
                     process = self.processes.get_process(pid)
                     if process is None:
@@ -1394,6 +1601,59 @@ class SkillManager:
             "authority_changed": False,
         }
 
+    def _validate_local_unload_state(
+        self,
+        actor: str,
+        pid: str,
+        skill_id: str,
+        *,
+        require_capability: bool,
+    ) -> None:
+        if not require_capability or actor != pid:
+            return
+        # A process already receives its own loaded Skill ids and prompt
+        # context. Preserve fail-fast validation of forged local provenance
+        # without weakening the cross-process error-order boundary.
+        self._resolve_unload_target_state(pid, skill_id)
+
+    def _unload_identity_authority_decisions(
+        self,
+        actor: str,
+        pid: str,
+        skill_id: str,
+        *,
+        require_capability: bool,
+    ) -> list[CapabilityDecision]:
+        if not require_capability:
+            return []
+        decisions = (
+            self._require_skill_right(actor, skill_id, CapabilityRight.EXECUTE)
+            if self._builtin_catalog.metadata(skill_id) is None
+            else []
+        )
+        admin_decision = self._require_process_admin_if_cross_actor(actor, pid)
+        if admin_decision is not None:
+            decisions.append(admin_decision)
+        return decisions
+
+    def _resolve_unload_target_state(
+        self,
+        pid: str,
+        skill_id: str,
+    ) -> tuple[Any, bool]:
+        process = self.processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        loaded = process.loaded_skills.get(skill_id)
+        if loaded is None:
+            raise NotFound(f"skill is not loaded in process {pid}: {skill_id}")
+        builtin_projection = self._loaded_builtin_projection_is_trusted(
+            skill_id,
+            loaded,
+            process,
+        )
+        return process, builtin_projection
+
     def _record_skill_unload(
         self,
         *,
@@ -1441,27 +1701,6 @@ class SkillManager:
             raise ValidationError(
                 f"loaded Skill activation provenance changed during unload: {skill_id}"
             )
-
-    def _unload_authority_decisions(
-        self,
-        *,
-        actor: str,
-        pid: str,
-        skill_id: str,
-        builtin_projection: bool,
-        require_capability: bool,
-    ) -> list[CapabilityDecision]:
-        if not require_capability:
-            return []
-        decisions = (
-            []
-            if builtin_projection
-            else self._require_skill_right(actor, skill_id, CapabilityRight.EXECUTE)
-        )
-        admin_decision = self._require_process_admin_if_cross_actor(actor, pid)
-        if admin_decision is not None:
-            decisions.append(admin_decision)
-        return decisions
 
     def _loaded_builtin_projection_is_trusted(
         self,
@@ -1816,115 +2055,248 @@ class SkillManager:
         root = skill_md.parent
         if skill_md.suffix.lower() in {".yaml", ".yml"}:
             raise ValidationError("legacy YAML Skill manifests are not supported; use a SKILL.md package")
-        raw_skill = self._read_bytes_limited(skill_md, self.config.skills.skill_md_hard_limit_bytes)
+        raw_resources, source = self._read_host_resources(root)
+        raw_skill = raw_resources["SKILL.md"]
         frontmatter, body = self._parse_skill_markdown(raw_skill.decode("utf-8"), expected_dir_name=root.name)
-        resources = self._read_host_resources(root, raw_skill)
+        resources = [
+            self._resource_from_bytes(resource_path, content)
+            for resource_path, content in sorted(raw_resources.items())
+        ]
         package = self._package_from_parts(frontmatter, body, resources)
-        return package, str(root.resolve())
+        return package, source
 
-    def _load_package_from_workspace(self, pid: str, path: str) -> tuple[SkillPackage, str]:
+    def _read_workspace_skill_manifest(
+        self,
+        pid: str,
+        path: str,
+    ) -> _WorkspaceSkillManifest:
         cwd = self._process.working_directory(pid)
         package_root, skill_md_path = self._workspace_package_paths(path)
-        read = self._filesystem.read_bytes(
+        raw_skill, total_bytes = self._read_workspace_package_file(
             pid,
             skill_md_path,
-            max_bytes=self.config.skills.skill_md_max_bytes,
+            display_path=skill_md_path,
+            file_max_bytes=self.config.skills.skill_md_max_bytes,
+            file_limit_name="skill_md_max_bytes",
+            file_error_prefix="SKILL.md",
+            total_bytes=0,
             cwd=cwd,
         )
-        if read.truncated:
-            raise ValidationError(
-                "SKILL.md exceeds "
-                f"skill_md_max_bytes={self.config.skills.skill_md_max_bytes}: {skill_md_path}"
-            )
         frontmatter, body = self._parse_skill_markdown(
-            read.content.decode("utf-8"),
+            raw_skill.decode("utf-8"),
             expected_dir_name=Path(package_root).name,
         )
         _target, workspace_package_root = self._filesystem.resolve_path(package_root, cwd=cwd)
-        references = self._frontmatter_reference_paths(frontmatter)
-        raw_resources: dict[str, bytes] = {"SKILL.md": read.content}
+        return _WorkspaceSkillManifest(
+            requested_path=path,
+            cwd=cwd,
+            package_root=package_root,
+            skill_md_path=skill_md_path,
+            workspace_package_root=workspace_package_root,
+            raw_skill=raw_skill,
+            frontmatter=frontmatter,
+            body=body,
+            total_bytes=total_bytes,
+        )
+
+    def _load_package_from_workspace(
+        self,
+        pid: str,
+        path: str,
+        *,
+        manifest: _WorkspaceSkillManifest | None = None,
+    ) -> tuple[SkillPackage, str]:
+        selected = manifest or self._read_workspace_skill_manifest(pid, path)
+        if selected.requested_path != path:
+            raise ValidationError("workspace Skill manifest path changed before load")
+        references = self._frontmatter_reference_paths(selected.frontmatter)
+        total_bytes = selected.total_bytes
+        raw_resources: dict[str, bytes] = {"SKILL.md": selected.raw_skill}
         for ref in references:
-            ref_read = self._filesystem.read_bytes(
+            self._require_workspace_package_file_slot(raw_resources)
+            content, total_bytes = self._read_workspace_package_file(
                 pid,
-                self._join_relative(package_root, ref),
-                max_bytes=self.config.skills.resource_read_max_bytes,
-                cwd=cwd,
+                self._join_relative(selected.package_root, ref),
+                display_path=ref,
+                file_max_bytes=self.config.skills.resource_read_max_bytes,
+                file_limit_name="resource_read_max_bytes",
+                file_error_prefix="skill metadata resource",
+                total_bytes=total_bytes,
+                cwd=selected.cwd,
             )
-            if ref_read.truncated:
-                raise ValidationError(
-                    "skill metadata resource exceeds "
-                    f"resource_read_max_bytes={self.config.skills.resource_read_max_bytes}: {ref}"
-                )
-            raw_resources[ref] = ref_read.content
-        jit_tools = self._load_jit_specs_from_resources(frontmatter, raw_resources)
+            raw_resources[ref] = content
+        jit_tools = self._load_jit_specs_from_resources(
+            selected.frontmatter,
+            raw_resources,
+        )
         for tool in jit_tools:
             if tool.source_path not in raw_resources:
-                script_read = self._filesystem.read_bytes(
+                self._require_workspace_package_file_slot(raw_resources)
+                content, total_bytes = self._read_workspace_package_file(
                     pid,
-                    self._join_relative(package_root, tool.source_path),
-                    max_bytes=self.config.skills.resource_read_max_bytes,
-                    cwd=cwd,
+                    self._join_relative(selected.package_root, tool.source_path),
+                    display_path=tool.source_path,
+                    file_max_bytes=self.config.skills.resource_read_max_bytes,
+                    file_limit_name="resource_read_max_bytes",
+                    file_error_prefix="Skill JIT source",
+                    total_bytes=total_bytes,
+                    cwd=selected.cwd,
                 )
-                if script_read.truncated:
-                    raise ValidationError(
-                        "Skill JIT source exceeds "
-                        f"resource_read_max_bytes={self.config.skills.resource_read_max_bytes}: "
-                        f"{tool.source_path}"
-                    )
-                raw_resources[tool.source_path] = script_read.content
-        self._read_workspace_resource_dirs(pid, workspace_package_root, raw_resources)
+                raw_resources[tool.source_path] = content
+        self._read_workspace_resource_dirs(
+            pid,
+            selected.workspace_package_root,
+            raw_resources,
+            total_bytes=total_bytes,
+        )
         resources = [self._resource_from_bytes(path, content) for path, content in sorted(raw_resources.items())]
-        package = self._package_from_parts(frontmatter, body, resources)
-        return package, package_root
+        package = self._package_from_parts(
+            selected.frontmatter,
+            selected.body,
+            resources,
+        )
+        if package.skill_id != selected.skill_id or package.name != selected.skill_id:
+            raise ValidationError(
+                "workspace Skill identity changed after pre-authorization: "
+                f"{selected.skill_id} != {package.skill_id}"
+            )
+        return package, selected.package_root
 
     def _read_workspace_resource_dirs(
         self,
         pid: str,
         workspace_package_root: str,
         raw_resources: dict[str, bytes],
+        *,
+        total_bytes: int,
     ) -> None:
         max_files = self.config.skills.max_package_files
+        traversal = _SkillPackageTraversalBudget(
+            max_directories=self.config.skills.max_package_directories,
+            max_depth=self.config.skills.max_package_depth,
+        )
         visited_dirs: set[str] = set()
+        pending: list[tuple[str, int]] = [
+            (self._join_relative(workspace_package_root, directory), 1)
+            for directory in reversed(self.config.skills.resource_dirs)
+        ]
 
-        def visit(directory: str) -> None:
+        while pending:
+            directory, depth = pending.pop()
             normalized_dir = directory.strip("/")
             if normalized_dir in visited_dirs:
-                return
+                continue
             visited_dirs.add(normalized_dir)
             if not self._has_read_authority(pid, self._filesystem.directory_resource_for_path(normalized_dir, cwd=None)):
-                return
+                continue
+            traversal.charge_directory(depth=depth)
+            remaining_entries = (
+                max_files
+                - len(raw_resources)
+                + traversal.max_directories
+                - traversal.directories
+            )
             try:
-                listing = self._filesystem.read_directory(pid, normalized_dir, limit=max_files, cwd=None)
+                listing = self._filesystem.read_directory(
+                    pid,
+                    normalized_dir,
+                    # Read one extra entry so a wide directory fails closed
+                    # instead of silently omitting package topology.
+                    limit=max(1, remaining_entries + 1),
+                    cwd=None,
+                )
             except NotFound:
-                return
-            if listing.truncated:
-                raise ValidationError(f"skill package exceeds max_package_files={max_files}")
+                # Configured resource roots are optional.  A path that did
+                # not exist consumed no traversal work beyond this bounded
+                # probe and therefore is not package topology.
+                traversal.directories -= 1
+                continue
+            if listing.truncated or len(listing.entries) > remaining_entries:
+                raise ValidationError(
+                    "skill package directory exceeds the remaining aggregate "
+                    f"max_package_files={max_files} and "
+                    "max_package_directories="
+                    f"{traversal.max_directories} budget"
+                )
+            child_directories: list[tuple[str, int]] = []
             for entry in listing.entries:
                 relative = self._workspace_resource_relative_path(workspace_package_root, entry.path)
                 if relative is None:
                     continue
                 if entry.kind == "directory":
-                    visit(entry.path)
+                    child_directories.append((entry.path, depth + 1))
                     continue
                 if entry.kind != "file" or relative in raw_resources:
                     continue
                 self._validate_resource_path(relative)
                 if not self._has_read_authority(pid, self._filesystem.resource_for_path(entry.path, cwd=None)):
                     continue
-                read = self._filesystem.read_bytes(
+                self._require_workspace_package_file_slot(
+                    raw_resources,
+                    directory_count=traversal.directories,
+                )
+                content, total_bytes = self._read_workspace_package_file(
                     pid,
                     entry.path,
-                    max_bytes=self.config.skills.resource_read_max_bytes,
+                    display_path=relative,
+                    file_max_bytes=self.config.skills.resource_read_max_bytes,
+                    file_limit_name="resource_read_max_bytes",
+                    file_error_prefix="skill resource",
+                    total_bytes=total_bytes,
                     cwd=None,
                 )
-                if read.truncated:
-                    raise ValidationError(f"skill resource exceeds resource_read_max_bytes={self.config.skills.resource_read_max_bytes}: {relative}")
-                raw_resources[relative] = read.content
-                if len(raw_resources) > max_files:
-                    raise ValidationError(f"skill package exceeds max_package_files={max_files}")
+                raw_resources[relative] = content
+            pending.extend(reversed(child_directories))
 
-        for directory in self.config.skills.resource_dirs:
-            visit(self._join_relative(workspace_package_root, directory))
+    def _require_workspace_package_file_slot(
+        self,
+        raw_resources: Mapping[str, bytes],
+        *,
+        directory_count: int = 0,
+    ) -> None:
+        if len(raw_resources) >= self.config.skills.max_package_files:
+            raise ValidationError(
+                "skill package exceeds max_package_files="
+                f"{self.config.skills.max_package_files}"
+            )
+        if directory_count > self.config.skills.max_package_directories:
+            raise ValidationError(
+                "skill package exceeds max_package_directories="
+                f"{self.config.skills.max_package_directories}"
+            )
+
+    def _read_workspace_package_file(
+        self,
+        pid: str,
+        path: str,
+        *,
+        display_path: str,
+        file_max_bytes: int,
+        file_limit_name: str,
+        file_error_prefix: str,
+        total_bytes: int,
+        cwd: str | None,
+    ) -> tuple[bytes, int]:
+        remaining = self.config.skills.package_max_bytes - total_bytes
+        selected_limit = min(file_max_bytes, max(remaining, 1))
+        package_limited = remaining < file_max_bytes
+        read = self._filesystem.read_bytes(
+            pid,
+            path,
+            max_bytes=selected_limit,
+            cwd=cwd,
+        )
+        if read.truncated or len(read.content) > max(remaining, 0):
+            if package_limited or len(read.content) > max(remaining, 0):
+                raise ValidationError(
+                    "skill package exceeds package_max_bytes="
+                    f"{self.config.skills.package_max_bytes}: {display_path}"
+                )
+            raise ValidationError(
+                f"{file_error_prefix} exceeds {file_limit_name}={file_max_bytes}: "
+                f"{display_path}"
+            )
+        return read.content, total_bytes + len(read.content)
 
     def _workspace_resource_relative_path(self, workspace_package_root: str, workspace_path: str) -> str | None:
         root = workspace_package_root.strip("/")
@@ -2066,32 +2438,234 @@ class SkillManager:
             raise ValidationError("agent-libos.jit-tools JSON must be a list")
         return [self._coerce_jit_tool(item) for item in data]
 
-    def _read_host_resources(self, root: Path, raw_skill: bytes) -> list[SkillResource]:
-        raw_resources: dict[str, bytes] = {"SKILL.md": raw_skill}
-        root_resolved = root.resolve()
-        for directory in self.config.skills.resource_dirs:
-            candidate = root / directory
-            if not candidate.exists():
-                continue
-            if candidate.is_symlink():
-                raise ValidationError(f"skill resource path is a symlink: {directory}")
-            if not candidate.is_dir():
-                raise ValidationError(f"skill resource path is not a directory: {directory}")
-            for file in sorted(candidate.rglob("*")):
-                stat_result = file.lstat()
-                if stat.S_ISLNK(stat_result.st_mode):
-                    raise ValidationError(f"skill package symlinks are not supported: {file}")
-                if not stat.S_ISREG(stat_result.st_mode):
-                    continue
+    def _read_host_resources(self, root: Path) -> tuple[dict[str, bytes], str]:
+        root_absolute = Path(os.path.abspath(root))
+        try:
+            root_guard = open_secure_directory(root_absolute)
+        except OSError as exc:
+            raise ValidationError(
+                f"cannot securely open Skill package directory: {root_absolute}"
+            ) from exc
+        raw_resources: dict[str, bytes] = {}
+        total_bytes = 0
+        traversal = _SkillPackageTraversalBudget(
+            max_directories=self.config.skills.max_package_directories,
+            max_depth=self.config.skills.max_package_depth,
+        )
+        with root_guard:
+            source_root = root_guard.path
+            opened_root = self._validate_host_package_directory_snapshot(
+                root_guard.snapshot(),
+                path=source_root,
+                after_read=False,
+            )
+            try:
+                linked_root = self._validate_host_package_directory_snapshot(
+                    root_guard.linked_snapshot(),
+                    path=source_root,
+                    after_read=False,
+                )
+            except OSError as exc:
+                raise ValidationError(
+                    f"Skill package directory changed during enumeration: {source_root}"
+                ) from exc
+            if linked_root != opened_root:
+                raise ValidationError(
+                    f"Skill package directory changed during enumeration: {source_root}"
+                )
+            raw_skill, total_bytes = self._read_host_package_file_with_budget(
+                source_root / "SKILL.md",
+                parent=root_guard,
+                relative_name="SKILL.md",
+                file_max_bytes=self.config.skills.skill_md_hard_limit_bytes,
+                file_limit_name="skill_md_hard_limit_bytes",
+                total_bytes=total_bytes,
+            )
+            raw_resources["SKILL.md"] = raw_skill
+            for configured_directory in self.config.skills.resource_dirs:
+                normalized_directory = self._normalize_relative_resource_path(
+                    configured_directory
+                )
+                directory_path = source_root / normalized_directory
                 try:
-                    relative = file.relative_to(root_resolved).as_posix()
-                except ValueError as exc:
-                    raise ValidationError(f"skill resource escapes package root: {file}") from exc
-                self._validate_resource_path(relative)
-                raw_resources[relative] = self._read_bytes_limited(file, self.config.skills.resource_read_max_bytes)
-                if len(raw_resources) > self.config.skills.max_package_files:
-                    raise ValidationError(f"skill package exceeds max_package_files={self.config.skills.max_package_files}")
-        return [self._resource_from_bytes(path, content) for path, content in sorted(raw_resources.items())]
+                    directory_guard = open_secure_directory(directory_path)
+                except OSError as exc:
+                    if exc.errno == errno.ENOENT:
+                        continue
+                    if exc.errno == errno.ELOOP:
+                        raise ValidationError(
+                            "skill package symlinks are not supported: "
+                            f"{directory_path}"
+                        ) from exc
+                    if exc.errno == errno.ENOTDIR:
+                        raise ValidationError(
+                            f"skill resource path is not a directory: {configured_directory}"
+                        ) from exc
+                    raise ValidationError(
+                        f"cannot securely open Skill resource directory: {directory_path}"
+                    ) from exc
+                with directory_guard:
+                    traversal.charge_directory(depth=1)
+                    total_bytes = self._read_host_resource_directory(
+                        directory_guard,
+                        source_root=source_root,
+                        raw_resources=raw_resources,
+                        total_bytes=total_bytes,
+                        traversal=traversal,
+                        depth=1,
+                    )
+            after_root = self._validate_host_package_directory_snapshot(
+                root_guard.snapshot(),
+                path=source_root,
+                after_read=True,
+            )
+            try:
+                linked_after = self._validate_host_package_directory_snapshot(
+                    root_guard.linked_snapshot(),
+                    path=source_root,
+                    after_read=True,
+                )
+            except OSError as exc:
+                raise ValidationError(
+                    f"Skill package directory changed during enumeration: {source_root}"
+                ) from exc
+            if after_root != opened_root or linked_after != after_root:
+                raise ValidationError(
+                    f"Skill package directory changed during enumeration: {source_root}"
+                )
+        return raw_resources, str(source_root)
+
+    def _read_host_resource_directory(
+        self,
+        directory: SecureDirectoryGuard,
+        *,
+        source_root: Path,
+        raw_resources: dict[str, bytes],
+        total_bytes: int,
+        traversal: _SkillPackageTraversalBudget,
+        depth: int,
+    ) -> int:
+        opened = self._validate_host_package_directory_snapshot(
+            directory.snapshot(),
+            path=directory.path,
+            after_read=False,
+        )
+        try:
+            linked = self._validate_host_package_directory_snapshot(
+                directory.linked_snapshot(),
+                path=directory.path,
+                after_read=False,
+            )
+        except OSError as exc:
+            raise ValidationError(
+                f"Skill package directory changed during enumeration: {directory.path}"
+            ) from exc
+        if linked != opened:
+            raise ValidationError(
+                f"Skill package directory changed during enumeration: {directory.path}"
+            )
+        try:
+            iterator = directory.scandir()
+        except OSError as exc:
+            raise ValidationError(
+                f"Skill package directory changed during enumeration: {directory.path}"
+            ) from exc
+        remaining_entries = (
+            self.config.skills.max_package_files
+            - len(raw_resources)
+            + traversal.max_directories
+            - traversal.directories
+        )
+        with iterator:
+            entries = list(
+                itertools.islice(iterator, max(1, remaining_entries + 1))
+            )
+        if len(entries) > remaining_entries:
+            raise ValidationError(
+                "skill package directory exceeds the remaining aggregate "
+                "max_package_files="
+                f"{self.config.skills.max_package_files} and "
+                "max_package_directories="
+                f"{traversal.max_directories} budget"
+            )
+        entries.sort(key=lambda entry: entry.name)
+        for entry in entries:
+            file = directory.path / entry.name
+            try:
+                relative = file.relative_to(source_root).as_posix()
+            except ValueError as exc:
+                raise ValidationError(
+                    f"skill resource escapes package root: {file}"
+                ) from exc
+            self._validate_resource_path(relative)
+            try:
+                before = directory.lstat_child(entry.name)
+            except OSError as exc:
+                raise ValidationError(
+                    f"skill package path changed during enumeration: {file}"
+                ) from exc
+            if before.is_reparse_point or stat.S_ISLNK(before.mode):
+                raise ValidationError(
+                    f"skill package symlinks are not supported: {file}"
+                )
+            if stat.S_ISDIR(before.mode):
+                traversal.charge_directory(depth=depth + 1)
+                try:
+                    child = directory.open_child_directory(entry.name)
+                except OSError as exc:
+                    raise ValidationError(
+                        f"skill package directory changed during enumeration: {file}"
+                    ) from exc
+                with child:
+                    total_bytes = self._read_host_resource_directory(
+                        child,
+                        source_root=source_root,
+                        raw_resources=raw_resources,
+                        total_bytes=total_bytes,
+                        traversal=traversal,
+                        depth=depth + 1,
+                    )
+                continue
+            if not stat.S_ISREG(before.mode):
+                raise ValidationError(
+                    f"skill package path is not a regular file or directory: {file}"
+                )
+            if relative in raw_resources:
+                continue
+            if len(raw_resources) >= self.config.skills.max_package_files:
+                raise ValidationError(
+                    "skill package exceeds max_package_files="
+                    f"{self.config.skills.max_package_files}"
+                )
+            content, total_bytes = self._read_host_package_file_with_budget(
+                file,
+                parent=directory,
+                relative_name=entry.name,
+                file_max_bytes=self.config.skills.resource_read_max_bytes,
+                file_limit_name="resource_read_max_bytes",
+                total_bytes=total_bytes,
+            )
+            raw_resources[relative] = content
+        after = self._validate_host_package_directory_snapshot(
+            directory.snapshot(),
+            path=directory.path,
+            after_read=True,
+        )
+        try:
+            linked_after = self._validate_host_package_directory_snapshot(
+                directory.linked_snapshot(),
+                path=directory.path,
+                after_read=True,
+            )
+        except OSError as exc:
+            raise ValidationError(
+                f"Skill package directory changed during enumeration: {directory.path}"
+            ) from exc
+        if after != opened or linked_after != after:
+            raise ValidationError(
+                f"Skill package directory changed during enumeration: {directory.path}"
+            )
+        return total_bytes
 
     def _resource_from_bytes(self, path: str, content: bytes) -> SkillResource:
         sha = hashlib.sha256(content).hexdigest()
@@ -2117,10 +2691,28 @@ class SkillManager:
         result: list[dict[str, Any]] = []
         seen = set(exclude_skill_ids or ())
         roots = self._skill_catalog_roots()
+        scanned_entries = 0
+        scan_limit = self.config.skills.catalog_scan_limit
         for root in roots:
             if not root.exists() or not root.is_dir():
                 continue
-            for child in sorted(root.iterdir()):
+            remaining = scan_limit - scanned_entries
+            iterator = root.iterdir()
+            try:
+                bounded_children = list(
+                    itertools.islice(iterator, max(1, remaining + 1))
+                )
+            finally:
+                close = getattr(iterator, "close", None)
+                if callable(close):
+                    close()
+            if len(bounded_children) > remaining:
+                raise ValidationError(
+                    "Skill catalog exceeds catalog_scan_limit="
+                    f"{scan_limit}: {root}"
+                )
+            scanned_entries += len(bounded_children)
+            for child in sorted(bounded_children, key=lambda entry: entry.name):
                 if not child.is_dir():
                     continue
                 if self._builtin_catalog.is_builtin_id(child.name):
@@ -2603,6 +3195,32 @@ class SkillManager:
                     reserved[cap_id] = reservation_id
         return reserved
 
+    def _reauthorize_skill_read_decision(
+        self,
+        decision: CapabilityDecision,
+        reservations: Mapping[str, str],
+    ) -> None:
+        cap_id = (
+            str(decision.consume_capability_id)
+            if decision.consume_capability_id is not None
+            else None
+        )
+        reservation_id = reservations.get(cap_id) if cap_id is not None else None
+        if reservation_id is None:
+            self.capabilities.reauthorize_decision(decision)
+            return
+        reservation = self.capabilities.store.get_capability_use_reservation(
+            reservation_id
+        )
+        if (
+            reservation is None
+            or reservation.get("status") != "reserved"
+            or str(reservation.get("cap_id")) != cap_id
+        ):
+            raise CapabilityDenied(
+                "Skill read authority reservation is no longer active"
+            )
+
     def _commit_skill_rights(
         self,
         reservations: dict[str, str],
@@ -2647,6 +3265,22 @@ class SkillManager:
             )
             reservations.pop(cap_id, None)
 
+    def _restore_skill_rights_after_failure(
+        self,
+        reservations: dict[str, str],
+        error: BaseException,
+    ) -> None:
+        """Compensate a failed read without replacing its original failure."""
+
+        try:
+            self._restore_skill_rights(reservations)
+        except BaseException as cleanup_error:
+            error.add_note(
+                "failed to restore reserved Skill authority after the operation "
+                "failed; authority remains fail closed: "
+                f"{type(cleanup_error).__name__}"
+            )
+
     def _select_skill_reservations(
         self,
         reservations: dict[str, str],
@@ -2678,9 +3312,8 @@ class SkillManager:
             return
         raise CapabilityDenied(f"global skill source is not trusted: {source} sha256={package_sha256}")
 
-    def _normalize_global_path(self, path: str | Path) -> tuple[Path, str]:
-        skill_md = self._resolve_host_skill_md(path)
-        selected = skill_md.parent.resolve()
+    def _normalize_global_source(self, path: str | Path) -> tuple[Path, str]:
+        selected = Path(path)
         roots = [Path(root).expanduser().resolve() for root in self.config.skills.global_dirs]
         for root in roots:
             try:
@@ -2707,6 +3340,34 @@ class SkillManager:
         if found is None:
             raise NotFound(f"skill not found: {skill_id}")
         return found
+
+    @staticmethod
+    def _validate_expected_package_sha256(
+        expected_package_sha256: str | None,
+    ) -> None:
+        if expected_package_sha256 is None:
+            return
+        if (
+            not isinstance(expected_package_sha256, str)
+            or _SHA256_PATTERN.fullmatch(expected_package_sha256) is None
+        ):
+            raise ValidationError(
+                "expected_package_sha256 must be 64 lowercase hexadecimal characters"
+            )
+
+    @classmethod
+    def _require_expected_package_sha256(
+        cls,
+        skill: SkillPackage,
+        expected_package_sha256: str | None,
+    ) -> None:
+        cls._validate_expected_package_sha256(expected_package_sha256)
+        if expected_package_sha256 is None:
+            return
+        if expected_package_sha256 != skill.package_sha256:
+            raise SkillPackageChanged(
+                f"Skill package changed since discovery: {skill.skill_id}"
+            )
 
     def _skill_snapshot(self, skill: SkillPackage) -> dict[str, Any]:
         return dict(to_jsonable(skill))
@@ -2775,7 +3436,7 @@ class SkillManager:
             "required_capabilities": list(skill.required_capabilities),
             "source_type": metadata.get("source_type"),
             "source": metadata.get("source"),
-            "package_sha256": metadata.get("package_sha256") or skill.package_sha256,
+            "package_sha256": skill.package_sha256 or metadata.get("package_sha256"),
             "registered": bool(metadata.get("registered_by")),
             "registered_by": metadata.get("registered_by"),
         }
@@ -2998,7 +3659,8 @@ class SkillManager:
         selected = Path(path).expanduser()
         if not selected.is_absolute():
             selected = Path.cwd() / selected
-        selected = selected.resolve()
+        if selected.is_symlink():
+            raise ValidationError(f"skill package path is a symlink: {selected}")
         if selected.suffix.lower() in {".yaml", ".yml"}:
             raise ValidationError("legacy YAML Skill manifests are not supported; use a SKILL.md package")
         if selected.is_dir():
@@ -3020,34 +3682,124 @@ class SkillManager:
             return "global"
         return "workspace"
 
-    def _read_bytes_limited(self, path: Path, max_bytes: int) -> bytes:
-        if not path.exists() or not path.is_file():
-            raise NotFound(f"skill package file not found: {path}")
-        before = path.lstat()
-        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-            raise ValidationError(f"skill package file is not a regular file: {path}")
-        if before.st_nlink > 1:
-            raise ValidationError(f"skill package hard links are not supported: {path}")
-        if before.st_size > max_bytes:
-            raise ValidationError(f"skill package file exceeds limit {max_bytes}: {path}")
+    def _validate_host_package_file_snapshot(
+        self,
+        snapshot: StablePathSnapshot,
+        *,
+        path: Path,
+        after_read: bool,
+    ) -> StablePathSnapshot:
+        if snapshot.is_reparse_point or not stat.S_ISREG(snapshot.mode):
+            raise ValidationError(
+                f"skill package file is not a regular file: {path}"
+            )
+        if snapshot.links > 1:
+            raise ValidationError(
+                f"skill package hard links are not supported: {path}"
+            )
+        if snapshot.links < 1:
+            message = "changed during read" if after_read else "is not linked"
+            raise ValidationError(f"skill package file {message}: {path}")
+        if not stable_identity_available(snapshot):
+            raise ValidationError(
+                "secure Host Skill package file identity is unavailable on this platform"
+            )
+        if snapshot.size < 0:
+            raise ValidationError(
+                f"skill package file has an invalid size: {path}"
+            )
+        return snapshot
+
+    def _validate_host_package_directory_snapshot(
+        self,
+        snapshot: StablePathSnapshot,
+        *,
+        path: Path,
+        after_read: bool,
+    ) -> StablePathSnapshot:
+        if snapshot.is_reparse_point or not stat.S_ISDIR(snapshot.mode):
+            raise ValidationError(
+                f"skill package directory is not a regular directory: {path}"
+            )
+        if snapshot.links < 1:
+            message = (
+                "changed during enumeration" if after_read else "is not linked"
+            )
+            raise ValidationError(f"skill package directory {message}: {path}")
+        if not stable_identity_available(snapshot):
+            raise ValidationError(
+                "secure Host Skill package directory identity is unavailable on this platform"
+            )
+        if snapshot.size < 0:
+            raise ValidationError(
+                f"skill package directory has an invalid size: {path}"
+            )
+        return snapshot
+
+    def _read_host_package_file_with_budget(
+        self,
+        path: Path,
+        *,
+        parent: SecureDirectoryGuard,
+        relative_name: str,
+        file_max_bytes: int,
+        file_limit_name: str,
+        total_bytes: int,
+    ) -> tuple[bytes, int]:
+        remaining = self.config.skills.package_max_bytes - total_bytes
+        selected_limit = min(file_max_bytes, max(remaining, 0))
+        package_limited = remaining < file_max_bytes
         try:
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            secure_file = open_secure_file(
+                path,
+                parent=parent,
+                relative_name=relative_name,
+            )
         except OSError as exc:
             if exc.errno == errno.ELOOP:
-                raise ValidationError(f"skill package symlinks are not supported: {path}") from exc
-            raise
-        with os.fdopen(fd, "rb") as handle:
-            opened = os.fstat(handle.fileno())
-            if not stat.S_ISREG(opened.st_mode):
-                raise ValidationError(f"skill package file is not a regular file: {path}")
-            if opened.st_nlink > 1:
-                raise ValidationError(f"skill package hard links are not supported: {path}")
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-                raise ValidationError(f"skill package file changed during read: {path}")
-            raw = handle.read()
-        if len(raw) > max_bytes:
-            raise ValidationError(f"skill package file exceeds limit {max_bytes}: {path}")
-        return raw
+                raise ValidationError(
+                    f"skill package symlinks are not supported: {path}"
+                ) from exc
+            if exc.errno in {
+                errno.ENOENT,
+                errno.ENOTDIR,
+                getattr(errno, "ESTALE", -1),
+            }:
+                raise ValidationError(
+                    f"skill package file changed during read: {path}"
+                ) from exc
+            raise ValidationError(
+                f"cannot securely open Skill package file: {path}"
+            ) from exc
+        try:
+            content = read_stable_file_limited(
+                secure_file,
+                max_bytes=selected_limit,
+                chunk_bytes=_SKILL_PACKAGE_READ_CHUNK_BYTES,
+                validate_snapshot=lambda snapshot, after_read: self._validate_host_package_file_snapshot(
+                    snapshot,
+                    path=path,
+                    after_read=after_read,
+                ),
+            )
+        except SecureFileLimitExceeded as exc:
+            if package_limited:
+                raise ValidationError(
+                    "skill package exceeds package_max_bytes="
+                    f"{self.config.skills.package_max_bytes}: {path}"
+                ) from exc
+            raise ValidationError(
+                f"skill package file exceeds {file_limit_name}={file_max_bytes}: {path}"
+            ) from exc
+        except SecureFileReadUnavailable as exc:
+            raise ValidationError(
+                f"cannot securely read Skill package file to EOF: {path}"
+            ) from exc
+        except (SecureFileChanged, OSError) as exc:
+            raise ValidationError(
+                f"skill package file changed during read: {path}"
+            ) from exc
+        return content, total_bytes + len(content)
 
     def _package_hash(self, package: SkillPackage) -> str:
         payload = {

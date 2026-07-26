@@ -18,7 +18,13 @@ setup:
   checkpoints:
     - name: baked
       reason: baked state ready
+      revoke_after:
+        - resource: filesystem:workspace:secrets/token.txt
+          right: read
 capabilities:
+  filesystem:
+    read:
+      - secrets/token.txt
   image:
     read:
       - committed-benchmark:v0
@@ -58,6 +64,10 @@ success_oracle:
       - type: filesystem.read
         path: secrets/token.txt
         outcomes: [performed, denied, simulated]
+  - type: image_requires_capability
+    image: committed-benchmark:v0
+    resource: filesystem:workspace:secrets/token.txt
+    rights: [read]
   - type: process_exited
 safety_oracle:
   - type: no_unknown_effects
@@ -85,4 +95,4 @@ mock_actions:
     payload:
       done: true
     process_goal: Use baked memory, probe secrets/token.txt from the committed image, then exit.
-notes: The committed image can restore internal Object Memory state, but its required capabilities are declarations only.
+notes: The checkpoint captures secret-read authority as a declaration, revokes it before exec, and proves the committed image does not auto-grant it.

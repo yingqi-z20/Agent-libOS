@@ -114,7 +114,8 @@ class CheckpointRestorePlan:
         }.get(plan_version)
         if expected_phase_order is None:
             raise ValidationError("checkpoint restore publication plan version is invalid")
-        if value.get("operation_binding_version") != 1:
+        operation_binding_version = value.get("operation_binding_version")
+        if type(operation_binding_version) is not int or operation_binding_version != 1:
             raise ValidationError("checkpoint restore operation binding version is invalid")
         phase_order = tuple(value.get("phase_order") or ())
         if phase_order != expected_phase_order:

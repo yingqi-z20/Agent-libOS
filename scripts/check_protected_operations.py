@@ -512,52 +512,83 @@ class _CallGraph:
         self,
         protected: set[FunctionNode],
     ) -> dict[FunctionNode, set[str]]:
-        candidates: dict[FunctionNode, set[str]] = {}
-        for call in (
+        calls = tuple(
             node
-            for function in protected
+            for function in self.functions
             for node in ast.walk(function)
             if isinstance(node, ast.Call)
             and _nearest_owner(node, self.parents) is function
-            and isinstance(node.func, ast.Name)
-        ):
-            callback_name = call.func.id
-            container = _nearest_owner(call, self.parents)
-            while container is not None:
-                if callback_name in self._parameters(container):
-                    candidates.setdefault(container, set()).add(callback_name)
-                    break
-                container = _nearest_owner(
-                    self.parents.get(container, container),
-                    self.parents,
-                )
+        )
+        invocations: dict[tuple[FunctionNode, str], list[ast.Call]] = {}
+        for call in calls:
+            if not isinstance(call.func, ast.Name):
+                continue
+            parameter_owner = self._parameter_owner(
+                call.func.id,
+                _nearest_owner(call, self.parents),
+            )
+            if parameter_owner is not None:
+                invocations.setdefault(
+                    (parameter_owner, call.func.id),
+                    [],
+                ).append(call)
+
+        def can_forward(gateway: FunctionNode, parameter: str) -> bool:
+            direct = invocations.get((gateway, parameter), ())
+            return not any(
+                isinstance(node, ast.Name)
+                and node.id == parameter
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                for node in ast.walk(gateway)
+            ) and all(
+                _nearest_owner(invocation, self.parents) in protected
+                for invocation in direct
+            )
 
         safe: dict[FunctionNode, set[str]] = {}
-        for gateway, parameters in candidates.items():
-            for parameter in parameters:
-                invocations = [
-                    node
-                    for node in ast.walk(gateway)
-                    if isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == parameter
-                ]
-                reassigned = any(
-                    isinstance(node, ast.Name)
-                    and node.id == parameter
-                    and isinstance(node.ctx, (ast.Store, ast.Del))
-                    for node in ast.walk(gateway)
-                )
-                if (
-                    invocations
-                    and not reassigned
-                    and all(
-                        _nearest_owner(invocation, self.parents) in protected
-                        for invocation in invocations
-                    )
-                ):
-                    safe.setdefault(gateway, set()).add(parameter)
+        for (gateway, parameter), direct in invocations.items():
+            if direct and can_forward(gateway, parameter):
+                safe.setdefault(gateway, set()).add(parameter)
+
+        # A scoped wrapper may forward its callback parameter to another
+        # gateway instead of invoking it itself.  Propagate the safety contract
+        # only through a parameter already proven to run exclusively from a
+        # protected phase; any direct pre-phase invocation still blocks the
+        # outer parameter from becoming protected.
+        changed = True
+        while changed:
+            changed = False
+            for call in calls:
+                owner = _nearest_owner(call, self.parents)
+                callee = self.resolve(call.func, owner)
+                if callee is None:
+                    continue
+                for target_parameter in tuple(safe.get(callee, ())):
+                    callback = self._bound_callback(call, callee, target_parameter)
+                    if not isinstance(callback, ast.Name):
+                        continue
+                    gateway = self._parameter_owner(callback.id, owner)
+                    if gateway is None or callback.id in safe.get(gateway, set()):
+                        continue
+                    if can_forward(gateway, callback.id):
+                        safe.setdefault(gateway, set()).add(callback.id)
+                        changed = True
         return safe
+
+    def _parameter_owner(
+        self,
+        name: str,
+        owner: FunctionNode | None,
+    ) -> FunctionNode | None:
+        container = owner
+        while container is not None:
+            if name in self._parameters(container):
+                return container
+            container = _nearest_owner(
+                self.parents.get(container, container),
+                self.parents,
+            )
+        return None
 
     def _bound_callback(
         self,
@@ -603,10 +634,24 @@ def _provider_call_kind(
     *,
     owner: FunctionNode | None,
     provider_handle_names: dict[FunctionNode, set[str]],
+    provider_aliases: set[tuple[LifecycleScope, str]],
+    definitions: set[tuple[LifecycleScope, str]],
+    parents: dict[ast.AST, ast.AST],
 ) -> tuple[str, str] | None:
     path = _attribute_path(node.func)
     if len(path) == 3 and path[:2] == ("self", "provider"):
         return "provider method", path[2]
+    if (
+        len(path) == 2
+        and _is_visible_provider_alias(
+            path[0],
+            owner=owner,
+            aliases=provider_aliases,
+            definitions=definitions,
+            parents=parents,
+        )
+    ):
+        return "provider method", path[1]
     if (
         len(path) >= 3
         and path[-2] == "handle"
@@ -621,6 +666,73 @@ def _provider_call_kind(
     ):
         return "provider handle method", path[1]
     return None
+
+
+def _is_visible_provider_alias(
+    name: str,
+    *,
+    owner: LifecycleScope,
+    aliases: set[tuple[LifecycleScope, str]],
+    definitions: set[tuple[LifecycleScope, str]],
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    for scope in _scope_chain(owner, parents):
+        key = (scope, name)
+        if key in aliases:
+            return True
+        if key in definitions:
+            return False
+    return False
+
+
+def _provider_alias_bindings(
+    tree: ast.AST,
+    *,
+    parents: dict[ast.AST, ast.AST],
+    definitions: set[tuple[LifecycleScope, str]],
+) -> set[tuple[LifecycleScope, str]]:
+    assignments: list[tuple[LifecycleScope, tuple[str, ...], ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = tuple(
+                name
+                for target in node.targets
+                for name in _bound_target_names(target)
+            )
+            assignments.append((_nearest_owner(node, parents), targets, node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignments.append(
+                (
+                    _nearest_owner(node, parents),
+                    _bound_target_names(node.target),
+                    node.value,
+                )
+            )
+
+    aliases: set[tuple[LifecycleScope, str]] = set()
+    changed = True
+    while changed:
+        changed = False
+        for owner, targets, value in assignments:
+            path = _attribute_path(value)
+            source_is_provider = path == ("self", "provider") or (
+                isinstance(value, ast.Name)
+                and _is_visible_provider_alias(
+                    value.id,
+                    owner=owner,
+                    aliases=aliases,
+                    definitions=definitions,
+                    parents=parents,
+                )
+            )
+            if not source_is_provider:
+                continue
+            for name in targets:
+                binding = (owner, name)
+                if binding not in aliases:
+                    aliases.add(binding)
+                    changed = True
+    return aliases
 
 
 def _provider_handle_names(
@@ -793,6 +905,11 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
         if _has_leading_recovery_cleanup_guard(function)
     }
     provider_handle_names = _provider_handle_names(tree, parents)
+    provider_aliases = _provider_alias_bindings(
+        tree,
+        parents=parents,
+        definitions=lifecycle_definitions,
+    )
     direct_provider_functions: set[FunctionNode] = set()
     provider_calls: list[tuple[ast.Call, FunctionNode | None, str, str]] = []
     for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
@@ -801,6 +918,9 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
             call,
             owner=owner,
             provider_handle_names=provider_handle_names,
+            provider_aliases=provider_aliases,
+            definitions=lifecycle_definitions,
+            parents=parents,
         )
         if provider_call is None:
             continue

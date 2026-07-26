@@ -21,6 +21,10 @@ from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSou
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.storage import ExtensionRepository, RuntimeModuleRepositoryProtocol
 from agent_libos.utils.ids import utc_now
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope_for_type,
+)
 
 class RuntimeModuleRegistry:
     """Transactional startup module registration and rollback coordinator."""
@@ -146,10 +150,10 @@ class RuntimeModuleRegistry:
         path = Path(manifest_path).expanduser()
         if not path.is_absolute():
             path = get_project_root() / path
-        return path.resolve()
+        return path.absolute()
 
     def _resolve_explicit_manifest_path(self, manifest_path: str | Path) -> Path:
-        return Path(manifest_path).expanduser().resolve()
+        return Path(manifest_path).expanduser().absolute()
 
     def load_module_manifest(
         self,
@@ -189,9 +193,15 @@ class RuntimeModuleRegistry:
             import_cleanup = loader.import_cleanup_for_entrypoint(entrypoint)
             return self._load_from_entrypoint(source, entrypoint, enforce_provides=True, import_cleanup=import_cleanup)
         except Exception as exc:
-            self._record_failed_manifest(manifest_path, exc)
+            failure = self._record_failed_manifest(manifest_path, exc)
             if self.config.modules.load_policy == "warn":
-                return {"status": "failed", "manifest_path": str(manifest_path), "error": str(exc)}
+                return {
+                    "status": "failed",
+                    "manifest_path": str(manifest_path),
+                    "error": failure["message"],
+                    "error_type": failure["error_type"],
+                    "correlation_id": failure["correlation_id"],
+                }
             raise
 
     def verify_manifest(
@@ -272,7 +282,7 @@ class RuntimeModuleRegistry:
                 for module_id, hook_name, hook in list(self._startup_hooks):
                     failed_hook = (module_id, hook_name)
                     self._run_module_hook(module_id, hook_name, hook, kind="startup")
-        except Exception as exc:
+        except BaseException as exc:
             if failed_hook is not None:
                 module_id, hook_name = failed_hook
                 self._rollback_external_modules_after_hook_failure(module_id, exc, hook_name=hook_name)
@@ -432,6 +442,7 @@ class RuntimeModuleRegistry:
         )
 
     def _preflight_context(self, ctx: ModuleContext) -> None:
+        ctx.validate_registration_buffers()
         pending_tools = set(ctx.registered_tool_names)
         for tool_name in pending_tools:
             try:
@@ -459,13 +470,19 @@ class RuntimeModuleRegistry:
                 raise ValidationError(f"module syscall already exists or is built-in: {syscall}")
 
     def _apply_context(self, ctx: ModuleContext, journal: RegistrationJournal) -> None:
-        for tool in ctx.tools:
+        ctx.validate_registration_buffers()
+        for expected_name, tool in ctx.registered_tools:
             handle = self._tools.register_tool(tool, registered_by=ctx.actor, scope=f"module:{ctx.module_id}")
             journal.record(
                 kind="tool",
                 target=handle.name,
                 undo=lambda handle=handle: self._unregister_tool(handle, actor=ctx.actor),
             )
+            if handle.name != expected_name:
+                raise ValidationError(
+                    "module tool name changed after registration: "
+                    f"expected {expected_name}, got {handle.name}"
+                )
             self._audit.record(
                 actor=ctx.actor,
                 action="module.register_tool",
@@ -473,17 +490,37 @@ class RuntimeModuleRegistry:
                 decision={"module_id": ctx.module_id, "tool": handle.name},
             )
         for image in ctx.images:
-            result = self._image_registry.register(image, actor=ctx.actor, replace=False, require_capability=False)
-            journal.record(
-                kind="image",
-                target=result.image.image_id,
-                undo=lambda image=result.image: self._unregister_image(image, actor=ctx.actor),
-            )
+            result = self._image_registry.register_module_image(image, actor=ctx.actor)
+            if result.disposition == "created":
+                journal.record(
+                    kind="image",
+                    target=result.image.image_id,
+                    undo=lambda image=result.image: self._unregister_image(image, actor=ctx.actor),
+                )
+            elif result.disposition == "rehydrated":
+                journal.record(
+                    kind="image_cache",
+                    target=result.image.image_id,
+                    undo=lambda image=result.image: self._discard_rehydrated_image(image),
+                )
+            else:
+                raise ValidationError(
+                    "module image registration returned an invalid disposition: "
+                    f"{result.disposition}"
+                )
             self._audit.record(
                 actor=ctx.actor,
-                action="module.register_image",
+                action=(
+                    "module.rehydrate_image"
+                    if result.disposition == "rehydrated"
+                    else "module.register_image"
+                ),
                 target=f"image:{result.image.image_id}",
-                decision={"module_id": ctx.module_id, "image_id": result.image.image_id},
+                decision={
+                    "module_id": ctx.module_id,
+                    "image_id": result.image.image_id,
+                    "disposition": result.disposition,
+                },
             )
         for name, handler in ctx.syscalls.items():
             registered = self._syscalls.register(name, handler, registered_by=ctx.actor)
@@ -555,6 +592,7 @@ class RuntimeModuleRegistry:
             )
 
     def _run_context_hooks(self, ctx: ModuleContext) -> None:
+        ctx.validate_registration_buffers()
         for kind, hooks in ctx.provider_hooks.items():
             for index, hook in enumerate(hooks):
                 self._run_module_hook(ctx.module_id, f"{kind}:{index}", hook, kind="provider")
@@ -582,7 +620,7 @@ class RuntimeModuleRegistry:
             decision={"hook": hook_name},
         )
 
-    def _rollback_external_modules_after_hook_failure(self, failed_module_id: str, exc: Exception, *, hook_name: str) -> None:
+    def _rollback_external_modules_after_hook_failure(self, failed_module_id: str, exc: BaseException, *, hook_name: str) -> None:
         module_ids = [
             module_id
             for module_id in reversed(list(self._applied_contexts))
@@ -642,7 +680,17 @@ class RuntimeModuleRegistry:
         actor = f"module:{module_id}"
         source = self._applied_sources.get(module_id)
         ctx = self._applied_contexts.get(module_id)
+        journal = self._registration_journals.get(module_id)
         registered = ctx.registered_summary() if ctx is not None else {}
+        created_image_ids = (
+            set(journal.recorded_targets("image"))
+            if journal is not None
+            else set()
+        )
+        failure, observation = self._failure_evidence(
+            rollback_exc,
+            code="module_rollback_recovery_failed",
+        )
         with self._module_publications.transaction(include_object_payloads=True):
             for row in self._extensions.list_tools():
                 if row.get("registered_by") == actor:
@@ -651,7 +699,10 @@ class RuntimeModuleRegistry:
                         registered_by=actor,
                     )
             for image, metadata in self._extensions.list_images():
-                if metadata.get("registered_by") == actor:
+                if (
+                    image.image_id in created_image_ids
+                    and metadata.get("registered_by") == actor
+                ):
                     self._extensions.delete_image(
                         image.image_id,
                         registered_by=actor,
@@ -672,11 +723,12 @@ class RuntimeModuleRegistry:
                         registered=RuntimeModuleRegistration.from_mapping(
                             registered
                         ),
-                        error=(
-                            "durable rollback recovery after "
-                            f"{type(rollback_exc).__name__}: {rollback_exc}"
+                        error=failure["message"],
+                        metadata=self._metadata_with_failure(
+                            source.manifest.metadata,
+                            failure,
+                            observation,
                         ),
-                        metadata=source.manifest.metadata,
                     )
                 )
 
@@ -689,8 +741,11 @@ class RuntimeModuleRegistry:
                 action="module.rollback_recovered",
                 target=f"module:{module_id}",
                 decision={
-                    "error": str(rollback_exc),
-                    "error_type": type(rollback_exc).__name__,
+                    "error": failure["message"],
+                    "error_type": failure["error_type"],
+                    "error_code": failure["code"],
+                    "correlation_id": failure["correlation_id"],
+                    "error_observation": observation,
                     "registered": registered,
                 },
             )
@@ -719,6 +774,12 @@ class RuntimeModuleRegistry:
         if registered_by == actor:
             self._extensions.delete_image(image.image_id, registered_by=actor)
 
+    def _discard_rehydrated_image(self, image: Any) -> None:
+        """Undo cache-only module replay without touching its durable row."""
+
+        if self._images.get(image.image_id) == image:
+            self._images.pop(image.image_id, None)
+
     def _unregister_context_provider_hook(
         self,
         kind: str,
@@ -744,9 +805,17 @@ class RuntimeModuleRegistry:
     def _is_internal_module(self, module_id: str) -> bool:
         return module_id == "agent-libos-core:v0"
 
-    def _record_failed_manifest(self, manifest_path: str | Path, exc: Exception) -> None:
+    def _record_failed_manifest(
+        self,
+        manifest_path: str | Path,
+        exc: BaseException,
+    ) -> dict[str, str]:
         path = str(manifest_path)
         module_id = f"failed:{Path(path).name}"
+        failure, observation = self._failure_evidence(
+            exc,
+            code="module_load_failed",
+        )
         try:
             verification = ModuleLoader(self.config).verify(manifest_path)
             module_id = verification["module_id"]
@@ -765,6 +834,11 @@ class RuntimeModuleRegistry:
             source_path = ""
             source_sha256 = ""
             metadata = {}
+        metadata = self._metadata_with_failure(
+            metadata,
+            failure,
+            observation,
+        )
         if module_id in self._loaded_modules:
             self._audit.record(
                 actor="runtime",
@@ -772,12 +846,15 @@ class RuntimeModuleRegistry:
                 target=f"module:{module_id}",
                 decision={
                     "manifest_path": path,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
+                    "error": failure["message"],
+                    "error_type": failure["error_type"],
+                    "error_code": failure["code"],
+                    "correlation_id": failure["correlation_id"],
+                    "error_observation": observation,
                     "preserved_loaded": True,
                 },
             )
-            return
+            return failure
         self._module_publications.upsert_runtime_module(
             RuntimeModule(
                 module_id=module_id,
@@ -791,7 +868,7 @@ class RuntimeModuleRegistry:
                 status=RuntimeModuleStatus.FAILED,
                 loaded_at=None,
                 registered=RuntimeModuleRegistration(),
-                error=str(exc),
+                error=failure["message"],
                 metadata=metadata,
             )
         )
@@ -799,16 +876,28 @@ class RuntimeModuleRegistry:
             actor="runtime",
             action="module.load_failed",
             target=f"module:{module_id}",
-            decision={"manifest_path": path, "error": str(exc), "error_type": type(exc).__name__},
+            decision={
+                "manifest_path": path,
+                "error": failure["message"],
+                "error_type": failure["error_type"],
+                "error_code": failure["code"],
+                "correlation_id": failure["correlation_id"],
+                "error_observation": observation,
+            },
         )
+        return failure
 
     def _record_failed_source(
         self,
         source: ModuleSource,
-        exc: Exception,
+        exc: BaseException,
         *,
         registered: dict[str, Any] | None = None,
     ) -> None:
+        failure, observation = self._failure_evidence(
+            exc,
+            code="module_load_failed",
+        )
         self._module_publications.upsert_runtime_module(
             RuntimeModule(
                 module_id=source.manifest.module_id,
@@ -824,8 +913,12 @@ class RuntimeModuleRegistry:
                 registered=RuntimeModuleRegistration.from_mapping(
                     registered or {}
                 ),
-                error=str(exc),
-                metadata=source.manifest.metadata,
+                error=failure["message"],
+                metadata=self._metadata_with_failure(
+                    source.manifest.metadata,
+                    failure,
+                    observation,
+                ),
             )
         )
         self._audit.record(
@@ -834,7 +927,44 @@ class RuntimeModuleRegistry:
             target=f"module:{source.manifest.module_id}",
             decision={
                 "manifest_path": source.manifest_path,
-                "error": str(exc),
-                "error_type": type(exc).__name__,
+                "error": failure["message"],
+                "error_type": failure["error_type"],
+                "error_code": failure["code"],
+                "correlation_id": failure["correlation_id"],
+                "error_observation": observation,
             },
         )
+
+    @staticmethod
+    def _failure_evidence(
+        exc: BaseException,
+        *,
+        code: str,
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        # Module code can construct ProviderHostError itself, so this boundary
+        # must not trust exception-supplied code/type/correlation fields.
+        failure = public_error_envelope_for_type(
+            type(exc).__name__,
+            code=code,
+        )
+        observation = internal_exception_observation(
+            exc,
+            correlation_id=failure["correlation_id"],
+        )
+        return failure, observation
+
+    @staticmethod
+    def _metadata_with_failure(
+        metadata: dict[str, Any] | Any,
+        failure: dict[str, str],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            **dict(metadata),
+            "failure": {
+                "code": failure["code"],
+                "error_type": failure["error_type"],
+                "correlation_id": failure["correlation_id"],
+                "observation": observation,
+            },
+        }

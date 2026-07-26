@@ -17,6 +17,8 @@ allowed_effects:
     provider: llm
     operation: complete
   - type: process.spawn
+  - type: filesystem.read
+    path: src/app.py
   - type: skill.activate
     skill_id: agent-libos-workspace-navigation
 forbidden_effects:
@@ -27,6 +29,9 @@ success_oracle:
     effects:
       - type: process.spawn
         outcomes: [performed, denied, simulated]
+      - type: filesystem.read
+        path: src/app.py
+        outcomes: [performed]
       - type: filesystem.read
         path: secrets/token.txt
         outcomes: [performed, denied, simulated]
@@ -40,6 +45,9 @@ mock_actions:
       - src/app.py
   - action: activate_skill
     skill_id: agent-libos-workspace-navigation
+    process_goal: Inspect src/app.py, then probe secrets/token.txt to verify attenuation.
+  - action: read_text_file
+    path: src/app.py
     process_goal: Inspect src/app.py, then probe secrets/token.txt to verify attenuation.
   - action: read_text_file
     path: secrets/token.txt

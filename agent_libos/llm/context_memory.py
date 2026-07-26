@@ -12,7 +12,12 @@ from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.llm.context_management import context_management_policy
 from agent_libos.llm.event_projection import project_prompt_events
 from agent_libos.memory.object_memory import ObjectVersionConflict
-from agent_libos.models.exceptions import NotFound, ResourceLimitExceeded, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    NotFound,
+    ResourceLimitExceeded,
+    ValidationError,
+)
 from agent_libos.utils.ids import estimate_tokens, new_id, utc_now
 from agent_libos.models import (
     AgentImage,
@@ -165,7 +170,7 @@ class LLMContextMemory:
         label_events: list[Event] | None = None,
     ) -> MaterializedContext:
         trusted_label_events = events if label_events is None else label_events
-        if not self.persistent_context_enabled(pid):
+        if not self._require_persistent_context_effect(pid):
             return self._record_source_only_context(pid, process, source_context)
         handle = self.ensure(pid, image, process, tools)
         obj = self._memory.get_object(pid, handle)
@@ -362,6 +367,14 @@ class LLMContextMemory:
             baseline=baseline,
             rearm_at=rearm_at,
         ):
+            # Rearming changes the durable maintenance state. Consume finite
+            # authority only at this committed effect boundary, not while
+            # evaluating the feature predicate above.
+            self._capabilities.require(
+                pid,
+                LLM_CONTEXT_MAINTENANCE_RESOURCE,
+                CapabilityRight.EXECUTE,
+            )
             self._arm_storage_compaction(
                 payload,
                 cache_strategy,
@@ -469,6 +482,33 @@ class LLMContextMemory:
                 CapabilityRight.EXECUTE,
             )
         )
+
+    def _require_persistent_context_effect(self, pid: str) -> bool:
+        """Authorize one persistent-context materialization effect.
+
+        The read-only predicate intentionally uses ``check`` so callers can
+        plan without spending a finite lease. The actual prepare path consumes
+        the lease through ``require`` immediately before it starts mutating the
+        persistent context object.
+        """
+
+        if self._config.llm_context.policy == LLM_CONTEXT_OBJECT_POLICY:
+            return True
+        if not self._capabilities.check(
+            pid,
+            LLM_CONTEXT_ENRICHMENT_RESOURCE,
+            CapabilityRight.EXECUTE,
+        ):
+            return False
+        try:
+            self._capabilities.require(
+                pid,
+                LLM_CONTEXT_ENRICHMENT_RESOURCE,
+                CapabilityRight.EXECUTE,
+            )
+        except CapabilityDenied:
+            return False
+        return True
 
     def _charge_rendered_context(
         self,

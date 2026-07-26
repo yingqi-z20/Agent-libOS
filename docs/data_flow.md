@@ -493,10 +493,13 @@ descendant bindings on success. Non-recursive directory delete similarly
 captures the target binding ID/generation and tombstones it with a storage-level
 compare-and-swap, so a binding created after provider dispatch is preserved.
 Later out-of-band modification does not silently lower the known path label.
-Directory listing snapshots the directory and child bindings before provider
-enumeration, rejects a changed subtree fingerprint, and labels returned
-(including truncation-lookahead) names from the captured snapshot rather than a
-newer lower binding. Runtime file writes and directory creation share the same
+Directory listing acquires the label-publication path lock, starts a directory
+label watcher, and snapshots the directory's base binding before provider
+enumeration. After the provider returns at most the requested entries plus one
+truncation-lookahead entry, the runtime snapshots the exact returned child paths
+and aggregates their labels. Before publishing the result it rechecks the
+watcher, the base-binding version, and that exact child snapshot; any change
+fails closed. Runtime file writes and directory creation share the same
 label-publication critical section with listing, so a newly visible child cannot
 be returned before its conservative path binding is durable. That section is a
 fair hierarchical path lock rather than one workspace-global mutex: unrelated

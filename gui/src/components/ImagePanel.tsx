@@ -1,7 +1,8 @@
-import { Download, Eye, Save } from "lucide-react";
-import { useState } from "react";
+import { Download, Eye, LoaderCircle, Save } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import type { ImageInspectResult, ImageSummary, RuntimeProcess } from "../api/types";
 import { useI18n } from "../i18n";
+import { RequestEpoch } from "../requestEpoch";
 import { CollapsibleJson } from "./CollapsibleJson";
 
 type ImageCommitRequest = {
@@ -43,16 +44,27 @@ export function ImagePanel({
   const [version, setVersion] = useState("v0");
   const [inspected, setInspected] = useState<ImageInspectResult | null>(null);
   const [inspectError, setInspectError] = useState<string | null>(null);
+  const [inspectingId, setInspectingId] = useState<string | null>(null);
+  const inspectRequests = useRef(new RequestEpoch());
+
+  useEffect(() => () => inspectRequests.current.invalidate(), []);
 
   const commitDisabled = !selectedProcess || !imageId.trim() || !name.trim() || !version.trim();
 
   async function inspect(image: ImageSummary) {
     if (!onInspectImage) return;
+    const request = inspectRequests.current.begin();
     setInspectError(null);
+    setInspectingId(image.image_id);
     try {
-      setInspected(await onInspectImage(image.image_id));
+      const result = await onInspectImage(image.image_id);
+      if (inspectRequests.current.isCurrent(request)) setInspected(result);
     } catch (error) {
-      setInspectError(error instanceof Error ? error.message : String(error));
+      if (inspectRequests.current.isCurrent(request)) {
+        setInspectError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (inspectRequests.current.isCurrent(request)) setInspectingId(null);
     }
   }
 
@@ -104,9 +116,21 @@ export function ImagePanel({
               {t("image.requiredModules", { count: image.required_modules_count })}
             </span>
             <div className="imageRowActions">
-              {onUseForSpawn ? <button onClick={() => onUseForSpawn(image.image_id)}>{t("image.useForSpawn")}</button> : null}
-              {onUseForExec ? <button onClick={() => onUseForExec(image.image_id)}>{t("image.useForExec")}</button> : null}
-              {onInspectImage ? <button onClick={() => void inspect(image)}><Eye size={14} />{t("image.inspect")}</button> : null}
+              {onUseForSpawn ? <button aria-label={`${t("image.useForSpawn")}: ${image.image_id}`} onClick={() => onUseForSpawn(image.image_id)}>{t("image.useForSpawn")}</button> : null}
+              {onUseForExec ? <button aria-label={`${t("image.useForExec")}: ${image.image_id}`} onClick={() => onUseForExec(image.image_id)}>{t("image.useForExec")}</button> : null}
+              {onInspectImage ? (
+                <button
+                  aria-label={`${t("image.inspect")}: ${image.image_id}`}
+                  aria-busy={inspectingId === image.image_id || undefined}
+                  disabled={inspectingId !== null}
+                  onClick={() => void inspect(image)}
+                >
+                  {inspectingId === image.image_id
+                    ? <LoaderCircle className="spin" size={14} aria-hidden="true" />
+                    : <Eye size={14} aria-hidden="true" />}
+                  {inspectingId === image.image_id ? t("user.working") : t("image.inspect")}
+                </button>
+              ) : null}
             </div>
           </article>
         ))}

@@ -420,12 +420,17 @@ A persistent target is owned by one writable Runtime at a time.
   where `getuid` is available it also requires current-user ownership. An
   existing database symlink is first resolved to its canonical target, so an
   alias shares the same lease identity. When both `fcntl.flock` and
-  `O_NOFOLLOW` are available, the Runtime holds a non-blocking lock over a
-  separately hardened sidecar. Where that lease
+  `O_NOFOLLOW` are available, the Runtime holds both a non-blocking lock over a
+  separately hardened path sidecar and an owner-only private identity lease
+  keyed by the validated database `(st_dev, st_ino)`. The database, path lease,
+  identity lease, and SQLite sidecars must be regular, current-user-owned,
+  single-link files. The database path is rechecked against its opened identity
+  before use, so hard links, replaced lockfiles, rename-plus-symlink retargets,
+  and alternate paths to an already leased inode fail closed. Where that lease
   mechanism is unavailable—including the Windows fallback—it uses SQLite
   exclusive locking. The fallback provides the single-writer lease but does
-  not claim the POSIX ownership, mode, or no-follow hardening guarantees when
-  those operating-system primitives are absent.
+  not claim the unavailable POSIX path/inode, ownership, mode, no-follow, or
+  single-link guarantees.
 - PostgreSQL uses a session advisory lock derived from the database/schema
   identity. Session close is the single ownership-release point; close never
   attempts a separate explicit advisory unlock. Cleanup failures are reported

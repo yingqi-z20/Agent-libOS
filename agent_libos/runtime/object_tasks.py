@@ -55,6 +55,10 @@ from agent_libos.runtime.object_task_state import (
 )
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 
 if TYPE_CHECKING:
     from agent_libos.capability.manager import CapabilityManager
@@ -81,6 +85,12 @@ class _PendingNotifyResultGrant:
     result_oid: str
     reservation_id: str | None
     used_by: str
+
+
+@dataclass(slots=True)
+class _TaskResultSettlement:
+    result_oid: str | None = None
+    pending_notify_grant: _PendingNotifyResultGrant | None = None
 
 
 class _NotifyResultGrantPublicationFailed(RuntimeError):
@@ -180,6 +190,8 @@ class ObjectTaskManager:
             thread_name_prefix="agent-libos-object-task-tool",
         )
         self._loop_ready = threading.Event()
+        self._worker_cleanup_started = threading.Event()
+        self._worker_shutdown_complete = threading.Event()
         self._thread = threading.Thread(
             target=self._run_loop,
             name="agent-libos-object-tasks",
@@ -195,6 +207,7 @@ class ObjectTaskManager:
         self._pending_args: dict[str, dict[str, Any]] = {}
         self._closing = False
         self._closed = False
+        self._worker_failure: str | None = None
         self.__lifecycle_shutdown_capability = object()
         self._recovered = False
         self._recovery_summary = ObjectTaskRecoverySummary()
@@ -271,12 +284,18 @@ class ObjectTaskManager:
                     )
                     if updated is None:
                         continue
+                    updated = self._notifications.begin_phase(updated)
+                    self._records.update_object_task(updated)
                     if updated.runner_pid is not None:
                         self._state.terminalize_runner(
                             str(updated.runner_pid),
                             reason="object task abandoned after runtime reopen",
                         )
                     self._state.cleanup_owner_pin_after_terminal(updated)
+                updated = self._notifications.notify_terminal(
+                    updated,
+                    phase="abandoned",
+                )
                 total += 1
                 self._append_recovery_sample(sample, updated.task_id, page_size)
             cursor = page.next_cursor
@@ -327,15 +346,24 @@ class ObjectTaskManager:
             "previous_result_oid": result_oid,
             "previous_error": task.error,
         }
-        return self._records.mark_object_task_result_unavailable_after_reopen(
-            task.task_id,
-            expected_result_oid=result_oid,
-            wait=wait,
-            error=(
-                "result unavailable after runtime reopen: runtime-only Object "
-                "payload was not reconstructable"
-            ),
-            updated_at=now,
+        with self._records.transaction():
+            updated = self._records.mark_object_task_result_unavailable_after_reopen(
+                task.task_id,
+                expected_result_oid=result_oid,
+                wait=wait,
+                error=(
+                    "result unavailable after runtime reopen: runtime-only Object "
+                    "payload was not reconstructable"
+                ),
+                updated_at=now,
+            )
+            if updated is None:
+                return None
+            updated = self._notifications.begin_phase(updated)
+            self._records.update_object_task(updated)
+        return self._notifications.notify_terminal(
+            updated,
+            phase="result_unavailable_after_reopen",
         )
 
     def _retry_notifications(self, page_size: int) -> tuple[int, list[str]]:
@@ -418,6 +446,10 @@ class ObjectTaskManager:
         owner_watch: bool | dict[str, Any] | ObjectTaskOwnerWatch | None = None,
     ) -> ObjectTask:
         self._ensure_open()
+        if type(grant_result_to_notify) is not bool:
+            raise ValidationError(
+                "object task grant_result_to_notify must be a boolean"
+            )
         tool_name = str(tool).strip()
         if not tool_name:
             raise ValidationError("object task tool name is required")
@@ -425,6 +457,9 @@ class ObjectTaskManager:
         selected_kind = self._message_kind(notify_kind, "object task notify_kind")
         selected_notify_pid = notify_pid or pid
         selected_owner_watch = self._normalize_owner_watch(owner_watch)
+        selected_notify_channel = self._messages.normalize_channel(
+            notify_channel or self.config.object_tasks.notification_channel
+        )
         self._require_related_notification_target(pid, selected_notify_pid)
         owner_rights = {
             ObjectRight.READ.value,
@@ -438,13 +473,23 @@ class ObjectTaskManager:
         if not self._tools.process_has_tool(pid, handle):
             raise ValidationError(f"tool is not in process tool table: {tool_name}")
         self._require_concurrency_capacity(owner.oid)
-        self._capabilities.require(pid, "process:spawn", CapabilityRight.WRITE)
+        spawn_decision = self._capabilities.require(
+            pid,
+            "process:spawn",
+            CapabilityRight.WRITE,
+            consume=False,
+        )
 
         task_id = new_id("otask")
         owner_reservations = self._reserve_owner_decisions(
             pid,
             owner,
             owner_rights,
+        )
+        spawn_reservation = self._capabilities.reserve_decision_use(
+            spawn_decision,
+            used_by=f"object_task:{task_id}",
+            reason="one-time object task spawn permission reserved",
         )
         runner_pid: str | None = None
         task_inserted = False
@@ -456,7 +501,8 @@ class ObjectTaskManager:
                 initial_status=ProcessStatus.WAITING_TOOL,
                 initial_wait_state=ToolProcessWait(operation_id=task_id),
             )
-            self._bootstrap_runner(runner_pid, handle, owner.oid, task_id)
+            with self._memory.ownership_locked():
+                self._bootstrap_runner(runner_pid, handle, owner.oid, task_id)
 
             now = utc_now()
             task = ObjectTask(
@@ -470,18 +516,25 @@ class ObjectTaskManager:
                 notification=ObjectTaskNotification(
                     recipient_pid=selected_notify_pid,
                     kind=selected_kind.value,
-                    channel=notify_channel or self.config.object_tasks.notification_channel,
+                    channel=selected_notify_channel,
                 ),
                 owner_watch=selected_owner_watch,
                 created_at=now,
                 updated_at=now,
             )
-            with self._records.transaction():
+            # Ownership changes are excluded while the final Store transaction
+            # checks for a newly committed restrictive policy and settles the
+            # exact finite-use reservations. A reserved ALLOW remains the grant
+            # authority; a later independent DENY/ASK still fails publication.
+            with self._memory.ownership_locked(), self._records.transaction():
                 if self._objects.get_object(owner.oid) is None:
                     raise NotFound(f"object not found: {owner.oid}")
                 self._require_concurrency_capacity(owner.oid)
-                if not owner_reservations:
-                    self._assert_owner_rights(pid, owner, owner_rights)
+                self._assert_no_restrictive_owner_policy(
+                    pid,
+                    owner,
+                    owner_rights,
+                )
                 self._records.insert_object_task(task)
                 self._operations.link_evidence(
                     "object_task",
@@ -490,12 +543,17 @@ class ObjectTaskManager:
                     metadata={"owner_oid": task.owner_oid, "status": task.status.value},
                 )
                 self._commit_owner_decisions(owner_reservations)
+                self._commit_spawn_decision(spawn_reservation, task_id=task_id)
                 self._record_start_observability(task, owner, task_args)
             task_inserted = True
-        except Exception:
+        except BaseException:
             if not task_inserted:
                 if runner_pid is None or self._cleanup_uncommitted_runner(runner_pid, task_id=task_id):
                     self._restore_owner_decisions(owner_reservations)
+                    self._restore_spawn_decision(
+                        spawn_reservation,
+                        task_id=task_id,
+                    )
                 else:
                     self._audit.record(
                         actor="object_task",
@@ -509,7 +567,7 @@ class ObjectTaskManager:
             raise
         try:
             with self._lock:
-                self._grant_result_to_notify[task_id] = bool(grant_result_to_notify)
+                self._grant_result_to_notify[task_id] = grant_result_to_notify
                 self._pending_args[task_id] = task_args
                 self._schedule_task_locked(task_id)
         except Exception as exc:
@@ -541,6 +599,13 @@ class ObjectTaskManager:
                 runner_pid,
                 [handle],
                 assigned_by=f"object_task:{task_id}",
+            )
+            owner_object = self._objects.get_object(owner_oid)
+            if owner_object is None:
+                raise NotFound(f"object not found: {owner_oid}")
+            self._authority_manifests.assert_data_flow_labels(
+                runner_pid,
+                DataLabels.from_object_metadata(owner_object.metadata),
             )
             self._capabilities.handle_for_object(
                 runner_pid,
@@ -604,40 +669,85 @@ class ObjectTaskManager:
         channel: str | None = None,
         kind: str | ProcessMessageKind | None = None,
     ) -> ObjectTask:
-        task = self._refresh_task_from_runner(self._get(task_id))
-        self._require_task_mutable(actor_pid, task)
-        if task.status in _TERMINAL_STATUSES:
-            raise ValidationError(f"cannot watch owner for terminal object task: {task_id}")
-        owner_watch = self._normalize_owner_watch(
-            {
-                "enabled": enabled,
-                "events": list(events) if events is not None else task.owner_watch.events,
-                "channel": channel or task.owner_watch.channel,
-                "kind": kind or task.owner_watch.kind,
-            }
-        )
-        updated = replace(task, owner_watch=owner_watch, updated_at=utc_now())
-        self._records.update_object_task(updated)
-        self._audit.record(
-            actor=actor_pid,
-            action="object_task.owner_watch.register",
-            target=f"object_task:{task_id}",
-            input_refs=[task.owner_oid],
-            decision={
-                "owner_oid": task.owner_oid,
-                "enabled": owner_watch.enabled,
-                "events": owner_watch.events,
-                "kind": owner_watch.kind,
-                "channel": owner_watch.channel,
-            },
-        )
-        return updated
+        # Refresh may take the in-memory task lock and perform Host-owned
+        # terminal reconciliation.  Do it before the durable authority lock to
+        # preserve the manager's lock ordering.
+        self._refresh_task_from_runner(self._get(task_id))
+        with self._records.transaction():
+            task = self._get(task_id)
+            decision = self._require_task_mutable(actor_pid, task)
+            if task.status in _TERMINAL_STATUSES:
+                raise ValidationError(f"cannot watch owner for terminal object task: {task_id}")
+            owner_watch = self._normalize_owner_watch(
+                {
+                    "enabled": enabled,
+                    "events": list(events) if events is not None else task.owner_watch.events,
+                    "channel": channel or task.owner_watch.channel,
+                    "kind": kind or task.owner_watch.kind,
+                }
+            )
+            with self._capabilities.authority_transaction(
+                [decision],
+                actor=actor_pid,
+                operation="object task owner-watch mutation",
+            ):
+                updated = replace(task, owner_watch=owner_watch, updated_at=utc_now())
+                self._records.update_object_task(updated)
+                self._audit.record(
+                    actor=actor_pid,
+                    action="object_task.owner_watch.register",
+                    target=f"object_task:{task_id}",
+                    input_refs=[task.owner_oid],
+                    decision={
+                        "owner_oid": task.owner_oid,
+                        "enabled": owner_watch.enabled,
+                        "events": owner_watch.events,
+                        "kind": owner_watch.kind,
+                        "channel": owner_watch.channel,
+                    },
+                )
+            return updated
 
     def get(self, task_id: str, *, actor_pid: str | None = None) -> ObjectTask:
-        task = self._refresh_task_from_runner(self._get(task_id))
-        if actor_pid is not None:
-            self._require_task_visible(actor_pid, task)
-        return self._notifications.retry_terminal(task)
+        self._refresh_task_from_runner(self._get(task_id))
+        # retry_terminal follows the task-lock -> store-lock order used by the
+        # background worker.  Taking the same lock order here avoids a DB/task
+        # lock inversion while keeping visibility and notification retry in
+        # the authority transaction.
+        with self._lock, self._records.transaction():
+            task = self._get(task_id)
+            decision = (
+                self._require_task_visible(actor_pid, task)
+                if actor_pid is not None
+                else None
+            )
+            with self._capabilities.authority_transaction(
+                [decision],
+                actor=actor_pid or "object_task",
+                operation="object task visibility",
+            ):
+                current = self._notifications.retry_terminal(task)
+        if (
+            current.status == ObjectTaskStatus.WAITING_MESSAGE
+            and not self._has_active_future(current.task_id)
+        ):
+            try:
+                if self._has_matching_waiting_message(current):
+                    self._schedule_waiting_message_resume(current.task_id)
+            except Exception as exc:
+                # Message post is already durable; a later read remains a
+                # reconciliation point, but inability to schedule must not make
+                # the task itself invisible.
+                try:
+                    self._audit.record(
+                        actor="object_task",
+                        action="object_task.message_reconcile_failed",
+                        target=f"object_task:{current.task_id}",
+                        decision={"error": internal_exception_observation(exc)},
+                    )
+                except BaseException:
+                    pass
+        return current
 
     def list(
         self,
@@ -648,55 +758,93 @@ class ObjectTaskManager:
         limit: int | None = None,
     ) -> list[ObjectTask]:
         selected_limit = self._coerce_list_limit(limit)
-        tasks = [
-            self._refresh_task_from_runner(task)
-            for task in self._records.list_object_tasks(
-                owner_oid=owner_oid,
-                include_terminal=include_terminal,
-                limit=None if actor_pid is not None and selected_limit is not None else selected_limit,
-            )
-        ]
+        if selected_limit == 0:
+            return []
+        candidate_limit = selected_limit
         if actor_pid is not None:
-            tasks = [task for task in tasks if self._can_view_task(actor_pid, task)]
-        if selected_limit is not None:
-            tasks = tasks[:selected_limit]
-        if actor_pid is not None:
-            self._consume_task_visibility(actor_pid, tasks)
-        return tasks
+            # Visibility filtering cannot safely push a simple result LIMIT into
+            # SQL, but it must not turn a one-row request into an unbounded
+            # payload/authorization scan. Use the configured recovery hard bound
+            # as a deterministic candidate ceiling.
+            candidate_limit = self.config.runtime.object_task_recovery_page_hard_limit
+        snapshots = self._records.list_object_tasks(
+            owner_oid=owner_oid,
+            include_terminal=include_terminal,
+            limit=candidate_limit,
+        )
+        refreshed = [self._refresh_task_from_runner(candidate) for candidate in snapshots]
+        with self._records.transaction():
+            selected: list[tuple[ObjectTask, Any | None]] = []
+            for snapshot in refreshed:
+                task = self._records.get_object_task(snapshot.task_id) or snapshot
+                if not include_terminal and task.status in _TERMINAL_STATUSES:
+                    continue
+                if actor_pid is None or task.creator_pid == actor_pid:
+                    selected.append((task, None))
+                    continue
+                decision = self._capabilities.authorize(
+                    actor_pid,
+                    f"object:{task.owner_oid}",
+                    ObjectRight.READ,
+                )
+                if decision.allowed:
+                    selected.append((task, decision))
+            if selected_limit is not None:
+                selected = selected[:selected_limit]
+            decisions = [decision for _, decision in selected if decision is not None]
+            with self._capabilities.authority_transaction(
+                decisions,
+                actor=actor_pid or "object_task",
+                operation="object task list visibility",
+            ):
+                return [task for task, _ in selected]
 
     def cancel(self, task_id: str, *, actor_pid: str, reason: str | None = None) -> ObjectTask:
-        task = self._refresh_task_from_runner(self._get(task_id))
-        decision = self._require_task_mutable(actor_pid, task)
-        if task.status in _TERMINAL_STATUSES:
-            return task
-        if task.status == ObjectTaskStatus.RUNNING and self._tools.is_sync_side_effect_tool(task.tool):
-            raise ValidationError(
-                f"running synchronous side-effect object task cannot be safely cancelled: {task_id}"
-            )
-        if decision is not None:
-            self._capabilities.claim_decision_use(
-                decision,
-                used_by=actor_pid,
-                reason="one-time object task cancellation authority consumed",
-            )
-        with self._lock:
+        selected_reason = self._messages.validate_body(str(reason or "cancelled"))
+        self._refresh_task_from_runner(self._get(task_id))
+        with self._lock, self._records.transaction():
+            task = self._get(task_id)
+            decision = self._require_task_mutable(actor_pid, task)
+            if task.status == ObjectTaskStatus.RUNNING and self._tools.is_sync_side_effect_tool(task.tool):
+                raise ValidationError(
+                    f"running synchronous side-effect object task cannot be safely cancelled: {task_id}"
+                )
+            with self._capabilities.authority_transaction(
+                [decision],
+                actor=actor_pid,
+                operation="object task cancellation",
+            ):
+                cancelled = (
+                    task
+                    if task.status in _TERMINAL_STATUSES
+                    else self._state.mark_cancelled(
+                        task,
+                        actor=actor_pid,
+                        reason=selected_reason,
+                    )
+                )
+            if task.status in _TERMINAL_STATUSES:
+                return cancelled
             future = self._futures.get(task_id)
             if future is not None:
                 future.cancel()
-        return self._mark_cancelled(task, actor=actor_pid, reason=reason or "cancelled")
+            self._cleanup_task_state_locked(cancelled.task_id)
+        return cancelled
 
     def wait(self, task_id: str, *, actor_pid: str | None = None, timeout: float | None = None) -> ObjectTask:
         selected_timeout = self._coerce_wait_timeout(timeout)
         deadline = None if selected_timeout is None else time.monotonic() + selected_timeout
-        if actor_pid is not None:
-            self._require_task_visible(actor_pid, self._refresh_task_from_runner(self._get(task_id)))
+        # A wait is one long-lived read operation.  Linearize and, when
+        # applicable, consume its authority once at entry; internal polling
+        # must not consume the same one-shot grant again on every iteration.
+        task = self.get(task_id, actor_pid=actor_pid)
         while True:
-            task = self.get(task_id)
             if (
                 task.status == ObjectTaskStatus.WAITING_HUMAN
                 and not self._has_active_future(task.task_id)
                 and self._schedule_waiting_human_resume(task)
             ):
+                task = self.get(task_id)
                 continue
             if task.status in _TERMINAL_STATUSES:
                 # Terminal task state is written before the worker coroutine
@@ -726,6 +874,7 @@ class ObjectTaskManager:
             if deadline is not None and time.monotonic() >= deadline:
                 return task
             time.sleep(0.01)
+            task = self.get(task_id)
 
     def _coerce_list_limit(self, limit: int | None) -> int | None:
         if limit is None:
@@ -756,9 +905,30 @@ class ObjectTaskManager:
         return selected
 
     def has_active_for_owner(self, owner_oid: str) -> bool:
-        for task in self._records.list_object_tasks(owner_oid=owner_oid, include_terminal=False):
+        for task in self._records.list_object_tasks(
+            owner_oid=owner_oid,
+            include_terminal=False,
+            limit=self.config.runtime.object_task_recovery_page_hard_limit,
+        ):
             self._refresh_task_from_runner(task)
-        return bool(self._records.list_object_tasks(owner_oid=owner_oid, include_terminal=False, limit=1))
+        return self.has_published_active_for_owner(owner_oid)
+
+    def has_published_active_for_owner(self, owner_oid: str) -> bool:
+        """Return whether a durable, non-terminal task pins ``owner_oid``.
+
+        This predicate deliberately performs no runner reconciliation or other
+        state mutation. ObjectMemory calls it while holding the ownership fence,
+        so keeping it to a bounded durable read preserves the ownership -> store
+        lock order used by task publication.
+        """
+
+        return bool(
+            self._records.list_object_tasks(
+                owner_oid=owner_oid,
+                include_terminal=False,
+                limit=1,
+            )
+        )
 
     def is_runner_pid(self, pid: str) -> bool:
         selected_pid = str(pid)
@@ -832,41 +1002,45 @@ class ObjectTaskManager:
             futures = tuple(self._futures.values())
 
         if not started:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor.shutdown(wait=True, cancel_futures=True)
             if not self._loop.is_closed():
                 self._loop.close()
+            self._worker_shutdown_complete.set()
         else:
             # Linearize on the loop after every pre-existing scheduling
             # callback. _closing prevents new submissions while the lifecycle
             # recovery fence prevents a queued coroutine from entering its
             # admitted execution body. If an admitted run is still alive, do
             # not cancel or stop anything: the lifecycle can retry after drain.
-            stop_decided = threading.Event()
-            stop_allowed = False
+            if not self._worker_cleanup_started.is_set():
+                stop_decided = threading.Event()
+                stop_allowed = False
 
-            def stop_if_quiescent() -> None:
-                nonlocal stop_allowed
-                with self._lock:
-                    stop_allowed = not self._active_runs
-                if stop_allowed:
-                    self._loop.stop()
-                stop_decided.set()
+                def stop_if_quiescent() -> None:
+                    nonlocal stop_allowed
+                    with self._lock:
+                        stop_allowed = not self._active_runs
+                    if stop_allowed:
+                        self._loop.stop()
+                    stop_decided.set()
 
-            try:
-                self._loop.call_soon_threadsafe(stop_if_quiescent)
-            except RuntimeError:
-                if self._thread.is_alive():
+                try:
+                    self._loop.call_soon_threadsafe(stop_if_quiescent)
+                except RuntimeError:
+                    if self._thread.is_alive():
+                        return False
+                if self._thread.is_alive() and not stop_decided.wait(
+                    timeout=self.config.object_tasks.shutdown_join_timeout_s
+                ):
                     return False
-            if self._thread.is_alive() and not stop_decided.wait(
-                timeout=self.config.object_tasks.shutdown_join_timeout_s
-            ):
-                return False
-            if not stop_allowed and self._thread.is_alive():
-                return False
+                if not stop_allowed and self._thread.is_alive():
+                    return False
             self._thread.join(
                 timeout=self.config.object_tasks.shutdown_join_timeout_s
             )
             if self._thread.is_alive():
+                return False
+            if not self._worker_shutdown_complete.is_set():
                 return False
 
             # _run_loop cancels and gathers every pending asyncio Task after
@@ -894,9 +1068,10 @@ class ObjectTaskManager:
             self._closing = True
             started = self._started
         if not started:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor.shutdown(wait=True, cancel_futures=True)
             if not self._loop.is_closed():
                 self._loop.close()
+            self._worker_shutdown_complete.set()
             self._closed = True
             return True
         if first_shutdown_attempt:
@@ -926,7 +1101,18 @@ class ObjectTaskManager:
                 decision={"unfinished": len(unfinished_ids)},
             )
             return False
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        if not self._worker_cleanup_started.is_set():
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except RuntimeError:
+                if self._thread.is_alive():
+                    self._audit.record(
+                        actor="runtime.shutdown",
+                        action="object_task.shutdown_deferred",
+                        target="object_tasks",
+                        decision={"reason": "event loop could not be stopped"},
+                    )
+                    return False
         self._thread.join(timeout=self.config.object_tasks.shutdown_join_timeout_s)
         if self._thread.is_alive():
             self._audit.record(
@@ -934,6 +1120,14 @@ class ObjectTaskManager:
                 action="object_task.shutdown_deferred",
                 target="object_tasks",
                 decision={"reason": "event loop thread did not stop"},
+            )
+            return False
+        if not self._worker_shutdown_complete.is_set():
+            self._audit.record(
+                actor="runtime.shutdown",
+                action="object_task.shutdown_deferred",
+                target="object_tasks",
+                decision={"reason": "worker executor cleanup did not complete"},
             )
             return False
         self._closed = True
@@ -949,14 +1143,22 @@ class ObjectTaskManager:
             # including error handling and terminal notification publication.
             # Nested Tool/Process/DataFlow guards inherit this lease.
             with self._admission.admit():
-                await self._execute_task(task_id)
+                try:
+                    await self._execute_task(task_id)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    # A task-local BaseException must not escape asyncio's Task
+                    # step, where KeyboardInterrupt/SystemExit would terminate
+                    # the manager loop. Settle the durable task while its
+                    # lifecycle admission is still active.
+                    self._fail_task_from_exception(task_id, exc)
         finally:
             self._finish_active_run(task_id)
 
     async def _execute_task(self, task_id: str) -> None:
         task = self._get(task_id)
-        result_oid: str | None = None
-        pending_notify_grant: _PendingNotifyResultGrant | None = None
+        settlement = _TaskResultSettlement()
         with self._lock:
             args = dict(self._pending_args.get(task_id, {}))
         context_metadata = self._context_metadata_for_resume(task)
@@ -970,54 +1172,7 @@ class ObjectTaskManager:
                 args,
                 context_metadata=context_metadata,
             )
-            latest_process = self._process.get(str(task.runner_pid))
-            latest_task = self._records.get_object_task(task_id)
-            if latest_task is None or latest_task.status in _TERMINAL_STATUSES:
-                self._state.discard_failed_result(
-                    str(task.runner_pid),
-                    task_id,
-                    result.result_handle.oid if result.result_handle else None,
-                )
-                return
-            if result.ok:
-                result_oid = result.result_handle.oid if result.result_handle is not None else None
-                if result_oid is not None:
-                    pending_notify_grant = self._publish_success_result(
-                        task,
-                        result_oid,
-                    )
-                # Serialize the final active-state check with cancellation and
-                # terminal task transitions. A cancellation that won while the
-                # result was being wired must discard, not publish, that result.
-                with self._lock:
-                    latest_task = self._records.get_object_task(task_id)
-                    if latest_task is None or latest_task.status in _TERMINAL_STATUSES:
-                        self._restore_notify_result_grant(
-                            pending_notify_grant,
-                            reason="object task completed after cancellation",
-                        )
-                        pending_notify_grant = None
-                        self._state.discard_failed_result(str(task.runner_pid), task_id, result_oid)
-                        return
-                    latest_process = self._process.get(str(task.runner_pid))
-                    if latest_process.status not in self._process.TERMINAL_STATUSES:
-                        self._process.exit(str(task.runner_pid), result=result.result_handle)
-                    self._mark_succeeded(
-                        task_id,
-                        result,
-                        result_oid,
-                        pending_notify_grant=pending_notify_grant,
-                    )
-                    pending_notify_grant = None
-                return
-            if latest_process.status not in self._process.TERMINAL_STATUSES:
-                self._process.exit(str(task.runner_pid), failed=True, message=result.error or "object task failed")
-            self._state.discard_failed_result(
-                str(task.runner_pid),
-                task_id,
-                result.result_handle.oid if result.result_handle else None,
-            )
-            self._state.mark_failed(task_id, result.error or "object task failed")
+            self._settle_tool_result(task, result, settlement)
         except asyncio.CancelledError:
             latest = self._records.get_object_task(task_id)
             if latest is not None and latest.status not in _TERMINAL_STATUSES:
@@ -1029,20 +1184,133 @@ class ObjectTaskManager:
             self._state.mark_waiting(task_id, ObjectTaskStatus.WAITING_PROCESS, {"child_pid": exc.child_pid}, str(exc))
         except ProcessMessageWaitRequired as exc:
             self._state.mark_waiting(task_id, ObjectTaskStatus.WAITING_MESSAGE, {"filters": exc.filters}, str(exc))
-        except Exception as exc:
-            latest = self._records.get_object_task(task_id)
-            # Once the success row is durable, failures in best-effort
-            # post-commit observability must not delete the published result.
-            if latest is not None and latest.status == ObjectTaskStatus.SUCCEEDED:
-                return
-            self._state.terminalize_runner(str(task.runner_pid), reason=f"object task failed: {exc}")
-            self._state.discard_failed_result(str(task.runner_pid), task_id, result_oid)
-            self._state.mark_failed(task_id, str(exc))
+        except BaseException as exc:
+            self._fail_task_from_exception(
+                task_id,
+                exc,
+                runner_pid=str(task.runner_pid),
+                result_oid=settlement.result_oid,
+            )
         finally:
             self._restore_notify_result_grant(
-                pending_notify_grant,
+                settlement.pending_notify_grant,
                 reason="object task notify-result publication did not settle",
             )
+
+    def _settle_tool_result(
+        self,
+        task: ObjectTask,
+        result: Any,
+        settlement: _TaskResultSettlement,
+    ) -> None:
+        task_id = task.task_id
+        runner_pid = str(task.runner_pid)
+        latest_process = self._process.get(runner_pid)
+        latest_task = self._records.get_object_task(task_id)
+        result_handle = result.result_handle
+        if latest_task is None or latest_task.status in _TERMINAL_STATUSES:
+            self._state.discard_failed_result(
+                runner_pid,
+                task_id,
+                result_handle.oid if result_handle else None,
+            )
+            return
+        if not result.ok:
+            if latest_process.status not in self._process.TERMINAL_STATUSES:
+                self._process.exit(
+                    runner_pid,
+                    failed=True,
+                    message=result.error or "object task failed",
+                )
+            self._state.discard_failed_result(
+                runner_pid,
+                task_id,
+                result_handle.oid if result_handle else None,
+            )
+            self._state.mark_failed(task_id, result.error or "object task failed")
+            return
+
+        settlement.result_oid = result_handle.oid if result_handle is not None else None
+        if settlement.result_oid is not None:
+            settlement.pending_notify_grant = self._publish_success_result(
+                task,
+                settlement.result_oid,
+            )
+        # Serialize the final active-state check with cancellation and terminal
+        # task transitions. A cancellation that won while the result was being
+        # wired must discard, not publish, that result.
+        with self._lock:
+            latest_task = self._records.get_object_task(task_id)
+            if latest_task is None or latest_task.status in _TERMINAL_STATUSES:
+                self._restore_notify_result_grant(
+                    settlement.pending_notify_grant,
+                    reason="object task completed after cancellation",
+                )
+                settlement.pending_notify_grant = None
+                self._state.discard_failed_result(
+                    runner_pid,
+                    task_id,
+                    settlement.result_oid,
+                )
+                return
+            latest_process = self._process.get(runner_pid)
+            if latest_process.status not in self._process.TERMINAL_STATUSES:
+                self._process.exit(runner_pid, result=result_handle)
+            self._mark_succeeded(
+                task_id,
+                result,
+                settlement.result_oid,
+                pending_notify_grant=settlement.pending_notify_grant,
+            )
+            settlement.pending_notify_grant = None
+
+    def _fail_task_from_exception(
+        self,
+        task_id: str,
+        exc: BaseException,
+        *,
+        runner_pid: str | None = None,
+        result_oid: str | None = None,
+    ) -> None:
+        latest = self._records.get_object_task(task_id)
+        if latest is None or latest.status in _TERMINAL_STATUSES:
+            # Once a success row is durable, failures in best-effort
+            # post-commit observability must not delete the published result.
+            return
+        selected_runner_pid = runner_pid or (
+            str(latest.runner_pid) if latest.runner_pid is not None else None
+        )
+        error = self._record_task_failure_diagnostic(task_id, exc)
+        if selected_runner_pid is not None:
+            self._state.terminalize_runner(
+                selected_runner_pid,
+                reason=f"object task failed: {error}",
+            )
+            self._state.discard_failed_result(
+                selected_runner_pid,
+                task_id,
+                result_oid,
+            )
+        self._state.mark_failed(task_id, error)
+
+    def _record_task_failure_diagnostic(
+        self,
+        task_id: str,
+        exc: BaseException,
+    ) -> str:
+        public_error = public_error_envelope(exc)
+        self._audit.record(
+            actor="object_task",
+            action="object_task.failure_diagnostic",
+            target=f"object_task:{task_id}",
+            decision=internal_exception_observation(exc),
+            correlation_id=public_error["correlation_id"],
+        )
+        return public_error["message"]
+
+    @staticmethod
+    def _task_error_message(exc: BaseException) -> str:
+        return public_error_envelope(exc)["message"]
 
     def _publish_success_result(
         self,
@@ -1064,6 +1332,13 @@ class ObjectTaskManager:
             creator is not None
             and creator.status not in self._process.TERMINAL_STATUSES
         ):
+            result_object = self._objects.get_object(result_oid)
+            if result_object is None:
+                raise NotFound(f"object task result not found: {result_oid}")
+            self._authority_manifests.assert_data_flow_labels(
+                task.creator_pid,
+                DataLabels.from_object_metadata(result_object.metadata),
+            )
             creator_handle = self._capabilities.handle_for_object(
                 task.creator_pid,
                 result_oid,
@@ -1086,20 +1361,58 @@ class ObjectTaskManager:
         return self._prepare_notify_result_grant(task, result_oid)
 
     def _run_loop(self) -> None:
+        cleanup_complete = True
+        failure: BaseException | None = None
         asyncio.set_event_loop(self._loop)
-        self._loop.set_default_executor(self._executor)
-        self._loop_ready.set()
-        self._loop.run_forever()
-        pending = asyncio.all_tasks(self._loop)
-        for task in pending:
-            task.cancel()
-        if pending:
-            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        # The object-task event loop owns this explicitly installed executor;
-        # drain it before Runtime closes the shared store, including work that
-        # a coroutine dependency may have submitted through the loop default.
-        self._loop.run_until_complete(self._loop.shutdown_default_executor())
-        self._loop.close()
+        try:
+            self._loop.set_default_executor(self._executor)
+            self._loop_ready.set()
+            self._loop.run_forever()
+        except BaseException as exc:
+            # The task boundary above contains task-local BaseExceptions. Keep
+            # this final guard so an unexpected loop callback still reaches
+            # deterministic executor cleanup instead of leaking worker threads.
+            failure = exc
+        finally:
+            self._loop_ready.set()
+            self._worker_cleanup_started.set()
+            try:
+                pending = asyncio.all_tasks(self._loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            except BaseException as exc:
+                cleanup_complete = False
+                if failure is None:
+                    failure = exc
+            try:
+                # The object-task event loop owns this explicitly installed
+                # executor. Its shutdown coroutine does not return until every
+                # underlying worker has exited.
+                self._loop.run_until_complete(
+                    self._loop.shutdown_default_executor()
+                )
+            except BaseException as exc:
+                cleanup_complete = False
+                if failure is None:
+                    failure = exc
+            try:
+                self._loop.close()
+            except BaseException as exc:
+                cleanup_complete = False
+                if failure is None:
+                    failure = exc
+            with self._lock:
+                self._worker_failure = (
+                    self._task_error_message(failure)
+                    if failure is not None
+                    else None
+                )
+            if cleanup_complete and self._loop.is_closed():
+                self._worker_shutdown_complete.set()
 
     def _schedule_task_locked(self, task_id: str) -> Future[Any]:
         if self._closing or self._closed:
@@ -1137,11 +1450,20 @@ class ObjectTaskManager:
         elif isinstance(value, dict):
             raw = dict(value)
             raw.setdefault("enabled", True)
-        elif value:
-            raw = {"enabled": True}
-        else:
+        elif isinstance(value, bool):
+            raw = {"enabled": value}
+        elif value is None:
             raw = {"enabled": False}
-        enabled = bool(raw.get("enabled", False))
+        else:
+            raise ValidationError(
+                "object task owner_watch must be a boolean or mapping"
+            )
+        enabled_value = raw.get("enabled", False)
+        if type(enabled_value) is not bool:
+            raise ValidationError(
+                "object task owner_watch.enabled must be a boolean"
+            )
+        enabled = enabled_value
         raw_events = raw.get("events") or self.config.object_tasks.owner_watch_events
         if isinstance(raw_events, str):
             raw_events = [raw_events]
@@ -1201,6 +1523,8 @@ class ObjectTaskManager:
                 source_oids=source_oids,
             )
         except Exception as exc:
+            public_error = public_error_envelope(exc)
+            internal_error = internal_exception_observation(exc)
             self._events.emit(
                 EventType.OBJECT_TASK_OWNER_CHANGE_UNDELIVERED,
                 source=actor_pid,
@@ -1209,16 +1533,22 @@ class ObjectTaskManager:
                     "task_id": task.task_id,
                     "runner_pid": task.runner_pid,
                     "event": change.get("event"),
-                    "error": str(exc),
+                    "error": public_error["message"],
                 },
                 priority=EventPriority.HIGH,
+                correlation_id=public_error["correlation_id"],
             )
             self._audit.record(
                 actor="object_task",
                 action="object_task.owner_watch.undelivered",
                 target=f"object_task:{task.task_id}",
                 input_refs=[task.owner_oid],
-                decision={"runner_pid": task.runner_pid, "event": change.get("event"), "error": str(exc)},
+                decision={
+                    "runner_pid": task.runner_pid,
+                    "event": change.get("event"),
+                    "internal_error": internal_error,
+                },
+                correlation_id=public_error["correlation_id"],
             )
             return False
         self._events.emit(
@@ -1343,7 +1673,8 @@ class ObjectTaskManager:
         try:
             request = self._human.get(request_id)
         except Exception as exc:
-            self._state.mark_failed(task.task_id, str(exc))
+            error = self._record_task_failure_diagnostic(task.task_id, exc)
+            self._state.mark_failed(task.task_id, error)
             self._cleanup_task_state(task.task_id)
             return True
         if request.status == HumanRequestStatus.PENDING:
@@ -1416,6 +1747,23 @@ class ObjectTaskManager:
         if message_ids is not None and message.message_id not in set(message_ids):
             return False
         return True
+
+    def _has_matching_waiting_message(self, task: ObjectTask) -> bool:
+        if task.runner_pid is None:
+            return False
+        filters = task.wait.get("filters") or {}
+        return bool(
+            self._messages.unread(
+                str(task.runner_pid),
+                kind=filters.get("kind"),
+                sender=filters.get("sender"),
+                channel=filters.get("channel"),
+                correlation_id=filters.get("correlation_id"),
+                reply_to=filters.get("reply_to"),
+                message_ids=filters.get("message_ids"),
+                limit=1,
+            )
+        )
 
     def _mark_succeeded(
         self,
@@ -1556,6 +1904,23 @@ class ObjectTaskManager:
             decisions.append(decision)
         return decisions
 
+    def _assert_no_restrictive_owner_policy(
+        self,
+        pid: str,
+        owner: ObjectHandle,
+        rights: set[str],
+    ) -> None:
+        for right in sorted(rights):
+            current = self._capabilities.authorize(
+                pid,
+                f"object:{owner.oid}",
+                right,
+            )
+            if not current.allowed and current.effect is not None:
+                raise CapabilityDenied(
+                    f"capability policy now restricts {right}: {owner.oid}"
+                )
+
     def _reserve_owner_decisions(
         self,
         pid: str,
@@ -1599,6 +1964,36 @@ class ObjectTaskManager:
                 restored_by="object_task",
                 reason="one-time object task owner permission restored before task commit",
             )
+
+    def _commit_spawn_decision(
+        self,
+        reservation_id: str | None,
+        *,
+        task_id: str,
+    ) -> None:
+        if reservation_id is None:
+            return
+        committed = self._capabilities.commit_reserved_use(
+            reservation_id,
+            committed_by=f"object_task:{task_id}",
+            reason="one-time object task spawn permission committed",
+        )
+        if not committed:
+            raise CapabilityDenied(
+                "object task spawn permission reservation could not be committed"
+            )
+
+    def _restore_spawn_decision(
+        self,
+        reservation_id: str | None,
+        *,
+        task_id: str,
+    ) -> None:
+        self._capabilities.restore_reserved_use(
+            reservation_id,
+            restored_by=f"object_task:{task_id}",
+            reason="one-time object task spawn permission restored before task commit",
+        )
 
     def _cleanup_uncommitted_runner(self, runner_pid: str, *, task_id: str) -> bool:
         cleanup_error: str | None = None
@@ -1681,17 +2076,13 @@ class ObjectTaskManager:
         if len(per_object) >= self.config.object_tasks.max_running_per_object:
             raise ValidationError("object task per-object concurrency limit exceeded")
 
-    def _require_task_visible(self, actor_pid: str, task: ObjectTask) -> None:
+    def _require_task_visible(self, actor_pid: str, task: ObjectTask) -> Any | None:
         if task.creator_pid == actor_pid:
-            return
+            return None
         decision = self._capabilities.authorize(actor_pid, f"object:{task.owner_oid}", ObjectRight.READ)
         if not decision.allowed:
             raise CapabilityDenied(f"{actor_pid} cannot inspect object task: {task.task_id}")
-        self._capabilities.claim_decision_use(
-            decision,
-            used_by=actor_pid,
-            reason="one-time object task visibility authority consumed",
-        )
+        return decision
 
     def _require_task_mutable(self, actor_pid: str, task: ObjectTask) -> Any | None:
         if task.creator_pid == actor_pid:
@@ -1700,33 +2091,6 @@ class ObjectTaskManager:
         if not decision.allowed:
             raise CapabilityDenied(f"{actor_pid} cannot cancel object task: {task.task_id}")
         return decision
-
-    def _consume_task_visibility(self, actor_pid: str, tasks: list[ObjectTask]) -> None:
-        decisions: list[Any] = []
-        capability_ids: set[str] = set()
-        for task in tasks:
-            if task.creator_pid == actor_pid:
-                continue
-            decision = self._capabilities.authorize(actor_pid, f"object:{task.owner_oid}", ObjectRight.READ)
-            if not decision.allowed:
-                raise CapabilityDenied(f"{actor_pid} cannot inspect object task: {task.task_id}")
-            cap_id = decision.consume_capability_id
-            if cap_id is None or str(cap_id) in capability_ids:
-                continue
-            capability_ids.add(str(cap_id))
-            decisions.append(decision)
-        with self._records.transaction():
-            for decision in decisions:
-                self._capabilities.claim_decision_use(
-                    decision,
-                    used_by=actor_pid,
-                    reason="one-time object task list visibility authority consumed",
-                )
-
-    def _can_view_task(self, actor_pid: str, task: ObjectTask) -> bool:
-        if task.creator_pid == actor_pid:
-            return True
-        return self._capabilities.check(actor_pid, f"object:{task.owner_oid}", ObjectRight.READ)
 
     def _get(self, task_id: str) -> ObjectTask:
         task = self._records.get_object_task(task_id)

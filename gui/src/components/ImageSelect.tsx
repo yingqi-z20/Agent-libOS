@@ -1,4 +1,5 @@
 import type { ImageSummary } from "../api/types";
+import { useId } from "react";
 import { useI18n } from "../i18n";
 
 type ImageSelectProps = {
@@ -11,11 +12,13 @@ type ImageSelectProps = {
 
 export function ImageSelect({ images, value, label, disabled = false, onChange }: ImageSelectProps) {
   const { t } = useI18n();
+  const labelId = useId();
   const known = images.some((image) => image.image_id === value);
+  const controlLabel = label ?? t("image.selectLabel");
   return (
-    <label className="imageSelect">
-      <span>{label ?? t("image.selectLabel")}</span>
-      <select value={known ? value : ""} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)}>
+    <div className="imageSelect" role="group" aria-labelledby={labelId}>
+      <span id={labelId}>{controlLabel}</span>
+      <select aria-labelledby={labelId} value={known ? value : ""} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)}>
         {!known ? <option value="">{t("image.customOption")}</option> : null}
         {images.map((image) => (
           <option key={image.image_id} value={image.image_id}>
@@ -23,7 +26,13 @@ export function ImageSelect({ images, value, label, disabled = false, onChange }
           </option>
         ))}
       </select>
-      <input value={value} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)} placeholder={t("image.manualPlaceholder")} />
-    </label>
+      <input
+        aria-label={`${controlLabel}: ${t("image.manualPlaceholder")}`}
+        value={value}
+        disabled={disabled}
+        onChange={(event) => onChange(event.currentTarget.value)}
+        placeholder={t("image.manualPlaceholder")}
+      />
+    </div>
   );
 }

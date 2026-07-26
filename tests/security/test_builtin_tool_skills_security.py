@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight
+from agent_libos.models import CapabilityRight, EventType
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.skills.schema import SkillPackage
 
@@ -14,11 +15,55 @@ from agent_libos.skills.schema import SkillPackage
 WORKSPACE_EDITING_SKILL = "agent-libos-workspace-editing"
 
 
+class _SkillReadCancelled(BaseException):
+    pass
+
+
 def _capability_ids(runtime: Runtime, pid: str) -> set[str]:
     return {
         capability.cap_id
         for capability in runtime.store.list_capabilities(subject=pid)
     }
+
+
+def _register_audit_skill(runtime: Runtime) -> str:
+    skill_id = "reservation-audit-skill"
+    runtime.skills.register_skill_package(
+        SkillPackage(
+            skill_id=skill_id,
+            name=skill_id,
+            description="Exercise finite Skill read authority.",
+            instructions="Read-only audit instructions.",
+        ),
+        actor="runtime",
+        require_capability=False,
+    )
+    return skill_id
+
+
+def _interrupt_skill_read(
+    runtime: Runtime,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    entrypoint: str,
+    pid: str,
+    skill_id: str,
+    error: BaseException,
+) -> None:
+    def interrupt(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise error
+
+    if entrypoint == "discover":
+        monkeypatch.setattr(
+            runtime.skills,
+            "_registered_discovery_summaries",
+            interrupt,
+        )
+        runtime.skills.discover_skills(actor=pid)
+        return
+    monkeypatch.setattr(runtime.skills, "_skill_summary", interrupt)
+    runtime.skills.inspect_skill(skill_id, actor=pid)
 
 
 def test_builtin_activation_without_skill_capability_preserves_image_authority(
@@ -86,7 +131,9 @@ def test_builtin_editing_projection_cannot_bypass_filesystem_write_capability(
         )
 
         assert not result.ok
-        assert "lacks write" in (result.error or "")
+        assert (result.error or "").startswith(
+            "permission_denied: CapabilityDenied"
+        )
         assert not (runtime.workspace_root / path).exists()
         denial_audit = next(
             record
@@ -96,7 +143,11 @@ def test_builtin_editing_projection_cannot_bypass_filesystem_write_capability(
         )
         assert denial_audit.decision["ok"] is False
         assert denial_audit.decision["policy_decision"] == "allow"
-        assert "tool_result" in denial_audit.decision
+        assert "tool_result" not in denial_audit.decision
+        assert denial_audit.decision["error"]["error_type"] == "CapabilityDenied"
+        assert len(
+            denial_audit.decision["error"]["exception_text"]["sha256"]
+        ) == 64
     finally:
         runtime.close()
 
@@ -298,7 +349,9 @@ def test_tampered_builtin_projection_fails_closed_for_prompt_and_unload(
         )
         assert not model_failure.ok
         assert "built-in" not in (model_failure.error or "")
-        assert "loaded skill" in (model_failure.error or "").casefold()
+        assert (model_failure.error or "").startswith(
+            "validation_error: ValidationError"
+        )
 
         with pytest.raises(ValidationError, match=error_match):
             runtime.skills.unload_skill(pid, WORKSPACE_EDITING_SKILL, actor=pid)
@@ -665,3 +718,162 @@ def test_self_consistent_forged_builtin_snapshot_lacks_host_activation_receipt(
         assert after.loaded_skills == before.loaded_skills
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("entrypoint", ["discover", "inspect"])
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, asyncio.CancelledError, _SkillReadCancelled],
+)
+def test_interrupted_skill_read_restores_finite_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    error_type: type[BaseException],
+) -> None:
+    runtime = Runtime.open(
+        tmp_path / f"skill-{entrypoint}-{error_type.__name__}-restore.sqlite"
+    )
+    try:
+        pid = runtime.process.spawn(goal="interrupt a finite-authority Skill read")
+        skill_id = _register_audit_skill(runtime)
+        resource = (
+            runtime.config.skills.registry_resource
+            if entrypoint == "discover"
+            else runtime.skills.resource_for(skill_id)
+        )
+        capability = runtime.capability.grant_once(
+            pid,
+            resource,
+            [CapabilityRight.READ],
+            issued_by="test.host",
+        )
+        objects_before = runtime.store.select_table_rows("objects")
+        loaded_before = deepcopy(runtime.process.get(pid).loaded_skills)
+
+        with pytest.raises(error_type):
+            _interrupt_skill_read(
+                runtime,
+                monkeypatch,
+                entrypoint=entrypoint,
+                pid=pid,
+                skill_id=skill_id,
+                error=error_type(),
+            )
+
+        persisted = runtime.store.get_capability(capability.cap_id)
+        assert persisted is not None
+        assert persisted.active
+        assert persisted.uses_remaining == 1
+        reservations = runtime.store.select_table_rows(
+            "capability_use_reservations",
+            "cap_id = ?",
+            (capability.cap_id,),
+        )
+        assert len(reservations) == 1
+        assert reservations[0]["status"] == "restored"
+        reservation_id = str(reservations[0]["reservation_id"])
+        assert any(
+            record.action == "capability.restore_reserved_use"
+            and record.decision.get("reservation_id") == reservation_id
+            for record in runtime.audit.trace(actor="skill")
+        )
+        assert any(
+            event.type == EventType.CAPABILITY_GRANTED
+            and event.source == "skill"
+            and event.payload.get("reservation_id") == reservation_id
+            for event in runtime.events.list(target=pid)
+        )
+        assert runtime.store.select_table_rows("objects") == objects_before
+        assert runtime.process.get(pid).loaded_skills == loaded_before
+        assert not any(
+            record.action in {"skill.activate", "skill.unload"}
+            for record in runtime.audit.trace(actor=pid)
+        )
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("entrypoint", ["discover", "inspect"])
+def test_interrupted_skill_read_cleanup_failure_is_visible_and_abandoned_on_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    database = tmp_path / f"skill-{entrypoint}-cleanup-failure.sqlite"
+    runtime = Runtime.open(database)
+    capability_id = ""
+    reservation_id = ""
+    try:
+        pid = runtime.process.spawn(goal="fail finite Skill read cleanup")
+        skill_id = _register_audit_skill(runtime)
+        resource = (
+            runtime.config.skills.registry_resource
+            if entrypoint == "discover"
+            else runtime.skills.resource_for(skill_id)
+        )
+        capability = runtime.capability.grant_once(
+            pid,
+            resource,
+            [CapabilityRight.READ],
+            issued_by="test.host",
+        )
+        capability_id = capability.cap_id
+
+        def fail_restore(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise RuntimeError("forced Skill authority cleanup failure")
+
+        monkeypatch.setattr(
+            runtime.capability,
+            "restore_reserved_use",
+            fail_restore,
+        )
+        cancellation = _SkillReadCancelled("cancel the Skill read")
+        with pytest.raises(_SkillReadCancelled) as raised:
+            _interrupt_skill_read(
+                runtime,
+                monkeypatch,
+                entrypoint=entrypoint,
+                pid=pid,
+                skill_id=skill_id,
+                error=cancellation,
+            )
+
+        assert raised.value is cancellation
+        assert any(
+            "authority remains fail closed: RuntimeError" in note
+            for note in getattr(raised.value, "__notes__", ())
+        )
+        persisted = runtime.store.get_capability(capability_id)
+        assert persisted is not None
+        assert not persisted.active
+        assert persisted.uses_remaining == 0
+        reservations = runtime.store.select_table_rows(
+            "capability_use_reservations",
+            "cap_id = ?",
+            (capability_id,),
+        )
+        assert len(reservations) == 1
+        assert reservations[0]["status"] == "reserved"
+        reservation_id = str(reservations[0]["reservation_id"])
+        assert not any(
+            record.action == "capability.restore_reserved_use"
+            for record in runtime.audit.trace(actor="skill")
+        )
+    finally:
+        runtime.close()
+
+    reopened = Runtime.open(database)
+    try:
+        persisted = reopened.store.get_capability(capability_id)
+        assert persisted is not None
+        assert not persisted.active
+        assert persisted.uses_remaining == 0
+        reservation = reopened.store.get_capability_use_reservation(
+            reservation_id
+        )
+        assert reservation is not None
+        assert reservation["status"] == "abandoned"
+    finally:
+        reopened.close()

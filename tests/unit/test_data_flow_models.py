@@ -8,6 +8,9 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agent_libos.config import AgentLibOSConfig, DEFAULT_CONFIG, DataFlowDefaults, load_config_file
 from agent_libos.models import (
+    CapabilityDecision,
+    CapabilityEffect,
+    CapabilityRight,
     DataFlowContext,
     DataIntegrity,
     DataLabels,
@@ -21,6 +24,7 @@ from agent_libos.models import (
     sink_pattern_matches,
 )
 from agent_libos.models.exceptions import ValidationError
+from agent_libos.runtime.data_flow_manager import DataFlowManager
 from agent_libos.storage import SQLiteStore
 from agent_libos.utils.ids import utc_now
 
@@ -148,6 +152,87 @@ def test_release_binding_normalizes_to_exact_payload_free_json_shape() -> None:
     }
     with pytest.raises(ValueError, match="unknown fields"):
         DataReleaseBinding.from_dict({**binding.to_dict(), "payload": "secret"})
+
+
+@pytest.mark.parametrize("invalid_count", [True, 1.0, 1.5, "1"])
+def test_reserved_release_binding_rejects_non_exact_backend_count(
+    invalid_count: object,
+) -> None:
+    binding = DataReleaseBinding(
+        sink="jsonrpc:crm:update",
+        sink_identity_sha256=_SHA_A,
+        trust_id="trust-a",
+        trust_hash=_SHA_B,
+        registry_generation=7,
+        manifest_hash=_SHA_C,
+        labels_hash=_SHA_A,
+        source_refs_hash=_SHA_B,
+        payload_hash=_SHA_C,
+        operation="jsonrpc.call",
+    )
+    cap_id = "cap_release_once"
+    decision = CapabilityDecision(
+        subject="pid_release",
+        resource=f"{DataFlowManager.RELEASE_RESOURCE_PREFIX}{binding.sink}",
+        right=CapabilityRight.APPROVE.value,
+        allowed=True,
+        effect=CapabilityEffect.ALLOW,
+        reason="release approved",
+        selected_capability_id=cap_id,
+        consume_capability_id=cap_id,
+        context={DataFlowManager.RELEASE_BINDING_KEY: binding.to_dict()},
+    )
+
+    class FakeReservationStore:
+        @staticmethod
+        def get_capability_use_reservation(_reservation_id: str) -> dict[str, object]:
+            return {
+                "status": "reserved",
+                "cap_id": cap_id,
+                "count": invalid_count,
+            }
+
+    manager = object.__new__(DataFlowManager)
+    manager.store = FakeReservationStore()
+
+    assert manager._matching_reserved_release_decision(
+        "pid_release",
+        binding,
+        decision,
+        "reservation_release",
+    ) is None
+
+
+@pytest.mark.parametrize("schema_version", (True, 1.0, "1", None))
+def test_authority_data_flow_schema_versions_reject_non_integer_aliases(
+    schema_version: object,
+) -> None:
+    with pytest.raises(ValueError, match="unsupported data release binding schema_version"):
+        DataReleaseBinding(
+            sink="jsonrpc:crm:update",
+            sink_identity_sha256=_SHA_A,
+            trust_id="trust-a",
+            trust_hash=_SHA_B,
+            registry_generation=7,
+            manifest_hash=_SHA_C,
+            labels_hash=_SHA_A,
+            source_refs_hash=_SHA_B,
+            payload_hash=_SHA_C,
+            operation="jsonrpc.call",
+            schema_version=schema_version,  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValueError, match="unsupported sink trust schema_version"):
+        SinkTrustSpec(
+            trust_id="trust-a",
+            pattern="human:owner:terminal",
+            trust_level="trusted",
+            max_sensitivity="secret",
+            generation=1,
+            created_by="test",
+            created_at="2026-01-01T00:00:00+00:00",
+            schema_version=schema_version,  # type: ignore[arg-type]
+        )
 
 
 def test_data_flow_config_defaults_to_untrusted_normal_and_loads_rules(tmp_path: Path) -> None:

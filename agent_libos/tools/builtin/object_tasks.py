@@ -123,7 +123,14 @@ class StartObjectTaskTool(SyncAgentTool[StartObjectTaskArgs]):
     policy = ToolPolicy(
         side_effects=True,
         idempotent=False,
-        declared_permissions={"object.write", "object.link", "process.spawn", "process.message", "tool.call"},
+        declared_permissions={
+            "object.read",
+            "object.write",
+            "object.link",
+            "process.spawn",
+            "process.message",
+            "tool.call",
+        },
         timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
     )
     tags = ["memory", "object", "task", "async"]
@@ -148,10 +155,18 @@ class StartObjectTaskTool(SyncAgentTool[StartObjectTaskArgs]):
 
 class GetObjectTaskTool(SyncAgentTool[GetObjectTaskArgs]):
     name = "get_object_task"
-    description = "Inspect an Object task if this process owns it or can read its owner object."
+    description = (
+        "Inspect an Object task if this process owns it or can read its owner object. "
+        "Inspection may reconcile runner state, retry a notification, or schedule a safe resume."
+    )
     args_schema = GetObjectTaskArgs
     output_schema = GetObjectTaskOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.read", "process.message", "tool.call"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["memory", "object", "task", "inspect"]
 
     def run(self, args: GetObjectTaskArgs, ctx: ToolContext) -> GetObjectTaskOutput:
@@ -161,10 +176,18 @@ class GetObjectTaskTool(SyncAgentTool[GetObjectTaskArgs]):
 
 class ListObjectTasksTool(SyncAgentTool[ListObjectTasksArgs]):
     name = "list_object_tasks"
-    description = "List Object tasks visible to this process."
+    description = (
+        "List Object tasks visible to this process. Candidate refresh may reconcile "
+        "runner state and publish a terminal notification."
+    )
     args_schema = ListObjectTasksArgs
     output_schema = ListObjectTasksOutput
-    policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.read", "process.message"},
+        timeout_s=_TOOL_DEFAULTS.standard_timeout_s,
+    )
     tags = ["memory", "object", "task", "inspect"]
 
     def run(self, args: ListObjectTasksArgs, ctx: ToolContext) -> ListObjectTasksOutput:
@@ -204,7 +227,12 @@ class WaitObjectTaskTool(SyncAgentTool[WaitObjectTaskArgs]):
     )
     args_schema = WaitObjectTaskArgs
     output_schema = WaitObjectTaskOutput
-    policy = ToolPolicy(side_effects=False, idempotent=False, timeout_s=_TOOL_DEFAULTS.sleep_tool_timeout_s)
+    policy = ToolPolicy(
+        side_effects=True,
+        idempotent=False,
+        declared_permissions={"object.read", "process.message", "tool.call"},
+        timeout_s=_TOOL_DEFAULTS.sleep_tool_timeout_s,
+    )
     tags = ["memory", "object", "task", "wait"]
 
     def run(self, args: WaitObjectTaskArgs, ctx: ToolContext) -> WaitObjectTaskOutput:

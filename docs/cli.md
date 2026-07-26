@@ -83,11 +83,13 @@ reopen. Accepted legacy rows from older development builds may still contain
 full JSON payload data; see [Runtime Storage](storage.md#transaction-model).
 Persistent stores also take an active-runtime lease. SQLite derives both the
 connection target and lease from the canonical database path, so a symlink
-alias cannot open a second writer. Where `fcntl` plus `O_NOFOLLOW` are
-available, the sidecar is opened no-follow, regular-file/inode checked, and
-protected by `flock`, while the database and SQLite sidecars are tightened to
-owner-only (`0600`); otherwise SQLite's kernel-managed exclusive database
-lock is used instead of a stale-file protocol. PostgreSQL uses a session
+alias cannot open a second writer. On the hardened POSIX path, the no-follow
+path-sidecar `flock` is paired with an owner-only identity lease keyed by the
+validated database `(st_dev, st_ino)`. The database, lease, identity-lease, and
+SQLite sidecars must be regular, current-user-owned, single-link files and are
+tightened to `0600`, rejecting hard links and path/lockfile replacement.
+Otherwise SQLite's kernel-managed exclusive database lock is used without
+claiming those POSIX path/inode guarantees. PostgreSQL uses a session
 advisory key scoped to `current_database()` plus `current_schema()`. A second
 writable Runtime cannot open the same database/schema target while a live owner
 holds the lease. A normal close or process/session termination releases it;
@@ -391,10 +393,12 @@ when full-I/O persistence is disabled.
 Full LLM input/output persistence is enabled by default for self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. Set
 `config.llm.persist_full_io=False` when a user or operator opts out of storing
-sensitive prompt, tool, reasoning, provider-error, and provider payload fields.
-The runtime then writes canonical content-free summary envelopes with byte
-counts, JSON shape/count metadata when available, and hashes; it does not keep
-readable previews of those fields. An `image_only` Image cannot run under this
+sensitive prompt, tool, reasoning, successful response, and raw provider
+response fields. Provider and extension exception text is never persisted or
+exposed to the model, regardless of this setting. The opt-out writes canonical
+content-free summary envelopes with byte counts, JSON shape/count metadata when
+available, and hashes; it does not keep readable previews of those fields. An
+`image_only` Image cannot run under this
 opt-out because it requires an exact durable transcript head; choose another
 prompt mode when content-free write-time persistence is required.
 
@@ -760,7 +764,12 @@ an uncommitted restore.
 Fork similarly returns `status: forked` after complete publication, or
 `status: forked_with_warnings` with `main_state_committed: true` when its
 post-commit event/audit sink fails. Do not retry that warning result as an
-uncommitted fork.
+uncommitted fork. An actor-scoped fork requires `execute` on the exact
+checkpoint and `write` for each missing captured image, plus matching startup
+Modules. It does not overwrite an already registered same-ID image; the fork
+can therefore combine captured state/tool bindings with that ID's current image
+contract. Treat this as reviewed contract drift, not replay equivalence; see
+[Checkpoint and Restore Semantics](checkpoints.md#fork-from-checkpoint).
 
 ## Skill Commands
 
@@ -769,9 +778,14 @@ uv run agent-libos --db .agent_libos.sqlite skills discover
 uv run agent-libos --db .agent_libos.sqlite skills validate skills/swe-agent
 uv run agent-libos --db .agent_libos.sqlite skills inspect swe-agent
 uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills discover --text swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent --expected-package-sha256 <package_sha256-from-discover>
 uv run agent-libos --db .agent_libos.sqlite skills unload <pid> swe-agent
 ```
+
+`skills activate` compare-and-swaps against the exact lowercase
+`package_sha256` returned by `skills discover`; rediscover instead of retrying
+if package content changes.
 
 Global Skills require exact package SHA-256 trust:
 
@@ -798,6 +812,10 @@ uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:
 uv run agent-libos --db .agent_libos.sqlite capabilities delegate <parent_pid> <child_pid> 'filesystem:workspace:src/*' --rights read
 uv run agent-libos --db .agent_libos.sqlite capabilities revoke <capability_id> --reason "no longer needed"
 ```
+
+`capabilities list --limit` defaults to `capability.list_limit` from the active
+Host configuration (100 by default). The same configured value is the maximum
+accepted page size, so an explicit `--limit` must be between 1 and that value.
 
 Capability records are structured authority statements: typed resource
 pattern, rights, `allow`/`deny`/`ask` effect, issuer lineage, delegation depth,

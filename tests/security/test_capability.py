@@ -1,7 +1,7 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from threading import Barrier
+from threading import Barrier, Event as ThreadEvent
 import pytest
 import contextlib
 import io
@@ -10,13 +10,66 @@ import tempfile
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
-from agent_libos.models import CapabilityEffect, CapabilityRight, CapabilitySpec, CapabilityStatus, EventType
+from agent_libos.capability.effect_binding import canonical_effect_hash
+from agent_libos.models import Capability, CapabilityEffect, CapabilityRight, CapabilitySpec, CapabilityStatus, DelegationPolicy, EventType, TaskAuthorityManifest
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
+from agent_libos.tools.base import ToolContext, ToolErrorCode
+from agent_libos.tools.builtin.capabilities import DelegateCapabilityTool
 
 
 def _grant_process_spawn(runtime: Runtime, pid: str) -> None:
     runtime.capability.grant(pid, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+
+
+def _capability_admission_state(runtime: Runtime, pid: str) -> tuple[object, ...]:
+    return (
+        runtime.store.list_capabilities(subject=pid),
+        [record.record_id for record in runtime.store.list_audit()],
+        [event.event_id for event in runtime.events.list()],
+        runtime.store.select_table_rows(
+            'capability_use_reservations',
+            order_by='reservation_id',
+        ),
+    )
+
+
+def _assert_rule_rejected_at_admission(
+    runtime: Runtime,
+    pid: str,
+    rule: dict[str, object],
+    *,
+    error_match: str,
+) -> None:
+    runtime.capability.grant(
+        pid,
+        'shell:git',
+        [CapabilityRight.EXECUTE],
+        issued_by='test',
+    )
+    finite_grant = runtime.capability.grant_once(
+        pid,
+        'shell:git',
+        [CapabilityRight.GRANT],
+        issued_by='test',
+    )
+    before = _capability_admission_state(runtime, pid)
+
+    with pytest.raises(ValidationError, match=error_match):
+        runtime.capability.issue(
+            pid,
+            pid,
+            CapabilitySpec(
+                resource='shell:git',
+                rights={CapabilityRight.EXECUTE.value},
+                constraints={'authority_rules': [rule]},
+            ),
+        )
+
+    assert _capability_admission_state(runtime, pid) == before
+    persisted_grant = runtime.store.get_capability(finite_grant.cap_id)
+    assert persisted_grant is not None
+    assert persisted_grant.uses_remaining == 1
 
 
 class TestCapabilityManager:
@@ -74,6 +127,232 @@ class TestCapabilityManager:
             assert not decision.allowed
             assert decision.effect == CapabilityEffect.DENY
             assert decision.selected_capability_id == deny.cap_id
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("restrictive_rule_first", [True, False])
+    def test_deny_authority_rule_inside_allow_capability_dominates_across_issuance_order(
+        self,
+        restrictive_rule_first: bool,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='rule deny precedence')
+
+            def issue_restrictive_rule() -> Capability:
+                return runtime.capability.issue_trusted(
+                    pid,
+                    'shell:git',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                    constraints={
+                        'authority_rules': [
+                            {
+                                'rule_id': 'test.git.push.cross-capability-deny',
+                                'operation': 'shell.run',
+                                'effect': 'deny',
+                                'risk': 'high',
+                                'conditions': {'argv': ['git', 'push'], 'match': 'prefix'},
+                            }
+                        ]
+                    },
+                )
+
+            if restrictive_rule_first:
+                restrictive = issue_restrictive_rule()
+                runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
+            else:
+                runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
+                restrictive = issue_restrictive_rule()
+
+            decision = runtime.capability.authorize(
+                pid,
+                'shell:git',
+                CapabilityRight.EXECUTE,
+                {
+                    'operation': 'shell.run',
+                    'authority_operation': 'shell.run',
+                    'argv': ['git', 'push', 'origin'],
+                },
+            )
+
+            assert not decision.allowed
+            assert decision.effect == CapabilityEffect.DENY
+            assert decision.selected_capability_id == restrictive.cap_id
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("ask_first", [True, False])
+    def test_ask_dominates_allow_across_issuance_order(self, ask_first: bool) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='ask precedence')
+
+            def issue_ask() -> Capability:
+                return runtime.capability.issue_trusted(
+                    pid,
+                    'shell:tool',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                    effect=CapabilityEffect.ASK,
+                )
+
+            if ask_first:
+                ask = issue_ask()
+                runtime.capability.grant(pid, 'shell:tool', [CapabilityRight.EXECUTE], issued_by='test')
+            else:
+                runtime.capability.grant(pid, 'shell:tool', [CapabilityRight.EXECUTE], issued_by='test')
+                ask = issue_ask()
+
+            decision = runtime.capability.authorize(pid, 'shell:tool', CapabilityRight.EXECUTE)
+
+            assert not decision.allowed
+            assert decision.effect == CapabilityEffect.ASK
+            assert decision.selected_capability_id == ask.cap_id
+        finally:
+            runtime.close()
+
+    def test_precedence_keeps_finite_allow_selection_and_consumption(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='finite allow selection')
+            runtime.capability.grant(pid, 'object:finite-selection', [CapabilityRight.READ], issued_by='test')
+            finite = runtime.capability.issue_trusted(
+                pid,
+                'object:finite-selection',
+                [CapabilityRight.READ],
+                issued_by='test',
+                uses_remaining=1,
+            )
+
+            decision = runtime.capability.authorize(pid, finite.resource, CapabilityRight.READ)
+
+            assert decision.allowed
+            assert decision.selected_capability_id == finite.cap_id
+            assert decision.consume_capability_id == finite.cap_id
+        finally:
+            runtime.close()
+
+    def test_exact_one_shot_approval_binding_resolves_ask_and_is_selected_for_consumption(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='bound approval precedence')
+            resource = 'mcp:approved:echo'
+            context = {
+                'operation': 'mcp.call',
+                'authority_operation': 'mcp.call',
+                'resource': resource,
+                'right': CapabilityRight.READ.value,
+                'registry_generation': 2,
+            }
+            runtime.capability.set_permission_policy(
+                pid,
+                resource,
+                [CapabilityRight.READ],
+                runtime.capability.ASK_EACH_TIME,
+                issued_by='test',
+            )
+            approval = runtime.capability.issue_trusted(
+                pid,
+                resource,
+                [CapabilityRight.READ],
+                issued_by='human',
+                uses_remaining=1,
+                constraints={
+                    runtime.capability.APPROVAL_BINDING_KEY: {
+                        'effect_id': 'eff_exact_approval',
+                        'canonical_args_hash': canonical_effect_hash(context),
+                        'target_state_version': None,
+                    }
+                },
+            )
+
+            decision = runtime.capability.authorize(pid, resource, CapabilityRight.READ, context)
+
+            assert decision.allowed
+            assert decision.selected_capability_id == approval.cap_id
+            assert decision.consume_capability_id == approval.cap_id
+            assert decision.constraint_results[runtime.capability.APPROVAL_BINDING_KEY]['ok']
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('approved_context', 'actual_context'),
+        [
+            (
+                {
+                    'operation': 'mcp.call',
+                    'authority_operation': 'mcp.call',
+                    'resource': 'mcp:approved:echo',
+                    'right': 'read',
+                },
+                {
+                    'operation': 'mcp.list_tools',
+                    'authority_operation': 'mcp.list_tools',
+                    'resource': 'mcp:approved:echo',
+                    'right': 'read',
+                },
+            ),
+            (
+                {
+                    'operation': 'mcp.call',
+                    'authority_operation': 'mcp.call',
+                    'resource': 'mcp:approved:echo',
+                    'right': 'read',
+                    'registry_generation': 1,
+                },
+                {
+                    'operation': 'mcp.call',
+                    'authority_operation': 'mcp.call',
+                    'resource': 'mcp:approved:echo',
+                    'right': 'read',
+                    'registry_generation': 2,
+                },
+            ),
+        ],
+    )
+    def test_stale_or_other_operation_approval_binding_cannot_resolve_ask(
+        self,
+        approved_context: dict[str, object],
+        actual_context: dict[str, object],
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='stale approval rejection')
+            resource = 'mcp:approved:echo'
+            ask = runtime.capability.set_permission_policy(
+                pid,
+                resource,
+                [CapabilityRight.READ],
+                runtime.capability.ASK_EACH_TIME,
+                issued_by='test',
+            )
+            runtime.capability.issue_trusted(
+                pid,
+                resource,
+                [CapabilityRight.READ],
+                issued_by='human',
+                uses_remaining=1,
+                constraints={
+                    runtime.capability.APPROVAL_BINDING_KEY: {
+                        'effect_id': 'eff_stale_approval',
+                        'canonical_args_hash': canonical_effect_hash(approved_context),
+                        'target_state_version': None,
+                    }
+                },
+            )
+
+            decision = runtime.capability.authorize(
+                pid,
+                resource,
+                CapabilityRight.READ,
+                actual_context,
+            )
+
+            assert not decision.allowed
+            assert decision.effect == CapabilityEffect.ASK
+            assert decision.selected_capability_id == ask.cap_id
+            assert decision.consume_capability_id is None
         finally:
             runtime.close()
 
@@ -263,6 +542,355 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_delegation_policy_fields_require_exact_types_before_issue_side_effects(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='strict delegation fields')
+            invalid_specs: list[CapabilitySpec | dict[str, object]] = [
+                {'resource': 'object:invalid-top-delegable', 'rights': ['read'], 'delegable': 'false'},
+                {'resource': 'object:invalid-top-revocable-zero', 'rights': ['read'], 'revocable': 0},
+                {'resource': 'object:invalid-top-revocable-one', 'rights': ['read'], 'revocable': 1},
+                {'resource': 'object:invalid-top-depth-bool', 'rights': ['read'], 'max_delegation_depth': True},
+                {'resource': 'object:invalid-top-depth-float', 'rights': ['read'], 'max_delegation_depth': 1.0},
+                {'resource': 'object:invalid-top-depth-string', 'rights': ['read'], 'max_delegation_depth': '1'},
+                {'resource': 'object:invalid-top-depth-negative', 'rights': ['read'], 'max_delegation_depth': -1},
+                {
+                    'resource': 'object:invalid-nested-delegable',
+                    'rights': ['read'],
+                    'delegation': {'delegable': 'false'},
+                },
+                {
+                    'resource': 'object:invalid-nested-revocable',
+                    'rights': ['read'],
+                    'delegation': {'revocable': 1},
+                },
+                {
+                    'resource': 'object:invalid-nested-depth',
+                    'rights': ['read'],
+                    'delegation': {'max_delegation_depth': True},
+                },
+                CapabilitySpec(
+                    resource='object:invalid-spec-instance',
+                    rights={CapabilityRight.READ.value},
+                    delegable='false',  # type: ignore[arg-type]
+                ),
+                CapabilitySpec(
+                    resource='object:invalid-policy-instance',
+                    rights={CapabilityRight.READ.value},
+                    delegation=DelegationPolicy(
+                        delegable='false',  # type: ignore[arg-type]
+                        max_delegation_depth=1.0,  # type: ignore[arg-type]
+                    ),
+                ),
+            ]
+
+            for spec in invalid_specs:
+                before_caps = runtime.store.list_capabilities(subject=pid)
+                before_audit = runtime.store.list_audit()
+
+                with pytest.raises(
+                    ValidationError,
+                    match='delegable|revocable|max_delegation_depth',
+                ):
+                    runtime.capability.issue(
+                        'test',
+                        pid,
+                        spec,
+                        require_authority=False,
+                    )
+
+                assert runtime.store.list_capabilities(subject=pid) == before_caps
+                assert runtime.store.list_audit() == before_audit
+
+            zero_depth = runtime.capability.issue(
+                'test',
+                pid,
+                {
+                    'resource': 'object:valid-depth-zero',
+                    'rights': ['read'],
+                    'delegable': False,
+                    'revocable': True,
+                    'max_delegation_depth': 0,
+                },
+                require_authority=False,
+            )
+            one_depth = runtime.capability.issue(
+                'test',
+                pid,
+                {
+                    'resource': 'object:valid-depth-one',
+                    'rights': ['read'],
+                    'delegation': {
+                        'delegable': True,
+                        'revocable': False,
+                        'max_delegation_depth': 1,
+                    },
+                },
+                require_authority=False,
+            )
+            assert (zero_depth.delegable, zero_depth.revocable, zero_depth.max_delegation_depth) == (False, True, 0)
+            assert (one_depth.delegable, one_depth.revocable, one_depth.max_delegation_depth) == (True, False, 1)
+        finally:
+            runtime.close()
+
+    def test_capability_spec_containers_reject_coercion_before_issue_side_effects(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='strict capability containers')
+            invalid_specs: list[CapabilitySpec | dict[str, object]] = [
+                {'resource': 7, 'rights': ['read']},
+                {'resource': 'object:rights-string', 'rights': 'read'},
+                {'resource': 'object:rights-mapping', 'rights': {'read': False}},
+                {'resource': 'object:rights-tuple', 'rights': ('read',)},
+                {'resource': 'object:constraints-false', 'rights': ['read'], 'constraints': False},
+                {'resource': 'object:constraints-list', 'rights': ['read'], 'constraints': []},
+                {
+                    'resource': 'object:constraints-pairs',
+                    'rights': ['read'],
+                    'constraints': [('purpose', 'laundered')],
+                },
+                {'resource': 'object:constraints-key', 'rights': ['read'], 'constraints': {1: 'bad'}},
+                {'resource': 'object:metadata-false', 'rights': ['read'], 'metadata': False},
+                {'resource': 'object:metadata-list', 'rights': ['read'], 'metadata': []},
+                {'resource': 'object:metadata-key', 'rights': ['read'], 'metadata': {1: 'bad'}},
+                {'resource': 'object:rules-false', 'rights': ['read'], 'rules': False},
+                {'resource': 'object:rules-mapping', 'rights': ['read'], 'rules': {}},
+                CapabilitySpec(
+                    resource='object:spec-rights-mapping',
+                    rights={'read': False},  # type: ignore[arg-type]
+                ),
+                CapabilitySpec(
+                    resource='object:spec-constraints-false',
+                    rights={CapabilityRight.READ.value},
+                    constraints=False,  # type: ignore[arg-type]
+                ),
+                CapabilitySpec(
+                    resource='object:spec-metadata-list',
+                    rights={CapabilityRight.READ.value},
+                    metadata=[],  # type: ignore[arg-type]
+                ),
+            ]
+
+            for spec in invalid_specs:
+                before_caps = runtime.store.list_capabilities(subject=pid)
+                before_audit = runtime.store.list_audit()
+                before_events = runtime.events.list()
+
+                with pytest.raises(ValidationError, match='resource|rights|constraints|metadata|rules'):
+                    runtime.capability.issue(
+                        'test',
+                        pid,
+                        spec,
+                        require_authority=False,
+                    )
+
+                assert runtime.store.list_capabilities(subject=pid) == before_caps
+                assert runtime.store.list_audit() == before_audit
+                assert runtime.events.list() == before_events
+
+            valid_mapping = runtime.capability.issue(
+                'test',
+                pid,
+                {
+                    'resource': 'object:strict-valid-mapping',
+                    'rights': ['read'],
+                    'constraints': {},
+                    'metadata': {'source': 'test'},
+                    'rules': [],
+                },
+                require_authority=False,
+            )
+            valid_spec = runtime.capability.issue(
+                'test',
+                pid,
+                CapabilitySpec(
+                    resource='object:strict-valid-spec',
+                    rights=frozenset({CapabilityRight.READ.value}),  # type: ignore[arg-type]
+                    constraints={},
+                    metadata={},
+                    rules=(),  # type: ignore[arg-type]
+                ),
+                require_authority=False,
+            )
+            assert valid_mapping.rights == {CapabilityRight.READ.value}
+            assert valid_spec.rights == {CapabilityRight.READ.value}
+        finally:
+            runtime.close()
+
+    def test_trusted_capability_helpers_reject_falsey_container_laundering(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            invalid_calls = [
+                lambda: runtime.capability.issue_trusted(
+                    'worker',
+                    'object:trusted-constraints-list',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                    constraints=[],  # type: ignore[arg-type]
+                ),
+                lambda: runtime.capability.issue_trusted(
+                    'worker',
+                    'object:trusted-metadata-list',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                    metadata=[],  # type: ignore[arg-type]
+                ),
+                lambda: runtime.capability.grant(
+                    'worker',
+                    'object:trusted-grant-constraints-list',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                    constraints=[],  # type: ignore[arg-type]
+                ),
+                lambda: runtime.capability.grant_once(
+                    'worker',
+                    'object:trusted-once-constraints-list',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                    constraints=[],  # type: ignore[arg-type]
+                ),
+            ]
+
+            for call in invalid_calls:
+                before_caps = runtime.store.list_capabilities(subject='worker')
+                before_audit = runtime.store.list_audit()
+                before_events = runtime.events.list()
+
+                with pytest.raises(ValidationError, match='constraints|metadata'):
+                    call()
+
+                assert runtime.store.list_capabilities(subject='worker') == before_caps
+                assert runtime.store.list_audit() == before_audit
+                assert runtime.events.list() == before_events
+        finally:
+            runtime.close()
+
+    def test_capability_spec_schema_rejects_unknown_fields_before_issue(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            invalid_specs = [
+                {
+                    'resource': 'object:unknown-effect-field',
+                    'rights': ['read'],
+                    'effectt': 'deny',
+                },
+                {
+                    'resource': 'object:unknown-lease-field',
+                    'rights': ['read'],
+                    'lease': {'uses_remaning': 1},
+                },
+                {
+                    'resource': 'object:unknown-delegation-field',
+                    'rights': ['read'],
+                    'delegation': {
+                        'delegable': True,
+                        'max_delegation_dept': 0,
+                    },
+                },
+                {
+                    'resource': 'object:conflicting-lease-fields',
+                    'rights': ['read'],
+                    'uses_remaining': 1,
+                    'lease': {},
+                },
+                {
+                    'resource': 'object:conflicting-delegation-fields',
+                    'rights': ['read'],
+                    'delegable': False,
+                    'delegation': {
+                        'delegable': True,
+                        'max_delegation_depth': 2,
+                    },
+                },
+                {
+                    'resource': 'object:conflicting-policy-fields',
+                    'rights': ['read'],
+                    'policy': 'always_deny',
+                    'permission_policy': 'always_allow',
+                },
+            ]
+
+            for spec in invalid_specs:
+                before_caps = runtime.store.list_capabilities(subject='worker')
+                before_audit = runtime.store.list_audit()
+                before_events = runtime.events.list()
+
+                with pytest.raises(ValidationError, match='unknown|conflicting'):
+                    runtime.capability.issue(
+                        'test',
+                        'worker',
+                        spec,
+                        require_authority=False,
+                    )
+
+                assert runtime.store.list_capabilities(subject='worker') == before_caps
+                assert runtime.store.list_audit() == before_audit
+                assert runtime.events.list() == before_events
+        finally:
+            runtime.close()
+
+    def test_invalid_delegation_dataclass_is_rejected_before_delegate_side_effects(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='strict delegate parent')
+            child = runtime.process.spawn(image='base-agent:v0', goal='strict delegate child')
+            runtime.capability.grant(
+                parent,
+                'object:strict-delegate',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+            malformed = CapabilitySpec(
+                resource='object:strict-delegate',
+                rights={CapabilityRight.READ.value},
+                delegation=DelegationPolicy(
+                    delegable=True,
+                    revocable='false',  # type: ignore[arg-type]
+                    max_delegation_depth=1,
+                ),
+            )
+            before_caps = runtime.store.list_capabilities(subject=child)
+            before_audit = runtime.store.list_audit()
+
+            with pytest.raises(ValidationError, match='revocable'):
+                runtime.capability.delegate(parent, child, malformed)
+
+            assert runtime.store.list_capabilities(subject=child) == before_caps
+            assert runtime.store.list_audit() == before_audit
+        finally:
+            runtime.close()
+
+    def test_manifest_compile_prevalidates_all_delegation_fields_before_issuing_any_capability(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='strict manifest compile')
+            manifest = TaskAuthorityManifest(
+                manifest_id='authm_strict_delegation_test',
+                pid=pid,
+                image_id='base-agent:v0',
+                goal_ref=None,
+                authorized_capabilities=[
+                    {'resource': 'object:manifest-valid-first', 'rights': ['read']},
+                    {
+                        'resource': 'object:manifest-invalid-second',
+                        'rights': ['read'],
+                        'delegable': 'false',
+                    },
+                ],
+                issued_by='test',
+            )
+            before_caps = runtime.store.list_capabilities(subject=pid)
+            before_audit = runtime.store.list_audit()
+
+            with pytest.raises(ValidationError, match='delegable'):
+                runtime.authority_manifests.compile_root_capabilities(manifest)
+
+            assert runtime.store.list_capabilities(subject=pid) == before_caps
+            assert runtime.store.list_audit() == before_audit
+        finally:
+            runtime.close()
+
     def test_permission_policy_aliases_are_converted_to_effect_and_lease(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -349,6 +977,42 @@ class TestCapabilityManager:
                 {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'push']},
             )
             assert not decision.allowed
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'conditions',
+        [[], '', 0, False],
+        ids=['list', 'empty-string', 'zero', 'false'],
+    )
+    def test_authority_rule_falsey_non_mapping_conditions_are_rejected(
+        self,
+        conditions: object,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='strict rule conditions')
+
+            with pytest.raises(ValidationError, match='conditions must be a mapping'):
+                runtime.capability.issue_trusted(
+                    pid,
+                    'shell:git',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test',
+                    constraints={
+                        'authority_rules': [
+                            {
+                                'rule_id': 'test.strict.conditions',
+                                'operation': 'shell.run',
+                                'effect': 'allow',
+                                'risk': 'low',
+                                'conditions': conditions,
+                            }
+                        ]
+                    },
+                )
+
+            assert not runtime.capability.check(pid, 'shell:git', CapabilityRight.EXECUTE)
         finally:
             runtime.close()
 
@@ -446,24 +1110,17 @@ class TestCapabilityManager:
         runtime = Runtime.open('local')
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='malformed authority rule')
-            runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
-            runtime.capability.issue_trusted(
+            _assert_rule_rejected_at_admission(
+                runtime,
                 pid,
-                'shell:git',
-                [CapabilityRight.EXECUTE],
-                issued_by='test',
-                effect=CapabilityEffect.DENY,
-                constraints={
-                    'authority_rules': [
-                        {
-                            'rule_id': 'test.git.push.deny.typo',
-                            'operation': 'shell.run',
-                            'effect': 'deny',
-                            'risk': 'high',
-                            'conditions': {'argv_typo': ['git', 'push']},
-                        }
-                    ]
+                {
+                    'rule_id': 'test.git.push.deny.typo',
+                    'operation': 'shell.run',
+                    'effect': 'deny',
+                    'risk': 'high',
+                    'conditions': {'argv_typo': ['git', 'push']},
                 },
+                error_match='unknown conditions: argv_typo',
             )
 
             decision = runtime.capability.authorize(
@@ -473,10 +1130,7 @@ class TestCapabilityManager:
                 {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'push']},
             )
 
-            assert not decision.allowed
-            assert decision.effect == CapabilityEffect.DENY
-            assert decision.constraint_results['authority_rules']['rule_id'] == 'test.git.push.deny.typo'
-            assert decision.constraint_results['authority_rules']['unknown_conditions'] == ['argv_typo']
+            assert decision.allowed
         finally:
             runtime.close()
 
@@ -484,23 +1138,17 @@ class TestCapabilityManager:
         runtime = Runtime.open('local')
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='malformed known authority rule')
-            runtime.capability.grant(pid, 'shell:git', [CapabilityRight.EXECUTE], issued_by='test')
-            runtime.capability.issue_trusted(
+            _assert_rule_rejected_at_admission(
+                runtime,
                 pid,
-                'shell:git',
-                [CapabilityRight.EXECUTE],
-                issued_by='test',
-                constraints={
-                    'authority_rules': [
-                        {
-                            'rule_id': 'test.git.regex.malformed',
-                            'operation': 'shell.run',
-                            'effect': 'allow',
-                            'risk': 'low',
-                            'conditions': {'regex_token': '['},
-                        }
-                    ]
+                {
+                    'rule_id': 'test.git.regex.malformed',
+                    'operation': 'shell.run',
+                    'effect': 'allow',
+                    'risk': 'low',
+                    'conditions': {'regex_token': '['},
                 },
+                error_match='malformed conditions: regex_token',
             )
 
             decision = runtime.capability.authorize(
@@ -510,9 +1158,7 @@ class TestCapabilityManager:
                 {'authority_operation': 'shell.run', 'operation': 'shell.run', 'argv': ['git', 'status']},
             )
 
-            assert not decision.allowed
-            assert decision.effect == CapabilityEffect.DENY
-            assert decision.constraint_results['authority_rules']['malformed_conditions'] == ['regex_token']
+            assert decision.allowed
         finally:
             runtime.close()
 
@@ -537,22 +1183,17 @@ class TestCapabilityManager:
         runtime = Runtime.open('local')
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='invalid authority timeout')
-            runtime.capability.issue_trusted(
+            _assert_rule_rejected_at_admission(
+                runtime,
                 pid,
-                'shell:git',
-                [CapabilityRight.EXECUTE],
-                issued_by='test',
-                constraints={
-                    'authority_rules': [
-                        {
-                            'rule_id': f'test.timeout.invalid.{condition_name}',
-                            'operation': 'shell.run',
-                            'effect': 'allow',
-                            'risk': 'low',
-                            'conditions': {condition_name: condition_value},
-                        }
-                    ]
+                {
+                    'rule_id': f'test.timeout.invalid.{condition_name}',
+                    'operation': 'shell.run',
+                    'effect': 'allow',
+                    'risk': 'low',
+                    'conditions': {condition_name: condition_value},
                 },
+                error_match=f'malformed conditions: {condition_name}',
             )
 
             decision = runtime.capability.authorize(
@@ -562,8 +1203,7 @@ class TestCapabilityManager:
                 {'authority_operation': 'shell.run', 'operation': 'shell.run', 'timeout_s': 1.0},
             )
 
-            assert not decision.allowed
-            assert decision.constraint_results['authority_rules']['malformed_conditions'] == [condition_name]
+            assert decision.allowed
         finally:
             runtime.close()
 
@@ -786,6 +1426,694 @@ class TestCapabilityManager:
             with pytest.raises(CapabilityDenied):
                 runtime.capability.claim_decision_use(second, used_by=pid, reason='test claim')
             assert runtime.capability.inspect(cap.cap_id)['status'] == 'revoked'
+        finally:
+            runtime.close()
+
+    def test_claim_decision_use_reauthorizes_before_consuming_stale_allow(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='stale claim deny')
+            cap = runtime.capability.grant_once(
+                pid,
+                'object:stale-claim',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            decision = runtime.capability.authorize(
+                pid,
+                cap.resource,
+                CapabilityRight.READ,
+            )
+            runtime.capability.issue_trusted(
+                pid,
+                cap.resource,
+                [CapabilityRight.READ],
+                issued_by='test',
+                effect=CapabilityEffect.DENY,
+            )
+            before_reservations = runtime.store.select_table_rows(
+                'capability_use_reservations'
+            )
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                runtime.capability.claim_decision_use(
+                    decision,
+                    used_by=pid,
+                    reason='stale one-shot claim',
+                )
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.active
+            assert persisted.uses_remaining == 1
+            assert runtime.store.select_table_rows(
+                'capability_use_reservations'
+            ) == before_reservations
+        finally:
+            runtime.close()
+
+    def test_claim_decision_use_reauthorizes_unlimited_cached_allow(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='stale unlimited claim')
+            allow = runtime.capability.issue_trusted(
+                pid,
+                'object:stale-unlimited-claim',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            decision = runtime.capability.authorize(pid, allow.resource, CapabilityRight.READ)
+            assert decision.consume_capability_id is None
+            runtime.capability.issue_trusted(
+                pid,
+                allow.resource,
+                [CapabilityRight.READ],
+                issued_by='test',
+                effect=CapabilityEffect.DENY,
+            )
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                runtime.capability.claim_decision_use(
+                    decision,
+                    used_by=pid,
+                    reason='stale unlimited claim',
+                )
+
+            assert runtime.store.get_capability(allow.cap_id) == allow
+        finally:
+            runtime.close()
+
+    def test_reserve_decision_use_reauthorizes_before_reserving(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='stale reserve')
+            cap = runtime.capability.grant_once(
+                pid,
+                'object:stale-reserve',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            decision = runtime.capability.authorize(pid, cap.resource, CapabilityRight.READ)
+            runtime.capability.issue_trusted(
+                pid,
+                cap.resource,
+                [CapabilityRight.READ],
+                issued_by='test',
+                effect=CapabilityEffect.DENY,
+            )
+            before_rows = runtime.store.select_table_rows('capability_use_reservations')
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                runtime.capability.reserve_decision_use(
+                    decision,
+                    used_by=pid,
+                    reason='stale reservation',
+                )
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 1
+            assert runtime.store.select_table_rows('capability_use_reservations') == before_rows
+        finally:
+            runtime.close()
+
+    def test_require_reauthorizes_inside_claim_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='require race')
+            cap = runtime.capability.grant_once(
+                pid,
+                'object:require-race',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            original_transaction = runtime.capability.authority_transaction
+            inserted = False
+
+            def install_deny_before_transaction(decisions, *, actor, operation):
+                nonlocal inserted
+                if not inserted and operation == 'test require transaction':
+                    inserted = True
+                    runtime.capability.issue_trusted(
+                        pid,
+                        cap.resource,
+                        [CapabilityRight.READ],
+                        issued_by='test',
+                        effect=CapabilityEffect.DENY,
+                    )
+                return original_transaction(
+                    decisions,
+                    actor=actor,
+                    operation=operation,
+                )
+
+            monkeypatch.setattr(
+                runtime.capability,
+                'authority_transaction',
+                install_deny_before_transaction,
+            )
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                runtime.capability.require(
+                    pid,
+                    cap.resource,
+                    CapabilityRight.READ,
+                    reason='test require transaction',
+                )
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 1
+        finally:
+            runtime.close()
+
+    def test_assert_handle_reauthorizes_exact_named_capability_without_broad_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='exact handle claim')
+            handle = runtime.capability.handle_for_object(
+                pid,
+                'exact-handle-claim',
+                [CapabilityRight.READ],
+                issued_by='test',
+                uses_remaining=1,
+            )
+            runtime.capability.issue_trusted(
+                pid,
+                'object:*',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            original_authorize_handle = runtime.capability.authorize_handle
+            first = True
+
+            def revoke_after_cached_handle_allow(subject, selected_handle, right):
+                nonlocal first
+                decision = original_authorize_handle(subject, selected_handle, right)
+                if first:
+                    first = False
+                    runtime.capability.revoke(
+                        handle.capability_id,
+                        revoked_by='test',
+                        reason='invalidate cached handle decision',
+                        require_authority=False,
+                    )
+                return decision
+
+            monkeypatch.setattr(
+                runtime.capability,
+                'authorize_handle',
+                revoke_after_cached_handle_allow,
+            )
+
+            with pytest.raises(CapabilityDenied, match='handle authority changed'):
+                runtime.capability.assert_handle(pid, handle, CapabilityRight.READ)
+
+            persisted = runtime.store.get_capability(handle.capability_id)
+            assert persisted is not None
+            assert persisted.status == CapabilityStatus.REVOKED
+            assert persisted.uses_remaining == 1
+            assert runtime.capability.check(pid, f'object:{handle.oid}', CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('state_change', ['revoke', 'expire'])
+    def test_claim_decision_use_rejects_revoked_or_expired_binding(
+        self,
+        state_change: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'stale claim {state_change}')
+            cap = runtime.capability.grant_once(
+                pid,
+                f'object:stale-claim-{state_change}',
+                [CapabilityRight.READ],
+                issued_by='test',
+                expires_at='2999-01-01T00:00:00Z',
+            )
+            decision = runtime.capability.authorize(
+                pid,
+                cap.resource,
+                CapabilityRight.READ,
+            )
+            if state_change == 'revoke':
+                runtime.capability.revoke(
+                    cap.cap_id,
+                    revoked_by='test',
+                    reason='invalidate cached decision',
+                )
+            else:
+                runtime.store.update_capability(
+                    replace(cap, expires_at='2000-01-01T00:00:00+00:00')
+                )
+            before_reservations = runtime.store.select_table_rows(
+                'capability_use_reservations'
+            )
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                runtime.capability.claim_decision_use(
+                    decision,
+                    used_by=pid,
+                    reason=f'stale {state_change} claim',
+                )
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None
+            assert persisted.uses_remaining == 1
+            assert runtime.store.select_table_rows(
+                'capability_use_reservations'
+            ) == before_reservations
+        finally:
+            runtime.close()
+
+    def test_concurrent_deny_commit_linearizes_before_cached_claim(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='concurrent deny claim')
+            cap = runtime.capability.grant_once(
+                pid,
+                'object:concurrent-deny-claim',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            decision = runtime.capability.authorize(
+                pid,
+                cap.resource,
+                CapabilityRight.READ,
+            )
+            deny_inserted = ThreadEvent()
+            claim_started = ThreadEvent()
+
+            def install_deny() -> str:
+                with runtime.store.transaction():
+                    runtime.capability.issue_trusted(
+                        pid,
+                        cap.resource,
+                        [CapabilityRight.READ],
+                        issued_by='test',
+                        effect=CapabilityEffect.DENY,
+                    )
+                    deny_inserted.set()
+                    assert claim_started.wait(timeout=5)
+                return 'deny_committed'
+
+            def claim() -> str:
+                assert deny_inserted.wait(timeout=5)
+                claim_started.set()
+                try:
+                    runtime.capability.claim_decision_use(
+                        decision,
+                        used_by=pid,
+                        reason='concurrent stale claim',
+                    )
+                except CapabilityDenied:
+                    return 'denied'
+                return 'claimed'
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                deny_future = pool.submit(install_deny)
+                claim_future = pool.submit(claim)
+                assert deny_future.result(timeout=10) == 'deny_committed'
+                assert claim_future.result(timeout=10) == 'denied'
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.active
+            assert persisted.uses_remaining == 1
+        finally:
+            runtime.close()
+
+    def test_concurrent_cached_one_shot_claim_has_one_winner(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='concurrent one-shot claim')
+            cap = runtime.capability.grant_once(
+                pid,
+                'object:concurrent-one-shot-claim',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            decisions = [
+                runtime.capability.authorize(pid, cap.resource, CapabilityRight.READ)
+                for _ in range(2)
+            ]
+            barrier = Barrier(2)
+
+            def claim(decision: object) -> str:
+                barrier.wait(timeout=5)
+                try:
+                    runtime.capability.claim_decision_use(
+                        decision,  # type: ignore[arg-type]
+                        used_by=pid,
+                        reason='concurrent one-shot claim',
+                    )
+                except CapabilityDenied:
+                    return 'denied'
+                return 'claimed'
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(claim, decisions))
+
+            assert sorted(results) == ['claimed', 'denied']
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None
+            assert persisted.uses_remaining == 0
+            assert persisted.status == CapabilityStatus.REVOKED
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('failed_sink', ['reserve_audit', 'revoke_event', 'commit_audit'])
+    def test_claim_decision_use_sink_failure_rolls_back_lease_and_evidence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        failed_sink: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'claim rollback {failed_sink}')
+            cap = runtime.capability.grant_once(
+                pid,
+                f'object:claim-rollback-{failed_sink}',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            decision = runtime.capability.authorize(
+                pid,
+                cap.resource,
+                CapabilityRight.READ,
+            )
+            before_reservations = runtime.store.select_table_rows(
+                'capability_use_reservations'
+            )
+            before_audit_ids = {
+                record.record_id for record in runtime.store.list_audit()
+            }
+            before_event_ids = {
+                event.event_id for event in runtime.events.list()
+            }
+            if failed_sink in {'reserve_audit', 'commit_audit'}:
+                original_record = runtime.audit.record
+                failed_action = (
+                    'capability.reserve_use'
+                    if failed_sink == 'reserve_audit'
+                    else 'capability.commit_reserved_use'
+                )
+
+                def fail_audit_after_write(*args, **kwargs):
+                    result = original_record(*args, **kwargs)
+                    if kwargs.get('action') == failed_action:
+                        raise RuntimeError(f'injected {failed_sink} failure')
+                    return result
+
+                monkeypatch.setattr(runtime.audit, 'record', fail_audit_after_write)
+            else:
+                original_emit = runtime.events.emit
+
+                def fail_event_after_write(event_type, *args, **kwargs):
+                    result = original_emit(event_type, *args, **kwargs)
+                    if event_type == EventType.CAPABILITY_REVOKED:
+                        raise RuntimeError('injected revoke_event failure')
+                    return result
+
+                monkeypatch.setattr(runtime.events, 'emit', fail_event_after_write)
+
+            with pytest.raises(RuntimeError, match=f'injected {failed_sink} failure'):
+                runtime.capability.claim_decision_use(
+                    decision,
+                    used_by=pid,
+                    reason='atomic cached claim',
+                )
+
+            persisted = runtime.store.get_capability(cap.cap_id)
+            assert persisted is not None and persisted.active
+            assert persisted.uses_remaining == 1
+            assert runtime.store.select_table_rows(
+                'capability_use_reservations'
+            ) == before_reservations
+            assert {
+                event.event_id for event in runtime.events.list()
+            } == before_event_ids
+            new_audits = [
+                record
+                for record in runtime.store.list_audit()
+                if record.record_id not in before_audit_ids
+            ]
+            assert all(
+                record.action not in {
+                    'capability.reserve_use',
+                    'capability.commit_reserved_use',
+                    'capability.consume',
+                }
+                for record in new_audits
+            )
+        finally:
+            runtime.close()
+
+    def test_capability_lease_counts_require_positive_exact_integers_without_side_effects(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            cap = runtime.capability.issue_trusted(
+                'worker',
+                'object:strict-lease-counts',
+                [CapabilityRight.READ],
+                issued_by='test',
+                uses_remaining=3,
+            )
+            invalid_counts = [True, 1.0, '1', 0, -1]
+            for index, count in enumerate(invalid_counts):
+                for operation in ('consume', 'reserve'):
+                    before_cap = runtime.store.get_capability(cap.cap_id)
+                    before_reservations = runtime.store.select_table_rows(
+                        'capability_use_reservations'
+                    )
+                    before_audit = runtime.store.list_audit()
+                    before_events = runtime.events.list()
+
+                    with pytest.raises(ValidationError, match='count'):
+                        if operation == 'consume':
+                            runtime.capability.consume_use(
+                                cap.cap_id,
+                                used_by='test',
+                                count=count,  # type: ignore[arg-type]
+                            )
+                        else:
+                            runtime.capability.reserve_use(
+                                cap.cap_id,
+                                reserved_by='test',
+                                count=count,  # type: ignore[arg-type]
+                            )
+
+                    assert runtime.store.get_capability(cap.cap_id) == before_cap
+                    assert runtime.store.select_table_rows(
+                        'capability_use_reservations'
+                    ) == before_reservations
+                    assert runtime.store.list_audit() == before_audit
+                    assert runtime.events.list() == before_events
+
+                with pytest.raises(ValueError, match='count'):
+                    runtime.store.consume_capability_uses(
+                        cap.cap_id,
+                        count,  # type: ignore[arg-type]
+                    )
+                with pytest.raises(ValueError, match='count'):
+                    runtime.store.reserve_capability_uses(
+                        cap.cap_id,
+                        f'invalid-reservation-{index}',
+                        count=count,  # type: ignore[arg-type]
+                        reserved_by='test',
+                        reason='invalid direct store count',
+                        created_at='2026-01-01T00:00:00Z',
+                    )
+        finally:
+            runtime.close()
+
+    def test_restore_rejects_fractional_persisted_reservation_before_side_effects(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            cap = runtime.capability.issue_trusted(
+                'worker',
+                'object:strict-reservation-restore',
+                [CapabilityRight.READ],
+                issued_by='test',
+                uses_remaining=2,
+            )
+            reservation_id = runtime.capability.reserve_use(
+                cap.cap_id,
+                reserved_by='test',
+                count=1,
+            )
+            runtime.store._execute(  # type: ignore[attr-defined]
+                'UPDATE capability_use_reservations SET count = ? WHERE reservation_id = ?',
+                (1.5, reservation_id),
+            )
+            before_cap = runtime.store.get_capability(cap.cap_id)
+            before_audit = runtime.store.list_audit()
+            before_events = runtime.events.list()
+            before_rows = runtime.store.select_table_rows(
+                'capability_use_reservations'
+            )
+
+            with pytest.raises(ValidationError, match='reservation count'):
+                runtime.capability.restore_reserved_use(
+                    reservation_id,
+                    restored_by='test',
+                )
+
+            assert runtime.store.get_capability(cap.cap_id) == before_cap
+            assert runtime.store.list_audit() == before_audit
+            assert runtime.events.list() == before_events
+            assert runtime.store.select_table_rows(
+                'capability_use_reservations'
+            ) == before_rows
+        finally:
+            runtime.close()
+
+    def test_fractional_persisted_capability_lease_fails_closed_on_decode(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            cap = runtime.capability.issue_trusted(
+                'worker',
+                'object:strict-persisted-lease',
+                [CapabilityRight.READ],
+                issued_by='test',
+                uses_remaining=2,
+            )
+            runtime.store._execute(  # type: ignore[attr-defined]
+                'UPDATE capabilities SET uses_remaining = ? WHERE cap_id = ?',
+                (1.5, cap.cap_id),
+            )
+
+            with pytest.raises(ValidationError, match='uses_remaining'):
+                runtime.store.get_capability(cap.cap_id)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('column', 'value', 'message'),
+        [
+            ('delegable', 'false', 'delegable'),
+            ('revocable', 2, 'revocable'),
+            ('delegation_depth', 1.5, 'delegation_depth'),
+            ('max_delegation_depth', 'two', 'max_delegation_depth'),
+        ],
+    )
+    def test_persisted_capability_authority_scalars_fail_closed_on_decode(
+        self,
+        column: str,
+        value: object,
+        message: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            cap = runtime.capability.issue_trusted(
+                'worker',
+                'object:strict-persisted-authority',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            runtime.store._execute(  # type: ignore[attr-defined]
+                f'UPDATE capabilities SET {column} = ? WHERE cap_id = ?',
+                (value, cap.cap_id),
+            )
+
+            with pytest.raises(ValidationError, match=message):
+                runtime.store.get_capability(cap.cap_id)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('delegable', 1),
+            ('revocable', 'false'),
+            ('delegation_depth', True),
+            ('max_delegation_depth', 1.5),
+        ],
+    )
+    def test_capability_store_rejects_non_exact_authority_scalars_on_write(
+        self,
+        field: str,
+        value: object,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            cap = runtime.capability.issue_trusted(
+                'worker',
+                'object:strict-store-authority',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            malformed = replace(cap, **{field: value})
+
+            with pytest.raises(ValueError, match=field):
+                runtime.store.update_capability(malformed)
+
+            assert runtime.store.get_capability(cap.cap_id) == cap
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('column', 'payload', 'message'),
+        [
+            ('rights_json', '{"read": false}', 'rights'),
+            ('constraints_json', '[]', 'constraints'),
+            ('metadata_json', '[]', 'metadata'),
+        ],
+    )
+    def test_persisted_capability_containers_fail_closed_on_decode(
+        self,
+        column: str,
+        payload: str,
+        message: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            cap = runtime.capability.issue_trusted(
+                'worker',
+                'object:strict-persisted-containers',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            runtime.store._execute(  # type: ignore[attr-defined]
+                f'UPDATE capabilities SET {column} = ? WHERE cap_id = ?',
+                (payload, cap.cap_id),
+            )
+
+            with pytest.raises(ValidationError, match=message):
+                runtime.store.get_capability(cap.cap_id)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('rights', {'read': False}),
+            ('constraints', []),
+            ('metadata', False),
+        ],
+    )
+    def test_capability_store_rejects_non_exact_containers_on_write(
+        self,
+        field: str,
+        value: object,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            cap = runtime.capability.issue_trusted(
+                'worker',
+                'object:strict-store-containers',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            malformed = replace(cap, **{field: value})
+
+            with pytest.raises(ValueError, match=field):
+                runtime.store.update_capability(malformed)
+
+            assert runtime.store.get_capability(cap.cap_id) == cap
         finally:
             runtime.close()
 
@@ -1039,26 +2367,22 @@ class TestCapabilityManager:
                     'conditions': {'regex_token': '['},
                 }
             ]
-            runtime.capability.grant(
-                parent,
-                'filesystem:workspace:*',
-                [CapabilityRight.READ],
-                issued_by='test',
-                constraints={'authority_rules': rules},
-                delegable=True,
-            )
+            before = _capability_admission_state(runtime, parent)
 
-            with pytest.raises(CapabilityDenied, match='malformed authority rule'):
-                runtime.capability.delegate(
+            with pytest.raises(
+                ValidationError,
+                match='malformed conditions: regex_token',
+            ):
+                runtime.capability.grant(
                     parent,
-                    child,
-                    CapabilitySpec(
-                        resource='filesystem:workspace:*',
-                        rights={CapabilityRight.READ.value},
-                        constraints={'authority_rules': rules},
-                    ),
+                    'filesystem:workspace:*',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                    constraints={'authority_rules': rules},
+                    delegable=True,
                 )
 
+            assert _capability_admission_state(runtime, parent) == before
             assert not runtime.capability.check(child, 'filesystem:workspace:public.txt', CapabilityRight.READ)
         finally:
             runtime.close()
@@ -1670,6 +2994,159 @@ class TestCapabilityRuntimeInterface:
             deny = runtime.capability.issue_trusted(parent, 'object:blocked', [CapabilityRight.READ], issued_by='test', effect=CapabilityEffect.DENY)
             with pytest.raises(CapabilityDenied):
                 self._run(parent_session.handle('capability.revoke', {'capability_id': deny.cap_id}))
+        finally:
+            runtime.close()
+
+    def test_capability_delegate_syscall_rejects_type_laundering_before_delegation(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='strict syscall parent')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'strict syscall child')
+            runtime.capability.grant(
+                parent,
+                'object:strict-syscall-delegate',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+            session = LibOSSyscallSession(runtime, parent)
+            invalid_fields = [
+                {'delegable': 'false'},
+                {'revocable': 0},
+                {'uses_remaining': True},
+                {'uses_remaining': 1.0},
+                {'uses_remaining': '1'},
+                {'uses_remaining': 0},
+                {'uses_remaining': -1},
+                {'resource': 7},
+                {'rights': 'read'},
+                {'rights': {'read': False}},
+                {'rights': ('read',)},
+                {'constraints': False},
+                {'constraints': []},
+                {'constraints': [('purpose', 'laundered')]},
+                {'metadata': False},
+                {'metadata': []},
+                {'child_pid': 7},
+            ]
+
+            for invalid in invalid_fields:
+                before_caps = runtime.store.list_capabilities(subject=child)
+                before_audit_ids = {
+                    record.record_id for record in runtime.store.list_audit()
+                }
+                with pytest.raises(
+                    ValidationError,
+                    match='delegable|revocable|uses_remaining|resource|rights|constraints|metadata|child_pid',
+                ):
+                    self._run(
+                        session.handle(
+                            'capability.delegate',
+                            {
+                                'child_pid': child,
+                                'resource': 'object:strict-syscall-delegate',
+                                'rights': [CapabilityRight.READ.value],
+                                **invalid,
+                            },
+                        )
+                    )
+
+                assert runtime.store.list_capabilities(subject=child) == before_caps
+                new_audit = [
+                    record
+                    for record in runtime.store.list_audit()
+                    if record.record_id not in before_audit_ids
+                ]
+                assert all(
+                    record.action not in {'capability.issue', 'capability.delegate'}
+                    for record in new_audit
+                )
+
+            delegated = self._run(
+                session.handle(
+                    'capability.delegate',
+                    {
+                        'child_pid': child,
+                        'resource': 'object:strict-syscall-delegate',
+                        'rights': [CapabilityRight.READ.value],
+                        'delegable': False,
+                        'revocable': True,
+                        'uses_remaining': 1,
+                    },
+                )
+            )
+            assert delegated['capability']['uses_remaining'] == 1
+            assert not delegated['capability']['delegable']
+            assert delegated['capability']['revocable']
+        finally:
+            runtime.close()
+
+    def test_delegate_capability_tool_rejects_authority_scalar_coercion_without_side_effects(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='strict tool parent')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'strict tool child')
+            runtime.capability.grant(
+                parent,
+                'object:strict-tool-delegate',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+            tool = DelegateCapabilityTool()
+            context = ToolContext(
+                trace_id='strict-delegate-trace',
+                call_id='strict-delegate-call',
+                pid=parent,
+                runtime=runtime,
+            )
+            invalid_fields = [
+                {'uses_remaining': True},
+                {'uses_remaining': '1'},
+                {'uses_remaining': 1.0},
+                {'uses_remaining': 0},
+                {'uses_remaining': -1},
+                {'delegable': 'false'},
+                {'delegable': 0},
+                {'delegable': 1},
+            ]
+
+            for invalid in invalid_fields:
+                before_caps = runtime.store.list_capabilities(subject=child)
+                before_audit = runtime.store.list_audit()
+                before_events = runtime.events.list()
+                result = tool.invoke(
+                    {
+                        'child_pid': child,
+                        'resource': 'object:strict-tool-delegate',
+                        'rights': [CapabilityRight.READ.value],
+                        **invalid,
+                    },
+                    context,
+                )
+
+                assert not result.ok
+                assert result.error is not None
+                assert result.error.code == ToolErrorCode.VALIDATION_ERROR
+                assert runtime.store.list_capabilities(subject=child) == before_caps
+                assert runtime.store.list_audit() == before_audit
+                assert runtime.events.list() == before_events
+
+            valid = tool.invoke(
+                {
+                    'child_pid': child,
+                    'resource': 'object:strict-tool-delegate',
+                    'rights': [CapabilityRight.READ.value],
+                    'uses_remaining': 1,
+                    'delegable': False,
+                },
+                context,
+            )
+            assert valid.ok, valid.error
+            assert valid.data['capability']['uses_remaining'] == 1
+            assert not valid.data['capability']['delegable']
         finally:
             runtime.close()
 

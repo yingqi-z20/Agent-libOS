@@ -7,7 +7,6 @@ import os
 import platform
 import re
 import stat
-import subprocess
 import time
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
@@ -22,13 +21,18 @@ from agentdojo.attacks.attack_registry import ATTACKS, load_attack
 from agentdojo.task_suite.load_suites import get_suite, get_suites
 
 import agent_libos as agent_libos_package
-from agent_libos.config import AgentLibOSConfig
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.llm.client import read_dotenv
 from agent_libos.models import PROMPT_MODE_MINIMAL_RUNTIME, PROMPT_MODES
+from agent_libos.substrate import LocalGitProvider
 from agent_libos.utils.openai_schema import normalize_openai_chat_tool_schema
 from agent_libos.utils.serde import to_jsonable
 
-from agent_libos_dojo.metrics import aggregate_results
+from agent_libos_dojo.metrics import (
+    aggregate_results,
+    validate_result_numerics,
+    validated_total_tokens,
+)
 from agent_libos_dojo.pipeline import (
     HIDDEN_TERMINAL_TOOL,
     AgentLibOSAmbientPipeline,
@@ -43,6 +47,15 @@ from agent_libos_dojo.pipeline import (
 BENCHMARK_VERSION = "v1.2.2"
 ARMS = ("upstream_control", "libos_ambient")
 CASE_MODES = ("benign", "attacked", "injection_as_user")
+# AgentDojo 0.1.35's TaskSuite.run_task_with_pipeline retries an empty model
+# output with at most three pipeline.query invocations.  Keep this explicit in
+# harness provenance so a per-query max_quanta value is never reported as a
+# per-trajectory limit.  This unit is one harness call to
+# LLMClient.complete_action/acomplete_action; SDK transport retries,
+# compatibility retries, and API fallbacks inside that call are deliberately
+# outside the count.
+MAX_QUERY_INVOCATIONS_PER_TRAJECTORY = 3
+LOGICAL_MODEL_INVOCATION_UNIT = "harness_complete_action_call"
 PILOT_USER_TASK = "user_task_0"
 PILOT_INJECTION_TASKS = {
     "workspace": "injection_task_0",
@@ -53,6 +66,15 @@ PILOT_INJECTION_TASKS = {
 }
 _MAX_VERIFY_FILE_BYTES = 256 * 1024 * 1024
 _MAX_VERIFY_TREE_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_VERIFY_TREE_ENTRIES = 100_000
+_MAX_VERIFY_TREE_DEPTH = 32
+_MAX_CREDENTIAL_FINGERPRINTS = 4
+_SUPPORTED_EVIDENCE_SCHEMA_VERSION = 1
+_PRIMARY_MANIFEST_ARTIFACTS = (
+    "metadata.json",
+    "metrics.json",
+    "results.jsonl",
+)
 
 
 @dataclass(frozen=True)
@@ -122,6 +144,38 @@ def plan_pilot(options: RunOptions) -> list[PlannedCase]:
     _validate_options(options)
     cases: list[PlannedCase] = []
     ordinal = 0
+
+    def append_arm_group(
+        *,
+        suite_name: str,
+        mode: str,
+        user_task_id: str | None,
+        injection_task_id: str | None,
+        attack: str | None,
+        repetition: int,
+    ) -> bool:
+        nonlocal ordinal
+        for arm in options.arms:
+            ordinal += 1
+            cases.append(
+                PlannedCase(
+                    ordinal=ordinal,
+                    arm=arm,
+                    suite=suite_name,
+                    case_mode=mode,
+                    user_task_id=user_task_id,
+                    injection_task_id=injection_task_id,
+                    attack=attack,
+                    repetition=repetition,
+                )
+            )
+        if options.case_limit is not None and len(cases) > options.case_limit:
+            raise ValueError(
+                "case_limit must preserve complete selected-arm groups "
+                f"(a multiple of {len(options.arms)})"
+            )
+        return options.case_limit is not None and len(cases) == options.case_limit
+
     for suite_name in options.suites:
         suite = get_suite(options.benchmark_version, suite_name)
         injection_tasks = options.injection_tasks or (
@@ -132,20 +186,15 @@ def plan_pilot(options: RunOptions) -> list[PlannedCase]:
                 if mode == "injection_as_user":
                     for injection_task_id in injection_tasks:
                         suite.get_injection_task_by_id(injection_task_id)
-                        for arm in options.arms:
-                            ordinal += 1
-                            cases.append(
-                                PlannedCase(
-                                    ordinal=ordinal,
-                                    arm=arm,
-                                    suite=suite_name,
-                                    case_mode=mode,
-                                    user_task_id=None,
-                                    injection_task_id=injection_task_id,
-                                    attack=None,
-                                    repetition=repetition,
-                                )
-                            )
+                        if append_arm_group(
+                            suite_name=suite_name,
+                            mode=mode,
+                            user_task_id=None,
+                            injection_task_id=injection_task_id,
+                            attack=None,
+                            repetition=repetition,
+                        ):
+                            return _validated_planned_cases(cases)
                     continue
                 for user_task_id in options.user_tasks:
                     suite.get_user_task_by_id(user_task_id)
@@ -157,31 +206,22 @@ def plan_pilot(options: RunOptions) -> list[PlannedCase]:
                     for injection_task_id in injection_ids:
                         if injection_task_id is not None:
                             suite.get_injection_task_by_id(injection_task_id)
-                        for arm in options.arms:
-                            ordinal += 1
-                            cases.append(
-                                PlannedCase(
-                                    ordinal=ordinal,
-                                    arm=arm,
-                                    suite=suite_name,
-                                    case_mode=mode,
-                                    user_task_id=user_task_id,
-                                    injection_task_id=injection_task_id,
-                                    attack=(options.attack if mode == "attacked" else None),
-                                    repetition=repetition,
-                                )
-                            )
+                        if append_arm_group(
+                            suite_name=suite_name,
+                            mode=mode,
+                            user_task_id=user_task_id,
+                            injection_task_id=injection_task_id,
+                            attack=(options.attack if mode == "attacked" else None),
+                            repetition=repetition,
+                        ):
+                            return _validated_planned_cases(cases)
+    return _validated_planned_cases(cases)
+
+
+def _validated_planned_cases(cases: list[PlannedCase]) -> list[PlannedCase]:
     semantic_keys = [_planned_case_semantic_key(case) for case in cases]
     if len(set(semantic_keys)) != len(semantic_keys):
         raise ValueError("planned cases contain duplicate semantic cases")
-    if options.case_limit is not None:
-        effective_limit = min(options.case_limit, len(cases))
-        if options.arms and effective_limit % len(options.arms) != 0:
-            raise ValueError(
-                "case_limit must preserve complete selected-arm groups "
-                f"(a multiple of {len(options.arms)})"
-            )
-        cases = cases[:effective_limit]
     return cases
 
 
@@ -283,21 +323,22 @@ def verify_run(
 ) -> dict[str, Any]:
     """Verify a run without trusting its manifest or favorable metrics."""
 
-    output = Path(output_dir).resolve()
+    output = Path(output_dir).absolute()
     errors: list[str] = []
     checks: dict[str, Any] = {}
+
+    artifact_tree = _artifact_tree_preflight(output)
+    artifact_files = artifact_tree.pop("_files", [])
+    checks["artifact_tree"] = artifact_tree
+    if not artifact_tree["valid"]:
+        errors.extend(artifact_tree["errors"])
+        return _verification_result(output, checks, errors, observations={})
 
     required = ("metadata.json", "metrics.json", "results.jsonl", "manifest.json")
     missing = [name for name in required if not (output / name).is_file()]
     checks["required_artifacts_present"] = not missing
     if missing:
         errors.append(f"missing required artifacts: {', '.join(missing)}")
-        return _verification_result(output, checks, errors, observations={})
-
-    artifact_tree = _artifact_tree_preflight(output)
-    checks["artifact_tree"] = artifact_tree
-    if not artifact_tree["valid"]:
-        errors.extend(artifact_tree["errors"])
         return _verification_result(output, checks, errors, observations={})
 
     try:
@@ -310,6 +351,47 @@ def verify_run(
         errors.append(f"failed to parse primary artifacts: {type(exc).__name__}: {exc}")
         return _verification_result(output, checks, errors, observations={})
     checks["primary_artifacts_parse"] = True
+
+    schema_versions = {
+        "metadata": metadata.get("schema_version"),
+        "metrics": metrics.get("schema_version"),
+        "manifest": manifest.get("schema_version"),
+        "query_evidence": metadata.get("query_evidence_schema_version"),
+        "tool_outcome_evidence": metadata.get(
+            "tool_outcome_evidence_schema_version"
+        ),
+    }
+    supported_schemas = all(
+        type(value) is int and value == _SUPPORTED_EVIDENCE_SCHEMA_VERSION
+        for value in schema_versions.values()
+    )
+    checks["supported_schema_versions"] = {
+        "valid": supported_schemas,
+        "observed": schema_versions,
+        "supported": _SUPPORTED_EVIDENCE_SCHEMA_VERSION,
+    }
+    if not supported_schemas:
+        errors.append("run artifacts require exact supported schema_version=1 values")
+
+    logical_model_bounds = _logical_model_invocation_bounds(metadata)
+    checks["logical_model_invocation_bounds"] = logical_model_bounds
+    if not logical_model_bounds["valid"]:
+        errors.append(
+            "metadata logical-model invocation bounds are missing or inconsistent"
+        )
+
+    try:
+        validate_result_numerics(rows)
+    except ValueError as exc:
+        checks["metric_numerics"] = False
+        errors.append(f"result metrics contain invalid numeric data: {exc}")
+        return _verification_result(
+            output,
+            checks,
+            errors,
+            observations={"rows": len(rows)},
+        )
+    checks["metric_numerics"] = True
 
     planned_count = metadata.get("planned_cases")
     planned_count_valid = (
@@ -350,22 +432,37 @@ def verify_run(
 
     expected_artifacts = manifest.get("artifacts")
     artifact_matches: dict[str, bool] = {}
-    if isinstance(expected_artifacts, dict):
-        for name, expected in expected_artifacts.items():
-            path = output / str(name)
-            artifact_matches[str(name)] = (
+    manifest_artifact_scope_valid = (
+        isinstance(expected_artifacts, dict)
+        and set(expected_artifacts) == set(_PRIMARY_MANIFEST_ARTIFACTS)
+        and all(isinstance(name, str) for name in expected_artifacts)
+    )
+    if manifest_artifact_scope_valid:
+        assert isinstance(expected_artifacts, dict)
+        for name in _PRIMARY_MANIFEST_ARTIFACTS:
+            expected = expected_artifacts[name]
+            path = output / name
+            artifact_matches[name] = (
                 path.is_file()
                 and isinstance(expected, str)
                 and _sha256_file(path) == expected
             )
     checks["artifact_hashes"] = artifact_matches
-    if set(artifact_matches) != {"metadata.json", "metrics.json", "results.jsonl"}:
+    checks["manifest_artifact_scope"] = manifest_artifact_scope_valid
+    if not manifest_artifact_scope_valid:
         errors.append("manifest artifact set is incomplete or unexpected")
     if not artifact_matches or not all(artifact_matches.values()):
         errors.append("one or more primary artifact hashes do not match the manifest")
 
     trace_dir = output / "traces"
-    trace_files = sorted(trace_dir.glob("*.json")) if trace_dir.is_dir() else []
+    trace_files = sorted(
+        (
+            path
+            for path in artifact_files
+            if path.parent == trace_dir and path.suffix == ".json"
+        ),
+        key=lambda path: path.name,
+    )
     trace_entries = [
         {
             "path": str(path.relative_to(output)),
@@ -445,10 +542,8 @@ def verify_run(
     hidden_terminal_absent = True
     query_evidence_valid = True
     tool_outcome_evidence_valid = True
-    query_evidence_required = metadata.get("query_evidence_schema_version") == 1
-    tool_outcome_evidence_required = (
-        metadata.get("tool_outcome_evidence_schema_version") == 1
-    )
+    query_evidence_required = True
+    tool_outcome_evidence_required = True
     provider_api_values: dict[str, set[str]] = defaultdict(set)
     provider_role_shapes: dict[str, set[tuple[str, ...]]] = defaultdict(set)
     for row in rows:
@@ -486,9 +581,35 @@ def verify_run(
             continue
         arm = str(row.get("arm") or "unknown")
         if query_evidence_required and (
-            not _query_evidence_valid(evidence)
+            not _query_evidence_valid(
+                evidence,
+                max_query_invocations=(
+                    logical_model_bounds["max_query_invocations_per_trajectory"]
+                    if logical_model_bounds["valid"]
+                    else MAX_QUERY_INVOCATIONS_PER_TRAJECTORY
+                ),
+                max_logical_model_invocations_per_query=(
+                    logical_model_bounds[
+                        "max_logical_model_invocations_per_query"
+                    ]
+                    if logical_model_bounds["valid"]
+                    else None
+                ),
+                max_logical_model_invocations_per_trajectory=(
+                    logical_model_bounds[
+                        "max_logical_model_invocations_per_trajectory"
+                    ]
+                    if logical_model_bounds["valid"]
+                    else None
+                ),
+            )
             or row.get("query_invocation_count")
             != evidence.get("query_invocation_count")
+            or row.get("provider_call_count")
+            != evidence.get("provider_call_count")
+            or row.get("logical_model_invocation_count")
+            != evidence.get("logical_model_invocation_count")
+            or row.get("usage") != evidence.get("usage")
         ):
             query_evidence_valid = False
         if tool_outcome_evidence_required:
@@ -582,10 +703,23 @@ def verify_run(
             "evaluation arms"
         )
 
-    credential_scan = _scan_credentials(output, env_file)
+    credential_scan = _scan_credentials(
+        output,
+        env_file,
+        metadata=metadata,
+        files=artifact_files,
+    )
     checks["credential_scan"] = credential_scan
-    if credential_scan["requested"] and not credential_scan["env_file_present"]:
+    if not credential_scan["snapshot_valid"]:
+        errors.append("credential scan is not bound to a valid run-start snapshot")
+    if (
+        credential_scan["requested"]
+        and not credential_scan["env_file_present"]
+        and not credential_scan["snapshot_valid"]
+    ):
         errors.append("credential scan was requested but the dotenv file is missing")
+    if not credential_scan["scan_complete"]:
+        errors.append("credential scan could not completely inspect bounded artifacts")
     if credential_scan["raw_secret_hit_count"]:
         errors.append("raw API credential or endpoint appears in run artifacts")
 
@@ -751,6 +885,9 @@ def _run_case(
             name in target_tool_set for name in attempted_tools
         ),
         "attempted_tool_names": attempted_tools,
+        "logical_model_invocation_count": run_evidence.get(
+            "logical_model_invocation_count"
+        ),
         "provider_call_count": (
             len(provider_calls) if isinstance(provider_calls, list) else None
         ),
@@ -883,7 +1020,9 @@ def _metadata(
             ),
             "temperature": 0.0,
             "parallel_tool_calls": False,
-            "max_output_tokens_per_call": options.max_output_tokens,
+            "max_output_tokens_per_logical_model_invocation": (
+                options.max_output_tokens
+            ),
         }
     finally:
         resolved_client.close()
@@ -928,14 +1067,25 @@ def _metadata(
         "endpoint_sha256": effective_llm_config["endpoint_sha256"],
         "credential_source": "explicit dotenv whitelist",
         "credential_present": effective_llm_config["credential_present"],
+        "credential_snapshot": snapshot.verification_metadata(),
         "effective_llm_config": effective_llm_config,
         "effective_llm_config_sha256": _sha256_json(effective_llm_config),
         "temperature": 0.0,
         "parallel_tool_calls": False,
         "query_evidence_schema_version": 1,
         "tool_outcome_evidence_schema_version": 1,
-        "max_output_tokens_per_call": options.max_output_tokens,
+        "max_output_tokens_per_logical_model_invocation": (
+            options.max_output_tokens
+        ),
         "max_quanta": options.max_quanta,
+        "max_query_invocations_per_trajectory": (
+            MAX_QUERY_INVOCATIONS_PER_TRAJECTORY
+        ),
+        "logical_model_invocation_unit": LOGICAL_MODEL_INVOCATION_UNIT,
+        "max_logical_model_invocations_per_query": options.max_quanta,
+        "max_logical_model_invocations_per_trajectory": (
+            options.max_quanta * MAX_QUERY_INVOCATIONS_PER_TRAJECTORY
+        ),
         "libos_prompt_mode": options.libos_prompt_mode,
         "observed_token_budget": options.observed_token_budget,
         "planned_cases": len(cases),
@@ -1174,19 +1324,93 @@ def _provider_execution_observation(
     return frozenset(apis), frozenset(removed), json_fallback_used
 
 
-def _query_evidence_valid(evidence: dict[str, Any]) -> bool:
+def _logical_model_invocation_bounds(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the declared harness-level invocation unit and its arithmetic.
+
+    These limits do not count SDK transport retries, compatibility retries, or
+    provider-API fallbacks performed inside one ``complete_action`` call.
+    """
+
+    max_quanta = metadata.get("max_quanta")
+    max_queries = metadata.get("max_query_invocations_per_trajectory")
+    max_per_query = metadata.get("max_logical_model_invocations_per_query")
+    max_per_trajectory = metadata.get(
+        "max_logical_model_invocations_per_trajectory"
+    )
+    integer_values = (max_quanta, max_queries, max_per_query, max_per_trajectory)
+    positive_integers = all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in integer_values
+    )
+    legacy_fields = sorted(
+        field
+        for field in (
+            "max_provider_calls_per_query",
+            "max_provider_calls_per_trajectory",
+            "max_provider_calls_per_case",
+        )
+        if field in metadata
+    )
+    valid = bool(
+        positive_integers
+        and max_quanta >= 2
+        and max_queries == MAX_QUERY_INVOCATIONS_PER_TRAJECTORY
+        and max_per_query == max_quanta
+        and max_per_trajectory == max_queries * max_per_query
+        and metadata.get("logical_model_invocation_unit")
+        == LOGICAL_MODEL_INVOCATION_UNIT
+        and not legacy_fields
+    )
+    return {
+        "valid": valid,
+        "logical_model_invocation_unit": metadata.get(
+            "logical_model_invocation_unit"
+        ),
+        "max_query_invocations_per_trajectory": max_queries,
+        "max_logical_model_invocations_per_query": max_per_query,
+        "max_logical_model_invocations_per_trajectory": max_per_trajectory,
+        "legacy_provider_bound_fields": legacy_fields,
+    }
+
+
+def _query_evidence_valid(
+    evidence: dict[str, Any],
+    *,
+    max_query_invocations: int = MAX_QUERY_INVOCATIONS_PER_TRAJECTORY,
+    max_logical_model_invocations_per_query: int | None = None,
+    max_logical_model_invocations_per_trajectory: int | None = None,
+) -> bool:
+    for limit in (
+        max_query_invocations,
+        max_logical_model_invocations_per_query,
+        max_logical_model_invocations_per_trajectory,
+    ):
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
+            return False
     if evidence.get("query_evidence_schema_version") != 1:
         return False
     count = evidence.get("query_invocation_count")
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 1
+        or count > max_query_invocations
+    ):
         return False
     runs = evidence.get("query_runs")
     transcripts = evidence.get("query_transcripts")
+    logical_model_requests = evidence.get("logical_model_requests")
     provider_calls = evidence.get("provider_calls")
-    if not all(isinstance(value, list) for value in (runs, transcripts, provider_calls)):
+    if not all(
+        isinstance(value, list)
+        for value in (runs, transcripts, logical_model_requests, provider_calls)
+    ):
         return False
     assert isinstance(runs, list)
     assert isinstance(transcripts, list)
+    assert isinstance(logical_model_requests, list)
     assert isinstance(provider_calls, list)
     if len(runs) != count or len(transcripts) != count:
         return False
@@ -1221,6 +1445,26 @@ def _query_evidence_valid(evidence: dict[str, Any]) -> bool:
         )
     if evidence.get("messages") != flattened_messages:
         return False
+    logical_model_counts: Counter[int] = Counter()
+    logical_requests_by_invocation: dict[int, list[dict[str, Any]]] = defaultdict(
+        list
+    )
+    logical_invocation_order: list[int] = []
+    for request in logical_model_requests:
+        if not isinstance(request, dict):
+            return False
+        invocation = request.get("query_invocation")
+        if invocation not in expected_invocations:
+            return False
+        selected_invocation = int(invocation)
+        logical_invocation_order.append(selected_invocation)
+        logical_model_counts[selected_invocation] += 1
+        untagged = dict(request)
+        untagged.pop("query_invocation", None)
+        logical_requests_by_invocation[selected_invocation].append(untagged)
+    if logical_invocation_order != sorted(logical_invocation_order):
+        return False
+
     provider_counts: Counter[int] = Counter()
     attempted_counts: Counter[int] = Counter()
     provider_calls_by_invocation: dict[int, list[dict[str, Any]]] = defaultdict(
@@ -1252,18 +1496,44 @@ def _query_evidence_valid(evidence: dict[str, Any]) -> bool:
     for run in runs:
         assert isinstance(run, dict)
         invocation = int(run["query_invocation"])
+        logical_model_count = run.get("logical_model_invocation_count")
         provider_count = run.get("provider_call_count")
         tool_count = run.get("tool_call_count")
         executed_tool_count = run.get("executed_tool_call_count")
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in (provider_count, tool_count, executed_tool_count)
+            for value in (
+                logical_model_count,
+                provider_count,
+                tool_count,
+                executed_tool_count,
+            )
         ):
             return False
+        assert isinstance(logical_model_count, int)
         assert isinstance(provider_count, int)
         assert isinstance(tool_count, int)
         assert isinstance(executed_tool_count, int)
+        if (
+            max_logical_model_invocations_per_query is not None
+            and logical_model_count > max_logical_model_invocations_per_query
+        ):
+            return False
+        if logical_model_count < 1:
+            return False
+        if logical_model_counts[invocation] != logical_model_count:
+            return False
         if provider_counts[invocation] != provider_count:
+            return False
+        if provider_count > logical_model_count:
+            return False
+        if any(
+            provider_call.get("request")
+            != logical_requests_by_invocation[invocation][index]
+            for index, provider_call in enumerate(
+                provider_calls_by_invocation[invocation]
+            )
+        ):
             return False
         if attempted_counts[invocation] != tool_count:
             return False
@@ -1283,8 +1553,18 @@ def _query_evidence_valid(evidence: dict[str, Any]) -> bool:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 return False
             usage[str(key)] += value
+    expected_logical_model_total = sum(logical_model_counts.values())
+    if (
+        max_logical_model_invocations_per_trajectory is not None
+        and expected_logical_model_total
+        > max_logical_model_invocations_per_trajectory
+    ):
+        return False
     return (
-        evidence.get("provider_call_count") == expected_provider_total
+        evidence.get("logical_model_invocation_count")
+        == expected_logical_model_total
+        and len(logical_model_requests) == expected_logical_model_total
+        and evidence.get("provider_call_count") == expected_provider_total
         and len(provider_calls) == expected_provider_total
         and evidence.get("tool_call_count") == expected_tool_total
         and (
@@ -1355,42 +1635,115 @@ def _tool_name(tool: dict[str, Any]) -> str:
 def _scan_credentials(
     output: Path,
     env_file: str | Path | None,
+    *,
+    metadata: Mapping[str, Any],
+    files: Sequence[Path],
 ) -> dict[str, Any]:
+    fingerprints = _credential_fingerprints(metadata.get("credential_snapshot"))
     result: dict[str, Any] = {
-        "requested": env_file is not None,
+        "requested": env_file is not None or fingerprints is not None,
         "env_file_present": False,
+        "snapshot_valid": fingerprints is not None,
+        "scan_complete": True,
         "files_scanned": 0,
         "raw_secret_hit_count": 0,
         "hit_paths": {"api_key": [], "base_url": []},
     }
-    if env_file is None:
-        return result
-    env_path = Path(env_file)
-    if not env_path.is_file():
-        return result
-    result["env_file_present"] = True
-    env = read_dotenv(env_path)
-    needles = {
-        "api_key": env.get("OPENAI_API_KEY"),
-        "base_url": env.get("OPENAI_BASE_URL"),
-    }
-    files = sorted(
-        path
-        for path in output.rglob("*")
-        if path.is_file() and not path.is_symlink()
-    )
-    result["files_scanned"] = len(files)
-    for label, value in needles.items():
-        if not value:
+    current_values: dict[str, str | None] = {}
+    if env_file is not None:
+        env_path = Path(env_file)
+        if env_path.is_file() and not env_path.is_symlink():
+            result["env_file_present"] = True
+            env = read_dotenv(env_path)
+            current_values = {
+                "api_key": env.get("OPENAI_API_KEY"),
+                "base_url": env.get("OPENAI_BASE_URL"),
+            }
+
+    if fingerprints is None:
+        # Legacy diagnostic mode can still scan the explicitly supplied file,
+        # but strict verification rejects the missing run-start binding.
+        fingerprints = {}
+        for label, value in current_values.items():
+            if not value:
+                continue
+            encoded = value.encode("utf-8")
+            fingerprints[label] = {
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "byte_length": len(encoded),
+            }
+
+    selected_files = sorted(files, key=lambda path: path.as_posix())
+    result["files_scanned"] = len(selected_files)
+    needles: dict[str, bytes] = {}
+    for label, value in current_values.items():
+        if not value or label not in fingerprints:
             continue
-        needle = value.encode("utf-8")
-        for path in files:
-            if _file_contains(path, needle):
+        encoded = value.encode("utf-8")
+        expected = fingerprints[label]
+        if (
+            len(encoded) == expected["byte_length"]
+            and hashlib.sha256(encoded).hexdigest() == expected["sha256"]
+        ):
+            needles[label] = encoded
+
+    for label, fingerprint in fingerprints.items():
+        needle = needles.get(label)
+        for path in selected_files:
+            try:
+                hit = (
+                    _file_contains(path, needle)
+                    if needle is not None
+                    else _file_contains_fingerprint(
+                        path,
+                        sha256=fingerprint["sha256"],
+                        byte_length=fingerprint["byte_length"],
+                    )
+                )
+            except OSError:
+                result["scan_complete"] = False
+                continue
+            if hit:
                 result["hit_paths"][label].append(str(path.relative_to(output)))
     result["raw_secret_hit_count"] = sum(
         len(paths) for paths in result["hit_paths"].values()
     )
     return result
+
+
+def _credential_fingerprints(value: Any) -> dict[str, dict[str, Any]] | None:
+    if not isinstance(value, Mapping) or type(value.get("schema_version")) is not int:
+        return None
+    if value.get("schema_version") != 1 or not _is_sha256(value.get("dotenv_sha256")):
+        return None
+    raw = value.get("credentials")
+    if (
+        not isinstance(raw, Mapping)
+        or not raw
+        or len(raw) > _MAX_CREDENTIAL_FINGERPRINTS
+    ):
+        return None
+    selected: dict[str, dict[str, Any]] = {}
+    for label, fingerprint in raw.items():
+        if label not in {"api_key", "base_url"} or not isinstance(
+            fingerprint, Mapping
+        ):
+            return None
+        sha256 = fingerprint.get("sha256")
+        byte_length = fingerprint.get("byte_length")
+        if (
+            not _is_sha256(sha256)
+            or isinstance(byte_length, bool)
+            or not isinstance(byte_length, int)
+            or byte_length < 1
+            or byte_length > 16_384
+        ):
+            return None
+        selected[str(label)] = {
+            "sha256": str(sha256),
+            "byte_length": byte_length,
+        }
+    return selected
 
 
 def _file_contains(path: Path, needle: bytes) -> bool:
@@ -1401,6 +1754,31 @@ def _file_contains(path: Path, needle: bytes) -> bool:
             selected = retained + chunk
             if needle in selected:
                 return True
+            retained = selected[-overlap:] if overlap else b""
+    return False
+
+
+def _file_contains_fingerprint(
+    path: Path,
+    *,
+    sha256: str,
+    byte_length: int,
+) -> bool:
+    overlap = byte_length - 1
+    retained = b""
+    processed = 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            selected = retained + chunk
+            start = 0 if processed == 0 else len(retained) - overlap
+            start = max(0, start)
+            final = len(selected) - byte_length
+            for offset in range(start, final + 1):
+                if hashlib.sha256(
+                    selected[offset : offset + byte_length]
+                ).hexdigest() == sha256:
+                    return True
+            processed += len(chunk)
             retained = selected[-overlap:] if overlap else b""
     return False
 
@@ -1422,7 +1800,10 @@ def _verification_result(
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
-    selected = json.loads(path.read_text(encoding="utf-8"))
+    selected = json.loads(
+        path.read_text(encoding="utf-8"),
+        parse_constant=_reject_json_constant,
+    )
     if not isinstance(selected, dict):
         raise TypeError(f"expected JSON object: {path.name}")
     return selected
@@ -1435,7 +1816,7 @@ def _read_json_lines(path: Path) -> list[dict[str, Any]]:
     ):
         if not line:
             raise ValueError(f"blank JSONL row at line {line_number}")
-        selected = json.loads(line)
+        selected = json.loads(line, parse_constant=_reject_json_constant)
         if not isinstance(selected, dict):
             raise TypeError(f"expected JSON object at JSONL line {line_number}")
         rows.append(selected)
@@ -1448,27 +1829,60 @@ def _artifact_tree_preflight(output: Path) -> dict[str, Any]:
     errors: list[str] = []
     file_count = 0
     total_bytes = 0
+    entry_count = 0
+    files: list[Path] = []
     try:
-        entries = sorted(output.rglob("*"), key=lambda path: str(path))
-        for path in entries:
-            relative = path.relative_to(output).as_posix()
-            selected = path.lstat()
-            if stat.S_ISLNK(selected.st_mode):
-                errors.append(f"run artifact tree contains a symbolic link: {relative}")
-                continue
-            if stat.S_ISDIR(selected.st_mode):
-                continue
-            if not stat.S_ISREG(selected.st_mode):
-                errors.append(f"run artifact tree contains a special file: {relative}")
-                continue
-            file_count += 1
-            total_bytes += selected.st_size
-            if selected.st_size > _MAX_VERIFY_FILE_BYTES:
-                errors.append(
-                    f"run artifact exceeds the per-file verification limit: {relative}"
-                )
-        if total_bytes > _MAX_VERIFY_TREE_BYTES:
-            errors.append("run artifact tree exceeds the total verification limit")
+        root_stat = output.lstat()
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            raise OSError("run artifact root must be a real directory")
+        stack: list[tuple[Path, int]] = [(output, 0)]
+        aborted = False
+        while stack and not aborted:
+            directory, depth = stack.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > _MAX_VERIFY_TREE_ENTRIES:
+                        errors.append("run artifact tree exceeds the entry limit")
+                        aborted = True
+                        break
+                    path = Path(entry.path)
+                    relative = path.relative_to(output).as_posix()
+                    selected = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(selected.st_mode):
+                        errors.append(
+                            f"run artifact tree contains a symbolic link: {relative}"
+                        )
+                        continue
+                    if stat.S_ISDIR(selected.st_mode):
+                        child_depth = depth + 1
+                        if child_depth > _MAX_VERIFY_TREE_DEPTH:
+                            errors.append(
+                                "run artifact tree exceeds the directory depth limit: "
+                                f"{relative}"
+                            )
+                            continue
+                        stack.append((path, child_depth))
+                        continue
+                    if not stat.S_ISREG(selected.st_mode):
+                        errors.append(
+                            f"run artifact tree contains a special file: {relative}"
+                        )
+                        continue
+                    file_count += 1
+                    total_bytes += selected.st_size
+                    files.append(path)
+                    if selected.st_size > _MAX_VERIFY_FILE_BYTES:
+                        errors.append(
+                            "run artifact exceeds the per-file verification limit: "
+                            f"{relative}"
+                        )
+                    if total_bytes > _MAX_VERIFY_TREE_BYTES:
+                        errors.append(
+                            "run artifact tree exceeds the total verification limit"
+                        )
+                        aborted = True
+                        break
     except OSError as exc:
         errors.append(
             f"failed to inspect run artifact tree: {type(exc).__name__}: {exc}"
@@ -1476,11 +1890,19 @@ def _artifact_tree_preflight(output: Path) -> dict[str, Any]:
     return {
         "valid": not errors,
         "file_count": file_count,
+        "entry_count": entry_count,
         "total_bytes": total_bytes,
         "max_file_bytes": _MAX_VERIFY_FILE_BYTES,
         "max_tree_bytes": _MAX_VERIFY_TREE_BYTES,
+        "max_entries": _MAX_VERIFY_TREE_ENTRIES,
+        "max_depth": _MAX_VERIFY_TREE_DEPTH,
         "errors": errors,
+        "_files": files,
     }
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
 
 def _harness_source_entries(root: Path) -> list[dict[str, str]]:
@@ -1778,11 +2200,7 @@ def _normalize_exposure_text(value: str) -> str:
 
 
 def _observed_total_tokens(row: dict[str, Any]) -> int:
-    usage = row.get("usage")
-    if not isinstance(usage, dict):
-        return 0
-    value = usage.get("total_tokens")
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    return validated_total_tokens(row)
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -1796,14 +2214,15 @@ def _atomic_json(path: Path, value: Any) -> None:
 
 
 def _git(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
+    provider = LocalGitProvider(root, config=DEFAULT_CONFIG.git)
+    result = provider.run(
+        args,
+        read_only=True,
+        max_output_bytes=DEFAULT_CONFIG.git.output_hard_limit_bytes,
     )
-    return result.stdout.strip()
+    if result.returncode != 0:
+        raise RuntimeError(f"Git provenance command failed: {' '.join(args)}")
+    return result.stdout.decode("utf-8", errors="replace").strip()
 
 
 def _sha256_file(path: Path) -> str:
@@ -1824,6 +2243,14 @@ def _optional_text_sha256(value: str | None) -> str | None:
     if value is None:
         return None
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _endpoint_kind(base_url: str) -> str:
