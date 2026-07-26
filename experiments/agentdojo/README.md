@@ -24,7 +24,9 @@ redefined `image_only`: it now sends the exact AgentDojo system message, the raw
 user goal, and a durable native assistant/tool transcript. The earlier
 `image_only` evidence used the removed Object Memory snapshot semantics and is
 kept only as a historical baseline. A new four-suite direct acceptance run is
-recorded in [the 2026-07-25 initial report](INITIAL_REPORT_2026-07-25.md). Use
+recorded in [the 2026-07-25 initial report](INITIAL_REPORT_2026-07-25.md). The
+complete 2,162-trajectory paired evaluation, including strict artifact hashes,
+is recorded in [the 2026-07-26 final report](FINAL_REPORT_2026-07-26.md). Use
 `--libos-prompt-mode` to select these modes explicitly.
 
 With `image_only`, both arms begin with system/user messages and continue with
