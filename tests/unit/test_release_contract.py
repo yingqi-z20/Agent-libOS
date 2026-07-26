@@ -631,15 +631,17 @@ def test_release_docs_distinguish_windows_ci_from_remaining_environment_gates(
         "the complete deterministic matrix in per-lane jobs on Windows 3.11",
         "checked-in CI coverage, not a separate local Windows run",
         (
-            "there is no Windows Job Object parent-death containment or "
-            "wall/CPU/RSS supervisor"
+            "ConPTY has no Job Object parent-death containment or wall/CPU/RSS "
+            "supervisor"
         ),
+        "plus Deno's `KILL_ON_JOB_CLOSE` parent-death containment",
         "Deterministic local Git path/locking tests run in Windows CI",
     ):
         assert required in status
     for required in (
-        "The checked-in Windows 3.11 job is CI evidence",
-        "it is not a claim of a separate local Windows run",
+        "including the native Windows `KILL_ON_JOB_CLOSE` containment path",
+        "The checked-in Windows 3.11 jobs are CI evidence",
+        "they are not a claim of a separate local Windows run",
         "real Git credential-manager interoperability",
     ):
         assert required in support

@@ -258,11 +258,12 @@ its reproducible report outside this status summary.
 
 - Native macOS process containment, filesystem locking, and PTY behavior outside
   the targeted configured host-filesystem-identity gate still require platform
-  release-gate runs. The Windows 3.11 CI job exercises the
+  release-gate runs. The Windows 3.11 CI jobs exercise the
   implemented deterministic process, filesystem, Git, and `pywinpty`/ConPTY
-  fallback paths, but it does not provide guarantees the implementation does
-  not have: there is no Windows Job Object parent-death containment or
-  wall/CPU/RSS supervisor, and budgeted `SubprocessLimits` spawns fail closed.
+  fallback paths, plus Deno's `KILL_ON_JOB_CLOSE` parent-death containment. It
+  does not provide guarantees the ConPTY backend does not have: ConPTY has no
+  Job Object parent-death containment or wall/CPU/RSS supervisor, and budgeted
+  `SubprocessLimits` spawns fail closed.
 - Native Electron desktop lifecycle and the production-build custom-protocol
   BrowserWindow smoke are separate environment gates; the source GUI and Python
   GUI server are covered. Installer packaging, signing, and notarization are

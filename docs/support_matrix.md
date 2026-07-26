@@ -23,7 +23,7 @@ Legend:
 | SQLite RuntimeStore | Default local backend, file and in-memory targets | Ubuntu deterministic lanes plus the Windows 3.11 complete deterministic matrix | macOS filesystem ACL and locking behavior still needs a native release-gate run; platform CI is not a proof against hostile local administrators |
 | PostgreSQL RuntimeStore | Optional `postgres` extra | Digest-pinned PostgreSQL 17.10 Bookworm service on Ubuntu/Python 3.11 | Other server versions and deployment TLS/auth topology are unvalidated operator gates |
 | Core process/shell containment | POSIX process groups plus platform-specific fallbacks | Ubuntu security/runtime/provider lanes plus the Windows 3.11 complete deterministic matrix | macOS native behavior and Windows guarantees beyond the implemented fallbacks remain environment gates; the Windows PTY backend still has no Job Object or wall/CPU/RSS supervisor |
-| Deno/TypeScript JIT | Deno required for real JIT; deterministic benchmark also has an explicit fake backend | Deno 2.9.4 on Ubuntu and Windows; real-Deno tests run when installed | Windows parent-death Job Object support is not implemented, and macOS native behavior remains a release gate |
+| Deno/TypeScript JIT | Deno required for real JIT; deterministic benchmark also has an explicit fake backend | Deno 2.9.4 on Ubuntu and Windows; real-Deno tests run when installed, including the native Windows `KILL_ON_JOB_CLOSE` containment path | Broader native macOS process behavior remains a release gate |
 | PTY Runtime Module | POSIX PTY plus optional Windows `pywinpty`/ConPTY session I/O; source checkout/source distribution only, not the core wheel | POSIX paths on Ubuntu; Windows 3.11 installs the `pty` extra before running the complete deterministic matrix | Current Windows backend has no Job Object, parent-death containment, or wall/CPU/RSS supervision; budgeted `SubprocessLimits` spawns fail closed. Native CI coverage does not expand those implementation guarantees |
 | Typed Git provider | System Git 2.26+, fixed non-bare workspace repository; local operations, managed worktrees, patch Objects, existing remotes, and repository-local simulated PRs | Deterministic provider/security/runtime tests use temporary SHA-1/SHA-256 repositories and local bare remotes on Ubuntu, with the complete deterministic matrix also running on Windows 3.11; Shell/PTY/provenance hardening is parameterized | Credential-manager integrations and real HTTPS/OpenSSH authentication require environment-gated runs; GitHub/GitLab APIs are not implemented |
 | JSON-RPC client | Registered HTTP endpoints only | Deterministic loopback/provider tests | Real network proxy/TLS/DNS policy is deployment-specific |
@@ -75,11 +75,11 @@ environment-gate cells above. Do not copy counts or “remaining gates” from
 `docs/prelaunch_hardening_report.md`; that file is bound to its historical
 commit.
 
-The checked-in Windows 3.11 job is CI evidence for the deterministic paths it
-actually executes; it is not a claim of a separate local Windows run and cannot
-establish unimplemented Job Object/resource-supervision guarantees or real Git
-credential-manager interoperability. Those boundaries remain exactly as stated
-in the platform rows above.
+The checked-in Windows 3.11 jobs are CI evidence for the deterministic paths
+they actually execute; they are not a claim of a separate local Windows run and
+cannot establish the unimplemented ConPTY Job Object/resource-supervision
+guarantees or real Git credential-manager interoperability. Those boundaries
+remain exactly as stated in the platform rows above.
 
 The checked-in Ubuntu/macOS host-filesystem-identity matrix is a configured CI
 gate for the exact manifest v2 platform nodes it selects. This repository record
