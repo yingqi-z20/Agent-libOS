@@ -603,6 +603,8 @@ class TestPostgresStore:
             runtime = Runtime(store, config=config, llm_client=_ScriptedActionClient())
             try:
                 pid = runtime.process.spawn(goal="postgres store smoke")
+                runtime.activate_skill(pid, "agent-libos-runtime-session")
+                assert "get_current_time" in runtime.process.get(pid).model_tool_table
                 runtime.capability.grant(pid, "filesystem:workspace:*", [CapabilityRight.READ], issued_by="test")
                 runtime.capability.grant(pid, "clock:now", [CapabilityRight.READ], issued_by="test")
                 runtime.messages.post(sender="human:owner", recipient_pid=pid, subject="hello", body="postgres")
