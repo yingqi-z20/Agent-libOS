@@ -611,6 +611,24 @@ class TestStorageBackendBoundaries:
         finally:
             reopened_identity.close()
 
+    def test_sqlite_portable_fallback_atomically_creates_fresh_database(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+        db_path = tmp_path / "portable.sqlite"
+
+        store = SQLiteStore(db_path)
+        try:
+            assert db_path.is_file()
+            assert store._database_identity == (
+                db_path.stat().st_dev,
+                db_path.stat().st_ino,
+            )
+        finally:
+            store.close()
+
     @pytest.mark.parametrize("suffix", [".runtime.lock", "-journal", "-wal", "-shm"])
     def test_sqlite_secure_files_reject_hardlinked_lease_and_sidecars(
         self,

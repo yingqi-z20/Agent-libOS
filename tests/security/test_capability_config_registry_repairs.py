@@ -124,6 +124,29 @@ def test_regex_rule_has_admission_and_total_match_time_bounds() -> None:
     assert time.perf_counter() - started < 0.5
 
 
+def test_regex_deny_rule_fails_closed_when_match_budget_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evaluator = CapabilityEvaluator()
+    deny = AuthorityRule(
+        rule_id="bounded.deny",
+        operation="shell.run",
+        effect=CapabilityEffect.DENY,
+        risk=AuthorityRisk.HIGH,
+        conditions={"regex_token": r"--safe"},
+    )
+    ticks = iter((10.0, 11.0))
+    monkeypatch.setattr(
+        "agent_libos.capability.evaluator.time.monotonic",
+        lambda: next(ticks),
+    )
+
+    assert evaluator.authority_rule_matches(
+        deny,
+        {"operation": "shell.run", "argv": ["--unknown"]},
+    ) is True
+
+
 def test_typed_capability_spec_rejects_conflicting_structured_aliases() -> None:
     runtime = Runtime.open("local")
     try:

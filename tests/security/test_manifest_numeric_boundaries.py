@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable
+import sys
 from typing import Any
 
 import pytest
@@ -16,7 +17,7 @@ def _mcp_manifest() -> dict[str, Any]:
         "schema_version": 1,
         "server_id": "numeric-boundary",
         "transport": "stdio",
-        "stdio": {"command": "python3"},
+        "stdio": {"command": sys.executable},
         "tools": [
             {
                 "tool_id": "echo",

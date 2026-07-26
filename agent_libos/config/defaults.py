@@ -416,7 +416,7 @@ class CapabilityDefaults:
     decision_explain_preview_chars: int = 2_000
     regex_pattern_max_bytes: StrictInt = 1_024
     regex_token_max_bytes: StrictInt = 4_096
-    regex_match_timeout_s: StrictFloat = 0.01
+    regex_match_timeout_s: StrictFloat = 0.05
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)

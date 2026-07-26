@@ -5,10 +5,15 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
+from threading import Lock
 from typing import Any
 from uuid import uuid4
+
+
+_utc_now_lock = Lock()
+_last_utc_now: datetime | None = None
 
 
 def new_id(prefix: str) -> str:
@@ -16,7 +21,21 @@ def new_id(prefix: str) -> str:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """Return a process-monotonic UTC timestamp at microsecond precision.
+
+    Some supported clocks, notably Windows runners, can return the same wall
+    time for several consecutive records. Storage keysets use timestamps as
+    their primary ordering key, so make ties impossible within one process
+    while preserving UTC ISO-8601 values.
+    """
+
+    global _last_utc_now
+    selected = datetime.now(timezone.utc)
+    with _utc_now_lock:
+        if _last_utc_now is not None and selected <= _last_utc_now:
+            selected = _last_utc_now + timedelta(microseconds=1)
+        _last_utc_now = selected
+    return selected.isoformat()
 
 
 def estimate_tokens(value: object) -> int:

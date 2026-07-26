@@ -23,6 +23,8 @@ class _FakeWindowsAPI:
     def __init__(self) -> None:
         self.file_contracts: list[WindowsOpenContract] = []
         self.directory_contracts: list[WindowsOpenContract] = []
+        self._directory_snapshots: dict[int, StablePathSnapshot] = {}
+        self._next_directory_handle = -1
 
     def open_file_descriptor(
         self,
@@ -39,12 +41,21 @@ class _FakeWindowsAPI:
         contract: WindowsOpenContract,
     ) -> int:
         self.directory_contracts.append(contract)
-        return os.open(path, os.O_RDONLY)
+        handle = self._next_directory_handle
+        self._next_directory_handle -= 1
+        self._directory_snapshots[handle] = snapshot_from_stat(path.stat())
+        return handle
 
     def snapshot(self, handle: int) -> StablePathSnapshot:
+        directory = self._directory_snapshots.get(handle)
+        if directory is not None:
+            return directory
         return snapshot_from_stat(os.fstat(handle))
 
     def close_handle(self, handle: int) -> None:
+        if handle in self._directory_snapshots:
+            del self._directory_snapshots[handle]
+            return
         os.close(handle)
 
 
@@ -285,7 +296,7 @@ def test_real_windows_file_guard_blocks_write_and_replacement_until_close(
 ) -> None:
     target = tmp_path / "guarded.py"
     parked = tmp_path / "parked.py"
-    target.write_text("VALUE = 1\n", encoding="utf-8")
+    target.write_bytes(b"VALUE = 1\n")
     secure_file = open_secure_file(target)
     try:
         with secure_file.open_binary() as handle:

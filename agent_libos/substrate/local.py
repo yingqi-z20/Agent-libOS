@@ -462,15 +462,23 @@ class LocalFilesystemProvider:
 
     def __init__(self, root: str | Path, namespace: str = _RUNTIME_DEFAULTS.workspace_namespace):
         lexical_root = Path(root).resolve()
-        self.root = (
-            self._darwin_existing_descriptor_path(
+        if sys.platform == "darwin":
+            self.root = self._darwin_existing_descriptor_path(
                 lexical_root,
                 require_directory=True,
                 purpose="filesystem adapter root",
             )
-            if sys.platform == "darwin"
-            else lexical_root
-        )
+        elif os.name == "nt":
+            # pathlib preserves DOS 8.3 aliases and caller casing. Pin the
+            # provider root to the spelling returned by the opened directory
+            # handle so later containment checks use one Windows identity.
+            guard = _WindowsDirectoryGuard.open(lexical_root)
+            try:
+                self.root = self._windows_final_path_from_handle(guard.handle)
+            finally:
+                guard.close()
+        else:
+            self.root = lexical_root
         self._darwin_volume_policy = (
             _optional_darwin_volume_identity_policy(self.root)
             if sys.platform == "darwin"
@@ -983,20 +991,20 @@ class LocalFilesystemProvider:
             os.close(parent_fd)
 
     def _state_under_root_windows(self, target: Path) -> PathState:
-        guard = (
-            self._windows_directory_guard(target)
-            if target == self.root
-            else self._windows_parent_directory_guard(target)
-        )
+        guard_target = target if target == self.root else target.parent
+        while guard_target != self.root and not guard_target.exists():
+            guard_target = guard_target.parent
+        guard = self._windows_directory_guard(guard_target)
         if guard is None:
             raise CapabilityDenied(
                 "filesystem state requires a guarded Windows path"
             )
         try:
             self._before_path_sink_checked("state", target)
+            self._reject_reparse_components(target)
             try:
                 observed = target.lstat()
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 return PathState(exists=False, kind="missing")
             file_attributes = int(getattr(observed, "st_file_attributes", 0))
             reparse_attribute = int(

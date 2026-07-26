@@ -739,7 +739,7 @@ sha256: {source_sha}
 
             resolved = ModuleLoader().resolve(manifest)
 
-            assert resolved.source_path == str(source.resolve())
+            assert os.path.samefile(resolved.source_path, source)
             assert not sentinel.exists()
             runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('package-module:v0', manifest, source_sha),))
             try:
@@ -1288,6 +1288,10 @@ sha256: {package_sha}
             with pytest.raises(ValidationError, match='source_max_bytes'):
                 Runtime.open(config=config, module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
 
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat mutation injection is POSIX-only; Win32 target handles deny concurrent writes',
+    )
     def test_module_source_growth_after_descriptor_open_uses_bounded_reads(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1353,6 +1357,10 @@ sha256: {package_sha}
         assert read_sizes
         assert all(0 < size <= source_limit + 1 for size in read_sizes)
 
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat mutation injection is POSIX-only; Win32 target handles deny concurrent writes',
+    )
     def test_module_manifest_growth_after_descriptor_open_uses_bounded_reads(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1430,6 +1438,10 @@ sha256: {package_sha}
         assert read_sizes
         assert all(0 < size <= manifest_limit + 1 for size in read_sizes)
 
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat replacement injection is POSIX-only; Win32 target handles deny replacement',
+    )
     def test_module_source_swap_during_descriptor_read_fails_in_resolve(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2434,7 +2446,7 @@ def _module_package_sha(manifest_dir: Path, source_root: Path) -> str:
 
 
 def _module_trust_key(module_id: str, manifest: Path, source_sha: str) -> str:
-    manifest_sha = hashlib.sha256(manifest.read_text(encoding='utf-8').encode('utf-8')).hexdigest()
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
     return ModuleLoader.trust_key(module_id, manifest_sha, source_sha)
 
 

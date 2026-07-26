@@ -65,7 +65,7 @@ def test_read_text_returns_full_raw_digest_and_omits_it_for_prefixes() -> None:
     with workspace_runtime() as (runtime, root):
         path = "digest.txt"
         content = "snow: 雪\n"
-        (root / path).write_text(content, encoding="utf-8")
+        (root / path).write_bytes(content.encode("utf-8"))
         pid = runtime.process.spawn(goal="read filesystem edit token")
         runtime.filesystem.grant_path(
             pid,

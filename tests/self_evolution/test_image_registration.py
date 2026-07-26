@@ -1930,6 +1930,10 @@ workspace:
             finally:
                 runtime.close()
 
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat mutation injection is POSIX-only; Win32 target handles deny concurrent writes',
+    )
     def test_host_image_package_growth_is_bounded_after_descriptor_open(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2003,6 +2007,10 @@ workspace:
         finally:
             runtime.close()
 
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat replacement injection is POSIX-only; Win32 target handles deny replacement',
+    )
     def test_host_image_package_swap_after_open_fails_before_authority_or_effects(
         self,
         monkeypatch: pytest.MonkeyPatch,

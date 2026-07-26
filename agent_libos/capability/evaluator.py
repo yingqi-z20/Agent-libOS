@@ -544,6 +544,7 @@ class CapabilityEvaluator:
 
     def _authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
         conditions = dict(rule.conditions or {})
+        regex_unavailable = False
         if "operation" in conditions and str(context.get("operation")) != str(conditions["operation"]):
             return False
         if "authority_operation" in conditions and (
@@ -554,15 +555,22 @@ class CapabilityEvaluator:
             return False
         regex = conditions.get("regex_token")
         argv = context.get("argv")
-        if isinstance(regex, str) and (
-            not self._valid_regex(regex)
-            or not isinstance(argv, list)
-            or not self._regex_matches_any_token(regex, argv)
-        ):
-            return False
+        if isinstance(regex, str):
+            if not self._valid_regex(regex) or not isinstance(argv, list):
+                return False
+            regex_match = self._regex_matches_any_token(regex, argv)
+            if regex_match is False:
+                return False
+            regex_unavailable = regex_match is None
         if any(key in conditions and context.get(key) != conditions[key] for key in _DIRECT_RULE_CONDITIONS):
             return False
-        return self._timeout_conditions_match(conditions, context)
+        if not self._timeout_conditions_match(conditions, context):
+            return False
+        if regex_unavailable:
+            # A bounded regex timeout must never turn a deny/ask rule into an
+            # implicit allow. Auto-allow rules still require a positive match.
+            return rule.effect in {CapabilityEffect.DENY, CapabilityEffect.ASK}
+        return True
 
     def authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
         return self._authority_rule_matches(rule, context)
@@ -582,7 +590,11 @@ class CapabilityEvaluator:
             return False
         return True
 
-    def _regex_matches_any_token(self, pattern: str, argv: list[Any]) -> bool:
+    def _regex_matches_any_token(
+        self,
+        pattern: str,
+        argv: list[Any],
+    ) -> bool | None:
         selected: list[str] = []
         for token in argv:
             if not isinstance(token, str):
@@ -600,7 +612,7 @@ class CapabilityEvaluator:
             for token in selected:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return False
+                    return None
                 if bounded_regex.fullmatch(
                     pattern,
                     token,
@@ -608,7 +620,7 @@ class CapabilityEvaluator:
                 ) is not None:
                     return True
         except (TimeoutError, bounded_regex.error):
-            return False
+            return None
         return False
 
     def _timeout_conditions_match(self, conditions: dict[str, Any], context: dict[str, Any]) -> bool:

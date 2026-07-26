@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -668,7 +670,7 @@ schema_version: 1
 server_id: {server_id}
 transport: stdio
 stdio:
-  command: python3
+  command: {json.dumps(sys.executable)}
   args: ["-m", "demo_server"]
 tools:
   - tool_id: echo

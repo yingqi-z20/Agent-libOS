@@ -3744,7 +3744,7 @@ def _open_pty_runtime(
         for line in manifest.read_text(encoding="utf-8").splitlines()
         if line.startswith("sha256:")
     )
-    manifest_sha = hashlib.sha256(manifest.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
     runtime = Runtime.open(
         target,
         substrate=substrate,

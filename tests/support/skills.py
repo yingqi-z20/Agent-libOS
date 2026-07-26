@@ -10,7 +10,9 @@ from agent_libos import Runtime
 def write_raw_skill(root: Path, name: str, frontmatter: str) -> Path:
     skill_dir = root / name
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text(f"---\n{frontmatter}---\n\n# {name}\n", encoding="utf-8")
+    (skill_dir / "SKILL.md").write_bytes(
+        f"---\n{frontmatter}---\n\n# {name}\n".encode("utf-8")
+    )
     return skill_dir
 
 
@@ -44,24 +46,28 @@ def write_skill_package(
         frontmatter_lines.append(f"  {key}: {value}")
     frontmatter_lines.append("---")
     selected_body = body or f"# {name}\n\nUse this skill for deterministic checks.\n"
-    (skill_dir / "SKILL.md").write_text("\n".join(frontmatter_lines) + "\n\n" + selected_body, encoding="utf-8")
+    (skill_dir / "SKILL.md").write_bytes(
+        ("\n".join(frontmatter_lines) + "\n\n" + selected_body).encode("utf-8")
+    )
 
     refs = skill_dir / "references" / "agent-libos"
     refs.mkdir(parents=True, exist_ok=True)
     if actions:
-        (refs / "actions.json").write_text(json.dumps(actions), encoding="utf-8")
+        (refs / "actions.json").write_bytes(json.dumps(actions).encode("utf-8"))
     if required_capabilities:
-        (refs / "required-capabilities.json").write_text(json.dumps(required_capabilities), encoding="utf-8")
+        (refs / "required-capabilities.json").write_bytes(
+            json.dumps(required_capabilities).encode("utf-8")
+        )
     if jit_tools:
-        (refs / "jit-tools.json").write_text(json.dumps(jit_tools), encoding="utf-8")
+        (refs / "jit-tools.json").write_bytes(json.dumps(jit_tools).encode("utf-8"))
     for path, content in (scripts or {}).items():
         target = skill_dir / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        target.write_bytes(content.encode("utf-8"))
     for path, content in (extra_resources or {}).items():
         target = skill_dir / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        target.write_bytes(content.encode("utf-8"))
 
     package = Runtime.open("local")
     try:

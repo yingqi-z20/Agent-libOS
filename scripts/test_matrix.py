@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import os
 import signal
@@ -11,6 +12,7 @@ import time
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 LANE_PATHS = {
@@ -298,11 +300,28 @@ def _run(command: Command, *, max_seconds: float) -> int:
     if command.env:
         env.update(command.env)
     started = time.perf_counter()
-    process = subprocess.Popen(command.argv, cwd=ROOT, env=env, **_process_group_options())
+    windows_job: Any | None = None
+    if os.name == "nt":
+        from agent_libos.substrate.local import WindowsJobObject
+
+        windows_job = WindowsJobObject.create()
+    try:
+        process = subprocess.Popen(
+            command.argv,
+            cwd=ROOT,
+            env=env,
+            **_process_group_options(),
+        )
+        if windows_job is not None:
+            windows_job.assign(process)
+    except BaseException:
+        if windows_job is not None:
+            windows_job.close()
+        raise
     try:
         returncode = process.wait(timeout=max_seconds if command.enforce_timeout else None)
     except subprocess.TimeoutExpired:
-        _terminate_process_tree(process)
+        _terminate_process_tree(process, windows_job=windows_job)
         elapsed = time.perf_counter() - started
         print(
             f"{command.name} timed out after {elapsed:.2f}s (limit {max_seconds:.2f}s); process tree terminated",
@@ -312,7 +331,7 @@ def _run(command: Command, *, max_seconds: float) -> int:
     # A successful root command is not sufficient release evidence when a test
     # or build helper left descendants in the dedicated group.  Reuse the same
     # bounded tree cleanup as the timeout path before reporting the root code.
-    _terminate_process_tree(process)
+    _terminate_process_tree(process, windows_job=windows_job)
     elapsed = time.perf_counter() - started
     print(f"==> {command.name} finished in {elapsed:.2f}s", flush=True)
     return returncode
@@ -326,7 +345,23 @@ def _process_group_options() -> dict[str, object]:
     return {}
 
 
-def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    windows_job: Any | None = None,
+) -> None:
+    if windows_job is not None:
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE remains effective after the root
+        # command exits, unlike taskkill /T which can no longer discover an
+        # orphaned descendant from a dead parent PID.
+        windows_job.close()
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        return
     parent_exited = process.poll() is not None
     if parent_exited:
         if os.name == "posix" and not _posix_process_group_exists(process.pid):

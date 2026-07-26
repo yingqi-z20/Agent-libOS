@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from collections.abc import Sequence
 from typing import Any, Protocol
 
@@ -50,6 +51,12 @@ class ChatResponder(Protocol):
 
 
 def main() -> None:
+    # Redirected Windows consoles otherwise inherit a legacy code page and
+    # argparse can fail while rendering the documented Unicode exit words.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(
         description=("Run a traditional human/LLM chat loop through Agent libOS HumanObject tools: "
                      "ask_human for user input and human_output for assistant replies."))

@@ -618,10 +618,11 @@ class SQLiteStore(SQLRuntimeStore):
     ) -> None:
         """Validate SQLite files, optionally creating/tightening them to 0600."""
         if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "fchmod"):
-            if not create_if_missing and not db_path.exists():
-                raise ValidationError(
-                    f"SQLite database path changed or disappeared while opening: {db_path}"
-                )
+            self._secure_database_file_portable(
+                db_path,
+                tighten=tighten,
+                create_if_missing=create_if_missing,
+            )
             return
         flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
         try:
@@ -667,6 +668,88 @@ class SQLiteStore(SQLRuntimeStore):
                 )
             finally:
                 os.close(sidecar_fd)
+
+    def _secure_database_file_portable(
+        self,
+        db_path: Path,
+        *,
+        tighten: bool,
+        create_if_missing: bool,
+    ) -> None:
+        """Create and identity-check a database where POSIX no-follow APIs are absent."""
+
+        flags = (
+            os.O_RDWR
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOINHERIT", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            fd = os.open(str(db_path), flags)
+        except FileNotFoundError as exc:
+            if not create_if_missing:
+                raise ValidationError(
+                    f"SQLite database path changed or disappeared while opening: {db_path}"
+                ) from exc
+            try:
+                fd = os.open(
+                    str(db_path),
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                # Another actor won the create race. Open that exact pathname
+                # and apply the same descriptor/path identity checks below.
+                fd = os.open(str(db_path), flags)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
+                raise ValidationError(f"unsafe SQLite database path: {db_path}") from exc
+            raise
+        try:
+            opened_stat = os.fstat(fd)
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise ValidationError(
+                    f"SQLite database must be a regular file: {db_path}"
+                )
+            self._require_owned_file(
+                opened_stat,
+                db_path,
+                label="SQLite database",
+            )
+            self._require_single_link(
+                opened_stat,
+                db_path,
+                label="SQLite database",
+            )
+            if tighten and hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+                opened_stat = os.fstat(fd)
+            try:
+                path_stat = os.stat(db_path, follow_symlinks=False)
+            except OSError as exc:
+                raise ValidationError(
+                    f"unsafe SQLite database path changed while opening: {db_path}"
+                ) from exc
+            reparse_attribute = int(
+                getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+            )
+            path_attributes = int(getattr(path_stat, "st_file_attributes", 0))
+            if (
+                not stat.S_ISREG(path_stat.st_mode)
+                or path_attributes & reparse_attribute
+                or path_stat.st_dev != opened_stat.st_dev
+                or path_stat.st_ino != opened_stat.st_ino
+            ):
+                raise ValidationError(
+                    f"unsafe SQLite database path changed while opening: {db_path}"
+                )
+            self._require_single_link(
+                path_stat,
+                db_path,
+                label="SQLite database",
+            )
+        finally:
+            os.close(fd)
 
     def _tighten_open_file(
         self,

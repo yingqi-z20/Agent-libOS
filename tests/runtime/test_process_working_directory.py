@@ -474,8 +474,8 @@ class TestProcessWorkingDirectory:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / 'pkg' / 'pkg').mkdir(parents=True)
-            (root / 'pkg' / 'module.py').write_text("print('outer')\n", encoding='utf-8')
-            (root / 'pkg' / 'pkg' / 'module.py').write_text("print('nested')\n", encoding='utf-8')
+            (root / 'pkg' / 'module.py').write_bytes(b"print('outer')\n")
+            (root / 'pkg' / 'pkg' / 'module.py').write_bytes(b"print('nested')\n")
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
             try:
                 pid = runtime.process.spawn(image='review-agent:v0', goal='preserve cwd-relative path')

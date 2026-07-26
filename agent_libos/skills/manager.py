@@ -3313,15 +3313,43 @@ class SkillManager:
         raise CapabilityDenied(f"global skill source is not trusted: {source} sha256={package_sha256}")
 
     def _normalize_global_source(self, path: str | Path) -> tuple[Path, str]:
-        selected = Path(path)
+        selected = Path(path).expanduser().resolve()
         roots = [Path(root).expanduser().resolve() for root in self.config.skills.global_dirs]
         for root in roots:
-            try:
-                relative = selected.relative_to(root)
-            except ValueError:
+            relative = self._relative_to_configured_host_root(selected, root)
+            if relative is None:
                 continue
             return selected, relative.as_posix()
         raise CapabilityDenied(f"global skill path is outside configured global_dirs: {selected}")
+
+    @staticmethod
+    def _relative_to_configured_host_root(
+        selected: Path,
+        root: Path,
+    ) -> Path | None:
+        try:
+            return selected.relative_to(root)
+        except ValueError:
+            pass
+        if os.name != "nt":
+            return None
+
+        # Windows can name the same existing directory through a DOS 8.3 alias
+        # or different preserved casing. Compare each ancestor by filesystem
+        # identity, then rebuild the relative suffix without trusting spelling.
+        suffix: list[str] = []
+        current = selected
+        while True:
+            try:
+                if os.path.samefile(current, root):
+                    return Path(*reversed(suffix)) if suffix else Path(".")
+            except OSError:
+                pass
+            parent = current.parent
+            if parent == current:
+                return None
+            suffix.append(current.name)
+            current = parent
 
     def _get_skill(self, skill_id: str) -> tuple[SkillPackage, dict[str, Any]]:
         builtin = self._builtin_catalog.get(skill_id)
@@ -3675,11 +3703,8 @@ class SkillManager:
         selected = path.expanduser().resolve()
         roots = [Path(root).expanduser().resolve() for root in self.config.skills.global_dirs]
         for root in roots:
-            try:
-                selected.relative_to(root)
-            except ValueError:
-                continue
-            return "global"
+            if self._relative_to_configured_host_root(selected, root) is not None:
+                return "global"
         return "workspace"
 
     def _validate_host_package_file_snapshot(

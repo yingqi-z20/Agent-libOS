@@ -101,9 +101,7 @@ sha256: {source_sha}
 """.lstrip(),
         encoding='utf-8',
     )
-    manifest_sha = hashlib.sha256(
-        manifest.read_text(encoding='utf-8').encode('utf-8')
-    ).hexdigest()
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
     return manifest, ModuleLoader.trust_key(module_id, manifest_sha, source_sha)
 
 
