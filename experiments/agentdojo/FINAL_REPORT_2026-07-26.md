@@ -261,11 +261,13 @@ locator；没有本地副本的读者无法仅凭 hash 取回真实模型响应�
 ## 最终测试门禁
 
 - 根仓库 compileall：通过。
-- 根仓库 deterministic test matrix：4,016 passed、6 个平台特定 skip，
-  281.98 秒，退出码 0。
-- invariant checker：89 个 invariant 对 4,306 个 pytest node，全部通过。
-- 隔离 AgentDojo harness：15/15 通过。
-- 8 个结论性 artifact strict verifier：全部通过。
+- 根仓库 deterministic test matrix：4,023 passed、6 个平台特定 skip，
+  301.66 秒，退出码 0。
+- invariant checker：90 个 invariant 对 4,313 个 pytest node，全部通过。
+- protected-operation 静态覆盖检查：通过。
+- 隔离 AgentDojo harness：17/17 通过。
+- 8 个结论性 artifact 由修复后 strict verifier 并行复核：全部退出码 0；
+  artifact/trace hash、row validity、完整配对与 credential/endpoint 扫描全部通过。
 
 ## 评测取舍与下一轮
 
