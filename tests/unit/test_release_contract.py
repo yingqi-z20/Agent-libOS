@@ -1083,9 +1083,13 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         assert all(fragment in str(step["run"]) for fragment in expected_fragments)
         if job_name in {"python", "security", "deterministic-release"}:
             assert "--skip-real-deno" not in str(step["run"])
-    for job_name, step_name in (
-        ("python", "Run pytest lane"),
-        ("security", "Run complete security lane"),
+    for job_name, step_name, lane_deadline in (
+        (
+            "python",
+            "Run pytest lane",
+            "${{ matrix.lane == 'runtime' && 480 || 360 }}",
+        ),
+        ("security", "Run complete security lane", "360"),
     ):
         step = next(
             item
@@ -1095,7 +1099,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         assert step["timeout-minutes"] == 15
         command = str(step["run"])
         assert "--durations 25" in command
-        assert "--max-lane-seconds 360" in command
+        assert f"--max-lane-seconds {lane_deadline}" in command
     postgres_job = parsed["jobs"]["postgres"]
     postgres_service = postgres_job["services"]["postgres"]
     assert postgres_service["image"] == (

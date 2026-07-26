@@ -267,7 +267,7 @@ jobs:
           uv run python scripts/test_matrix.py
           --lane ${{ matrix.lane }}
           --durations 25
-          --max-lane-seconds 360
+          --max-lane-seconds ${{ matrix.lane == 'runtime' && 480 || 360 }}
 
   security:
     needs: static

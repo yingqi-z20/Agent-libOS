@@ -118,12 +118,13 @@ the Python `all` lane is one command, while the GUI test, typecheck, and build
 commands each receive the full timeout independently. Timeout exits with status
 124 after terminating the process group/tree. Standard lanes deselect
 `postgres` tests because the PostgreSQL CI
-service runs them separately with `pytest -m postgres --run-postgres`. CI runs
-each standard lane with a 360-second process deadline and a 15-minute outer
-step deadline. Run the `gui` lane separately; it cleans Electron output before
-production compilation, excludes generated `dist-electron` files from Vitest,
-and never emits test files into the production Electron tree. Install GUI
-dependencies first with `npm --prefix gui install`.
+service runs them separately with `pytest -m postgres --run-postgres`. CI gives
+the runtime lane a 480-second process deadline and the other standard lanes a
+360-second deadline, all within a 15-minute outer step deadline. Run the `gui`
+lane separately; it cleans Electron output before production compilation,
+excludes generated `dist-electron` files from Vitest, and never emits test
+files into the production Electron tree. Install GUI dependencies first with
+`npm --prefix gui install`.
 
 The architecture check covers the core package and repository-level Runtime
 Modules. Its default function-size ceiling is 200 lines; larger existing

@@ -24,7 +24,8 @@ LANE_PATHS = {
 PYTHON_LANES = tuple(LANE_PATHS)
 # Standard lanes target five minutes on the bounded-parallel development
 # baseline. Keep a larger local default for serial diagnosis and host variance;
-# CI supplies its tighter 360-second regression deadline explicitly.
+# CI supplies explicit 360-second deadlines for most lanes and 480 seconds for
+# the larger runtime lane.
 DEFAULT_MAX_LANE_SECONDS = 600.0
 DEFAULT_WORKERS = "1"
 DEFAULT_PARALLEL_WORKER_CAP = 4
