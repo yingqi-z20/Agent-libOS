@@ -227,9 +227,9 @@ its reproducible report outside this status summary.
 ## Supported release scope
 
 - Python 3.11 through 3.14 is the declared package range. Per-change CI runs the
-  Python lanes on Ubuntu 3.11 and 3.14, and the complete deterministic `all`
-  lane on Windows 3.11. This records checked-in CI coverage, not a separate
-  local Windows run. The canonical release build job uses Python 3.11, while
+  Python lanes on Ubuntu 3.11 and 3.14, and the complete deterministic matrix
+  in per-lane jobs on Windows 3.11. This records checked-in CI coverage, not a
+  separate local Windows run. The canonical release build job uses Python 3.11, while
   downstream artifact-smoke jobs cover Python 3.11 through 3.14; neither claim
   substitutes for evidence from an unrecorded local clean install.
 - The GUI package declares Node `>=22.12.0` and npm `>=8`. Per-change CI checks

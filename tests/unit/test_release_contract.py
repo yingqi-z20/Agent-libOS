@@ -628,7 +628,7 @@ def test_release_docs_distinguish_windows_ci_from_remaining_environment_gates(
     )
 
     for required in (
-        "the complete deterministic `all` lane on Windows 3.11",
+        "the complete deterministic matrix in per-lane jobs on Windows 3.11",
         "checked-in CI coverage, not a separate local Windows run",
         (
             "there is no Windows Job Object parent-death containment or "
@@ -926,6 +926,20 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     assert windows_job["runs-on"] == "windows-latest"
     assert windows_job["needs"] == "static"
     assert windows_job["timeout-minutes"] == 30
+    assert windows_job["name"] == "windows (${{ matrix.lane }})"
+    assert windows_job["strategy"] == {
+        "fail-fast": False,
+        "matrix": {
+            "lane": [
+                "unit",
+                "runtime",
+                "security",
+                "self-evolution",
+                "providers",
+                "benchmark",
+            ]
+        },
+    }
     windows_python = next(
         item
         for item in windows_job["steps"]
@@ -1060,9 +1074,9 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         ),
         (
             "windows",
-            "Run complete deterministic Python matrix",
+            "Run deterministic Python lane",
             (
-                "scripts/test_matrix.py --lane all",
+                "scripts/test_matrix.py --lane ${{ matrix.lane }}",
                 "--max-lane-seconds 900",
             ),
         ),

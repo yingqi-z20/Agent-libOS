@@ -387,6 +387,12 @@ jobs:
     needs: static
     runs-on: windows-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ["unit", "runtime", "security", "self-evolution", "providers", "benchmark"]
+
+    name: windows (${{ matrix.lane }})
 
     steps:
       - name: Check out repository
@@ -413,10 +419,10 @@ jobs:
       - name: Install dependencies with native PTY support
         run: uv sync --frozen --all-groups --extra pty
 
-      - name: Run complete deterministic Python matrix
+      - name: Run deterministic Python lane
         timeout-minutes: 25
         run: >-
-          uv run python scripts/test_matrix.py --lane all
+          uv run python scripts/test_matrix.py --lane ${{ matrix.lane }}
           --durations 25 --max-lane-seconds 900
 
   deterministic-release:
