@@ -529,6 +529,13 @@ class TestJitSecurity:
     ) -> None:
         sandbox = DenoTypescriptSandbox()
 
+        class FakeJob:
+            def assign_pid(self, pid: int) -> None:
+                assert pid == 4242
+
+            def close(self) -> None:
+                return None
+
         async def fake_create_subprocess_exec(*_command: str, **_kwargs: Any) -> Any:
             return SimpleNamespace(pid=4242, returncode=None)
 
@@ -562,6 +569,8 @@ class TestJitSecurity:
         monkeypatch.setattr(sandbox, '_monitor_process', fake_monitor_process)
         monkeypatch.setattr(sandbox, '_serve_process', fake_serve_process)
         monkeypatch.setattr(sandbox, '_kill_process', fake_kill_process)
+        if os.name == 'nt':
+            monkeypatch.setattr(WindowsJobObject, 'create', FakeJob)
 
         validation = sandbox.run_tests(
             'export function run(args, libos) { return {}; }',

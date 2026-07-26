@@ -199,6 +199,7 @@ class TestSkillPackageLoading:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        original_cwd = Path.cwd()
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             write_raw_skill(
@@ -238,6 +239,10 @@ class TestSkillPackageLoading:
                 assert loaded_paths == [(root / 'custom-catalog' / 'configured-skill').resolve()]
             finally:
                 runtime.close()
+                # Windows refuses to remove a directory while it is the
+                # process working directory. Leave the temporary workspace
+                # before its context manager performs cleanup.
+                monkeypatch.chdir(original_cwd)
 
 
     def test_standard_package_validation_and_global_trust(self) -> None:
