@@ -43,6 +43,7 @@ from agent_libos.models import (
 )
 from tests.support.deno import COUNT_CHARS_SOURCE
 from tests.support.fakes import RecordingActionClient
+from tests.support.runtime import close_runtime
 from tests.support.skills import write_skill_package
 from agent_libos.tools.base import ToolContext
 from agent_libos.tools.builtin import context as context_tool_module
@@ -2701,7 +2702,7 @@ class TestLLMContextMemory:
                 assert success_secret not in durable_sinks
                 assert usage_secret not in durable_sinks
             finally:
-                runtime.close()
+                close_runtime(runtime)
 
             with sqlite3.connect(db) as connection:
                 database_dump = '\n'.join(connection.iterdump())
@@ -2716,7 +2717,7 @@ class TestLLMContextMemory:
                 assert persisted.usage['cache_read_tokens'] == 0
                 assert persisted.usage['cache_write_tokens'] == 7
             finally:
-                reopened.close()
+                close_runtime(reopened)
 
     def test_full_snapshot_executor_disables_configured_responses_state_chain_observably(
         self,
@@ -4684,7 +4685,7 @@ class TestLLMContextMemory:
                 assert waiting['waiting_event']
                 assert runtime.store.get_llm_pending_action(pid)['wait_type'] == 'child'
             finally:
-                runtime.close()
+                close_runtime(runtime)
 
             reopened = Runtime.open(db)
             try:
@@ -4694,7 +4695,10 @@ class TestLLMContextMemory:
                 reopened_process = reopened.process.get(pid)
                 assert RUNTIME_SESSION_SKILL in reopened_process.loaded_skills
                 assert 'compact_process_context' in reopened_process.model_tool_table
-                results = reopened.run_until_idle(max_quanta=2)
+                results = reopened.run_until_idle(
+                    max_quanta=2,
+                    cancel_inflight_on_budget_exhaustion=False,
+                )
                 completed = _last_action_result(results, 'compact_process_context')
                 assert completed['result']['ok']
                 context = reopened.store.get_object_by_name(context_object_name(pid), namespace=reopened.memory.resolve_namespace(pid))
@@ -4702,7 +4706,7 @@ class TestLLMContextMemory:
                 assert context.payload['entries'][0]['summary']['goal'] == 'reopened state'
                 assert reopened.store.get_llm_pending_action(pid)['status'] == 'completed'
             finally:
-                reopened.close()
+                close_runtime(reopened)
 
     def test_reopen_after_compressor_exit_reruns_missing_result_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4729,7 +4733,7 @@ class TestLLMContextMemory:
                 result_oid = child_exit['result']['payload']['result_oid']
                 assert runtime.store.get_llm_pending_action(pid)['status'] == 'pending'
             finally:
-                runtime.close()
+                close_runtime(runtime)
 
             conn = sqlite3.connect(db)
             try:
@@ -4749,7 +4753,10 @@ class TestLLMContextMemory:
                 reopened_process = reopened.process.get(pid)
                 assert RUNTIME_SESSION_SKILL in reopened_process.loaded_skills
                 assert 'compact_process_context' in reopened_process.model_tool_table
-                results = reopened.run_until_idle(max_quanta=3)
+                results = reopened.run_until_idle(
+                    max_quanta=3,
+                    cancel_inflight_on_budget_exhaustion=False,
+                )
                 completed = _last_action_result(results, 'compact_process_context')
                 assert completed['result']['ok']
                 output = completed['result']['payload']
@@ -4759,7 +4766,7 @@ class TestLLMContextMemory:
                 assert context.payload['entries'][0]['summary']['goal'] == 'rerun result'
                 assert context.payload['entries'][0]['compaction_metadata']['discarded_compressor_pids']
             finally:
-                reopened.close()
+                close_runtime(reopened)
 
 def _register_multiplexed_image(
     runtime: Runtime,

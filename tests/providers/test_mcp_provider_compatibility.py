@@ -27,6 +27,7 @@ from agent_libos.substrate import (
     SdkMcpProvider,
 )
 from agent_libos.utils.serde import dumps, to_jsonable
+from tests.support.mcp import MCP_TEST_STDIO_COMMAND, MCP_TEST_STDIO_COMMAND_YAML
 
 
 def test_mcp_provider_keeps_legacy_method_signatures() -> None:
@@ -178,7 +179,7 @@ def _prepare_stdio_runtime(
     runtime.capability.grant(
         pid,
         runtime.mcp.stdio_resource_for_argv(
-            "python3",
+            MCP_TEST_STDIO_COMMAND,
             ["-m", "demo_server"],
         ),
         [CapabilityRight.EXECUTE],
@@ -193,7 +194,7 @@ schema_version: 1
 server_id: {server_id}
 transport: stdio
 stdio:
-  command: python3
+  command: {MCP_TEST_STDIO_COMMAND_YAML}
   args: ["-m", "demo_server"]
 tools:
   - tool_id: echo

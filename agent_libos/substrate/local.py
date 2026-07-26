@@ -2838,12 +2838,20 @@ class HttpJsonRpcProvider:
                             too_large=too_large,
                         )
             except Exception as exc:
+                timed_out = (
+                    isinstance(exc, TimeoutError)
+                    or (
+                        deadline_guard is not None
+                        and deadline_guard.expired.is_set()
+                    )
+                    or time.monotonic() >= deadline
+                )
                 last_error = (
                     "TimeoutError: JSON-RPC pinned request timed out"
-                    if deadline_guard is not None and deadline_guard.expired.is_set()
+                    if timed_out
                     else f"{type(exc).__name__}: {exc}"
                 )
-                if request_dispatch_started:
+                if request_dispatch_started or timed_out:
                     break
                 continue
         return JsonRpcTransportResult(

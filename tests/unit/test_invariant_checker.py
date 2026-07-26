@@ -232,6 +232,68 @@ benchmark_attack_classes:
 
         assert errors == []
 
+    def test_platform_scoped_invariant_is_not_required_on_other_platform(
+        self,
+    ) -> None:
+        darwin_node = "tests/security/test_identity.py::test_darwin"
+        linux_node = "tests/security/test_identity.py::test_linux"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "platform-identity",
+                    "title": "Platform identity",
+                    "lane": "security",
+                    "node_ids": [darwin_node, linux_node],
+                    "required_platform_nodes": {
+                        "darwin": [darwin_node],
+                        "linux": [linux_node],
+                    },
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids=set(),
+            errors=errors,
+            lane="security",
+            platform="windows",
+        )
+
+        assert errors == []
+
+    def test_generic_invariant_node_remains_required_on_other_platform(
+        self,
+    ) -> None:
+        generic_node = "tests/security/test_identity.py::test_generic"
+        darwin_node = "tests/security/test_identity.py::test_darwin"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "mixed-platform-identity",
+                    "title": "Mixed platform identity",
+                    "lane": "security",
+                    "node_ids": [generic_node, darwin_node],
+                    "required_platform_nodes": {"darwin": [darwin_node]},
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids=set(),
+            errors=errors,
+            lane="security",
+            platform="windows",
+        )
+
+        assert errors == [
+            "mixed-platform-identity: no declared regression node completed "
+            "without skip in the security lane"
+        ]
+
     def test_pytest_receipt_records_only_non_xfail_passing_calls(
         self,
         monkeypatch: MonkeyPatch,

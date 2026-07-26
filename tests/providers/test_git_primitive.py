@@ -1466,6 +1466,14 @@ def test_git_subprocess_budget_terminates_process_before_unbounded_dispatch(
         )
         _grant_git_authority(runtime, pid)
 
+        if not runtime.git.provider.supports_subprocess_limits:
+            with pytest.raises(ValidationError, match="SubprocessLimits"):
+                runtime.git.status(pid)
+            process = runtime.process.get(pid)
+            assert process.status is ProcessStatus.RUNNABLE
+            assert process.resource_usage.subprocess_wall_seconds == 0
+            return
+
         with pytest.raises(ResourceLimitExceeded):
             runtime.git.status(pid)
 
@@ -1512,6 +1520,14 @@ def test_git_approval_retry_rechecks_exhausted_budget_before_provider_dispatch(
             [CapabilityRight.READ, CapabilityRight.WRITE],
             issued_by="git-provider-test",
         )
+        if not runtime.git.provider.supports_subprocess_limits:
+            def forbidden_invoke(*_args: Any, **_kwargs: Any) -> Any:
+                raise AssertionError("unsupported budget reached provider dispatch")
+
+            monkeypatch.setattr(runtime.git.provider, "_invoke", forbidden_invoke)
+            with pytest.raises(ValidationError, match="SubprocessLimits"):
+                runtime.git.status(pid)
+            return
         state = runtime.git.status(pid).state.token
 
         with pytest.raises(HumanApprovalRequired):
@@ -2324,7 +2340,7 @@ def test_worktree_git_write_rebinds_stale_trusted_file_label(tmp_path: Path) -> 
     root = tmp_path / "repo"
     _init_repository(root)
     _git(root, "switch", "-q", "-c", "untrusted")
-    (root / "tracked.txt").write_text("replacement\n", encoding="utf-8")
+    (root / "tracked.txt").write_bytes(b"replacement\n")
     _git(root, "commit", "-q", "-am", "replacement")
     _git(root, "switch", "-q", "main")
     runtime = _open_runtime(root)
@@ -2470,7 +2486,7 @@ def test_switch_propagates_secret_commit_lineage_to_materialized_file(
     _init_repository(root)
     _git(root, "switch", "-q", "-c", "secret-branch")
     secret_path = root / "secret.txt"
-    secret_path.write_text("classified\n", encoding="utf-8")
+    secret_path.write_bytes(b"classified\n")
     runtime = _open_runtime(root)
     try:
         writer = runtime.process.spawn(image="base-agent:v0", goal="label secret bytes")
@@ -2553,7 +2569,7 @@ def test_stash_round_trip_preserves_secret_worktree_lineage(
     root = tmp_path / "repo"
     _init_repository(root)
     tracked = root / "tracked.txt"
-    tracked.write_text("classified stash\n", encoding="utf-8")
+    tracked.write_bytes(b"classified stash\n")
     runtime = _open_runtime(root)
     try:
         writer = runtime.process.spawn(image="base-agent:v0", goal="label stash bytes")
@@ -2606,7 +2622,7 @@ def test_managed_worktree_materialization_preserves_secret_commit_lineage(
     _init_repository(root)
     _git(root, "switch", "-q", "-c", "secret-worktree")
     secret_path = root / "secret.txt"
-    secret_path.write_text("classified worktree\n", encoding="utf-8")
+    secret_path.write_bytes(b"classified worktree\n")
     runtime = _open_runtime(root)
     try:
         writer = runtime.process.spawn(image="base-agent:v0", goal="label secret bytes")

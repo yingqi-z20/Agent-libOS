@@ -466,6 +466,17 @@ class LocalGitProvider:
             env["GCM_INTERACTIVE"] = "Never"
         return env
 
+    @staticmethod
+    def _expand_git_user_path(path: str | Path) -> Path:
+        """Expand ``~/`` using the HOME value inherited by the Git child."""
+
+        raw = os.fspath(path)
+        if raw == "~" or raw.startswith(("~/", "~\\")):
+            home = os.environ.get("HOME")
+            if home:
+                return Path(home) if raw == "~" else Path(home) / raw[2:]
+        return Path(raw).expanduser()
+
     def _trusted_host_executable(self, name: str) -> tuple[Path, str]:
         selected = shutil.which(name, path=self._safe_path())
         if not selected and os.name == "nt" and not name.casefold().endswith(".exe"):
@@ -1924,7 +1935,7 @@ class LocalGitProvider:
         def include(candidate: Path) -> None:
             # Keep the lexical entry so the later lstat rejects an attribute
             # symlink instead of silently following it outside the repository.
-            selected = Path(os.path.abspath(candidate.expanduser()))
+            selected = Path(os.path.abspath(self._expand_git_user_path(candidate)))
             if selected not in seen:
                 seen.add(selected)
                 files.append(selected)
@@ -1932,7 +1943,7 @@ class LocalGitProvider:
         include(layout.common_dir / "info" / "attributes")
         for scope, _origin, key, value in entries:
             if scope != "command" and key == "core.attributesfile" and value:
-                selected = Path(value).expanduser()
+                selected = self._expand_git_user_path(value)
                 if not selected.is_absolute():
                     # Git resolves relative core.attributesFile values from
                     # the command cwd, which is pinned to workspace_root.

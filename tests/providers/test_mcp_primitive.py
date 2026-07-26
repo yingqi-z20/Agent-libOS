@@ -5,6 +5,7 @@ import base64
 import contextlib
 from dataclasses import replace
 import hashlib
+import json
 import os
 from pathlib import Path
 import socket
@@ -52,6 +53,7 @@ from agent_libos.substrate.local import (
     _bounded_mcp_content,
 )
 from agent_libos.utils.serde import dumps, to_jsonable
+from tests.support.mcp import MCP_TEST_STDIO_COMMAND
 
 
 def _provider_tool_list_bytes(tools: list[McpProviderTool]) -> int:
@@ -73,7 +75,7 @@ def _grant_stdio_spawn(
     runtime: Runtime,
     pid: str,
     *,
-    command: str = "python3",
+    command: str = MCP_TEST_STDIO_COMMAND,
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
@@ -94,6 +96,8 @@ class TestMcpPrimitive:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        if os.name != "posix":
+            pytest.skip("POSIX process-group containment regression")
         import agent_libos.substrate.local as local_substrate
 
         terminated: list[int] = []
@@ -1412,7 +1416,7 @@ class TestMcpPrimitive:
         external = tmp_path / "external"
         workspace.mkdir()
         external.mkdir()
-        executable = external / "demo-mcp"
+        executable = external / ("demo-mcp.exe" if os.name == "nt" else "demo-mcp")
         executable.write_bytes(b"trusted executable")
         executable.chmod(0o755)
         provider = SdkMcpProvider(workspace)
@@ -2301,7 +2305,7 @@ class TestMcpPrimitive:
                 runtime.capability.grant_once(
                     pid,
                     runtime.mcp.stdio_resource_for_argv(
-                        "python3",
+                        MCP_TEST_STDIO_COMMAND,
                         ["-m", "demo_server"],
                         env=mapped_env,
                     ),
@@ -2459,7 +2463,7 @@ class TestMcpPrimitive:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        executable = tmp_path / "trusted-mcp"
+        executable = tmp_path / ("trusted-mcp.exe" if os.name == "nt" else "trusted-mcp")
         executable.write_text("trusted MCP executable\n", encoding="utf-8")
         executable.chmod(0o755)
         runtime = Runtime.open("local")
@@ -2540,8 +2544,9 @@ class TestMcpPrimitive:
         external = tmp_path / 'external'
         workspace.mkdir()
         external.mkdir()
-        trusted_executable = external / 'trusted-mcp'
-        attacker_executable = external / 'attacker-mcp'
+        executable_suffix = '.exe' if os.name == 'nt' else ''
+        trusted_executable = external / f'trusted-mcp{executable_suffix}'
+        attacker_executable = external / f'attacker-mcp{executable_suffix}'
         trusted_executable.write_text('trusted MCP executable\n', encoding='utf-8')
         attacker_executable.write_text('attacker MCP executable\n', encoding='utf-8')
         trusted_executable.chmod(0o755)
@@ -2857,7 +2862,7 @@ class TestMcpPrimitive:
             max_request_bytes=65_536,
             max_response_bytes=1_048_576,
             stdio=McpStdioTransportSpec(
-                command='python3',
+                command=MCP_TEST_STDIO_COMMAND,
                 args=['-m', 'demo_server'],
             ),
             http=McpHttpTransportSpec(
@@ -2915,7 +2920,7 @@ class TestMcpPrimitive:
                 ),
                 runtime.capability.grant_once(
                     actor,
-                    runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_server']),
+                    runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ['-m', 'demo_server']),
                     [CapabilityRight.EXECUTE],
                     issued_by='test',
                 ),
@@ -2947,7 +2952,7 @@ class TestMcpPrimitive:
         try:
             actor = runtime.process.spawn(image='base-agent:v0', goal='finite mcp register commit')
             server_id = 'register-finite-commit'
-            stdio_resource = runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_server'])
+            stdio_resource = runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ['-m', 'demo_server'])
             authority = [
                 runtime.capability.grant_once(
                     actor,
@@ -3438,9 +3443,10 @@ class TestMcpPrimitive:
         if shape == "server":
             manifest = _stdio_manifest("unknown-server-field") + "\nmax_reponse_bytes: 1"
         elif shape == "stdio":
+            command_line = f"  command: {json.dumps(MCP_TEST_STDIO_COMMAND)}"
             manifest = _stdio_manifest("unknown-stdio-field").replace(
-                "  command: python3",
-                "  command: python3\n  shell: true",
+                command_line,
+                command_line + "\n  shell: true",
             )
         elif shape == "tool":
             manifest = _stdio_manifest("unknown-tool-field").replace(
@@ -4084,7 +4090,7 @@ class TestMcpPrimitive:
             )
             stdio = runtime.capability.grant_once(
                 pid,
-                runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_server']),
+                runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ['-m', 'demo_server']),
                 [CapabilityRight.EXECUTE],
                 issued_by='test',
             )
@@ -4125,7 +4131,7 @@ class TestMcpPrimitive:
                 ),
                 runtime.capability.grant_once(
                     pid,
-                    runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_server']),
+                    runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ['-m', 'demo_server']),
                     [CapabilityRight.EXECUTE],
                     issued_by='test',
                 ),
@@ -4411,7 +4417,7 @@ class TestMcpPrimitive:
             runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
             runtime.capability.grant(
                 pid,
-                runtime.mcp.stdio_resource_for_argv("python3", ["-m", "demo_server"]),
+                runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ["-m", "demo_server"]),
                 [CapabilityRight.EXECUTE],
                 issued_by="test",
             )
@@ -4426,7 +4432,7 @@ class TestMcpPrimitive:
             runtime.capability.grant(
                 pid,
                 runtime.mcp.stdio_resource_for_argv(
-                    "python3",
+                    MCP_TEST_STDIO_COMMAND,
                     ["-m", "demo_server"],
                     env={"DEMO_TOKEN": "AGENT_LIBOS_MCP_ALLOWED_TOKEN"},
                     cwd="server-cwd",
@@ -5405,7 +5411,7 @@ def _stdio_manifest_mapping(server_id: str) -> dict[str, Any]:
         "server_id": server_id,
         "transport": "stdio",
         "stdio": {
-            "command": "python3",
+            "command": MCP_TEST_STDIO_COMMAND,
             "args": ["-m", "demo_server"],
             "env": {},
             "cwd": None,
@@ -5440,7 +5446,7 @@ def _http_manifest_mapping(server_id: str) -> dict[str, Any]:
 def _stdio_manifest(
     server_id: str,
     *,
-    command: str = "python3",
+    command: str = MCP_TEST_STDIO_COMMAND,
     mcp_name: str = "demo.echo",
     duplicate_tool: bool = False,
     env_source: str | None = None,
@@ -5451,7 +5457,7 @@ def _stdio_manifest(
     rollback_class: str = "no_rollback_required",
     rollback_status: str | None = None,
 ) -> str:
-    cwd_line = f"\n  cwd: {cwd}" if cwd is not None else ""
+    cwd_line = f"\n  cwd: {json.dumps(cwd)}" if cwd is not None else ""
     environment = dict(env or {})
     if env_source is not None:
         environment['DEMO_TOKEN'] = env_source
@@ -5483,7 +5489,7 @@ schema_version: 1
 server_id: {server_id}
 transport: stdio
 stdio:
-  command: {command}
+  command: {json.dumps(command)}
   args: ["-m", "demo_server"]{env_block}{cwd_line}
 tools:
   - tool_id: echo
@@ -5535,11 +5541,11 @@ max_response_bytes: 1048576
 
 
 def _manifest_without_server_id() -> str:
-    return """
+    return f"""
 schema_version: 1
 transport: stdio
 stdio:
-  command: python3
+  command: {json.dumps(MCP_TEST_STDIO_COMMAND)}
   args: ["-m", "demo_server"]
 tools:
   - tool_id: echo

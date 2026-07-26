@@ -32,6 +32,7 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.substrate import LocalResourceProviderSubstrate
+from tests.support.mcp import MCP_TEST_STDIO_COMMAND, MCP_TEST_STDIO_COMMAND_YAML
 
 
 def _create_store_with_schema_version(db: Path, version: int) -> None:
@@ -441,7 +442,7 @@ class TestCLIBuiltinCommand:
                         ),
                         runtime.capability.grant_once(
                             target_pid,
-                            runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_mcp']),
+                            runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ['-m', 'demo_mcp']),
                             [CapabilityRight.EXECUTE],
                             issued_by='test',
                         ),
@@ -1285,7 +1286,7 @@ schema_version: 1
 server_id: {server_id}
 transport: stdio
 stdio:
-  command: python3
+  command: {MCP_TEST_STDIO_COMMAND_YAML}
   args: ["-m", "demo_mcp"]
 tools:
   - tool_id: echo

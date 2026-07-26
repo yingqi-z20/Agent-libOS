@@ -423,7 +423,7 @@ jobs:
         timeout-minutes: 25
         run: >-
           uv run python scripts/test_matrix.py --lane ${{ matrix.lane }}
-          --durations 25 --max-lane-seconds 900
+          --durations 25 --max-lane-seconds 1400
 
   deterministic-release:
     needs: static

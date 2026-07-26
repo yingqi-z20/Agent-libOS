@@ -494,7 +494,7 @@ def test_workspace_oracle_requires_exact_persisted_content(tmp_path: Path) -> No
         },
     }
     target = tmp_path / "skill-eval.txt"
-    target.write_text("wrong\n", encoding="utf-8")
+    target.write_bytes(b"wrong\n")
     failed = evaluation_runner._evaluate_task_outcome(
         object(),  # type: ignore[arg-type]
         pid="pid-test",
@@ -502,7 +502,7 @@ def test_workspace_oracle_requires_exact_persisted_content(tmp_path: Path) -> No
         workspace=tmp_path,
         probe=probe,
     )
-    target.write_text("routed\n", encoding="utf-8")
+    target.write_bytes(b"routed\n")
     passed = evaluation_runner._evaluate_task_outcome(
         object(),  # type: ignore[arg-type]
         pid="pid-test",

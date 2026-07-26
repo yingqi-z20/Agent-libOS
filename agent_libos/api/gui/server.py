@@ -491,8 +491,13 @@ class SchedulerController:
             )
             self._thread = thread
             thread.start()
+            # Capture the start acknowledgement while the worker is still
+            # excluded by this lock. A fast terminal batch may finish while
+            # status publication is in progress, but that must not rewrite the
+            # response to the request that successfully started it.
+            started_status = self.status()
         self.service.publish_scheduler_status()
-        return self.status()
+        return started_status
 
     def shutdown(self, timeout_s: float | None = None) -> bool:
         selected_timeout = self.service.runtime.config.gui.scheduler_shutdown_join_timeout_s if timeout_s is None else timeout_s

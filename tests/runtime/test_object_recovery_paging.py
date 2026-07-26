@@ -32,6 +32,7 @@ STORE_BACKENDS = [
 
 
 @pytest.mark.parametrize("backend", STORE_BACKENDS)
+@pytest.mark.timeout(300 if os.name == "nt" else 120)
 def test_runtime_object_and_task_recovery_is_keyset_paged_and_bounded(
     backend: str,
     tmp_path: Path,

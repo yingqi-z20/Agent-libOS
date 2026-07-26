@@ -217,6 +217,7 @@ def test_awaitable_cleanup_bounds_resistant_async_generator_shutdown(
     pid = runtime.process.spawn(goal="noncooperative async generator cleanup")
     generator_started = threading.Event()
     release_generator = threading.Event()
+    generators: list[Any] = []
     caplog.set_level(logging.ERROR, logger="asyncio")
     try:
         async def resistant_generator() -> Any:
@@ -232,6 +233,7 @@ def test_awaitable_cleanup_bounds_resistant_async_generator_shutdown(
 
         async def quantum(selected_pid: str) -> dict[str, str]:
             generator = resistant_generator()
+            generators.append(generator)
             assert await anext(generator) == "started"
             return {"pid": selected_pid}
 
@@ -271,6 +273,7 @@ def test_awaitable_cleanup_bounds_resistant_async_generator_shutdown(
         ]
     finally:
         release_generator.set()
+        generators.clear()
         runtime.close()
 
 

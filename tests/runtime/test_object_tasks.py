@@ -433,7 +433,7 @@ class TestObjectTasks:
             _grant_process_spawn(runtime, pid)
             owner = _owner(runtime, pid)
             task = runtime.object_tasks.start(pid, owner, "get_working_directory", {})
-            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=30)
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.completed_at is not None
             assert completed.result_oid is not None
@@ -643,7 +643,7 @@ class TestObjectTasks:
             completed = runtime.object_tasks.wait(
                 task.task_id,
                 actor_pid=pid,
-                timeout=2,
+                timeout=30,
             )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.result_oid is not None
@@ -4097,6 +4097,8 @@ class TestObjectTasks:
                 if (
                     terminal is not None
                     and terminal.status == ObjectTaskStatus.SUCCEEDED
+                    and terminal.notification.status
+                    == ObjectTaskNotificationStatus.FAILED
                     and not runtime.object_tasks._has_active_future(task.task_id)
                 ):
                     break

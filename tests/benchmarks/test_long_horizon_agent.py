@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -96,6 +97,10 @@ def test_evaluation_authority_allows_required_git_diff_and_checkpoint(
         runtime.close()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows Host oracle fails closed without SubprocessLimits",
+)
 def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
     tmp_path: Path,
 ) -> None:
@@ -311,6 +316,10 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
         reopened.close()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows Host oracle fails closed without SubprocessLimits",
+)
 def test_oracle_requires_durable_workflow_evidence_not_only_passing_files(
     tmp_path: Path,
 ) -> None:
@@ -437,6 +446,10 @@ def test_workflow_order_requires_baseline_and_fresh_finalization_evidence() -> N
     }
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows Host oracle fails closed without SubprocessLimits",
+)
 def test_oracle_requires_executable_regressions_not_comment_markers(
     tmp_path: Path,
 ) -> None:
@@ -473,6 +486,10 @@ def test_oracle_requires_executable_regressions_not_comment_markers(
     assert result["passed"] is False
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows Host oracle fails closed without SubprocessLimits",
+)
 def test_oracle_accepts_semantic_regressions_without_reserved_names(
     tmp_path: Path,
 ) -> None:
@@ -569,6 +586,10 @@ def test_workflow_oracle_rejects_inexact_baseline_receipts(
     assert checks[failed_check] is False
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows Host oracle fails closed without SubprocessLimits",
+)
 def test_host_oracle_uses_isolated_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -596,6 +617,10 @@ def test_host_oracle_uses_isolated_environment(
         assert result["argv_is_absolute"] is True
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows Host oracle fails closed before executing workspace code",
+)
 def test_host_oracle_fails_closed_on_output_limit(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -606,6 +631,26 @@ def test_host_oracle_fails_closed_on_output_limit(tmp_path: Path) -> None:
     assert result["completed"] is False
     assert result["limit_kind"] == "subprocess_stdout_chars"
     assert len(result["stdout"]) <= 65_536
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows-specific fail-closed Host oracle boundary",
+)
+def test_windows_host_oracle_rejects_workspace_code_without_subprocess_limits(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with HostOracleRunner(workspace) as oracle:
+        result = oracle.run_isolated_python("print('must not execute')")
+
+    assert result["completed"] is False
+    assert result["returncode"] is None
+    assert result["stdout"] == ""
+    assert result["limit_kind"] == "host_oracle_error"
+    assert result["error_type"] == "ValidationError"
 
 
 def test_host_oracle_projects_only_known_host_error_types(

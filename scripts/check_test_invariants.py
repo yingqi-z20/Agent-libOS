@@ -142,13 +142,36 @@ def _check_invariant_execution(
             for node_id in node_ids
             if isinstance(node_id, str) and node_id
         }
-        if normalized_nodes.isdisjoint(normalized_executed):
+        required = invariant.get("required_platform_nodes", {})
+        applicable_nodes = normalized_nodes
+        if isinstance(required, dict) and required:
+            platform_scoped_nodes = {
+                node_id.replace("\\", "/")
+                for platform_nodes in required.values()
+                if isinstance(platform_nodes, list)
+                for node_id in platform_nodes
+                if isinstance(node_id, str) and node_id
+            }
+            generic_nodes = normalized_nodes - platform_scoped_nodes
+            selected_platform_nodes = required.get(selected_platform, [])
+            applicable_nodes = generic_nodes | {
+                node_id.replace("\\", "/")
+                for node_id in selected_platform_nodes
+                if isinstance(node_id, str) and node_id
+            }
+            # A fully platform-scoped invariant does not apply on a Host for
+            # which it declares no regression nodes. This keeps, for example,
+            # Darwin/Linux filesystem identity evidence from making a native
+            # Windows lane fail solely because every declared node correctly
+            # skipped there.
+            if not applicable_nodes:
+                continue
+        if applicable_nodes.isdisjoint(normalized_executed):
             selected_lane = lane or "all deterministic"
             errors.append(
                 f"{invariant_id}: no declared regression node completed "
                 f"without skip in the {selected_lane} lane"
             )
-        required = invariant.get("required_platform_nodes", {})
         if not isinstance(required, dict) or selected_platform is None:
             continue
         platform_nodes = required.get(selected_platform, [])

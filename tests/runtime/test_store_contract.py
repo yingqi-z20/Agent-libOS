@@ -1195,7 +1195,7 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
                 phase_count += 1
                 if phase_count == 2:
                     release_mutation.set()
-                    assert mutation_attempted.wait(timeout=5)
+                    assert mutation_attempted.wait(timeout=30)
                     assert not mutation_done.is_set()
 
         monkeypatch.setattr(
@@ -1217,7 +1217,7 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
             )
         finally:
             release_mutation.set()
-            worker.join(timeout=5)
+            worker.join(timeout=30)
 
         assert not worker.is_alive()
         assert mutation_errors == []

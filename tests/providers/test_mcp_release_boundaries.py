@@ -22,6 +22,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import ProviderHostError
 from agent_libos.storage import open_store
 from agent_libos.utils.serde import dumps, to_jsonable
+from tests.support.mcp import MCP_TEST_STDIO_COMMAND, MCP_TEST_STDIO_COMMAND_YAML
 
 
 @pytest.fixture(
@@ -184,7 +185,7 @@ def _grant_stdio_spawn(runtime: Runtime, pid: str) -> None:
     runtime.capability.grant(pid, "process:spawn", [CapabilityRight.WRITE], issued_by="test")
     runtime.capability.grant(
         pid,
-        runtime.mcp.stdio_resource_for_argv("python3", args),
+        runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, args),
         [CapabilityRight.EXECUTE],
         issued_by="test",
     )
@@ -196,7 +197,7 @@ schema_version: 1
 server_id: {server_id}
 transport: stdio
 stdio:
-  command: python3
+  command: {MCP_TEST_STDIO_COMMAND_YAML}
   args: ["-m", "demo_server"]
 timeout_s: 5
 max_request_bytes: 65536

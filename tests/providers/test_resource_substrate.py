@@ -317,7 +317,11 @@ class TestResourceProviderSubstrate:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = LocalShellProvider(temp_dir)
             result = provider.run(
-                [sys.executable, "-c", "import sys; sys.stdout.write('雪' * 5)"],
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.buffer.write(bytes.fromhex('e99baa') * 5)",
+                ],
                 timeout=5.0,
                 stdout_limit_chars=5,
             )
@@ -327,7 +331,11 @@ class TestResourceProviderSubstrate:
 
             with pytest.raises(SubprocessLimitExceeded) as caught:
                 provider.run(
-                    [sys.executable, "-c", "import sys; sys.stdout.write('雪' * 6)"],
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys; sys.stdout.buffer.write(bytes.fromhex('e99baa') * 6)",
+                    ],
                     timeout=5.0,
                     stdout_limit_chars=5,
                 )
@@ -351,7 +359,7 @@ class TestResourceProviderSubstrate:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = LocalShellProvider(temp_dir)
             result = provider.run(
-                [sys.executable, "-c", "print('bounded')"],
+                [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'bounded\\n')"],
                 timeout=5.0,
             )
 

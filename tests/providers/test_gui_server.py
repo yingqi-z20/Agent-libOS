@@ -58,6 +58,7 @@ from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from tests.support.checkpoints import checkpoint_cli_json
+from tests.support.mcp import MCP_TEST_STDIO_COMMAND, MCP_TEST_STDIO_COMMAND_YAML
 from tests.support.skills import write_skill_package
 
 
@@ -3674,7 +3675,10 @@ class TestGuiServer:
         assert secret not in outward
         assert private_path not in outward
 
-    def test_scheduler_background_internal_error_is_safe_in_status(self) -> None:
+    def test_scheduler_background_internal_error_is_safe_in_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         runtime = self.server.service.runtime
         secret = "C6w9Rp3Nk8Xm5Vq2Ld7Hs4Ta"
         path = "/Users/private/gui-background.sqlite"
@@ -3686,6 +3690,20 @@ class TestGuiServer:
             raise failure
 
         runtime.run_until_idle = fail_background
+
+        original_publish = self.server.service.publish_scheduler_status
+
+        def publish_after_background_settles() -> None:
+            thread = self.server.service.scheduler._thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=2)
+            original_publish()
+
+        monkeypatch.setattr(
+            self.server.service,
+            "publish_scheduler_status",
+            publish_after_background_settles,
+        )
 
         status = self.server.service.scheduler.start(max_quanta=1, reason="failure-test")
         assert status["running"]
@@ -4251,7 +4269,7 @@ class TestGuiServer:
 
         self.server.service.runtime.capability.grant(
             pid,
-            self.server.service.runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_mcp']),
+            self.server.service.runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ['-m', 'demo_mcp']),
             [CapabilityRight.EXECUTE],
             issued_by='test',
         )
@@ -4363,7 +4381,7 @@ class TestGuiServer:
         )
         runtime.capability.grant(
             pid,
-            runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_mcp']),
+            runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ['-m', 'demo_mcp']),
             [CapabilityRight.EXECUTE],
             issued_by='test',
         )
@@ -4898,7 +4916,7 @@ schema_version: 1
 server_id: {server_id}
 transport: stdio
 stdio:
-  command: python3
+  command: {MCP_TEST_STDIO_COMMAND_YAML}
   args: ["-m", "demo_mcp"]
 tools:
   - tool_id: echo

@@ -27,6 +27,7 @@ from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import PostgresStore, SQLiteStore, UnitOfWork, open_store
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import dumps
+from tests.support.runtime import close_runtime
 
 
 STORE_BACKENDS = [
@@ -670,7 +671,7 @@ def test_ten_thousand_terminal_publications_reconcile_in_bounded_restart_pages(
         )
         assert reopened.process.reconcile_terminal_publications() == []
     finally:
-        reopened.close()
+        close_runtime(reopened)
 
     publication_queries.clear()
     terminal_reconciliation_queries.clear()
@@ -703,7 +704,7 @@ def test_ten_thousand_terminal_publications_reconcile_in_bounded_restart_pages(
             default=0,
         ) <= 18
     finally:
-        reopened_again.close()
+        close_runtime(reopened_again)
 
 
 def test_multi_page_reconciliation_and_recovery_collectors_are_bounded(
@@ -777,7 +778,7 @@ def test_multi_page_reconciliation_and_recovery_collectors_are_bounded(
                 ),
             )
 
-        runtime.close()
+        close_runtime(runtime)
 
         def record_recovery(
             _manager: object,
@@ -797,7 +798,7 @@ def test_multi_page_reconciliation_and_recovery_collectors_are_bounded(
         assert len(recovered_ids) == total
         assert len(recovered) == config.runtime.publication_reconciliation_page_size
     finally:
-        runtime.close()
+        close_runtime(runtime)
 
 
 def test_checkpoint_terminal_operation_reconciliation_is_paged_and_bounded(
