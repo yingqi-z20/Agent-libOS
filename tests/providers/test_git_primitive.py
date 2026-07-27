@@ -149,6 +149,7 @@ def _init_repository(root: Path) -> None:
     _git(root, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(root, "config", "user.name", "Agent libOS Test")
     _git(root, "config", "user.email", "agent-libos@example.test")
+    _git(root, "config", "core.autocrlf", "false")
     (root / "tracked.txt").write_text("initial\n", encoding="utf-8")
     _git(root, "add", "--", "tracked.txt")
     _git(root, "commit", "-q", "-m", "initial")
@@ -2834,7 +2835,7 @@ def test_staged_only_restore_needs_no_filesystem_authority(
         runtime.close()
 
 
-@pytest.mark.timeout(240 if os.name == "nt" else 120)
+@pytest.mark.timeout(300 if os.name == "nt" else 120)
 def test_local_branch_switch_stash_integrate_restore_reset_and_clean(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
@@ -3837,6 +3838,7 @@ def test_post_dispatch_git_failure_is_retained_as_unknown(
         runtime.close()
 
 
+@pytest.mark.timeout(300 if os.name == "nt" else 120)
 def test_non_fast_forward_push_and_exact_force_with_lease(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     remote = tmp_path / "remote.git"
@@ -4034,6 +4036,7 @@ def test_pull_defaults_to_the_capability_scoped_current_branch(tmp_path: Path) -
         runtime.close()
 
 
+@pytest.mark.timeout(300 if os.name == "nt" else 120)
 def test_repository_content_high_water_covers_all_patch_scopes_and_renames(
     tmp_path: Path,
 ) -> None:

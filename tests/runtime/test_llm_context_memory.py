@@ -1,6 +1,7 @@
 from __future__ import annotations
 import base64
 import asyncio
+import contextlib
 import hashlib
 import secrets
 from concurrent.futures import ThreadPoolExecutor
@@ -2704,7 +2705,7 @@ class TestLLMContextMemory:
             finally:
                 close_runtime(runtime)
 
-            with sqlite3.connect(db) as connection:
+            with contextlib.closing(sqlite3.connect(db)) as connection:
                 database_dump = '\n'.join(connection.iterdump())
             assert success_secret not in database_dump
             assert usage_secret not in database_dump

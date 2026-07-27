@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import threading
+import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
@@ -1132,6 +1133,7 @@ class SQLRuntimeStore:
         self._object_payloads: dict[str, Any] = {}
         self._transaction_depth = 0
         self._payload_transaction_frames: list[dict[str, Any]] = []
+        self._transaction_cursors: weakref.WeakSet[Any] = weakref.WeakSet()
         self._stale_operation_recovery_index_depth = 0
         self._stale_operation_recovery_index_active = False
         self._poisoned_reason: str | None = None
@@ -1900,7 +1902,33 @@ class SQLRuntimeStore:
         return nullcontext() if guard is None else guard()
 
     def close(self) -> None:
-        self.conn.close()
+        errors = self._close_transaction_cursors()
+        try:
+            self.conn.close()
+        except BaseException as exc:
+            errors.append(exc)
+        if not errors:
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        raise BaseExceptionGroup("SQL store cleanup failed", errors)
+
+    def _track_transaction_cursor(self, cursor: Any) -> Any:
+        self._transaction_cursors.add(cursor)
+        return cursor
+
+    def _close_transaction_cursors(self) -> list[BaseException]:
+        cursors = tuple(getattr(self, "_transaction_cursors", ()))
+        transaction_cursors = getattr(self, "_transaction_cursors", None)
+        if transaction_cursors is not None:
+            transaction_cursors.clear()
+        errors: list[BaseException] = []
+        for cursor in cursors:
+            try:
+                cursor.close()
+            except BaseException as exc:
+                errors.append(exc)
+        return errors
 
     def _ensure_healthy(
         self,
@@ -1959,6 +1987,7 @@ class SQLRuntimeStore:
         self._close_poisoned_data_plane()
 
     def _close_poisoned_data_plane(self) -> None:
+        self._close_transaction_cursors()
         try:
             self.conn.close()
         except Exception:
@@ -3122,7 +3151,7 @@ class SQLRuntimeStore:
             self._payload_transaction_frames.append(payload_frame)
             self._transaction_depth += 1
             try:
-                yield self.conn.cursor()
+                yield self._track_transaction_cursor(self.conn.cursor())
             except BaseException as exc:
                 # A nested finalization ambiguity already poisoned and closed
                 # the connection. Do not perform a second rollback attempt or
@@ -3195,7 +3224,7 @@ class SQLRuntimeStore:
             self._ensure_healthy()
             self._ensure_store_scope_admitted()
             if self._transaction_depth:
-                yield self.conn.cursor()
+                yield self._track_transaction_cursor(self.conn.cursor())
             else:
                 with self.transaction() as cur:
                     yield cur

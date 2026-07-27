@@ -330,7 +330,8 @@ class LocalGitProvider:
             raise ValueError("git.worktree_root must not be inside Git metadata")
         self.managed_worktree_root = managed
         self._thread_lock = threading.RLock()
-        self._lock_state = threading.local()
+        self._repository_lock_owner: int | None = None
+        self._repository_lock_depth = 0
         self._subprocess_scope_state = threading.local()
         self._executable_cache: tuple[Path, tuple[int, int, int, int, int], str] | None = None
         self._version_cache: tuple[
@@ -3356,13 +3357,14 @@ class LocalGitProvider:
                 retryable=True,
             )
         try:
-            depth = int(getattr(self._lock_state, "depth", 0))
-            if depth:
-                self._lock_state.depth = depth + 1
+            owner = threading.get_ident()
+            depth = self._repository_lock_depth
+            if self._repository_lock_owner == owner and depth:
+                self._repository_lock_depth = depth + 1
                 try:
                     yield self.repository_layout(worktree=worktree)
                 finally:
-                    self._lock_state.depth = depth
+                    self._repository_lock_depth = depth
                 return
             layout = self.repository_layout(worktree=worktree)
             lock_directory = layout.common_dir / "agent-libos"
@@ -3407,13 +3409,15 @@ class LocalGitProvider:
                                 retryable=True,
                             )
                         time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-                self._lock_state.depth = 1
+                self._repository_lock_owner = owner
+                self._repository_lock_depth = 1
                 current = self.repository_layout(worktree=worktree)
                 if not self._same_layout(layout, current):
                     raise self._error(GitErrorCode.STALE_STATE, "Git repository identity changed before dispatch")
                 yield current
             finally:
-                self._lock_state.depth = 0
+                self._repository_lock_depth = 0
+                self._repository_lock_owner = None
                 if acquired:
                     try:
                         if os.name == "nt":

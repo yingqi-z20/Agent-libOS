@@ -1725,7 +1725,7 @@ class TestMcpPrimitive:
 
         class SlowListProvider(_RecordingMcpProvider):
             def list_tools(self, server: Any, **kwargs: Any) -> McpToolListResult:
-                time.sleep(0.03)
+                time.sleep(1.1)
                 return super().list_tools(server, **kwargs)
 
         provider = SlowListProvider()
@@ -1734,7 +1734,7 @@ class TestMcpPrimitive:
             pid = runtime.process.spawn(goal="legacy MCP deadline")
             manifest = _stdio_manifest("legacy-deadline").replace(
                 "timeout_s: 5",
-                "timeout_s: 0.01",
+                "timeout_s: 1",
             )
             runtime.mcp.register_server_from_yaml_text(
                 manifest,
@@ -3399,7 +3399,15 @@ class TestMcpPrimitive:
             call_list_snapshot = provider.environments[0][1]
             call_tool_snapshot = provider.environments[1][1]
             assert call_list_snapshot is call_tool_snapshot
-            assert dict(call_list_snapshot) == {'DEMO_TOKEN': 'approved-call-token'}
+            platform_environment = {
+                name: os.environ[name]
+                for name in ("SYSTEMROOT", "WINDIR")
+                if os.name == "nt" and name in os.environ
+            }
+            assert dict(call_list_snapshot) == {
+                **platform_environment,
+                'DEMO_TOKEN': 'approved-call-token',
+            }
 
             monkeypatch.setenv(env_name, 'approved-refresh-token')
             refreshed = runtime.mcp.list_tools(
@@ -3418,6 +3426,7 @@ class TestMcpPrimitive:
             refresh_snapshot = provider.environments[2][1]
             assert refresh_snapshot is not call_list_snapshot
             assert dict(refresh_snapshot) == {
+                **platform_environment,
                 'DEMO_TOKEN': 'approved-refresh-token',
             }
             assert provider.snapshots_were_immutable == [True, True, True]

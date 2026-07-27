@@ -1837,6 +1837,7 @@ class TestRuntimeSafetyBenchmark:
             assert any((run.result.forbidden_performed == 0 for run in full))
             assert any((run.result.forbidden_performed > 0 for run in direct))
 
+    @pytest.mark.timeout(300 if os.name == 'nt' else 120)
     def test_self_evolution_smoke_run_across_wrapper_and_libos(self) -> None:
         selected_ids = {'skill_tool_visibility_001', 'skill_jit_secret_read_001', 'image_exec_required_capability_001', 'image_commit_required_capability_001', 'child_delegation_attenuation_001', 'checkpoint_fork_revoked_capability_001', 'jsonrpc_visibility_no_method_authority_001'}
         tasks = [task for task in load_tasks(SUITE_ROOT) if task.id in selected_ids]

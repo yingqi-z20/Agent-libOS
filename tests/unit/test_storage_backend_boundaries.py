@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import os
 import re
+import sqlite3
 import stat
 import threading
 
@@ -439,11 +440,18 @@ class TestStorageBackendBoundaries:
         db_path = tmp_path / "runtime.sqlite"
         first = SQLiteStore(db_path)
         try:
+            with first.transaction() as cursor:
+                cursor.execute(
+                    "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                    ("exclusive-lease", None, "{}", "test", "1", "1"),
+                )
             with pytest.raises(ValidationError, match="already open"):
                 SQLiteStore(db_path)
         finally:
             first.close()
 
+        with pytest.raises(sqlite3.ProgrammingError, match="closed cursor"):
+            cursor.execute("SELECT 1")
         assert not db_path.with_suffix(db_path.suffix + ".runtime.lock").exists()
         second = SQLiteStore(db_path)
         second.close()
@@ -691,6 +699,35 @@ class TestStorageBackendBoundaries:
             }
             assert {"after", "outer"}.issubset(namespaces)
             assert "inner" not in namespaces
+        finally:
+            store.close()
+
+    def test_store_close_closes_retained_transaction_cursors(self) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            with store.transaction() as committed:
+                committed.execute(
+                    "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                    ("committed", None, "{}", "test", "1", "1"),
+                )
+
+            assert committed.execute("SELECT 1").fetchone()[0] == 1
+
+            with pytest.raises(RuntimeError, match="rollback cursor"):
+                with store.transaction() as rolled_back:
+                    rolled_back.execute(
+                        "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                        ("rolled-back", None, "{}", "test", "1", "1"),
+                    )
+                    raise RuntimeError("rollback cursor")
+
+            assert rolled_back.execute("SELECT 1").fetchone()[0] == 1
+            store.close()
+
+            with pytest.raises(sqlite3.ProgrammingError, match="closed cursor"):
+                committed.execute("SELECT 1")
+            with pytest.raises(sqlite3.ProgrammingError, match="closed cursor"):
+                rolled_back.execute("SELECT 1")
         finally:
             store.close()
 

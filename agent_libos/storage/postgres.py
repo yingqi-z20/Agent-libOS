@@ -88,6 +88,9 @@ class _PostgresCursor:
     def rowcount(self) -> int:
         return int(self._cursor.rowcount)
 
+    def close(self) -> None:
+        self._cursor.close()
+
     def execute(self, sql: str, params: Iterable[Any] = ()) -> "_PostgresCursor":
         selected_params = tuple(params)
         if selected_params:
@@ -227,7 +230,11 @@ class PostgresStore(SQLRuntimeStore):
         used by runtime handoff.
         """
 
-        errors: list[BaseException] = []
+        errors = (
+            self._close_transaction_cursors()
+            if conn is getattr(self, "conn", None)
+            else []
+        )
         try:
             conn.close()
         except BaseException as exc:
