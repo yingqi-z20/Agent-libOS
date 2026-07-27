@@ -818,7 +818,10 @@ def test_typed_provider_spec_integer_timeout_is_canonical_across_reopen(
             if adapter == "jsonrpc":
                 spec = replace(
                     _registry_contract_endpoint("canonical-timeout-jsonrpc"),
-                    timeout_s=1,
+                    # This contract exercises integer/float canonicalization,
+                    # not the provider deadline. Leave enough dispatch budget
+                    # for a loaded Windows runner.
+                    timeout_s=30,
                 )
                 assert type(spec.timeout_s) is int
                 runtime.jsonrpc.register_endpoint(
@@ -839,7 +842,7 @@ def test_typed_provider_spec_integer_timeout_is_canonical_across_reopen(
             else:
                 spec = replace(
                     _registry_contract_http_mcp_server("canonical-timeout-mcp"),
-                    timeout_s=1,
+                    timeout_s=30,
                 )
                 assert type(spec.timeout_s) is int
                 runtime.mcp.register_server(

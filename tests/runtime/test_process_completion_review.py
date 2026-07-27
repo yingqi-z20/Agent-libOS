@@ -180,6 +180,7 @@ def test_final_exit_linearizes_against_concurrent_human_followup(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
+    sync_timeout_s = 30.0
     runtime = Runtime.open(tmp_path / "completion-review-race.sqlite")
     try:
         pid = runtime.process.spawn(
@@ -194,13 +195,13 @@ def test_final_exit_linearizes_against_concurrent_human_followup(
 
         def delayed_exit(*args: Any, **kwargs: Any) -> Any:
             exit_entered.set()
-            assert post_attempted.wait(2)
+            assert post_attempted.wait(sync_timeout_s)
             return original_exit(*args, **kwargs)
 
         monkeypatch.setattr(runtime.process, "exit", delayed_exit)
 
         def post_followup() -> None:
-            assert exit_entered.wait(2)
+            assert exit_entered.wait(sync_timeout_s)
             post_attempted.set()
             try:
                 runtime.human.send_process_message(
@@ -221,7 +222,7 @@ def test_final_exit_linearizes_against_concurrent_human_followup(
                 "completion_evidence": _completion_evidence(review),
             },
         )
-        poster.join(timeout=2)
+        poster.join(timeout=sync_timeout_s)
 
         assert poster.is_alive() is False
         assert completed["ok"] is True

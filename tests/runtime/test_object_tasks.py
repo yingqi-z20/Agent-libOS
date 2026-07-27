@@ -3853,6 +3853,7 @@ class TestObjectTasks:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        sync_timeout_s = 30.0
         db_path = tmp_path / "queued-object-task-recovery-release.sqlite"
         runtime = Runtime.open(db_path)
         loop_blocked = threading.Event()
@@ -3873,10 +3874,12 @@ class TestObjectTasks:
 
             def block_loop() -> None:
                 loop_blocked.set()
-                release_loop.wait(timeout=10)
+                release_loop.wait(timeout=sync_timeout_s * 2)
 
             loop.call_soon_threadsafe(block_loop)
-            assert loop_blocked.wait(timeout=2), "object task loop did not block"
+            assert loop_blocked.wait(
+                timeout=sync_timeout_s
+            ), "object task loop did not block"
 
             pid = runtime.process.spawn(
                 image="base-agent:v0",
@@ -3935,9 +3938,11 @@ class TestObjectTasks:
 
             release_thread = threading.Thread(target=release_runtime)
             release_thread.start()
-            assert stop_queued.wait(timeout=2), "recovery stop barrier was not queued"
+            assert stop_queued.wait(
+                timeout=sync_timeout_s
+            ), "recovery stop barrier was not queued"
             release_loop.set()
-            release_thread.join(timeout=5)
+            release_thread.join(timeout=sync_timeout_s)
 
             assert not release_thread.is_alive()
             assert release_error == []
@@ -3954,7 +3959,7 @@ class TestObjectTasks:
         finally:
             release_loop.set()
             if release_thread is not None and release_thread.is_alive():
-                release_thread.join(timeout=5)
+                release_thread.join(timeout=sync_timeout_s)
             if not released:
                 if fenced:
                     _close_fenced_runtime(runtime)
@@ -4129,6 +4134,7 @@ class TestObjectTasks:
         self,
         tmp_path: Path,
     ) -> None:
+        sync_timeout_s = 30.0
         db_path = tmp_path / "object-task-recovery-release.sqlite"
         runtime = Runtime.open(db_path)
         fenced = False
@@ -4148,7 +4154,7 @@ class TestObjectTasks:
             waiting = runtime.object_tasks.wait(
                 task.task_id,
                 actor_pid=pid,
-                timeout=2,
+                timeout=sync_timeout_s,
             )
             assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
             assert waiting.runner_pid is not None

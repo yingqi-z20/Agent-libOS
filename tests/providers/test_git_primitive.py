@@ -366,6 +366,7 @@ def test_provider_defers_hook_isolation_until_a_git_call(
 def test_provider_repository_lock_thread_waiter_honors_timeout(
     tmp_path: Path,
 ) -> None:
+    sync_timeout_s = 30.0
     root = tmp_path / "repo"
     _init_repository(root)
     provider = LocalGitProvider(root)
@@ -378,9 +379,9 @@ def test_provider_repository_lock_thread_waiter_honors_timeout(
 
     def hold_repository_lock() -> None:
         try:
-            with provider.repository_lock(timeout=2.0):
+            with provider.repository_lock(timeout=DEFAULT_CONFIG.git.lock_timeout_s):
                 holder_entered.set()
-                if not holder_release.wait(timeout=5.0):
+                if not holder_release.wait(timeout=sync_timeout_s):
                     raise AssertionError("repository lock holder was not released")
         except BaseException as exc:  # pragma: no cover - surfaced below
             holder_failures.append(exc)
@@ -401,14 +402,14 @@ def test_provider_repository_lock_thread_waiter_honors_timeout(
     holder = threading.Thread(target=hold_repository_lock)
     waiter = threading.Thread(target=wait_for_repository_lock)
     holder.start()
-    assert holder_entered.wait(timeout=2.0)
+    assert holder_entered.wait(timeout=sync_timeout_s)
     waiter.start()
 
-    waiter_completed_while_held = waiter_done.wait(timeout=1.0)
+    waiter_completed_while_held = waiter_done.wait(timeout=sync_timeout_s)
     holder_was_still_holding = not holder_done.is_set()
     holder_release.set()
-    holder.join(timeout=2.0)
-    waiter.join(timeout=2.0)
+    holder.join(timeout=sync_timeout_s)
+    waiter.join(timeout=sync_timeout_s)
 
     assert not holder.is_alive()
     assert not waiter.is_alive()
@@ -417,7 +418,7 @@ def test_provider_repository_lock_thread_waiter_honors_timeout(
     assert holder_was_still_holding
     assert waiter_results == [GitErrorCode.REPOSITORY_BUSY.value]
 
-    with provider.repository_lock(timeout=0.5):
+    with provider.repository_lock(timeout=DEFAULT_CONFIG.git.lock_timeout_s):
         pass
 
 
@@ -428,7 +429,9 @@ def test_provider_repository_lock_remains_reentrant_in_same_thread(
     _init_repository(root)
     provider = LocalGitProvider(root)
 
-    with provider.repository_lock(timeout=0.5) as outer:
+    with provider.repository_lock(
+        timeout=DEFAULT_CONFIG.git.lock_timeout_s
+    ) as outer:
         with provider.repository_lock(timeout=0.05) as inner:
             assert outer.repository_id == inner.repository_id
             assert outer.worktree_id == inner.worktree_id
