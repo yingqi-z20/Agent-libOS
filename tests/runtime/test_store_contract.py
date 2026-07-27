@@ -1133,7 +1133,12 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
         provider = _RegistryDispatchBarrierProvider()
         runtime.jsonrpc.provider = provider
         pid = runtime.process.spawn(goal="registry phase linearization")
-        endpoint = _registry_contract_endpoint("inflight-registry-jsonrpc")
+        endpoint = replace(
+            _registry_contract_endpoint("inflight-registry-jsonrpc"),
+            # The synchronization barrier below may wait for 30 seconds on a
+            # loaded CI host; this contract test is not exercising deadlines.
+            timeout_s=60.0,
+        )
         runtime.jsonrpc.register_endpoint(
             endpoint,
             actor="test.host",

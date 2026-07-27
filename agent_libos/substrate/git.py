@@ -1340,6 +1340,11 @@ class LocalGitProvider:
             "core.fsmonitor=false",
             "-c",
             "core.untrackedCache=false",
+            # Git for Windows still gates Win32 long-path support behind this
+            # setting. Runtime-managed worktrees can legitimately cross the
+            # legacy MAX_PATH boundary even when the primary checkout does not.
+            "-c",
+            "core.longpaths=true",
             "-c",
             f"core.hooksPath={self._disabled_hooks_path()}",
             "-c",

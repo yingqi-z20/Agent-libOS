@@ -2805,7 +2805,9 @@ class HttpJsonRpcProvider:
         for address in resolved_addresses:
             request_dispatch_started = False
             deadline_guard: _JsonRpcSocketDeadline | None = None
-            remaining_timeout = deadline - time.monotonic()
+            # Floating-point addition/subtraction can otherwise reconstruct a
+            # duration a few ulps above the caller's exact timeout budget.
+            remaining_timeout = min(timeout_s, deadline - time.monotonic())
             if remaining_timeout <= 0:
                 last_error = "TimeoutError: JSON-RPC pinned request timed out"
                 break

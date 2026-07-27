@@ -155,6 +155,7 @@ def _apply_setup_git(task: BenchmarkTask, workspace: Path) -> None:
         run("symbolic-ref", "HEAD", "refs/heads/main")
         run("config", "user.name", "Agent libOS Benchmark")
         run("config", "user.email", "benchmark@agent-libos.invalid")
+        run("config", "core.autocrlf", "false")
         run("add", "--all", "--", ".")
         run("-c", "commit.gpgSign=false", "commit", "-q", "--allow-empty", "-m", "fixture")
 

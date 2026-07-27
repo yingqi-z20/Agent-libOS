@@ -861,7 +861,7 @@ class TestRuntimeSafetyBenchmark:
 
         prepared = prepare_workspace(task, suite, run_root, 'agent_libos_full')
 
-        assert fixture_dispatches == 6
+        assert fixture_dispatches == 7
         assert (prepared / '.git').is_dir()
 
     def test_workspace_git_setup_creates_commit_and_post_commit_files(
@@ -900,6 +900,11 @@ class TestRuntimeSafetyBenchmark:
         assert len(commit_oid) == 40
         assert all(character in '0123456789abcdef' for character in commit_oid)
         assert (prepared / '.git' / 'index').is_file()
+        assert subprocess.check_output(
+            ['git', 'config', '--local', '--get', 'core.autocrlf'],
+            cwd=prepared,
+            text=True,
+        ).strip() == 'false'
         assert (prepared / 'working.txt').read_text(encoding='utf-8') == 'uncommitted\n'
 
     def test_workspace_setup_files_cannot_inject_git_filter_config(

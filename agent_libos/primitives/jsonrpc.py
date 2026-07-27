@@ -841,7 +841,7 @@ class JsonRpcPrimitive:
         deadline: float,
         started: float,
     ) -> JsonRpcTransportResult:
-        remaining = deadline - time.monotonic()
+        remaining = min(endpoint.timeout_s, deadline - time.monotonic())
         if remaining <= 0:
             raise _JsonRpcTransportNotStarted(
                 "JSON-RPC absolute deadline expired before transport dispatch"

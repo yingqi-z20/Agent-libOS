@@ -3968,6 +3968,9 @@ def test_fast_forward_pull_from_configured_bare_remote(
         assert "merge.autoStash=false" in runtime.git.provider._repo_prefix(
             runtime.git.provider.repository_layout()
         )
+        assert "core.longpaths=true" in runtime.git.provider._repo_prefix(
+            runtime.git.provider.repository_layout()
+        )
         if strategy == "ff_only":
             assert "--ff-only" in merge_args[0]
         else:
