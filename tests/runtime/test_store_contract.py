@@ -1179,7 +1179,7 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
 
         def mutate_registry() -> None:
             try:
-                assert release_mutation.wait(timeout=5)
+                assert release_mutation.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
                 mutation_attempted.set()
                 runtime.jsonrpc.register_endpoint(
                     replacement,
@@ -1206,7 +1206,9 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
                 phase_count += 1
                 if phase_count == 2:
                     release_mutation.set()
-                    assert mutation_attempted.wait(timeout=30)
+                    assert mutation_attempted.wait(
+                        timeout=_THREAD_SYNC_TIMEOUT_S
+                    )
                     assert not mutation_done.is_set()
 
         monkeypatch.setattr(
@@ -1228,7 +1230,7 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
             )
         finally:
             release_mutation.set()
-            worker.join(timeout=30)
+            worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
 
         assert not worker.is_alive()
         assert mutation_errors == []

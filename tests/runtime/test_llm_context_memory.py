@@ -7,6 +7,7 @@ import secrets
 from concurrent.futures import ThreadPoolExecutor
 import pytest
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -52,6 +53,12 @@ from agent_libos.tools.builtin.context import (
     CompactProcessContextArgs,
     CompactProcessContextTool,
 )
+
+
+# Persistent-context tests repeatedly close and reopen SQLite runtimes. Allow
+# the same Windows hosted-runner I/O variance as other non-deadline integration
+# suites while retaining the normal timeout everywhere else.
+pytestmark = pytest.mark.timeout(300 if os.name == "nt" else 120)
 
 
 RUNTIME_SESSION_SKILL = 'agent-libos-runtime-session'

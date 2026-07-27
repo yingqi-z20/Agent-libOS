@@ -32,7 +32,11 @@ STORE_BACKENDS = [
 
 
 @pytest.mark.parametrize("backend", STORE_BACKENDS)
-@pytest.mark.timeout(300 if os.name == "nt" else 120)
+# Windows hosted runners can spend several minutes in the SQLite recovery
+# stress fixture when four xdist workers contend for the same filesystem. This
+# contract does not assert latency; the lane-level deadline remains the hard
+# upper bound for a genuinely stuck recovery.
+@pytest.mark.timeout(600 if os.name == "nt" else 120)
 def test_runtime_object_and_task_recovery_is_keyset_paged_and_bounded(
     backend: str,
     tmp_path: Path,

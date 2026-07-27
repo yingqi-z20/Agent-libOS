@@ -1244,7 +1244,11 @@ def test_source_neutral_discovery_ranks_concrete_task_terms(
         runtime.close()
 
 
-@pytest.mark.timeout(300 if os.name == "nt" else 120)
+# The complete routing corpus opens and exercises every built-in Skill. On
+# Windows hosted runners it can exceed five minutes when SQLite and four xdist
+# workers share the workspace filesystem; the lane deadline still detects a
+# genuinely stuck routing contract.
+@pytest.mark.timeout(600 if os.name == "nt" else 120)
 def test_every_builtin_skill_has_positive_and_adjacent_negative_routing(
     tmp_path: Path,
 ) -> None:
