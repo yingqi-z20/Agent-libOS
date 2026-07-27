@@ -36,6 +36,11 @@ Capability、approval、IFC、protected effect 或审计防篡改性声明，因
 依赖固定为 AgentDojo `0.1.35`，benchmark version 为 `v1.2.2`。catalog 与本轮
 覆盖如下：
 
+本文沿用 artifact 的历史字段名 `provider_call_count` / “provider call”：它统计
+成功返回给 harness 的 `LLMClient.complete_action` 逻辑调用，不是 SDK transport
+retry、兼容性重试或 API fallback 产生的物理 HTTP 请求次数。跨 query 的 16/19
+等调用数也都采用这一 harness 口径。
+
 | Suite | User tasks | Injection tasks | Benign | Attacked | Direct | 双臂轨迹 |
 |---|---:|---:|---:|---:|---:|---:|
 | workspace | 40 | 14 | 40 | 560 | 14 | 1,228 |
@@ -73,13 +78,13 @@ Capability、approval、IFC、protected effect 或审计防篡改性声明，因
    证据。
 
 旧失败发生在 workspace `user_task_25 / injection_task_12` 的 ambient 轨迹：第一
-个 query 已完成 16 次成功模型调用并退出 process，第二个 query 在 provider 前因
+个 query 已完成 16 次成功 harness 逻辑模型调用并退出 process，第二个 query 在 provider 前因
 复用终态 process 失败。该缺失 usage 从 SQLite 复算为 196,749 token。修复后：
 
 - 强制首个 query 返回空文本的确定性回归通过；
 - 同一真实模型 pair 的独立 replay 为 2/2 valid；
 - 最终全量中 ambient 没有自然触发第二 query，control 有 1 条轨迹触发了两次
-  query，总计 19 次 provider call。因而 retry 分支的全量真实模型覆盖仍应与确定性
+  query，总计 19 次成功 harness 逻辑模型调用。因而 retry 分支的全量真实模型覆盖仍应与确定性
   回归分开表述。
 
 本轮没有添加“相同参数自动去重”。写效果的硬幂等仍要求 protected operation 的
@@ -98,7 +103,7 @@ Capability、approval、IFC、protected effect 或审计防篡改性声明，因
 | Safe and useful | 856/949 (90.20%) | 864/949 (91.04%) | +0.84 pp |
 | Injection exposed | 924/949 (97.37%) | 935/949 (98.52%) | +1.16 pp |
 | Direct solvability | 28/35 (80.00%) | 27/35 (77.14%) | −2.86 pp |
-| Provider calls | 4,682 | 4,627 | −55 |
+| 成功 harness 逻辑模型调用（历史字段 `provider_call_count`） | 4,682 | 4,627 | −55 |
 | Tool calls | 3,617 | 3,559 | −58 |
 | Observed tokens | 23,194,868 | 23,200,740 | +5,872 |
 | Mean tokens / trajectory | 21,456.86 | 21,462.29 | +5.43 |
@@ -164,10 +169,10 @@ control 为 travel 10 个、slack 1 个。
 
 扫描对 function name 与规范 JSON args 做逐轨迹精确指纹：
 
-- ambient：763 个 provider write call；762 个成功执行，1 个
+- ambient：模型响应请求了 763 个写工具调用；762 个成功执行，1 个
   `send_channel_message` 因注入文本被错误拼进不存在的 channel 名而拒绝；0 个
   相同写尝试重复，0 个相同成功写效果重复。
-- control：761 个 provider write call；相同写尝试重复同样为 0。原生 control
+- control：模型响应请求了 761 个写工具调用；相同写尝试重复同样为 0。原生 control
   trace 不保存与 ambient `tool_executions` 同构的逐次成功/失败投影，因此不把其
   successful-execution 数与 ambient 做伪对称比较。
 - ambient 的 19 个额外相同调用分布在 15 条轨迹，最大 multiplicity 为 4；全部是
@@ -177,7 +182,7 @@ control 为 travel 10 个、slack 1 个。
 
 ambient trace 还记录了 13 个 iteration-boundary suppressed tool calls；这些调用
 出现在最后允许的模型响应中，但没有执行。唯一跨 query 重试的是 control 的
-workspace `user_task_2 / injection_task_5`：首 query 达到 16 次 provider call 后
+workspace `user_task_2 / injection_task_5`：首 query 达到 16 次 harness 逻辑模型调用后
 返回空终态，第二 query 用 3 次调用完成，总计 19 次、88,569 token。单条最大 token
 是 control 的 workspace `user_task_25 / injection_task_12`，16 次调用、201,032
 token。

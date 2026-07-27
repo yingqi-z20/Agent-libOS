@@ -47,7 +47,22 @@ class CapabilityStorePort(Protocol):
     def get_capability(self, cap_id: str) -> Capability | None:
         ...
 
-    def list_capabilities(self, subject: str | None = None) -> list[Capability]:
+    def list_capabilities(
+        self,
+        subject: str | None = None,
+        *,
+        limit: int | None = None,
+    ) -> list[Capability]:
+        ...
+
+    def query_capabilities(
+        self,
+        subject: str | None = None,
+        *,
+        active_only: bool,
+        after_cap_id: str | None,
+        limit: int,
+    ) -> list[Capability]:
         ...
 
     def consume_capability_uses(self, cap_id: str, count: int = 1) -> Capability | None:

@@ -26,6 +26,16 @@ provider hooks during startup. Every real provider boundary must use the
 | MCP | `SdkMcpProvider` for Streamable HTTP and stdio | Registered server/tool capability; stdio additionally requires `process:spawn` and exact `mcp_stdio:<digest>` execute authority exposed by server inspection | Tool calls do a negative clearance precheck, exact tool/stdio authorization, target-only executable resolution, and exact Sink clearance before preparation; complete credentials are resolved only after the reservation/intent exists. HTTP DNS and stdio spawn are covered by that intent, while live tool refresh resolves env first; registry lookup is gated; live discovery is bidirectional and tool results use bounded provider evidence | Tools-only v1 surface, closed manifest shape, header/stdio-env allowlists, request/response and timeout limits, contained stdio process lifecycle |
 | PTY | Trusted `modules/pty` Runtime Module provider hooks | Startup hash trust plus normal process/shell authority; published sessions are Object Memory `EXTERNAL_REF` handles with Object rights | Spawn is bidirectional; read/continuous ingest are ingress; write/resize/public close are egress. Effectful operations use protected pending-to-finalized evidence; write raises the session label high-water even after an ambiguous provider outcome | Output bounds on both backends; independent reader/monitor workers and process-tree wall/CPU/RSS supervision on POSIX. Windows uses `pywinpty`/ConPTY, has no Job Object or resource supervisor, and rejects `SubprocessLimits` before spawn |
 
+Filesystem compare-and-swap is an optional provider extension, not a breaking
+change to `FilesystemProvider.write_text`. Existing custom providers continue
+to receive the legacy write signature for ordinary writes. A conditional write
+uses `FilesystemCompareAndSwapProvider.write_text_compare_and_swap` only after
+runtime feature detection; if the extension is absent, the primitive rejects
+the request before path resolution, authority reservation, mutation intent, or
+provider dispatch. The local provider validates the expected full-content
+SHA-256 (or the `missing` creation token) again inside its path-creation lock
+immediately before opening or replacing the target.
+
 `modules/pty` is a repository/source-distribution asset, not part of the core
 Python wheel. A wheel-only installation must receive that trusted module
 separately before it can load the provider hooks. The optional `pty` dependency
@@ -51,6 +61,18 @@ failure between dispatch and post-attempt charging can leave provider call or
 token usage uncharged. Missing or invalid billable usage fails the completed
 action closed when a token budget is configured, and an over-budget completion
 is retained without dispatching its model-selected tools.
+
+LLM responses also cross a fixed inbound trust boundary that is independent of
+the outbound `max_tokens` preference. Before provider-authored content or tool
+arguments are joined or copied into durable Runtime state, content is limited
+to 262,144 characters and each content or argument string to 1,048,576 UTF-8
+bytes. A completion may contain at most 256 tool calls; each arguments string is
+limited to 262,144 characters, and all tool arguments together are limited to
+1,048,576 characters and 1,048,576 UTF-8 bytes. Responses API output is limited
+to 2,048 items and each message content list to 2,048 parts. A type, encoding,
+iterator, count, or size violation fails the completion closed through the same
+text-free `LLMError` boundary; oversized provider content is not truncated into
+an apparently valid model action.
 
 Explicit `safety_identifier`, `prompt_cache_key`, and
 `prompt_cache_retention` fields are dispatched to the Host-selected

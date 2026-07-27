@@ -19,15 +19,43 @@ from agent_libos.llm.openai_schema import (
 )
 from agent_libos.models.exceptions import LibOSError
 from agent_libos.ports.blocking_work import run_blocking_once
+from agent_libos.utils.public_errors import (
+    internal_error_observation,
+    internal_exception_observation,
+    public_error_envelope,
+)
 from agent_libos.utils.serde import to_jsonable
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _API_MODES = {"auto", "responses", "chat"}
 
+# These are inbound trust-boundary limits, not generation preferences. They
+# cap provider-authored material before it is joined or copied into durable
+# runtime state. Keep them independent of outbound max-token configuration.
+LLM_RESPONSE_CONTENT_MAX_CHARS = 262_144
+LLM_RESPONSE_TEXT_MAX_BYTES = 1_048_576
+LLM_RESPONSE_TOOL_CALL_MAX_COUNT = 256
+LLM_RESPONSE_TOOL_ARGUMENT_MAX_CHARS = 262_144
+LLM_RESPONSE_TOOL_ARGUMENT_TOTAL_MAX_CHARS = 1_048_576
+LLM_RESPONSE_TOOL_ARGUMENT_TOTAL_MAX_BYTES = 1_048_576
+LLM_RESPONSE_OUTPUT_MAX_ITEMS = 2_048
+LLM_RESPONSE_CONTENT_MAX_PARTS = 2_048
+
 
 class LLMError(LibOSError):
     pass
+
+
+class LLMTransientError(LLMError):
+    """Provider failure that is safe to retry in a later process quantum."""
+
+
+_PROVIDER_FAILURE_MARKER = object()
+_PROVIDER_FAILURE_MARKER_ATTR = "_agent_libos_provider_failure_marker"
+_PROVIDER_FAILURE_OBSERVATION_ATTR = (
+    "_agent_libos_provider_failure_observation"
+)
 
 
 @dataclass
@@ -109,6 +137,12 @@ class LLMClient:
             if self.fallback_json_actions is None
             else self.fallback_json_actions
         )
+        if self.inherit_ambient_openai_sdk_config and self.base_url is None:
+            # Freeze the SDK's ambient endpoint before policy validation.  If
+            # this remains unset, the OpenAI SDK re-reads OPENAI_BASE_URL at
+            # lazy client construction and can dispatch to an endpoint that
+            # Agent libOS never authorized or included in provider identity.
+            self.base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
         self._validate_base_url_policy()
 
     @classmethod
@@ -292,7 +326,10 @@ class LLMClient:
             schema_name=schema_name,
         )
         if not completion.content:
-            raise LLMError("LLM returned empty content")
+            raise llm_provider_failure_error(
+                "empty content",
+                diagnostic_type="ProviderEmptyResponse",
+            )
         return completion
 
     def complete_action(
@@ -341,7 +378,9 @@ class LLMClient:
                 cause = exc.__cause__ or exc
                 if self.api_mode == "auto" and self._should_fallback_to_chat(cause):
                     pass
-                elif self.fallback_json_actions and self._is_tool_protocol_rejection(exc):
+                elif self.fallback_json_actions and self._is_tool_protocol_rejection(
+                    exc.__cause__ or exc
+                ):
                     return await self._complete_json_action_fallback(
                         messages,
                         selected_temperature,
@@ -444,7 +483,10 @@ class LLMClient:
             provider_call = retry_call
         if not result.content:
             finish_reason = _first_choice_attr(provider_call.response, "finish_reason")
-            raise LLMError(f"LLM returned empty content; finish_reason={finish_reason!r}")
+            raise llm_provider_failure_error(
+                finish_reason,
+                diagnostic_type="ProviderEmptyResponse",
+            )
         return result
 
     async def _chat_complete_action(
@@ -461,7 +503,9 @@ class LLMClient:
         try:
             provider_call = await self._create_chat_completion(payload)
         except LLMError as exc:
-            if self.fallback_json_actions and self._is_tool_protocol_rejection(exc):
+            if self.fallback_json_actions and self._is_tool_protocol_rejection(
+                exc.__cause__ or exc
+            ):
                 return await self._complete_json_action_fallback(
                     messages,
                     temperature,
@@ -476,6 +520,13 @@ class LLMClient:
             result = self._completion_from_chat(
                 retry_call,
                 additional_removed=provider_call.compatibility_removed_options,
+            )
+            provider_call = retry_call
+        finish_reason = _first_choice_attr(provider_call.response, "finish_reason")
+        if finish_reason in {"length", "content_filter"}:
+            raise llm_provider_failure_error(
+                finish_reason,
+                diagnostic_type="ProviderFinishReason",
             )
         return result
 
@@ -494,7 +545,10 @@ class LLMClient:
             schema_name="response",
         )
         if not result.content:
-            raise LLMError("LLM returned empty content during JSON action fallback")
+            raise llm_provider_failure_error(
+                "empty JSON action fallback content",
+                diagnostic_type="ProviderEmptyResponse",
+            )
         result.fallback_json_action_used = True
         return result
 
@@ -701,16 +755,13 @@ class LLMClient:
                 last_error = exc
                 retry = self._compatibility_retry_payload(request, exc, api=api)
                 if retry is None:
-                    request_id = getattr(exc, "request_id", None)
-                    status_code = getattr(exc, "status_code", None)
-                    raise LLMError(
-                        f"OpenAI SDK {api} request failed: status={status_code!r} request_id={request_id!r} error={exc}"
-                    ) from exc
+                    raise _openai_sdk_request_error(api, exc) from exc
                 removed_options.update(
                     key for key in request if key not in retry
                 )
                 request = retry
-        raise LLMError(f"OpenAI SDK {api} request failed after compatibility retries: {last_error}") from last_error
+        assert last_error is not None
+        raise _openai_sdk_request_error(api, last_error) from last_error
 
     def _compatibility_retry_payload(self, payload: dict[str, Any], exc: Exception, api: str) -> dict[str, Any] | None:
         message = str(exc).lower()
@@ -776,21 +827,63 @@ class LLMClient:
         response = provider_call.response
         error = getattr(response, "error", None)
         if error is not None:
-            raise LLMError(f"OpenAI response failed: {error}")
+            raise llm_provider_failure_error(
+                error,
+                diagnostic_type="ProviderResponseError",
+            )
+        status = _get_attr_or_key(response, "status")
+        if status not in {None, "completed"}:
+            details = _get_attr_or_key(response, "incomplete_details")
+            reason = _get_attr_or_key(details, "reason") if details is not None else None
+            raise llm_provider_failure_error(
+                (status, reason),
+                diagnostic_type="ProviderResponseStatus",
+            )
+        output = _bounded_provider_items(
+            getattr(response, "output", None),
+            limit=LLM_RESPONSE_OUTPUT_MAX_ITEMS,
+            label="response.output",
+        )
         tool_calls: list[dict[str, Any]] = []
-        for item in getattr(response, "output", None) or []:
+        argument_chars = 0
+        argument_bytes = 0
+        for item in output:
             if _get_attr_or_key(item, "type") != "function_call":
                 continue
+            if len(tool_calls) >= LLM_RESPONSE_TOOL_CALL_MAX_COUNT:
+                raise _provider_response_bounds_error("response.tool_calls")
+            item_status = _get_attr_or_key(item, "status")
+            if item_status not in {None, "completed"}:
+                raise llm_provider_failure_error(
+                    item_status,
+                    diagnostic_type="ProviderFunctionCallStatus",
+                )
+            arguments = _get_attr_or_key(item, "arguments") or "{}"
+            arguments = _bounded_provider_text(
+                arguments,
+                limit=LLM_RESPONSE_TOOL_ARGUMENT_MAX_CHARS,
+                label="response.tool_call.arguments",
+            )
+            argument_chars += len(arguments)
+            argument_bytes += len(arguments.encode("utf-8"))
+            if argument_chars > LLM_RESPONSE_TOOL_ARGUMENT_TOTAL_MAX_CHARS:
+                raise _provider_response_bounds_error(
+                    "response.tool_call.arguments_total"
+                )
+            if argument_bytes > LLM_RESPONSE_TOOL_ARGUMENT_TOTAL_MAX_BYTES:
+                raise _provider_response_bounds_error(
+                    "response.tool_call.arguments_total_bytes"
+                )
             tool_calls.append(
                 {
                     "id": _get_attr_or_key(item, "id") or _get_attr_or_key(item, "call_id"),
                     "call_id": _get_attr_or_key(item, "call_id"),
                     "name": _get_attr_or_key(item, "name"),
-                    "arguments": _get_attr_or_key(item, "arguments") or "{}",
+                    "arguments": arguments,
                 }
             )
         return LLMCompletion(
-            content=self._response_text(response),
+            content=self._response_text(response, output=output),
             tool_calls=tool_calls,
             raw=response,
             api="responses",
@@ -819,23 +912,58 @@ class LLMClient:
         try:
             message = completion.choices[0].message
         except (AttributeError, IndexError) as exc:
-            raise LLMError(f"unexpected LLM response shape: {completion}") from exc
+            raise llm_provider_failure_error(exc) from exc
 
+        raw_tool_calls = _bounded_provider_items(
+            getattr(message, "tool_calls", None),
+            limit=LLM_RESPONSE_TOOL_CALL_MAX_COUNT,
+            label="chat.message.tool_calls",
+        )
         tool_calls: list[dict[str, Any]] = []
-        for call in getattr(message, "tool_calls", None) or []:
+        argument_chars = 0
+        argument_bytes = 0
+        for call in raw_tool_calls:
             function = getattr(call, "function", None)
             if function is None:
                 continue
+            arguments = getattr(function, "arguments", "{}") or "{}"
+            arguments = _bounded_provider_text(
+                arguments,
+                limit=LLM_RESPONSE_TOOL_ARGUMENT_MAX_CHARS,
+                label="chat.tool_call.arguments",
+            )
+            argument_chars += len(arguments)
+            argument_bytes += len(arguments.encode("utf-8"))
+            if argument_chars > LLM_RESPONSE_TOOL_ARGUMENT_TOTAL_MAX_CHARS:
+                raise _provider_response_bounds_error(
+                    "chat.tool_call.arguments_total"
+                )
+            if argument_bytes > LLM_RESPONSE_TOOL_ARGUMENT_TOTAL_MAX_BYTES:
+                raise _provider_response_bounds_error(
+                    "chat.tool_call.arguments_total_bytes"
+                )
             tool_calls.append(
                 {
                     "id": getattr(call, "id", None),
                     "name": getattr(function, "name", None),
-                    "arguments": getattr(function, "arguments", "{}"),
+                    "arguments": arguments,
                 }
+            )
+        content = self._message_content(message)
+        finish_reason = _first_choice_attr(completion, "finish_reason")
+        if finish_reason in {"length", "content_filter"} and (tool_calls or content.strip()):
+            raise llm_provider_failure_error(
+                finish_reason,
+                diagnostic_type="ProviderFinishReason",
+            )
+        if tool_calls and finish_reason not in {None, "tool_calls", "function_call"}:
+            raise llm_provider_failure_error(
+                finish_reason,
+                diagnostic_type="ProviderFinishReason",
             )
 
         return LLMCompletion(
-            content=self._message_content(message),
+            content=content,
             tool_calls=tool_calls,
             raw=completion,
             api="chat",
@@ -1003,17 +1131,54 @@ class LLMClient:
         return retry
 
     @staticmethod
-    def _response_text(response: Any) -> str:
+    def _response_text(
+        response: Any,
+        *,
+        output: list[Any] | None = None,
+    ) -> str:
         output_text = getattr(response, "output_text", None)
         if isinstance(output_text, str):
-            return output_text
+            return _bounded_provider_text(
+                output_text,
+                limit=LLM_RESPONSE_CONTENT_MAX_CHARS,
+                label="response.output_text",
+            )
         parts: list[str] = []
-        for item in getattr(response, "output", None) or []:
+        total_chars = 0
+        total_bytes = 0
+        selected_output = output
+        if selected_output is None:
+            selected_output = _bounded_provider_items(
+                getattr(response, "output", None),
+                limit=LLM_RESPONSE_OUTPUT_MAX_ITEMS,
+                label="response.output",
+            )
+        for item in selected_output:
             if _get_attr_or_key(item, "type") != "message":
                 continue
-            for content in _get_attr_or_key(item, "content") or []:
+            contents = _bounded_provider_items(
+                _get_attr_or_key(item, "content"),
+                limit=LLM_RESPONSE_CONTENT_MAX_PARTS,
+                label="response.message.content",
+            )
+            for content in contents:
                 if _get_attr_or_key(content, "type") == "output_text":
-                    parts.append(str(_get_attr_or_key(content, "text") or ""))
+                    text = _bounded_provider_text(
+                        _get_attr_or_key(content, "text") or "",
+                        limit=LLM_RESPONSE_CONTENT_MAX_CHARS,
+                        label="response.message.content.text",
+                    )
+                    total_chars += len(text)
+                    total_bytes += len(text.encode("utf-8"))
+                    if total_chars > LLM_RESPONSE_CONTENT_MAX_CHARS:
+                        raise _provider_response_bounds_error(
+                            "response.content_total"
+                        )
+                    if total_bytes > LLM_RESPONSE_TEXT_MAX_BYTES:
+                        raise _provider_response_bounds_error(
+                            "response.content_total_bytes"
+                        )
+                    parts.append(text)
         return "".join(parts)
 
     @staticmethod
@@ -1022,10 +1187,35 @@ class LLMClient:
         if content is None:
             return ""
         if isinstance(content, str):
-            return content
+            return _bounded_provider_text(
+                content,
+                limit=LLM_RESPONSE_CONTENT_MAX_CHARS,
+                label="chat.message.content",
+            )
         if isinstance(content, list):
-            return "".join(_content_part_text(part) for part in content)
-        return str(content)
+            parts = _bounded_provider_items(
+                content,
+                limit=LLM_RESPONSE_CONTENT_MAX_PARTS,
+                label="chat.message.content",
+            )
+            selected: list[str] = []
+            total_chars = 0
+            total_bytes = 0
+            for part in parts:
+                text = _provider_content_part_text(part)
+                total_chars += len(text)
+                total_bytes += len(text.encode("utf-8"))
+                if total_chars > LLM_RESPONSE_CONTENT_MAX_CHARS:
+                    raise _provider_response_bounds_error(
+                        "chat.message.content_total"
+                    )
+                if total_bytes > LLM_RESPONSE_TEXT_MAX_BYTES:
+                    raise _provider_response_bounds_error(
+                        "chat.message.content_total_bytes"
+                    )
+                selected.append(text)
+            return "".join(selected)
+        raise _provider_response_bounds_error("chat.message.content_type")
 
     def _messages_with_json_instruction(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         json_instruction = self.defaults.json_instruction
@@ -1265,6 +1455,137 @@ def _is_openai_sdk_error(exc: Exception) -> bool:
     return isinstance(exc, OpenAIError)
 
 
+def llm_provider_failure_error(
+    source: BaseException | object,
+    *,
+    transient: bool = False,
+    diagnostic_type: str | None = None,
+) -> LLMError:
+    """Wrap provider-authored failure data in one text-free public error.
+
+    The raw exception remains available as ``__cause__`` at the raise site.
+    Durable callers may recover only the private type/length/digest observation
+    through :func:`llm_error_internal_observation`; no provider text is copied
+    into the wrapper message or attributes.
+    """
+
+    if isinstance(source, LLMError):
+        try:
+            marker = object.__getattribute__(
+                source,
+                _PROVIDER_FAILURE_MARKER_ATTR,
+            )
+        except BaseException:
+            marker = None
+        if marker is _PROVIDER_FAILURE_MARKER:
+            return source
+
+    error_class = (
+        LLMTransientError
+        if transient or isinstance(source, LLMTransientError)
+        else LLMError
+    )
+    wrapped = error_class("LLM provider failure")
+    public_error = public_error_envelope(wrapped, code="llm_error")
+    # Cache the public envelope before replacing ``args`` so every downstream
+    # boundary observes exactly the same correlation identifier.
+    wrapped.args = (public_error["message"],)
+    if isinstance(source, BaseException):
+        observation = internal_exception_observation(
+            source,
+            correlation_id=public_error["correlation_id"],
+        )
+    else:
+        observation = internal_error_observation(
+            error_type=diagnostic_type or type(source).__name__,
+            text=_safe_provider_diagnostic_text(source),
+            correlation_id=public_error["correlation_id"],
+        )
+    object.__setattr__(
+        wrapped,
+        _PROVIDER_FAILURE_MARKER_ATTR,
+        _PROVIDER_FAILURE_MARKER,
+    )
+    object.__setattr__(
+        wrapped,
+        _PROVIDER_FAILURE_OBSERVATION_ATTR,
+        observation,
+    )
+    return wrapped
+
+
+def llm_error_internal_observation(
+    error: BaseException,
+    *,
+    correlation_id: str,
+) -> dict[str, Any]:
+    """Return a provider-source observation when ``error`` is a safe wrapper."""
+
+    try:
+        marker = object.__getattribute__(error, _PROVIDER_FAILURE_MARKER_ATTR)
+        selected = object.__getattribute__(
+            error,
+            _PROVIDER_FAILURE_OBSERVATION_ATTR,
+        )
+    except BaseException:
+        marker = None
+        selected = None
+    if marker is _PROVIDER_FAILURE_MARKER and isinstance(selected, dict):
+        text = selected.get("exception_text")
+        if (
+            selected.get("correlation_id") == correlation_id
+            and isinstance(selected.get("error_type"), str)
+            and isinstance(text, dict)
+            and type(text.get("bytes")) is int
+            and text["bytes"] >= 0
+            and isinstance(text.get("sha256"), str)
+            and len(text["sha256"]) == 64
+        ):
+            return {
+                "error_type": selected["error_type"],
+                "correlation_id": correlation_id,
+                "exception_text": {
+                    "bytes": text["bytes"],
+                    "sha256": text["sha256"],
+                },
+            }
+    return internal_exception_observation(
+        error,
+        correlation_id=correlation_id,
+    )
+
+
+def _safe_provider_diagnostic_text(value: object) -> str:
+    try:
+        return str(value)
+    except BaseException:
+        return "provider diagnostic text is unavailable"
+
+
+def _openai_sdk_request_error(api: str, exc: Exception) -> LLMError:
+    del api  # The API mode is Host-controlled but not needed in the envelope.
+    return llm_provider_failure_error(
+        exc,
+        transient=_is_transient_openai_sdk_error(exc),
+    )
+
+
+def _is_transient_openai_sdk_error(exc: Exception) -> bool:
+    """Mirror the SDK's documented retryable transport/status classes."""
+
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and (
+        status_code in {408, 409, 429} or 500 <= status_code <= 599
+    ):
+        return True
+    return type(exc).__name__ in {
+        "APIConnectionError",
+        "APITimeoutError",
+        "InternalServerError",
+        "RateLimitError",
+    }
+
+
 
 def _is_openai_base_url(base_url: str) -> bool:
     parsed = urlparse(base_url)
@@ -1295,6 +1616,58 @@ def _message_content_for_search(message: dict[str, Any]) -> str:
     if isinstance(content, list):
         return " ".join(_content_part_text(part) for part in content)
     return "" if content is None else str(content)
+
+
+def _provider_response_bounds_error(label: str) -> LLMError:
+    return llm_provider_failure_error(
+        label,
+        diagnostic_type="ProviderResponseBounds",
+    )
+
+
+def _bounded_provider_text(value: Any, *, limit: int, label: str) -> str:
+    if not isinstance(value, str) or len(value) > limit:
+        raise _provider_response_bounds_error(label)
+    try:
+        encoded_bytes = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise _provider_response_bounds_error(f"{label}_encoding") from exc
+    if encoded_bytes > LLM_RESPONSE_TEXT_MAX_BYTES:
+        raise _provider_response_bounds_error(f"{label}_bytes")
+    return value
+
+
+def _bounded_provider_items(value: Any, *, limit: int, label: str) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, bytearray, dict)):
+        raise _provider_response_bounds_error(f"{label}_type")
+    if isinstance(value, (list, tuple)):
+        if len(value) > limit:
+            raise _provider_response_bounds_error(label)
+        return list(value)
+    try:
+        iterator = iter(value)
+    except TypeError as exc:
+        raise _provider_response_bounds_error(f"{label}_type") from exc
+    selected: list[Any] = []
+    for item in iterator:
+        if len(selected) >= limit:
+            raise _provider_response_bounds_error(label)
+        selected.append(item)
+    return selected
+
+
+def _provider_content_part_text(part: Any) -> str:
+    if isinstance(part, dict):
+        value = part.get("text") or part.get("content") or ""
+    else:
+        value = getattr(part, "text", getattr(part, "content", "")) or ""
+    return _bounded_provider_text(
+        value,
+        limit=LLM_RESPONSE_CONTENT_MAX_CHARS,
+        label="chat.message.content_part",
+    )
 
 
 def _content_part_text(part: Any) -> str:

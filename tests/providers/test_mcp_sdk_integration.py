@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -22,7 +24,13 @@ from agent_libos.models import (
     McpToolSpec,
 )
 from agent_libos.substrate import LocalResourceProviderSubstrate, SdkMcpProvider
-from agent_libos.substrate.local import _McpHttpResponseLimiter, _mcp_stdio_read_size
+from agent_libos.substrate.base import SubprocessLimits
+from agent_libos.substrate.local import (
+    _McpHttpResponseLimiter,
+    _MCP_STABLE_CWD_SUPPORTED,
+    _mcp_stdio_read_size,
+    _strict_stdio_client,
+)
 
 pytestmark = pytest.mark.mcp
 
@@ -78,6 +86,10 @@ class TestMcpSdkIntegration:
         finally:
             runtime.close()
 
+    @pytest.mark.skipif(
+        not _MCP_STABLE_CWD_SUPPORTED,
+        reason="stable configured cwd dispatch requires Linux /proc/self/fd",
+    )
     def test_stdio_uses_workspace_cwd_and_exact_allowlisted_env(
         self,
         tmp_path: Path,
@@ -139,6 +151,84 @@ class TestMcpSdkIntegration:
         finally:
             runtime.close()
 
+    def test_stdio_infinite_small_frames_hit_aggregate_stdout_limit(self) -> None:
+        from mcp.client.stdio import StdioServerParameters
+
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-c",
+                "import os\n"
+                "line = b'{\"jsonrpc\":\"2.0\",\"method\":\"tick\"}\\n'\n"
+                "while True: os.write(1, line)",
+            ],
+            env={},
+        )
+
+        async def exercise() -> None:
+            async with _strict_stdio_client(
+                params,
+                max_frame_bytes=256,
+                deadline=time.monotonic() + 1.0,
+                limits=SubprocessLimits(wall_seconds=1.0),
+            ) as (read, _write):
+                while True:
+                    item = await read.receive()
+                    if isinstance(item, BaseException):
+                        raise item
+
+        with pytest.raises(Exception) as caught:
+            asyncio.run(exercise())
+
+        assert "MCP stdio stdout exceeded max_output_bytes=" in "\n".join(
+            _exception_messages(caught.value)
+        )
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group cleanup regression")
+    def test_stdio_cleanup_kills_child_after_direct_parent_exits(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from mcp.client.stdio import StdioServerParameters
+
+        pid_file = tmp_path / "stdio-child.pid"
+        script = (
+            "import pathlib, subprocess, sys\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid), encoding='utf-8')\n"
+        )
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-c", script],
+            env={},
+        )
+
+        async def exercise() -> None:
+            async with _strict_stdio_client(
+                params,
+                max_frame_bytes=1_024,
+                deadline=time.monotonic() + 1.0,
+                limits=SubprocessLimits(wall_seconds=1.0),
+            ):
+                until = time.monotonic() + 0.75
+                while not pid_file.exists() and time.monotonic() < until:
+                    await asyncio.sleep(0.01)
+                assert pid_file.exists()
+                await asyncio.sleep(0.05)
+
+        asyncio.run(asyncio.wait_for(exercise(), timeout=2.0))
+        child_pid = int(pid_file.read_text(encoding="utf-8"))
+        try:
+            until = time.monotonic() + 1.0
+            while _pid_is_running(child_pid) and time.monotonic() < until:
+                time.sleep(0.02)
+            assert not _pid_is_running(child_pid)
+        finally:
+            if _pid_is_running(child_pid):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(child_pid, 9)
+
     def test_streamable_http_fastmcp_tool_call(self, tmp_path: Path) -> None:
         port = _free_local_port()
         server_path = _write_fastmcp_http_server(tmp_path)
@@ -163,12 +253,7 @@ class TestMcpSdkIntegration:
             finally:
                 runtime.close()
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+            _stop_http_server_process(proc)
 
     def test_streamable_http_raw_response_exceeding_limit_is_rejected(self, tmp_path: Path) -> None:
         port = _free_local_port()
@@ -199,12 +284,7 @@ class TestMcpSdkIntegration:
             finally:
                 runtime.close()
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+            _stop_http_server_process(proc)
 
     def test_streamable_http_provider_honors_call_limit_below_manifest_limit(self, tmp_path: Path) -> None:
         port = _free_local_port()
@@ -245,12 +325,7 @@ class TestMcpSdkIntegration:
                     max_response_bytes=2_048,
                 )
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+            _stop_http_server_process(proc)
 
     def test_streamable_http_rejects_content_encoding_before_decode(self) -> None:
         port = _free_local_port()
@@ -357,6 +432,18 @@ class TestMcpSdkIntegration:
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
+
+
+def _stop_http_server_process(proc: subprocess.Popen[str]) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            stream.close()
 
 
 def _write_fastmcp_stdio_server(root: Path) -> Path:
@@ -507,6 +594,31 @@ def _wait_for_port(port: int) -> None:
                 return
         time.sleep(0.1)
     raise AssertionError(f"MCP test server did not listen on port {port}")
+
+
+def _exception_messages(error: BaseException) -> list[str]:
+    messages = [str(error)]
+    if isinstance(error, BaseExceptionGroup):
+        for nested in error.exceptions:
+            messages.extend(_exception_messages(nested))
+    return messages
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        import psutil
+
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True
 
 
 def _redirect_handler(location: str) -> type[BaseHTTPRequestHandler]:

@@ -12,6 +12,11 @@ _TOKEN_FIELDS = (
     "output_tokens",
 )
 
+# Provider token counters eventually participate in JSON interchange and
+# floating-point resource accounting. Keep them inside the largest integer
+# that remains exact in IEEE-754 binary64.
+LLM_USAGE_COUNTER_MAX = (1 << 53) - 1
+
 
 def canonicalize_llm_usage(
     raw_usage: Any,
@@ -162,7 +167,12 @@ def _store_counter(
     key: str,
     value: Any,
 ) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > LLM_USAGE_COUNTER_MAX
+    ):
         invalid_fields.add(key)
         return
     usage[key] = value

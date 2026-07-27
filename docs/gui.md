@@ -73,10 +73,26 @@ non-file targets, and symbolic links whose canonical target is outside the
 distribution root. Assets are read from a verified file descriptor so a
 pathname swap after validation cannot redirect the response.
 
+The Electron window applies the same exact-origin guard to renderer-initiated
+navigations and server-side redirects. Same-origin Vite development routes
+remain usable, while cross-origin, protocol-relative, credential-confused, and
+malformed targets are prevented from replacing the trusted renderer. External
+links use the separately protocol-filtered preload bridge or denied-window
+handler instead of top-level navigation. Both child-server startup output
+streams have the same 64 KiB cumulative limit; exceeding either fails startup
+and runs the process-tree cleanup path without retaining the oversized output.
+
 The GUI can display data-flow Audit/Event/Explain evidence produced by runtime
 operations, but it does not expose a Sink-trust mutation route or model tool.
 Sink trust remains Host configuration/API state; adding a GUI view later must
 not turn renderer visibility into `data_flow_sink_registry:*` authority.
+
+Agent-authored Markdown is treated as untrusted presentation data. Markdown
+image syntax is always rendered as an escaped, accessible text placeholder;
+the renderer never creates an `img`, `source`, or preload request for its
+destination, whether that destination is remote, local, relative, `data:`, or
+`blob:`. Production Content Security Policy remains a second boundary rather
+than the control responsible for preventing Markdown-triggered network egress.
 
 Only the checkpoint create/restore/fork, Skill activation/unload, Capability
 grant/delegate/revoke, image registration/commit, JSON-RPC registration, and
@@ -128,10 +144,14 @@ The GUI server accepts the same runtime store targets as the CLI. SQLite paths
 are the default local store; PostgreSQL DSNs require installing the `postgres`
 extra and are redacted in startup and health payloads. Persistent stores use an
 active-runtime lease, so a GUI server and a writable CLI Runtime cannot open
-the same SQLite target or PostgreSQL database/schema concurrently. SQLite uses
-the canonical target plus a no-follow sidecar `flock` where available and a
-kernel exclusive database lock otherwise; PostgreSQL uses a stable
-database/schema advisory key. See [Runtime Storage](storage.md).
+the same SQLite target or PostgreSQL database/schema concurrently. On the
+hardened POSIX path, SQLite pairs its canonical target and no-follow sidecar
+`flock` with an owner-only `(st_dev, st_ino)` identity lease; the database and
+sidecars must be regular, current-user-owned, single-link files, so hard-link
+aliases and path/lockfile replacement fail closed. Other platforms use a kernel
+exclusive database lock without claiming those POSIX identity guarantees.
+PostgreSQL uses a stable database/schema advisory key. See
+[Runtime Storage](storage.md#active-runtime-leases).
 
 The server prints one JSON line containing the selected local URL and bearer
 token:
@@ -165,8 +185,14 @@ uv run python scripts/test_matrix.py --lane gui
 `npm --prefix gui run build` removes `dist-electron` before compiling. Vitest
 excludes both renderer and Electron build output, and the production Electron
 TypeScript configuration excludes `*.test.ts`; generated JavaScript therefore
-cannot become a second copy of the source test suite. A useful clean-build
-check is:
+cannot become a second copy of the source test suite.
+
+The DOM-level Markdown security regression uses jsdom 28 because that major
+supports the GUI package's declared Node 22.12 floor. jsdom 29 raises its Node
+22 floor to 22.13, so adopting it requires an intentional engine-support
+change rather than an incidental test-dependency update.
+
+A useful clean-build check is:
 
 ```bash
 npm --prefix gui run test
@@ -209,8 +235,10 @@ restore the last user/operator view when renderer storage is available. The
 default user workspace uses a task sidebar and a dedicated conversation area.
 The first-task state starts with an empty goal instead of silently submitting a
 sample task, offers reusable starter prompts and a Ctrl/Command+Enter shortcut,
-and keeps model, image, working-directory, workspace, and Git settings inside a
-progressively disclosed runtime-and-permissions section. A successful launch
+and keeps a compact read-only launch summary beside an **Edit settings** button.
+The **New task settings** dialog edits the image, model profile, quanta,
+working directory, workspace, Git, command, and context-maintenance choices as
+one local draft. A successful launch
 clears the goal draft and uses a bounded one-line goal summary as the task label
 for the current GUI window. At most 200 bounded labels are retained in
 `sessionStorage`, so reloads remain legible without persisting full goals across
@@ -231,7 +259,7 @@ Shift+Enter inserts a line break.
 Task-start controls include a workspace access scope, a separate local-Git
 request switch, and a command-execution selector that defaults to disabled.
 Persistent context enrichment and bounded automatic maintenance are disabled by
-default and can be explicitly enabled in the same settings panel.
+default and can be explicitly enabled in the dialog's permission group.
 These controls create an
 explicit Host-authored launch manifest: Human communication is granted to the
 root process. Explicit persistent context receives non-delegable
@@ -356,8 +384,8 @@ away, so disabling custom-base-url use remains stable across GUI restarts.
 
 The scheduler defaults to automatic mode. Users can pause auto-run, step a
 selected process, or run the selected process with an optional quantum budget.
-For a paused process, Run resumes it and re-enables automatic scheduling instead
-of sending a run request that the paused state cannot execute. Human-request
+For a paused process, Run clears the pause fence and starts a run scoped to that
+process without changing the global auto-run setting. Human-request
 responses use their own per-request pending guard, so a concurrently running or
 message-triggered task cannot discard an approval or rejection. Passive status
 notices do not intercept controls beneath them, and long snapshot-truncation
@@ -614,7 +642,17 @@ Important endpoints:
   `POST /api/skills/{skill_id}/activate|unload`
 - `GET /api/capabilities`, `GET /api/capabilities/{capability_id}`,
   `POST /api/capabilities/grant|delegate|explain`, and
-  `POST /api/capabilities/{capability_id}/revoke`
+  `POST /api/capabilities/{capability_id}/revoke`. Capability inventory clients
+  should request `GET /api/capabilities?mode=page`, optionally with `subject`,
+  `limit`, and the opaque `after` cursor returned by the preceding page. The
+  response is `{items, next_after, has_more}`; callers must replay
+  `next_after` as `after` without parsing it until `has_more` is false. `limit`
+  defaults to and cannot exceed `capability.list_limit`. Omitting `mode=page`
+  preserves the legacy array response for same-build older clients, but that
+  response is only one bounded page and must not be treated as a complete
+  inventory when it reaches the configured limit. The checked-in renderer uses
+  page mode and also fails closed on missing/repeated cursors, more than 10,000
+  received items, or an inventory that does not terminate within 10,000 pages.
 - `GET /api/images`, `GET /api/images/{image_id}`, and
   `POST /api/images/register|commit`
 - `GET /api/jsonrpc`, `GET /api/jsonrpc/{endpoint_id}`,

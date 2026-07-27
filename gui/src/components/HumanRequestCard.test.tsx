@@ -120,6 +120,7 @@ describe("HumanRequestCard", () => {
     expect(html).toContain("Source count");
     expect(html).toContain("3");
     expect(html).toContain("human.gui.present");
+    expect(html).toContain('aria-label="Approve: human.gui.present · human:owner:gui · request_data_release_approval"');
     expect(html).not.toContain("ORIGINAL_RELEASE_PAYLOAD_MUST_NOT_RENDER");
     expect(html.match(/<button/g)).toHaveLength(2);
   });
@@ -139,8 +140,8 @@ describe("HumanRequestCard", () => {
     expect(parseDataReleaseApprovalContext(request.payload)).toBeNull();
     const html = render(request);
     expect(html).toContain("Release metadata is incomplete");
-    expect(html).toMatch(/<button disabled="">Approve<\/button>/);
-    expect(html).toMatch(/<button class="danger">Reject<\/button>/);
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Approve<\/button>/);
+    expect(html).toMatch(/<button[^>]*class="danger"[^>]*>Reject<\/button>/);
   });
 
   it("keeps the draft when submission fails instead of optimistically clearing it", () => {
@@ -172,6 +173,43 @@ describe("HumanRequestCard", () => {
     expect(questionHtml).toContain('required=""');
     expect(approvalHtml).not.toContain('name="human-answer"');
     expect(approvalHtml).not.toContain('name="permission-policy"');
+  });
+
+  it("renders the structured scope for permission decisions", () => {
+    const request = humanRequest("permission_request", {
+      requested_permission: {
+        subject: "pid_1",
+        resource: "filesystem:workspace/src",
+        rights: ["read", "write"]
+      },
+      context: {
+        risk: "high",
+        resource_scope: "exact",
+        request_origin: "model"
+      }
+    });
+
+    const html = render(request);
+
+    expect(html).toContain("Approval context");
+    expect(html).toContain("filesystem:workspace/src");
+    expect(html).toContain("high");
+    expect(html).toContain('role="group"');
+  });
+
+  it("renders the exact bounded context for external-operation approvals", () => {
+    const request = humanRequest("external_operation_approval");
+    request.payload.context = {
+      operation: "shell.run",
+      argv: ["git", "status"],
+      cwd: "workspace/sentinel-context"
+    };
+
+    const html = render(request);
+
+    expect(html).toContain("Approval context");
+    expect(html).toContain("workspace/sentinel-context");
+    expect(html).toContain("shell.run");
   });
 });
 

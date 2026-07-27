@@ -35,15 +35,21 @@ Object payloads and external effects have separate lifetimes and guarantees.
 - Both launch tools accept inherited file/dir paths and
   `inherit_capabilities`. Relative paths resolve against the **parent cwd at
   launch**, even if the child gets another cwd. Capability entries need
-  `resource`, nonempty `rights`, and optional constraints; the matching parent
-  grant must be live and delegable. Possession without delegation authority is
-  insufficient. An omitted `resource_budget` is attenuated from the parent's
-  remaining hierarchical budget, not copied wholesale; an explicit budget must
-  also fit. Record the returned PID: `status="runnable"` is launch, not success.
+  a canonical nonempty `resource`, required nonempty known `rights`, and an
+  optional JSON-object `constraints`; unknown fields and conflicting duplicate
+  resources are rejected. Duplicate resources with identical constraints merge
+  rights deterministically. The matching parent grant must be live and
+  delegable. Possession without delegation authority is insufficient. An
+  omitted `resource_budget` is attenuated from the parent's remaining
+  hierarchical budget, not copied wholesale; an explicit budget must also fit.
+  Verify the returned selected/memory root OIDs and effective resource budget,
+  not just the request. Record the returned PID: `status="runnable"` is launch,
+  not success.
 - `list_child_processes` returns only direct children. `include_terminal=true`
   includes terminal rows by default. Inspect exact lowercase `status`,
-  `wait_state`, typed `outcome`, `result_oid`, cwd, and `state_generation`.
-  Terminal means `exited`, `failed`, or `killed`; only `exited` is success.
+  `wait_state`, typed `outcome`, `result_oid`, cwd, memory-root OIDs, effective
+  resource budget, and `state_generation`. Terminal means `exited`, `failed`,
+  or `killed`; only `exited` is success.
 
 ### Wait and control
 
@@ -55,17 +61,23 @@ Object payloads and external effects have separate lifetimes and guarantees.
   `ready=true`, still require `status="exited"` and inspect the typed outcome.
   Wait may grant a parent handle to an exited/failed result, subject to data-flow;
   verify/materialize it rather than treating a non-null OID as proof.
-- `signal_child_process` accepts a direct nonterminal `child_pid`, one of
-  `pause`, `resume`, `cancel`, or `terminate`, plus optional `reason`.
+- `signal_child_process` normally accepts a direct nonterminal `child_pid`, one
+  of `pause`, `resume`, `cancel`, or `terminate`, plus optional `reason`.
   Pause/resume cannot clear a tool/event/Human wait or a Host-only resume gate.
-  Cancel/terminate transition to `killed`; they neither roll back completed
-  file/provider/message effects nor import memory. Send an interrupt message
-  when the intent is new instructions rather than lifecycle control.
+  Cancel/terminate transition a nonterminal child to `killed`; they neither roll
+  back completed file/provider/message effects nor import memory. One recovery
+  exception is intentional: cancel/terminate may target a terminal direct child
+  whose durable terminal cleanup is incomplete. That call retries only the
+  remaining cleanup phases and preserves the existing terminal status, outcome,
+  generation, and already-published terminal evidence; it does not perform a
+  second signal transition. Send an interrupt message when the intent is new
+  instructions rather than lifecycle control.
 
 ### Messages
 
-- `send_process_message` can address only self, parent, or a direct child; it
-  cannot reach a sibling or terminal process. Use a stable `channel` and
+- `send_process_message` requires a `recipient_pid` that identifies self,
+  parent, or a direct child; it cannot reach a sibling or terminal process.
+  Use a stable `channel` and
   `correlation_id`; set `reply_to` to the exact message answered. `kind=interrupt`
   gives a durable notice before the recipient's next non-message tool call;
   normal notice comes after a tool call. Neither pauses or cancels execution.
@@ -83,6 +95,10 @@ Object payloads and external effects have separate lifetimes and guarantees.
   `include_acked=false`. With `ack=false` or `include_acked=true`, repeating the
   same filters can replay the same first page forever. Narrow exact IDs/filters
   or obtain Host evidence; never claim mailbox completeness from such retries.
+  The full matching snapshot count, not merely the returned query window, drives
+  `has_more` and `omitted_count`. Default ACK is committed atomically with the
+  durable ToolResult, so a ToolResult persistence failure leaves that page
+  unread and safely retryable.
 - `receive_process_messages` has the same filters and acknowledgement behavior,
   but defaults to `block=true`. With no match it suspends until a matching unread
   message arrives; nonmatches stay queued. `block=false` returns `ready=false`.
@@ -98,8 +114,10 @@ Object payloads and external effects have separate lifetimes and guarantees.
   `PROCESS`-owned Objects. It adopts merged ownership and adds parent handles but
   does not rename Objects into the parent namespace. Inspect every
   `merged_oids` and `skipped_oids`; data-flow denial can fail the operation.
-  Those arrays cover merge candidates, not the complete disposition: remaining
-  child-owned Objects are released, and their OIDs are not returned by this tool.
+  Also inspect `adopted_oids`, `released_oids`,
+  `retained_child_owned_oids`, and `pinned_child_owned_oids`. An active
+  ObjectTask can pin a non-merged tail; such Objects stay child-owned until that
+  pin becomes terminal and a later lifecycle cleanup releases them.
 - **Merge is an irreversible collection boundary.** It releases remaining child
   `PROCESS` and `PROCESS_RESULT` Objects and revokes stale handles. A final Object
   generated by `process_exit(payload=...)` may not be a child root. Consequently,
@@ -150,12 +168,23 @@ Object payloads and external effects have separate lifetimes and guarantees.
   outcomes, and handles can remain while payload materialization fails; only
   explicitly captured checkpoint/image data is restored. An OID alone does not
   prove result survival.
-- Parent exit releases unmerged child memory; cancel/terminate cannot undo
-  external effects. Preserve required artifacts through an authorized durable
-  boundary before ownership ends.
+- A process cannot normally exit while any ordinary descendant is nonterminal.
+  Wait for or cancel/terminate every live child first; this prevents a terminal
+  parent from leaving independently runnable descendants able to produce orphan
+  effects. The deliberate exception is an already-published active ObjectTask
+  runner: its lifecycle is Host-managed, it may finish after its creator exits,
+  and its owner pin is retained until the task becomes terminal. An unpublished
+  runner receives no exception. Internal failed-exit handling terminates ordinary
+  descendants bottom-up but preserves those Host-managed runners. Once ordinary
+  descendants are terminal, parent exit releases unmerged child memory.
+  Cancel/terminate cannot undo external effects. Preserve required artifacts
+  through an authorized durable boundary before ownership ends.
 - Do not blindly retry sends, signals, resumed waits, or merge: an effect may
   have committed before observation failed. Re-read process generation/state,
-  mailbox ack, result handles, and merge lists first. A newer
+  durable terminal-cleanup state through available Host evidence, mailbox ack,
+  result handles, and merge lists first. A repeated cancel/terminate is the
+  supported cleanup retry only when the child is already terminal and cleanup
+  is known incomplete; it cannot replace the original outcome. A newer
   `state_generation` proves only a transition, not success.
 
 ## Completion evidence
@@ -168,8 +197,8 @@ Report only after verifying:
 - each materialized/verified result and its survival across any reopen;
 - sent/received message IDs, correlation/reply links, acknowledgements, and
   relevant unread messages;
-- returned `merged_oids`/`skipped_oids`, every known result preserved before
-  merge, and the fact that any unreported child-owned tail was released;
+- returned merge/adopt/release/retained/pinned OID lists, and every known result
+  preserved before merge;
 - every failure, kill, pause/recovery, denial, and partial outcome. `ready=true`,
   an OID, or one successful sibling never proves the whole task succeeded.
 

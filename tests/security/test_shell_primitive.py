@@ -8,13 +8,14 @@ import os
 import pytest
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellDefaults
 from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, GitErrorCode, HumanRequestStatus, ObjectMetadata, ObjectType, SinkTrustLevel, SinkTrustRule
-from agent_libos.models.exceptions import CapabilityDenied, GitError, HumanApprovalRequired, HumanResponseRequired, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, GitError, HumanApprovalRequired, HumanResponseRequired, ResourceLimitExceeded, ValidationError
 from agent_libos.primitives.git_command_policy import harden_read_only_git_argv
 from agent_libos.tools.builtin.shell import RunShellCommandArgs
 from agent_libos.substrate import (
@@ -25,6 +26,7 @@ from agent_libos.substrate import (
     LocalHumanProvider,
     LocalResourceProviderSubstrate,
     ProviderEffectNotStarted,
+    SubprocessLimitExceeded,
     SubprocessTimeoutExpired,
 )
 from modules.pty.pty_module import LocalPtyProvider
@@ -1087,6 +1089,113 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
+    def test_shell_timeout_cause_preserves_metrics_and_timeout_evidence(self) -> None:
+        provider = CauseWrappedTimeoutShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='wrapped timeout evidence')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+
+            with pytest.raises(TimeoutError, match='timed out'):
+                runtime.shell.run(pid, ['git', 'status'], timeout=0.25)
+
+            timeout_records = [
+                record
+                for record in runtime.audit.trace()
+                if record.action == 'primitive.shell.timeout'
+            ]
+            assert len(timeout_records) == 1
+            assert timeout_records[0].decision['error_type'] == 'SubprocessTimeoutExpired'
+            assert timeout_records[0].decision['metrics']['wall_seconds'] == 0.25
+            assert runtime.process.get(pid).resource_usage.subprocess_wall_seconds == 0.25
+        finally:
+            runtime.close()
+
+    def test_shell_resource_limit_cause_preserves_metrics_and_limit_evidence(self) -> None:
+        provider = CauseWrappedLimitShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='wrapped limit evidence')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+
+            with pytest.raises(ResourceLimitExceeded, match='CPU limit'):
+                runtime.shell.run(pid, ['git', 'status'])
+
+            limit_records = [
+                record
+                for record in runtime.audit.trace()
+                if record.action == 'primitive.shell.resource_limit_exceeded'
+            ]
+            assert len(limit_records) == 1
+            assert limit_records[0].decision['error_type'] == 'SubprocessLimitExceeded'
+            assert limit_records[0].decision['metrics']['cpu_seconds'] == 0.5
+            assert limit_records[0].decision['metrics']['limit_kind'] == 'cpu_time'
+            assert runtime.process.get(pid).resource_usage.subprocess_cpu_seconds == 0.5
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('failure_kind', ['timeout', 'limit'])
+    def test_shell_accounting_overage_does_not_mask_provider_failure_evidence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_kind: str,
+    ) -> None:
+        provider = (
+            CauseWrappedTimeoutShellProvider()
+            if failure_kind == 'timeout'
+            else CauseWrappedLimitShellProvider()
+        )
+        runtime = self._runtime_with_shell_provider(provider)
+
+        def accounting_overage(*_args: Any, **_kwargs: Any) -> None:
+            raise ResourceLimitExceeded('accounting overage after durable charge')
+
+        monkeypatch.setattr(
+            runtime.shell,
+            '_charge_subprocess_metrics',
+            accounting_overage,
+        )
+        try:
+            pid = runtime.process.spawn(
+                image='review-agent:v0',
+                goal=f'{failure_kind} accounting evidence',
+            )
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+            expected_error = TimeoutError if failure_kind == 'timeout' else ResourceLimitExceeded
+
+            with pytest.raises(expected_error):
+                runtime.shell.run(pid, ['git', 'status'], timeout=0.25)
+
+            action = (
+                'primitive.shell.timeout'
+                if failure_kind == 'timeout'
+                else 'primitive.shell.resource_limit_exceeded'
+            )
+            records = [record for record in runtime.audit.trace() if record.action == action]
+            assert len(records) == 1
+            assert records[0].decision['error_type'] == (
+                'SubprocessTimeoutExpired'
+                if failure_kind == 'timeout'
+                else 'SubprocessLimitExceeded'
+            )
+            assert records[0].decision['metrics']['limit_kind'] == (
+                'wall_time' if failure_kind == 'timeout' else 'cpu_time'
+            )
+        finally:
+            runtime.close()
+
     def test_shell_classifier_failure_returns_result_and_records_conservative_effect(self) -> None:
         provider = ClassifierFailureShellProvider()
         runtime = self._runtime_with_shell_provider(provider)
@@ -1292,6 +1401,41 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
+    def test_shell_tool_caller_cancellation_joins_provider_before_propagating(self) -> None:
+        provider = BlockingShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
+
+        async def scenario() -> None:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='cancel shell tool')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+            task = asyncio.create_task(
+                runtime.tools.acall(pid, 'run_shell_command', {'argv': ['tool']})
+            )
+            assert await asyncio.wait_for(
+                asyncio.to_thread(provider.entered.wait, 1),
+                timeout=2,
+            )
+
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+
+            provider.release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert provider.finished.is_set()
+            assert 'primitive.shell.run' in self._audit_actions(runtime)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            provider.release.set()
+            runtime.close()
+
     def test_shell_tool_is_one_shot_argv_only(self) -> None:
         assert set(RunShellCommandArgs.model_fields) == {
             'argv',
@@ -1299,6 +1443,29 @@ class TestShellPrimitive:
             'max_stdout_chars',
             'max_stderr_chars',
         }
+
+    def test_shell_tool_rejects_unknown_timeout_field_before_dispatch(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='strict shell args')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+
+            result = runtime.tools.call(
+                pid,
+                'run_shell_command',
+                {'argv': ['tool'], 'timeuot_s': 0.01},
+            )
+
+            assert not result.ok
+            assert result.error == 'Invalid arguments for tool `run_shell_command`.'
+            assert result.payload['error']['code'] == 'validation_error'
+            assert provider.calls == []
+        finally:
+            runtime.close()
 
     def test_shell_tool_timeout_returns_no_command_output(self) -> None:
         provider = TimeoutShellProvider()
@@ -1318,8 +1485,9 @@ class TestShellPrimitive:
             )
 
             assert not result.ok
-            assert result.error == 'Shell command timed out.'
+            assert (result.error or '').startswith('timeout: ToolExecutionError')
             assert result.payload['error']['code'] == 'timeout'
+            assert result.payload['error']['retryable'] is False
             assert 'stdout' not in result.payload
             assert 'stderr' not in result.payload
             assert provider.calls == [(['tool'], 0.01)]
@@ -1432,6 +1600,115 @@ class TestShellMatcher:
         finally:
             runtime.close()
 
+    @pytest.mark.parametrize(
+        'argv',
+        [
+            ['curl', 'https://example.test'],
+            ['pytest'],
+            ['npm', 'test'],
+            ['bash', 'script.sh'],
+        ],
+    )
+    def test_custom_deny_rule_overrides_builtin_ask(self, argv: list[str]) -> None:
+        config = AgentLibOSConfig(
+            shell=ShellDefaults(
+                rules=(
+                    AuthorityRule(
+                        rule_id='custom.builtin-ask.deny',
+                        operation='shell.run',
+                        effect=CapabilityEffect.DENY,
+                        risk=AuthorityRisk.HIGH,
+                        conditions={'argv': argv, 'match': 'exact'},
+                    ),
+                ),
+                whitelist=(),
+                blacklist=(),
+            )
+        )
+        runtime, provider = self._runtime_with_config(config)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='custom deny builtin ask')
+            runtime.shell.grant_policy(pid, config.shell.always_allow_level, issued_by='test')
+
+            with pytest.raises(CapabilityDenied, match='denied'):
+                runtime.shell.run(pid, argv)
+
+            assert provider.calls == []
+            assert runtime.human.pending() == []
+        finally:
+            runtime.close()
+
+    def test_custom_rule_uses_complete_conjunctive_shell_operation_context(self) -> None:
+        config = AgentLibOSConfig(
+            shell=ShellDefaults(
+                rules=(
+                    AuthorityRule(
+                        rule_id='custom.context.deny',
+                        operation='shell.run',
+                        effect=CapabilityEffect.DENY,
+                        risk=AuthorityRisk.HIGH,
+                        conditions={
+                            'argv': ['tool', 'inspect'],
+                            'match': 'prefix',
+                            'regex_token': r'--safe',
+                            'cwd': '.',
+                            'timeout_max_s': 1.0,
+                            'resource': 'shell:tool',
+                            'right': 'execute',
+                        },
+                    ),
+                ),
+                whitelist=(),
+                blacklist=(),
+            )
+        )
+        runtime, provider = self._runtime_with_config(config)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='conjunctive shell rule')
+            runtime.shell.grant_policy(pid, config.shell.always_allow_level, issued_by='test')
+
+            result = runtime.shell.run(pid, ['tool', 'inspect', '--safe'], timeout=2.0, cwd='.')
+            assert result.stdout == 'ok\n'
+
+            with pytest.raises(CapabilityDenied, match='denied'):
+                runtime.shell.run(pid, ['tool', 'inspect', '--safe'], timeout=0.5, cwd='.')
+
+            assert provider.calls == [(['tool', 'inspect', '--safe'], 2.0)]
+        finally:
+            runtime.close()
+
+    def test_custom_rule_with_unavailable_operation_context_fails_closed(self) -> None:
+        config = AgentLibOSConfig(
+            shell=ShellDefaults(
+                rules=(
+                    AuthorityRule(
+                        rule_id='custom.unavailable-context.allow',
+                        operation='shell.run',
+                        effect=CapabilityEffect.ALLOW,
+                        risk=AuthorityRisk.LOW,
+                        conditions={
+                            'argv': ['tool', 'inspect'],
+                            'match': 'exact',
+                            'endpoint_id': 'not-a-shell-context-field',
+                        },
+                    ),
+                ),
+                whitelist=(),
+                blacklist=(),
+            )
+        )
+        runtime, provider = self._runtime_with_config(config)
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='missing custom rule context')
+            runtime.shell.grant_policy(pid, config.shell.always_allow_level, issued_by='test')
+
+            with pytest.raises(CapabilityDenied, match='denied'):
+                runtime.shell.run(pid, ['tool', 'inspect'])
+
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
     def test_custom_allow_rule_with_shell_syntax_payload_requires_approval(self) -> None:
         config = AgentLibOSConfig(
             shell=ShellDefaults(
@@ -1498,17 +1775,21 @@ class TestShellMatcher:
             def __init__(self, argv: list[str], **kwargs: Any) -> None:
                 captured['argv'] = argv
                 captured['kwargs'] = kwargs
-                kwargs['stdout'].write(b'ok\n')
-                kwargs['stdout'].flush()
+                assert kwargs['stdout'] is local_substrate.subprocess.PIPE
+                assert kwargs['stderr'] is local_substrate.subprocess.PIPE
+                stdout_read, stdout_write = os.pipe()
+                stderr_read, stderr_write = os.pipe()
+                os.write(stdout_write, b'ok\n')
+                os.close(stdout_write)
+                os.close(stderr_write)
+                self.stdout = os.fdopen(stdout_read, 'rb', buffering=0)
+                self.stderr = os.fdopen(stderr_read, 'rb', buffering=0)
 
             def poll(self) -> int:
                 return 0
 
             def wait(self, timeout: float | None = None) -> int:
                 return 0
-
-            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
-                return 'ok\n', ''
 
         class FakePsutilProcess:
             def __init__(self, pid: int) -> None:
@@ -1536,8 +1817,8 @@ class TestShellMatcher:
         assert result.stdout == 'ok\n'
         assert Path(captured['argv'][0]).stem == 'echo'
         assert captured['argv'][1:] == ['safe$(printf${IFS}__INJECTED__)']
-        assert captured['kwargs']['stdout'] is not local_substrate.subprocess.PIPE
-        assert captured['kwargs']['stderr'] is not local_substrate.subprocess.PIPE
+        assert captured['kwargs']['stdout'] is local_substrate.subprocess.PIPE
+        assert captured['kwargs']['stderr'] is local_substrate.subprocess.PIPE
         assert captured['kwargs']['shell'] is False
         assert 'OPENAI_API_KEY' not in captured['kwargs']['env']
 
@@ -1554,8 +1835,15 @@ class TestShellMatcher:
             def __init__(self, argv: list[str], **kwargs: Any) -> None:
                 captured['argv'] = argv
                 captured['kwargs'] = kwargs
-                kwargs['stdout'].write(b'ok\n')
-                kwargs['stdout'].flush()
+                assert kwargs['stdout'] is local_substrate.subprocess.PIPE
+                assert kwargs['stderr'] is local_substrate.subprocess.PIPE
+                stdout_read, stdout_write = os.pipe()
+                stderr_read, stderr_write = os.pipe()
+                os.write(stdout_write, b'ok\n')
+                os.close(stdout_write)
+                os.close(stderr_write)
+                self.stdout = os.fdopen(stdout_read, 'rb', buffering=0)
+                self.stderr = os.fdopen(stderr_read, 'rb', buffering=0)
 
             def poll(self) -> int:
                 return 0
@@ -1670,6 +1958,85 @@ class TimeoutShellProvider(FakeShellProvider):
             'provider timed out after execution began',
             metrics=CommandMetrics(wall_seconds=timeout, killed=True, limit_kind='wall_time'),
         )
+
+
+class BlockingShellProvider(FakeShellProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: Any | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
+        del cwd, limits, stdout_limit_chars, stderr_limit_chars
+        self.calls.append((list(argv), timeout))
+        self.entered.set()
+        assert self.release.wait(timeout=2)
+        self.finished.set()
+        return CommandResult(
+            argv=list(argv),
+            returncode=0,
+            stdout=self.stdout,
+            stderr=self.stderr,
+        )
+
+
+class CauseWrappedTimeoutShellProvider(FakeShellProvider):
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: Any | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
+        del cwd, limits, stdout_limit_chars, stderr_limit_chars
+        self.calls.append((list(argv), timeout))
+        cause = SubprocessTimeoutExpired(
+            'provider timed out after execution began',
+            metrics=CommandMetrics(
+                wall_seconds=timeout,
+                killed=True,
+                limit_kind='wall_time',
+            ),
+        )
+        raise RuntimeError('provider wrapper') from cause
+
+
+class CauseWrappedLimitShellProvider(FakeShellProvider):
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float = 30.0,
+        cwd: str | None = None,
+        limits: Any | None = None,
+        stdout_limit_chars: int | None = None,
+        stderr_limit_chars: int | None = None,
+    ) -> CommandResult:
+        del cwd, limits, stdout_limit_chars, stderr_limit_chars
+        self.calls.append((list(argv), timeout))
+        cause = SubprocessLimitExceeded(
+            'provider exceeded CPU limit',
+            metrics=CommandMetrics(
+                wall_seconds=0.75,
+                cpu_seconds=0.5,
+                killed=True,
+                limit_kind='cpu_time',
+            ),
+        )
+        raise RuntimeError('provider wrapper') from cause
 
 
 class SwitchingShellProvider(ResolvingShellProvider):

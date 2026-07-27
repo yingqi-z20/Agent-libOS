@@ -5,6 +5,7 @@ import ast
 from configparser import ConfigParser, Error as ConfigParserError
 from email import policy
 from email.parser import BytesParser
+import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -105,13 +106,19 @@ SDIST_FORBIDDEN_PARTS = frozenset(
     }
 )
 SDIST_FORBIDDEN_SUFFIXES = frozenset({".db", ".pyc", ".pyo", ".sqlite"})
-ALLOWED_SECRET_FIXTURES = frozenset(
-    {
-        "benchmarks/runtime_safety/fixtures/basic_repo/.env",
-        "benchmarks/runtime_safety/fixtures/basic_repo/config/private.key",
-        "benchmarks/runtime_safety/fixtures/basic_repo/secrets/token.txt",
-    }
-)
+ALLOWED_SECRET_FIXTURE_SHA256 = {
+    "benchmarks/runtime_safety/fixtures/basic_repo/.env": (
+        "8aac0c24c8d27c785c264368e073b15bec29709f0cb340defb6f1c175d772b26"
+    ),
+    "benchmarks/runtime_safety/fixtures/basic_repo/config/private.key": (
+        "d9269c575547491851aaea7f0da8b5b10cc752bea917f4cab10a329d0ab95c96"
+    ),
+    "benchmarks/runtime_safety/fixtures/basic_repo/secrets/token.txt": (
+        "78c8c6a65f94cedb182f5e37ea8ab2df82b89febb1a213df527008870a592777"
+    ),
+}
+ALLOWED_SECRET_FIXTURES = frozenset(ALLOWED_SECRET_FIXTURE_SHA256)
+CHECKSUM_MANIFEST_NAME = "SHA256SUMS"
 
 
 def _python_package_version(root: Path) -> str:
@@ -178,12 +185,115 @@ def _safe_archive_path(name: str) -> PurePosixPath:
     return path
 
 
-def _single_artifact(artifact_dir: Path, pattern: str, kind: str) -> Path:
-    matches = sorted(artifact_dir.glob(pattern))
-    if len(matches) != 1:
-        rendered = ", ".join(path.name for path in matches) or "none"
-        raise ValueError(f"expected exactly one {kind} matching {pattern}, found: {rendered}")
-    return matches[0]
+def _reject_duplicate_archive_paths(names: list[str], *, kind: str) -> None:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for name in names:
+        canonical = _safe_archive_path(name).as_posix()
+        if canonical in seen:
+            duplicates.add(canonical)
+        seen.add(canonical)
+    if duplicates:
+        raise ValueError(f"{kind} contains duplicate member paths: {sorted(duplicates)}")
+
+
+def _require_regular_artifact(path: Path) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as exc:
+        raise ValueError(f"release artifact cannot be inspected: {path.name}") from exc
+    if stat.S_ISLNK(mode):
+        raise ValueError(f"release artifact must not be a symbolic link: {path.name}")
+    if not stat.S_ISREG(mode):
+        raise ValueError(f"release artifact must be a regular file: {path.name}")
+
+
+def _release_artifact_paths(
+    artifact_dir: Path,
+    version: str,
+    *,
+    include_checksum_manifest: bool,
+) -> tuple[Path, Path, Path | None]:
+    try:
+        directory_mode = artifact_dir.lstat().st_mode
+    except OSError as exc:
+        raise ValueError(f"release artifact directory cannot be inspected: {artifact_dir}") from exc
+    if stat.S_ISLNK(directory_mode) or not stat.S_ISDIR(directory_mode):
+        raise ValueError("release artifact directory must be a real directory")
+
+    entries = sorted(artifact_dir.iterdir(), key=lambda path: path.name)
+    for entry in entries:
+        _require_regular_artifact(entry)
+
+    wheel_name = f"{ARCHIVE_NAME}-{version}-py3-none-any.whl"
+    sdist_name = f"{ARCHIVE_NAME}-{version}.tar.gz"
+    expected_names = {wheel_name, sdist_name}
+    if include_checksum_manifest:
+        expected_names.add(CHECKSUM_MANIFEST_NAME)
+    actual_names = {entry.name for entry in entries}
+    if actual_names != expected_names:
+        raise ValueError(
+            "release artifact directory must contain exactly the canonical files: "
+            f"missing={sorted(expected_names - actual_names)}, "
+            f"unexpected={sorted(actual_names - expected_names)}"
+        )
+    manifest = artifact_dir / CHECKSUM_MANIFEST_NAME if include_checksum_manifest else None
+    return artifact_dir / wheel_name, artifact_dir / sdist_name, manifest
+
+
+def _file_sha256(path: Path) -> str:
+    _require_regular_artifact(path)
+    digest = hashlib.sha256()
+    with path.open("rb") as artifact:
+        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checksum_manifest_bytes(wheel: Path, sdist: Path) -> bytes:
+    return (
+        f"{_file_sha256(wheel)}  {wheel.name}\n"
+        f"{_file_sha256(sdist)}  {sdist.name}\n"
+    ).encode("ascii")
+
+
+def _verify_checksum_manifest(manifest: Path, wheel: Path, sdist: Path) -> None:
+    _require_regular_artifact(manifest)
+    try:
+        actual = manifest.read_bytes()
+    except OSError as exc:
+        raise ValueError("release checksum manifest cannot be read") from exc
+    expected = _checksum_manifest_bytes(wheel, sdist)
+    if actual != expected:
+        raise ValueError(
+            "release checksum manifest must contain the exact canonical artifact digests"
+        )
+
+
+def write_checksum_manifest(
+    artifact_dir: Path,
+    wheel: Path,
+    sdist: Path,
+    version: str,
+) -> Path:
+    manifest = artifact_dir / CHECKSUM_MANIFEST_NAME
+    try:
+        with manifest.open("xb") as output:
+            output.write(_checksum_manifest_bytes(wheel, sdist))
+    except FileExistsError as exc:
+        raise ValueError("release checksum manifest already exists") from exc
+    except OSError as exc:
+        raise ValueError("release checksum manifest cannot be written") from exc
+    canonical_wheel, canonical_sdist, canonical_manifest = _release_artifact_paths(
+        artifact_dir,
+        version,
+        include_checksum_manifest=True,
+    )
+    assert canonical_manifest is not None
+    if canonical_wheel != wheel or canonical_sdist != sdist:
+        raise ValueError("release artifact paths changed while writing checksums")
+    _verify_checksum_manifest(canonical_manifest, canonical_wheel, canonical_sdist)
+    return canonical_manifest
 
 
 def _decode_builtin_frontmatter_scalar(raw: str, *, field: str) -> str:
@@ -336,7 +446,14 @@ def _validate_console_scripts(raw: bytes) -> None:
 
 def _validate_wheel(wheel_path: Path, version: str) -> None:
     dist_info = f"{ARCHIVE_NAME}-{version}.dist-info"
+    expected_wheel_name = f"{ARCHIVE_NAME}-{version}-py3-none-any.whl"
+    if wheel_path.name != expected_wheel_name:
+        raise ValueError(
+            "wheel filename must use the exact py3-none-any tag: "
+            f"{wheel_path.name} != {expected_wheel_name}"
+        )
     with zipfile.ZipFile(wheel_path) as archive:
+        _reject_duplicate_archive_paths(archive.namelist(), kind="wheel")
         for item in archive.infolist():
             if stat.S_ISLNK(item.external_attr >> 16):
                 raise ValueError(f"wheel contains a symbolic link: {item.filename}")
@@ -345,6 +462,11 @@ def _validate_wheel(wheel_path: Path, version: str) -> None:
             path = _safe_archive_path(name)
             if not path.parts or path.parts[0] not in {"agent_libos", dist_info}:
                 raise ValueError(f"wheel contains a non-core top-level path: {name}")
+            if _looks_like_secret_file(path):
+                raise ValueError(
+                    "wheel contains a secret-like file: "
+                    f"{path.as_posix()}"
+                )
         missing = sorted(WHEEL_REQUIRED_FILES - names)
         if missing:
             raise ValueError(f"wheel is missing core files: {missing}")
@@ -358,9 +480,15 @@ def _validate_wheel(wheel_path: Path, version: str) -> None:
             {path: archive.read(path) for path in builtin_paths}
         )
         metadata_path = f"{dist_info}/METADATA"
+        wheel_metadata_path = f"{dist_info}/WHEEL"
         entry_points_path = f"{dist_info}/entry_points.txt"
         license_path = f"{dist_info}/licenses/LICENSE"
-        for required in (metadata_path, entry_points_path, license_path):
+        for required in (
+            metadata_path,
+            wheel_metadata_path,
+            entry_points_path,
+            license_path,
+        ):
             if required not in names:
                 raise ValueError(f"wheel is missing {required}")
         metadata = BytesParser(policy=policy.default).parsebytes(archive.read(metadata_path))
@@ -372,13 +500,29 @@ def _validate_wheel(wheel_path: Path, version: str) -> None:
             raise ValueError(
                 "wheel Requires-Python must remain >=3.11,<3.15"
             )
+        wheel_metadata = BytesParser(policy=policy.default).parsebytes(
+            archive.read(wheel_metadata_path)
+        )
+        purelib_values = wheel_metadata.get_all("Root-Is-Purelib", [])
+        if purelib_values != ["true"]:
+            raise ValueError(
+                "wheel WHEEL metadata must contain exactly "
+                "Root-Is-Purelib: true"
+            )
+        tags = wheel_metadata.get_all("Tag", [])
+        if tags != ["py3-none-any"]:
+            raise ValueError(
+                "wheel WHEEL metadata must contain exactly one Tag: "
+                "py3-none-any"
+            )
         _validate_console_scripts(archive.read(entry_points_path))
 
 
 def _looks_like_secret_file(path: PurePosixPath) -> bool:
-    return path.name == ".env" or path.suffix.lower() in {".key", ".p12", ".pem", ".pfx"} or (
+    folded_name = path.name.casefold()
+    return folded_name == ".env" or folded_name.startswith(".env.") or path.suffix.lower() in {".key", ".p12", ".pem", ".pfx"} or (
         any(part.lower() in {"secret", "secrets"} for part in path.parts)
-        and "token" in path.name.lower()
+        and "token" in folded_name
     )
 
 
@@ -386,7 +530,12 @@ def _validate_sdist(sdist_path: Path, version: str) -> None:
     prefix = f"{ARCHIVE_NAME}-{version}"
     relative_files: set[str] = set()
     with tarfile.open(sdist_path, mode="r:gz") as archive:
-        for member in archive.getmembers():
+        members = archive.getmembers()
+        _reject_duplicate_archive_paths(
+            [member.name for member in members],
+            kind="sdist",
+        )
+        for member in members:
             path = _safe_archive_path(member.name)
             if not path.parts or path.parts[0] != prefix:
                 raise ValueError(f"sdist path is outside {prefix}: {member.name}")
@@ -401,8 +550,24 @@ def _validate_sdist(sdist_path: Path, version: str) -> None:
                 raise ValueError(f"sdist contains generated or private path: {relative_text}")
             if relative.suffix.lower() in SDIST_FORBIDDEN_SUFFIXES:
                 raise ValueError(f"sdist contains generated file: {relative_text}")
-            if _looks_like_secret_file(relative) and relative_text not in ALLOWED_SECRET_FIXTURES:
-                raise ValueError(f"sdist contains an undeclared secret-like file: {relative_text}")
+            if _looks_like_secret_file(relative):
+                expected_digest = ALLOWED_SECRET_FIXTURE_SHA256.get(relative_text)
+                if expected_digest is None:
+                    raise ValueError(
+                        "sdist contains an undeclared secret-like file: "
+                        f"{relative_text}"
+                    )
+                fixture_file = archive.extractfile(member)
+                if fixture_file is None:
+                    raise ValueError(
+                        f"sdist secret-like fixture cannot be read: {relative_text}"
+                    )
+                actual_digest = hashlib.sha256(fixture_file.read()).hexdigest()
+                if actual_digest != expected_digest:
+                    raise ValueError(
+                        "sdist allowed secret-like fixture content mismatch: "
+                        f"{relative_text}"
+                    )
         metadata_file = archive.extractfile(f"{prefix}/PKG-INFO")
         if metadata_file is None:
             raise ValueError("sdist PKG-INFO cannot be read")
@@ -431,12 +596,23 @@ def _validate_sdist(sdist_path: Path, version: str) -> None:
         raise ValueError(f"sdist is missing repository release files: {missing}")
 
 
-def validate_artifacts(artifact_dir: Path, *, root: Path = ROOT) -> tuple[Path, Path, str]:
+def validate_artifacts(
+    artifact_dir: Path,
+    *,
+    root: Path = ROOT,
+    verify_checksums: bool = False,
+) -> tuple[Path, Path, str]:
     version = validate_version_alignment(root)
-    wheel = _single_artifact(artifact_dir, f"{ARCHIVE_NAME}-{version}-*.whl", "wheel")
-    sdist = _single_artifact(artifact_dir, f"{ARCHIVE_NAME}-{version}.tar.gz", "sdist")
+    wheel, sdist, manifest = _release_artifact_paths(
+        artifact_dir,
+        version,
+        include_checksum_manifest=verify_checksums,
+    )
     _validate_wheel(wheel, version)
     _validate_sdist(sdist, version)
+    if verify_checksums:
+        assert manifest is not None
+        _verify_checksum_manifest(manifest, wheel, sdist)
     return wheel, sdist, version
 
 
@@ -448,16 +624,34 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Check only source version alignment; artifact_dir must be omitted.",
     )
+    checksum_group = parser.add_mutually_exclusive_group()
+    checksum_group.add_argument(
+        "--write-checksums",
+        action="store_true",
+        help="Write an exact SHA256SUMS manifest after validating the two artifacts.",
+    )
+    checksum_group.add_argument(
+        "--verify-checksums",
+        action="store_true",
+        help="Require and verify the exact SHA256SUMS manifest.",
+    )
     args = parser.parse_args(argv)
     if args.version_only:
         if args.artifact_dir is not None:
             parser.error("artifact_dir cannot be used with --version-only")
+        if args.write_checksums or args.verify_checksums:
+            parser.error("checksum options cannot be used with --version-only")
         version = validate_version_alignment()
         print(f"release version identifiers are aligned at {version}")
         return 0
     if args.artifact_dir is None:
         parser.error("artifact_dir is required unless --version-only is used")
-    wheel, sdist, version = validate_artifacts(args.artifact_dir.resolve())
+    wheel, sdist, version = validate_artifacts(
+        args.artifact_dir,
+        verify_checksums=args.verify_checksums,
+    )
+    if args.write_checksums:
+        write_checksum_manifest(args.artifact_dir, wheel, sdist, version)
     print(f"validated {PROJECT_NAME} {version} artifacts: {wheel.name}, {sdist.name}")
     return 0
 

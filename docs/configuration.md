@@ -146,6 +146,13 @@ libOS does not support `OPENAI_CUSTOM_HEADERS`, `OPENAI_ADMIN_KEY`, or
 are removed before any provider request rather than becoming untracked profile
 state.
 
+After the SDK exhausts its configured retries, timeout, connection, rate-limit,
+and retryable HTTP status failures are recorded and pause the AgentProcess for
+explicit Host resume. Resuming issues a new, separately accounted provider call
+from the durable process context. Deterministic configuration, protocol, and
+non-retryable provider errors still fail the process closed; the Runtime never
+loops indefinitely on an unavailable provider.
+
 Secrets are the exception to that fallback description: every profile reads
 its API key only from the environment variable named by its `api_key_env`.
 `safety_identifier_env`, when set and no literal `safety_identifier` is set,
@@ -170,25 +177,25 @@ same change.
 
 | Group | Fields |
 | --- | --- |
-| `runtime` | `local_store_target`, `runtime_db_filename`, `store_backend`, `store_dsn`, `workspace_namespace`, `default_image_id`, `coding_image_id`, `default_human`, `terminal_channel`, `run_until_idle_max_quanta`, `launcher_max_quanta`, `launch_authority_mode`, `publication_recovery_max_attempts`, `publication_reconciliation_page_size`, `publication_reconciliation_page_hard_limit`, `publication_artifact_lookup_hard_limit`, `resource_usage_reservation_recovery_page_size`, `resource_usage_reservation_recovery_page_hard_limit`, `capability_use_reservation_recovery_page_size`, `capability_use_reservation_recovery_page_hard_limit`, `object_payload_recovery_page_size`, `object_payload_recovery_page_hard_limit`, `object_task_recovery_page_size`, `object_task_recovery_page_hard_limit`, `jit_rehydration_page_size`, `jit_rehydration_page_hard_limit`, `external_effect_recovery_page_size`, `external_effect_recovery_page_hard_limit`, `operation_recovery_page_size`, `operation_recovery_page_hard_limit`, `payload_retention_enabled`, `payload_retention_summary_after_seconds`, `payload_retention_hash_only_after_seconds`, `payload_retention_page_size`, `payload_retention_page_hard_limit` |
+| `runtime` | `local_store_target`, `runtime_db_filename`, `store_backend`, `store_dsn`, `workspace_namespace`, `default_image_id`, `coding_image_id`, `default_human`, `terminal_channel`, `run_until_idle_max_quanta`, `launcher_max_quanta`, `launch_authority_mode`, `publication_recovery_max_attempts`, `publication_reconciliation_page_size`, `publication_reconciliation_page_hard_limit`, `publication_artifact_lookup_hard_limit`, `resource_usage_reservation_recovery_page_size`, `resource_usage_reservation_recovery_page_hard_limit`, `capability_use_reservation_recovery_page_size`, `capability_use_reservation_recovery_page_hard_limit`, `object_payload_recovery_page_size`, `object_payload_recovery_page_hard_limit`, `object_task_recovery_page_size`, `object_task_recovery_page_hard_limit`, `jit_rehydration_page_size`, `jit_rehydration_page_hard_limit`, `external_effect_recovery_page_size`, `external_effect_recovery_page_hard_limit`, `operation_recovery_page_size`, `operation_recovery_page_hard_limit`, `payload_retention_enabled`, `payload_retention_summary_after_seconds`, `payload_retention_hash_only_after_seconds`, `payload_retention_page_size`, `payload_retention_page_hard_limit`, `process_terminal_cleanup_recovery_page_size`, `process_terminal_cleanup_recovery_page_hard_limit` |
 | `gui` | `event_buffer_limit`, `request_body_max_bytes`, `scheduler_shutdown_join_timeout_s`, `http_shutdown_delay_s`, `object_task_wait_default_timeout_s`, `object_task_wait_max_timeout_s`, `snapshot_event_limit`, `snapshot_audit_limit`, `snapshot_llm_call_limit`, `snapshot_process_message_limit`, `snapshot_process_llm_call_limit`, `snapshot_object_task_limit`, `snapshot_collection_max_items`, `snapshot_string_max_chars`, `sse_payload_max_bytes`, `agent_rating_comment_max_chars` |
-| `capability` | `default_delegation_depth`, `max_rights_per_capability`, `max_constraints_bytes`, `list_limit`, `decision_explain_preview_chars` |
+| `capability` | `default_delegation_depth`, `max_rights_per_capability`, `max_constraints_bytes`, `list_limit`, `decision_explain_preview_chars`, `regex_pattern_max_bytes`, `regex_token_max_bytes`, `regex_match_timeout_s` |
 | `data_flow` | `default_trust_level`, `default_max_sensitivity`, `sink_rules`, `operation_minimum_integrity`, `registry_resource`, `registry_list_limit`, `decision_list_limit`, `file_binding_list_limit` |
 | `scheduler` | `max_quanta`, `poll_interval_s`, `max_workers`, `drain_window_s`, `shutdown_join_timeout_s` |
 | `process` | `max_tool_calls`, `max_child_processes`, `max_runtime_seconds`, `max_context_materialization_tokens`, `max_context_materialization_total_tokens`, `max_llm_calls`, `max_llm_total_tokens`, `max_subprocess_wall_seconds`, `max_subprocess_cpu_seconds`, `max_subprocess_memory_bytes`, `max_external_read_bytes`, `max_external_write_bytes`, `max_jsonrpc_bytes`, `max_mcp_bytes`, `max_deno_syscalls`, `default_goal_text`, `default_working_directory`, `fork_budget_divisor`, `fork_min_tool_calls`, `fork_min_child_processes` |
 | `llm` | `default_profile_id`, `profiles`, `temperature`, `max_tokens`, `context_window_tokens`, `timeout_s`, `max_retries`, `api_mode`, `store`, `safety_identifier`, `prompt_cache_key`, `prompt_cache_retention`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `compatibility_retry_attempts`, `action_repair_attempts`, `tool_output_prompt_max_chars`, `content_preview_chars`, `tool_arguments_preview_chars`, `call_record_preview_chars`, `call_record_list_limit`, `call_record_hard_limit`, `persist_full_io`, `json_instruction`, `fallback_status_codes` |
-| `tools` | `version`, `default_timeout_s`, `standard_timeout_s`, `interactive_timeout_s`, `default_text_encoding`, `tool_observability_preview_chars`, `tool_call_args_hard_limit_bytes`, `tool_result_payload_hard_limit_bytes`, `filesystem_read_max_bytes`, `filesystem_read_hard_limit_bytes`, `directory_entry_limit`, `directory_entry_hard_limit`, `executable_snapshot_sibling_limit`, `memory_payload_chars`, `memory_payload_hard_limit_chars`, `memory_payload_hard_limit_bytes`, `memory_append_entry_max_bytes`, `message_subject_max_chars`, `message_body_max_chars`, `message_payload_max_bytes`, `message_id_max_chars`, `message_read_limit`, `message_read_hard_limit`, `message_filter_ids_hard_limit`, `message_filter_json_max_bytes`, `message_wait_status_max_chars`, `human_request_payload_max_bytes`, `human_output_max_chars`, `human_request_list_limit`, `object_file_max_bytes`, `object_file_hard_limit_bytes`, `shell_timeout_s`, `sandbox_timeout_s`, `jit_source_max_chars`, `jit_tests_max_count`, `jit_test_case_max_bytes`, `jit_validation_timeout_s`, `jit_validation_log_max_chars`, `deno_executable`, `deno_timeout_s`, `deno_timeout_hard_limit_s`, `deno_max_rpc_calls`, `deno_max_stdout_bytes`, `deno_max_stderr_bytes`, `deno_jsr_allowlist`, `static_tool_id_digest_chars`, `approval_preview_chars`, `clock_timezone`, `max_sleep_seconds`, `sleep_timeout_grace_s` |
+| `tools` | `version`, `default_timeout_s`, `standard_timeout_s`, `interactive_timeout_s`, `default_text_encoding`, `tool_observability_preview_chars`, `tool_call_args_hard_limit_bytes`, `tool_result_payload_hard_limit_bytes`, `filesystem_read_max_bytes`, `filesystem_read_hard_limit_bytes`, `directory_entry_limit`, `directory_entry_hard_limit`, `executable_snapshot_sibling_limit`, `memory_payload_chars`, `memory_payload_hard_limit_chars`, `memory_payload_hard_limit_bytes`, `memory_append_entry_max_bytes`, `message_subject_max_chars`, `message_body_max_chars`, `message_payload_max_bytes`, `message_id_max_chars`, `message_read_limit`, `message_read_hard_limit`, `message_filter_ids_hard_limit`, `message_filter_json_max_bytes`, `message_wait_status_max_chars`, `human_request_payload_max_bytes`, `human_output_max_chars`, `human_request_list_limit`, `object_file_max_bytes`, `object_file_hard_limit_bytes`, `shell_timeout_s`, `sandbox_timeout_s`, `jit_source_max_chars`, `jit_tests_max_count`, `jit_test_case_max_bytes`, `jit_validation_timeout_s`, `jit_validation_log_max_chars`, `deno_executable`, `deno_timeout_s`, `deno_timeout_hard_limit_s`, `deno_max_rpc_calls`, `deno_max_stdout_bytes`, `deno_max_stderr_bytes`, `deno_jsr_allowlist`, `static_tool_id_digest_chars`, `approval_preview_chars`, `clock_timezone`, `max_sleep_seconds`, `sleep_timeout_grace_s`, `human_response_payload_max_bytes`, `human_response_max_depth`, `human_response_max_nodes` |
 | `shell` | `policy_capability_key`, `policy_resource`, `default_policy_level`, `timeout_hard_limit_s`, `max_stdout_chars`, `max_stderr_chars`, `stdout_hard_limit_chars`, `stderr_hard_limit_chars`, `rules`, `whitelist`, `blacklist` |
-| `git` | `enabled`, `executable`, `minimum_version`, `repository_resource`, `worktree_root`, `trusted_metadata_roots`, `local_timeout_s`, `remote_timeout_s`, `timeout_hard_limit_s`, `lock_timeout_s`, `status_entry_limit`, `status_entry_hard_limit`, `log_entry_limit`, `log_entry_hard_limit`, `output_max_bytes`, `output_hard_limit_bytes`, `patch_max_bytes`, `patch_hard_limit_bytes`, `state_content_hard_limit_bytes`, `allowed_remote_schemes`, `allow_scp_style_ssh`, `allow_file_remotes`, `inherit_credential_helpers`, `inherit_ssh_agent`, `protect_git_metadata` |
+| `git` | `enabled`, `executable`, `minimum_version`, `repository_resource`, `worktree_root`, `trusted_metadata_roots`, `local_timeout_s`, `remote_timeout_s`, `timeout_hard_limit_s`, `lock_timeout_s`, `status_entry_limit`, `status_entry_hard_limit`, `log_entry_limit`, `log_entry_hard_limit`, `output_max_bytes`, `output_hard_limit_bytes`, `patch_max_bytes`, `patch_hard_limit_bytes`, `state_content_hard_limit_bytes`, `allowed_remote_schemes`, `allow_scp_style_ssh`, `allow_file_remotes`, `inherit_credential_helpers`, `inherit_ssh_agent`, `protect_git_metadata`, `ref_list_limit`, `pull_request_list_limit` |
 | `jsonrpc` | `registry_resource`, `endpoint_id_max_chars`, `method_id_max_chars`, `rpc_method_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist` |
 | `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
 | `image` | `registry_resource`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `manifest_hard_limit_bytes`, `structured_field_hard_limit_bytes`, `max_default_tools`, `max_required_capabilities`, `max_required_modules`, `package_manifest_name`, `package_workspace_dir`, `package_tools_dir`, `package_resources_dir`, `materialized_workspace_root`, `package_manifest_max_bytes`, `package_manifest_hard_limit_bytes`, `package_file_max_bytes`, `package_max_bytes`, `package_max_files`, `prompt_max_chars`, `max_package_jit_tools`, `max_workspace_grants` |
 | `image_commit` | `artifact_version`, `artifact_hard_limit_bytes`, `payload_capture_limit_bytes`, `max_required_capabilities`, `max_committed_tools`, `max_committed_jit_sources`, `metadata_preview_chars` |
-| `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix` |
+| `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix`, `query_scan_page_size`, `query_scan_ceiling`, `metadata_text_max_chars`, `metadata_collection_max_items`, `metadata_collection_item_max_chars`, `metadata_max_bytes` |
 | `object_tasks` | `max_running_global`, `max_running_per_object`, `notification_channel`, `owner_watch_channel`, `owner_watch_events`, `shutdown_join_timeout_s` |
 | `llm_context` | `policy`, `schema_version`, `object_name_prefix`, `recent_event_limit`, `prompt_event_payload_max_chars`, `storage_compaction_threshold_bytes`, `storage_compaction_max_chunks`, `storage_compaction_preserve_recent_entries` |
 | `checkpoint` | `list_limit`, `payload_capture_limit_bytes`, `snapshot_hard_limit_bytes`, `diff_preview_items` |
-| `skills` | `schema_version`, `registry_resource`, `trust_resource`, `global_dirs`, `workspace_dirs`, `resource_dirs`, `trusted_global_package_sha256`, `global_requires_trust`, `skill_md_max_bytes`, `skill_md_hard_limit_bytes`, `resource_read_max_bytes`, `package_max_bytes`, `max_package_files`, `max_prompt_instruction_chars`, `max_jit_source_chars`, `discover_limit`, `id_max_chars`, `name_max_chars`, `description_max_chars`, `version_max_chars`, `max_tools`, `max_actions`, `max_jit_tools`, `max_required_capabilities` |
+| `skills` | `schema_version`, `registry_resource`, `trust_resource`, `global_dirs`, `workspace_dirs`, `resource_dirs`, `trusted_global_package_sha256`, `global_requires_trust`, `skill_md_max_bytes`, `skill_md_hard_limit_bytes`, `resource_read_max_bytes`, `package_max_bytes`, `max_package_files`, `max_prompt_instruction_chars`, `max_jit_source_chars`, `discover_limit`, `id_max_chars`, `name_max_chars`, `description_max_chars`, `version_max_chars`, `max_tools`, `max_actions`, `max_jit_tools`, `max_required_capabilities`, `max_package_directories`, `max_package_depth`, `catalog_scan_limit` |
 | `modules` | `schema_version`, `manifest_paths`, `trusted_modules`, `trusted_sha256`, `manifest_max_bytes`, `manifest_hard_limit_bytes`, `source_max_bytes`, `package_max_bytes`, `max_package_files`, `load_policy`, `discover_limit`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `entrypoint_max_chars`, `max_declared_tools`, `max_declared_images`, `max_declared_syscalls`, `max_declared_provider_hooks`, `max_declared_startup_hooks` |
 | `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
 | `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
@@ -209,6 +216,14 @@ another.
 
 The table is checked against the dataclass fields by
 `tests/unit/test_configuration_docs.py`.
+
+Skill package topology and catalog discovery have independent Host ceilings:
+
+| Skills field | Default | Semantics |
+| --- | ---: | --- |
+| `skills.max_package_directories` | `256` | Maximum aggregate resource directories traversed while loading one Host or workspace Skill package. Missing configured resource roots are not charged; exceeding the bound rejects the package. |
+| `skills.max_package_depth` | `32` | Maximum resource-directory depth in one Skill package, with each configured resource root at depth 1. A deeper package is rejected before descending further. |
+| `skills.catalog_scan_limit` | `1000` | Maximum Host catalog entries or registered Skill rows examined for one metadata discovery. Detecting entry or row N+1 fails explicitly instead of returning an incomplete search result. |
 
 Each entry under `llm.profiles.<profile_id>` accepts exactly these fields:
 
@@ -243,6 +258,35 @@ configurable. A runtime release emits only the snapshot version it can decode.
   wildcard meaning anywhere except the final character. Manifests reference
   those names; resolved secret values must not be persisted in registry rows,
   audit metadata, benchmark provenance, or GUI responses.
+- `mcp.timeout_s` defaults to `10.0` seconds (with a `60.0` second hard limit)
+  and is one absolute exchange deadline, not a fresh timeout for each I/O
+  stage. DNS queueing and resolution, every resolved-address connect attempt,
+  TLS, request writes, response headers/body chunks, stdio spawn, and stdio
+  protocol work all consume that same deadline. `mcp.max_request_bytes`
+  defaults to `65536` and `mcp.max_response_bytes` to `1048576`; provider byte
+  counters must cover the canonical JSON payload and may not under-report it.
+  Stdio additionally caps each response frame at `max_response_bytes`, total
+  stdout at four times that value, stderr at that value, each request frame at
+  `max_request_bytes`, and total stdin at four times that value. Stdio children
+  also inherit the process's remaining subprocess wall/CPU/memory budgets;
+  unavailable metrics fail closed when a configured CPU or memory limit cannot
+  be enforced.
+- `tools.shell_timeout_s` defaults to `30.0` seconds and
+  `shell.timeout_hard_limit_s` to `300.0`. Provider timeout and subprocess-limit
+  failures are recognized through their causal wrapper chain, charged once to
+  the process resource ledger, and surfaced as the corresponding safe Runtime
+  timeout/resource-limit result. Arbitrary nested provider text is not added to
+  the public error allowlist.
+- Filesystem reads default to `tools.filesystem_read_max_bytes=65536` and are
+  capped by `tools.filesystem_read_hard_limit_bytes=1048576`. On Darwin,
+  existing workspace entries derive capability, lock, and file-label keys from
+  descriptor-backed `F_GETPATH` spelling so case and Unicode aliases cannot
+  create parallel identities. Future names use the containing volume's
+  reported case-sensitivity/case-preservation and APFS normalization semantics; ambiguous
+  non-ASCII case folds, unknown volume comparison semantics, or unavailable
+  canonical identity evidence fail closed for that future path. Existing paths
+  remain usable when only future-name volume metadata is unavailable. Linux
+  case- and normalization-distinct entries remain distinct.
 - `git.executable` is resolved on a Host path outside the workspace. The
   default `git.minimum_version` is `2.26.0`; deployments may configure a
   different dotted numeric threshold. `git.worktree_root` must remain below the workspace, while
@@ -255,8 +299,10 @@ configurable. A runtime release emits only the snapshot version it can decode.
   startup. See [Git Provider and Primitive](git.md).
 - `llm.persist_full_io` defaults to true. Set it to false when the deployment's
   user agreement does not authorize retention of full prompts, tool schemas,
-  reasoning, outputs, provider errors, and raw provider payloads. The opt-out
-  persists canonical content-free summary envelopes containing byte counts,
+  reasoning, outputs, successful response content, and raw provider response
+  fields. Provider and extension exception text is never persisted or exposed
+  to the model, regardless of this setting. The opt-out persists canonical
+  content-free summary envelopes containing byte counts,
   JSON shape/count metadata when available, and hashes rather than readable
   previews. It also redacts
   conditional LLM release resume rows before approval; exact same-runtime
@@ -322,7 +368,20 @@ configurable. A runtime release emits only the snapshot version it can decode.
   connection-local temporary index materializes the running ancestors of
   indexed pending/unknown effects; each page then performs only a bounded
   primary-key membership read. Recovery processes the full backlog but exposes
-  only a page-bounded ID sample plus the exact total count. Payload retention is separately opt-in through
+  only a page-bounded ID sample plus the exact total count.
+  Terminal-process cleanup recovery uses the independent
+  `runtime.process_terminal_cleanup_recovery_page_size` setting, which defaults
+  to `500`; its store-enforced hard limit
+  `runtime.process_terminal_cleanup_recovery_page_hard_limit` defaults to
+  `5000`. Both values must be positive and the page size cannot exceed the hard
+  limit. Startup walks only incomplete cleanup intents through the partial
+  `(created_at, pid)` keyset index, processes the complete backlog, and retains
+  at most one page of recovered PID or failure samples alongside exact totals.
+  These settings bound each query and diagnostic buffer, not the number of
+  durable cleanup intents that recovery will finish. Failure samples contain
+  only exception type, byte count, and SHA-256 fingerprint, never exception
+  text.
+  Payload retention is separately opt-in through
   `runtime.payload_retention_enabled`; startup never runs it implicitly. The
   summary/hash ages and page limits are validated together, and every applied
   maintenance page is lifecycle-gated, CAS-protected, and audited in the same
@@ -341,6 +400,15 @@ configurable. A runtime release emits only the snapshot version it can decode.
   registry mutations. `registry_list_limit`, `decision_list_limit`, and
   `file_binding_list_limit` bound active control-plane reads; they do not
   truncate append-only decision or binding history in storage.
+- Human response ingress is bounded by
+  `tools.human_response_payload_max_bytes` (default `131,072` serialized
+  bytes), `tools.human_response_max_depth` (default `32` nested containers),
+  and `tools.human_response_max_nodes` (default `4,096` JSON values). These
+  limits apply to complete GUI, CLI, Host, and terminal-provider decisions
+  before they can choose an approval, grant authority, or mutate request or
+  process state. An invalid terminal-provider response leaves the Human request
+  pending after the protected provider read is evidenced; an invalid direct
+  decision has no decision side effects.
 - `tools.executable_snapshot_sibling_limit` bounds the direct sibling entries
   linked beside a mutable workspace executable snapshot before Shell, MCP
   stdio, or PTY dispatch. Exceeding the limit, failing enumeration, or failing

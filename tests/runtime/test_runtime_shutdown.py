@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import inspect
 import threading
 import time
@@ -120,6 +121,23 @@ def _mark_test_recovery_fence(
     with lifecycle.admit():
         lifecycle.mark_recovery_required(publication_id=publication_id)
     return f"runtime.recovery_required:{publication_id}"
+
+
+def _assert_text_free_lifecycle_error(
+    error: dict[str, str],
+    *,
+    component: str,
+    error_type: str,
+    hidden_text: str,
+) -> None:
+    assert error["component"] == component
+    assert error["code"] == "internal_error"
+    assert error["error_type"] == error_type
+    assert error["correlation_id"] in error["error"]
+    assert hidden_text not in repr(error)
+    encoded = hidden_text.encode("utf-8")
+    assert error["error_text_bytes"] == str(len(encoded))
+    assert error["error_text_sha256"] == hashlib.sha256(encoded).hexdigest()
 
 
 class _FirstRecoveryCloseProbeBarrierStore(SQLiteStore):
@@ -607,7 +625,11 @@ class TestRuntimeShutdown:
             CAPABILITY_MANAGER_MIXED_PUBLIC_METHODS,
             CAPABILITY_MANAGER_READ_ONLY_PUBLIC_METHODS,
         )
-        assert sum(len(methods) for methods in manager_classes) == 48
+        assert sum(len(methods) for methods in manager_classes) == 53
+        assert {
+            "inspect_for_presentation",
+            "presentation_page",
+        } <= CAPABILITY_MANAGER_READ_ONLY_PUBLIC_METHODS
         assert not any(
             left & right
             for index, left in enumerate(manager_classes)
@@ -901,6 +923,34 @@ class TestRuntimeShutdown:
             assert after is not None
             assert after.memory_view == before_view
             assert after.revision == before_revision
+        finally:
+            runtime.close()
+
+    def test_close_failed_data_flow_snapshot_helpers_use_current_runtime_guard(
+        self,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(goal="data-flow snapshot admission fence")
+            handle = runtime.memory.create_object(
+                pid,
+                ObjectType.ARTIFACT,
+                {"fenced": True},
+            )
+            obj = runtime.store.get_object(handle.oid)
+            assert obj is not None
+            with runtime.lifecycle.admit():
+                runtime.lifecycle.mark_recovery_required(
+                    publication_id="publication-data-flow-snapshot-admission-fence",
+                )
+
+            attempts = (
+                lambda: runtime.data_flow.context_from_object_snapshot(obj),
+                lambda: runtime.data_flow.watch_directory_labels(""),
+            )
+            for attempt in attempts:
+                with pytest.raises(RuntimeError, match="state=close_failed"):
+                    attempt()
         finally:
             runtime.close()
 
@@ -2386,8 +2436,15 @@ class TestRuntimeShutdown:
         assert outcome["ok"] is True
         assert outcome["already_shutdown"] is False
         assert outcome["reason"] == "backend-already-released"
-        assert outcome["warnings"][0]["component"] == "shutdown_evidence"
-        assert "already released" in outcome["warnings"][0]["error"]
+        _assert_text_free_lifecycle_error(
+            outcome["warnings"][0],
+            component="shutdown_evidence",
+            error_type="RuntimeError",
+            hidden_text=(
+                "runtime store ownership was already released before "
+                "shutdown evidence"
+            ),
+        )
         assert component_calls == ["shutdown"]
         assert lifecycle.closed
         assert store._admission_commit_guard is None
@@ -2415,8 +2472,15 @@ class TestRuntimeShutdown:
             assert outcome["ok"] is True
             assert outcome["already_shutdown"] is False
             assert outcome["reason"] == "async-backend-already-released"
-            assert outcome["warnings"][0]["component"] == "shutdown_evidence"
-            assert "already released" in outcome["warnings"][0]["error"]
+            _assert_text_free_lifecycle_error(
+                outcome["warnings"][0],
+                component="shutdown_evidence",
+                error_type="RuntimeError",
+                hidden_text=(
+                    "runtime store ownership was already released before "
+                    "shutdown evidence"
+                ),
+            )
             assert component_calls == ["ashutdown"]
             assert lifecycle.closed
             assert store._admission_commit_guard is None
@@ -2591,17 +2655,16 @@ class TestRuntimeShutdown:
                     await leader
 
                 follower_result = await follower
-                expected_warning = {
-                    "component": "store",
-                    "error": warning_text,
-                    "error_type": "RuntimeError",
-                }
-                assert follower_result == {
-                    "ok": True,
-                    "already_shutdown": False,
-                    "reason": "cancelled-warning-leader",
-                    "warnings": [expected_warning],
-                }
+                assert follower_result["ok"] is True
+                assert follower_result["already_shutdown"] is False
+                assert follower_result["reason"] == "cancelled-warning-leader"
+                assert len(follower_result["warnings"]) == 1
+                _assert_text_free_lifecycle_error(
+                    follower_result["warnings"][0],
+                    component="store",
+                    error_type="RuntimeError",
+                    hidden_text=warning_text,
+                )
                 assert await lifecycle.ashutdown() == {
                     **follower_result,
                     "already_shutdown": True,
@@ -2643,13 +2706,13 @@ class TestRuntimeShutdown:
         readback = lifecycle.shutdown(reason="must-remain-closed")
         assert readback["ok"] is True
         assert readback["already_shutdown"] is True
-        assert readback["warnings"] == [
-            {
-                "component": "store",
-                "error": str(warning),
-                "error_type": "KeyboardInterrupt",
-            }
-        ]
+        assert len(readback["warnings"]) == 1
+        _assert_text_free_lifecycle_error(
+            readback["warnings"][0],
+            component="store",
+            error_type="KeyboardInterrupt",
+            hidden_text=str(warning),
+        )
 
     def test_sync_shutdown_control_warning_is_caller_local_to_leader(
         self,
@@ -2724,19 +2787,17 @@ class TestRuntimeShutdown:
             assert not follower.is_alive()
             assert leader_errors == [warning]
             assert follower_errors == []
-            expected_warning = {
-                "component": "store",
-                "error": str(warning),
-                "error_type": "KeyboardInterrupt",
-            }
-            assert follower_results == [
-                {
-                    "ok": True,
-                    "already_shutdown": False,
-                    "reason": "control-warning-leader",
-                    "warnings": [expected_warning],
-                }
-            ]
+            assert len(follower_results) == 1
+            assert follower_results[0]["ok"] is True
+            assert follower_results[0]["already_shutdown"] is False
+            assert follower_results[0]["reason"] == "control-warning-leader"
+            assert len(follower_results[0]["warnings"]) == 1
+            _assert_text_free_lifecycle_error(
+                follower_results[0]["warnings"][0],
+                component="store",
+                error_type="KeyboardInterrupt",
+                hidden_text=str(warning),
+            )
             assert lifecycle.shutdown() == {
                 **follower_results[0],
                 "already_shutdown": True,
@@ -4045,9 +4106,13 @@ class TestRuntimeShutdown:
             errors = asyncio.run(lifecycle.acleanup_failed_assembly())
             assert calls == ["failing", "later"]
             assert [error["error_type"] for error in errors] == ["RuntimeError"]
-            assert [error["error"] for error in errors] == [
-                "injected async cleanup failure"
-            ]
+            assert len(errors) == 1
+            _assert_text_free_lifecycle_error(
+                errors[0],
+                component=errors[0]["component"],
+                error_type="RuntimeError",
+                hidden_text="injected async cleanup failure",
+            )
             assert lifecycle.finalizers_snapshot() == (failing_finalizer,)
             assert lifecycle.state == "close_failed"
             assert asyncio.run(lifecycle.acleanup_failed_assembly()) == []
@@ -5031,13 +5096,13 @@ class TestRuntimeShutdown:
             assert handle.owns_store is True
             assert handle.partial_runtime is not None
             assert not hasattr(handle.partial_runtime, "lifecycle")
-            assert handle.cleanup_errors == (
-                {
-                    "component": "substrate",
-                    "error_type": "ComponentStopDeferred",
-                    "error": "returned false",
-                },
-            )
+            assert len(handle.cleanup_errors) == 1
+            deferred = handle.cleanup_errors[0]
+            assert deferred["component"] == "substrate"
+            assert deferred["code"] == "runtime_cleanup_deferred"
+            assert deferred["error_type"] == "ComponentStopDeferred"
+            assert deferred["correlation_id"].startswith("corr_")
+            assert "returned false" not in str(deferred)
             assert store.close_calls == 0
             await handle.arelease()
             assert handle.released is True

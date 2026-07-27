@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from collections.abc import Iterable
 from typing import Any, Protocol
 
 from agent_libos.models import (
+    Capability,
     ExternalEffectPage,
     ExternalEffectRecord,
     ExternalEffectRecoveryQuery,
+    OperationEvidenceLink,
+    OperationRecord,
 )
 
 
@@ -20,13 +24,19 @@ class ProtectedEffectPort(Protocol):
     ) -> AbstractContextManager[Any]:
         ...
 
-    def insert_external_effect(self, effect: ExternalEffectRecord) -> None:
+    def insert_external_effect(self, record: ExternalEffectRecord) -> None:
         ...
 
     def get_external_effect(self, effect_id: str) -> ExternalEffectRecord | None:
         ...
 
-    def list_external_effects(self, **filters: Any) -> list[ExternalEffectRecord]:
+    def list_external_effects(
+        self,
+        *,
+        created_after: str | None = None,
+        pid: str | None = None,
+        pids: Iterable[str] | None = None,
+    ) -> list[ExternalEffectRecord]:
         ...
 
     def query_external_effect_recovery(
@@ -42,25 +52,49 @@ class ProtectedEffectPort(Protocol):
     ) -> ExternalEffectRecord | None:
         ...
 
-    def finalize_external_effect(self, *args: Any, **kwargs: Any) -> Any:
+    def finalize_external_effect(
+        self,
+        intent_effect_id: str,
+        record: ExternalEffectRecord,
+    ) -> bool:
         ...
 
-    def transition_external_effect(self, *args: Any, **kwargs: Any) -> Any:
+    def transition_external_effect(
+        self,
+        effect_id: str,
+        *,
+        expected_states: Iterable[str],
+        transaction_state: str,
+        provider_metadata: dict[str, Any] | None = None,
+        provider_receipt: dict[str, Any] | None = None,
+        updated_at: str,
+    ) -> bool:
         ...
 
-    def abandon_external_effect_intent(self, *args: Any, **kwargs: Any) -> Any:
+    def abandon_external_effect_intent(self, effect_id: str) -> bool:
         ...
 
-    def get_capability_use_reservation(self, reservation_id: str) -> Any | None:
+    def get_capability_use_reservation(
+        self,
+        reservation_id: str,
+    ) -> dict[str, Any] | None:
         ...
 
-    def list_operation_evidence(self, **filters: Any) -> list[Any]:
+    def list_operation_evidence(
+        self,
+        *,
+        operation_ids: Iterable[str] | None = None,
+        evidence_types: Iterable[str] | None = None,
+        evidence_id: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> list[OperationEvidenceLink]:
         ...
 
-    def get_operation(self, operation_id: str) -> Any | None:
+    def get_operation(self, operation_id: str) -> OperationRecord | None:
         ...
 
-    def get_capability(self, capability_id: str) -> Any | None:
+    def get_capability(self, cap_id: str) -> Capability | None:
         ...
 
 

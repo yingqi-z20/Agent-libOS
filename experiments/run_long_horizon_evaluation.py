@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import tempfile
 from pathlib import Path
 
 from benchmarks.long_horizon_agent import report_all_successful, run_evaluation
+from experiments.evaluation_output import AtomicJsonOutput
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -44,29 +44,38 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(
             "OPENAI_API_KEY and OPENAI_LANGUAGE_MODEL or OPENAI_MODEL are required"
         )
-    if args.artifacts_root:
-        artifacts_root = Path(args.artifacts_root).resolve()
+    output = Path(args.output).resolve()
+    artifacts_root = (
+        Path(args.artifacts_root).resolve() if args.artifacts_root else None
+    )
+    if artifacts_root is not None:
+        if _paths_overlap(output, artifacts_root):
+            parser.error("--output and --artifacts-root must not overlap")
+        if artifacts_root.exists() and not artifacts_root.is_dir():
+            parser.error("--artifacts-root must name a directory")
         if artifacts_root.exists() and any(artifacts_root.iterdir()):
             parser.error("--artifacts-root must be absent or empty")
-        report = run_evaluation(
-            artifacts_root,
-            repetitions=args.repetitions,
-            phase_one_quanta=args.phase_one_quanta,
-            max_quanta=args.max_quanta,
-        )
-        report["artifacts_root"] = str(artifacts_root)
-    else:
-        with tempfile.TemporaryDirectory(prefix="agent-libos-long-horizon-") as root:
+
+    with AtomicJsonOutput(output) as artifact:
+        if artifacts_root is not None:
             report = run_evaluation(
-                root,
+                artifacts_root,
                 repetitions=args.repetitions,
                 phase_one_quanta=args.phase_one_quanta,
                 max_quanta=args.max_quanta,
             )
-    rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
-    output = Path(args.output).resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(rendered, encoding="utf-8")
+            report["artifacts_root"] = str(artifacts_root)
+        else:
+            with tempfile.TemporaryDirectory(
+                prefix="agent-libos-long-horizon-"
+            ) as root:
+                report = run_evaluation(
+                    root,
+                    repetitions=args.repetitions,
+                    phase_one_quanta=args.phase_one_quanta,
+                    max_quanta=args.max_quanta,
+                )
+        rendered = artifact.commit(report)
     print(rendered, end="")
     if args.require_all_successful and not report_all_successful(report):
         raise SystemExit(1)
@@ -77,6 +86,14 @@ def _positive_int(value: str) -> int:
     if selected < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return selected
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return (
+        first == second
+        or first in second.parents
+        or second in first.parents
+    )
 
 
 def _has_real_llm_environment() -> bool:

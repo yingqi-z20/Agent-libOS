@@ -25,6 +25,7 @@ from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.storage import ProcessRepository
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.public_errors import internal_exception_observation
 
 if TYPE_CHECKING:
     from agent_libos.runtime.process_manager import ProcessManager
@@ -157,7 +158,28 @@ class ProcessMessageManager:
             )
             self._wake_if_waiting_for_message(message)
         if self._object_tasks is not None:
-            self._object_tasks.notify_process_message(message)
+            try:
+                self._object_tasks.notify_process_message(message)
+            except Exception as exc:
+                # The message, wake transition, event, and audit are already
+                # committed.  A best-effort ObjectTask wake hook must not turn
+                # that durable success into an apparent send failure that a
+                # caller will retry. ObjectTask reads reconcile matching unread
+                # messages, so retaining the row is the retry mechanism.
+                try:
+                    self.audit.record(
+                        actor="process.message",
+                        action="process.message.object_task_wake_failed",
+                        target=f"process_message:{message.message_id}",
+                        decision={
+                            "recipient_pid": message.recipient_pid,
+                            "error": internal_exception_observation(exc),
+                        },
+                    )
+                except BaseException:
+                    # Diagnostics are post-commit too and cannot redefine the
+                    # outcome of the already-persisted message.
+                    pass
         return message
 
     def send_from_process(
@@ -219,8 +241,10 @@ class ProcessMessageManager:
         correlation_id: str | None = None,
         reply_to: str | None = None,
         message_ids: list[str] | None = None,
+        limit: int | None = None,
     ) -> list[ProcessMessage]:
         self._require_process(pid)
+        selected_limit = self._normalize_limit(limit)
         filters = self._filters(
             kind=kind,
             sender=sender,
@@ -238,6 +262,7 @@ class ProcessMessageManager:
             correlation_id=filters.get("correlation_id"),
             reply_to=filters.get("reply_to"),
             message_ids=filters.get("message_ids"),
+            limit=selected_limit,
         )
 
     def list(
@@ -276,6 +301,56 @@ class ProcessMessageManager:
         )
         return messages
 
+    def list_page(
+        self,
+        pid: str,
+        *,
+        include_acked: bool = False,
+        kind: ProcessMessageKind | str | None = None,
+        sender: str | None = None,
+        channel: str | None = None,
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+        message_ids: list[str] | None = None,
+        limit: int | None = None,
+    ) -> tuple[list[ProcessMessage], int]:
+        """Return one bounded window and the full matching snapshot count."""
+
+        self._require_process(pid)
+        selected_limit = self._normalize_limit(limit)
+        filters = self._filters(
+            kind=kind,
+            sender=sender,
+            channel=channel,
+            correlation_id=correlation_id,
+            reply_to=reply_to,
+            message_ids=message_ids,
+        )
+        status = None if include_acked else ProcessMessageStatus.UNREAD
+        with self.store.transaction():
+            messages = self.store.list_process_messages(
+                pid,
+                status=status,
+                kind=ProcessMessageKind(filters.get("kind")) if filters.get("kind") is not None else None,
+                sender=filters.get("sender"),
+                channel=filters.get("channel"),
+                correlation_id=filters.get("correlation_id"),
+                reply_to=filters.get("reply_to"),
+                message_ids=filters.get("message_ids"),
+                limit=selected_limit,
+            )
+            matching_count = self.store.count_process_messages(
+                pid,
+                status=status,
+                kind=ProcessMessageKind(filters.get("kind")) if filters.get("kind") is not None else None,
+                sender=filters.get("sender"),
+                channel=filters.get("channel"),
+                correlation_id=filters.get("correlation_id"),
+                reply_to=filters.get("reply_to"),
+                message_ids=filters.get("message_ids"),
+            )
+        return messages, matching_count
+
     def receive(
         self,
         pid: str,
@@ -306,7 +381,7 @@ class ProcessMessageManager:
         # transition with respect to post(). A post that wins the lock is seen
         # by the read; a post that loses it observes the registered waiter and
         # wakes it. There is no register-after-check lost-wakeup window.
-        with self.store.locked():
+        with self.store.transaction():
             messages = self.list(
                 pid,
                 include_acked=include_acked,
@@ -320,6 +395,70 @@ class ProcessMessageManager:
             )
             if messages or not block:
                 return messages
+            process = self._require_process(pid)
+            wait_state = self._message_wait_state(filters)
+            self._transitions.transition(
+                pid,
+                ProcessStatus.WAITING_EVENT,
+                expected_revision=process.revision,
+                expected_status=process.status,
+                expected_state_generation=process.state_generation,
+                wait_state=wait_state,
+            )
+            self.audit.record(
+                actor=pid,
+                action="process.message.wait",
+                target=f"process:{pid}",
+                decision={"filters": filters, "block": True},
+            )
+        raise ProcessMessageWaitRequired(
+            recipient_pid=pid,
+            filters=filters,
+            message=f"{pid} is waiting for process message filters={filters}",
+        )
+
+    def receive_page(
+        self,
+        pid: str,
+        *,
+        block: bool = False,
+        include_acked: bool = False,
+        kind: ProcessMessageKind | str | None = None,
+        sender: str | None = None,
+        channel: str | None = None,
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+        message_ids: list[str] | None = None,
+        limit: int | None = None,
+    ) -> tuple[list[ProcessMessage], int]:
+        """Receive a bounded window while retaining full-window count evidence."""
+
+        filters = self._filters(
+            kind=kind,
+            sender=sender,
+            channel=channel,
+            correlation_id=correlation_id,
+            reply_to=reply_to,
+            message_ids=message_ids,
+        )
+        if block and message_ids == []:
+            raise ValidationError("blocking process message receive requires a non-empty message id filter")
+        if block and limit == 0:
+            raise ValidationError("blocking process message receive requires a positive limit")
+        with self.store.transaction():
+            messages, matching_count = self.list_page(
+                pid,
+                include_acked=include_acked,
+                kind=filters.get("kind"),
+                sender=filters.get("sender"),
+                channel=filters.get("channel"),
+                correlation_id=filters.get("correlation_id"),
+                reply_to=filters.get("reply_to"),
+                message_ids=filters.get("message_ids"),
+                limit=limit,
+            )
+            if messages or not block:
+                return messages, matching_count
             process = self._require_process(pid)
             wait_state = self._message_wait_state(filters)
             self._transitions.transition(
@@ -356,44 +495,59 @@ class ProcessMessageManager:
         if message_ids is not None and not message_ids:
             return []
         selected_ids = set(message_ids or [])
-        # Explicit message ids already define the bounded ack set. Pass that
-        # size down as the query limit so large read windows are not truncated
-        # by the default message_read_limit before the id filter is applied.
-        messages = self.list(
-            pid,
-            include_acked=False,
-            kind=kind,
-            sender=sender,
-            channel=channel,
-            correlation_id=correlation_id,
-            reply_to=reply_to,
-            message_ids=list(selected_ids) if selected_ids else None,
-            limit=len(selected_ids) if selected_ids else None,
-        )
-        if selected_ids:
-            messages = [message for message in messages if message.message_id in selected_ids]
-        now = utc_now()
-        acked: list[ProcessMessage] = []
-        for message in messages:
-            message.status = ProcessMessageStatus.ACKED
-            message.acked_at = now
-            message.updated_at = now
-            self.store.update_process_message(message)
-            acked.append(message)
-        if acked:
-            self.events.emit(
-                EventType.PROCESS_MESSAGE_ACKED,
-                source=pid,
-                target=pid,
-                payload={"message_ids": [message.message_id for message in acked], "count": len(acked)},
+        with self.store.transaction():
+            # Explicit message ids already define the bounded ack set. Pass
+            # that size down as the query limit so large read windows are not
+            # truncated by the default message_read_limit before the id filter
+            # is applied. Selection stays in the transaction so concurrent
+            # ACK callers cannot both claim the same unread row.
+            messages = self.list(
+                pid,
+                include_acked=False,
+                kind=kind,
+                sender=sender,
+                channel=channel,
+                correlation_id=correlation_id,
+                reply_to=reply_to,
+                message_ids=list(selected_ids) if selected_ids else None,
+                limit=len(selected_ids) if selected_ids else None,
             )
-            self.audit.record(
-                actor=pid,
-                action="process.message.ack",
-                target=f"process:{pid}",
-                decision={"message_ids": [message.message_id for message in acked], "count": len(acked)},
-            )
-        return acked
+            if selected_ids:
+                messages = [message for message in messages if message.message_id in selected_ids]
+            now = utc_now()
+            acked: list[ProcessMessage] = []
+            for message in messages:
+                if not self.store.ack_process_message(
+                    message.message_id,
+                    recipient_pid=pid,
+                    acked_at=now,
+                    updated_at=now,
+                ):
+                    # A selected row changing before its CAS is an integrity
+                    # conflict. Raising rolls back prior rows in this batch so
+                    # a multi-message ACK is all-or-none.
+                    raise ProcessError(
+                        f"process message changed while acknowledging: {message.message_id}"
+                    )
+                message.status = ProcessMessageStatus.ACKED
+                message.acked_at = now
+                message.updated_at = now
+                acked.append(message)
+            if acked:
+                acked_ids = [message.message_id for message in acked]
+                self.events.emit(
+                    EventType.PROCESS_MESSAGE_ACKED,
+                    source=pid,
+                    target=pid,
+                    payload={"message_ids": acked_ids, "count": len(acked)},
+                )
+                self.audit.record(
+                    actor=pid,
+                    action="process.message.ack",
+                    target=f"process:{pid}",
+                    decision={"message_ids": acked_ids, "count": len(acked)},
+                )
+            return acked
 
     def notice(
         self,
@@ -435,14 +589,18 @@ class ProcessMessageManager:
 
     def _require_related_process(self, sender_pid: str, recipient_pid: str) -> None:
         sender = self._require_process(sender_pid)
-        recipient = self._require_process(recipient_pid)
-        if sender.pid == recipient.pid:
+        recipient = self.store.get_process(recipient_pid)
+        if recipient is not None and sender.pid == recipient.pid:
             return
-        if sender.parent_pid == recipient.pid:
+        if recipient is not None and sender.parent_pid == recipient.pid:
             return
-        if recipient.parent_pid == sender.pid:
+        if recipient is not None and recipient.parent_pid == sender.pid:
             return
-        raise ProcessError(f"{sender_pid} can only message itself, its parent, or its direct children")
+        # Missing and unrelated recipient identifiers intentionally share one
+        # public denial so the relationship check is not an existence oracle.
+        raise ProcessError(
+            f"{sender_pid} can only message itself, its parent, or its direct children"
+        )
 
     def _require_process(self, pid: str):
         process = self.store.get_process(pid)
@@ -542,8 +700,25 @@ class ProcessMessageManager:
                 correlation_id=filters.get("correlation_id"),
                 reply_to=filters.get("reply_to"),
                 message_ids=filters.get("message_ids"),
+                limit=1,
             )
         )
+
+    def normalize_channel(self, channel: str | None) -> str:
+        """Validate a channel before a caller performs durable side effects."""
+
+        return self._normalize_channel(channel)
+
+    def validate_body(self, body: str) -> str:
+        """Validate message body bounds without posting a message."""
+
+        selected = str(body or "")
+        self._validate_text_limit(
+            selected,
+            self.config.tools.message_body_max_chars,
+            "process message body",
+        )
+        return selected
 
     def _normalize_channel(self, channel: str | None) -> str:
         selected = (channel or "default").strip()
@@ -596,7 +771,9 @@ class ProcessMessageManager:
         return selected
 
     def _normalize_limit(self, limit: int | None) -> int:
-        selected = self.config.tools.message_read_limit if limit is None else int(limit)
+        if limit is not None and type(limit) is not int:
+            raise ValidationError("process message read limit must be an integer")
+        selected = self.config.tools.message_read_limit if limit is None else limit
         if selected < 0:
             raise ValidationError("process message read limit must be non-negative")
         if selected > self.config.tools.message_read_hard_limit:

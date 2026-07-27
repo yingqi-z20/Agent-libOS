@@ -30,10 +30,17 @@ from agent_libos.models import (
     SinkTrustRule,
 )
 from agent_libos.models import ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectType, ResourceBudget
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
 from agent_libos.primitives.git_command_policy import harden_read_only_git_argv
 from agent_libos.substrate import LocalResourceProviderSubstrate, ProviderEffectNotStarted, SubprocessLimits
-from modules.pty.pty_module import LocalPtyProvider, _PtyRuntimeSession
+from modules.pty.pty_module import (
+    LocalPtyProvider,
+    _PtyRuntimeSession,
+    _WinPtySession,
+)
+from tests.support.public_errors import assert_public_error_message
+
+_PTY_PROCESS_OBSERVATION_TIMEOUT_S = 5.0
 
 
 class TestPtyModule:
@@ -882,7 +889,9 @@ class TestPtyModule:
                     source_oids=[source.oid],
                 )
 
-                deadline = time.monotonic() + 1.0
+                deadline = (
+                    time.monotonic() + _PTY_PROCESS_OBSERVATION_TIMEOUT_S
+                )
                 while time.monotonic() < deadline and not marker.exists():
                     time.sleep(0.01)
                 assert marker.read_text(encoding="utf-8") == "ran"
@@ -929,7 +938,9 @@ class TestPtyModule:
                     startup_timeout_s=0.2,
                 )
 
-                deadline = time.monotonic() + 1.0
+                deadline = (
+                    time.monotonic() + _PTY_PROCESS_OBSERVATION_TIMEOUT_S
+                )
                 observed_content: str | None = None
                 while time.monotonic() < deadline:
                     if observed.exists():
@@ -1026,7 +1037,9 @@ class TestPtyModule:
                 )
 
                 assert dispatch_count >= 2
-                deadline = time.monotonic() + 1.0
+                deadline = (
+                    time.monotonic() + _PTY_PROCESS_OBSERVATION_TIMEOUT_S
+                )
                 while time.monotonic() < deadline and not trusted.exists():
                     time.sleep(0.01)
                 assert trusted.read_text(encoding="utf-8") == "trusted"
@@ -1258,7 +1271,9 @@ class TestPtyModule:
                 )
 
                 assert dispatch_count >= 2
-                deadline = time.monotonic() + 1.0
+                deadline = (
+                    time.monotonic() + _PTY_PROCESS_OBSERVATION_TIMEOUT_S
+                )
                 while time.monotonic() < deadline and not trusted.exists():
                     time.sleep(0.01)
                 assert trusted.read_text(encoding="utf-8") == "trusted"
@@ -1509,7 +1524,12 @@ class TestPtyModule:
                 result = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"]})
 
                 assert not result.ok
-                assert "lacks shell execute policy" in (result.error or "")
+                assert_public_error_message(
+                    result.error,
+                    code="permission_denied",
+                    error_type="CapabilityDenied",
+                    forbidden=("lacks shell execute policy",),
+                )
                 assert provider.spawned == []
             finally:
                 runtime.close()
@@ -1561,6 +1581,115 @@ class TestPtyModule:
                     for obj in runtime.store.list_objects()
                     if isinstance(obj.payload, dict) and obj.payload.get("kind") == "pty_session"
                 ] == []
+            finally:
+                runtime.close()
+
+    def test_pty_create_post_spawn_close_and_delete_failure_fences_caller_until_shutdown_retry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(
+                initial_outputs=["should-not-be-readable\n"],
+                close_failures=1,
+            )
+            runtime = _open_pty_runtime(temp_dir, provider)
+            adapter = _pty_adapter(runtime)
+            original_delete = runtime.memory.delete_object_trusted
+            cleanup_delete_attempts: list[str] = []
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="fence failed PTY create",
+                )
+
+                def fail_start_reader(*_args: Any, **_kwargs: Any) -> None:
+                    raise RuntimeError("reader setup failed")
+
+                def fail_cleanup_delete(
+                    actor: str,
+                    oid: str,
+                    *,
+                    reason: str,
+                    **kwargs: Any,
+                ) -> bool:
+                    if reason == "pty_create_post_spawn_failure":
+                        cleanup_delete_attempts.append(oid)
+                        raise RuntimeError("object delete failed")
+                    if reason == "pty_close":
+                        raise RuntimeError("object delete failed")
+                    return original_delete(
+                        actor,
+                        oid,
+                        reason=reason,
+                        **kwargs,
+                    )
+
+                monkeypatch.setattr(adapter, "_start_reader", fail_start_reader)
+                monkeypatch.setattr(
+                    runtime.memory,
+                    "delete_object_trusted",
+                    fail_cleanup_delete,
+                )
+
+                with pytest.raises(RuntimeError, match="reader setup failed"):
+                    adapter.create(
+                        pid,
+                        ["git", "status"],
+                        cwd=".",
+                        startup_timeout_s=0,
+                    )
+
+                public_objects = [
+                    obj
+                    for obj in runtime.store.list_objects()
+                    if isinstance(obj.payload, dict)
+                    and obj.payload.get("kind") == "pty_session"
+                ]
+                assert len(public_objects) == 1
+                public_oid = public_objects[0].oid
+                assert cleanup_delete_attempts == [public_oid]
+                assert public_oid not in adapter._sessions
+                assert len(adapter._sessions) == 1
+                orphan_oid, orphan = next(iter(adapter._sessions.items()))
+                assert orphan_oid.startswith("orphan:")
+                assert orphan.session_oid == orphan_oid
+                assert orphan.public_session_oid == public_oid
+                assert orphan.host_only_orphan
+                assert orphan.stop_event.is_set()
+                assert orphan.handle.is_alive()
+
+                with pytest.raises(NotFound, match="not active"):
+                    adapter.read(pid, public_oid, timeout_s=0)
+                with pytest.raises(NotFound, match="not active"):
+                    adapter.write(pid, public_oid, "caller-write\n")
+                with pytest.raises(NotFound, match="not active"):
+                    adapter.resize(pid, public_oid, cols=100, rows=30)
+                with pytest.raises(RuntimeError, match="object delete failed"):
+                    adapter.close(pid, public_oid)
+                with pytest.raises(NotFound, match="not found|not active"):
+                    adapter.read(pid, orphan_oid, timeout_s=0)
+                assert adapter.list(pid) == []
+                assert provider.sessions[0].writes == []
+                assert provider.sessions[0].size == (80, 24)
+                assert provider.sessions[0].close_forces == [True]
+
+                assert adapter.shutdown()
+                assert adapter._sessions == {}
+                assert not provider.sessions[0].is_alive()
+                assert provider.sessions[0].close_forces == [True, True]
+
+                monkeypatch.setattr(
+                    runtime.memory,
+                    "delete_object_trusted",
+                    original_delete,
+                )
+                assert original_delete(
+                    "runtime.pty",
+                    public_oid,
+                    reason="test_stale_failed_create_cleanup",
+                )
+                assert runtime.store.get_object(public_oid) is None
             finally:
                 runtime.close()
 
@@ -1679,6 +1808,213 @@ class TestPtyModule:
                 assert effect.provider_metadata["cleanup"]["succeeded"] is True
             finally:
                 runtime.close()
+
+    def test_pty_pre_registration_failure_never_retains_handle_under_public_oid(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(
+                initial_outputs=["should-not-be-readable\n"],
+                close_failures=1,
+            )
+            runtime = _open_pty_runtime(temp_dir, provider)
+            adapter = _pty_adapter(runtime)
+            original_delete = runtime.memory.delete_object_trusted
+            cleanup_delete_attempts: list[str] = []
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="fence pre-registration PTY failure",
+                )
+
+                def fail_runtime_session(
+                    *_args: Any,
+                    **_kwargs: Any,
+                ) -> _PtyRuntimeSession:
+                    raise RuntimeError("runtime session construction failed")
+
+                def fail_public_object_delete(
+                    actor: str,
+                    oid: str,
+                    *,
+                    reason: str,
+                    **kwargs: Any,
+                ) -> bool:
+                    if reason == "pty_create_pre_registration_failure":
+                        cleanup_delete_attempts.append(oid)
+                        raise RuntimeError("object delete failed")
+                    if reason == "pty_close":
+                        raise RuntimeError("object delete failed")
+                    return original_delete(
+                        actor,
+                        oid,
+                        reason=reason,
+                        **kwargs,
+                    )
+
+                monkeypatch.setattr(
+                    adapter,
+                    "_runtime_session_from_spawn",
+                    fail_runtime_session,
+                )
+                monkeypatch.setattr(
+                    runtime.memory,
+                    "delete_object_trusted",
+                    fail_public_object_delete,
+                )
+
+                with pytest.raises(
+                    RuntimeError,
+                    match="runtime session construction failed",
+                ):
+                    adapter.create(
+                        pid,
+                        ["git", "status"],
+                        cwd=".",
+                        startup_timeout_s=0,
+                    )
+
+                public_objects = [
+                    obj
+                    for obj in runtime.store.list_objects()
+                    if isinstance(obj.payload, dict)
+                    and obj.payload.get("kind") == "pty_session"
+                ]
+                assert len(public_objects) == 1
+                public_oid = public_objects[0].oid
+                assert cleanup_delete_attempts == [public_oid]
+                assert public_oid not in adapter._sessions
+                assert len(adapter._sessions) == 1
+                orphan_oid, orphan = next(iter(adapter._sessions.items()))
+                assert orphan_oid.startswith("orphan:")
+                assert orphan.host_only_orphan
+                assert orphan.public_session_oid == public_oid
+                assert orphan.stop_event.is_set()
+                assert orphan.handle.is_alive()
+
+                with pytest.raises(NotFound, match="not active"):
+                    adapter.read(pid, public_oid, timeout_s=0)
+                with pytest.raises(NotFound, match="not active"):
+                    adapter.write(pid, public_oid, "caller-write\n")
+                with pytest.raises(NotFound, match="not active"):
+                    adapter.resize(pid, public_oid, cols=100, rows=30)
+                with pytest.raises(RuntimeError, match="object delete failed"):
+                    adapter.close(pid, public_oid)
+                assert adapter.list(pid) == []
+                assert provider.sessions[0].writes == []
+                assert provider.sessions[0].size == (80, 24)
+                assert provider.sessions[0].close_forces == [True]
+
+                assert adapter.shutdown()
+                assert adapter._sessions == {}
+                assert not provider.sessions[0].is_alive()
+                assert provider.sessions[0].close_forces == [True, True]
+
+                monkeypatch.setattr(
+                    runtime.memory,
+                    "delete_object_trusted",
+                    original_delete,
+                )
+                assert original_delete(
+                    "runtime.pty",
+                    public_oid,
+                    reason="test_stale_failed_create_cleanup",
+                )
+            finally:
+                runtime.close()
+
+    def test_failed_spawn_cleanup_retains_handle_until_shutdown(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[], close_failures=1)
+            runtime = _open_pty_runtime(temp_dir, provider)
+            adapter = _pty_adapter(runtime)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="retain failed PTY spawn handle",
+                )
+
+                def fail_session_object(*_args: Any, **_kwargs: Any) -> tuple[str, str, str]:
+                    raise RuntimeError("session object creation failed")
+
+                monkeypatch.setattr(adapter, "_create_session_object", fail_session_object)
+
+                with pytest.raises(RuntimeError, match="session object creation failed"):
+                    adapter.create(
+                        pid,
+                        ["git", "status"],
+                        cwd=".",
+                        startup_timeout_s=0,
+                    )
+
+                assert len(adapter._sessions) == 1
+                orphan_oid, orphan = next(iter(adapter._sessions.items()))
+                assert orphan_oid.startswith("orphan:")
+                assert orphan.handle is provider.sessions[0]
+                assert orphan.handle.is_alive()
+                effect = runtime.store.list_external_effects(pid=pid)[0]
+                assert effect.provider_metadata["cleanup"] == {
+                    "attempted": True,
+                    "succeeded": False,
+                    "retained": True,
+                }
+
+                assert adapter.shutdown()
+                assert adapter._sessions == {}
+                assert not provider.sessions[0].is_alive()
+            finally:
+                runtime.close()
+
+    def test_provider_close_returning_alive_does_not_publish_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="reject false PTY close",
+                )
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
+                handle = provider.sessions[0]
+                original_close = handle.close
+                monkeypatch.setattr(handle, "close", lambda **_kwargs: None)
+
+                with pytest.raises(TimeoutError, match="remained alive"):
+                    adapter.close(pid, created.session_oid, timeout_s=0.01)
+
+                session = adapter._sessions[created.session_oid]
+                assert not session.closed
+                assert session.close_outcome_unknown
+                assert runtime.store.get_object(created.session_oid) is not None
+
+                monkeypatch.setattr(handle, "close", original_close)
+                session.close_outcome_unknown = False
+            finally:
+                runtime.close()
+
+    def test_windows_wait_compatibility_path_remains_deadline_bounded(self) -> None:
+        proc = NonTerminatingWinPtyProcess()
+        session = _WinPtySession(proc)
+        started = time.monotonic()
+
+        with pytest.raises(TimeoutError, match="close deadline"):
+            session.close(timeout_s=0.02)
+
+        assert time.monotonic() - started < 0.5
+        assert proc.wait_calls == 1
 
     def test_pty_write_resize_and_close_each_record_external_effect(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2361,7 +2697,12 @@ class TestPtyModule:
                 result = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
 
                 assert not result.ok
-                assert "explicit command capability denied" in (result.error or "")
+                assert_public_error_message(
+                    result.error,
+                    code="permission_denied",
+                    error_type="CapabilityDenied",
+                    forbidden=("explicit command capability denied",),
+                )
                 assert provider.spawned == []
             finally:
                 runtime.close()
@@ -2435,7 +2776,12 @@ class TestPtyModule:
                 write = runtime.tools.call(other, "pty_write", {"session_oid": session_oid, "text": "whoami\n"})
 
                 assert not write.ok
-                assert "cannot write to PTY session owned by" in (write.error or "")
+                assert_public_error_message(
+                    write.error,
+                    code="permission_denied",
+                    error_type="CapabilityDenied",
+                    forbidden=("cannot write to PTY session owned by",),
+                )
                 assert provider.sessions[0].writes == []
             finally:
                 runtime.close()
@@ -2478,7 +2824,12 @@ class TestPtyModule:
                 result = runtime.tools.call(pid, "pty_create", {"argv": ["git", "status"], "startup_timeout_s": 0})
 
                 assert not result.ok
-                assert "SubprocessLimits" in (result.error or "")
+                assert_public_error_message(
+                    result.error,
+                    code="validation_error",
+                    error_type="ValidationError",
+                    forbidden=("SubprocessLimits",),
+                )
                 assert provider.spawned == []
             finally:
                 runtime.close()
@@ -2605,7 +2956,12 @@ class TestPtyModule:
                 )
 
                 assert not written.ok
-                assert "configured limit" in (written.error or "")
+                assert_public_error_message(
+                    written.error,
+                    code="validation_error",
+                    error_type="ValidationError",
+                    forbidden=("configured limit",),
+                )
                 assert provider.sessions[0].writes == []
             finally:
                 runtime.close()
@@ -2621,7 +2977,12 @@ class TestPtyModule:
 
                 assert first.ok, first.error
                 assert not second.ok
-                assert "per-process limit" in (second.error or "")
+                assert_public_error_message(
+                    second.error,
+                    code="validation_error",
+                    error_type="ValidationError",
+                    forbidden=("per-process limit",),
+                )
                 assert len(provider.spawned) == 1
             finally:
                 runtime.close()
@@ -2648,6 +3009,46 @@ class TestPtyModule:
 
                 assert second.ok, second.error
                 assert len(provider.spawned) == 2
+            finally:
+                runtime.close()
+
+    def test_natural_exit_close_consumes_finite_delete_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[], session_alive=False)
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="settle natural-exit PTY deletion",
+                )
+                adapter = _pty_adapter(runtime)
+                created = adapter.create(
+                    pid,
+                    ["git", "status"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
+                finite = _grant_pty_object_once(
+                    runtime,
+                    pid,
+                    created.session_oid,
+                    CapabilityRight.DELETE,
+                )
+                deadline = time.monotonic() + 1.0
+                while (
+                    created.session_oid in adapter._sessions
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+
+                assert created.session_oid not in adapter._sessions
+                assert runtime.store.get_object(created.session_oid) is not None
+
+                closed = adapter.close(pid, created.session_oid)
+
+                assert closed.closed
+                assert runtime.store.get_capability(finite.cap_id).uses_remaining == 0
+                assert runtime.store.get_object(created.session_oid) is None
             finally:
                 runtime.close()
 
@@ -2703,7 +3104,12 @@ class TestPtyModule:
                 retried = runtime.tools.call(pid, "pty_close", {"session_oid": session_oid})
 
                 assert not retried.ok
-                assert "unresolved prior close outcome" in (retried.error or "")
+                assert_public_error_message(
+                    retried.error,
+                    code="validation_error",
+                    error_type="ValidationError",
+                    forbidden=("unresolved prior close outcome",),
+                )
                 assert provider.sessions[0].closed is False
                 assert runtime.store.get_object(session_oid) is not None
             finally:
@@ -3338,7 +3744,7 @@ def _open_pty_runtime(
         for line in manifest.read_text(encoding="utf-8").splitlines()
         if line.startswith("sha256:")
     )
-    manifest_sha = hashlib.sha256(manifest.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
     runtime = Runtime.open(
         target,
         substrate=substrate,
@@ -3436,6 +3842,25 @@ def _invoke_pty_mutation(adapter: Any, pid: str, session_oid: str, operation: st
     if operation == "close":
         return adapter.close(pid, session_oid)
     raise AssertionError(f"unsupported PTY mutation operation: {operation}")
+
+
+class NonTerminatingWinPtyProcess:
+    pid = 4242
+    exitstatus = None
+    returncode = None
+
+    def __init__(self) -> None:
+        self.wait_calls = 0
+
+    def isalive(self) -> bool:
+        return True
+
+    def terminate(self, *, force: bool = True) -> None:
+        del force
+
+    def wait(self, **_kwargs: Any) -> None:
+        self.wait_calls += 1
+        raise TypeError("timeout keyword is unsupported")
 
 
 class FakePtyProvider:

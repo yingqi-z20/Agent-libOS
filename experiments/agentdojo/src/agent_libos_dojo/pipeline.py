@@ -102,6 +102,34 @@ class ExplicitDotenvSnapshot:
             if value
         }
 
+    def verification_metadata(self) -> dict[str, Any]:
+        """Return secret-free fingerprints bound to the run-start bytes.
+
+        Verification may happen after credentials rotate.  Length plus a
+        SHA-256 fingerprint lets the bounded verifier recognize the original
+        value without persisting the credential itself.
+        """
+
+        dotenv = dict(self._dotenv_items)
+        credentials: dict[str, dict[str, Any]] = {}
+        for label, name in (
+            ("api_key", "OPENAI_API_KEY"),
+            ("base_url", "OPENAI_BASE_URL"),
+        ):
+            value = dotenv.get(name)
+            if not value:
+                continue
+            encoded = value.encode("utf-8")
+            credentials[label] = {
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "byte_length": len(encoded),
+            }
+        return {
+            "schema_version": 1,
+            "dotenv_sha256": self.file_sha256,
+            "credentials": credentials,
+        }
+
 
 @dataclass
 class RunRecorder:
@@ -531,6 +559,10 @@ class ControlPipeline(AgentPipeline):
             query_run = {
                 "arm": "upstream_control",
                 "messages": to_jsonable(returned_messages),
+                "logical_model_requests": list(self.recorder.provider_requests),
+                "logical_model_invocation_count": len(
+                    self.recorder.provider_requests
+                ),
                 "provider_calls": list(self.recorder.provider_calls),
                 "usage": self.recorder.usage(),
                 "provider_call_count": len(self.recorder.provider_calls),
@@ -1039,6 +1071,7 @@ def _ambient_run_snapshot(
         "status_before_host_exit": status_before_host_exit,
         "status_message": process.status_message,
         "scheduler_result_count": len(results),
+        "logical_model_invocation_count": len(recorder.provider_requests),
         "provider_call_count": len(recorder.provider_calls),
         "llm_call_record_count": len(calls),
         "tool_call_count": sum(
@@ -1049,6 +1082,7 @@ def _ambient_run_snapshot(
         "hidden_terminal_tool_calls": 1 if recorder.final_answer is not None else 0,
         "replaced_runtime_tool_names": sorted(replaced_tool_names),
         "usage": recorder.usage(),
+        "logical_model_requests": list(recorder.provider_requests),
         "provider_calls": list(recorder.provider_calls),
         "tool_executions": list(recorder.tool_executions),
         "iteration_limit_suppressed_tool_calls": list(
@@ -1085,6 +1119,7 @@ def _aggregate_control_query_runs(
     if not query_runs:
         return {}
     aggregate = dict(query_runs[-1])
+    logical_model_requests: list[dict[str, Any]] = []
     provider_calls: list[dict[str, Any]] = []
     messages: list[Any] = []
     usage: Counter[str] = Counter()
@@ -1094,6 +1129,12 @@ def _aggregate_control_query_runs(
     executed_tool_call_count = 0
     for query_run in query_runs:
         invocation = int(query_run.get("query_invocation") or 0)
+        for request in query_run.get("logical_model_requests") or []:
+            if not isinstance(request, Mapping):
+                continue
+            tagged_request = dict(request)
+            tagged_request["query_invocation"] = invocation
+            logical_model_requests.append(tagged_request)
         for provider_call in query_run.get("provider_calls") or []:
             if not isinstance(provider_call, Mapping):
                 continue
@@ -1121,6 +1162,9 @@ def _aggregate_control_query_runs(
         query_summaries.append(
             {
                 "query_invocation": invocation,
+                "logical_model_invocation_count": int(
+                    query_run.get("logical_model_invocation_count") or 0
+                ),
                 "provider_call_count": int(
                     query_run.get("provider_call_count") or 0
                 ),
@@ -1137,6 +1181,8 @@ def _aggregate_control_query_runs(
             "query_invocation_count": len(query_runs),
             "query_runs": query_summaries,
             "query_transcripts": query_transcripts,
+            "logical_model_requests": logical_model_requests,
+            "logical_model_invocation_count": len(logical_model_requests),
             "provider_calls": provider_calls,
             "provider_call_count": len(provider_calls),
             "tool_call_count": tool_call_count,
@@ -1156,6 +1202,7 @@ def _aggregate_ambient_query_runs(
     if not query_runs:
         return {}
     aggregate = dict(query_runs[-1])
+    logical_model_requests: list[Any] = []
     provider_calls: list[Any] = []
     tool_executions: list[Any] = []
     suppressed_calls: list[Any] = []
@@ -1169,6 +1216,14 @@ def _aggregate_ambient_query_runs(
     scalar_totals: Counter[str] = Counter()
     for query_run in query_runs:
         invocation = int(query_run.get("query_invocation") or 0)
+        logical_model_requests.extend(
+            {
+                **dict(item),
+                "query_invocation": invocation,
+            }
+            for item in query_run.get("logical_model_requests") or []
+            if isinstance(item, Mapping)
+        )
         provider_calls.extend(
             {
                 **dict(item),
@@ -1234,6 +1289,9 @@ def _aggregate_ambient_query_runs(
                 "pid": query_run.get("pid"),
                 "process_status": query_run.get("process_status"),
                 "status_before_host_exit": query_run.get("status_before_host_exit"),
+                "logical_model_invocation_count": query_run.get(
+                    "logical_model_invocation_count", 0
+                ),
                 "provider_call_count": query_run.get("provider_call_count", 0),
                 "tool_call_count": query_run.get("tool_call_count", 0),
                 "executed_tool_call_count": query_run.get(
@@ -1255,6 +1313,8 @@ def _aggregate_ambient_query_runs(
             "query_invocation_count": len(query_runs),
             "query_runs": query_summaries,
             "query_transcripts": query_transcripts,
+            "logical_model_requests": logical_model_requests,
+            "logical_model_invocation_count": len(logical_model_requests),
             "provider_calls": provider_calls,
             "provider_call_count": len(provider_calls),
             "tool_executions": tool_executions,

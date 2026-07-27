@@ -1,8 +1,9 @@
 import { Box, Eye } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { LibOSClient } from "../api/client";
 import type { ModuleSummary } from "../api/types";
 import { useI18n } from "../i18n";
+import { RequestEpoch } from "../requestEpoch";
 import { CollapsibleJson } from "./CollapsibleJson";
 
 export function ModulesPanel({ modules, client }: { modules: ModuleSummary[]; client: LibOSClient }) {
@@ -11,21 +12,38 @@ export function ModulesPanel({ modules, client }: { modules: ModuleSummary[]; cl
   const [details, setDetails] = useState<unknown>(null);
   const [loading, setLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const inspectRequests = useRef(new RequestEpoch());
+  const selectedIdRef = useRef(selectedId);
+  const clientRef = useRef(client);
+  selectedIdRef.current = selectedId;
+  clientRef.current = client;
 
   useEffect(() => {
     if (!modules.some((module) => module.module_id === selectedId)) setSelectedId(modules[0]?.module_id ?? "");
   }, [modules, selectedId]);
 
+  useEffect(() => {
+    inspectRequests.current.invalidate();
+    setLoading(false);
+    return () => inspectRequests.current.invalidate();
+  }, [client, selectedId]);
+
   async function inspect() {
     if (!selectedId) return;
+    const inspectedId = selectedId;
+    const inspectedClient = client;
+    const request = inspectRequests.current.begin();
     setLoading(true);
     setLocalError(null);
     try {
-      setDetails(await client.inspectModule(selectedId));
+      const result = await client.inspectModule(selectedId);
+      if (inspectRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient) setDetails(result);
     } catch (error) {
-      setLocalError(error instanceof Error ? error.message : String(error));
+      if (inspectRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient) {
+        setLocalError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
-      setLoading(false);
+      if (inspectRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient) setLoading(false);
     }
   }
 

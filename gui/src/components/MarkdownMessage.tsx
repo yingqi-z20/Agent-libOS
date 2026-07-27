@@ -5,6 +5,14 @@ import type { MouseEvent, ReactNode } from "react";
 const SAFE_MARKDOWN_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
 const markdownComponents: Components = {
+  img({ alt }) {
+    const accessibleLabel = alt || "Image omitted";
+    return (
+      <span className="markdownImagePlaceholder" role="img" aria-label={accessibleLabel}>
+        {alt ? `[image: ${alt}]` : "[image omitted]"}
+      </span>
+    );
+  },
   a({ href, children, node: _node, ...props }) {
     if (!isSafeMarkdownHref(href)) {
       return <span>{children}</span>;

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import os
 import re
+import sqlite3
 import stat
 import threading
 
@@ -439,11 +440,18 @@ class TestStorageBackendBoundaries:
         db_path = tmp_path / "runtime.sqlite"
         first = SQLiteStore(db_path)
         try:
+            with first.transaction() as cursor:
+                cursor.execute(
+                    "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                    ("exclusive-lease", None, "{}", "test", "1", "1"),
+                )
             with pytest.raises(ValidationError, match="already open"):
                 SQLiteStore(db_path)
         finally:
             first.close()
 
+        with pytest.raises(sqlite3.ProgrammingError, match="closed cursor"):
+            cursor.execute("SELECT 1")
         assert not db_path.with_suffix(db_path.suffix + ".runtime.lock").exists()
         second = SQLiteStore(db_path)
         second.close()
@@ -464,6 +472,207 @@ class TestStorageBackendBoundaries:
 
         reopened = SQLiteStore(alias)
         reopened.close()
+
+    def test_sqlite_runtime_lease_rejects_hardlink_database_alias(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        if sqlite_backend.fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("POSIX secure runtime lease is unavailable")
+        db_path = tmp_path / "runtime.sqlite"
+        alias = tmp_path / "runtime-hardlink.sqlite"
+        first = SQLiteStore(db_path)
+        unexpected: SQLiteStore | None = None
+        try:
+            try:
+                os.link(db_path, alias)
+            except OSError:
+                pytest.skip("hardlink creation is not available in this environment")
+            with pytest.raises(ValidationError, match="hard link|already open"):
+                unexpected = SQLiteStore(alias)
+        finally:
+            if unexpected is not None:
+                unexpected.close()
+            first.close()
+
+    def test_sqlite_runtime_lease_survives_lockfile_path_replacement(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        if sqlite_backend.fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("POSIX secure runtime lease is unavailable")
+        db_path = tmp_path / "runtime.sqlite"
+        lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
+        first = SQLiteStore(db_path)
+        unexpected: SQLiteStore | None = None
+        try:
+            lease_path.unlink()
+            with pytest.raises(ValidationError, match="already open"):
+                unexpected = SQLiteStore(db_path)
+        finally:
+            if unexpected is not None:
+                unexpected.close()
+            first.close()
+
+        reopened = SQLiteStore(db_path)
+        reopened.close()
+
+    def test_sqlite_runtime_lease_survives_database_rename_and_symlink_retarget(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        if sqlite_backend.fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("POSIX secure runtime lease is unavailable")
+        db_path = tmp_path / "runtime.sqlite"
+        moved_path = tmp_path / "moved-runtime.sqlite"
+        first = SQLiteStore(db_path)
+        unexpected: SQLiteStore | None = None
+        try:
+            db_path.rename(moved_path)
+            try:
+                db_path.symlink_to(moved_path)
+            except OSError:
+                pytest.skip("symlink creation is not available in this environment")
+            with pytest.raises(ValidationError, match="already open"):
+                unexpected = SQLiteStore(db_path)
+        finally:
+            if unexpected is not None:
+                unexpected.close()
+            first.close()
+
+        reopened = SQLiteStore(db_path)
+        reopened.close()
+
+    def test_sqlite_existing_store_disappearance_does_not_create_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "runtime.sqlite"
+        seeded = SQLiteStore(db_path)
+        lease = seeded._lease_handle
+        identity_directory = lease.identity_path.parent if lease is not None else None
+        seeded.close()
+        adjacent_lease = db_path.with_suffix(db_path.suffix + ".runtime.lock")
+        adjacent_lease.unlink(missing_ok=True)
+        identity_before = (
+            {path.name for path in identity_directory.iterdir()}
+            if identity_directory is not None
+            else set()
+        )
+        original_preflight = SQLiteStore._preflight_existing_store
+
+        def remove_after_preflight(store: SQLiteStore, path: Path) -> bool:
+            result = original_preflight(store, path)
+            path.unlink()
+            return result
+
+        monkeypatch.setattr(
+            SQLiteStore,
+            "_preflight_existing_store",
+            remove_after_preflight,
+        )
+
+        with pytest.raises(ValidationError, match="changed or disappeared"):
+            SQLiteStore(db_path)
+
+        assert not db_path.exists()
+        assert not adjacent_lease.exists()
+        if identity_directory is not None:
+            assert {path.name for path in identity_directory.iterdir()} == identity_before
+
+    def test_sqlite_identity_lease_is_owner_only_and_released_on_close(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        if sqlite_backend.fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("POSIX secure runtime lease is unavailable")
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        lease = store._lease_handle
+        assert lease is not None
+        assert lease.identity_path.exists()
+        assert lease.path.exists()
+        assert lease.identity_path.stat().st_mode & 0o777 == 0o600
+        assert lease.identity_path.parent.stat().st_mode & 0o777 == 0o700
+        assert lease.identity_path.stat().st_nlink == 1
+        competing = lease.identity_path.open("r+")
+        try:
+            with pytest.raises(BlockingIOError):
+                sqlite_backend.fcntl.flock(
+                    competing.fileno(),
+                    sqlite_backend.fcntl.LOCK_EX | sqlite_backend.fcntl.LOCK_NB,
+                )
+        finally:
+            competing.close()
+
+        store.close()
+
+        assert store._lease_handle is None
+        assert lease.handle.closed
+        assert lease.identity_handle.closed
+        reopened_identity = lease.identity_path.open("r+")
+        try:
+            sqlite_backend.fcntl.flock(
+                reopened_identity.fileno(),
+                sqlite_backend.fcntl.LOCK_EX | sqlite_backend.fcntl.LOCK_NB,
+            )
+        finally:
+            reopened_identity.close()
+
+    def test_sqlite_portable_fallback_atomically_creates_fresh_database(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+        db_path = tmp_path / "portable.sqlite"
+
+        store = SQLiteStore(db_path)
+        try:
+            assert db_path.is_file()
+            assert store._database_identity == (
+                db_path.stat().st_dev,
+                db_path.stat().st_ino,
+            )
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("suffix", [".runtime.lock", "-journal", "-wal", "-shm"])
+    def test_sqlite_secure_files_reject_hardlinked_lease_and_sidecars(
+        self,
+        tmp_path: Path,
+        suffix: str,
+    ) -> None:
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "fchmod"):
+            pytest.skip("POSIX owner-only file validation is unavailable")
+        if suffix == ".runtime.lock" and sqlite_backend.fcntl is None:
+            pytest.skip("separate SQLite file runtime lease is unavailable")
+        db_path = tmp_path / "runtime.sqlite"
+        seeded = SQLiteStore(db_path)
+        seeded.close()
+        linked_path = (
+            db_path.with_suffix(db_path.suffix + suffix)
+            if suffix == ".runtime.lock"
+            else Path(f"{db_path}{suffix}")
+        )
+        if linked_path.exists():
+            linked_path.unlink()
+        sentinel = tmp_path / f"sentinel{suffix.replace('/', '_')}"
+        sentinel.write_text("must not be used as SQLite state", encoding="utf-8")
+        try:
+            os.link(sentinel, linked_path)
+        except OSError:
+            pytest.skip("hardlink creation is not available in this environment")
+
+        unexpected: SQLiteStore | None = None
+        try:
+            with pytest.raises(ValidationError, match="hard link"):
+                unexpected = SQLiteStore(db_path)
+        finally:
+            if unexpected is not None:
+                unexpected.close()
+
+        assert sentinel.read_text(encoding="utf-8") == "must not be used as SQLite state"
 
     def test_nested_store_transactions_use_savepoints(self) -> None:
         store = SQLiteStore(":memory:")
@@ -490,6 +699,35 @@ class TestStorageBackendBoundaries:
             }
             assert {"after", "outer"}.issubset(namespaces)
             assert "inner" not in namespaces
+        finally:
+            store.close()
+
+    def test_store_close_closes_retained_transaction_cursors(self) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            with store.transaction() as committed:
+                committed.execute(
+                    "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                    ("committed", None, "{}", "test", "1", "1"),
+                )
+
+            assert committed.execute("SELECT 1").fetchone()[0] == 1
+
+            with pytest.raises(RuntimeError, match="rollback cursor"):
+                with store.transaction() as rolled_back:
+                    rolled_back.execute(
+                        "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                        ("rolled-back", None, "{}", "test", "1", "1"),
+                    )
+                    raise RuntimeError("rollback cursor")
+
+            assert rolled_back.execute("SELECT 1").fetchone()[0] == 1
+            store.close()
+
+            with pytest.raises(sqlite3.ProgrammingError, match="closed cursor"):
+                committed.execute("SELECT 1")
+            with pytest.raises(sqlite3.ProgrammingError, match="closed cursor"):
+                rolled_back.execute("SELECT 1")
         finally:
             store.close()
 
@@ -1769,7 +2007,7 @@ class TestStorageBackendBoundaries:
         raw_text = (AGENT_LIBOS / "storage" / "sql.py").read_text(encoding="utf-8")
         pattern = (
             r"\b(?:PRAGMA\s+[A-Z_]+|INSERT\s+OR\s+[A-Z_]+|"
-            r"COLLATE\s+[A-Z_]+|JSON_EXTRACT)\b"
+            r"COLLATE\s+[A-Z_]+)\b"
         )
         matches = list(re.finditer(pattern, raw_text, re.IGNORECASE))
 
@@ -1778,11 +2016,9 @@ class TestStorageBackendBoundaries:
             "INSERT OR IGNORE",
             "INSERT OR REPLACE",
             "COLLATE BINARY",
-            "JSON_EXTRACT",
         }
         assert all(
             match.group(0).upper().startswith("PRAGMA ")
-            or match.group(0).upper() == "JSON_EXTRACT"
             or match.group(0) == match.group(0).upper()
             for match in matches
         )

@@ -35,7 +35,7 @@ The call publishes a checkpoint-derived artifact and registry entry. It does not
 
 The root-process artifact captures reconstructable Object roots/payloads, namespaces/internal Object authority, visible static/JIT state and source, loaded Skills, cwd string, and module/capability requirements. It does not clone children, files/shell, provider registrations/sessions, MCP/JSON-RPC state, UI state, budgets/usage, or external effects. Source-row metadata may remain, but boot does not replay its lease, status, waits, mailbox/history, event cursor, or outcomes. Package files separately when boot needs them.
 
-Boot remaps internal Object/namespace capabilities. External capabilities become requirements only. Hash-pinned modules fail closed if absent/mismatched; global Skill trust and provider registries are not packaged.
+Boot remaps internal Object/namespace capabilities. External capabilities become requirements only. Hash-pinned modules fail closed if absent/mismatched; global Skill trust and provider registries are not packaged. Before boot, the Host must also confirm that every captured Object's data-flow labels, including tenant boundaries, are admissible for the target process; boot rejects incompatible metadata rather than relabeling it.
 
 Drift hazard: commit gets prompt/mode, planner/action settings, context/safety policy, JIT exposure, default Skills, and LLM profile from the **current registry entry** for the captured `source_image_id`; these are not all checkpoint-frozen. Replacing/removing that ID after checkpoint creation can yield a changed contract or fallbacks. Confirm it, do not replace it, commit promptly, and use a fresh target. Output cannot prove inherited-contract equality.
 
@@ -49,7 +49,7 @@ Use an exact trusted/just-published `image`; explicitly provide audit `args`, in
 
 Exec **must be the only tool call in its tool-call batch**. Never send sibling calls with it. Success changes the active prompt/tool/Skill contract, so all follow-up belongs to a new model step under the post-exec contract.
 
-Exec retains PID and budget/usage. It has no LLM-profile argument, so the process profile field remains. Resolve every typed child/mailbox/Human/Tool/Host wait first; exec requires runnable state or the exact active lease. Switching images needs exact target-image read; external requirements do not grant themselves.
+Exec retains PID and budget/usage. It has no LLM-profile argument, so the process profile field remains. Resolve every typed child/mailbox/Human/Tool/Host wait first; exec requires runnable state or the exact active lease. Switching images needs exact target-image read; external requirements do not grant themselves. A finite or one-shot image-read grant is settled before boot publication and is not refunded merely because a later boot step fails and the prior process snapshot is restored.
 
 Choose `goal` deliberately. Omitting it retains the old `goal_oid`; supplying one creates a replacement goal Object. Avoid carrying an old goal into a materially different contract.
 
@@ -75,11 +75,11 @@ Success returns `pid`, `old_image`, `new_image`, `status`, `goal_oid`, both flag
 
 ## Failure and recovery
 
-For load/commit validation or authority errors, fix the reviewed input or authority. Never force progress with `replace=true`, a weakened manifest, or guessed IDs. A reported failure is not evidence that the requested entry exists. If transport timeout makes a non-idempotent mutation ambiguous, determine whether the exact ID/artifact published before retrying.
+For load/commit validation or authority errors, fix the reviewed input or authority. Never force progress with `replace=true`, a weakened manifest, or guessed IDs. A reported failure is not evidence that the requested entry exists. If transport timeout makes a non-idempotent mutation ambiguous, stop: this Skill's mutation-only publication tools cannot inspect the registry. Hand the returned IDs and transport evidence to a Host/operator with registry/artifact inspection, and retry only after that path proves the original mutation absent.
 
 Exec preflight can reject an unknown image, missing exact read authority, active typed wait, unavailable/mismatched module or artifact, malformed image, or incompatible process state. Resolve the named condition before reconsidering exec.
 
-If boot fails and the runtime reports successful rollback, the prior contract/snapshot was restored; do not claim the target is active. If the error reports recovery required, ambiguous rollback, incomplete compensation, or a recovery fence, stop all mutation. Do not retry exec, guess an image, or use either contract's tool assumptions. The Host must reopen/reconcile the durable publication and confirm a terminal result. Images/checkpoints do not undo provider effects, so separately reconcile remote actions.
+If boot fails and the runtime reports successful rollback, the prior contract/snapshot was restored; do not claim the target is active. Any settled one-shot target-image read remains consumed, so a deliberate later attempt needs newly valid authority. If the error reports recovery required, ambiguous rollback, incomplete compensation, or a recovery fence, stop all mutation. Do not retry exec, guess an image, or use either contract's tool assumptions. The Host must reopen/reconcile the durable publication and confirm a terminal result. Images/checkpoints do not undo provider effects, so separately reconcile remote actions.
 
 Never “roll back” by replacing a registry ID with old bytes. That changes future resolution and may affect other processes; it does not restore process state. Use checkpoint recovery, or later exec a separately published image after the current publication has a known outcome.
 

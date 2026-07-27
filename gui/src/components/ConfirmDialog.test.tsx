@@ -12,6 +12,7 @@ describe("ConfirmDialog", () => {
           message="Review the exact capability."
           details={{ capability_id: "cap_1" }}
           busy
+          error="The operation could not be completed."
           onCancel={() => undefined}
           onConfirm={() => undefined}
         />
@@ -24,5 +25,7 @@ describe("ConfirmDialog", () => {
     expect(html).toMatch(/aria-labelledby="[^"]+"/);
     expect(html).toMatch(/aria-describedby="[^"]+"/);
     expect(html).toContain("Working");
+    expect(html).toContain('role="alert"');
+    expect(html).toContain("The operation could not be completed.");
   });
 });

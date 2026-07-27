@@ -242,6 +242,7 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         obj = runtime.memory.get_object_by_name(ctx.pid, args.name, namespace=args.namespace)
+        source_context = runtime.data_flow.context_from_object_snapshot(obj)
         text = self._extract_text(obj.payload)
         # The object payload is handed directly to the filesystem primitive; the
         # process-visible result below still omits the concrete content.
@@ -255,7 +256,7 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
                 encoding=args.encoding,
                 overwrite=args.overwrite,
                 cwd=cwd,
-                source_oids=[obj.oid],
+                source_context=source_context,
             )
         except FileExistsError as exc:
             raise ToolExecutionError(

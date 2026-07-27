@@ -61,6 +61,14 @@ class OperationPort(Protocol):
     def finish(self, outcome: str, *, operation_id: str | None = None) -> Any:
         ...
 
+    def wait(
+        self,
+        *,
+        operation_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> OperationRecord | None:
+        ...
+
 
 class RuntimePublicationOperationPort(Protocol):
     """Exact operation boundary required by publication reconciliation."""

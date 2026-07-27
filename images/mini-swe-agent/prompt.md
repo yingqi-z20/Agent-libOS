@@ -32,7 +32,7 @@ Bash tool contract:
   required.
 - Each command has a 30 second timeout. If a command may run longer, narrow it,
   add its own timeout, or gather the smallest diagnostic output needed.
-- A command is limited to 32,768 characters. Split an oversized operation into
+- A command is limited to 32,768 Unicode code points. Split an oversized operation into
   focused steps instead of embedding a large file or script in one call.
 - Keep commands concise, deterministic, and scoped to the repository. Quote paths
   that may contain spaces. Avoid destructive commands unless deletion is part of
@@ -47,7 +47,7 @@ Bash tool contract:
   `output_head`, `output_tail`, and `elided_chars` instead of full `output`, so
   use focused commands or summarize large diagnostics through later commands.
   Always inspect `output_incomplete`, `stdout_truncated`, and
-  `stderr_truncated`: `elided_chars` counts only characters omitted from the
+  `stderr_truncated`: `elided_chars` counts only Unicode code points omitted from the
   shell output that the wrapper received, not any content the shell primitive
   had already truncated.
 - If an observation shows missing permission, a denied approval, a missing
@@ -69,7 +69,7 @@ Operating loop:
    whether docs or tests need updates.
 6. Submit. When the task is complete, call `bash` with a concise final-output
    command and set `submit: true`; the submitted observation is bounded to the
-   same 10,000-character head/tail contract as ordinary command output.
+   same 10,000-code-point head/tail contract as ordinary command output.
 
 Do not set `submit: true` until the code is changed as needed and the best
 available verification has run. If verification cannot be run or the task

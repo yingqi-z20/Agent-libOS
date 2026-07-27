@@ -58,9 +58,9 @@ Use a fresh token from `git_status` on the **selected merge worktree**. The toke
 
 Choose one exact strategy:
 
-- `fast_forward` requires the base to fast-forward to the recorded head and leaves `HEAD` exactly at `head_oid`.
-- `merge` forces a merge commit with signing disabled; it does not expose a lower-level strategy selector. Creating that commit requires usable Host/repository identity.
-- `squash` applies the recorded head changes, then creates one new commit named for the PR. It also requires usable Host/repository identity, disables hooks/signing for the commit, and does not move the head branch.
+- `fast_forward` rejects divergent histories and advances `HEAD` to `head_oid` when the base is behind that head. If both OIDs are equal, or the recorded head is already an ancestor of the base, Git can report already up to date and leave `HEAD` at the base; the PR can still be recorded as merged without a new commit.
+- `merge` requests `--no-ff` with signing disabled and exposes no lower-level strategy selector. It normally creates a merge commit when the head contributes reachable history not already in the base, but equal OIDs or a head already contained in the base can complete as an already-up-to-date no-op. A merge commit, when one is created, requires usable Host/repository identity.
+- `squash` asks Git to stage the recorded head's net changes and then attempts one new commit named for the PR. It requires usable Host/repository identity, disables hooks/signing for the commit, and does not move the head branch. An empty net delta—including `base_oid == head_oid` or otherwise identical resulting trees—leaves nothing to commit, so the operation fails rather than promising a squash commit or marking the PR merged.
 
 Merge requires PR approve authority, mandatory one-use Human approval, repository write/delete/admin authority, and filesystem read/write/delete authority. Recorded approval reviews are separate and do not satisfy these controls. Success updates PR metadata to `merged`, records `merged_oid`, and returns `{pull_request, operation}` with the successor at `operation.after.token`.
 
@@ -79,16 +79,16 @@ Success returns `{pull_request, operation}` with status `closed` and successor `
 3. Create with the exact local branch names and fresh main token. Record `pr_id`, base/head refs and OIDs, patch/title/body hashes, snapshot refs, and `operation.after.token`.
 4. Discover with `git_list_pull_requests`, but inspect the exact PR before reviewing, closing, or merging. Recompute the exact frozen range diff and compare its SHA-256 to `patch_sha256`; also check current branches separately because snapshots and live branches serve different purposes.
 5. Record a review only after examining the complete change and any tests. Since review bodies are not readable through the result, keep the returned `review_id`, decision, body hash, and operation evidence if exact comment accountability matters.
-6. Before merge, inspect the chosen worktree, ensure the base branch is checked out at the recorded OID and fully clean, and acquire its own fresh token. Select fast-forward, forced merge commit, or squash based on the requested history policy.
+6. Before merge, inspect the chosen worktree, ensure the base branch is checked out at the recorded OID and fully clean, and acquire its own fresh token. Select ff-only integration, a `--no-ff` merge request, or squash based on the requested history policy, accounting for the already-up-to-date and empty-delta boundaries above.
 7. After merge, inspect PR status, snapshot refs, selected worktree status, base branch/`HEAD`, resulting commit, and exact range/content. Run task-specific tests. After close, inspect the PR and refs to prove preserved evidence and unchanged branches.
 
 Do not treat “approved” as permission to merge or “request_changes” as a technical lock. If policy requires review-state gating, enforce it in the calling workflow and show the reviewed evidence explicitly.
 
 ## Failure and recovery
 
-All PR writes are non-idempotent effects. The model-facing error omits some provider settlement details. Treat only a clearly pre-dispatch validation, permission/approval, or stale-state rejection as effect-not-started; after any other failure, conservatively read and reconcile refs, metadata, and the relevant worktree before retrying.
+All PR writes are non-idempotent effects. The model-facing error omits some provider settlement details. Treat only a clearly pre-dispatch validation, permission/approval, or initial repository-token CAS rejection as effect-not-started; after any other failure, conservatively read and reconcile refs, metadata, and the relevant worktree before retrying. A `stale_state` alone is insufficient because PR metadata CAS can detect concurrent change after a review/close metadata effect began or after merge already changed Git state.
 
-- On `STALE_STATE`, re-inspect PR metadata/snapshots, live base/head refs, the relevant worktree status, and exact diff. Use a fresh token from the operation's actual worktree context and repeat the decision, not just the call.
+- On an initial token `stale_state`, no PR mutation/write effect from that invocation started, although protected read-only provider observations may already have occurred. A later `stale_state`—for example, metadata CAS after a Git merge—can follow a state-changing effect and must be reconciled. In either case, re-inspect PR metadata/snapshots, live base/head refs, the relevant worktree status, and exact diff. Use a fresh token from the operation's actual worktree context and repeat the decision, not just the call.
 - On pre-dispatch Human approval, preserve exact arguments. Creation's stable ID supports the same approved retry while state is unchanged; merge approval is one-use and tied to exact scope. If state changes while waiting, obtain a new observation and approval decision.
 - Creation writes snapshot refs before metadata. Any failure after possible dispatch—not only timeout or a literal `unknown_effect`—can leave snapshot refs without metadata, metadata with uncertain acknowledgement, or a complete PR. Reconcile `git_list_pull_requests`, `git_list_refs(kind="pull_requests")`, and exact inspection before retrying.
 - Review writes metadata with a new random review ID. After an uncertain result, inspect the review list for actor, decision, timestamp, and body hash. Because body text is not returned and a second call creates a new ID, do not blindly replay.
@@ -103,6 +103,6 @@ For creation, report the local-only nature of the PR, exact `pr_id`, title/body 
 
 For review, report PR ID/status, reviewed frozen range and matching patch hash, test evidence, decision, review ID, actor, timestamp, body hash, and successor token. State that the review body itself is not returned by inspection.
 
-For merge, report selected worktree, clean precondition, strategy, approval/authority outcome, old base/head OIDs, resulting `merged_oid`, commit topology appropriate to the strategy, post-merge clean status, PR status, preserved snapshots, successor token, and tests. For close, report closed status, unchanged branch OIDs, preserved reviews/snapshot refs, and successor token.
+For merge, report selected worktree, clean precondition, strategy, approval/authority outcome, old base/head OIDs, resulting `merged_oid`, whether HEAD advanced or the integration was already up to date, whether a new commit was actually created, commit topology appropriate to the strategy, post-merge clean status, PR status, preserved snapshots, successor token, and tests. For close, report closed status, unchanged branch OIDs, preserved reviews/snapshot refs, and successor token.
 
 Never claim an external forge PR exists, all PRs were enumerated after a truncated list, review text was read when only its hash is visible, or checkpoint/image durability for Git common-directory metadata.

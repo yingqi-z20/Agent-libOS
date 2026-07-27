@@ -90,6 +90,16 @@ class RuntimeStore(Protocol):
     ) -> AbstractContextManager[StoreTransaction]:
         ...
 
+    def uncertain_commit_confirmation(self) -> AbstractContextManager[None]:
+        """Fence one exact post-commit readback on the owning thread."""
+
+        ...
+
+    def accept_uncertain_commit_confirmation(self) -> bool:
+        """Restore a poisoned data plane after exact durable confirmation."""
+
+        ...
+
     def probe_runtime_assembly_readiness(self) -> StoreAssemblyReadiness:
         """Inspect lock/transaction readiness without waiting or mutating state."""
 
@@ -106,8 +116,15 @@ class RuntimeStore(Protocol):
     def claim_runtime_assembly(
         self,
         reservation: StoreAssemblyReservation,
+        *,
+        require_unbound_runtime: bool = False,
     ) -> AbstractContextManager[None]:
-        """Activate an exact reservation for the calling startup worker."""
+        """Activate an exact reservation for the calling startup worker.
+
+        Builders set ``require_unbound_runtime`` so an already-published
+        Runtime is rejected before any dependency graph is attached. Direct
+        Store reservation users retain re-entrant diagnostic/query access.
+        """
 
         ...
 

@@ -5,7 +5,7 @@ from typing import Any
 
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.snapshots.models import SNAPSHOT_SCHEMA_VERSION, ProcessSnapshot
-from agent_libos.utils.serde import dumps, loads
+from agent_libos.utils.serde import bounded_json_loads, dumps
 
 
 class SnapshotVersionError(ValidationError):
@@ -16,6 +16,7 @@ class SnapshotCodec:
     """Strict codec for the 0.3 typed process snapshot format."""
 
     schema_version = SNAPSHOT_SCHEMA_VERSION
+    max_document_bytes = 16_777_216
 
     @classmethod
     def decode_mapping(cls, value: Mapping[str, Any]) -> ProcessSnapshot:
@@ -51,7 +52,13 @@ class SnapshotCodec:
 
     @classmethod
     def loads(cls, value: str) -> ProcessSnapshot:
-        decoded = loads(value)
+        try:
+            decoded = bounded_json_loads(
+                value,
+                max_bytes=cls.max_document_bytes,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"invalid snapshot document JSON: {exc}") from exc
         if not isinstance(decoded, Mapping):
             raise ValidationError("snapshot document must be an object")
         return cls.decode_mapping(decoded)

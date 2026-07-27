@@ -1,9 +1,13 @@
 from __future__ import annotations
 import base64
 import asyncio
+import contextlib
+import hashlib
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 import pytest
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -17,7 +21,7 @@ from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.llm.context_memory import context_object_name
 from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.llm.pending import pending_metadata
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
@@ -41,7 +45,20 @@ from agent_libos.models import (
 )
 from tests.support.deno import COUNT_CHARS_SOURCE
 from tests.support.fakes import RecordingActionClient
+from tests.support.runtime import close_runtime
 from tests.support.skills import write_skill_package
+from agent_libos.tools.base import ToolContext
+from agent_libos.tools.builtin import context as context_tool_module
+from agent_libos.tools.builtin.context import (
+    CompactProcessContextArgs,
+    CompactProcessContextTool,
+)
+
+
+# Persistent-context tests repeatedly close and reopen SQLite runtimes. Allow
+# the same Windows hosted-runner I/O variance as other non-deadline integration
+# suites while retaining the normal timeout everywhere else.
+pytestmark = pytest.mark.timeout(300 if os.name == "nt" else 120)
 
 
 RUNTIME_SESSION_SKILL = 'agent-libos-runtime-session'
@@ -1704,7 +1721,13 @@ class TestLLMContextMemory:
             )
 
             assert not model_resume.ok
-            assert 'Host resume' in (model_resume.error or '')
+            assert (model_resume.error or '').startswith(
+                'execution_error: ProcessError (correlation_id=corr_'
+            )
+            assert model_resume.payload['error']['code'] == 'execution_error'
+            assert model_resume.payload['error']['type'] == 'ProcessError'
+            assert model_resume.payload['error']['safe_message'] == model_resume.error
+            assert 'Host resume' not in (model_resume.error or '')
             assert runtime.process.get(child).status == ProcessStatus.PAUSED
             assert runtime.run_process_once(child)['skipped'] is True
             assert runtime.human.pending() == []
@@ -2337,7 +2360,10 @@ class TestLLMContextMemory:
             assert result['executed_count'] == 1
             assert result['action']['action'] == 'get_current_time'
             assert result['result']['ok'] is False
-            assert 'unknown timezone' in (result['result']['error'] or '')
+            assert (result['result']['error'] or '').startswith(
+                'validation_error: ValidationError (correlation_id=corr_'
+            )
+            assert 'unknown timezone' not in (result['result']['error'] or '')
             assert result['stop_reason'] == 'tool_failed'
             assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
             assert not any(
@@ -2684,9 +2710,9 @@ class TestLLMContextMemory:
                 assert success_secret not in durable_sinks
                 assert usage_secret not in durable_sinks
             finally:
-                runtime.close()
+                close_runtime(runtime)
 
-            with sqlite3.connect(db) as connection:
+            with contextlib.closing(sqlite3.connect(db)) as connection:
                 database_dump = '\n'.join(connection.iterdump())
             assert success_secret not in database_dump
             assert usage_secret not in database_dump
@@ -2699,7 +2725,7 @@ class TestLLMContextMemory:
                 assert persisted.usage['cache_read_tokens'] == 0
                 assert persisted.usage['cache_write_tokens'] == 7
             finally:
-                reopened.close()
+                close_runtime(reopened)
 
     def test_full_snapshot_executor_disables_configured_responses_state_chain_observably(
         self,
@@ -4051,6 +4077,261 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    @pytest.mark.parametrize(
+        ("failure_type", "expected_code"),
+        (
+            (RuntimeError, "execution_error"),
+            (ValidationError, "validation_error"),
+            (CapabilityDenied, "permission_denied"),
+        ),
+    )
+    def test_compact_process_context_failure_is_correlated_and_text_free(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_type: type[Exception],
+        expected_code: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='sanitize context compaction failure',
+            )
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
+            _grant_context_compressor_authority(runtime, pid)
+            _seed_context_entries(runtime, pid, count=2)
+            failure_text = secrets.token_urlsafe(48)
+            failure = failure_type(failure_text)
+
+            def fail_spawn(*_args: object, **_kwargs: object) -> str:
+                raise failure
+
+            monkeypatch.setattr(context_tool_module, '_spawn_stage', fail_spawn)
+
+            result = runtime.tools.call(
+                pid,
+                'compact_process_context',
+                {'force': True, 'target_tokens': 512, 'max_chunks': 1},
+            )
+
+            assert result.ok is False
+            job = runtime.store.get_object_by_name(
+                f'context_compaction_job:{pid}',
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert job is not None
+            assert job.payload['status'] == 'failed'
+            assert 'completed_at' not in job.payload
+            assert 'result' not in job.payload
+            public = job.payload['error_details']
+            assert public['code'] == expected_code
+            assert public['error_type'] == failure_type.__name__
+            assert public['correlation_id'].startswith('corr_')
+            assert job.payload['error'] == (
+                f"{expected_code}: {failure_type.__name__} "
+                f"(correlation_id={public['correlation_id']})"
+            )
+            assert result.error == job.payload['error']
+            assert job.payload['internal_error'] == {
+                'error_type': failure_type.__name__,
+                'correlation_id': public['correlation_id'],
+                'exception_text': {
+                    'bytes': len(failure_text.encode('utf-8')),
+                    'sha256': hashlib.sha256(
+                        failure_text.encode('utf-8')
+                    ).hexdigest(),
+                },
+            }
+
+            durable_sinks = json.dumps(
+                {
+                    'job': job.payload,
+                    'tool_result': {
+                        'error': result.error,
+                        'payload': result.payload,
+                    },
+                    'audit': [record.decision for record in runtime.audit.trace()],
+                    'events': [event.payload for event in runtime.events.list()],
+                },
+                sort_keys=True,
+                default=str,
+            )
+            assert failure_text not in durable_sinks
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("failure_type", "expected_code"),
+        (
+            (KeyboardInterrupt, "interrupted"),
+            (asyncio.CancelledError, "cancelled"),
+        ),
+    )
+    def test_compact_process_context_control_failure_remains_control_flow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_type: type[BaseException],
+        expected_code: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='preserve context compaction cancellation',
+            )
+            _seed_context_entries(runtime, pid, count=2)
+            failure_text = secrets.token_urlsafe(48)
+            failure = failure_type(failure_text)
+
+            def fail_spawn(*_args: object, **_kwargs: object) -> str:
+                raise failure
+
+            monkeypatch.setattr(context_tool_module, '_spawn_stage', fail_spawn)
+            tool = CompactProcessContextTool()
+            args = CompactProcessContextArgs(
+                force=True,
+                target_tokens=512,
+                max_chunks=1,
+            )
+            context = ToolContext(
+                trace_id='trace_context_control_failure',
+                call_id='call_context_control_failure',
+                pid=pid,
+                runtime=runtime,
+            )
+
+            with pytest.raises(failure_type) as caught:
+                tool.run(args, context)
+
+            assert caught.value is failure
+            assert caught.value.__cause__ is None
+            assert caught.value.__context__ is None
+            job = runtime.store.get_object_by_name(
+                f'context_compaction_job:{pid}',
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert job is not None
+            assert job.payload['status'] == 'failed'
+            assert 'completed_at' not in job.payload
+            assert 'result' not in job.payload
+            public = job.payload['error_details']
+            assert public['code'] == expected_code
+            assert public['error_type'] == failure_type.__name__
+            assert str(caught.value) == job.payload['error']
+            assert job.payload['internal_error']['correlation_id'] == (
+                public['correlation_id']
+            )
+            assert job.payload['internal_error']['exception_text'] == {
+                'bytes': len(failure_text.encode('utf-8')),
+                'sha256': hashlib.sha256(failure_text.encode('utf-8')).hexdigest(),
+            }
+            durable_sinks = json.dumps(
+                {
+                    'job': job.payload,
+                    'exception': {
+                        'text': str(caught.value),
+                        'repr': repr(caught.value),
+                    },
+                    'audit': [record.decision for record in runtime.audit.trace()],
+                    'events': [event.payload for event in runtime.events.list()],
+                },
+                sort_keys=True,
+                default=str,
+            )
+            assert failure_text not in durable_sinks
+        finally:
+            runtime.close()
+
+    def test_compact_process_context_replace_failure_is_text_free_and_terminal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='sanitize context replacement failure',
+            )
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
+            _grant_context_compressor_authority(runtime, pid)
+            context = _seed_context_entries(runtime, pid, count=2)
+            failure_text = secrets.token_urlsafe(48)
+            failure = RuntimeError(failure_text)
+
+            monkeypatch.setattr(
+                context_tool_module,
+                '_spawn_stage',
+                lambda *_args, **_kwargs: 'pid_compactor_fixture',
+            )
+            monkeypatch.setattr(
+                runtime.process,
+                'wait',
+                lambda *_args, **_kwargs: SimpleNamespace(
+                    status=ProcessStatus.EXITED,
+                    result=object(),
+                ),
+            )
+            monkeypatch.setattr(
+                context_tool_module,
+                '_read_child_summary',
+                lambda *_args, **_kwargs: _compact_summary('fixture summary'),
+            )
+
+            def fail_replace(*_args: object, **_kwargs: object) -> dict[str, Any]:
+                raise failure
+
+            monkeypatch.setattr(
+                runtime.llm.context_memory,
+                'replace_with_compacted_summary',
+                fail_replace,
+            )
+
+            result = runtime.tools.call(
+                pid,
+                'compact_process_context',
+                {'force': True, 'target_tokens': 512, 'max_chunks': 1},
+            )
+
+            assert result.ok is False
+            job = runtime.store.get_object_by_name(
+                f'context_compaction_job:{pid}',
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert job is not None
+            assert job.payload['status'] == 'failed'
+            assert job.payload['error'] == result.error
+            assert job.payload['error_details']['code'] == 'execution_error'
+            assert job.payload['error_details']['error_type'] == 'RuntimeError'
+            assert job.payload['internal_error']['correlation_id'] == (
+                job.payload['error_details']['correlation_id']
+            )
+            assert job.payload['internal_error']['exception_text'] == {
+                'bytes': len(failure_text.encode('utf-8')),
+                'sha256': hashlib.sha256(failure_text.encode('utf-8')).hexdigest(),
+            }
+            after = runtime.store.get_object(context.oid)
+            assert after is not None
+            assert not any(
+                entry.get('kind') == 'context_compacted'
+                for entry in after.payload['entries']
+            )
+            durable_sinks = json.dumps(
+                {
+                    'job': job.payload,
+                    'tool_result': {
+                        'error': result.error,
+                        'payload': result.payload,
+                    },
+                    'audit': [record.decision for record in runtime.audit.trace()],
+                    'events': [event.payload for event in runtime.events.list()],
+                },
+                sort_keys=True,
+                default=str,
+            )
+            assert failure_text not in durable_sinks
+        finally:
+            runtime.close()
+
     def test_compact_process_context_invalid_child_output_does_not_replace_context(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -4078,11 +4359,24 @@ class TestLLMContextMemory:
 
             completed = _last_action_result(results, 'compact_process_context')
             assert completed['result']['ok'] is False
-            assert 'missing required fields' in (completed['result']['error'] or '')
+            error = completed['result']['error'] or ''
+            assert error.startswith(
+                'validation_error: ToolExecutionError (correlation_id=corr_'
+            )
+            assert 'missing required fields' not in error
             after = runtime.store.get_object(before.oid)
             assert after is not None
             assert after.version == before_version
             assert after.payload == before_payload
+            job = runtime.store.get_object_by_name(
+                f'context_compaction_job:{pid}',
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert job is not None
+            assert job.payload['status'] == 'failed'
+            assert job.payload['error'] == error
+            assert job.payload['error_details']['correlation_id'] in error
+            assert 'missing required fields' not in json.dumps(job.payload)
         finally:
             runtime.close()
 
@@ -4112,7 +4406,10 @@ class TestLLMContextMemory:
             result = runtime.tools.call(pid, 'compact_process_context', {'_resume_job': forged_job})
 
             assert result.ok is False
-            assert 'not callable directly' in (result.error or '')
+            assert (result.error or '').startswith(
+                'validation_error: ToolExecutionError (correlation_id=corr_'
+            )
+            assert 'not callable directly' not in (result.error or '')
             after = runtime.store.get_object(context.oid)
             assert after is not None
             assert not any(entry.get('kind') == 'context_compacted' for entry in after.payload['entries'])
@@ -4153,14 +4450,23 @@ class TestLLMContextMemory:
                     break
 
             assert failed is not None
-            assert 'exhausted child process budget' in (failed['result']['error'] or '')
+            error = failed['result']['error'] or ''
+            assert error.startswith(
+                'execution_error: ResourceLimitExceeded (correlation_id=corr_'
+            )
+            assert 'exhausted child process budget' not in error
             job = runtime.store.get_object_by_name(
                 f'context_compaction_job:{pid}',
                 namespace=runtime.memory.resolve_namespace(pid),
             )
             assert job is not None
             assert job.payload['status'] == 'failed'
-            assert 'exhausted child process budget' in job.payload['error']
+            assert job.payload['error'] == error
+            assert job.payload['error_details']['correlation_id'] in error
+            assert job.payload['internal_error']['error_type'] == (
+                'ResourceLimitExceeded'
+            )
+            assert 'exhausted child process budget' not in json.dumps(job.payload)
             assert len(runtime.process.list_children(pid)) == runtime.config.process.max_child_processes
         finally:
             runtime.close()
@@ -4198,11 +4504,24 @@ class TestLLMContextMemory:
 
             completed = _last_action_result(results, 'compact_process_context')
             assert completed['result']['ok'] is False
-            assert 'changed during compaction' in (completed['result']['error'] or '')
+            error = completed['result']['error'] or ''
+            assert error.startswith(
+                'validation_error: ToolExecutionError (correlation_id=corr_'
+            )
+            assert 'changed during compaction' not in error
             after = runtime.store.get_object(context.oid)
             assert after is not None
             assert after.payload['entries'][-1] == {'kind': 'external_update', 'value': 'must survive'}
             assert not any(entry.get('kind') == 'context_compacted' for entry in after.payload['entries'])
+            job = runtime.store.get_object_by_name(
+                f'context_compaction_job:{pid}',
+                namespace=runtime.memory.resolve_namespace(pid),
+            )
+            assert job is not None
+            assert job.payload['status'] == 'failed'
+            assert job.payload['error'] == error
+            assert job.payload['error_details']['correlation_id'] in error
+            assert 'changed during compaction' not in json.dumps(job.payload)
         finally:
             runtime.close()
 
@@ -4256,6 +4575,7 @@ class TestLLMContextMemory:
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='race final context version check')
             context = _seed_context_entries(runtime, pid, count=3)
+            generation_before = runtime.store.get_llm_context_generation(pid)
             original_build = runtime.llm.context_memory._build_compacted_payload
             entry_version_checked = threading.Barrier(2)
             allow_replace = threading.Barrier(2)
@@ -4299,6 +4619,7 @@ class TestLLMContextMemory:
                 'value': 'must survive final CAS',
             }
             assert not any(entry.get('kind') == 'context_compacted' for entry in after.payload['entries'])
+            assert runtime.store.get_llm_context_generation(pid) != generation_before
         finally:
             runtime.close()
 
@@ -4372,7 +4693,7 @@ class TestLLMContextMemory:
                 assert waiting['waiting_event']
                 assert runtime.store.get_llm_pending_action(pid)['wait_type'] == 'child'
             finally:
-                runtime.close()
+                close_runtime(runtime)
 
             reopened = Runtime.open(db)
             try:
@@ -4382,7 +4703,10 @@ class TestLLMContextMemory:
                 reopened_process = reopened.process.get(pid)
                 assert RUNTIME_SESSION_SKILL in reopened_process.loaded_skills
                 assert 'compact_process_context' in reopened_process.model_tool_table
-                results = reopened.run_until_idle(max_quanta=2)
+                results = reopened.run_until_idle(
+                    max_quanta=2,
+                    cancel_inflight_on_budget_exhaustion=False,
+                )
                 completed = _last_action_result(results, 'compact_process_context')
                 assert completed['result']['ok']
                 context = reopened.store.get_object_by_name(context_object_name(pid), namespace=reopened.memory.resolve_namespace(pid))
@@ -4390,7 +4714,7 @@ class TestLLMContextMemory:
                 assert context.payload['entries'][0]['summary']['goal'] == 'reopened state'
                 assert reopened.store.get_llm_pending_action(pid)['status'] == 'completed'
             finally:
-                reopened.close()
+                close_runtime(reopened)
 
     def test_reopen_after_compressor_exit_reruns_missing_result_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4417,7 +4741,7 @@ class TestLLMContextMemory:
                 result_oid = child_exit['result']['payload']['result_oid']
                 assert runtime.store.get_llm_pending_action(pid)['status'] == 'pending'
             finally:
-                runtime.close()
+                close_runtime(runtime)
 
             conn = sqlite3.connect(db)
             try:
@@ -4437,7 +4761,10 @@ class TestLLMContextMemory:
                 reopened_process = reopened.process.get(pid)
                 assert RUNTIME_SESSION_SKILL in reopened_process.loaded_skills
                 assert 'compact_process_context' in reopened_process.model_tool_table
-                results = reopened.run_until_idle(max_quanta=3)
+                results = reopened.run_until_idle(
+                    max_quanta=3,
+                    cancel_inflight_on_budget_exhaustion=False,
+                )
                 completed = _last_action_result(results, 'compact_process_context')
                 assert completed['result']['ok']
                 output = completed['result']['payload']
@@ -4447,7 +4774,7 @@ class TestLLMContextMemory:
                 assert context.payload['entries'][0]['summary']['goal'] == 'rerun result'
                 assert context.payload['entries'][0]['compaction_metadata']['discarded_compressor_pids']
             finally:
-                reopened.close()
+                close_runtime(reopened)
 
 def _register_multiplexed_image(
     runtime: Runtime,

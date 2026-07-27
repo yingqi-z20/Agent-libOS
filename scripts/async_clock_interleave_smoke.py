@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import re
 import threading
 import time
@@ -40,6 +41,22 @@ async def run_interleaved_clock_demo(
     timezone: str = _SCRIPT_DEFAULTS.clock_demo_timezone,
     echo: bool = True,
 ) -> dict[str, Any]:
+    if type(iterations) is not int or iterations < 1:
+        raise ValueError("iterations must be a positive integer")
+    if not isinstance(interval_s, (int, float)) or isinstance(interval_s, bool):
+        raise ValueError("interval_s must be a finite positive number")
+    interval_s = float(interval_s)
+    if not math.isfinite(interval_s) or interval_s <= 0:
+        raise ValueError("interval_s must be a finite positive number")
+    if offset_s is not None:
+        if not isinstance(offset_s, (int, float)) or isinstance(offset_s, bool):
+            raise ValueError("offset_s must be a finite non-negative number")
+        offset_s = float(offset_s)
+        if not math.isfinite(offset_s) or offset_s < 0:
+            raise ValueError("offset_s must be a finite non-negative number")
+    if not isinstance(timezone, str) or not timezone.strip():
+        raise ValueError("timezone must be a non-empty string")
+    timezone = timezone.strip()
     runtime = await aopen_runtime(db)
     outputs: list[dict[str, Any]] = []
     output_lock = threading.Lock()
@@ -113,7 +130,10 @@ async def run_interleaved_clock_demo(
         )
 
         max_quanta = 2 * (iterations * 3 + 2)
-        results = await runtime.arun_until_idle(max_quanta=max_quanta)
+        results = await runtime.arun_until_idle(
+            max_quanta=max_quanta,
+            pids=(pid_a, pid_b),
+        )
         statuses = {pid_a: runtime.process.get(pid_a).status, pid_b: runtime.process.get(pid_b).status}
         expected_labels = [label for _ in range(iterations) for label in ("A", "B")]
         actual_labels = [entry["label"] for entry in outputs if entry["label"] in {"A", "B"}]

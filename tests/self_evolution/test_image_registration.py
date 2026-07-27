@@ -1,12 +1,19 @@
 from __future__ import annotations
+
 import json
 import os
-import pytest
+import shutil
+import sys
 import tempfile
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+import pytest
+
 from agent_libos import AgentImage, Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     CapabilityRight,
     EventType,
@@ -267,6 +274,36 @@ class TestImageRegistration:
             assert persisted is not None
             assert persisted[0].default_tools == ['human_output']
             assert runtime.process.get(pid).tool_table.keys() == {'human_output'}
+        finally:
+            runtime.close()
+
+    def test_module_image_rehydrate_is_internal_exact_and_provenance_bound(self) -> None:
+        runtime = Runtime.open('local')
+        image = AgentImage(image_id='module-replay:v0', name='module-replay')
+        owner = 'module:owner:v0'
+        try:
+            created = runtime.image_registry.register_module_image(image, actor=owner)
+            assert created.disposition == 'created'
+
+            with pytest.raises(ValidationError, match='already exists'):
+                runtime.image_registry.register(image, actor=owner)
+            with pytest.raises(ValidationError, match='already exists'):
+                runtime.image_registry.register_module_image(image, actor=owner)
+
+            runtime.images.pop(image.image_id)
+            before = runtime.store.get_image(image.image_id)
+            with pytest.raises(ValidationError, match='already exists'):
+                runtime.image_registry.register_module_image(
+                    image,
+                    actor='module:other:v0',
+                )
+            assert image.image_id not in runtime.images
+            assert runtime.store.get_image(image.image_id) == before
+
+            rehydrated = runtime.image_registry.register_module_image(image, actor=owner)
+            assert rehydrated.disposition == 'rehydrated'
+            assert runtime.store.get_image(image.image_id) == before
+            assert runtime.get_image(image.image_id) == image
         finally:
             runtime.close()
 
@@ -634,7 +671,10 @@ class TestImageRegistration:
                 runtime.filesystem.grant_directory(pid, 'package-agent', [CapabilityRight.READ], issued_by='test')
                 result = runtime.tools.call(pid, 'load_image_package', {'path': 'package-agent'})
                 assert not result.ok
-                assert 'lacks write on image:package-agent:v0' in (result.error or '')
+                assert (result.error or '').startswith(
+                    'permission_denied: CapabilityDenied'
+                )
+                assert 'image:package-agent:v0' not in (result.error or '')
                 with pytest.raises(KeyError):
                     runtime.get_image('package-agent:v0')
             finally:
@@ -707,6 +747,158 @@ class TestImageRegistration:
                     runtime.filesystem.read_text(pid, 'seed.txt', cwd=cwd)
             finally:
                 runtime.close()
+
+    @pytest.mark.parametrize(
+        ('field', 'yaml_value'),
+        [
+            ('recursive', '"false"'),
+            ('recursive', '1'),
+            ('recursive', 'null'),
+            ('delegable', '"false"'),
+            ('delegable', '1'),
+            ('delegable', 'null'),
+        ],
+        ids=[
+            'recursive-string',
+            'recursive-int',
+            'recursive-null',
+            'delegable-string',
+            'delegable-int',
+            'delegable-null',
+        ],
+    )
+    def test_image_package_rejects_non_boolean_workspace_grant_flags_before_effects(
+        self,
+        tmp_path: Path,
+        field: str,
+        yaml_value: str,
+    ) -> None:
+        root = _write_image_package(
+            tmp_path / 'package-agent',
+            workspace_grants=False,
+        )
+        root.joinpath('IMAGE.yaml').write_text(
+            f"""
+image_id: package-agent:v0
+name: package-agent
+prompt: prompt.md
+workspace:
+  source: workspace
+  grants:
+    - path: .
+      rights: [read]
+      {field}: {yaml_value}
+""".lstrip(),
+            encoding='utf-8',
+        )
+        runtime = Runtime.open(
+            'local',
+            substrate=LocalResourceProviderSubstrate(tmp_path),
+        )
+        try:
+            before_artifacts = runtime.store.list_image_artifacts()
+            before_capabilities = runtime.store.list_capabilities()
+            before_audit_ids = [record.record_id for record in runtime.audit.trace()]
+            before_event_ids = [event.event_id for event in runtime.events.list()]
+            before_publications = runtime.store.list_runtime_publications()
+            materialized = (
+                tmp_path / runtime.config.image.materialized_workspace_root
+            )
+
+            with pytest.raises(
+                ValidationError,
+                match=rf'workspace\.grants\[\]\.{field} must be a boolean',
+            ):
+                runtime.image_registry.register_from_package_path(
+                    root,
+                    actor='cli',
+                )
+
+            assert 'package-agent:v0' not in runtime.images
+            assert runtime.store.get_image('package-agent:v0') is None
+            assert runtime.store.list_image_artifacts() == before_artifacts
+            assert runtime.store.list_capabilities() == before_capabilities
+            assert [
+                record.record_id for record in runtime.audit.trace()
+            ] == before_audit_ids
+            assert [event.event_id for event in runtime.events.list()] == before_event_ids
+            assert runtime.store.list_runtime_publications() == before_publications
+            assert not materialized.exists()
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('grant_flags', 'expected_recursive', 'expected_delegable'),
+        [
+            ('', False, False),
+            ('      recursive: false\n      delegable: false\n', False, False),
+            ('      recursive: true\n      delegable: true\n', True, True),
+        ],
+        ids=['defaults', 'explicit-false', 'explicit-true'],
+    )
+    def test_image_package_workspace_grant_boolean_defaults_and_execution(
+        self,
+        tmp_path: Path,
+        grant_flags: str,
+        expected_recursive: bool,
+        expected_delegable: bool,
+    ) -> None:
+        root = _write_image_package(
+            tmp_path / 'package-agent',
+            workspace_grants=False,
+        )
+        root.joinpath('IMAGE.yaml').write_text(
+            f"""
+image_id: package-agent:v0
+name: package-agent
+prompt: prompt.md
+workspace:
+  source: workspace
+  grants:
+    - path: .
+      rights: [read]
+{grant_flags}""".lstrip(),
+            encoding='utf-8',
+        )
+        runtime = Runtime.open(
+            'local',
+            substrate=LocalResourceProviderSubstrate(tmp_path),
+        )
+        try:
+            result = runtime.image_registry.register_from_package_path(
+                root,
+                actor='cli',
+            )
+            persisted = runtime.store.get_image_artifact(
+                str(result.image.boot['artifact_id'])
+            )
+            assert persisted is not None
+            artifact, _metadata = persisted
+            [grant] = artifact['workspace']['grants']
+            assert grant['recursive'] is expected_recursive
+            assert grant['delegable'] is expected_delegable
+
+            pid = runtime.process.spawn(
+                image='package-agent:v0',
+                goal='validated workspace grant booleans',
+            )
+            workspace_root = runtime.process.working_directory(pid)
+            package_caps = [
+                capability
+                for capability in runtime.store.list_capabilities(subject=pid)
+                if capability.issued_by == 'image.package:package-agent:v0'
+            ]
+            assert len(package_caps) == 1
+            [capability] = package_caps
+            expected_resource = (
+                runtime.filesystem.directory_resource_for_path(workspace_root)
+                if expected_recursive
+                else runtime.filesystem.resource_for_path(workspace_root)
+            )
+            assert capability.resource == expected_resource
+            assert capability.delegable is expected_delegable
+        finally:
+            runtime.close()
 
     @pytest.mark.real_deno
     def test_image_package_jit_tools_are_process_local_and_not_workspace_files(self) -> None:
@@ -1737,6 +1929,237 @@ workspace:
                     runtime.image_registry.register_from_package_path(root, actor='cli')
             finally:
                 runtime.close()
+
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat mutation injection is POSIX-only; Win32 target handles deny concurrent writes',
+    )
+    def test_host_image_package_growth_is_bounded_after_descriptor_open(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        root = _write_image_package(tmp_path / 'package-agent')
+        target = root / 'workspace' / 'seed.txt'
+        file_limit = 512
+        config = replace(
+            DEFAULT_CONFIG,
+            image=replace(
+                DEFAULT_CONFIG.image,
+                package_file_max_bytes=file_limit,
+            ),
+        )
+        runtime = Runtime.open('local', config=config)
+        real_fstat = os.fstat
+        real_fdopen = os.fdopen
+        target_identity = (target.stat().st_dev, target.stat().st_ino)
+        grew = False
+        read_sizes: list[int] = []
+
+        class RecordingHandle:
+            def __init__(self, handle: Any):
+                self.handle = handle
+
+            def __enter__(self) -> 'RecordingHandle':
+                self.handle.__enter__()
+                return self
+
+            def __exit__(self, *args: object) -> object:
+                return self.handle.__exit__(*args)
+
+            def fileno(self) -> int:
+                return self.handle.fileno()
+
+            def read(self, size: int = -1) -> bytes:
+                read_sizes.append(size)
+                return self.handle.read(size)
+
+        def grow_after_open(fd: int) -> os.stat_result:
+            nonlocal grew
+            result = real_fstat(fd)
+            if not grew and (result.st_dev, result.st_ino) == target_identity:
+                grew = True
+                with target.open('ab') as output:
+                    output.write(b'x' * file_limit)
+            return result
+
+        def record_reads(fd: int, *args: object, **kwargs: object) -> Any:
+            handle = real_fdopen(fd, *args, **kwargs)
+            opened = real_fstat(fd)
+            if (opened.st_dev, opened.st_ino) == target_identity:
+                return RecordingHandle(handle)
+            return handle
+
+        monkeypatch.setattr(os, 'fstat', grow_after_open)
+        monkeypatch.setattr(os, 'fdopen', record_reads)
+        try:
+            with pytest.raises(
+                ValidationError,
+                match=r'package_file_max_bytes=512',
+            ):
+                runtime.image_registry.validate_package_path(root)
+
+            assert grew
+            assert read_sizes
+            assert all(0 < size <= file_limit + 1 for size in read_sizes)
+            assert 'package-agent:v0' not in runtime.images
+            assert runtime.store.list_image_artifacts() == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat replacement injection is POSIX-only; Win32 target handles deny replacement',
+    )
+    def test_host_image_package_swap_after_open_fails_before_authority_or_effects(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        root = _write_image_package(tmp_path / 'package-agent')
+        prompt = root / 'prompt.md'
+        original_prompt = tmp_path / 'original-prompt.md'
+        replacement = tmp_path / 'replacement-prompt.md'
+        replacement.write_text('Replaced after descriptor open.\n', encoding='utf-8')
+        prompt_identity = (prompt.stat().st_dev, prompt.stat().st_ino)
+        real_fstat = os.fstat
+        swapped = False
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(goal='host package swap must fail closed')
+            capability = runtime.capability.grant_once(
+                actor,
+                runtime.image_registry.resource_for('package-agent:v0'),
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            before_artifacts = runtime.store.list_image_artifacts()
+            before_audit = list(runtime.audit.trace())
+            before_events = list(runtime.events.list())
+
+            def swap_after_open(fd: int) -> os.stat_result:
+                nonlocal swapped
+                result = real_fstat(fd)
+                if not swapped and (result.st_dev, result.st_ino) == prompt_identity:
+                    swapped = True
+                    os.replace(prompt, original_prompt)
+                    os.replace(replacement, prompt)
+                return result
+
+            monkeypatch.setattr(os, 'fstat', swap_after_open)
+
+            with pytest.raises(ValidationError, match='changed during read'):
+                runtime.image_registry.register_from_package_path(
+                    root,
+                    actor=actor,
+                    require_capability=True,
+                )
+
+            assert swapped
+            assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+            assert 'package-agent:v0' not in runtime.images
+            assert runtime.store.get_image('package-agent:v0') is None
+            assert runtime.store.list_image_artifacts() == before_artifacts
+            assert runtime.audit.trace() == before_audit
+            assert runtime.events.list() == before_events
+        finally:
+            runtime.close()
+
+    def test_host_image_package_secure_open_failure_fails_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        root = _write_image_package(tmp_path / 'package-agent')
+        runtime = Runtime.open('local')
+        try:
+            def unavailable(*_args: object, **_kwargs: object) -> object:
+                raise OSError('secure Host image package file open failed')
+
+            monkeypatch.setattr(
+                'agent_libos.runtime.image_registry.open_secure_directory',
+                unavailable,
+            )
+            with pytest.raises(ValidationError, match='securely open image package'):
+                runtime.image_registry.validate_package_path(root)
+            assert 'package-agent:v0' not in runtime.images
+            assert runtime.store.list_image_artifacts() == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.skipif(os.name == 'nt', reason='requires POSIX symlink semantics')
+    def test_host_image_package_rejects_symlinked_intermediate_ancestor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        real_parent = tmp_path / 'real-parent'
+        root = _write_image_package(real_parent / 'package-agent')
+        alias_parent = tmp_path / 'alias-parent'
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+        runtime = Runtime.open('local')
+        try:
+            with pytest.raises(
+                ValidationError,
+                match='securely open image package',
+            ):
+                runtime.image_registry.validate_package_path(
+                    alias_parent / root.name
+                )
+            assert 'package-agent:v0' not in runtime.images
+            assert runtime.store.list_image_artifacts() == []
+        finally:
+            runtime.close()
+
+    def test_host_image_package_directory_replacement_during_enumeration_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        if os.name == 'nt':
+            pytest.skip('POSIX descriptor replacement fixture')
+        root = _write_image_package(tmp_path / 'package-agent')
+        parked = tmp_path / 'package-agent-original'
+        root_identity = (root.stat().st_dev, root.stat().st_ino)
+        real_fstat = os.fstat
+        swapped = False
+
+        def replace_after_directory_open(fd: int) -> os.stat_result:
+            nonlocal swapped
+            result = real_fstat(fd)
+            if not swapped and (result.st_dev, result.st_ino) == root_identity:
+                swapped = True
+                os.replace(root, parked)
+                shutil.copytree(parked, root)
+            return result
+
+        monkeypatch.setattr(os, 'fstat', replace_after_directory_open)
+        runtime = Runtime.open('local')
+        try:
+            with pytest.raises(ValidationError, match='changed during enumeration'):
+                runtime.image_registry.validate_package_path(root)
+            assert swapped
+            assert 'package-agent:v0' not in runtime.images
+            assert runtime.store.list_image_artifacts() == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.skipif(
+        sys.platform != 'win32',
+        reason='requires real Win32 package handles',
+    )
+    def test_windows_image_package_reads_through_secure_handle_chain(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        root = _write_image_package(tmp_path / 'package-agent')
+        runtime = Runtime.open('local')
+        try:
+            summary = runtime.image_registry.validate_package_path(root)
+
+            assert summary['image_id'] == 'package-agent:v0'
+            assert summary['counts']['files'] > 0
+        finally:
+            runtime.close()
 
     def test_image_package_rejects_undeclared_root_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

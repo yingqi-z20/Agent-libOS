@@ -37,11 +37,11 @@ def _test_record(logs: str) -> dict[str, Any]:
 def test_successful_jit_result_uses_deterministic_bounded_summary(
     monkeypatch: Any,
 ) -> None:
-    result = {"blob": "x" * 131_072, "count": 7}
+    result = {"blob": "x" * 16_384, "count": 7}
     sandbox = _sandbox(monkeypatch, result)
 
-    first = sandbox.run_tests(SOURCE, [{"args": {}}])
-    second = sandbox.run_tests(SOURCE, [{"args": {}}])
+    first = sandbox.run_tests(SOURCE, [{"args": {}, "expected": result}])
+    second = sandbox.run_tests(SOURCE, [{"args": {}, "expected": result}])
     record = _test_record(first.logs)
     encoded = json.dumps(
         result,
@@ -109,7 +109,7 @@ def test_execution_failure_omits_stack_host_path_and_credentials(
         )
 
     monkeypatch.setattr(sandbox, "run_source", fail)
-    validation = sandbox.run_tests(SOURCE, [{"args": {}}])
+    validation = sandbox.run_tests(SOURCE, [{"args": {}, "expected": {}}])
     error = json.loads(validation.errors[0])
 
     assert not validation.ok
@@ -125,8 +125,12 @@ def test_execution_failure_omits_stack_host_path_and_credentials(
 def test_non_json_result_summary_is_stable_and_never_uses_repr_address(
     monkeypatch: Any,
 ) -> None:
-    first = _sandbox(monkeypatch, object()).run_tests(SOURCE, [{"args": {}}])
-    second = _sandbox(monkeypatch, object()).run_tests(SOURCE, [{"args": {}}])
+    first = _sandbox(monkeypatch, object()).run_tests(
+        SOURCE, [{"args": {}, "expected": None}]
+    )
+    second = _sandbox(monkeypatch, object()).run_tests(
+        SOURCE, [{"args": {}, "expected": None}]
+    )
     first_record = _test_record(first.logs)
     second_record = _test_record(second.logs)
 
@@ -134,6 +138,63 @@ def test_non_json_result_summary_is_stable_and_never_uses_repr_address(
     assert first_record["result"]["type"] == "non-json:object"
     assert first_record["result"]["lossy"] is True
     assert "0x" not in first.logs
+
+
+def test_candidate_test_requires_expected_without_executing_source(
+    monkeypatch: Any,
+) -> None:
+    sandbox = _sandbox(monkeypatch, {"ok": True})
+    calls = 0
+
+    def run_source(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    monkeypatch.setattr(sandbox, "run_source", run_source)
+    validation = sandbox.run_tests(SOURCE, [{"args": {}}])
+
+    assert not validation.ok
+    assert validation.errors == ["JIT test 1 must include expected"]
+    assert calls == 0
+
+
+def test_candidate_expected_comparison_is_json_type_sensitive(
+    monkeypatch: Any,
+) -> None:
+    sandbox = _sandbox(monkeypatch, {"value": True})
+
+    validation = sandbox.run_tests(
+        SOURCE,
+        [{"args": {}, "expected": {"value": 1}}],
+    )
+
+    assert not validation.ok
+    assert json.loads(validation.errors[0])["reason"] == "result_mismatch"
+
+
+def test_candidate_expected_comparison_treats_json_numbers_as_one_type(
+    monkeypatch: Any,
+) -> None:
+    sandbox = _sandbox(
+        monkeypatch,
+        {"top": 1, "nested": [2.0, {"value": 3}]},
+    )
+
+    validation = sandbox.run_tests(
+        SOURCE,
+        [
+            {
+                "args": {},
+                "expected": {
+                    "top": 1.0,
+                    "nested": [2, {"value": 3.0}],
+                },
+            }
+        ],
+    )
+
+    assert validation.ok, validation.errors
 
 
 def test_validate_jit_tool_bounds_and_redacts_untrusted_backend_diagnostics() -> None:

@@ -15,7 +15,11 @@ from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, LLMDefaults, LLMProfile
 from agent_libos.llm.client import LLMError
 from agent_libos.llm.executor import LLMProcessExecutor
-from agent_libos.llm.user_profiles import UserLLMProfileStore, default_user_llm_profiles_path
+from agent_libos.llm.user_profiles import (
+    UserLLMProfileStore,
+    default_user_llm_profiles_path,
+    summarize_llm_profile,
+)
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
@@ -1141,6 +1145,76 @@ class TestUserLLMProfileStore:
                         "max_retries": 1.5,
                     },
                 )
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://user:password@gateway.example/v1",
+            "https://gateway.example/v1#private",
+            "https://gateway.example/v1?api_key=private",
+            "https://gateway.example/v1?ACCESS-TOKEN=private",
+            "https://gateway.example/v1?x-amz-signature=private",
+        ],
+    )
+    def test_user_llm_profile_rejects_base_url_credential_components(
+        self,
+        tmp_path: Path,
+        base_url: str,
+    ) -> None:
+        store = UserLLMProfileStore(tmp_path / "llm-profiles.json")
+
+        with pytest.raises(ValidationError, match="base_url"):
+            store.upsert(
+                "unsafe",
+                {
+                    "model": "unsafe",
+                    "api_key_env": "UNSAFE_API_KEY",
+                    "base_url": base_url,
+                },
+            )
+
+    def test_user_llm_profile_allows_safe_base_url_query_parameters(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        base_url = "https://gateway.example/openai/v1?api-version=2026-01-01&tenant=public"
+        store = UserLLMProfileStore(tmp_path / "llm-profiles.json")
+
+        profile = store.upsert(
+            "safe-query",
+            {
+                "model": "safe-query",
+                "api_key_env": "SAFE_QUERY_API_KEY",
+                "base_url": base_url,
+            },
+        )
+
+        assert profile.base_url == base_url
+
+    def test_llm_profile_summary_defensively_removes_unsafe_url_components(self) -> None:
+        profile = LLMProfile(
+            model="legacy",
+            base_url=(
+                "https://user:password@gateway.example/v1"
+                "?api_key=query-secret&api-version=2026-01-01#private"
+            ),
+        )
+
+        summary = summarize_llm_profile(
+            "legacy",
+            profile,
+            source="config",
+            editable=False,
+            default_profile_id="legacy",
+            env={},
+        )
+
+        assert summary["base_url"] == (
+            "https://gateway.example/v1?api-version=2026-01-01"
+        )
+        assert "password" not in str(summary)
+        assert "query-secret" not in str(summary)
+        assert "private" not in str(summary)
 
     def test_runtime_ashutdown_closes_async_llm_clients(self) -> None:
         async def run() -> bool:

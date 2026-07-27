@@ -10,6 +10,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import (
+    CapabilityDenied,
     HumanApprovalRequired,
     NotFound,
     ProcessMessageWaitRequired,
@@ -18,8 +19,17 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 from agent_libos.utils.serde import dumps, to_jsonable
-from agent_libos.llm.client import LLMClient
+from agent_libos.llm.client import (
+    LLMClient,
+    LLMError,
+    LLMTransientError,
+    llm_error_internal_observation,
+)
 from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.context_memory import (
     LLM_CONTEXT_MAINTENANCE_RESOURCE,
@@ -248,6 +258,9 @@ class LLMProcessExecutor:
             tools=self._tools,
             resources=self._resources,
             content_preview_chars=self.config.llm.content_preview_chars,
+            tool_call_args_hard_limit_bytes=(
+                self.config.tools.tool_call_args_hard_limit_bytes
+            ),
             pre_tool_notice=self._pre_tool_interrupt_notice,
             post_tool_notice=self._notify_normal_messages,
             publish_result=self._add_to_view,
@@ -1206,7 +1219,41 @@ class LLMProcessExecutor:
         )
 
     def _fail_llm_quantum(self, pid: str, error: Exception) -> dict[str, Any]:
-        durable_error = self._durable_llm_error(error)
+        if isinstance(error, LLMTransientError):
+            public_error, internal_error = self._llm_error_artifacts(error)
+            durable_error = public_error["message"]
+            self._process.pause_for_host_resume(
+                pid,
+                f"Retryable LLM provider failure: {durable_error}",
+            )
+            self._audit.record(
+                actor=pid,
+                action="llm.action_retryable_failure",
+                target=f"process:{pid}",
+                decision={
+                    "error": durable_error,
+                    "error_details": public_error,
+                    "internal_error": internal_error,
+                    "retryable": True,
+                    "error_type": type(error).__name__,
+                },
+                correlation_id=public_error["correlation_id"],
+            )
+            return {
+                "ok": False,
+                "error": durable_error,
+                "error_details": public_error,
+                "retryable": True,
+                "paused": True,
+            }
+        preserve_domain_text = self._preserve_llm_domain_error_text(error)
+        public_error: dict[str, str] | None = None
+        internal_error: dict[str, Any] | None = None
+        if preserve_domain_text:
+            durable_error = str(error)
+        else:
+            public_error, internal_error = self._llm_error_artifacts(error)
+            durable_error = public_error["message"]
         reason = (
             "image_only_full_io_required"
             if isinstance(error, _ImageOnlyFullIORequired)
@@ -1218,6 +1265,13 @@ class LLMProcessExecutor:
             message=f"LLM quantum failed: {durable_error}",
         )
         decision: dict[str, Any] = {"error": durable_error}
+        if public_error is not None and internal_error is not None:
+            decision.update(
+                {
+                    "error_details": public_error,
+                    "internal_error": internal_error,
+                }
+            )
         if reason is not None:
             decision["reason"] = reason
         self._audit.record(
@@ -1225,8 +1279,15 @@ class LLMProcessExecutor:
             action="llm.action_failed",
             target=f"process:{pid}",
             decision=decision,
+            correlation_id=(
+                public_error["correlation_id"]
+                if public_error is not None
+                else None
+            ),
         )
-        result = {"ok": False, "error": durable_error}
+        result: dict[str, Any] = {"ok": False, "error": durable_error}
+        if public_error is not None:
+            result["error_details"] = public_error
         if reason is not None:
             result["reason"] = reason
         return result
@@ -1465,26 +1526,69 @@ class LLMProcessExecutor:
             "reason": reason,
             **(extra or {}),
         }
+        public_error, internal_error = self._llm_error_artifacts(
+            error,
+            code="llm_context_management_error",
+        )
         if include_error_type:
             decision["error_type"] = type(error).__name__
         if include_error:
-            decision["error"] = str(error)
+            decision["error"] = public_error["message"]
+            decision["error_details"] = public_error
+            decision["internal_error"] = internal_error
         self._audit.record(
             actor=pid,
             action="llm.context_pressure_failed",
             target=f"process:{pid}",
             decision=decision,
+            correlation_id=public_error["correlation_id"],
         )
         return self._fail_llm_quantum(pid, error)
 
+    @staticmethod
+    def _llm_error_artifacts(
+        error: BaseException,
+        *,
+        code: str = "llm_error",
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        """Return one correlation-stable, text-free outward failure view.
+
+        Provider and extension exception text may contain prompts, paths, DSNs,
+        or credentials.  ``persist_full_io`` governs successful request/response
+        retention; it never authorizes exception text to cross a durable or
+        model-facing boundary.
+        """
+
+        public_error = public_error_envelope(error, code=code)
+        internal_error = llm_error_internal_observation(
+            error,
+            correlation_id=public_error["correlation_id"],
+        )
+        return public_error, internal_error
+
     def _durable_llm_error(self, error: BaseException) -> str:
-        detail = str(error)
-        if self.config.llm.persist_full_io:
-            return detail
-        encoded = detail.encode("utf-8", errors="replace")
-        return (
-            f"{type(error).__name__}: provider error detail redacted "
-            f"(bytes={len(encoded)}, sha256={hashlib.sha256(encoded).hexdigest()})"
+        if self._preserve_llm_domain_error_text(error):
+            return str(error)
+        return self._llm_error_artifacts(error)[0]["message"]
+
+    @staticmethod
+    def _preserve_llm_domain_error_text(error: BaseException) -> bool:
+        """Keep established Host/model protocol errors actionable.
+
+        These classes are minted before provider dispatch or from the model's
+        normal action payload. Provider invocation failures are normalized to
+        ``LLMError`` by ``LLMProviderService`` and never enter this branch.
+        """
+
+        return not isinstance(error, LLMError) and isinstance(
+            error,
+            (
+                CapabilityDenied,
+                NotFound,
+                ResourceLimitExceeded,
+                ValidationError,
+                ValueError,
+            ),
         )
 
     def _completion_content_preview(self, content: Any) -> str:
@@ -2512,11 +2616,15 @@ class LLMProcessExecutor:
         pending: dict[str, Any],
         error: BaseException,
     ) -> None:
+        public_error, internal_error = self._llm_error_artifacts(
+            error,
+            code="llm_pending_resume_error",
+        )
         message = (
             "durable LLM action resume failed after its non-replayable claim; "
-            f"automatic replay is disabled: {type(error).__name__}: {error}"
+            f"automatic replay is disabled: {public_error['message']}"
         )
-        terminal_error: str | None = None
+        terminal_error: dict[str, Any] | None = None
         process = self._processes.get_process(pid)
         if process is not None and process.status not in {
             ProcessStatus.EXITED,
@@ -2526,7 +2634,14 @@ class LLMProcessExecutor:
             try:
                 self._process.exit(pid, failed=True, message=message)
             except Exception as exc:
-                terminal_error = f"{type(exc).__name__}: {exc}"
+                terminal_public, terminal_internal = self._llm_error_artifacts(
+                    exc,
+                    code="llm_pending_resume_terminal_error",
+                )
+                terminal_error = {
+                    "public_error": terminal_public,
+                    "internal_error": terminal_internal,
+                }
                 # Process finalization can span multiple subsystems.  If it
                 # fails after the claim, persist the minimum fail-closed state
                 # so a direct run_once caller cannot spin on a RUNNABLE row.
@@ -2550,9 +2665,17 @@ class LLMProcessExecutor:
                                 status_message=message,
                             )
                 except Exception as fallback_exc:
-                    terminal_error = (
-                        f"{terminal_error}; fallback={type(fallback_exc).__name__}: {fallback_exc}"
+                    fallback_public, fallback_internal = self._llm_error_artifacts(
+                        fallback_exc,
+                        code="llm_pending_resume_terminal_error",
                     )
+                    terminal_error = {
+                        **dict(terminal_error or {}),
+                        "fallback": {
+                            "public_error": fallback_public,
+                            "internal_error": fallback_internal,
+                        },
+                    }
         try:
             self._audit.record(
                 actor="llm.executor",
@@ -2562,10 +2685,13 @@ class LLMProcessExecutor:
                     "wait_type": pending.get("wait_type"),
                     "status": pending.get("status"),
                     "error_type": type(error).__name__,
-                    "error": str(error),
+                    "error": public_error["message"],
+                    "error_details": public_error,
+                    "internal_error": internal_error,
                     "terminal_error": terminal_error,
                     "replayed": False,
                 },
+                correlation_id=public_error["correlation_id"],
             )
         except Exception:
             # Preserve the original post-claim failure.  The durable resuming
@@ -2707,6 +2833,10 @@ class LLMProcessExecutor:
         error: Exception,
     ) -> dict[str, Any]:
         self._clear_pending_action(pid, self._pending_resume_token(pending))
+        public_error, internal_error = self._llm_error_artifacts(
+            error,
+            code="llm_context_management_error",
+        )
         return await self._finish_resumed_context_management(
             pid,
             result={
@@ -2714,7 +2844,9 @@ class LLMProcessExecutor:
                 "tool_id": None,
                 "result_oid": None,
                 "payload": None,
-                "error": str(error),
+                "error": public_error["message"],
+                "error_details": public_error,
+                "internal_error": internal_error,
                 "error_type": type(error).__name__,
             },
             metadata=metadata,
@@ -2767,7 +2899,12 @@ class LLMProcessExecutor:
             if not isinstance(tool_call, dict):
                 continue
             try:
-                tool_call_to_action(tool_call)
+                tool_call_to_action(
+                    tool_call,
+                    max_argument_bytes=(
+                        self.config.tools.tool_call_args_hard_limit_bytes
+                    ),
+                )
             except Exception:
                 continue
             return self._completion_tool_call_context(completion, index=index)
@@ -3768,6 +3905,29 @@ class LLMProcessExecutor:
         if attempted:
             observation["action"] = "deduplicated"
             return
+        try:
+            # The earlier check is a read-only planning predicate. Consume a
+            # finite maintenance lease only when this pressure episode will
+            # actually attempt the compaction effect.
+            self._capabilities.require(
+                state.pid,
+                LLM_CONTEXT_MAINTENANCE_RESOURCE,
+                CapabilityRight.EXECUTE,
+            )
+        except CapabilityDenied:
+            observation["action"] = "not_authorized"
+            self._audit_context_pressure(
+                state.pid,
+                "llm.context_pressure_maintenance_not_authorized",
+                assessment,
+                policy,
+                episode_id=episode_id,
+                extra={
+                    "persistent_context_enabled": persistent_context_enabled,
+                    "maintenance_authorized": False,
+                },
+            )
+            return
         await self._attempt_auto_context_management(
             state,
             policy=policy,
@@ -3867,6 +4027,10 @@ class LLMProcessExecutor:
                 metadata={**pending_context, "outcome": "attempted"},
             )
         except Exception as exc:
+            public_error, internal_error = self._llm_error_artifacts(
+                exc,
+                code="llm_context_management_error",
+            )
             observation.update(
                 {"action": "failed", "failure_reason": type(exc).__name__}
             )
@@ -3879,8 +4043,11 @@ class LLMProcessExecutor:
                 extra={
                     "reason": "attempt_marker_persistence_failed",
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "error": public_error["message"],
+                    "error_details": public_error,
+                    "internal_error": internal_error,
                 },
+                correlation_id=public_error["correlation_id"],
             )
             return
         self._audit_context_pressure(
@@ -3900,6 +4067,10 @@ class LLMProcessExecutor:
         except _ContextManagementHandled:
             raise
         except Exception as exc:
+            public_error, internal_error = self._llm_error_artifacts(
+                exc,
+                code="llm_context_management_error",
+            )
             generation_after = self._processes.get_llm_context_generation(
                 state.pid
             )
@@ -3914,9 +4085,12 @@ class LLMProcessExecutor:
                 episode_id=episode_id,
                 extra={
                     "reason": type(exc).__name__,
-                    "error": str(exc),
+                    "error": public_error["message"],
+                    "error_details": public_error,
+                    "internal_error": internal_error,
                     "context_generation_after": generation_after,
                 },
+                correlation_id=public_error["correlation_id"],
             )
             if generation_after != assessment.context_generation:
                 raise _ContextManagementHandled(
@@ -4266,6 +4440,7 @@ class LLMProcessExecutor:
         *,
         episode_id: str,
         extra: dict[str, Any] | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         self._audit.record(
             actor=pid,
@@ -4278,6 +4453,7 @@ class LLMProcessExecutor:
                 "mode": policy.mode,
                 **dict(extra or {}),
             },
+            correlation_id=correlation_id,
         )
 
     def _prepare_resumed_llm_request(
@@ -4538,6 +4714,13 @@ class LLMProcessExecutor:
             source="llm.error",
             context={"error_type": type(error).__name__},
         )
+        preserve_domain_text = self._preserve_llm_domain_error_text(error)
+        public_error: dict[str, str] | None = None
+        internal_error: dict[str, Any] | None = None
+        selected_error = str(error)
+        if not preserve_domain_text:
+            public_error, internal_error = self._llm_error_artifacts(error)
+            selected_error = public_error["message"]
         observable = observable_llm_call_fields(
             messages=state.request_messages,
             tools=state.tools,
@@ -4545,9 +4728,15 @@ class LLMProcessExecutor:
             tool_calls=[],
             reasoning=None,
             raw_response=None,
-            error=str(error),
+            error=selected_error,
             config=self.config,
         )
+        observability = dict(observable["observability"])
+        if public_error is not None and internal_error is not None:
+            observability["failure"] = {
+                "public_error": public_error,
+                "internal_error": internal_error,
+            }
         self._processes.insert_llm_call(
             LLMCallRecord(
                 call_id=state.call_id,
@@ -4562,7 +4751,7 @@ class LLMProcessExecutor:
                 tool_calls=observable["tool_calls"],
                 reasoning=observable["reasoning"],
                 raw_response=observable["raw_response"],
-                observability=observable["observability"],
+                observability=observability,
                 error=observable["error"],
                 created_at=state.created_at,
                 completed_at=utc_now(),
@@ -4810,8 +4999,8 @@ class LLMProcessExecutor:
                 }
             )[:32]
 
-    @staticmethod
     def _fallback_json_action_was_used(
+        self,
         state: _LLMCallState,
         completion: Any,
     ) -> bool:
@@ -4821,7 +5010,12 @@ class LLMProcessExecutor:
             return True
         for tool_call in list(getattr(completion, "tool_calls", []) or []):
             try:
-                tool_call_to_action(tool_call)
+                tool_call_to_action(
+                    tool_call,
+                    max_argument_bytes=(
+                        self.config.tools.tool_call_args_hard_limit_bytes
+                    ),
+                )
             except Exception:
                 continue
             return False
@@ -5385,8 +5579,10 @@ class LLMProcessExecutor:
             return (
                 "Resolve message handling before other work. If the preceding discovery "
                 "result identifies a Skill declaring read_process_messages or "
-                "receive_process_messages, activate that exact returned id; otherwise call "
-                "discover_skills with text 'messages' and a bounded limit. Then call a "
+                "receive_process_messages, activate that exact returned id with the same "
+                "row's package_sha256 as expected_package_sha256; otherwise call "
+                "discover_skills with text 'messages' and an unquoted JSON integer limit "
+                "such as 5. Then call a "
                 "visible message-read tool to inspect and acknowledge unread process messages."
             )
         return (
@@ -5550,9 +5746,19 @@ class LLMProcessExecutor:
                 memory=self._memory,
             )
         except Exception as exc:
+            public_error, internal_error = self._llm_error_artifacts(
+                exc,
+                code="llm_context_restore_error",
+            )
             self._audit.record(
                 actor="llm.executor",
                 action="llm.pending_compaction_child_restore_failed",
                 target=f"process:{pending.get('pid')}",
-                decision={"error": str(exc), "child_pid": pending.get("child_pid")},
+                decision={
+                    "error": public_error["message"],
+                    "error_details": public_error,
+                    "internal_error": internal_error,
+                    "child_pid": pending.get("child_pid"),
+                },
+                correlation_id=public_error["correlation_id"],
             )

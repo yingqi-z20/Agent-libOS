@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import builtins
 import json
+import math
+import re
 import threading
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
@@ -74,6 +76,14 @@ _REMOVED_TOOL_GROUP_METADATA_KEYS = frozenset(
     }
 )
 
+_CANONICAL_JSON_INTEGER = re.compile(r"-?(?:0|[1-9][0-9]*)\Z")
+_CANONICAL_JSON_NUMBER = re.compile(
+    r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z"
+)
+_MODEL_SCALAR_STRING_MAX_CHARS = 128
+_MODEL_ARGUMENT_NORMALIZATION_MAX_DEPTH = 32
+_MODEL_ARGUMENT_NORMALIZATION_MAX_FIELDS = 64
+
 _SKILL_TOOL_BOOTSTRAP = (
     "discover_skills",
     "activate_skill",
@@ -116,6 +126,245 @@ _JIT_MULTIPLEXER_SPEC = ToolSpec(
     tags=["jit", "tool", "multiplexer", "protocol"],
     side_effects=list(_JIT_DECLARED_PERMISSIONS),
 )
+
+
+def _normalize_schema_scalar_strings(
+    value: Any,
+    schema: dict[str, Any],
+    *,
+    root_schema: dict[str, Any],
+    path: tuple[str, ...],
+    changed: list[str],
+    depth: int,
+) -> Any:
+    """Normalize canonical scalar strings only when every schema variant forbids strings."""
+
+    if (
+        depth > _MODEL_ARGUMENT_NORMALIZATION_MAX_DEPTH
+        or len(changed) >= _MODEL_ARGUMENT_NORMALIZATION_MAX_FIELDS
+    ):
+        return value
+    variants = _expanded_schema_variants(
+        schema,
+        root_schema=root_schema,
+        depth=depth,
+        seen_refs=frozenset(),
+    )
+    if not variants:
+        return value
+
+    if isinstance(value, str):
+        allowed_types = _schema_variant_types(variants)
+        normalized = _normalize_scalar_string(value, allowed_types)
+        if normalized is value:
+            return value
+        changed.append(_normalization_path(path))
+        return normalized
+
+    if isinstance(value, dict):
+        return _normalize_schema_mapping(
+            value,
+            variants,
+            root_schema=root_schema,
+            path=path,
+            changed=changed,
+            depth=depth,
+        )
+
+    if isinstance(value, list):
+        return _normalize_schema_items(
+            value,
+            variants,
+            root_schema=root_schema,
+            path=path,
+            changed=changed,
+            depth=depth,
+        )
+
+    return value
+
+
+def _normalize_schema_mapping(
+    value: dict[Any, Any],
+    variants: list[dict[str, Any]],
+    *,
+    root_schema: dict[str, Any],
+    path: tuple[str, ...],
+    changed: list[str],
+    depth: int,
+) -> dict[Any, Any]:
+    normalized_mapping = dict(value)
+    for key, item in value.items():
+        if len(changed) >= _MODEL_ARGUMENT_NORMALIZATION_MAX_FIELDS:
+            break
+        property_schemas = [
+            properties[key]
+            for variant in variants
+            if isinstance((properties := variant.get("properties")), dict)
+            and key in properties
+            and isinstance(properties[key], dict)
+        ]
+        if not property_schemas:
+            continue
+        selected_schema = (
+            property_schemas[0]
+            if len(property_schemas) == 1
+            else {"anyOf": property_schemas}
+        )
+        normalized_mapping[key] = _normalize_schema_scalar_strings(
+            item,
+            selected_schema,
+            root_schema=root_schema,
+            path=(*path, str(key)),
+            changed=changed,
+            depth=depth + 1,
+        )
+    return normalized_mapping
+
+
+def _normalize_schema_items(
+    value: list[Any],
+    variants: list[dict[str, Any]],
+    *,
+    root_schema: dict[str, Any],
+    path: tuple[str, ...],
+    changed: list[str],
+    depth: int,
+) -> list[Any]:
+    item_schemas = [
+        item_schema
+        for variant in variants
+        if isinstance((item_schema := variant.get("items")), dict)
+    ]
+    if not item_schemas:
+        return value
+    selected_schema = (
+        item_schemas[0] if len(item_schemas) == 1 else {"anyOf": item_schemas}
+    )
+    normalized_items = list(value)
+    for index, item in enumerate(value):
+        if len(changed) >= _MODEL_ARGUMENT_NORMALIZATION_MAX_FIELDS:
+            break
+        normalized_items[index] = _normalize_schema_scalar_strings(
+            item,
+            selected_schema,
+            root_schema=root_schema,
+            path=(*path, f"[{index}]"),
+            changed=changed,
+            depth=depth + 1,
+        )
+    return normalized_items
+
+
+def _expanded_schema_variants(
+    schema: dict[str, Any],
+    *,
+    root_schema: dict[str, Any],
+    depth: int,
+    seen_refs: frozenset[str],
+) -> list[dict[str, Any]]:
+    if depth > _MODEL_ARGUMENT_NORMALIZATION_MAX_DEPTH:
+        return []
+    selected = dict(schema)
+    ref = selected.get("$ref")
+    if isinstance(ref, str):
+        if ref in seen_refs:
+            return []
+        target = _local_schema_ref(root_schema, ref)
+        if target is None:
+            return []
+        selected = {**target, **{key: item for key, item in selected.items() if key != "$ref"}}
+        seen_refs = seen_refs | {ref}
+
+    raw_variants = selected.get("anyOf") or selected.get("oneOf")
+    if isinstance(raw_variants, list):
+        common = {
+            key: item
+            for key, item in selected.items()
+            if key not in {"anyOf", "oneOf"}
+        }
+        expanded: list[dict[str, Any]] = []
+        for raw_variant in raw_variants:
+            if not isinstance(raw_variant, dict):
+                continue
+            expanded.extend(
+                _expanded_schema_variants(
+                    {**common, **raw_variant},
+                    root_schema=root_schema,
+                    depth=depth + 1,
+                    seen_refs=seen_refs,
+                )
+            )
+        return expanded
+    return [selected]
+
+
+def _local_schema_ref(
+    root_schema: dict[str, Any],
+    ref: str,
+) -> dict[str, Any] | None:
+    if not ref.startswith("#/"):
+        return None
+    selected: Any = root_schema
+    for raw_token in ref[2:].split("/"):
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if not isinstance(selected, dict) or token not in selected:
+            return None
+        selected = selected[token]
+    return dict(selected) if isinstance(selected, dict) else None
+
+
+def _schema_variant_types(variants: list[dict[str, Any]]) -> set[str]:
+    selected: set[str] = set()
+    for variant in variants:
+        schema_type = variant.get("type")
+        if isinstance(schema_type, str):
+            selected.add(schema_type)
+        elif isinstance(schema_type, list):
+            selected.update(item for item in schema_type if isinstance(item, str))
+    return selected
+
+
+def _normalize_scalar_string(value: str, allowed_types: set[str]) -> Any:
+    if not allowed_types or "string" in allowed_types:
+        return value
+    stripped = value.strip()
+    if not stripped or len(stripped) > _MODEL_SCALAR_STRING_MAX_CHARS:
+        return value
+    lowered = stripped.casefold()
+    if "null" in allowed_types and lowered == "null":
+        return None
+    if "boolean" in allowed_types and lowered in {"true", "false"}:
+        return lowered == "true"
+    if "integer" in allowed_types and _CANONICAL_JSON_INTEGER.fullmatch(stripped):
+        try:
+            return int(stripped)
+        except ValueError:
+            return value
+    if "number" in allowed_types and _CANONICAL_JSON_NUMBER.fullmatch(stripped):
+        try:
+            normalized = json.loads(stripped)
+        except (TypeError, ValueError):
+            return value
+        if (
+            isinstance(normalized, (int, float))
+            and not isinstance(normalized, bool)
+            and (not isinstance(normalized, float) or math.isfinite(normalized))
+        ):
+            return normalized
+    return value
+
+
+def _normalization_path(path: tuple[str, ...]) -> str:
+    if not path:
+        return "$"
+    rendered = ""
+    for item in path:
+        if item.startswith("["):
+            rendered += item
+        else:
+            rendered += ("." if rendered else "") + item
+    return rendered[:512]
 
 
 class ToolBroker:
@@ -321,41 +570,51 @@ class ToolBroker:
         *,
         assigned_by: str,
     ) -> dict[str, str]:
-        process = self.processes.get_process(pid)
-        if process is None:
+        if self.processes.get_process(pid) is None:
             raise NotFound(f"process not found: {pid}")
         resolved: dict[str, ToolHandle] = {}
         for tool in tools:
-            handle = self.resolve(tool)
+            try:
+                handle = self.resolve(tool)
+            except NotFound:
+                if isinstance(tool, ToolHandle):
+                    self.jit.preflight_process_bindings(
+                        pid,
+                        (tool,),
+                        assigned_by=assigned_by,
+                    )
+                raise
             resolved[handle.name] = handle
         self.jit.preflight_process_bindings(
             pid,
             resolved.values(),
             assigned_by=assigned_by,
         )
-        table = {
-            name: handle.tool_id
-            for name, handle in resolved.items()
-        }
-        process.tool_table = table
-        process.model_tool_table = dict(table)
-        process.updated_at = utc_now()
-        self.processes.patch_process(
-            pid,
-            {
-                "tool_table": process.tool_table,
-                "model_tool_table": process.model_tool_table,
-                "updated_at": process.updated_at,
-            },
-            expected_revision=process.revision,
-        )
-        self.audit.record(
-            actor=assigned_by,
-            action="process.tools.configure",
-            target=f"process:{pid}",
-            decision={"tools": sorted(table)},
-        )
-        return table
+        with self.unit_of_work.transaction():
+            process = self.processes.get_process(pid)
+            if process is None:
+                raise NotFound(f"process not found: {pid}")
+            table = {
+                name: handle.tool_id
+                for name, handle in resolved.items()
+            }
+            updated_at = utc_now()
+            self.processes.patch_process(
+                pid,
+                {
+                    "tool_table": dict(table),
+                    "model_tool_table": dict(table),
+                    "updated_at": updated_at,
+                },
+                expected_revision=process.revision,
+            )
+            self.audit.record(
+                actor=assigned_by,
+                action="process.tools.configure",
+                target=f"process:{pid}",
+                decision={"tools": sorted(table)},
+            )
+        return dict(table)
 
     def grant_execute(self, pid: str, tool: ToolHandle | str, issued_by: str = "tool_broker") -> str:
         with self._mutation_admission():
@@ -380,11 +639,14 @@ class ToolBroker:
         return self.registry.process_has_tool(pid, handle)
 
     def is_sync_side_effect_tool(self, tool: ToolHandle | str) -> bool:
-        handle = self.resolve(tool)
-        implementation = self.registry.implementation(handle.tool_id)
-        if implementation is None:
-            return False
-        return isinstance(implementation, SyncAgentTool) and bool(implementation.spec().policy.get("side_effects"))
+        with self._registry_lifecycle_lock():
+            handle = self._resolve_locked(tool)
+            implementation = self.registry.implementation(handle.tool_id)
+            if implementation is None:
+                return False
+            return isinstance(implementation, SyncAgentTool) and bool(
+                implementation.spec().policy.get("side_effects")
+            )
 
     def propose(
         self,
@@ -795,32 +1057,34 @@ class ToolBroker:
         *,
         assigned_by: str,
     ) -> dict[str, str]:
-        process = self.processes.get_process(pid)
-        if process is None:
-            raise NotFound(f"process not found: {pid}")
-        table: dict[str, str] = {}
-        for tool in tools:
-            handle = self.resolve(tool, pid=pid)
-            if process.tool_table.get(handle.name) != handle.tool_id:
-                raise ValidationError(f"tool is not authorized by process image: {handle.name}")
-            table[handle.name] = handle.tool_id
-        process.model_tool_table = table
-        process.updated_at = utc_now()
-        self.processes.patch_process(
-            pid,
-            {
-                "model_tool_table": process.model_tool_table,
-                "updated_at": process.updated_at,
-            },
-            expected_revision=process.revision,
-        )
-        self.audit.record(
-            actor=assigned_by,
-            action="process.tools.project",
-            target=f"process:{pid}",
-            decision={"tools": sorted(table), "authority_changed": False},
-        )
-        return table
+        with self.unit_of_work.transaction():
+            process = self.processes.get_process(pid)
+            if process is None:
+                raise NotFound(f"process not found: {pid}")
+            table: dict[str, str] = {}
+            for tool in tools:
+                handle = self.resolve(tool, pid=pid)
+                if process.tool_table.get(handle.name) != handle.tool_id:
+                    raise ValidationError(
+                        f"tool is not authorized by process image: {handle.name}"
+                    )
+                table[handle.name] = handle.tool_id
+            updated_at = utc_now()
+            self.processes.patch_process(
+                pid,
+                {
+                    "model_tool_table": dict(table),
+                    "updated_at": updated_at,
+                },
+                expected_revision=process.revision,
+            )
+            self.audit.record(
+                actor=assigned_by,
+                action="process.tools.project",
+                target=f"process:{pid}",
+                decision={"tools": sorted(table), "authority_changed": False},
+            )
+        return dict(table)
 
     def model_tool_names(self, pid: str) -> builtins.list[str]:
         names = [str(row.get("name") or "") for row in self.model_visible_tools(pid)]
@@ -920,6 +1184,23 @@ class ToolBroker:
                         "normalization": "reversible_json_string_encoding",
                     },
                 )
+        elif name != JIT_MULTIPLEXER_TOOL_NAME:
+            action, normalized_fields = self._normalize_schema_model_action(
+                pid,
+                name,
+                action,
+            )
+            if normalized_fields:
+                self.audit.record(
+                    actor=pid,
+                    action="llm.tool_arguments_normalized",
+                    target=name,
+                    decision={
+                        "tool": name,
+                        "normalized_fields": normalized_fields,
+                        "normalization": "schema_guided_canonical_scalar_string",
+                    },
+                )
         if name == JIT_MULTIPLEXER_TOOL_NAME:
             if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
                 raise ValueError(f"{JIT_MULTIPLEXER_TOOL_NAME} is not available for this image")
@@ -931,6 +1212,40 @@ class ToolBroker:
             args = {key: value for key, value in action.items() if key != "action"}
             self.execution.validate_jit_arguments(handle, args)
         return action
+
+    def _normalize_schema_model_action(
+        self,
+        pid: str,
+        name: str,
+        action: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Repair only unambiguous scalar stringification at the LLM boundary."""
+
+        process = self.processes.get_process(pid)
+        if process is None or name not in process.model_tool_table:
+            return action, []
+        try:
+            handle = self.resolve(name, pid=pid)
+        except NotFound:
+            return action, []
+        spec = self.extensions.get_tool_spec(handle.tool_id)
+        if spec is None or not isinstance(spec.input_schema, dict):
+            return action, []
+        arguments = {
+            key: value for key, value in action.items() if key != "action"
+        }
+        changed: list[str] = []
+        normalized = _normalize_schema_scalar_strings(
+            arguments,
+            spec.input_schema,
+            root_schema=spec.input_schema,
+            path=(),
+            changed=changed,
+            depth=0,
+        )
+        if not changed or not isinstance(normalized, dict):
+            return action, []
+        return {**normalized, "action": name}, sorted(set(changed))
 
     @staticmethod
     def _normalize_process_message_model_action(

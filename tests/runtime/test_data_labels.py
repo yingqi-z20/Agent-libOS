@@ -17,6 +17,7 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied
 from tests.support.fakes import RecordingActionClient
+from tests.support.public_errors import assert_public_error_message
 from tests.support.runtime import temporary_runtime
 
 
@@ -311,8 +312,20 @@ def test_llm_created_object_fails_closed_for_missing_or_unreadable_explicit_pare
             },
         )
 
-        assert not missing.ok and "parent not found" in str(missing.error)
-        assert not unreadable.ok and "parent is not readable" in str(unreadable.error)
+        assert not missing.ok
+        assert_public_error_message(
+            missing.error,
+            code="permission_denied",
+            error_type="CapabilityDenied",
+            forbidden=("parent not found", "obj_missing"),
+        )
+        assert not unreadable.ok
+        assert_public_error_message(
+            unreadable.error,
+            code="permission_denied",
+            error_type="CapabilityDenied",
+            forbidden=("parent is not readable", hidden.oid),
+        )
 
 
 @pytest.mark.parametrize(
@@ -338,7 +351,12 @@ def test_llm_memory_tool_cannot_assert_trusted_labels(metadata: dict[str, str]) 
         )
 
         assert not result.ok
-        assert "cannot" in str(result.error).lower()
+        assert_public_error_message(
+            result.error,
+            code="permission_denied",
+            error_type="ToolExecutionError",
+            forbidden=("cannot",),
+        )
 
 
 def test_trusted_tool_context_sources_label_child_goal() -> None:
@@ -548,7 +566,12 @@ def test_fork_rejects_explicit_root_outside_child_identity_domain() -> None:
         )
 
         assert not result.ok
-        assert "data_flow_policy does not allow" in (result.error or "")
+        assert_public_error_message(
+            result.error,
+            code="permission_denied",
+            error_type="CapabilityDenied",
+            forbidden=("data_flow_policy does not allow", secret.oid),
+        )
         assert {child.pid for child in runtime.process.list_children(parent)} == children_before
 
 

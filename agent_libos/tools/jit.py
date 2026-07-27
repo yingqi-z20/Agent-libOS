@@ -7,8 +7,8 @@ from collections.abc import Callable, Iterable
 from itertools import islice
 from typing import Any
 
+from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
-from jsonschema.validators import validator_for as jsonschema_validator_for
 
 from agent_libos.config import AgentLibOSConfig
 from agent_libos.memory.object_memory import ObjectMemoryManager
@@ -32,7 +32,7 @@ from agent_libos.models import (
     ValidationResult,
     is_openai_tool_name,
 )
-from agent_libos.models.exceptions import NotFound, ValidationError
+from agent_libos.models.exceptions import NotFound, ResourceLimitExceeded, ValidationError
 from agent_libos.ports import AuditPort
 from agent_libos.storage import UnitOfWork
 from agent_libos.substrate import (
@@ -45,6 +45,190 @@ from agent_libos.tools.observability import ensure_json_size, sanitize_for_obser
 from agent_libos.tools.registry import ToolRegistry
 from agent_libos.tools.sandbox import SandboxBackend
 from agent_libos.utils.ids import new_id, utc_now
+
+
+JIT_SCHEMA_MAX_DEPTH = 32
+JIT_SCHEMA_MAX_NODES = 1_024
+
+_JIT_SCHEMA_ALLOWED_KEYWORDS = frozenset(
+    {
+        "$comment",
+        "additionalProperties",
+        "allOf",
+        "anyOf",
+        "const",
+        "contains",
+        "default",
+        "dependentRequired",
+        "dependentSchemas",
+        "deprecated",
+        "description",
+        "else",
+        "enum",
+        "examples",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "if",
+        "items",
+        "maxContains",
+        "maximum",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "minContains",
+        "minimum",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "multipleOf",
+        "not",
+        "oneOf",
+        "prefixItems",
+        "properties",
+        "propertyNames",
+        "readOnly",
+        "required",
+        "then",
+        "title",
+        "type",
+        "writeOnly",
+    }
+)
+_JIT_SCHEMA_FORBIDDEN_KEYWORDS = (
+    "$ref",
+    "$dynamicRef",
+    "$recursiveRef",
+    "pattern",
+    "patternProperties",
+)
+_JIT_SCHEMA_SINGLE_CHILD_KEYWORDS = frozenset(
+    {
+        "additionalProperties",
+        "contains",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+    }
+)
+_JIT_SCHEMA_ARRAY_CHILD_KEYWORDS = frozenset(
+    {"allOf", "anyOf", "oneOf", "prefixItems"}
+)
+_JIT_SCHEMA_MAPPING_CHILD_KEYWORDS = frozenset(
+    {"dependentSchemas", "properties"}
+)
+
+
+class JITSchemaDialectError(ValueError):
+    """Raised when a JIT tool schema falls outside the bounded safe dialect."""
+
+
+def validate_jit_json_schema(schema: dict[str, Any]) -> None:
+    """Validate the bounded, reference-free JSON Schema dialect used by JIT tools.
+
+    JIT schemas are attacker-controlled and later evaluated in the Host process.
+    Keep the supported surface reference-free and regex-free, and bound its tree
+    before invoking jsonschema's meta-schema validator.
+    """
+
+    if not isinstance(schema, dict):
+        raise JITSchemaDialectError("schema root must be an object")
+    _validate_jit_schema_structure(schema)
+    _validate_jit_schema_keywords(schema)
+    try:
+        Draft202012Validator.check_schema(schema)
+    except JsonSchemaSchemaError as exc:
+        raise JITSchemaDialectError(exc.message) from exc
+
+
+def _validate_jit_schema_structure(schema: dict[str, Any]) -> None:
+    pending: list[tuple[Any, int, bool]] = [(schema, 0, False)]
+    active_containers: set[int] = set()
+    scheduled_nodes = 1
+
+    while pending:
+        value, depth, leaving = pending.pop()
+        if leaving:
+            active_containers.remove(id(value))
+            continue
+
+        if isinstance(value, dict):
+            if any(not isinstance(key, str) for key in value):
+                raise JITSchemaDialectError("schema object keys must be strings")
+            children = value.values()
+        elif isinstance(value, list):
+            children = value
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise JITSchemaDialectError(
+                    "schema must contain only finite JSON numbers"
+                )
+            continue
+        elif value is None or isinstance(value, (str, int, bool)):
+            continue
+        else:
+            raise JITSchemaDialectError("schema must contain only JSON values")
+
+        container_id = id(value)
+        if container_id in active_containers:
+            raise JITSchemaDialectError("schema must not contain cyclic containers")
+        active_containers.add(container_id)
+        pending.append((value, depth, True))
+
+        child_count = len(value)
+        if scheduled_nodes + child_count > JIT_SCHEMA_MAX_NODES:
+            raise JITSchemaDialectError(
+                "schema exceeds maximum node count="
+                f"{JIT_SCHEMA_MAX_NODES}"
+            )
+        if child_count and depth >= JIT_SCHEMA_MAX_DEPTH:
+            raise JITSchemaDialectError(
+                "schema exceeds maximum depth="
+                f"{JIT_SCHEMA_MAX_DEPTH}"
+            )
+        scheduled_nodes += child_count
+        child_depth = depth + 1
+        pending.extend((child, child_depth, False) for child in children)
+
+
+def _validate_jit_schema_keywords(schema: dict[str, Any]) -> None:
+    pending: list[dict[str, Any] | bool] = [schema]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, bool):
+            continue
+
+        for keyword in _JIT_SCHEMA_FORBIDDEN_KEYWORDS:
+            if keyword in current:
+                raise JITSchemaDialectError(
+                    f"restricted JIT schema dialect forbids keyword {keyword!r}"
+                )
+        for keyword in current:
+            if keyword not in _JIT_SCHEMA_ALLOWED_KEYWORDS:
+                raise JITSchemaDialectError(
+                    f"restricted JIT schema dialect does not support keyword {keyword!r}"
+                )
+
+        for keyword in _JIT_SCHEMA_SINGLE_CHILD_KEYWORDS:
+            child = current.get(keyword)
+            if isinstance(child, (dict, bool)):
+                pending.append(child)
+        for keyword in _JIT_SCHEMA_ARRAY_CHILD_KEYWORDS:
+            children = current.get(keyword)
+            if isinstance(children, list):
+                pending.extend(
+                    child for child in children if isinstance(child, (dict, bool))
+                )
+        for keyword in _JIT_SCHEMA_MAPPING_CHILD_KEYWORDS:
+            children = current.get(keyword)
+            if isinstance(children, dict):
+                pending.extend(
+                    child
+                    for child in children.values()
+                    if isinstance(child, (dict, bool))
+                )
 
 
 class JITToolService:
@@ -175,22 +359,64 @@ class JITToolService:
         *,
         pid: str | None = None,
     ) -> ValidationResult:
-        candidate = self.get_candidate(candidate_id)
-        owner_pid = pid or candidate.pid
-        self.require_candidate_owner(candidate, owner_pid)
+        if pid is None:
+            candidate = self.get_candidate(candidate_id)
+            owner_pid = candidate.pid
+        else:
+            candidate = self.get_owned_candidate(candidate_id, pid)
+            owner_pid = pid
+        if candidate.status != ToolCandidateStatus.PROPOSED:
+            raise ValidationError(
+                "tool candidate validation requires proposed status: "
+                f"{candidate_id} status={candidate.status.value}"
+            )
         try:
             result = self._run_candidate_tests(candidate, owner_pid)
-        except (SubprocessLimitExceeded, SubprocessTimeoutExpired) as exc:
-            self._charge_subprocess_metrics(
-                owner_pid,
-                exc.metrics,
-                source="tool.validate.deno",
-                context={
-                    "candidate_id": candidate_id,
-                    "tool": candidate.spec.name,
+        except (
+            ResourceLimitExceeded,
+            SubprocessLimitExceeded,
+            SubprocessTimeoutExpired,
+        ) as exc:
+            terminal_error: BaseException = exc
+            metrics = getattr(exc, "metrics", None)
+            if isinstance(metrics, CommandMetrics):
+                try:
+                    self._charge_subprocess_metrics(
+                        owner_pid,
+                        metrics,
+                        source="tool.validate.deno",
+                        context={
+                            "candidate_id": candidate_id,
+                            "tool": candidate.spec.name,
+                        },
+                    )
+                except ResourceLimitExceeded as charge_error:
+                    terminal_error = charge_error
+            limit_kind = (
+                metrics.limit_kind
+                if isinstance(metrics, CommandMetrics) and metrics.limit_kind
+                else "cumulative_process_budget"
+            )
+            interrupted = ValidationResult(
+                ok=False,
+                errors=[
+                    "JIT validation was interrupted by an enforced resource "
+                    f"limit: {limit_kind}"
+                ],
+                metadata={"metrics": self._metrics_json(metrics)},
+            )
+            self._persist_candidate_validation(
+                candidate,
+                owner_pid=owner_pid,
+                validation=interrupted,
+                source_metadata={
+                    "language": self.sandbox.language,
+                    "validation_interrupted": True,
                 },
             )
-            raise
+            if terminal_error is exc:
+                raise
+            raise terminal_error from exc
         errors = list(result.errors)
         if candidate.requested_capabilities:
             errors.append("Deno/TypeScript JIT tools cannot request external capabilities")
@@ -201,9 +427,28 @@ class JITToolService:
             logs=result.logs,
             metadata=result.metadata,
         )
+        self._persist_candidate_validation(
+            candidate,
+            owner_pid=owner_pid,
+            validation=validation,
+        )
+        return validation
+
+    def _persist_candidate_validation(
+        self,
+        candidate: ToolCandidate,
+        *,
+        owner_pid: str,
+        validation: ValidationResult,
+        source_metadata: dict[str, Any] | None = None,
+    ) -> None:
         candidate.validation = self._validation_observation(
             validation,
-            self.sandbox.metadata_for_source(candidate.source_code),
+            (
+                self.sandbox.metadata_for_source(candidate.source_code)
+                if source_metadata is None
+                else source_metadata
+            ),
         )
         candidate.status = (
             ToolCandidateStatus.VALIDATED
@@ -212,8 +457,7 @@ class JITToolService:
         )
         candidate.updated_at = utc_now()
         with self.unit_of_work.transaction():
-            current = self.get_candidate(candidate_id)
-            self.require_candidate_owner(current, owner_pid)
+            current = self.get_owned_candidate(candidate.candidate_id, owner_pid)
             state_changed = current.status != ToolCandidateStatus.REGISTERED
             if state_changed:
                 current.validation = candidate.validation
@@ -223,13 +467,12 @@ class JITToolService:
             self.audit.record(
                 actor="tool_broker",
                 action="tool.validate",
-                target=f"tool_candidate:{candidate_id}",
+                target=f"tool_candidate:{candidate.candidate_id}",
                 decision={
                     **(candidate.validation or {}),
                     "candidate_state_changed": state_changed,
                 },
             )
-        return validation
 
     def register(
         self,
@@ -240,8 +483,7 @@ class JITToolService:
         scope: str,
         replace_tool_id: str | None,
     ) -> ToolHandle:
-        candidate = self.get_candidate(candidate_id)
-        self.require_candidate_owner(candidate, pid)
+        candidate = self.get_owned_candidate(candidate_id, pid)
         if candidate.status == ToolCandidateStatus.REGISTERED:
             raise ValidationError(f"tool candidate is already registered: {candidate_id}")
         if self.registry.name_collides_with_static_tool(candidate.spec.name):
@@ -267,7 +509,7 @@ class JITToolService:
         scope: str,
         replace_tool_id: str | None,
     ) -> ToolHandle:
-        candidate = self.get_candidate(candidate_id)
+        candidate = self.get_owned_candidate(candidate_id, pid)
         tool_id = new_id("tool")
         handle = ToolHandle(
             tool_id=tool_id,
@@ -277,8 +519,7 @@ class JITToolService:
         )
         try:
             with self.unit_of_work.transaction():
-                candidate = self.get_candidate(candidate_id)
-                self.require_candidate_owner(candidate, pid)
+                candidate = self.get_owned_candidate(candidate_id, pid)
                 self._require_publishable(candidate, candidate_id)
                 process = self.processes.get_process(pid)
                 if process is None:
@@ -658,13 +899,18 @@ class JITToolService:
             raise NotFound(f"tool candidate not found: {candidate_id}")
         return candidate
 
+    def get_owned_candidate(self, candidate_id: str, pid: str) -> ToolCandidate:
+        """Resolve a process-owned candidate without exposing foreign existence."""
+
+        candidate = self.extensions.get_tool_candidate(candidate_id)
+        if candidate is None or candidate.pid != pid:
+            raise ValidationError("tool candidate is unavailable to this process")
+        return candidate
+
     @staticmethod
     def require_candidate_owner(candidate: ToolCandidate, pid: str) -> None:
         if candidate.pid != pid:
-            raise ValidationError(
-                f"tool candidate {candidate.candidate_id} belongs to "
-                f"process {candidate.pid}, not {pid}"
-            )
+            raise ValidationError("tool candidate is unavailable to this process")
 
     @staticmethod
     def _require_publishable(candidate: ToolCandidate, candidate_id: str) -> None:
@@ -837,6 +1083,10 @@ class JITToolService:
                 self.config.tools.jit_test_case_max_bytes,
                 f"JIT test {index}",
             )
+            if not isinstance(test, dict):
+                raise ValidationError(f"JIT test {index} must be a JSON object")
+            if "expected" not in test:
+                raise ValidationError(f"JIT test {index} must include expected")
 
     def _validate_tool_spec(self, spec: ToolSpec) -> None:
         if not is_openai_tool_name(spec.name):
@@ -880,16 +1130,22 @@ class JITToolService:
     def _validate_json_schema(self, schema: dict[str, Any], field: str) -> None:
         if not isinstance(schema, dict):
             raise ValidationError(f"JIT tool {field} must be a JSON schema object")
+        try:
+            _validate_jit_schema_structure(schema)
+        except JITSchemaDialectError as exc:
+            raise ValidationError(
+                f"JIT tool {field} is not a valid JSON schema: {exc}"
+            ) from exc
         ensure_json_size(
             schema,
             self.config.tools.jit_test_case_max_bytes,
             f"JIT tool {field}",
         )
         try:
-            jsonschema_validator_for(schema).check_schema(schema)
-        except JsonSchemaSchemaError as exc:
+            validate_jit_json_schema(schema)
+        except JITSchemaDialectError as exc:
             raise ValidationError(
-                f"JIT tool {field} is not a valid JSON schema: {exc.message}"
+                f"JIT tool {field} is not a valid JSON schema: {exc}"
             ) from exc
 
     def _subprocess_limits(self, pid: str) -> SubprocessLimits | None:

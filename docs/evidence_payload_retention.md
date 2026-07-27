@@ -40,10 +40,14 @@ provider finalization accept only `full`; the retention CAS is the only store
 operation that can advance the tier or populate the digest column.
 
 For LLM calls the content-bearing payload fields are messages, visible tools,
-response content, tool calls, reasoning, raw provider response, and provider
-error text. Each present value is replaced by its tier-appropriate content-free
-envelope; absent optional reasoning, raw-response, or error fields remain
-`null`.
+response content, tool calls, reasoning, raw provider response, and the durable
+public/domain error field. Each present value is replaced by its
+tier-appropriate content-free envelope; absent optional reasoning,
+raw-response, or error fields remain `null`. Provider-invocation exception text
+has a stricter boundary: it is normalized to a text-free public error before
+any durable or model-facing sink, regardless of retention tier or
+`llm.persist_full_io`.
+
 The entire `observability` mapping is also replaced; retention does not preserve
 selected observability keys or field previews. Its replacement contains only
 the retention schema version, tier, aggregate retained-payload hash, and a
@@ -184,11 +188,16 @@ audit failure rolls back the batch.
 
 `llm.persist_full_io=true` remains the write-time choice for full LLM I/O.
 New `persist_full_io=false` rows are written directly at the `summary` tier:
-every content-bearing field and provider error is replaced by the canonical
-content-free envelope above, and `observability` contains only the aggregate
-retention marker. No prompt, schema, response, tool-call argument, reasoning,
-provider payload, error text, key name, scalar value, or preview is durable in
-that row.
+every content-bearing field and durable error field is replaced by the
+canonical content-free envelope above, and `observability` contains only the
+aggregate retention marker. No prompt, schema, response, tool-call argument,
+reasoning, provider payload, error text, key name, scalar value, or preview
+remains readable in those content-bearing or observability fields. The
+identity, policy, accounting, status, and timestamp fields listed above remain
+durable and may themselves contain ordinary field names and scalar values.
+Provider-invocation exception text is never durable even when
+`persist_full_io=true`; the setting authorizes retention of successful
+request/response content, not raw exception messages.
 
 An `image_only` process is not an exception that writes a redacted transcript.
 It requires a lossless native transcript head and fails before provider dispatch

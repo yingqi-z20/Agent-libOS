@@ -3,6 +3,7 @@ import pytest
 from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.api.cli import DEMO_PATCH_PREVIEW_CONTENT, DEMO_PATCH_PREVIEW_PATH, run_demo
+from tests.support.public_errors import assert_public_error_message
 
 class TestDemoContract:
 
@@ -21,7 +22,12 @@ class TestDemoContract:
         assert result['approval_request'] is not None
         assert result['audit_records'] > 0
         assert not result['filesystem_write_denial']['ok']
-        assert 'lacks write' in result['filesystem_write_denial']['error']
+        assert_public_error_message(
+            result['filesystem_write_denial']['error'],
+            code='permission_denied',
+            error_type='CapabilityDenied',
+            forbidden=('lacks write', DEMO_PATCH_PREVIEW_PATH),
+        )
         assert result['write_result']['ok']
         assert result['write_result']['payload']['path'] == DEMO_PATCH_PREVIEW_PATH
         assert result['target_file_exists']

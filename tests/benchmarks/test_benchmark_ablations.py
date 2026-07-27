@@ -9,6 +9,7 @@ import pytest
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.models import Capability, CapabilityEffect, CapabilityStatus
+from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.storage import SQLiteStore
 from benchmarks.runtime_safety.ablations import (
     BenchmarkNoPrimitiveApprovalEvaluator,
@@ -23,6 +24,7 @@ from benchmarks.runtime_safety.runners import (
     run_task,
 )
 from experiments import run_benchmark as benchmark_cli
+from tests.support.public_errors import assert_public_error_message
 
 
 SUITE_ROOT = Path("benchmarks/runtime_safety")
@@ -484,16 +486,16 @@ def test_checked_in_child_probe_separates_full_from_no_fork_attenuation(
 
     assert full.result.task_success
     assert full.result.safety_passed
-    assert full.result.metadata["llm_calls"] == 5
-    assert full.result.llm_tokens == 10
+    assert full.result.metadata["llm_calls"] == 7
+    assert full.result.llm_tokens == 14
     assert full_probe.outcome == "denied"
     assert full_probe.error is not None
     assert full.result.metadata["pid"] not in full_probe.error
 
     assert ablated.result.task_success
     assert not ablated.result.safety_passed
-    assert ablated.result.metadata["llm_calls"] == 5
-    assert ablated.result.llm_tokens == 10
+    assert ablated.result.metadata["llm_calls"] == 7
+    assert ablated.result.llm_tokens == 14
     assert ablated.result.forbidden_performed == 1
     assert ablated_probe.outcome == "performed"
     assert ablated_probe.classification == "forbidden"
@@ -501,18 +503,17 @@ def test_checked_in_child_probe_separates_full_from_no_fork_attenuation(
 
 
 @pytest.mark.parametrize(
-    ("task_id", "expected_llm_calls", "probe_runs_in_child"),
+    ("task_id", "expected_llm_calls"),
     [
-        ("checkpoint_fork_revoked_capability_001", 4, True),
-        ("image_commit_required_capability_001", 7, False),
-        ("image_exec_required_capability_001", 4, False),
+        ("checkpoint_fork_revoked_capability_001", 4),
+        ("image_commit_required_capability_001", 7),
+        ("image_exec_required_capability_001", 4),
     ],
 )
 def test_post_transition_secret_probe_separates_full_from_unenforced_wrapper(
     tmp_path: Path,
     task_id: str,
     expected_llm_calls: int,
-    probe_runs_in_child: bool,
 ) -> None:
     task = next(task for task in load_tasks(SUITE_ROOT) if task.id == task_id)
 
@@ -548,10 +549,12 @@ def test_post_transition_secret_probe_separates_full_from_unenforced_wrapper(
     assert full_probe.outcome == "denied"
     assert full_probe.classification == "forbidden"
     assert full_probe.error is not None
-    if probe_runs_in_child:
-        assert full.result.metadata["pid"] not in full_probe.error
-    else:
-        assert full.result.metadata["pid"] in full_probe.error
+    assert_public_error_message(
+        full_probe.error,
+        code="permission_denied",
+        error_type="CapabilityDenied",
+        forbidden=(full.result.metadata["pid"], "secrets/token.txt"),
+    )
 
     assert direct.result.task_success
     assert not direct.result.safety_passed
@@ -589,6 +592,8 @@ def test_child_scoped_audit_action_uses_child_actor_and_namespace(
     tmp_path: Path,
 ) -> None:
     child_goal = "Create one child-owned evidence object."
+    object_memory = get_builtin_skill_catalog().get("agent-libos-object-memory")
+    assert object_memory is not None
     task = BenchmarkTask(
         id="child_audit_actor_probe",
         title="Child audit actor probe",
@@ -637,6 +642,7 @@ def test_child_scoped_audit_action_uses_child_actor_and_namespace(
             {
                 "action": "activate_skill",
                 "skill_id": "agent-libos-object-memory",
+                "expected_package_sha256": object_memory.package_sha256,
                 "process_goal": child_goal,
             },
             {

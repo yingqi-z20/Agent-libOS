@@ -13,6 +13,7 @@ from agent_libos.models import (
     CapabilityRight,
     DataLabels,
     ResourceBudget,
+    ResourceScope,
     TaskAuthorityManifest,
     encode_permitted_effects_policy,
 )
@@ -45,6 +46,17 @@ _CAPABILITY_SPEC_FIELDS = frozenset(
         "expires_at",
         "uses_remaining",
         "max_delegation_depth",
+    }
+)
+
+_UNREQUESTABLE_ROOT_PREFIX_RIGHTS = frozenset(
+    {
+        CapabilityRight.ADMIN.value,
+        CapabilityRight.GRANT.value,
+        CapabilityRight.REVOKE.value,
+        CapabilityRight.WRITE.value,
+        CapabilityRight.EXECUTE.value,
+        CapabilityRight.DELETE.value,
     }
 )
 
@@ -134,11 +146,13 @@ class AuthorityManifestManager:
             if "data_flow_policy" in payload
             else parent_data_flow_policy
         )
-        expires_at = self._optional_expiry(
-            payload["expires_at"]
+        expires_at = (
+            self._required_expiry(payload["expires_at"], "expires_at")
             if "expires_at" in payload
-            else (parent.expires_at if parent is not None else None),
-            "expires_at",
+            else self._optional_expiry(
+                parent.expires_at if parent is not None else None,
+                "expires_at",
+            )
         )
         if parent_is_ceiling:
             self._require_effects_attenuated(parent.permitted_effects, permitted_effects)
@@ -182,41 +196,54 @@ class AuthorityManifestManager:
             },
             created_at=utc_now(),
         )
-        manifest = self._insert_hashed_manifest(manifest)
-        missing_required = self._missing_required_capabilities(manifest)
-        self.audit.record(
-            actor=manifest.issued_by,
-            action="authority_manifest.bind",
-            target=f"process:{pid}",
-            decision={
-                "manifest_id": manifest.manifest_id,
-                "manifest_hash": manifest.manifest_hash,
-                "image_id": image_id,
-                "authorized_capabilities": len(manifest.authorized_capabilities),
-                "required_capabilities": len(required),
-                "missing_required_capabilities": len(missing_required),
-                "parent_manifest_id": manifest.parent_manifest_id,
-            },
-        )
+        # Binding and its append-only evidence are one authority mutation.  The
+        # repository transaction is nestable, so this is also safe when launch
+        # already owns the surrounding process transaction.
+        with self.store.transaction():
+            manifest = self._insert_hashed_manifest(manifest)
+            missing_required = self._missing_required_capabilities(manifest)
+            self.audit.record(
+                actor=manifest.issued_by,
+                action="authority_manifest.bind",
+                target=f"process:{pid}",
+                decision={
+                    "manifest_id": manifest.manifest_id,
+                    "manifest_hash": manifest.manifest_hash,
+                    "image_id": image_id,
+                    "authorized_capabilities": len(manifest.authorized_capabilities),
+                    "required_capabilities": len(required),
+                    "missing_required_capabilities": len(missing_required),
+                    "parent_manifest_id": manifest.parent_manifest_id,
+                },
+            )
         return manifest
 
     def compile_root_capabilities(self, manifest: TaskAuthorityManifest) -> list[str]:
-        cap_ids: list[str] = []
-        for spec in self.bounded_capability_specs(manifest):
-            cap = self.capabilities.issue_trusted(
-                subject=manifest.pid,
-                resource=str(spec["resource"]),
-                rights=list(spec["rights"]),
-                issued_by=f"authority_manifest:{manifest.manifest_id}",
-                constraints=dict(spec.get("constraints") or {}),
-                expires_at=spec.get("expires_at"),
-                uses_remaining=spec.get("uses_remaining"),
-                delegable=bool(spec.get("delegable", False)),
-                revocable=bool(spec.get("revocable", True)),
-                max_delegation_depth=spec.get("max_delegation_depth"),
-                metadata={"authority_manifest_id": manifest.manifest_id},
+        if manifest.parent_manifest_id is not None:
+            raise ValidationError(
+                "derived authority manifests cannot be compiled as root capabilities"
             )
-            cap_ids.append(cap.cap_id)
+        specs = self.bounded_capability_specs(manifest)
+        cap_ids: list[str] = []
+        # A manifest compiles to one capability batch or none.  Normalization
+        # is deliberately complete before entering this transaction so a bad
+        # later spec cannot publish an earlier grant.
+        with self.store.transaction():
+            for spec in specs:
+                cap = self.capabilities.issue_trusted(
+                    subject=manifest.pid,
+                    resource=str(spec["resource"]),
+                    rights=list(spec["rights"]),
+                    issued_by=f"authority_manifest:{manifest.manifest_id}",
+                    constraints=dict(spec.get("constraints") or {}),
+                    expires_at=spec.get("expires_at"),
+                    uses_remaining=spec.get("uses_remaining"),
+                    delegable=spec["delegable"],
+                    revocable=spec["revocable"],
+                    max_delegation_depth=spec.get("max_delegation_depth"),
+                    metadata={"authority_manifest_id": manifest.manifest_id},
+                )
+                cap_ids.append(cap.cap_id)
         return cap_ids
 
     def bounded_capability_specs(
@@ -225,9 +252,12 @@ class AuthorityManifestManager:
     ) -> list[dict[str, Any]]:
         """Return declared grants with every lease capped by the manifest."""
 
+        # Normalize the complete batch before issuing the first capability so
+        # a malformed later entry cannot leave a partially compiled manifest.
+        normalized = self._normalize_specs(manifest.authorized_capabilities)
         selected: list[dict[str, Any]] = []
-        for raw_spec in manifest.authorized_capabilities:
-            spec = dict(raw_spec)
+        for normalized_spec in normalized:
+            spec = dict(normalized_spec)
             expires_at = self._bounded_expiry(
                 manifest.expires_at,
                 spec.get("expires_at"),
@@ -335,12 +365,16 @@ class AuthorityManifestManager:
         unhashed = replace(manifest, manifest_hash="")
         policy_schema_version = manifest.permitted_effects_policy_schema_version
         provenance = manifest.metadata.get(PERMITTED_EFFECTS_POLICY_PROVENANCE_KEY)
-        if policy_schema_version == PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION:
+        if (
+            type(policy_schema_version) is int
+            and policy_schema_version == PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION
+        ):
             valid = (
-                provenance == PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION
+                type(provenance) is int
+                and provenance == PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION
                 and self._hash(unhashed) == manifest.manifest_hash
             )
-        elif policy_schema_version == 1:
+        elif type(policy_schema_version) is int and policy_schema_version == 1:
             # Legacy rows predate the provenance marker and persisted the
             # logical list directly. Their empty list meant unrestricted. The
             # marker absence plus the decoded v1 storage shape is required;
@@ -519,12 +553,39 @@ class AuthorityManifestManager:
         A model permission request carries only resource, rights, and an expiry
         inherited from the matching ceiling.  Accept the canonical no-op values
         emitted by existing Host clients, but reject fields whose grant or lease
-        semantics cannot be propagated through that request path.
+        semantics cannot be propagated through that request path. Root-prefix
+        privileged ceilings are also invalid because the model request boundary
+        permanently rejects them before Human review.
         """
 
         raw_values = list(values) if isinstance(values, (list, tuple)) else values
+        if isinstance(raw_values, list):
+            for raw in raw_values:
+                if not isinstance(raw, dict):
+                    continue
+                if "uses_remaining" in raw:
+                    raise ValidationError(
+                        "requestable capability uses_remaining is not supported"
+                    )
+                if "max_delegation_depth" in raw:
+                    raise ValidationError(
+                        "requestable capability max_delegation_depth is not supported"
+                    )
         selected = self._normalize_specs(raw_values)
         for raw, spec in zip(raw_values, selected):
+            pattern = self.capabilities.parse_resource_pattern(spec["resource"])
+            privileged = sorted(
+                set(spec["rights"]) & _UNREQUESTABLE_ROOT_PREFIX_RIGHTS
+            )
+            if (
+                pattern.scope == ResourceScope.PREFIX
+                and not pattern.body
+                and privileged
+            ):
+                raise ValidationError(
+                    "requestable capability root-prefix authority cannot include "
+                    f"privileged rights: resource={spec['resource']} rights={privileged}"
+                )
             if "constraints" in raw and raw.get("constraints") != {}:
                 raise ValidationError(
                     "requestable capability constraints must be an empty object"
@@ -536,14 +597,6 @@ class AuthorityManifestManager:
             if spec.get("revocable") is not True:
                 raise ValidationError(
                     "requestable capability revocable must be true"
-                )
-            if "uses_remaining" in raw:
-                raise ValidationError(
-                    "requestable capability uses_remaining is not supported"
-                )
-            if "max_delegation_depth" in raw:
-                raise ValidationError(
-                    "requestable capability max_delegation_depth is not supported"
                 )
         return selected
 
@@ -560,9 +613,9 @@ class AuthorityManifestManager:
                 f"data_flow_policy contains unsupported fields: {unknown}"
             )
         schema_version = selected.get("schema_version", 1)
-        if schema_version != 1:
+        if type(schema_version) is not int or schema_version != 1:
             raise ValidationError(
-                f"unsupported data_flow_policy schema_version: {schema_version}"
+                "unsupported data_flow_policy schema_version"
             )
         return {
             "schema_version": 1,
@@ -636,24 +689,20 @@ class AuthorityManifestManager:
             "delegable": self._capability_boolean(value, "delegable", default=False),
             "revocable": self._capability_boolean(value, "revocable", default=True),
         }
-        if value.get("expires_at") is not None:
-            selected["expires_at"] = self._optional_expiry(
+        if "expires_at" in value:
+            selected["expires_at"] = self._required_expiry(
                 value["expires_at"],
                 "capability expires_at",
             )
-        if value.get("uses_remaining") is not None:
+        if "uses_remaining" in value:
             uses_remaining = value["uses_remaining"]
-            if (
-                isinstance(uses_remaining, bool)
-                or not isinstance(uses_remaining, int)
-                or uses_remaining < 1
-            ):
+            if type(uses_remaining) is not int or uses_remaining < 1:
                 raise ValidationError(
                     "capability uses_remaining must be a positive integer"
                 )
             selected["uses_remaining"] = uses_remaining
-        max_depth = value.get("max_delegation_depth")
-        if max_depth is not None:
+        if "max_delegation_depth" in value:
+            max_depth = value["max_delegation_depth"]
             if isinstance(max_depth, bool) or not isinstance(max_depth, int):
                 raise ValidationError("max_delegation_depth must be a non-negative integer")
             if max_depth < 0:
@@ -869,6 +918,16 @@ class AuthorityManifestManager:
             raise ValidationError(f"{label} must be an ISO-8601 datetime") from exc
         return selected
 
+    @classmethod
+    def _required_expiry(cls, value: Any, label: str) -> str:
+        if value is None:
+            raise ValidationError(
+                f"{label} must be an ISO-8601 datetime string"
+            )
+        selected = cls._optional_expiry(value, label)
+        assert selected is not None
+        return selected
+
     @staticmethod
     def _capability_boolean(
         value: Mapping[str, Any],
@@ -916,16 +975,18 @@ class AuthorityManifestManager:
 
     @staticmethod
     def _template_payload(manifest: TaskAuthorityManifest) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "authorized_capabilities": manifest.authorized_capabilities,
             "permitted_effects": manifest.permitted_effects,
             "resource_budget": manifest.resource_budget,
             "approval_policy": manifest.approval_policy,
             "data_flow_policy": manifest.data_flow_policy,
-            "expires_at": manifest.expires_at,
             "issued_by": manifest.issued_by,
             "metadata": manifest.metadata,
         }
+        if manifest.expires_at is not None:
+            payload["expires_at"] = manifest.expires_at
+        return payload
 
     @staticmethod
     def _hash(manifest: TaskAuthorityManifest) -> str:

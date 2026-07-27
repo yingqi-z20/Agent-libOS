@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from collections.abc import Sequence
 from typing import Any, Protocol
 
@@ -12,6 +13,10 @@ from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.models import AgentImage, LLMCallRecord, ProcessStatus, ResourceBudget
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 from agent_libos.utils.serde import to_jsonable
 
 if __package__:  # pragma: no branch - depends on module versus file execution
@@ -46,6 +51,12 @@ class ChatResponder(Protocol):
 
 
 def main() -> None:
+    # Redirected Windows consoles otherwise inherit a legacy code page and
+    # argparse can fail while rendering the documented Unicode exit words.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(
         description=("Run a traditional human/LLM chat loop through Agent libOS HumanObject tools: "
                      "ask_human for user input and human_output for assistant replies."))
@@ -117,7 +128,6 @@ async def run_chat(
         exit_words=exit_words,
     )
     runtime.llm.client = client
-    runtime.register_image(chat_image())
 
     def output_sink(message: str) -> None:
         outputs.append(message)
@@ -129,6 +139,10 @@ async def run_chat(
     if input_fn is not None:
         runtime.substrate.human.input_reader = input_fn
     try:
+        # A persistent Runtime reloads this fixed image identity. Replacing the
+        # same script-owned definition makes reruns idempotent while still
+        # exercising the normal image validation and publication path.
+        runtime.register_image(chat_image(), replace=True)
         pid = runtime.process.spawn(
             image=CHAT_IMAGE_ID,
             goal=CHAT_PROCESS_GOAL,
@@ -228,7 +242,20 @@ class ModelResponder:
         try:
             completion = self.client.complete_with_metadata(messages, json_mode=False)
         except Exception as exc:
-            self._record_llm_call(call_id=call_id, messages=messages, created_at=created_at, error=str(exc))
+            public_error = public_error_envelope(
+                exc,
+                code="llm_provider_error",
+            )
+            self._record_llm_call(
+                call_id=call_id,
+                messages=messages,
+                created_at=created_at,
+                error=public_error["message"],
+                internal_error=internal_exception_observation(
+                    exc,
+                    correlation_id=public_error["correlation_id"],
+                ),
+            )
             raise
         self._record_llm_call(call_id=call_id, messages=messages, created_at=created_at, completion=completion)
         return completion.content
@@ -241,6 +268,7 @@ class ModelResponder:
         created_at: str,
         completion: LLMCompletion | None = None,
         error: str | None = None,
+        internal_error: dict[str, Any] | None = None,
     ) -> None:
         if self._runtime is None:
             return
@@ -251,8 +279,12 @@ class ModelResponder:
             tool_calls=completion.tool_calls if completion else [],
             reasoning=completion.reasoning if completion else None,
             raw_response=completion.raw if completion else None,
+            error=error,
             config=self._runtime.config,
         )
+        observability = dict(observable_fields["observability"])
+        if internal_error is not None:
+            observability["failure"] = {"internal_error": internal_error}
         self._runtime.store.insert_llm_call(
             LLMCallRecord(
                 call_id=call_id,
@@ -276,8 +308,8 @@ class ModelResponder:
                 reasoning=observable_fields["reasoning"],
                 usage=completion.usage if completion else {},
                 raw_response=observable_fields["raw_response"],
-                observability=observable_fields["observability"],
-                error=error,
+                observability=observability,
+                error=observable_fields["error"],
                 created_at=created_at,
                 completed_at=utc_now(),
             )

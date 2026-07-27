@@ -61,7 +61,7 @@ The implementation currently includes:
   uses optional `pywinpty`/ConPTY, has no Job Object or wall/CPU/RSS supervisor,
   and rejects a budgeted spawn that supplies `SubprocessLimits`. Install the
   optional `pty` extra from a source checkout/source distribution; the module
-  itself is not included in the core wheel. See [docs/modules.md](docs/modules.md).
+  itself is not included in the core wheel. See [docs/modules.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/modules.md).
 - Durable process message queues for IPC, including interrupt delivery.
 - Object-bound background tool tasks that can notify processes through the
   same durable message queues, including optional owner-change watches, without
@@ -85,11 +85,11 @@ The implementation currently includes:
   Unmatched Sinks are untrusted/normal; Host-trusted Sinks accept data only
   within sensitivity and tenant/principal clearance, while conditional
   high-sensitivity sends require an exact one-shot release. See
-  [docs/data_flow.md](docs/data_flow.md).
+  [docs/data_flow.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/data_flow.md).
 - Durable Host-authored Task Authority Manifests that compile launch authority,
   budgets, approval policy, and effect ceilings while treating image
   `required_capabilities` as declarations only. See
-  [docs/task_authority_manifest.md](docs/task_authority_manifest.md).
+  [docs/task_authority_manifest.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/task_authority_manifest.md).
 - A Resource Provider Substrate for injectable filesystem, clock, shell, and
   human I/O backends, a pinned system-Git provider exposed as `Runtime.git`,
   plus JSON-RPC over HTTP and MCP client providers for pre-registered remote
@@ -145,91 +145,91 @@ The implementation currently includes:
 
 Start here, then read the deeper references as needed:
 
-- [docs/release_status.md](docs/release_status.md): current-version readiness,
+- [docs/release_status.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/release_status.md): current-version readiness,
   validation outcomes, and remaining environment boundaries.
-- [docs/python_api.md](docs/python_api.md): public Python imports, Runtime
+- [docs/python_api.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/python_api.md): public Python imports, Runtime
   lifecycle, manager properties, sync/async usage, exceptions, and
   compatibility boundaries.
-- [docs/architecture.md](docs/architecture.md): runtime layers, provider
+- [docs/architecture.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/architecture.md): runtime layers, provider
   substrate, and the tool/primitive boundary.
-- [docs/threat_model.md](docs/threat_model.md): assets, adversaries, TCB,
+- [docs/threat_model.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/threat_model.md): assets, adversaries, TCB,
   trust boundaries, guarantees, non-goals, and severity calibration.
-- [docs/runtime_model.md](docs/runtime_model.md): process lifecycle, scheduler,
+- [docs/runtime_model.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/runtime_model.md): process lifecycle, scheduler,
   cwd, human queue, IPC, fork/spawn/exec, and waits.
-- [docs/explainable_operations.md](docs/explainable_operations.md): operation
+- [docs/explainable_operations.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/explainable_operations.md): operation
   trees, evidence completeness, Context Manifests, redaction, CLI, and GUI/API
   queries.
-- [docs/protected_operation_sdk.md](docs/protected_operation_sdk.md): stable
+- [docs/protected_operation_sdk.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/protected_operation_sdk.md): stable
   provider-operation contracts, phases, failure semantics, evidence, and
   extension examples.
-- [docs/providers.md](docs/providers.md): provider inventory, authority/effect
+- [docs/providers.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/providers.md): provider inventory, authority/effect
   contracts, containment limits, and extension checklist.
-- [docs/git.md](docs/git.md): the typed `Runtime.git` provider/primitive,
+- [docs/git.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/git.md): the typed `Runtime.git` provider/primitive,
   model tools, state tokens, capabilities, hardening, remotes, patch Objects,
   managed worktrees, and simulated pull requests.
-- [docs/capabilities.md](docs/capabilities.md): resource naming, rights,
+- [docs/capabilities.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/capabilities.md): resource naming, rights,
   one-shot grants, human approval, shell policy, and filesystem containment.
-- [docs/data_flow.md](docs/data_flow.md): label integrity, Host Sink trust,
+- [docs/data_flow.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/data_flow.md): label integrity, Host Sink trust,
   exact release, exit coverage, process identity domains, persistence, and
   guarantee boundaries.
-- [docs/object_memory.md](docs/object_memory.md): namespaces, object rights,
+- [docs/object_memory.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/object_memory.md): namespaces, object rights,
   file/object bridge, context materialization, and payload persistence.
-- [docs/tools_and_jit.md](docs/tools_and_jit.md): built-in tools,
+- [docs/tools_and_jit.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/tools_and_jit.md): built-in tools,
   ToolBroker, Deno/TypeScript JIT tools, syscall protocol, and sandbox rules.
-- [docs/modules.md](docs/modules.md): trusted startup Runtime Module
+- [docs/modules.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/modules.md): trusted startup Runtime Module
   manifests, trust model, registration surfaces, CLI, and checkpoint behavior.
-- [docs/jsonrpc.md](docs/jsonrpc.md): client-only JSON-RPC endpoint registry,
+- [docs/jsonrpc.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/jsonrpc.md): client-only JSON-RPC endpoint registry,
   capability resources, tools, syscalls, and checkpoint behavior.
-- [docs/mcp.md](docs/mcp.md): client-only MCP server registry, tools-only v1
+- [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md): client-only MCP server registry, tools-only v1
   scope, capability resources, tools, syscalls, and checkpoint behavior.
-- [docs/skills.md](docs/skills.md): standard `SKILL.md` packages,
+- [docs/skills.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/skills.md): standard `SKILL.md` packages,
   workspace/global sources, trust, activate/unload semantics, bundled JIT
   tools, and `swe-agent`.
-- [docs/checkpoints.md](docs/checkpoints.md): scoped snapshots, restore, fork,
+- [docs/checkpoints.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/checkpoints.md): scoped snapshots, restore, fork,
   replay diagnostics, retained runtime history, and external-effect reporting.
-- [docs/storage.md](docs/storage.md): transaction rollback/poison semantics,
+- [docs/storage.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/storage.md): transaction rollback/poison semantics,
   Object payload durability, schema recovery, and active-runtime leases.
-- [docs/evidence_payload_retention.md](docs/evidence_payload_retention.md):
+- [docs/evidence_payload_retention.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/evidence_payload_retention.md):
   explicit, auditable LLM/external-effect payload retention tiers and safety
   exclusions.
-- [docs/configuration.md](docs/configuration.md): load precedence, field-level
+- [docs/configuration.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/configuration.md): load precedence, field-level
   config inventory, secrets, and bounded-window defaults.
-- [docs/cli.md](docs/cli.md): stable CLI command reference and examples.
-- [docs/gui.md](docs/gui.md): Electron desktop console, local GUI server,
+- [docs/cli.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/cli.md): stable CLI command reference and examples.
+- [docs/gui.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/gui.md): Electron desktop console, local GUI server,
   HTTP/SSE APIs, same-build contract boundary, and development commands.
-- [docs/gui_api_schema.json](docs/gui_api_schema.json): versioned JSON Schema
+- [docs/gui_api_schema.json](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/gui_api_schema.json): versioned JSON Schema
   subset for snapshots, errors, and confirmed high-risk GUI mutations.
-- [docs/benchmark.md](docs/benchmark.md): runtime-safety and practical-workflow
+- [docs/benchmark.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/benchmark.md): runtime-safety and practical-workflow
   evaluation contracts, scale gates, outputs, and metrics.
-- [docs/mini_swe_agent_image.md](docs/mini_swe_agent_image.md): package-only
+- [docs/mini_swe_agent_image.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mini_swe_agent_image.md): package-only
   `mini-swe-agent` image behavior and known interface differences.
-- [docs/development.md](docs/development.md): setup, tests, real LLM smoke,
+- [docs/development.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/development.md): setup, tests, real LLM smoke,
   configuration defaults, and contribution rules.
-- [docs/support_matrix.md](docs/support_matrix.md): declared support, CI-covered
+- [docs/support_matrix.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/support_matrix.md): declared support, CI-covered
   environments, and explicit platform/provider release gates.
-- [docs/invariants.md](docs/invariants.md): current invariant-to-test map.
-- [docs/artifact_anonymity.md](docs/artifact_anonymity.md): anonymous artifact
+- [docs/invariants.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/invariants.md): current invariant-to-test map.
+- [docs/artifact_anonymity.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/artifact_anonymity.md): anonymous artifact
   hygiene checklist.
-- [docs/paper_thesis.md](docs/paper_thesis.md): current paper thesis and
+- [docs/paper_thesis.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/paper_thesis.md): current paper thesis and
   non-goals.
-- [benchmarks/runtime_safety/schema.md](benchmarks/runtime_safety/schema.md):
+- [benchmarks/runtime_safety/schema.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/benchmarks/runtime_safety/schema.md):
   benchmark task schema v1 and run-output schema v2.
-- [benchmarks/external_effect_recovery/README.md](benchmarks/external_effect_recovery/README.md):
+- [benchmarks/external_effect_recovery/README.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/benchmarks/external_effect_recovery/README.md):
   100k CI and one-million-record external-effect recovery scale profiles.
-- [benchmarks/runtime_publication_recovery/README.md](benchmarks/runtime_publication_recovery/README.md):
+- [benchmarks/runtime_publication_recovery/README.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/benchmarks/runtime_publication_recovery/README.md):
   10k CI runtime-publication reopen and reconciliation scale gate.
-- [benchmarks/practical_agent_workflows/README.md](benchmarks/practical_agent_workflows/README.md):
+- [benchmarks/practical_agent_workflows/README.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/benchmarks/practical_agent_workflows/README.md):
   native-live and modeled practical-workflow evidence contract and report
   schema.
-- [benchmarks/builtin_tool_skills/README.md](benchmarks/builtin_tool_skills/README.md):
+- [benchmarks/builtin_tool_skills/README.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/benchmarks/builtin_tool_skills/README.md):
   opt-in paid paired evaluation of Skill projection versus the full tool schema.
-- [benchmarks/long_horizon_agent/README.md](benchmarks/long_horizon_agent/README.md):
+- [benchmarks/long_horizon_agent/README.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/benchmarks/long_horizon_agent/README.md):
   opt-in paid long-horizon evaluation across restart, follow-up messages, and
   prompt-injection pressure.
-- [experiments/agentdojo/README.md](experiments/agentdojo/README.md): isolated
+- [experiments/agentdojo/README.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/experiments/agentdojo/README.md): isolated
   AgentDojo harness, its frozen Python 3.11–3.12 environment, deterministic CI
   scope, and opt-in real-model evaluation workflow.
-- [AGENTS.md](AGENTS.md): repository structure, testing, security, and
+- [AGENTS.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/AGENTS.md): repository structure, testing, security, and
   contribution guidance for local agents and contributors.
 
 ### Historical references (not current contracts)
@@ -237,11 +237,11 @@ Start here, then read the deeper references as needed:
 These files are retained for design and project history. Do not use them to
 infer current commands, interfaces, security guarantees, or release evidence:
 
-- [agent_libos_design_doc.md](agent_libos_design_doc.md): historical design
+- [agent_libos_design_doc.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/agent_libos_design_doc.md): historical design
   archive containing planned and superseded interfaces.
-- [plan.md](plan.md): dated paper-submission roadmap, not an implementation
+- [plan.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/plan.md): dated paper-submission roadmap, not an implementation
   reference.
-- [docs/prelaunch_hardening_report.md](docs/prelaunch_hardening_report.md):
+- [docs/prelaunch_hardening_report.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/prelaunch_hardening_report.md):
   historical, source-bound subsystem review and validation snapshot, not the
   current release-status source.
 
@@ -249,7 +249,7 @@ infer current commands, interfaces, security guarantees, or release evidence:
 
 Prerequisites are Python 3.11–3.14 and [uv](https://docs.astral.sh/uv/). The
 typed Git provider and full test matrix require system Git 2.26 or newer. GUI
-development requires Node `^20.19.0` or `>=22.12.0` and npm 8 or newer; CI uses
+development requires Node `>=22.12.0` and npm 8 or newer; CI uses
 Node 24. Deno is optional unless running real TypeScript/JIT coverage.
 
 Install dependencies:
@@ -275,8 +275,16 @@ Skills, Images, and configuration through their normal explicit paths.
 Build and validate both release artifacts with:
 
 ```bash
-uv build --clear --out-dir dist
-uv run python scripts/check_release_artifacts.py dist
+uv sync --frozen --no-dev --group release
+uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
+.venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
+uv run --frozen --no-dev --group release twine check \
+  dist/agent_libos-1.0.0-py3-none-any.whl dist/agent_libos-1.0.0.tar.gz
+uv run --frozen --no-dev --group release check-wheel-contents \
+  dist/agent_libos-1.0.0-py3-none-any.whl
+.venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
+uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
+uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
 ```
 
 Validate the installed console entrypoints from an artifact, rather than only
@@ -284,7 +292,10 @@ from the source checkout, in a disposable environment:
 
 ```bash
 uv venv /tmp/agent-libos-wheel-check
-uv pip install --python /tmp/agent-libos-wheel-check/bin/python dist/*.whl
+uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
+  --require-hashes -r runtime-requirements.txt
+uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
+  --no-deps dist/agent_libos-1.0.0-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -292,7 +303,12 @@ uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/agent-libos-migrate-tool-groups --help
 
 uv venv /tmp/agent-libos-sdist-check
-uv pip install --python /tmp/agent-libos-sdist-check/bin/python dist/*.tar.gz
+uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
+  --require-hashes -r runtime-requirements.txt
+uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
+  --require-hashes -r release-build-requirements.txt
+uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
+  --no-deps --no-build-isolation dist/agent_libos-1.0.0.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -320,7 +336,7 @@ The default is a complete transactionally rolled-back dry run; startup never
 runs this content migration automatically. If the report is correct, repeat the
 same command with `--apply` to commit it. Pass `--config <path>` for a
 non-default config overlay or supply a PostgreSQL URI in place of the SQLite
-path. See [Tool Broker, Skills, and JIT Tools](docs/tools_and_jit.md#on-demand-tool-skills)
+path. See [Tool Broker, Skills, and JIT Tools](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/tools_and_jit.md#on-demand-tool-skills)
 for conversion rules and immutable-artifact behavior.
 
 Run tests:
@@ -407,8 +423,8 @@ it, so it remains archival evidence only.
 The two rate denominators are qualified effect populations, not task counts,
 and missing/unknown evidence invalidates rates instead of being inferred from
 `result.ok`. The ignored artifact must be packaged separately. See the
-[current release status](docs/release_status.md) and
-[benchmark contract](docs/benchmark.md).
+[current release status](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/release_status.md) and
+[benchmark contract](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/benchmark.md).
 
 Run the practical workflow evidence suite separately:
 
@@ -461,7 +477,7 @@ cannot be reconstructed are released fail-closed on reopen instead of being
 treated as real payloads. An accepted legacy row from an older development
 build may still contain full JSON payload data; migrate or recreate such a
 store before claiming marker-only historical retention. See
-[docs/storage.md](docs/storage.md#transaction-model).
+[docs/storage.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/storage.md#transaction-model).
 Persistent stores take an active-runtime lease: SQLite uses a secure sidecar
 `flock` where available or an exclusive database lock as fallback, and
 PostgreSQL uses a session advisory lock. Two writable `Runtime` instances
@@ -469,16 +485,20 @@ cannot concurrently open the same store. Closing the first runtime releases the
 lease and permits a later reopen.
 
 SQLite resolves both its connection and lease from the canonical database
-path. On platforms with `fcntl` and `O_NOFOLLOW`, the sidecar is opened
-no-follow, verified as the same regular-file inode before use, and protected by
-`flock`. On that secure POSIX path, the database, lease, journal, WAL, and SHM
-files are created or tightened owner-only (`0600`). Where that path is
-unavailable, SQLite uses its kernel-managed exclusive database lock instead of
-trusting a stale sidecar. PostgreSQL advisory keys are scoped to the current
-database and schema. Store transactions also fail closed: commit or
-savepoint-release failure triggers rollback, and a rollback failure poisons and
-closes the store rather than allowing further reads or writes. See
-[docs/storage.md](docs/storage.md).
+path. On the hardened POSIX path, a no-follow path-sidecar `flock` is paired
+with an owner-only identity lease keyed by the validated database
+`(st_dev, st_ino)`. The database, lease, identity-lease, journal, WAL, and SHM
+files must be regular, current-user-owned, single-link files and are tightened
+to `0600`; this rejects hard-link aliases and path/lockfile replacement. Where
+that mechanism is unavailable, SQLite uses its kernel-managed exclusive
+database lock without claiming the POSIX path/inode guarantees. PostgreSQL
+advisory keys are scoped to the current database and schema. Store transactions
+also fail closed: an ordinary statement/savepoint failure rolls back while the
+transaction is still active. If commit or savepoint release has an uncertain
+outcome, the Runtime does not invent a rollback; it poisons and closes the
+store unless a narrow typed backend confirmation proves the outcome. A failed
+rollback also poisons and closes the store. See
+[docs/storage.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/storage.md).
 
 Omitting `--max-quanta` uses `runtime.run_until_idle_max_quanta`. Its default
 `null` value runs until the Runtime becomes idle; configure that setting or pass
@@ -511,7 +531,7 @@ retention maintenance API can later reduce eligible terminal rows through
 content-free summary and hash-only tiers. It is disabled by default, never runs
 during startup, and never trims the active `image_only` transcript head,
 compatible Responses-continuation anchors, or process-result recovery payloads.
-See [Evidence and LLM Payload Retention](docs/evidence_payload_retention.md).
+See [Evidence and LLM Payload Retention](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/evidence_payload_retention.md).
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
@@ -558,7 +578,7 @@ then `llm.default_profile_id`; exec and child creation otherwise retain or
 inherit the current process profile. Non-default named profiles do not inherit
 ambient endpoint, model, or provider-policy `OPENAI_*` values, so declare those
 fields explicitly. Every profile reads its API key only from `api_key_env`. See
-[Configuration Reference](docs/configuration.md#effective-llm-profile-precedence)
+[Configuration Reference](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/configuration.md#effective-llm-profile-precedence)
 for the exact precedence and supported fields.
 
 The Runtime and generic CLI do not implicitly load a workspace `.env`. If these
@@ -579,6 +599,11 @@ Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`,
 `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific
 `OPENAI_ENABLE_THINKING`.
 
+When the SDK exhausts retries for a timeout, connection failure, rate limit, or
+retryable provider status, the Runtime records the failed call and pauses the
+process for explicit Host resume instead of discarding its durable progress.
+Configuration, protocol, and non-retryable provider errors still fail closed.
+
 Provider-side Responses storage/chaining policy is opt-in: the defaults remain
 `store=false` and `responses_previous_response_id=false`. The current
 AgentProcess executor nevertheless stays stateless when those settings are
@@ -593,7 +618,7 @@ provider-side state: Responses receives `function_call`/
 `function_call_output` items, while Chat receives assistant/tool messages.
 Durable waiting actions remain protected by per-generation resume tokens
 and non-replayable claims. See
-[docs/development.md](docs/development.md#real-llm-smoke).
+[docs/development.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/development.md#real-llm-smoke).
 
 ## Common CLI Examples
 
@@ -630,7 +655,8 @@ Register and activate the SWE-Agent style Skill:
 ```bash
 uv run agent-libos --db .agent_libos.sqlite skills validate skills/swe-agent
 uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills discover --text swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent --expected-package-sha256 <package_sha256-from-discover>
 ```
 
 Register and call a preconfigured JSON-RPC endpoint:
@@ -642,7 +668,7 @@ uv run agent-libos --db .agent_libos.sqlite jsonrpc call <pid> demo-weather fore
 ```
 
 Create the manifest from the complete schema/example in
-[docs/jsonrpc.md](docs/jsonrpc.md); the angle-bracket path is a user-supplied
+[docs/jsonrpc.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/jsonrpc.md); the angle-bracket path is a user-supplied
 file, not a file shipped at the repository root.
 
 Register and call a preconfigured MCP tool:
@@ -657,7 +683,7 @@ uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mc
 uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
 ```
 
-Create the manifest from [docs/mcp.md](docs/mcp.md); the angle-bracket path is
+Create the manifest from [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md); the angle-bracket path is
 user supplied. The `mcp` extra is not installed by the core Quick Start command.
 
 The `process:spawn` and exact `mcp_stdio:<sha256>` grants are required only for
@@ -689,7 +715,7 @@ On Windows PowerShell:
 uv run python scripts\run_coding_agent.py --workspace ..\some-repo --goal "Summarize the current project"
 ```
 
-See [docs/cli.md](docs/cli.md) for the full command reference.
+See [docs/cli.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/cli.md) for the full command reference.
 
 ## Core Invariants
 
@@ -748,10 +774,15 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   Finite-use object rights for write/resize/close are reserved until the PTY
   provider boundary is known to have started. Automatic child-exit cleanup
   persists a close intent before reading exit state or closing the handle.
-  Runtime shutdown or object release closes the host PTY, and a failed
-  post-spawn setup closes the handle and removes the object before returning
-  failure. PTY fork drops `EXTERNAL_REF` handles rather than cloning provider
-  resources.
+  Runtime shutdown or object release closes the host PTY. A failed post-spawn
+  setup first removes the public session key, then attempts a protected close
+  and a best-effort deletion of the public Object regardless of the close
+  result. If close or Object deletion fails, the Runtime retains any
+  unconfirmed live handle under a stopped, Host-only orphan key so
+  shutdown/recovery can retry cleanup; even a stale Object left by deletion
+  failure cannot address that handle, and the failed create does not transfer a
+  usable session to the caller. PTY fork
+  drops `EXTERNAL_REF` handles rather than cloning provider resources.
 - `process.exit` and `process.exec` are ordinary syscalls from TypeScript. The
   runtime applies lifecycle changes after the JIT tool returns its normal tool
   result.
@@ -796,7 +827,7 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   deployments needing independent integrity must add signed or remote
   append-only evidence outside that trust boundary.
 
-See [docs/invariants.md](docs/invariants.md) for test coverage.
+See [docs/invariants.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/invariants.md) for test coverage.
 
 ## Development
 
@@ -833,7 +864,7 @@ checkpoint defaults. Optional modules such as `modules/pty` keep their own
 module-local settings outside `AgentLibOSConfig`.
 `AgentLibOSConfig` is validated at construction time, so invalid or inverted
 bounds fail before a Runtime starts.
-See [docs/configuration.md](docs/configuration.md) for precedence and the
+See [docs/configuration.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/configuration.md) for precedence and the
 field-level inventory, including MCP and bounded event-window settings.
 
 Add runtime dependencies with `uv add <package>` and development dependencies

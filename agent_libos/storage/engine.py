@@ -42,6 +42,9 @@ def split_sql_script(script: str) -> list[str]:
 class SqlSession(Protocol):
     """Small backend-neutral cursor contract used by SQL repositories."""
 
+    def close(self) -> None:
+        ...
+
     @property
     def rowcount(self) -> int:
         ...

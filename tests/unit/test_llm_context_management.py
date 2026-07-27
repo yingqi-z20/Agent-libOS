@@ -13,6 +13,7 @@ from agent_libos.llm.context_management import (
     estimate_request_input_tokens,
     provider_usage_lower_bound,
 )
+from agent_libos.llm.usage import LLM_USAGE_COUNTER_MAX
 from agent_libos.models.exceptions import ValidationError
 
 
@@ -136,6 +137,41 @@ def test_responses_chain_uses_previous_total_usage_as_lower_bound() -> None:
         context_generation="generation-1",
         previous_response_id="response-1",
     ) == 950
+
+
+def test_responses_chain_ignores_out_of_range_provider_usage() -> None:
+    call = SimpleNamespace(
+        api="responses",
+        response_id="response-1",
+        request_options={
+            "llm_profile_id": "coding",
+            "llm_context_generation": "generation-1",
+        },
+        usage={"total_tokens": 10**400},
+    )
+
+    assert provider_usage_lower_bound(
+        call,
+        profile_id="coding",
+        context_generation="generation-1",
+        previous_response_id="response-1",
+    ) == 0
+
+    call.usage = {"total_tokens": float("inf")}
+    assert provider_usage_lower_bound(
+        call,
+        profile_id="coding",
+        context_generation="generation-1",
+        previous_response_id="response-1",
+    ) == 0
+
+    call.usage = {"total_tokens": LLM_USAGE_COUNTER_MAX}
+    assert provider_usage_lower_bound(
+        call,
+        profile_id="coding",
+        context_generation="generation-1",
+        previous_response_id="response-1",
+    ) == LLM_USAGE_COUNTER_MAX
 
 
 def test_responses_chain_adds_retained_history_to_new_request() -> None:

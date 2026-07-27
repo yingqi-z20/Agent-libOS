@@ -31,6 +31,8 @@ from agent_libos_dojo.pipeline import (
 )
 from agent_libos_dojo.runner import (
     ARMS,
+    LOGICAL_MODEL_INVOCATION_UNIT,
+    MAX_QUERY_INVOCATIONS_PER_TRAJECTORY,
     PlannedCase,
     RunOptions,
     _agent_libos_source_entries,
@@ -46,6 +48,20 @@ from agent_libos_dojo.runner import (
     run,
     verify_run,
 )
+
+
+def _logical_model_bound_metadata(max_per_query: int = 16) -> dict[str, Any]:
+    return {
+        "max_quanta": max_per_query,
+        "max_query_invocations_per_trajectory": (
+            MAX_QUERY_INVOCATIONS_PER_TRAJECTORY
+        ),
+        "logical_model_invocation_unit": LOGICAL_MODEL_INVOCATION_UNIT,
+        "max_logical_model_invocations_per_query": max_per_query,
+        "max_logical_model_invocations_per_trajectory": (
+            max_per_query * MAX_QUERY_INVOCATIONS_PER_TRAJECTORY
+        ),
+    }
 
 
 class MiniEnv(TaskEnvironment):
@@ -414,6 +430,7 @@ def test_ambient_pipeline_supports_agentdojo_empty_output_retry(tmp_path) -> Non
     assert get_text_content_as_str(second[3][-1].get("content") or []) == ""
     assert env.value == 1
     assert pipeline.last_run["query_invocation_count"] == 2
+    assert pipeline.last_run["logical_model_invocation_count"] == 4
     assert pipeline.last_run["provider_call_count"] == 4
     assert pipeline.last_run["tool_call_count"] == 4
     assert pipeline.last_run["executed_tool_call_count"] == 2
@@ -423,7 +440,34 @@ def test_ambient_pipeline_supports_agentdojo_empty_output_retry(tmp_path) -> Non
         "query-001",
         "query-002",
     ]
-    assert _query_evidence_valid(pipeline.last_run)
+    assert [
+        request["query_invocation"]
+        for request in pipeline.last_run["logical_model_requests"]
+    ] == [1, 1, 2, 2]
+    assert _query_evidence_valid(
+        pipeline.last_run,
+        max_query_invocations=3,
+        max_logical_model_invocations_per_query=2,
+        max_logical_model_invocations_per_trajectory=6,
+    )
+    assert not _query_evidence_valid(
+        pipeline.last_run,
+        max_query_invocations=1,
+        max_logical_model_invocations_per_query=2,
+        max_logical_model_invocations_per_trajectory=2,
+    )
+    assert not _query_evidence_valid(
+        pipeline.last_run,
+        max_query_invocations=3,
+        max_logical_model_invocations_per_query=1,
+        max_logical_model_invocations_per_trajectory=3,
+    )
+    assert not _query_evidence_valid(
+        pipeline.last_run,
+        max_query_invocations=3,
+        max_logical_model_invocations_per_query=2,
+        max_logical_model_invocations_per_trajectory=3,
+    )
 
 
 def test_control_pipeline_retains_every_query_and_first_query_tool_evidence() -> None:
@@ -473,6 +517,7 @@ def test_control_pipeline_retains_every_query_and_first_query_tool_evidence() ->
     assert get_text_content_as_str(first[3][-1].get("content") or []) == ""
     assert get_text_content_as_str(second[3][-1].get("content") or []) == "done"
     assert pipeline.last_run["query_invocation_count"] == 2
+    assert pipeline.last_run["logical_model_invocation_count"] == 3
     assert pipeline.last_run["provider_call_count"] == 3
     assert pipeline.last_run["usage"]["total_tokens"] == 15
     assert [
@@ -491,6 +536,12 @@ def test_control_pipeline_retains_every_query_and_first_query_tool_evidence() ->
     corrupted["query_runs"][0]["usage"]["total_tokens"] = 4
     corrupted["usage"]["total_tokens"] = 14
     assert not _query_evidence_valid(corrupted)
+    corrupted = copy.deepcopy(pipeline.last_run)
+    corrupted["query_runs"][0]["logical_model_invocation_count"] = 1
+    assert not _query_evidence_valid(corrupted)
+    corrupted = copy.deepcopy(pipeline.last_run)
+    corrupted["logical_model_requests"][0]["message_roles"] = ["tampered"]
+    assert not _query_evidence_valid(corrupted)
     assert _injection_exposed(
         pipeline.last_run,
         {"marker": "AGENTDOJO_QUERY_ONE_INJECTION_MARKER"},
@@ -503,6 +554,81 @@ def test_control_pipeline_retains_every_query_and_first_query_tool_evidence() ->
             "error": None,
         }
     ]
+
+
+def test_query_evidence_rejects_more_than_three_agentdojo_queries() -> None:
+    runtime = FunctionsRuntime()
+    client = ScriptedControlClient(
+        [
+            LLMCompletion(
+                content="done",
+                tool_calls=[],
+                model="scripted-model",
+                usage={"total_tokens": 1},
+            )
+            for _ in range(4)
+        ]
+    )
+    pipeline = ControlPipeline(
+        client=client,
+        system_message="Synthetic AgentDojo system message.",
+        max_output_tokens=128,
+        max_tool_iterations=1,
+    )
+
+    try:
+        for _ in range(4):
+            pipeline.query("Finish.", runtime)
+    finally:
+        pipeline.close()
+
+    assert pipeline.last_run["query_invocation_count"] == 4
+    assert _query_evidence_valid(pipeline.last_run, max_query_invocations=4)
+    assert not _query_evidence_valid(pipeline.last_run)
+
+
+def test_logical_invocation_count_does_not_expand_internal_client_retries() -> None:
+    class InternallyRetryingClient(LLMClient):
+        transport_attempts = 0
+
+        def complete_action(
+            self,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            temperature: float | None = None,
+            max_tokens: int | None = None,
+            previous_response_id: str | None = None,
+            parallel_tool_calls: bool | None = None,
+        ) -> LLMCompletion:
+            del messages, tools, temperature, max_tokens, previous_response_id
+            del parallel_tool_calls
+            # Simulate retry/fallback work encapsulated by one LLMClient call.
+            self.transport_attempts += 3
+            return LLMCompletion(
+                content="done",
+                tool_calls=[],
+                model="scripted-model",
+                usage={"total_tokens": 1},
+            )
+
+    runtime = FunctionsRuntime()
+    client = InternallyRetryingClient(model="scripted-model", api_key="not-used")
+    pipeline = ControlPipeline(
+        client=client,
+        system_message="Synthetic AgentDojo system message.",
+        max_output_tokens=128,
+        max_tool_iterations=1,
+    )
+
+    try:
+        pipeline.query("Finish.", runtime)
+    finally:
+        pipeline.close()
+
+    assert client.transport_attempts == 3
+    assert pipeline.last_run["logical_model_invocation_count"] == 1
+    assert pipeline.last_run["provider_call_count"] == 1
+    assert _query_evidence_valid(pipeline.last_run)
 
 
 def test_tool_outcome_metrics_pair_failures_and_suppressed_calls_by_fingerprint() -> None:
@@ -633,6 +759,33 @@ def test_default_pilot_is_24_paired_cases_and_uses_existing_slack_injection(tmp_
         assert case.ordinal == ordinal
 
 
+def test_dry_run_reports_harness_logical_model_invocation_limits(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli_main(
+        [
+            "run",
+            "--output",
+            str(tmp_path / "dry-run"),
+            "--max-quanta",
+            "7",
+            "--dry-run",
+        ]
+    )
+
+    projection = json.loads(capsys.readouterr().out)
+    assert projection["max_query_invocations_per_trajectory"] == 3
+    assert projection["logical_model_invocation_unit"] == (
+        "harness_complete_action_call"
+    )
+    assert projection["max_logical_model_invocations_per_query"] == 7
+    assert projection["max_logical_model_invocations_per_trajectory"] == 21
+    assert projection["max_output_tokens_per_logical_model_invocation"] == 4096
+    assert "max_output_tokens_per_call" not in projection
+    assert not any(key.startswith("max_provider_calls_per_") for key in projection)
+
+
 def test_case_limit_rejects_zero_and_partial_arm_group(tmp_path) -> None:
     options = RunOptions(output_dir=tmp_path / "out", env_file=tmp_path / ".env")
 
@@ -651,6 +804,17 @@ def test_case_limit_rejects_zero_and_partial_arm_group(tmp_path) -> None:
     )
     assert len(diagnostic) == 1
     assert diagnostic[0].arm == "upstream_control"
+
+    bounded = plan_pilot(
+        replace(
+            options,
+            arms=("upstream_control",),
+            repetitions=1_000_000_000,
+            case_limit=1,
+        )
+    )
+    assert len(bounded) == 1
+    assert bounded[0].repetition == 1
 
     with pytest.raises(SystemExit) as captured:
         cli_main(
@@ -894,6 +1058,22 @@ def test_metadata_binds_editable_agent_libos_source(
     assert metadata["effective_llm_config_sha256"] == _sha256_json(
         metadata["effective_llm_config"]
     )
+    assert metadata["max_quanta"] == 16
+    assert metadata["max_query_invocations_per_trajectory"] == 3
+    assert metadata["logical_model_invocation_unit"] == (
+        "harness_complete_action_call"
+    )
+    assert metadata["max_logical_model_invocations_per_query"] == 16
+    assert metadata["max_logical_model_invocations_per_trajectory"] == 48
+    assert metadata["max_output_tokens_per_logical_model_invocation"] == 4096
+    assert "max_output_tokens_per_call" not in metadata
+    assert (
+        metadata["effective_llm_config"][
+            "max_output_tokens_per_logical_model_invocation"
+        ]
+        == 4096
+    )
+    assert not any(key.startswith("max_provider_calls_per_") for key in metadata)
 
     env_file.write_text(
         "OPENAI_LANGUAGE_MODEL=test-model\n"
@@ -952,6 +1132,10 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
         "OPENAI_BASE_URL=https://example.invalid/v1\n",
         encoding="utf-8",
     )
+    environment_snapshot = capture_explicit_dotenv_environment(
+        env_file,
+        config=evaluation_config(max_output_tokens=32),
+    )
     raw_tool = {
         "type": "function",
         "function": {
@@ -1001,6 +1185,7 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
             "target_tool_names": ["synthetic_tool"],
             "target_tool_name_attempted": False,
             "attempted_tool_names": [],
+            "logical_model_invocation_count": 1,
             "provider_call_count": 1,
             "tool_call_count": 0,
             "executed_tool_call_count": 0,
@@ -1062,6 +1247,7 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
                     "query_runs": [
                         {
                             "query_invocation": 1,
+                            "logical_model_invocation_count": 1,
                             "provider_call_count": 1,
                             "tool_call_count": 0,
                             "executed_tool_call_count": 0,
@@ -1074,6 +1260,13 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
                             "messages": transcript_messages,
                         }
                     ],
+                    "logical_model_requests": [
+                        {
+                            **provider_call["request"],
+                            "query_invocation": 1,
+                        }
+                    ],
+                    "logical_model_invocation_count": 1,
                     "provider_calls": [provider_call],
                     "provider_call_count": 1,
                     "tool_call_count": 0,
@@ -1087,13 +1280,16 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
 
     metrics = aggregate_results(rows)
     metadata = {
+        "schema_version": 1,
         "status": "complete",
         "query_evidence_schema_version": 1,
         "tool_outcome_evidence_schema_version": 1,
+        **_logical_model_bound_metadata(),
         "planned_cases": len(rows),
         "cases": planned_cases,
         "completed_cases": len(rows),
         "observed_total_tokens": metrics["observed_total_tokens"],
+        "credential_snapshot": environment_snapshot.verification_metadata(),
     }
     _atomic_json(output / "metadata.json", metadata)
     _atomic_json(output / "metrics.json", metrics)
@@ -1120,6 +1316,60 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
     assert verified["checks"]["tool_outcome_evidence"]
     assert verified["checks"]["credential_scan"]["raw_secret_hit_count"] == 0
 
+    tampered_bounds = copy.deepcopy(metadata)
+    tampered_bounds["max_logical_model_invocations_per_trajectory"] = 47
+    _atomic_json(output / "metadata.json", tampered_bounds)
+    _atomic_json(
+        output / "manifest.json",
+        _manifest(output, tampered_bounds, metrics, rows),
+    )
+    invalid_bounds = verify_run(output, env_file=env_file)
+    assert invalid_bounds["status"] == "fail"
+    assert not invalid_bounds["checks"]["logical_model_invocation_bounds"][
+        "valid"
+    ]
+    _atomic_json(output / "metadata.json", metadata)
+    _atomic_json(output / "manifest.json", _manifest(output, metadata, metrics, rows))
+
+    env_file.write_text(
+        "OPENAI_API_KEY=rotated-unit-test-credential\n"
+        "OPENAI_BASE_URL=https://rotated.example.invalid/v1\n",
+        encoding="utf-8",
+    )
+    rotated = verify_run(
+        output,
+        env_file=env_file,
+        require_complete=True,
+        require_all_valid=True,
+    )
+    assert rotated["status"] == "pass", rotated
+    leaked = output / "leaked-run-start-credential.txt"
+    leaked.write_text("unit-test-secret-credential", encoding="utf-8")
+    leaked_result = verify_run(output, env_file=env_file)
+    assert leaked_result["status"] == "fail"
+    assert leaked_result["checks"]["credential_scan"]["raw_secret_hit_count"] == 1
+    leaked.unlink()
+
+    downgraded_metadata = copy.deepcopy(metadata)
+    downgraded_metadata["query_evidence_schema_version"] = 0
+    _atomic_json(output / "metadata.json", downgraded_metadata)
+    _atomic_json(
+        output / "manifest.json",
+        _manifest(output, downgraded_metadata, metrics, rows),
+    )
+    downgraded = verify_run(output, env_file=env_file)
+    assert downgraded["status"] == "fail"
+    assert not downgraded["checks"]["supported_schema_versions"]["valid"]
+    _atomic_json(output / "metadata.json", metadata)
+
+    escaped_manifest = _manifest(output, metadata, metrics, rows)
+    escaped_manifest["artifacts"]["../outside-secret.txt"] = "0" * 64
+    _atomic_json(output / "manifest.json", escaped_manifest)
+    escaped = verify_run(output, env_file=env_file)
+    assert escaped["status"] == "fail"
+    assert not escaped["checks"]["manifest_artifact_scope"]
+    _atomic_json(output / "manifest.json", _manifest(output, metadata, metrics, rows))
+
     outside = tmp_path / "outside-secret.txt"
     outside.write_text("unit-test-secret-credential", encoding="utf-8")
     linked = output / "linked-evidence.txt"
@@ -1136,11 +1386,16 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
     single_rows = [rows[0]]
     single_metrics = aggregate_results(single_rows)
     single_metadata = {
+        "schema_version": 1,
         "status": "complete",
+        "query_evidence_schema_version": 1,
+        "tool_outcome_evidence_schema_version": 1,
+        **_logical_model_bound_metadata(),
         "planned_cases": 1,
         "cases": [planned_cases[0]],
         "completed_cases": 1,
         "observed_total_tokens": single_metrics["observed_total_tokens"],
+        "credential_snapshot": environment_snapshot.verification_metadata(),
     }
     first_trace = json.loads(
         (traces_dir / f"{rows[0]['case_id']}.json").read_text(encoding="utf-8")
@@ -1198,11 +1453,16 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
     orphan_metrics = aggregate_results(orphan_rows)
     orphan_plan = [*planned_cases, {**orphan_trace["case"], "case_id": orphan_row["case_id"]}]
     orphan_metadata = {
+        "schema_version": 1,
         "status": "complete",
+        "query_evidence_schema_version": 1,
+        "tool_outcome_evidence_schema_version": 1,
+        **_logical_model_bound_metadata(),
         "planned_cases": len(orphan_rows),
         "cases": orphan_plan,
         "completed_cases": len(orphan_rows),
         "observed_total_tokens": orphan_metrics["observed_total_tokens"],
+        "credential_snapshot": environment_snapshot.verification_metadata(),
     }
     for row in rows:
         source = traces_dir / f"{row['case_id']}.json"
@@ -1236,6 +1496,44 @@ def test_verify_run_recomputes_evidence_and_detects_tampering(tmp_path) -> None:
     assert tampered["status"] == "fail"
     assert not tampered["checks"]["artifact_hashes"]["metrics.json"]
     assert not tampered["checks"]["metrics_recomputed"]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"status": "valid", "usage": {"total_tokens": -1}, "duration_s": 0.1},
+        {
+            "status": "valid",
+            "usage": {"total_tokens": 1},
+            "duration_s": float("nan"),
+        },
+        {
+            "status": "valid",
+            "usage": {"total_tokens": 100_000_001},
+            "duration_s": 0.1,
+        },
+    ],
+)
+def test_metrics_reject_invalid_numeric_inputs(row: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        aggregate_results([row])
+
+
+def test_artifact_preflight_rejects_entry_topology_before_full_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "wide-run"
+    output.mkdir()
+    for index in range(4):
+        (output / f"entry-{index}.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(runner_module, "_MAX_VERIFY_TREE_ENTRIES", 3)
+
+    result = runner_module._artifact_tree_preflight(output)
+
+    assert not result["valid"]
+    assert result["entry_count"] == 4
+    assert any("entry limit" in error for error in result["errors"])
 
 
 def test_source_fingerprint_rejects_symbolic_links(tmp_path) -> None:

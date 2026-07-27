@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,112 @@ def test_publication_scale_profile_and_workflows_are_stable() -> None:
     for workflow in (release_workflow, scheduled_workflow):
         assert "run_publication_reconciliation_scale.py" in workflow
         assert "--profile ci" in workflow
+
+
+def test_publication_benchmark_serializes_complete_global_patch_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def fake_locked(**kwargs: object) -> int:
+        selected = int(kwargs["total_records"])  # type: ignore[arg-type]
+        if selected == 1:
+            first_entered.set()
+            assert release_first.wait(2)
+        else:
+            second_entered.set()
+        return selected
+
+    monkeypatch.setattr(
+        publication_runner,
+        "_run_publication_scale_benchmark_locked",
+        fake_locked,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            run_publication_scale_benchmark,
+            total_records=1,
+            unreconciled_records=1,
+            page_size=1,
+        )
+        assert first_entered.wait(2)
+        second = executor.submit(
+            run_publication_scale_benchmark,
+            total_records=2,
+            unreconciled_records=1,
+            page_size=1,
+        )
+        assert not second_entered.wait(0.1)
+        release_first.set()
+        assert first.result(timeout=2) == 1
+        assert second.result(timeout=2) == 2
+
+
+def test_publication_cleanup_attempts_every_step_and_preserves_primary() -> None:
+    observed: list[str] = []
+
+    def step(name: str, *, fail: bool = False) -> None:
+        observed.append(name)
+        if fail:
+            raise RuntimeError(name)
+
+    with pytest.raises(ValueError, match="primary") as exc_info:
+        try:
+            raise ValueError("primary")
+        finally:
+            publication_runner._run_cleanup_steps(
+                [
+                    ("restore", lambda: step("restore", fail=True)),
+                    ("close", lambda: step("close", fail=True)),
+                    ("remove", lambda: step("remove")),
+                ]
+            )
+
+    assert observed == ["restore", "close", "remove"]
+    assert len(exc_info.value.__notes__) == 2
+
+
+def test_publication_cleanup_groups_failures_after_all_steps() -> None:
+    observed: list[str] = []
+
+    def fail(name: str) -> None:
+        observed.append(name)
+        raise RuntimeError(name)
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        publication_runner._run_cleanup_steps(
+            [
+                ("restore", lambda: fail("restore")),
+                ("close", lambda: fail("close")),
+            ]
+        )
+
+    assert observed == ["restore", "close"]
+    assert len(exc_info.value.exceptions) == 2
+
+
+def test_publication_connect_trace_filter_matches_only_benchmark_database(
+    tmp_path: Path,
+) -> None:
+    database = (tmp_path / "benchmark.sqlite").resolve()
+
+    assert publication_runner._connect_targets_database(
+        (database,),
+        {},
+        database,
+    )
+    assert publication_runner._connect_targets_database(
+        (f"{database.as_uri()}?mode=rw",),
+        {"uri": True},
+        database,
+    )
+    assert not publication_runner._connect_targets_database(
+        (tmp_path / "unrelated.sqlite",),
+        {},
+        database,
+    )
 
 
 @pytest.mark.parametrize(

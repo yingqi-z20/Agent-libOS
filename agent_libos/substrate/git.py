@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import math
+import mmap
 import os
 import re
 import shlex
@@ -13,6 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -26,13 +30,15 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
     GitErrorCode,
 )
-from agent_libos.models.exceptions import GitError
+from agent_libos.models.exceptions import GitError, ValidationError
 from agent_libos.substrate.base import (
     CommandMetrics,
     GitCommandResult,
     GitRepositoryLayout,
     GitRepositoryState,
     ProviderEffectNotStarted,
+    SubprocessLimitExceeded,
+    SubprocessLimits,
     executable_content_sha256,
 )
 
@@ -88,6 +94,88 @@ _CONTENT_FILTER_OPERATIONS = frozenset(
 )
 _DIFF_OPERATIONS = frozenset({"blame", "diff", "log", "show"})
 _MERGE_OPERATIONS = frozenset({"cherry-pick", "merge", "pull", "rebase", "revert"})
+_MINIMUM_SPAWNED_PROCESS_RSS_BYTES = max(1, mmap.PAGESIZE)
+
+
+@dataclass(slots=True)
+class _GitSubprocessScope:
+    limits: SubprocessLimits | None
+    wall_seconds: float = 0.0
+    cpu_seconds: float = 0.0
+    peak_memory_bytes: int = 0
+    killed: bool = False
+    limit_kind: str | None = None
+
+    @property
+    def metrics(self) -> CommandMetrics:
+        return CommandMetrics(
+            wall_seconds=self.wall_seconds,
+            cpu_seconds=self.cpu_seconds,
+            peak_memory_bytes=self.peak_memory_bytes,
+            killed=self.killed,
+            limit_kind=self.limit_kind,
+        )
+
+    def remaining_limits(self) -> SubprocessLimits | None:
+        if self.limits is None:
+            return None
+        return SubprocessLimits(
+            wall_seconds=(
+                None
+                if self.limits.wall_seconds is None
+                else max(0.0, self.limits.wall_seconds - self.wall_seconds)
+            ),
+            cpu_seconds=(
+                None
+                if self.limits.cpu_seconds is None
+                else max(0.0, self.limits.cpu_seconds - self.cpu_seconds)
+            ),
+            memory_bytes=self.limits.memory_bytes,
+        )
+
+    def record(self, metrics: CommandMetrics) -> None:
+        self.wall_seconds += max(0.0, metrics.wall_seconds)
+        self.cpu_seconds += max(0.0, metrics.cpu_seconds)
+        self.peak_memory_bytes = max(
+            self.peak_memory_bytes,
+            max(0, metrics.peak_memory_bytes),
+        )
+        self.killed = self.killed or metrics.killed
+        if metrics.limit_kind is not None:
+            self.limit_kind = metrics.limit_kind
+
+
+@dataclass(slots=True)
+class _GitProcessSupervision:
+    cpu_seconds: float = 0.0
+    peak_memory_bytes: int = 0
+    resource_limit_kind: str | None = None
+    output_limit_kind: str | None = None
+    timed_out: bool = False
+    terminated_for_limit: bool = False
+
+
+@dataclass(slots=True)
+class _GitStdinDelivery:
+    thread: threading.Thread
+    errors: list[BaseException]
+
+    @property
+    def failure(self) -> BaseException | None:
+        return self.errors[0] if self.errors else None
+
+
+@dataclass(frozen=True, slots=True)
+class _GitInvocationObservation:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    metrics: CommandMetrics
+    resource_limit_kind: str | None
+    output_limit_kind: str | None
+    timed_out: bool
+
+
 _FILTER_DRIVER_SUFFIXES = frozenset({"clean", "smudge", "process"})
 _DIFF_DRIVER_SUFFIXES = frozenset({"command", "textconv"})
 _MERGE_DRIVER_SUFFIXES = frozenset({"driver"})
@@ -202,6 +290,15 @@ def _digest_fields(*fields: str) -> str:
     return digest.hexdigest()
 
 
+def _is_positive_finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return value > 0 and math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
 class LocalGitProvider:
     """Pinned, byte-preserving system-Git provider.
 
@@ -211,6 +308,8 @@ class LocalGitProvider:
     avoided: the workspace's lexical ``.git`` entry is validated first and is
     then supplied to Git explicitly.
     """
+
+    supports_subprocess_limits = os.name != "nt"
 
     def __init__(
         self,
@@ -231,7 +330,9 @@ class LocalGitProvider:
             raise ValueError("git.worktree_root must not be inside Git metadata")
         self.managed_worktree_root = managed
         self._thread_lock = threading.RLock()
-        self._lock_state = threading.local()
+        self._repository_lock_owner: int | None = None
+        self._repository_lock_depth = 0
+        self._subprocess_scope_state = threading.local()
         self._executable_cache: tuple[Path, tuple[int, int, int, int, int], str] | None = None
         self._version_cache: tuple[
             str,
@@ -245,6 +346,39 @@ class LocalGitProvider:
         # also lets Python reclaim the directory with the provider instead of
         # leaking one directory per Runtime construction.
         self._hooks_tempdir: tempfile.TemporaryDirectory[str] | None = None
+
+    @contextmanager
+    def subprocess_scope(
+        self,
+        *,
+        limits: SubprocessLimits | None = None,
+    ) -> Iterator[_GitSubprocessScope]:
+        if limits is not None:
+            if not self.supports_subprocess_limits:
+                raise ValidationError(
+                    "Git provider cannot enforce SubprocessLimits on this platform"
+                )
+            for field in ("wall_seconds", "cpu_seconds", "memory_bytes"):
+                value = getattr(limits, field)
+                if value is None:
+                    continue
+                if not _is_positive_finite_number(value):
+                    raise ValidationError(
+                        f"Git provider {field} limit must be finite and > 0"
+                    )
+        if getattr(self._subprocess_scope_state, "current", None) is not None:
+            raise ValidationError("Git provider subprocess scopes must not be nested")
+        scope = _GitSubprocessScope(limits=limits)
+        self._subprocess_scope_state.current = scope
+        try:
+            yield scope
+        finally:
+            with contextlib.suppress(AttributeError):
+                del self._subprocess_scope_state.current
+
+    def _active_subprocess_scope(self) -> _GitSubprocessScope | None:
+        scope = getattr(self._subprocess_scope_state, "current", None)
+        return scope if isinstance(scope, _GitSubprocessScope) else None
 
     def _disabled_hooks_path(self) -> Path:
         with self._thread_lock:
@@ -332,6 +466,17 @@ class LocalGitProvider:
         if os.name == "nt":
             env["GCM_INTERACTIVE"] = "Never"
         return env
+
+    @staticmethod
+    def _expand_git_user_path(path: str | Path) -> Path:
+        """Expand ``~/`` using the HOME value inherited by the Git child."""
+
+        raw = os.fspath(path)
+        if raw == "~" or raw.startswith(("~/", "~\\")):
+            home = os.environ.get("HOME")
+            if home:
+                return Path(home) if raw == "~" else Path(home) / raw[2:]
+        return Path(raw).expanduser()
 
     def _trusted_host_executable(self, name: str) -> tuple[Path, str]:
         selected = shutil.which(name, path=self._safe_path())
@@ -435,83 +580,451 @@ class LocalGitProvider:
             except OSError:
                 pass
 
-    def _invoke(
+    @staticmethod
+    def _sample_process_tree(
+        process: psutil.Process,
+        peak_memory: int,
+        *,
+        require_complete: bool,
+    ) -> tuple[float, int]:
+        cpu_seconds = 0.0
+        memory_bytes = 0
+        processes = [process]
+        if require_complete:
+            try:
+                processes.extend(process.children(recursive=True))
+            except (psutil.NoSuchProcess, ProcessLookupError):
+                pass
+            except (psutil.Error, OSError) as exc:
+                raise ValidationError(
+                    "Git provider cannot enforce CPU/memory SubprocessLimits "
+                    "because complete process metrics are unavailable"
+                ) from exc
+        for item in processes:
+            try:
+                times = item.cpu_times()
+                cpu_seconds += float(times.user) + float(times.system)
+                memory_bytes += int(item.memory_info().rss)
+            except (psutil.NoSuchProcess, ProcessLookupError):
+                continue
+            except (psutil.Error, OSError) as exc:
+                if require_complete:
+                    raise ValidationError(
+                        "Git provider cannot enforce CPU/memory SubprocessLimits "
+                        "because complete process metrics are unavailable"
+                    ) from exc
+        return cpu_seconds, max(peak_memory, memory_bytes)
+
+    @staticmethod
+    def _subprocess_limit_kind(
+        *,
+        wall_seconds: float,
+        cpu_seconds: float,
+        peak_memory: int,
+        limits: SubprocessLimits | None,
+    ) -> str | None:
+        if limits is None:
+            return None
+        if limits.wall_seconds is not None and wall_seconds > limits.wall_seconds:
+            return "subprocess_wall_seconds"
+        if limits.cpu_seconds is not None and cpu_seconds > limits.cpu_seconds:
+            return "subprocess_cpu_seconds"
+        if limits.memory_bytes is not None and peak_memory > limits.memory_bytes:
+            return "subprocess_memory_bytes"
+        return None
+
+    @staticmethod
+    def _metrics_payload(metrics: CommandMetrics) -> dict[str, Any]:
+        return {
+            "wall_seconds": metrics.wall_seconds,
+            "cpu_seconds": metrics.cpu_seconds,
+            "peak_memory_bytes": metrics.peak_memory_bytes,
+            "killed": metrics.killed,
+            "limit_kind": metrics.limit_kind,
+        }
+
+    def _validate_invoke_bounds(
         self,
-        argv: Sequence[str],
         *,
         timeout: float,
-        stdin: bytes | None,
         max_output_bytes: int,
-        read_only: bool,
         operation: str,
-        env_overrides: dict[str, str] | None = None,
-    ) -> GitCommandResult:
-        if timeout <= 0 or timeout > self.config.timeout_hard_limit_s:
+    ) -> None:
+        timeout_hard_limit = self.config.timeout_hard_limit_s
+        if not _is_positive_finite_number(timeout_hard_limit):
+            raise self._error(
+                GitErrorCode.TIMEOUT,
+                "invalid configured Git timeout hard limit",
+                operation=operation,
+            )
+        if (
+            not _is_positive_finite_number(timeout)
+            or timeout > timeout_hard_limit
+        ):
             raise self._error(GitErrorCode.TIMEOUT, "invalid Git timeout", operation=operation)
-        if max_output_bytes <= 0 or max_output_bytes > self.config.output_hard_limit_bytes:
+        output_hard_limit = self.config.output_hard_limit_bytes
+        if (
+            isinstance(output_hard_limit, bool)
+            or not isinstance(output_hard_limit, int)
+            or output_hard_limit <= 0
+        ):
+            raise self._error(
+                GitErrorCode.OUTPUT_TOO_LARGE,
+                "invalid configured Git output hard limit",
+                operation=operation,
+            )
+        if (
+            isinstance(max_output_bytes, bool)
+            or not isinstance(max_output_bytes, int)
+            or max_output_bytes <= 0
+            or max_output_bytes > output_hard_limit
+        ):
             raise self._error(
                 GitErrorCode.OUTPUT_TOO_LARGE,
                 "requested Git output limit exceeds the configured hard limit",
                 operation=operation,
             )
+
+    @staticmethod
+    def _exhausted_subprocess_limit_kind(
+        limits: SubprocessLimits,
+    ) -> str | None:
+        for kind, value in (
+            ("subprocess_wall_seconds", limits.wall_seconds),
+            ("subprocess_cpu_seconds", limits.cpu_seconds),
+            ("subprocess_memory_bytes", limits.memory_bytes),
+        ):
+            if value is not None and value <= 0:
+                return kind
+        return None
+
+    def _remaining_invoke_limits(
+        self,
+        active_scope: _GitSubprocessScope | None,
+    ) -> SubprocessLimits | None:
+        if active_scope is None:
+            return None
+        limits = active_scope.remaining_limits()
+        if limits is None:
+            return None
+        exhausted_kind = self._exhausted_subprocess_limit_kind(limits)
+        if exhausted_kind is None:
+            return limits
+        metrics = CommandMetrics(limit_kind=exhausted_kind)
+        active_scope.limit_kind = exhausted_kind
+        raise SubprocessLimitExceeded(
+            f"Git subprocess exceeded {exhausted_kind}",
+            metrics=metrics,
+        )
+
+    def _prepare_git_command(
+        self,
+        argv: Sequence[str],
+    ) -> tuple[Path, tuple[int, int, int, int, int], str, list[str]]:
         executable, identity_before, content_before = self._resolve_executable()
         full_argv = [str(executable), *map(str, argv)]
         if any("\x00" in item for item in full_argv):
             raise self._error(GitErrorCode.COMMAND_FAILED, "Git argv contains a NUL byte")
-        started = time.monotonic()
-        peak_memory = 0
-        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        return executable, identity_before, content_before, full_argv
+
+    def _launch_git_process(
+        self,
+        full_argv: list[str],
+        *,
+        stdin: bytes | None,
+        stdout_file: Any,
+        stderr_file: Any,
+        read_only: bool,
+        env_overrides: dict[str, str] | None,
+    ) -> subprocess.Popen[bytes]:
+        environment = self._safe_env(read_only=read_only)
+        environment.update(dict(env_overrides or {}))
+        try:
+            process = subprocess.Popen(
+                full_argv,
+                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                cwd=self.workspace_root,
+                env=environment,
+                start_new_session=os.name != "nt",
+            )
+        except FileNotFoundError as exc:
+            raise self._error(
+                GitErrorCode.GIT_UNAVAILABLE,
+                "system Git is unavailable",
+            ) from exc
+        except OSError as exc:
+            raise self._error(
+                GitErrorCode.COMMAND_FAILED,
+                "system Git could not start",
+            ) from exc
+        return process
+
+    @staticmethod
+    def _start_git_stdin_delivery(
+        process: subprocess.Popen[bytes],
+        payload: bytes | None,
+    ) -> _GitStdinDelivery | None:
+        if payload is None or process.stdin is None:
+            return None
+        errors: list[BaseException] = []
+        stdin_stream = process.stdin
+
+        def deliver() -> None:
             try:
-                environment = self._safe_env(read_only=read_only)
-                environment.update(dict(env_overrides or {}))
-                process = subprocess.Popen(
-                    full_argv,
-                    stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    cwd=self.workspace_root,
-                    env=environment,
-                    start_new_session=os.name != "nt",
-                )
-            except FileNotFoundError as exc:
-                raise self._error(GitErrorCode.GIT_UNAVAILABLE, "system Git is unavailable") from exc
-            except OSError as exc:
-                raise self._error(GitErrorCode.COMMAND_FAILED, "system Git could not start") from exc
-            if stdin is not None and process.stdin is not None:
+                stdin_stream.write(payload)
+            except BrokenPipeError:
+                pass
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
                 try:
-                    process.stdin.write(stdin)
-                    process.stdin.close()
+                    stdin_stream.close()
                 except BrokenPipeError:
                     pass
-            deadline = started + timeout
-            oversized = False
-            timed_out = False
-            while process.poll() is None:
-                now = time.monotonic()
-                try:
-                    usage = psutil.Process(process.pid).memory_info().rss
-                    peak_memory = max(peak_memory, int(usage))
-                except (psutil.Error, OSError):
-                    pass
-                if stdout_file.tell() > max_output_bytes or stderr_file.tell() > max_output_bytes:
-                    oversized = True
+                except BaseException as exc:
+                    if not errors:
+                        errors.append(exc)
+
+        thread = threading.Thread(
+            target=deliver,
+            name=f"agent-libos-git-stdin-{process.pid}",
+            daemon=True,
+        )
+        delivery = _GitStdinDelivery(thread=thread, errors=errors)
+        thread.start()
+        return delivery
+
+    def _finish_git_stdin_delivery(
+        self,
+        delivery: _GitStdinDelivery | None,
+        *,
+        operation: str,
+    ) -> BaseException | None:
+        if delivery is None:
+            return None
+        delivery.thread.join(timeout=2.0)
+        if delivery.thread.is_alive():
+            return self._error(
+                GitErrorCode.COMMAND_FAILED,
+                "Git stdin delivery did not terminate after child cleanup",
+                operation=operation,
+            )
+        return delivery.failure
+
+    def _cleanup_git_process_after_failure(
+        self,
+        process: subprocess.Popen[bytes],
+        delivery: _GitStdinDelivery | None,
+    ) -> None:
+        # This cleanup owns the child immediately after Popen succeeds.  It
+        # deliberately tolerates control-flow BaseExceptions from individual
+        # cleanup steps so that kill, reap, and writer join are all attempted
+        # before the original failure is re-raised.
+        with contextlib.suppress(BaseException):
+            if process.poll() is None:
+                self._kill_process_tree(process)
+        with contextlib.suppress(BaseException):
+            self._wait_for_git_process(process)
+        if delivery is not None:
+            with contextlib.suppress(BaseException):
+                delivery.thread.join(timeout=2.0)
+
+    def _attach_process_metrics(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        require_complete: bool,
+    ) -> psutil.Process | None:
+        try:
+            return psutil.Process(process.pid)
+        except (psutil.Error, OSError) as exc:
+            if require_complete:
+                self._kill_process_tree(process)
+                with contextlib.suppress(Exception):
+                    process.wait(timeout=1.0)
+                raise ValidationError(
+                    "Git provider cannot enforce CPU/memory SubprocessLimits "
+                    "because process metrics are unavailable"
+                ) from exc
+        return None
+
+    @staticmethod
+    def _output_limit_kind_from_files(
+        stdout_file: Any,
+        stderr_file: Any,
+        max_output_bytes: int,
+    ) -> str | None:
+        if os.fstat(stdout_file.fileno()).st_size > max_output_bytes:
+            return "subprocess_stdout_bytes"
+        if os.fstat(stderr_file.fileno()).st_size > max_output_bytes:
+            return "subprocess_stderr_bytes"
+        return None
+
+    @staticmethod
+    def _output_limit_kind_from_bytes(
+        stdout: bytes,
+        stderr: bytes,
+        max_output_bytes: int,
+    ) -> str | None:
+        if len(stdout) > max_output_bytes:
+            return "subprocess_stdout_bytes"
+        if len(stderr) > max_output_bytes:
+            return "subprocess_stderr_bytes"
+        return None
+
+    def _supervise_git_process(
+        self,
+        process: subprocess.Popen[bytes],
+        ps_process: psutil.Process | None,
+        *,
+        started: float,
+        timeout: float,
+        max_output_bytes: int,
+        subprocess_limits: SubprocessLimits | None,
+        require_complete_metrics: bool,
+        stdout_file: Any,
+        stderr_file: Any,
+        stdin_delivery: _GitStdinDelivery | None,
+    ) -> _GitProcessSupervision:
+        # RSS is page-granular, so every successfully spawned process has at
+        # least one resident page. Seed that safe lower bound when enforcing a
+        # memory limit so a short-lived Git process cannot exit before psutil's
+        # first sample and incorrectly appear to have consumed zero memory.
+        state = _GitProcessSupervision(
+            peak_memory_bytes=(
+                _MINIMUM_SPAWNED_PROCESS_RSS_BYTES
+                if subprocess_limits is not None
+                and subprocess_limits.memory_bytes is not None
+                else 0
+            )
+        )
+        try:
+            while True:
+                if stdin_delivery is not None and stdin_delivery.failure is not None:
+                    state.terminated_for_limit = True
                     self._kill_process_tree(process)
                     break
-                if now >= deadline:
-                    timed_out = True
+                wall_seconds = max(0.0, time.monotonic() - started)
+                if ps_process is not None:
+                    state.cpu_seconds, state.peak_memory_bytes = (
+                        self._sample_process_tree(
+                            ps_process,
+                            state.peak_memory_bytes,
+                            require_complete=require_complete_metrics,
+                        )
+                    )
+                state.resource_limit_kind = self._subprocess_limit_kind(
+                    wall_seconds=wall_seconds,
+                    cpu_seconds=state.cpu_seconds,
+                    peak_memory=state.peak_memory_bytes,
+                    limits=subprocess_limits,
+                )
+                state.output_limit_kind = self._output_limit_kind_from_files(
+                    stdout_file,
+                    stderr_file,
+                    max_output_bytes,
+                )
+                if (
+                    state.resource_limit_kind is not None
+                    or state.output_limit_kind is not None
+                ):
+                    state.terminated_for_limit = True
                     self._kill_process_tree(process)
+                    break
+                if wall_seconds >= timeout:
+                    state.timed_out = True
+                    state.terminated_for_limit = True
+                    self._kill_process_tree(process)
+                    break
+                if process.poll() is not None:
                     break
                 time.sleep(0.01)
-            try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
+        finally:
+            if process.poll() is None:
                 self._kill_process_tree(process)
-                process.wait()
-            elapsed = max(0.0, time.monotonic() - started)
-            stdout_file.seek(0)
-            stderr_file.seek(0)
-            stdout = stdout_file.read(max_output_bytes + 1)
-            stderr = stderr_file.read(max_output_bytes + 1)
+        return state
+
+    def _wait_for_git_process(self, process: subprocess.Popen[bytes]) -> None:
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            self._kill_process_tree(process)
+            process.wait()
+
+    def _complete_git_observation(
+        self,
+        process: subprocess.Popen[bytes],
+        ps_process: psutil.Process | None,
+        state: _GitProcessSupervision,
+        *,
+        started: float,
+        timeout: float,
+        max_output_bytes: int,
+        subprocess_limits: SubprocessLimits | None,
+        require_complete_metrics: bool,
+        stdout_file: Any,
+        stderr_file: Any,
+    ) -> _GitInvocationObservation:
+        self._wait_for_git_process(process)
+        elapsed = max(0.0, time.monotonic() - started)
+        if ps_process is not None:
+            final_cpu, state.peak_memory_bytes = self._sample_process_tree(
+                ps_process,
+                state.peak_memory_bytes,
+                require_complete=require_complete_metrics,
+            )
+            state.cpu_seconds = max(state.cpu_seconds, final_cpu)
+        if state.resource_limit_kind is None:
+            state.resource_limit_kind = self._subprocess_limit_kind(
+                wall_seconds=elapsed,
+                cpu_seconds=state.cpu_seconds,
+                peak_memory=state.peak_memory_bytes,
+                limits=subprocess_limits,
+            )
+        if not state.timed_out and elapsed >= timeout:
+            state.timed_out = True
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(max_output_bytes + 1)
+        stderr = stderr_file.read(max_output_bytes + 1)
+        if state.output_limit_kind is None:
+            state.output_limit_kind = self._output_limit_kind_from_bytes(
+                stdout,
+                stderr,
+                max_output_bytes,
+            )
+        limit_kind = (
+            state.resource_limit_kind
+            or state.output_limit_kind
+            or ("subprocess_timeout" if state.timed_out else None)
+        )
+        metrics = CommandMetrics(
+            wall_seconds=elapsed,
+            cpu_seconds=state.cpu_seconds,
+            peak_memory_bytes=state.peak_memory_bytes,
+            killed=state.terminated_for_limit,
+            limit_kind=limit_kind,
+        )
+        return _GitInvocationObservation(
+            returncode=int(process.returncode or 0),
+            stdout=stdout,
+            stderr=stderr,
+            metrics=metrics,
+            resource_limit_kind=state.resource_limit_kind,
+            output_limit_kind=state.output_limit_kind,
+            timed_out=state.timed_out,
+        )
+
+    def _verify_git_executable_after_invoke(
+        self,
+        executable: Path,
+        identity_before: tuple[int, int, int, int, int],
+        content_before: str,
+        *,
+        operation: str,
+    ) -> None:
         try:
             executable_after, identity_after, content_after = self._resolve_executable()
         except GitError as exc:
@@ -530,35 +1043,145 @@ class LocalGitProvider:
                 "Git executable identity changed during dispatch",
                 operation=operation,
             )
-        metrics = CommandMetrics(
-            wall_seconds=elapsed,
-            peak_memory_bytes=peak_memory,
-            killed=timed_out or oversized,
-            limit_kind="wall" if timed_out else ("output" if oversized else None),
-        )
-        if timed_out:
+
+    def _raise_for_invoke_failure(
+        self,
+        observation: _GitInvocationObservation,
+        *,
+        operation: str,
+        read_only: bool,
+    ) -> None:
+        metrics = observation.metrics
+        if observation.resource_limit_kind is not None:
+            raise SubprocessLimitExceeded(
+                f"Git subprocess exceeded {observation.resource_limit_kind}",
+                metrics=metrics,
+            )
+        if observation.timed_out:
             raise self._error(
                 GitErrorCode.TIMEOUT,
                 "Git operation timed out; its effect may be unknown",
                 operation=operation,
-                retryable=True,
-                details={"effect": "unknown"},
+                retryable=read_only,
+                details={
+                    "effect": "none" if read_only else "unknown",
+                    "limit_kind": "subprocess_timeout",
+                    "metrics": self._metrics_payload(metrics),
+                },
             )
-        if oversized or len(stdout) > max_output_bytes or len(stderr) > max_output_bytes:
+        if observation.output_limit_kind is not None:
             raise self._error(
                 GitErrorCode.OUTPUT_TOO_LARGE,
                 "Git output exceeded the configured hard limit",
                 operation=operation,
-                details={"effect": "unknown" if not read_only else "none"},
+                details={
+                    "effect": "none" if read_only else "unknown",
+                    "limit_kind": observation.output_limit_kind,
+                    "metrics": self._metrics_payload(metrics),
+                },
             )
+
+    def _invoke(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        stdin: bytes | None,
+        max_output_bytes: int,
+        read_only: bool,
+        operation: str,
+        env_overrides: dict[str, str] | None = None,
+    ) -> GitCommandResult:
+        self._validate_invoke_bounds(
+            timeout=timeout,
+            max_output_bytes=max_output_bytes,
+            operation=operation,
+        )
+        active_scope = self._active_subprocess_scope()
+        subprocess_limits = self._remaining_invoke_limits(active_scope)
+        executable, identity_before, content_before, full_argv = (
+            self._prepare_git_command(argv)
+        )
+        started = time.monotonic()
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process: subprocess.Popen[bytes] | None = None
+            stdin_delivery: _GitStdinDelivery | None = None
+            try:
+                process = self._launch_git_process(
+                    full_argv,
+                    stdin=stdin,
+                    stdout_file=stdout_file,
+                    stderr_file=stderr_file,
+                    read_only=read_only,
+                    env_overrides=env_overrides,
+                )
+                stdin_delivery = self._start_git_stdin_delivery(process, stdin)
+                require_complete_metrics = bool(
+                    subprocess_limits is not None
+                    and (
+                        subprocess_limits.cpu_seconds is not None
+                        or subprocess_limits.memory_bytes is not None
+                    )
+                )
+                ps_process = self._attach_process_metrics(
+                    process,
+                    require_complete=require_complete_metrics,
+                )
+                state = self._supervise_git_process(
+                    process,
+                    ps_process,
+                    started=started,
+                    timeout=timeout,
+                    max_output_bytes=max_output_bytes,
+                    subprocess_limits=subprocess_limits,
+                    require_complete_metrics=require_complete_metrics,
+                    stdout_file=stdout_file,
+                    stderr_file=stderr_file,
+                    stdin_delivery=stdin_delivery,
+                )
+                observation = self._complete_git_observation(
+                    process,
+                    ps_process,
+                    state,
+                    started=started,
+                    timeout=timeout,
+                    max_output_bytes=max_output_bytes,
+                    subprocess_limits=subprocess_limits,
+                    require_complete_metrics=require_complete_metrics,
+                    stdout_file=stdout_file,
+                    stderr_file=stderr_file,
+                )
+                stdin_failure = self._finish_git_stdin_delivery(
+                    stdin_delivery,
+                    operation=operation,
+                )
+            except BaseException:
+                if process is not None:
+                    self._cleanup_git_process_after_failure(process, stdin_delivery)
+                raise
+        if active_scope is not None:
+            active_scope.record(observation.metrics)
+        if stdin_failure is not None:
+            raise stdin_failure
+        self._verify_git_executable_after_invoke(
+            executable,
+            identity_before,
+            content_before,
+            operation=operation,
+        )
+        self._raise_for_invoke_failure(
+            observation,
+            operation=operation,
+            read_only=read_only,
+        )
         return GitCommandResult(
             argv=tuple(full_argv),
-            returncode=int(process.returncode or 0),
-            stdout=stdout,
-            stderr=stderr,
-            stdout_sha256=hashlib.sha256(stdout).hexdigest(),
-            stderr_sha256=hashlib.sha256(stderr).hexdigest(),
-            metrics=metrics,
+            returncode=observation.returncode,
+            stdout=observation.stdout,
+            stderr=observation.stderr,
+            stdout_sha256=hashlib.sha256(observation.stdout).hexdigest(),
+            stderr_sha256=hashlib.sha256(observation.stderr).hexdigest(),
+            metrics=observation.metrics,
         )
 
     def _git_version(self) -> tuple[str, Path]:
@@ -717,6 +1340,11 @@ class LocalGitProvider:
             "core.fsmonitor=false",
             "-c",
             "core.untrackedCache=false",
+            # Git for Windows still gates Win32 long-path support behind this
+            # setting. Runtime-managed worktrees can legitimately cross the
+            # legacy MAX_PATH boundary even when the primary checkout does not.
+            "-c",
+            "core.longpaths=true",
             "-c",
             f"core.hooksPath={self._disabled_hooks_path()}",
             "-c",
@@ -735,6 +1363,8 @@ class LocalGitProvider:
             "tag.gpgSign=false",
             "-c",
             "push.gpgSign=false",
+            "-c",
+            "merge.autoStash=false",
             "-c",
             "submodule.recurse=false",
             "-c",
@@ -1072,17 +1702,10 @@ class LocalGitProvider:
             )
         return self._resolve_helper(value)
 
-    def _validate_repository_config(
+    def _trusted_local_config_origins(
         self,
         layout: GitRepositoryLayout,
-        *,
-        remote: str | None,
-        operation: str,
-        treeish_targets: Sequence[str] = (),
-    ) -> tuple[str, tuple[tuple[str, str], ...]]:
-        entries = self._config_entries(layout)
-        normalized: list[str] = []
-        helper_identities: list[tuple[str, str]] = []
+    ) -> set[Path]:
         local_config_paths = (
             layout.common_dir / "config",
             layout.git_dir / "config.worktree",
@@ -1106,6 +1729,109 @@ class LocalGitProvider:
                     GitErrorCode.UNSAFE_CONFIG,
                     "repository Git config is not a trusted regular file",
                 )
+        return allowed_local_origins
+
+    def _repository_config_origin_path(
+        self,
+        *,
+        scope: str,
+        origin: str,
+        allowed_local_origins: set[Path],
+    ) -> Path | None:
+        if not origin.startswith("file:"):
+            return None
+        origin_path = Path(origin[5:]).expanduser().resolve(strict=False)
+        if scope in {"local", "worktree"} and origin_path not in allowed_local_origins:
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "repository Git config includes are not allowed",
+            )
+        if (
+            _is_within(origin_path, self.workspace_root)
+            and origin_path not in allowed_local_origins
+        ):
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "workspace-controlled Git config includes are not allowed",
+            )
+        return origin_path
+
+    def _validate_repository_config_entry(
+        self,
+        *,
+        scope: str,
+        origin: str,
+        key: str,
+        value: str,
+        remote: str | None,
+        operation: str,
+        allowed_local_origins: set[Path],
+        driver_is_active: Callable[[str, str], bool],
+    ) -> tuple[str, str] | None:
+        if (
+            operation == "merge"
+            and value.strip()
+            and key.startswith("branch.")
+            and key.endswith(".mergeoptions")
+        ):
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "branch mergeOptions can change typed merge semantics",
+            )
+        origin_path = self._repository_config_origin_path(
+            scope=scope,
+            origin=origin,
+            allowed_local_origins=allowed_local_origins,
+        )
+        if self._config_selects_executable_extension(
+            key=key,
+            value=value,
+            remote=remote,
+            operation=operation,
+            driver_is_active=driver_is_active,
+        ):
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "repository config contains an executable Git extension",
+            )
+        self._validate_remote_config_entry(
+            scope=scope,
+            key=key,
+            value=value,
+            remote=remote,
+        )
+        if bool(value) and (
+            key == "extensions.partialclone"
+            or (
+                key.startswith("remote.")
+                and key.rsplit(".", 1)[-1] in {"promisor", "partialclonefilter"}
+            )
+        ):
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "partial-clone repositories are unavailable because reads must never lazy-fetch",
+            )
+        return self._credential_helper_identity(
+            scope=scope,
+            origin_path=origin_path,
+            key=key,
+            value=value,
+            remote=remote,
+            allowed_local_origins=allowed_local_origins,
+        )
+
+    def _validate_repository_config(
+        self,
+        layout: GitRepositoryLayout,
+        *,
+        remote: str | None,
+        operation: str,
+        treeish_targets: Sequence[str] = (),
+    ) -> tuple[str, tuple[tuple[str, str], ...]]:
+        entries = self._config_entries(layout)
+        normalized: list[str] = []
+        helper_identities: list[tuple[str, str]] = []
+        allowed_local_origins = self._trusted_local_config_origins(layout)
         active_drivers: dict[str, set[str]] | None = None
 
         def driver_is_active(kind: str, key: str) -> bool:
@@ -1129,47 +1855,14 @@ class LocalGitProvider:
             if scope == "command":
                 continue
             normalized.append(f"{scope}\0{origin}\0{key}\0{value}")
-            origin_path: Path | None = None
-            if origin.startswith("file:"):
-                origin_path = Path(origin[5:]).expanduser().resolve(strict=False)
-                if scope in {"local", "worktree"} and origin_path not in allowed_local_origins:
-                    raise self._error(
-                        GitErrorCode.UNSAFE_CONFIG,
-                        "repository Git config includes are not allowed",
-                    )
-                if _is_within(origin_path, self.workspace_root) and origin_path not in allowed_local_origins:
-                    raise self._error(GitErrorCode.UNSAFE_CONFIG, "workspace-controlled Git config includes are not allowed")
-            if self._config_selects_executable_extension(
+            helper_identity = self._validate_repository_config_entry(
+                scope=scope,
+                origin=origin,
                 key=key,
                 value=value,
                 remote=remote,
                 operation=operation,
                 driver_is_active=driver_is_active,
-            ):
-                raise self._error(GitErrorCode.UNSAFE_CONFIG, "repository config contains an executable Git extension")
-            self._validate_remote_config_entry(
-                scope=scope,
-                key=key,
-                value=value,
-                remote=remote,
-            )
-            if bool(value) and (
-                key == "extensions.partialclone"
-                or (
-                    key.startswith("remote.")
-                    and key.rsplit(".", 1)[-1] in {"promisor", "partialclonefilter"}
-                )
-            ):
-                raise self._error(
-                    GitErrorCode.UNSAFE_CONFIG,
-                    "partial-clone repositories are unavailable because reads must never lazy-fetch",
-                )
-            helper_identity = self._credential_helper_identity(
-                scope=scope,
-                origin_path=origin_path,
-                key=key,
-                value=value,
-                remote=remote,
                 allowed_local_origins=allowed_local_origins,
             )
             if helper_identity is not None:
@@ -1246,37 +1939,24 @@ class LocalGitProvider:
         seen: set[Path] = set()
 
         def include(candidate: Path) -> None:
-            resolved = candidate.expanduser().resolve(strict=False)
-            if resolved not in seen:
-                seen.add(resolved)
-                files.append(resolved)
+            # Keep the lexical entry so the later lstat rejects an attribute
+            # symlink instead of silently following it outside the repository.
+            selected = Path(os.path.abspath(self._expand_git_user_path(candidate)))
+            if selected not in seen:
+                seen.add(selected)
+                files.append(selected)
 
         include(layout.common_dir / "info" / "attributes")
         for scope, _origin, key, value in entries:
             if scope != "command" and key == "core.attributesfile" and value:
-                selected = Path(value).expanduser()
+                selected = self._expand_git_user_path(value)
                 if not selected.is_absolute():
                     # Git resolves relative core.attributesFile values from
                     # the command cwd, which is pinned to workspace_root.
                     selected = self.workspace_root / selected
                 include(selected)
-        visited = 0
-        for directory, directory_names, file_names in os.walk(layout.root, followlinks=False):
-            visited += len(directory_names) + len(file_names)
-            if visited > 100_000:
-                raise self._error(
-                    GitErrorCode.UNSAFE_CONFIG,
-                    "attribute discovery exceeded its safety bound",
-                )
-            current = Path(directory)
-            directory_names[:] = [
-                name
-                for name in directory_names
-                if name.casefold() != ".git"
-                and (current / name).resolve(strict=False) != self.managed_worktree_root
-            ]
-            if ".gitattributes" in file_names:
-                include(current / ".gitattributes")
+        for selected in self._working_tree_attribute_paths(layout):
+            include(selected)
         drivers = {"filter": set(), "diff": set(), "merge": set()}
         total = 0
 
@@ -1334,6 +2014,62 @@ class LocalGitProvider:
         ):
             inspect(raw)
         return drivers
+
+    def _working_tree_attribute_paths(
+        self,
+        layout: GitRepositoryLayout,
+    ) -> Iterator[Path]:
+        """List only tracked or non-ignored worktree attribute sources.
+
+        Walking the whole checkout lets a large ignored virtual environment or
+        dependency cache exhaust the attribute-discovery bound even though Git
+        will never consult it. ``ls-files`` is run with hooks, fsmonitor, lazy
+        fetches, and executable diff extensions disabled by ``_repo_prefix``;
+        it does not invoke content filters.
+        """
+
+        result = self._invoke(
+            [
+                *self._repo_prefix(layout, literal_pathspecs=False),
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ":(top,glob)**/.gitattributes",
+            ],
+            timeout=self.config.local_timeout_s,
+            stdin=None,
+            max_output_bytes=self.config.output_hard_limit_bytes,
+            read_only=True,
+            operation="attribute_worktree_inspection",
+        )
+        if result.returncode != 0:
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "working-tree Git attributes could not be enumerated",
+            )
+        paths = [raw for raw in result.stdout.split(b"\0") if raw]
+        if len(paths) > 100_000:
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "attribute discovery exceeded its safety bound",
+            )
+        for raw in paths:
+            relative = Path(os.fsdecode(raw))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "working-tree Git attributes escaped the repository",
+                )
+            selected = Path(os.path.abspath(layout.root / relative))
+            if not _is_within(selected, layout.root):
+                raise self._error(
+                    GitErrorCode.UNSAFE_CONFIG,
+                    "working-tree Git attributes escaped the repository",
+                )
+            yield selected
 
     def _index_attribute_sources(
         self,
@@ -2053,6 +2789,37 @@ class LocalGitProvider:
             raise self._error(GitErrorCode.OUTPUT_TOO_LARGE, "pull request metadata exceeds its hard limit") from exc
         return data, hashlib.sha256(data).hexdigest()
 
+    def _bounded_pull_request_metadata_paths(
+        self,
+        directory: Path,
+    ) -> tuple[Path, ...]:
+        paths: list[Path] = []
+        try:
+            for selected in directory.iterdir():
+                if len(paths) >= self.config.status_entry_hard_limit:
+                    raise self._error(
+                        GitErrorCode.OUTPUT_TOO_LARGE,
+                        "pull request metadata count exceeds its hard limit",
+                    )
+                if (
+                    selected.suffix != ".json"
+                    or not _PULL_REQUEST_ID_RE.fullmatch(selected.stem)
+                ):
+                    raise self._error(
+                        GitErrorCode.UNSAFE_REPOSITORY,
+                        "unexpected pull request metadata entry",
+                    )
+                paths.append(selected)
+        except GitError:
+            raise
+        except OSError as exc:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "pull request metadata could not be listed",
+            ) from exc
+        paths.sort(key=lambda path: path.name)
+        return tuple(paths)
+
     def list_pull_request_metadata(self, *, limit: int) -> tuple[tuple[str, bytes, str], ...]:
         if isinstance(limit, bool) or limit <= 0 or limit > self.config.status_entry_hard_limit:
             raise self._error(GitErrorCode.OUTPUT_TOO_LARGE, "pull request list limit is invalid")
@@ -2067,16 +2834,9 @@ class LocalGitProvider:
         if stat.S_ISLNK(directory_state.st_mode) or not stat.S_ISDIR(directory_state.st_mode):
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata directory is not trusted")
         rows: list[tuple[str, bytes, str]] = []
-        try:
-            names = sorted(directory.iterdir(), key=lambda path: path.name)
-        except OSError as exc:
-            raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata could not be listed") from exc
-        if len(names) > limit:
-            names = names[:limit]
+        names = self._bounded_pull_request_metadata_paths(directory)[:limit]
         total = 0
         for selected in names:
-            if selected.suffix != ".json" or not _PULL_REQUEST_ID_RE.fullmatch(selected.stem):
-                raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "unexpected pull request metadata entry")
             item = self.read_pull_request_metadata(selected.stem)
             if item is None:
                 continue
@@ -2163,15 +2923,8 @@ class LocalGitProvider:
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata directory is not trusted")
         digest = hashlib.sha256()
         total = 0
-        try:
-            names = sorted(directory.iterdir(), key=lambda item: item.name)
-        except OSError as exc:
-            raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata could not be inspected") from exc
-        if len(names) > self.config.status_entry_hard_limit:
-            raise self._error(GitErrorCode.OUTPUT_TOO_LARGE, "pull request metadata count exceeds its hard limit")
+        names = self._bounded_pull_request_metadata_paths(directory)
         for selected in names:
-            if selected.suffix != ".json" or not _PULL_REQUEST_ID_RE.fullmatch(selected.stem):
-                raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "unexpected pull request metadata entry")
             try:
                 metadata = selected.lstat()
                 if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
@@ -2424,6 +3177,88 @@ class LocalGitProvider:
             and before.object_format == after.object_format
         )
 
+    def _remote_environment_for_run(
+        self,
+        before: GitRepositoryLayout,
+        *,
+        remote: str | None,
+        operation: str,
+        expected_remote_fingerprint: str | None,
+        treeish_targets: Sequence[str],
+    ) -> dict[str, str]:
+        if remote is None:
+            return {}
+        current_fingerprint = self.remote_fingerprint(remote, worktree=before.root)
+        if (
+            expected_remote_fingerprint is not None
+            and current_fingerprint["fingerprint"] != expected_remote_fingerprint
+        ):
+            raise self._error(
+                GitErrorCode.STALE_STATE,
+                "Git remote configuration or refs changed before provider dispatch",
+                operation=operation,
+                retryable=True,
+            )
+        fetch_url, push_url = self._remote_urls(before, remote)
+        config_sha256, _helpers = self._validate_repository_config(
+            before,
+            remote=remote,
+            operation=operation,
+            treeish_targets=treeish_targets,
+        )
+        if (
+            hashlib.sha256(fetch_url.encode("utf-8")).hexdigest()
+            != current_fingerprint["fetch_url_sha256"]
+            or hashlib.sha256(push_url.encode("utf-8")).hexdigest()
+            != current_fingerprint["push_url_sha256"]
+            or config_sha256 != current_fingerprint["config_sha256"]
+        ):
+            raise self._error(
+                GitErrorCode.STALE_STATE,
+                "Git remote configuration changed during provider preflight",
+                operation=operation,
+                retryable=True,
+            )
+        environment, _ssh_identities = self._remote_dispatch_environment(
+            fetch_url,
+            push_url,
+        )
+        return environment
+
+    def _verify_run_layout(
+        self,
+        before: GitRepositoryLayout,
+        *,
+        worktree: str | Path | None,
+        operation: str,
+        read_only: bool,
+        verify_after: bool,
+    ) -> None:
+        if not verify_after:
+            return
+        try:
+            after = self.repository_layout(worktree=worktree)
+        except GitError as exc:
+            if read_only:
+                raise
+            raise self._error(
+                GitErrorCode.UNKNOWN_EFFECT,
+                "Git repository identity could not be revalidated after mutation",
+                operation=operation,
+                details={"effect": "unknown"},
+            ) from exc
+        if not self._same_layout(before, after):
+            raise self._error(
+                (
+                    GitErrorCode.UNSAFE_REPOSITORY
+                    if read_only
+                    else GitErrorCode.UNKNOWN_EFFECT
+                ),
+                "Git repository identity changed during operation",
+                operation=operation,
+                details={"effect": "none" if read_only else "unknown"},
+            )
+
     def run(
         self,
         args: Sequence[str],
@@ -2450,40 +3285,13 @@ class LocalGitProvider:
             operation=operation,
             treeish_targets=treeish_targets,
         )
-        remote_env: dict[str, str] = {}
-        if remote is not None:
-            current_fingerprint = self.remote_fingerprint(remote, worktree=before.root)
-            if (
-                expected_remote_fingerprint is not None
-                and current_fingerprint["fingerprint"] != expected_remote_fingerprint
-            ):
-                raise self._error(
-                    GitErrorCode.STALE_STATE,
-                    "Git remote configuration or refs changed before provider dispatch",
-                    operation=operation,
-                    retryable=True,
-                )
-            fetch_url, push_url = self._remote_urls(before, remote)
-            config_sha256, _helpers = self._validate_repository_config(
-                before,
-                remote=remote,
-                operation=operation,
-                treeish_targets=treeish_targets,
-            )
-            if (
-                hashlib.sha256(fetch_url.encode("utf-8")).hexdigest()
-                != current_fingerprint["fetch_url_sha256"]
-                or hashlib.sha256(push_url.encode("utf-8")).hexdigest()
-                != current_fingerprint["push_url_sha256"]
-                or config_sha256 != current_fingerprint["config_sha256"]
-            ):
-                raise self._error(
-                    GitErrorCode.STALE_STATE,
-                    "Git remote configuration changed during provider preflight",
-                    operation=operation,
-                    retryable=True,
-                )
-            remote_env, _ssh_identities = self._remote_dispatch_environment(fetch_url, push_url)
+        remote_env = self._remote_environment_for_run(
+            before,
+            remote=remote,
+            operation=operation,
+            expected_remote_fingerprint=expected_remote_fingerprint,
+            treeish_targets=treeish_targets,
+        )
         selected_timeout = timeout if timeout is not None else (
             self.config.remote_timeout_s if remote is not None else self.config.local_timeout_s
         )
@@ -2497,26 +3305,41 @@ class LocalGitProvider:
             operation=operation,
             env_overrides=remote_env,
         )
-        if verify_after:
-            try:
-                after = self.repository_layout(worktree=worktree)
-            except GitError as exc:
-                if read_only:
-                    raise
-                raise self._error(
-                    GitErrorCode.UNKNOWN_EFFECT,
-                    "Git repository identity could not be revalidated after mutation",
-                    operation=operation,
-                    details={"effect": "unknown"},
-                ) from exc
-            if not self._same_layout(before, after):
-                raise self._error(
-                    GitErrorCode.UNKNOWN_EFFECT if not read_only else GitErrorCode.UNSAFE_REPOSITORY,
-                    "Git repository identity changed during operation",
-                    operation=operation,
-                    details={"effect": "unknown" if not read_only else "none"},
-                )
+        self._verify_run_layout(
+            before,
+            worktree=worktree,
+            operation=operation,
+            read_only=read_only,
+            verify_after=verify_after,
+        )
         return result
+
+    def run_with_limits(
+        self,
+        args: Sequence[str],
+        *,
+        worktree: str | Path | None = None,
+        timeout: float | None = None,
+        stdin: bytes | None = None,
+        max_output_bytes: int | None = None,
+        read_only: bool = True,
+        remote: str | None = None,
+        expected_remote_fingerprint: str | None = None,
+        verify_after: bool = True,
+        limits: SubprocessLimits,
+    ) -> GitCommandResult:
+        with self.subprocess_scope(limits=limits):
+            return self.run(
+                args,
+                worktree=worktree,
+                timeout=timeout,
+                stdin=stdin,
+                max_output_bytes=max_output_bytes,
+                read_only=read_only,
+                remote=remote,
+                expected_remote_fingerprint=expected_remote_fingerprint,
+                verify_after=verify_after,
+            )
 
     @contextmanager
     def repository_lock(
@@ -2539,13 +3362,14 @@ class LocalGitProvider:
                 retryable=True,
             )
         try:
-            depth = int(getattr(self._lock_state, "depth", 0))
-            if depth:
-                self._lock_state.depth = depth + 1
+            owner = threading.get_ident()
+            depth = self._repository_lock_depth
+            if self._repository_lock_owner == owner and depth:
+                self._repository_lock_depth = depth + 1
                 try:
                     yield self.repository_layout(worktree=worktree)
                 finally:
-                    self._lock_state.depth = depth
+                    self._repository_lock_depth = depth
                 return
             layout = self.repository_layout(worktree=worktree)
             lock_directory = layout.common_dir / "agent-libos"
@@ -2590,13 +3414,15 @@ class LocalGitProvider:
                                 retryable=True,
                             )
                         time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-                self._lock_state.depth = 1
+                self._repository_lock_owner = owner
+                self._repository_lock_depth = 1
                 current = self.repository_layout(worktree=worktree)
                 if not self._same_layout(layout, current):
                     raise self._error(GitErrorCode.STALE_STATE, "Git repository identity changed before dispatch")
                 yield current
             finally:
-                self._lock_state.depth = 0
+                self._repository_lock_depth = 0
+                self._repository_lock_owner = None
                 if acquired:
                     try:
                         if os.name == "nt":

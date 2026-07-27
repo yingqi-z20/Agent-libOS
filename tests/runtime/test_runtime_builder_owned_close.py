@@ -68,6 +68,35 @@ def _extract_one(error: BaseException) -> RuntimeAssemblyCleanupRequired:
     return handles[0]
 
 
+def test_cleanup_handle_never_exposes_component_exception_text() -> None:
+    store = SQLiteStore(":memory:")
+    secret = "SECRET /private/runtime/store-credential"
+    try:
+        record = RuntimeAssemblyCleanupRequired._error_record(
+            "store",
+            RuntimeError(secret),
+        )
+        handle = RuntimeAssemblyCleanupRequired(
+            partial_runtime=None,
+            store=store,
+            cleanup_errors=[record],
+        )
+
+        assert len(handle.cleanup_errors) == 1
+        public = handle.cleanup_errors[0]
+        assert public["component"] == "store"
+        assert public["code"] == "runtime_cleanup_failed"
+        assert public["error_type"] == "RuntimeError"
+        assert public["correlation_id"].startswith("corr_")
+        assert secret not in str(public)
+        assert secret not in str(record)
+        observation = record["internal_observation"]
+        assert observation["correlation_id"] == public["correlation_id"]
+        assert len(observation["exception_text"]["sha256"]) == 64
+    finally:
+        store.close()
+
+
 def test_owned_close_failure_blocks_successor_until_exact_sync_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -940,6 +969,7 @@ def test_concurrent_successor_cannot_cross_owned_close_reservation(
     monkeypatch.setattr(store, "close", blocking_close)
     release_errors: list[BaseException] = []
     successor_errors: list[BaseException] = []
+    successor_done = threading.Event()
 
     def release_handle() -> None:
         try:
@@ -952,21 +982,33 @@ def test_concurrent_successor_cannot_cross_owned_close_reservation(
             RuntimeBuilder.configured(Runtime).from_store(store)
         except BaseException as exc:
             successor_errors.append(exc)
+        finally:
+            successor_done.set()
 
     release_thread = threading.Thread(target=release_handle)
     successor_thread = threading.Thread(target=assemble_successor)
     release_thread.start()
     assert close_entered.wait(timeout=3)
     successor_thread.start()
-    assert successor_thread.is_alive()
-    allow_close.set()
-    release_thread.join(timeout=3)
-    successor_thread.join(timeout=3)
+    try:
+        assert successor_done.wait(timeout=3)
+        successor_thread.join(timeout=3)
+        assert not successor_thread.is_alive()
+        assert release_thread.is_alive()
+    finally:
+        allow_close.set()
+        release_thread.join(timeout=3)
+        successor_thread.join(timeout=3)
 
     assert not release_thread.is_alive()
     assert not successor_thread.is_alive()
     assert release_errors == []
-    assert successor_errors
+    assert len(successor_errors) == 1
+    assert type(successor_errors[0]) is RuntimeError
+    assert (
+        str(successor_errors[0])
+        == "runtime store assembly is not ready: lock_busy"
+    )
     assert handle.released is True
 
 

@@ -7,9 +7,16 @@ from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import CapabilityRight, ProcessStatus
+from agent_libos.models import (
+    CapabilityRight,
+    ObjectPatch,
+    ObjectRight,
+    ObjectType,
+    ProcessStatus,
+)
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.observability import json_size_bytes
+from tests.support.public_errors import assert_public_error_message
 
 class TestObjectFileTool:
 
@@ -61,18 +68,125 @@ class TestObjectFileTool:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='use object file tools')
         denied_read = self.runtime.tools.call(pid, 'create_object_from_file', {'name': object_name, 'path': source})
         assert not denied_read.ok
-        assert 'lacks read' in (denied_read.error or '')
+        assert_public_error_message(
+            denied_read.error,
+            code='permission_denied',
+            error_type='CapabilityDenied',
+            forbidden=('lacks read', source),
+        )
         self.runtime.filesystem.grant_path(pid, source, [CapabilityRight.READ], issued_by='test')
         created = self.runtime.tools.call(pid, 'create_object_from_file', {'name': object_name, 'path': source})
         assert created.ok
         assert 'capability checked' not in json.dumps(created.payload, ensure_ascii=False)
         denied_write = self.runtime.tools.call(pid, 'write_object_to_file', {'name': object_name, 'path': target})
         assert not denied_write.ok
-        assert 'lacks write' in (denied_write.error or '')
+        assert_public_error_message(
+            denied_write.error,
+            code='permission_denied',
+            error_type='CapabilityDenied',
+            forbidden=('lacks write', target),
+        )
         self.runtime.filesystem.grant_path(pid, target, [CapabilityRight.WRITE], issued_by='test')
         written = self.runtime.tools.call(pid, 'write_object_to_file', {'name': object_name, 'path': target})
         assert written.ok
         assert (self.runtime.workspace_root / target).read_text(encoding='utf-8') == 'capability checked'
+
+    def test_write_object_to_file_reuses_exact_one_time_read_snapshot(self) -> None:
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='export one-time Object snapshot',
+        )
+        name = f'one-time.export.{uuid4().hex}'
+        target = f'agent_outputs/one_time_export_{uuid4().hex}.txt'
+        original = self.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'content': 'read exactly once'},
+            name=name,
+        )
+        self.runtime.capability.revoke(
+            original.capability_id,
+            revoked_by='test.host',
+            reason='replace with one-time Object read',
+            require_authority=False,
+        )
+        one_time_read = self.runtime.capability.issue_trusted(
+            pid,
+            f'object:{original.oid}',
+            [ObjectRight.READ],
+            issued_by='test.host',
+            uses_remaining=1,
+        )
+        self.runtime.filesystem.grant_path(
+            pid,
+            target,
+            [CapabilityRight.WRITE],
+            issued_by='test.host',
+        )
+
+        result = self.runtime.tools.call(
+            pid,
+            'write_object_to_file',
+            {'name': name, 'path': target},
+        )
+
+        assert result.ok, result.error
+        assert (self.runtime.workspace_root / target).read_text(
+            encoding='utf-8'
+        ) == 'read exactly once'
+        persisted = self.runtime.store.get_capability(one_time_read.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 0
+
+    def test_write_object_to_file_rejects_changed_source_snapshot_before_write(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='reject stale Object export',
+        )
+        name = f'stale.export.{uuid4().hex}'
+        target = f'agent_outputs/stale_export_{uuid4().hex}.txt'
+        handle = self.runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {'content': 'old snapshot bytes'},
+            name=name,
+            immutable=False,
+        )
+        self.runtime.filesystem.grant_path(
+            pid,
+            target,
+            [CapabilityRight.WRITE],
+            issued_by='test.host',
+        )
+        original_write = self.runtime.filesystem.write_text
+        update_count = 0
+
+        def update_before_write(*args, **kwargs):
+            nonlocal update_count
+            update_count += 1
+            self.runtime.memory.update_object(
+                pid,
+                handle,
+                ObjectPatch(payload={'content': 'new snapshot bytes'}),
+            )
+            return original_write(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.filesystem, 'write_text', update_before_write)
+        effects_before = tuple(self.runtime.store.list_external_effects(pid=pid))
+
+        result = self.runtime.tools.call(
+            pid,
+            'write_object_to_file',
+            {'name': name, 'path': target},
+        )
+
+        assert not result.ok
+        assert update_count == 1
+        assert not (self.runtime.workspace_root / target).exists()
+        assert tuple(self.runtime.store.list_external_effects(pid=pid)) == effects_before
+        assert self.runtime.store.get_file_label_binding(target) is None
 
     def test_create_object_from_file_rejects_limit_above_filesystem_read_boundary(self) -> None:
         pid = self.runtime.process.spawn(
@@ -93,7 +207,12 @@ class TestObjectFileTool:
         )
 
         assert not rejected.ok
-        assert 'effective Object-file read limit' in (rejected.error or '')
+        assert_public_error_message(
+            rejected.error,
+            code='validation_error',
+            error_type='ToolExecutionError',
+            forbidden=('effective Object-file read limit',),
+        )
         assert not self.runtime.capability.check(
             pid,
             'filesystem:workspace:does-not-need-to-exist.txt',
@@ -210,7 +329,12 @@ class TestObjectFileTool:
         )
 
         assert not failed.ok
-        assert 'payload limit' in (failed.error or '')
+        assert_public_error_message(
+            failed.error,
+            code='execution_error',
+            error_type='ToolExecutionError',
+            forbidden=('payload limit', source),
+        )
         assert truncated.ok, truncated.error
         assert truncated.payload['truncated'] is True
         obj = self.runtime.store.get_object(truncated.payload['oid'])

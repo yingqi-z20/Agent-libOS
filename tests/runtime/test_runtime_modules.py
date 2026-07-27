@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -13,11 +14,17 @@ import types
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.api.cli import main as cli_main
 from agent_libos.models import AgentImage
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    NotFound,
+    ProviderHostError,
+    ValidationError,
+)
 from agent_libos.modules.host import ModuleHookContext, ModuleHookServices
 from agent_libos.modules.journal import RegistrationJournal, RegistrationRollbackError
 from agent_libos.modules.loader import ModuleLoader
@@ -55,8 +62,14 @@ class TestRuntimeModule:
         journal.record(kind='tool', target='older', undo=lambda: order.append('older'))
         journal.record(kind='tool', target='retry', undo=transient_failure)
 
-        with pytest.raises(RegistrationRollbackError, match='transient inverse failure'):
+        with pytest.raises(
+            RegistrationRollbackError,
+            match='module_rollback_failed: RegistrationRollbackError',
+        ) as caught:
             journal.rollback()
+
+        assert 'transient inverse failure' not in str(caught.value)
+        assert str(caught.value).count('correlation_id=') == 1
 
         assert order == ['older']
         assert journal.size == 1
@@ -93,6 +106,39 @@ class TestRuntimeModule:
             assert runtime.modules._registration_journals['agent-libos-core:v0'].size > 0
         finally:
             runtime.close()
+
+    def test_failed_core_module_rehydrate_preserves_durable_images(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db = tmp_path / 'runtime.sqlite'
+        runtime = Runtime.open(db)
+        registry_type = type(runtime.modules)
+        original_apply = registry_type._apply_context
+        durable_ids = {image.image_id for image, _metadata in runtime.store.list_images()}
+        assert durable_ids
+        runtime.close()
+
+        def apply_then_fail(self: Any, ctx: Any, journal: RegistrationJournal) -> None:
+            original_apply(self, ctx, journal)
+            if ctx.module_id == 'agent-libos-core:v0':
+                raise RuntimeError('injected failure after core image rehydrate')
+
+        monkeypatch.setattr(registry_type, '_apply_context', apply_then_fail)
+        with pytest.raises(RuntimeError, match='after core image rehydrate'):
+            Runtime.open(db)
+
+        monkeypatch.setattr(registry_type, '_apply_context', original_apply)
+        reopened = Runtime.open(db)
+        try:
+            persisted_ids = {
+                image.image_id for image, _metadata in reopened.store.list_images()
+            }
+            assert persisted_ids == durable_ids
+            assert durable_ids <= set(reopened.images)
+        finally:
+            reopened.close()
 
     def test_module_hook_host_has_only_explicit_journaled_runtime_state(self) -> None:
         runtime = Runtime.open()
@@ -297,7 +343,10 @@ class TestRuntimeModule:
                 assert 'read_text_file' in runtime.process.get(pid).tool_table
                 result = runtime.tools.call(pid, 'read_text_file', {'path': 'secret.txt'})
                 assert not result.ok
-                assert 'lacks read' in (result.error or '')
+                assert (result.error or '').startswith(
+                    'permission_denied: CapabilityDenied'
+                )
+                assert 'secret.txt' not in (result.error or '')
             finally:
                 runtime.close()
 
@@ -306,6 +355,99 @@ class TestRuntimeModule:
             manifest, _source_sha = _write_module(Path(temp_dir))
             with pytest.raises(CapabilityDenied):
                 Runtime.open(module_manifests=(str(manifest),))
+
+    def test_warn_policy_module_failure_redacts_exception_text_from_durable_evidence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        secret = 'token=module-secret /opaque/private/module.py payload=opaque-value'
+        config = replace(
+            DEFAULT_CONFIG,
+            modules=replace(DEFAULT_CONFIG.modules, load_policy='warn'),
+        )
+        runtime = Runtime.open(config=config)
+        try:
+            def fail_resolve(
+                _loader: ModuleLoader,
+                _manifest_path: str | Path,
+            ) -> object:
+                raise RuntimeError(secret)
+
+            monkeypatch.setattr(ModuleLoader, 'resolve', fail_resolve)
+            result = runtime.modules.load_module_manifest(
+                tmp_path / 'failed-module.yaml'
+            )
+            failed = runtime.modules.inspect_module('failed:failed-module.yaml')
+            failure_audits = [
+                record.decision
+                for record in runtime.audit.trace()
+                if record.action == 'module.load_failed'
+            ]
+            projected = json.dumps(
+                {
+                    'result': result,
+                    'failed': failed,
+                    'audit': failure_audits,
+                },
+                sort_keys=True,
+            )
+
+            assert secret not in projected
+            assert '/opaque/private/module.py' not in projected
+            assert 'opaque-value' not in projected
+            assert result['error'].startswith('module_load_failed: RuntimeError')
+            assert failed['error'] == result['error']
+            assert result['correlation_id'] in projected
+        finally:
+            runtime.close()
+
+    def test_module_failure_does_not_trust_exception_supplied_public_envelope(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        supplied = {
+            'code': 'secretModuleCode',
+            'error_type': 'SecretModuleType',
+            'correlation_id': 'secretCorrelation',
+        }
+        config = replace(
+            DEFAULT_CONFIG,
+            modules=replace(DEFAULT_CONFIG.modules, load_policy='warn'),
+        )
+        runtime = Runtime.open(config=config)
+        try:
+            def fail_resolve(
+                _loader: ModuleLoader,
+                _manifest_path: str | Path,
+            ) -> object:
+                raise ProviderHostError(**supplied)
+
+            monkeypatch.setattr(ModuleLoader, 'resolve', fail_resolve)
+            result = runtime.modules.load_module_manifest(
+                tmp_path / 'failed-provider-envelope.yaml'
+            )
+            failed = runtime.modules.inspect_module(
+                'failed:failed-provider-envelope.yaml'
+            )
+            failure_audits = [
+                record.decision
+                for record in runtime.audit.trace()
+                if record.action == 'module.load_failed'
+            ]
+            projected = json.dumps(
+                {'result': result, 'failed': failed, 'audit': failure_audits},
+                sort_keys=True,
+            )
+
+            assert all(value not in projected for value in supplied.values())
+            assert result['error'].startswith(
+                'module_load_failed: ProviderHostError'
+            )
+            assert result['correlation_id'].startswith('corr_')
+        finally:
+            runtime.close()
 
     def test_module_trust_binds_manifest_contents(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -412,6 +554,121 @@ sha256: {source_sha}
                     trusted_modules=(_module_trust_key('mutating-module:v0', manifest, source_sha),),
                 )
 
+    def test_module_entrypoint_cannot_mutate_registration_buffers_before_preflight(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        source = tmp_path / 'mutating_buffers.py'
+        source.write_text(
+            "from agent_libos.models import AgentImage\n\n"
+            "def register_module(ctx):\n"
+            "    ctx.images.append(AgentImage(image_id='hidden-buffer:v0', name='hidden-buffer'))\n",
+            encoding='utf-8',
+        )
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        manifest = tmp_path / 'module.yaml'
+        manifest.write_text(
+            f"""
+schema_version: 1
+module_id: mutating-buffers:v0
+name: Mutating buffers module
+entrypoint: ./mutating_buffers.py:register_module
+provides: {{}}
+sha256: {source_sha}
+""".lstrip(),
+            encoding='utf-8',
+        )
+        runtime = Runtime.open()
+        register_attempts = 0
+        original_register = runtime.image_registry.register_module_image
+
+        def observe_register(*args: Any, **kwargs: Any) -> Any:
+            nonlocal register_attempts
+            register_attempts += 1
+            return original_register(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.image_registry, 'register_module_image', observe_register)
+        try:
+            with pytest.raises(ValidationError, match='register_image'):
+                runtime.modules.load_module_manifest(
+                    manifest,
+                    trusted_modules=(
+                        _module_trust_key(
+                            'mutating-buffers:v0',
+                            manifest,
+                            source_sha,
+                        ),
+                    ),
+                )
+
+            assert register_attempts == 0
+            assert 'hidden-buffer:v0' not in runtime.images
+            assert runtime.store.get_image('hidden-buffer:v0') is None
+        finally:
+            runtime.close()
+
+    def test_module_tool_name_cannot_change_after_declared_registration(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source = tmp_path / 'mutating_tool.py'
+        source.write_text(
+            "from pydantic import BaseModel\n"
+            "from agent_libos.tools.base import SyncAgentTool\n\n"
+            "class Args(BaseModel):\n"
+            "    pass\n\n"
+            "class MutatingTool(SyncAgentTool[Args]):\n"
+            "    name = 'declared_tool'\n"
+            "    description = 'mutates after registration'\n"
+            "    args_schema = Args\n\n"
+            "    def run(self, args, ctx):\n"
+            "        return {}\n\n"
+            "def register_module(ctx):\n"
+            "    tool = MutatingTool()\n"
+            "    ctx.register_tool(tool)\n"
+            "    tool.name = 'hidden_tool'\n",
+            encoding='utf-8',
+        )
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        manifest = tmp_path / 'module.yaml'
+        manifest.write_text(
+            f"""
+schema_version: 1
+module_id: mutating-tool:v0
+name: Mutating tool module
+entrypoint: ./mutating_tool.py:register_module
+provides:
+  tools: [declared_tool]
+sha256: {source_sha}
+""".lstrip(),
+            encoding='utf-8',
+        )
+        runtime = Runtime.open()
+        try:
+            with pytest.raises(ValidationError, match='changed after registration'):
+                runtime.modules.load_module_manifest(
+                    manifest,
+                    trusted_modules=(
+                        _module_trust_key(
+                            'mutating-tool:v0',
+                            manifest,
+                            source_sha,
+                        ),
+                    ),
+                )
+
+            with pytest.raises(NotFound):
+                runtime.tools.resolve('declared_tool')
+            with pytest.raises(NotFound):
+                runtime.tools.resolve('hidden_tool')
+            assert all(
+                row['name'] not in {'declared_tool', 'hidden_tool'}
+                for row in runtime.store.list_tools()
+            )
+        finally:
+            runtime.close()
+
     def test_configured_startup_module_paths_resolve_from_project_root_not_cwd(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -482,7 +739,7 @@ sha256: {source_sha}
 
             resolved = ModuleLoader().resolve(manifest)
 
-            assert resolved.source_path == str(source.resolve())
+            assert os.path.samefile(resolved.source_path, source)
             assert not sentinel.exists()
             runtime = Runtime.open(module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('package-module:v0', manifest, source_sha),))
             try:
@@ -763,6 +1020,186 @@ sha256: {package_sha}
         assert tuple(sys.meta_path) == before_meta_path
         assert {name for name in sys.modules if name.startswith('_agent_libos_module_pkg_')} == before_module_names
 
+    def test_reexported_package_entrypoint_retains_manifest_import_cleanup(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        package = tmp_path / 'reexported'
+        package.mkdir()
+        (package / '__init__.py').write_text('', encoding='utf-8')
+        (package / 'helper.py').write_text(
+            'def register_module(ctx):\n    pass\n',
+            encoding='utf-8',
+        )
+        (package / 'main.py').write_text(
+            'from .helper import register_module\n',
+            encoding='utf-8',
+        )
+        package_sha = _module_package_sha(tmp_path, package)
+        manifest = tmp_path / 'reexported.yaml'
+        manifest.write_text(
+            f'''
+schema_version: 1
+module_id: reexported-module:v0
+name: Re-exported module
+entrypoint: reexported.main:register_module
+provides: {{}}
+sha256: {package_sha}
+'''.lstrip(),
+            encoding='utf-8',
+        )
+        before_meta_path = tuple(sys.meta_path)
+        before_module_names = {
+            name
+            for name in sys.modules
+            if name.startswith('_agent_libos_module_pkg_')
+        }
+        runtime: Runtime | None = None
+        try:
+            runtime = Runtime.open(
+                module_manifests=(str(manifest),),
+                trusted_modules=(
+                    _module_trust_key(
+                        'reexported-module:v0',
+                        manifest,
+                        package_sha,
+                    ),
+                ),
+            )
+
+            assert 'reexported-module:v0' in runtime.modules._module_import_cleanups
+            runtime.close()
+            runtime = None
+
+            assert tuple(sys.meta_path) == before_meta_path
+            assert {
+                name
+                for name in sys.modules
+                if name.startswith('_agent_libos_module_pkg_')
+            } == before_module_names
+        finally:
+            if runtime is not None:
+                runtime.close()
+            for importer in tuple(sys.meta_path):
+                package_name = getattr(importer, 'package_name', '')
+                if (
+                    importer not in before_meta_path
+                    and isinstance(package_name, str)
+                    and package_name.startswith('_agent_libos_module_pkg_')
+                ):
+                    ModuleLoader.cleanup_imported_package(
+                        (package_name, importer)
+                    )
+
+    def test_package_import_identity_collision_fails_before_execution(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        package = tmp_path / 'collision'
+        nested = package / 'a'
+        nested.mkdir(parents=True)
+        (package / '__init__.py').write_text('', encoding='utf-8')
+        (package / 'a.b.py').write_text(
+            'def register_module(ctx):\n    pass\n',
+            encoding='utf-8',
+        )
+        sentinel = tmp_path / 'colliding-module-executed'
+        (nested / 'b.py').write_text(
+            'from pathlib import Path\n'
+            f'Path({str(sentinel)!r}).write_text("executed", encoding="utf-8")\n'
+            'def register_module(ctx):\n    pass\n',
+            encoding='utf-8',
+        )
+        package_sha = _module_package_sha(tmp_path, package)
+        manifest = tmp_path / 'collision.yaml'
+        manifest.write_text(
+            f'''
+schema_version: 1
+module_id: collision-module:v0
+name: Collision module
+entrypoint: ./collision/a.b.py:register_module
+provides: {{}}
+sha256: {package_sha}
+'''.lstrip(),
+            encoding='utf-8',
+        )
+        loader = ModuleLoader()
+        source = loader.resolve(manifest)
+        before_meta_path = tuple(sys.meta_path)
+
+        with pytest.raises(ValidationError, match='same import identity'):
+            loader.import_entrypoint(source)
+
+        assert tuple(sys.meta_path) == before_meta_path
+        assert not sentinel.exists()
+
+    @pytest.mark.parametrize(
+        ('failure_statement', 'exception_type'),
+        [
+            ('raise KeyboardInterrupt()', KeyboardInterrupt),
+            ('raise asyncio.CancelledError()', asyncio.CancelledError),
+        ],
+    )
+    def test_multifile_module_base_exception_import_cleans_snapshot_namespace(
+        self,
+        tmp_path: Path,
+        failure_statement: str,
+        exception_type: type[BaseException],
+    ) -> None:
+        package = tmp_path / 'interrupting'
+        package.mkdir()
+        (package / '__init__.py').write_text('', encoding='utf-8')
+        (package / 'main.py').write_text(
+            'import asyncio\n'
+            f'{failure_statement}\n\n'
+            'def register_module(ctx):\n'
+            '    pass\n',
+            encoding='utf-8',
+        )
+        package_sha = _module_package_sha(tmp_path, package)
+        manifest = tmp_path / 'module.yaml'
+        manifest.write_text(
+            f"""
+schema_version: 1
+module_id: interrupting-module:v0
+name: Interrupting module
+entrypoint: interrupting.main:register_module
+provides: {{}}
+sha256: {package_sha}
+""".lstrip(),
+            encoding='utf-8',
+        )
+        loader = ModuleLoader()
+        source = loader.resolve(manifest)
+        before_meta_path = tuple(sys.meta_path)
+        before_modules = {
+            name for name in sys.modules
+            if name.startswith('_agent_libos_module_pkg_')
+        }
+
+        with pytest.raises(exception_type):
+            loader.import_entrypoint(source)
+
+        leaked_importers = [
+            importer for importer in sys.meta_path
+            if all(importer is not existing for existing in before_meta_path)
+        ]
+        leaked_modules = {
+            name for name in sys.modules
+            if name.startswith('_agent_libos_module_pkg_')
+        } - before_modules
+        try:
+            assert leaked_importers == []
+            assert leaked_modules == set()
+        finally:
+            for importer in leaked_importers:
+                try:
+                    sys.meta_path.remove(importer)
+                except ValueError:
+                    pass
+            for name in leaked_modules:
+                sys.modules.pop(name, None)
+
     def test_multifile_module_source_swap_after_trust_does_not_execute_swapped_helper(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -851,6 +1288,345 @@ sha256: {package_sha}
             with pytest.raises(ValidationError, match='source_max_bytes'):
                 Runtime.open(config=config, module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
 
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat mutation injection is POSIX-only; Win32 target handles deny concurrent writes',
+    )
+    def test_module_source_growth_after_descriptor_open_uses_bounded_reads(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        manifest, _source_sha = _write_module(tmp_path)
+        source = tmp_path / 'test_module.py'
+        source_identity = (source.stat().st_dev, source.stat().st_ino)
+        source_limit = source.stat().st_size + 64
+        config = replace(
+            DEFAULT_CONFIG,
+            modules=replace(
+                DEFAULT_CONFIG.modules,
+                source_max_bytes=source_limit,
+            ),
+        )
+        real_fstat = os.fstat
+        real_fdopen = os.fdopen
+        grew = False
+        read_sizes: list[int] = []
+
+        class RecordingHandle:
+            def __init__(self, handle: Any):
+                self._handle = handle
+
+            def __enter__(self) -> 'RecordingHandle':
+                self._handle.__enter__()
+                return self
+
+            def __exit__(self, *args: object) -> object:
+                return self._handle.__exit__(*args)
+
+            def fileno(self) -> int:
+                return self._handle.fileno()
+
+            def read(self, size: int = -1) -> bytes:
+                read_sizes.append(size)
+                return self._handle.read(size)
+
+        def grow_after_open(fd: int) -> os.stat_result:
+            nonlocal grew
+            result = real_fstat(fd)
+            if not grew and (result.st_dev, result.st_ino) == source_identity:
+                grew = True
+                with source.open('ab') as output:
+                    output.write(b'x' * source_limit)
+            return result
+
+        def record_source_reads(fd: int, *args: object, **kwargs: object) -> Any:
+            handle = real_fdopen(fd, *args, **kwargs)
+            opened = real_fstat(fd)
+            if (opened.st_dev, opened.st_ino) == source_identity:
+                return RecordingHandle(handle)
+            return handle
+
+        monkeypatch.setattr(os, 'fstat', grow_after_open)
+        monkeypatch.setattr(os, 'fdopen', record_source_reads)
+
+        with pytest.raises(ValidationError, match=f'source_max_bytes={source_limit}'):
+            ModuleLoader(config).resolve(manifest)
+
+        assert grew
+        assert read_sizes
+        assert all(0 < size <= source_limit + 1 for size in read_sizes)
+
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat mutation injection is POSIX-only; Win32 target handles deny concurrent writes',
+    )
+    def test_module_manifest_growth_after_descriptor_open_uses_bounded_reads(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        manifest, _source_sha = _write_module(tmp_path)
+        manifest_identity = (manifest.stat().st_dev, manifest.stat().st_ino)
+        manifest_limit = manifest.stat().st_size + 64
+        config = replace(
+            DEFAULT_CONFIG,
+            modules=replace(
+                DEFAULT_CONFIG.modules,
+                manifest_max_bytes=manifest_limit,
+            ),
+        )
+        real_path_stat = Path.stat
+        real_fstat = os.fstat
+        real_fdopen = os.fdopen
+        grew = False
+        read_sizes: list[int] = []
+
+        class RecordingHandle:
+            def __init__(self, handle: Any):
+                self._handle = handle
+
+            def __enter__(self) -> 'RecordingHandle':
+                self._handle.__enter__()
+                return self
+
+            def __exit__(self, *args: object) -> object:
+                return self._handle.__exit__(*args)
+
+            def fileno(self) -> int:
+                return self._handle.fileno()
+
+            def read(self, size: int = -1) -> bytes:
+                read_sizes.append(size)
+                return self._handle.read(size)
+
+        def grow_manifest() -> None:
+            nonlocal grew
+            if grew:
+                return
+            grew = True
+            with manifest.open('ab') as output:
+                output.write(b'\n#' + (b'x' * manifest_limit))
+
+        def grow_from_path_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+            result = real_path_stat(path, *args, **kwargs)
+            if (result.st_dev, result.st_ino) == manifest_identity:
+                grow_manifest()
+            return result
+
+        def grow_from_fstat(fd: int) -> os.stat_result:
+            result = real_fstat(fd)
+            if (result.st_dev, result.st_ino) == manifest_identity:
+                grow_manifest()
+            return result
+
+        def record_manifest_reads(fd: int, *args: object, **kwargs: object) -> Any:
+            handle = real_fdopen(fd, *args, **kwargs)
+            opened = real_fstat(fd)
+            if (opened.st_dev, opened.st_ino) == manifest_identity:
+                return RecordingHandle(handle)
+            return handle
+
+        monkeypatch.setattr(Path, 'stat', grow_from_path_stat)
+        monkeypatch.setattr(os, 'fstat', grow_from_fstat)
+        monkeypatch.setattr(os, 'fdopen', record_manifest_reads)
+
+        with pytest.raises(ValidationError, match=f'manifest_max_bytes={manifest_limit}'):
+            ModuleLoader(config).resolve(manifest)
+
+        assert grew
+        assert read_sizes
+        assert all(0 < size <= manifest_limit + 1 for size in read_sizes)
+
+    @pytest.mark.skipif(
+        os.name == 'nt',
+        reason='os.fstat replacement injection is POSIX-only; Win32 target handles deny replacement',
+    )
+    def test_module_source_swap_during_descriptor_read_fails_in_resolve(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        manifest, _source_sha = _write_module(tmp_path)
+        source = tmp_path / 'test_module.py'
+        original_source = tmp_path / 'original_test_module.py'
+        replacement = tmp_path / 'replacement.py'
+        replacement.write_text('def register_module(ctx):\n    pass\n', encoding='utf-8')
+        source_identity = (source.stat().st_dev, source.stat().st_ino)
+        real_fstat = os.fstat
+        swapped = False
+
+        def swap_after_open(fd: int) -> os.stat_result:
+            nonlocal swapped
+            result = real_fstat(fd)
+            if not swapped and (result.st_dev, result.st_ino) == source_identity:
+                swapped = True
+                os.replace(source, original_source)
+                os.replace(replacement, source)
+            return result
+
+        monkeypatch.setattr(os, 'fstat', swap_after_open)
+
+        with pytest.raises(ValidationError, match='changed during read'):
+            ModuleLoader().resolve(manifest)
+
+        assert swapped
+
+    @pytest.mark.skipif(os.name == 'nt', reason='requires POSIX symlink semantics')
+    def test_module_manifest_rejects_symlinked_intermediate_ancestor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        real_parent = tmp_path / 'real-parent'
+        real_parent.mkdir()
+        manifest, _source_sha = _write_module(real_parent)
+        alias_parent = tmp_path / 'alias-parent'
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+        with pytest.raises(ValidationError, match='symlinks are not supported'):
+            ModuleLoader().resolve(alias_parent / manifest.name)
+
+    @pytest.mark.skipif(os.name == 'nt', reason='requires POSIX symlink semantics')
+    def test_module_package_root_rejects_symlinked_intermediate_ancestor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        real_parent = tmp_path / 'real-parent'
+        package = real_parent / 'tiny'
+        package.mkdir(parents=True)
+        (package / '__init__.py').write_text('', encoding='utf-8')
+        (package / 'main.py').write_text(
+            'def register_module(ctx):\n    pass\n',
+            encoding='utf-8',
+        )
+        alias_parent = tmp_path / 'alias-parent'
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+        with pytest.raises(ValidationError, match='securely open module package'):
+            ModuleLoader()._read_package_source_files(
+                tmp_path.resolve(),
+                alias_parent / 'tiny',
+            )
+
+    @pytest.mark.skipif(os.name == 'nt', reason='requires POSIX symlink semantics')
+    def test_module_resolve_rejects_symlinked_package_ancestor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        package = tmp_path / 'realpkg'
+        package.mkdir()
+        (package / '__init__.py').write_text('', encoding='utf-8')
+        (package / 'main.py').write_text(
+            'def register_module(ctx):\n    pass\n',
+            encoding='utf-8',
+        )
+        package_sha = _module_package_sha(tmp_path, package)
+        alias = tmp_path / 'aliaspkg'
+        alias.symlink_to(package, target_is_directory=True)
+        manifest = tmp_path / 'module.yaml'
+        manifest.write_text(
+            f'''\
+schema_version: 1
+module_id: symlinked-package:v0
+name: Symlinked package
+entrypoint: aliaspkg.main:register_module
+provides: {{}}
+sha256: {package_sha}
+''',
+            encoding='utf-8',
+        )
+
+        with pytest.raises(ValidationError, match='symlinks are not supported'):
+            ModuleLoader().resolve(manifest)
+
+    def test_module_package_file_limit_stops_lazy_enumeration(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        manifest, _package_sha = _write_tiny_multifile_module(tmp_path)
+        package = (tmp_path / 'tiny').resolve()
+        real_rglob = Path.rglob
+        yielded = 0
+
+        def counting_rglob(path: Path, pattern: str):
+            iterator = real_rglob(path, pattern)
+            if path != package:
+                return iterator
+
+            def counted():
+                nonlocal yielded
+                for item in iterator:
+                    yielded += 1
+                    yield item
+
+            return counted()
+
+        monkeypatch.setattr(Path, 'rglob', counting_rglob)
+        config = replace(
+            DEFAULT_CONFIG,
+            modules=replace(DEFAULT_CONFIG.modules, max_package_files=1),
+        )
+
+        with pytest.raises(ValidationError, match='max_package_files=1'):
+            ModuleLoader(config).resolve(manifest)
+
+        assert yielded <= 2
+
+    def test_module_package_directory_replacement_during_enumeration_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        if os.name == 'nt':
+            pytest.skip('POSIX descriptor replacement fixture')
+        manifest, _package_sha = _write_tiny_multifile_module(tmp_path)
+        package = tmp_path / 'tiny'
+        parked = tmp_path / 'tiny-original'
+        package_identity = (package.stat().st_dev, package.stat().st_ino)
+        real_fstat = os.fstat
+        swapped = False
+
+        def replace_after_directory_open(fd: int) -> os.stat_result:
+            nonlocal swapped
+            result = real_fstat(fd)
+            if not swapped and (result.st_dev, result.st_ino) == package_identity:
+                swapped = True
+                os.replace(package, parked)
+                shutil.copytree(parked, package)
+            return result
+
+        monkeypatch.setattr(os, 'fstat', replace_after_directory_open)
+
+        with pytest.raises(
+            ValidationError,
+            match='changed during enumeration|cannot securely open module source',
+        ):
+            ModuleLoader().resolve(manifest)
+
+        assert swapped
+
+    @pytest.mark.skipif(
+        sys.platform != 'win32',
+        reason='requires real Win32 package handles',
+    )
+    def test_windows_multifile_module_reads_through_secure_handle_chain(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        manifest, package_sha = _write_tiny_multifile_module(tmp_path)
+
+        source = ModuleLoader().resolve(manifest)
+
+        assert source.source_kind == 'package'
+        assert source.source_sha256 == package_sha
+        assert {record.module_path for record in source.source_files} == {
+            '__init__.py',
+            'a.py',
+            'b.py',
+            'main.py',
+        }
+
     def test_failed_module_does_not_leave_partial_tool_registration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -871,19 +1647,19 @@ sha256: {package_sha}
             root = Path(temp_dir)
             manifest, source_sha = _write_module(root)
             runtime = Runtime.open()
-            original_register = runtime.image_registry.register
+            original_register = runtime.image_registry.register_module_image
             try:
                 def fail_register(*args, **kwargs):
                     raise RuntimeError('image register exploded')
 
-                runtime.image_registry.register = fail_register
+                runtime.image_registry.register_module_image = fail_register
                 with pytest.raises(RuntimeError, match='image register exploded'):
                     runtime.modules.load_module_manifest(manifest, trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
                 assert all(row['name'] != 'module_echo' for row in runtime.store.list_tools())
                 assert 'module-agent:v0' not in runtime.images
                 assert runtime.modules.inspect_module('test-module:v0')['status'] == 'failed'
             finally:
-                runtime.image_registry.register = original_register
+                runtime.image_registry.register_module_image = original_register
                 runtime.close()
 
     def test_invalid_module_image_does_not_leave_partial_tool_registration(self) -> None:
@@ -911,12 +1687,78 @@ sha256: {package_sha}
             try:
                 failed = runtime.modules.inspect_module('test-module:v0')
                 assert failed['status'] == 'failed'
-                assert 'startup hook failed' in failed['error']
+                assert failed['error'].startswith(
+                    'module_load_failed: RuntimeError'
+                )
+                assert 'startup hook failed' not in failed['error']
                 assert 'module-agent:v0' not in runtime.images
                 assert all(row['name'] != 'module_echo' for row in runtime.store.list_tools())
                 assert runtime.syscalls.get('module.ping') is None
             finally:
                 runtime.close()
+
+    @pytest.mark.parametrize(
+        ('startup_hook_exception', 'exception_type', 'error_message'),
+        [
+            (
+                "KeyboardInterrupt('startup hook interrupted token=secret /opaque/private/hook.py payload=opaque')",
+                KeyboardInterrupt,
+                'startup hook interrupted token=secret /opaque/private/hook.py payload=opaque',
+            ),
+            (
+                "__import__('asyncio').CancelledError('startup hook cancelled token=secret /opaque/private/hook.py payload=opaque')",
+                asyncio.CancelledError,
+                'startup hook cancelled token=secret /opaque/private/hook.py payload=opaque',
+            ),
+        ],
+        ids=('keyboard-interrupt', 'cancelled-error'),
+    )
+    def test_startup_hook_base_exception_rolls_back_external_module_state(
+        self,
+        tmp_path: Path,
+        startup_hook_exception: str,
+        exception_type: type[BaseException],
+        error_message: str,
+    ) -> None:
+        db = tmp_path / 'runtime.sqlite'
+        manifest, source_sha = _write_module(
+            tmp_path,
+            startup_hook_exception=startup_hook_exception,
+        )
+        trust = _module_trust_key('test-module:v0', manifest, source_sha)
+
+        with pytest.raises(exception_type, match=error_message):
+            Runtime.open(
+                db,
+                module_manifests=(str(manifest),),
+                trusted_modules=(trust,),
+            )
+
+        runtime = Runtime.open(db)
+        try:
+            failed = runtime.modules.inspect_module('test-module:v0')
+            assert failed['status'] == 'failed'
+            assert failed['error'].startswith(
+                f'module_load_failed: {exception_type.__name__}'
+            )
+            assert error_message not in failed['error']
+            failure_audits = [
+                record.decision
+                for record in runtime.audit.trace()
+                if record.action == 'module.load_failed'
+            ]
+            projected = json.dumps(
+                {'failed': failed, 'audit': failure_audits},
+                sort_keys=True,
+            )
+            assert error_message not in projected
+            assert '/opaque/private/hook.py' not in projected
+            assert failed['metadata']['failure']['correlation_id'] in projected
+            assert 'module-agent:v0' not in runtime.images
+            assert all(row['name'] != 'module_echo' for row in runtime.store.list_tools())
+            assert runtime.syscalls.get('module.ping') is None
+        finally:
+            runtime.close()
 
     def test_startup_hook_rollback_audit_failure_recovers_persistent_state(
         self,
@@ -949,7 +1791,10 @@ sha256: {package_sha}
         try:
             failed = runtime.modules.inspect_module('test-module:v0')
             assert failed['status'] == 'failed'
-            assert 'startup hook failed' in failed['error']
+            assert failed['error'].startswith(
+                'module_load_failed: RuntimeError'
+            )
+            assert 'startup hook failed' not in failed['error']
             assert 'module-agent:v0' not in runtime.images
             assert all(row['name'] != 'module_echo' for row in runtime.store.list_tools())
             assert any(
@@ -1009,6 +1854,58 @@ sha256: {package_sha}
         finally:
             reopened.close()
 
+    def test_rehydrated_module_image_survives_durable_rollback_recovery(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db = tmp_path / 'runtime.sqlite'
+        manifest, source_sha = _write_module(tmp_path)
+        trust = _module_trust_key('test-module:v0', manifest, source_sha)
+        runtime = Runtime.open(
+            db,
+            module_manifests=(str(manifest),),
+            trusted_modules=(trust,),
+        )
+        try:
+            persisted_before = runtime.store.get_image('module-agent:v0')
+            assert persisted_before is not None
+        finally:
+            runtime.close()
+
+        manifest, failing_sha = _write_module(tmp_path, failing_startup_hook=True)
+        failing_trust = _module_trust_key(
+            'test-module:v0',
+            manifest,
+            failing_sha,
+        )
+        original_record = AuditManager.record
+
+        def fail_rollback_audit(self: Any, *args: Any, **kwargs: Any) -> Any:
+            action = kwargs.get('action')
+            if action is None and len(args) > 1:
+                action = args[1]
+            if action == 'module.rollback':
+                raise RuntimeError('rollback audit sink failed')
+            return original_record(self, *args, **kwargs)
+
+        monkeypatch.setattr(AuditManager, 'record', fail_rollback_audit)
+        with pytest.raises(RuntimeError, match='startup hook failed'):
+            Runtime.open(
+                db,
+                module_manifests=(str(manifest),),
+                trusted_modules=(failing_trust,),
+            )
+
+        monkeypatch.setattr(AuditManager, 'record', original_record)
+        reopened = Runtime.open(db)
+        try:
+            persisted_after = reopened.store.get_image('module-agent:v0')
+            assert persisted_after == persisted_before
+            assert reopened.get_image('module-agent:v0') == persisted_before[0]
+        finally:
+            reopened.close()
+
     def test_failing_startup_hook_cannot_leave_direct_runtime_registrations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1023,7 +1920,10 @@ sha256: {package_sha}
             try:
                 failed = runtime.modules.inspect_module('mutating-hook-module:v0')
                 assert failed['status'] == 'failed'
-                assert 'mutating startup hook failed' in failed['error']
+                assert failed['error'].startswith(
+                    'module_load_failed: RuntimeError'
+                )
+                assert 'mutating startup hook failed' not in failed['error']
                 assert 'hook-direct-image:v0' not in runtime.images
                 assert all(row['name'] != 'hook_direct_tool' for row in runtime.store.list_tools())
                 assert runtime.store.get_image('hook-direct-image:v0') is None
@@ -1082,8 +1982,13 @@ sha256: {package_sha}
 
         monkeypatch.setattr(runtime.tools, 'unregister_tool', transient_unregister_failure)
         try:
-            with pytest.raises(RegistrationRollbackError, match='transient tool unregister failure'):
+            with pytest.raises(
+                RegistrationRollbackError,
+                match='module_rollback_failed: RegistrationRollbackError',
+            ) as caught:
                 runtime.modules.load_module_manifest(manifest, trusted_modules=(trust,))
+
+            assert 'transient tool unregister failure' not in str(caught.value)
 
             with pytest.raises(NotFound):
                 runtime.tools.resolve('hook_direct_tool')
@@ -1340,14 +2245,30 @@ sha256: 0000000000000000000000000000000000000000000000000000000000000000
 """.lstrip()
             )
 
-def _write_module(root: Path, *, expose_read_tool: bool=False, invalid_registration: bool=False, invalid_image: bool=False, provider_hook: bool=False, failing_startup_hook: bool=False, entrypoint: str='./test_module.py:register_module', marker: str='module') -> tuple[Path, str]:
+def _write_module(
+    root: Path,
+    *,
+    expose_read_tool: bool = False,
+    invalid_registration: bool = False,
+    invalid_image: bool = False,
+    provider_hook: bool = False,
+    failing_startup_hook: bool = False,
+    startup_hook_exception: str | None = None,
+    entrypoint: str = './test_module.py:register_module',
+    marker: str = 'module',
+) -> tuple[Path, str]:
     source = root / 'test_module.py'
     default_tools = ['module_echo', 'read_text_file'] if expose_read_tool else ['module_echo']
     if invalid_image:
         default_tools.append('missing_module_tool')
     provider_hook_code = '\ndef mark_provider(runtime):\n    runtime.audit.record(actor="module:test-module:v0", action="test.provider_hook", target="runtime")\n'.rstrip() if provider_hook else ''
     provider_hook_registration = "ctx.register_provider_hook('test_hook', mark_provider)" if provider_hook else ''
-    startup_hook_body = "raise RuntimeError('startup hook failed')" if failing_startup_hook else 'runtime.audit.record(actor="module:test-module:v0", action="test.startup_hook", target="runtime")'
+    if startup_hook_exception is not None:
+        startup_hook_body = f'raise {startup_hook_exception}'
+    elif failing_startup_hook:
+        startup_hook_body = "raise RuntimeError('startup hook failed')"
+    else:
+        startup_hook_body = 'runtime.audit.record(actor="module:test-module:v0", action="test.startup_hook", target="runtime")'
     source.write_text(f"""\nfrom pydantic import BaseModel\n\nfrom agent_libos.models import AgentImage\nfrom agent_libos.tools.base import SyncAgentTool, ToolContext\n\n\nclass EchoArgs(BaseModel):\n    text: str\n\n\nclass ModuleEchoTool(SyncAgentTool[EchoArgs]):\n    name = "module_echo"\n    description = "Echo text through a startup module."\n    args_schema = EchoArgs\n\n    def run(self, args: EchoArgs, ctx: ToolContext):\n        return {{"echo": args.text, "pid": ctx.pid, "marker": {marker!r}}}\n\n\ndef module_ping(session, args):\n    return {{"pid": session.pid, "value": args.get("value")}}\n\n\ndef mark_startup(runtime):\n    {startup_hook_body}\n\n\n{provider_hook_code}\n\n\ndef register_module(ctx):\n    ctx.register_tool(ModuleEchoTool())\n    {("ctx.register_syscall('undeclared.syscall', module_ping)" if invalid_registration else "ctx.register_syscall('module.ping', module_ping)")}\n    ctx.register_image(AgentImage(\n        image_id="module-agent:v0",\n        name="module-agent",\n        default_tools={default_tools!r},\n    ))\n    {provider_hook_registration}\n    ctx.add_startup_hook(mark_startup)\n""".lstrip(), encoding='utf-8')
     source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
     syscalls = '[]\n' if invalid_registration else "['module.ping']\n"
@@ -1525,7 +2446,7 @@ def _module_package_sha(manifest_dir: Path, source_root: Path) -> str:
 
 
 def _module_trust_key(module_id: str, manifest: Path, source_sha: str) -> str:
-    manifest_sha = hashlib.sha256(manifest.read_text(encoding='utf-8').encode('utf-8')).hexdigest()
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
     return ModuleLoader.trust_key(module_id, manifest_sha, source_sha)
 
 

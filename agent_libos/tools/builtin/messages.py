@@ -24,6 +24,7 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 # tuning defaults.
 _MESSAGE_CARRIER_REF_RESERVE_BYTES = 256
 _MESSAGE_FLOW_LABEL_RESERVE_BYTES = 8_192
+_DEFERRED_PROCESS_MESSAGE_ACK_METADATA_KEY = "_deferred_process_message_ack_ids"
 _DURABLE_MESSAGE_METADATA_KEYS = frozenset(
     {"source_oids", "source_refs", "data_labels", "data_flow_context"}
 )
@@ -211,7 +212,7 @@ class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
                 code=ToolErrorCode.VALIDATION_ERROR,
                 details={"kind": args.kind, "allowed": [kind.value for kind in ProcessMessageKind]},
             ) from exc
-        messages = runtime.messages.list(
+        messages, matching_count = runtime.messages.list_page(
             ctx.pid,
             include_acked=args.include_acked,
             kind=kind,
@@ -227,6 +228,7 @@ class ReadProcessMessagesTool(SyncAgentTool[ReadProcessMessagesArgs]):
             ctx,
             tool_name=self.name,
             messages=messages,
+            matching_count=matching_count,
             ready=True,
             ack=args.ack,
         )
@@ -270,7 +272,7 @@ class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
                 code=ToolErrorCode.VALIDATION_ERROR,
                 details={"kind": args.kind, "allowed": [kind.value for kind in ProcessMessageKind]},
             ) from exc
-        messages = runtime.messages.receive(
+        messages, matching_count = runtime.messages.receive_page(
             ctx.pid,
             block=args.block,
             include_acked=args.include_acked,
@@ -287,7 +289,8 @@ class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
             ctx,
             tool_name=self.name,
             messages=messages,
-            ready=bool(messages),
+            matching_count=matching_count,
+            ready=matching_count > 0,
             ack=args.ack,
         )
 
@@ -344,29 +347,38 @@ def _bounded_message_result(
     *,
     tool_name: str,
     messages: list[ProcessMessage],
+    matching_count: int,
     ready: bool,
     ack: bool,
 ) -> ToolResult:
-    """Select and acknowledge only a page that can be persisted in full.
+    """Select a persistable page and stage its ACK with ToolResult commit.
 
     Process-message reads are side effects because their default behavior is
     to acknowledge returned unread messages. ToolExecutionService applies its
     generic result-size guard only after ``run`` returns, which is too late for
     this tool: an oversized page used to be acknowledged and then replaced by
     ``result_omitted``. Size the exact model-facing projection first, retain a
-    conservative allowance for message label carriers, and do the destructive
-    ACK only after the real flow-labelled envelope is known to fit.
+    conservative allowance for message label carriers, and defer the
+    destructive ACK so ToolExecutionService can commit it atomically with the
+    durable ToolResult.
     """
+
+    if matching_count < len(messages):
+        raise ToolExecutionError(
+            "Process message snapshot count is smaller than its returned window.",
+            code=ToolErrorCode.EXECUTION_ERROR,
+        )
 
     selected = _select_messages_for_result(
         runtime,
         ctx,
         tool_name=tool_name,
         messages=messages,
+        matching_count=matching_count,
         ready=ready,
         ack=ack,
     )
-    remaining = messages[len(selected) :]
+    omitted_count = matching_count - len(selected)
     predicted_acked_ids = [
         message.message_id
         for message in selected
@@ -376,7 +388,7 @@ def _bounded_message_result(
         tool_name=tool_name,
         ready=ready,
         selected=selected,
-        remaining=remaining,
+        omitted_count=omitted_count,
         acked_message_ids=predicted_acked_ids,
         acknowledge_selected=ack,
     )
@@ -384,7 +396,7 @@ def _bounded_message_result(
         tool_name=tool_name,
         ready=ready,
         selected=selected,
-        remaining=remaining,
+        omitted_count=omitted_count,
         acked_message_ids=predicted_acked_ids,
         acknowledge_selected=ack,
     )
@@ -406,44 +418,11 @@ def _bounded_message_result(
         result=predicted_result,
     )
 
-    acked: list[ProcessMessage] = []
     if predicted_acked_ids:
-        acked = runtime.messages.ack(ctx.pid, predicted_acked_ids)
-        acked_by_id = {message.message_id: message for message in acked}
-        selected = [
-            acked_by_id.get(message.message_id, message)
-            for message in selected
-        ]
-    output = _message_output(
-        tool_name=tool_name,
-        ready=ready,
-        selected=selected,
-        remaining=remaining,
-        acked_message_ids=[message.message_id for message in acked],
-        acknowledge_selected=False,
-    )
-    model_output = _model_message_output(
-        tool_name=tool_name,
-        ready=ready,
-        selected=selected,
-        remaining=remaining,
-        acked_message_ids=[message.message_id for message in acked],
-        acknowledge_selected=False,
-    )
-    result = _flow_labeled_result(
-        runtime,
-        ctx.pid,
-        carrier_oids,
-        output,
-        model_output,
-    )
-    _ensure_message_result_fits(
-        runtime,
-        ctx,
-        tool_name=tool_name,
-        result=result,
-    )
-    return result
+        predicted_result.metadata[_DEFERRED_PROCESS_MESSAGE_ACK_METADATA_KEY] = list(
+            predicted_acked_ids
+        )
+    return predicted_result
 
 
 def _select_messages_for_result(
@@ -452,13 +431,14 @@ def _select_messages_for_result(
     *,
     tool_name: str,
     messages: list[ProcessMessage],
+    matching_count: int,
     ready: bool,
     ack: bool,
 ) -> list[ProcessMessage]:
     selected: list[ProcessMessage] = []
     for message in messages:
         candidate = [*selected, message]
-        remaining = messages[len(candidate) :]
+        omitted_count = matching_count - len(candidate)
         acked_ids = [
             item.message_id
             for item in candidate
@@ -468,7 +448,7 @@ def _select_messages_for_result(
             tool_name=tool_name,
             ready=ready,
             selected=candidate,
-            remaining=remaining,
+            omitted_count=omitted_count,
             acked_message_ids=acked_ids,
             acknowledge_selected=ack,
         )
@@ -482,7 +462,7 @@ def _select_messages_for_result(
             tool_name=tool_name,
             ready=ready,
             selected=candidate,
-            remaining=remaining,
+            omitted_count=omitted_count,
             acked_message_ids=acked_ids,
             acknowledge_selected=ack,
         )
@@ -505,7 +485,7 @@ def _message_output(
     tool_name: str,
     ready: bool,
     selected: list[ProcessMessage],
-    remaining: list[ProcessMessage],
+    omitted_count: int,
     acked_message_ids: list[str],
     acknowledge_selected: bool,
 ) -> ReadProcessMessagesOutput:
@@ -516,14 +496,14 @@ def _message_output(
             for message in selected
         ],
         acked_message_ids=acked_message_ids,
-        has_more=bool(remaining),
-        omitted_count=len(remaining),
+        has_more=omitted_count > 0,
+        omitted_count=omitted_count,
         continuation=(
             {
                 "tool": tool_name,
                 "same_filters": True,
             }
-            if remaining
+            if omitted_count > 0
             else None
         ),
     )
@@ -534,7 +514,7 @@ def _model_message_output(
     tool_name: str,
     ready: bool,
     selected: list[ProcessMessage],
-    remaining: list[ProcessMessage],
+    omitted_count: int,
     acked_message_ids: list[str],
     acknowledge_selected: bool,
 ) -> ModelReadProcessMessagesOutput:
@@ -545,11 +525,11 @@ def _model_message_output(
             for message in selected
         ],
         acked_message_ids=acked_message_ids,
-        has_more=bool(remaining),
-        omitted_count=len(remaining),
+        has_more=omitted_count > 0,
+        omitted_count=omitted_count,
         continuation=(
             {"tool": tool_name, "same_filters": True}
-            if remaining
+            if omitted_count > 0
             else None
         ),
     )

@@ -111,48 +111,85 @@ def test_prepared_effect_recovery_precedes_stale_reservation_abandonment(
         try:
             actor = "prepared-recovery-actor"
             contract_name = "primitive.test.prepared_recovery_order"
-            prepared_capability, prepared_reservation_id = _reserve_capability_use(
-                runtime,
-                subject=actor,
-                resource="test:prepared-recovery-order",
-                used_by=actor,
-                reason=f"protected operation reserved authority for {contract_name}",
+            effect_id = "effect-prepared-recovery-order"
+            now = "2026-01-01T00:00:00Z"
+            operation = runtime.operations.start(
+                kind="primitive",
+                name=contract_name,
+                actor=actor,
+                pid=actor,
             )
+            with runtime.operations.attach(operation.operation_id):
+                with runtime.store.transaction():
+                    prepared_capability, prepared_reservation_id = (
+                        _reserve_capability_use(
+                            runtime,
+                            subject=actor,
+                            resource="test:prepared-recovery-order",
+                            used_by=actor,
+                            reason=(
+                                "protected operation reserved authority for "
+                                f"{contract_name}"
+                            ),
+                        )
+                    )
+                    runtime.store.insert_external_effect(
+                        ExternalEffectRecord(
+                            effect_id=effect_id,
+                            record_id=None,
+                            event_id=None,
+                            pid=actor,
+                            provider="test",
+                            operation="prepared_recovery_order",
+                            target="test:prepared-recovery-order",
+                            rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                            rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                            state_mutation=True,
+                            information_flow=False,
+                            provider_metadata={
+                                "protected_operation": {
+                                    "contract_name": contract_name,
+                                    "actor": actor,
+                                    "reservation_ids": [prepared_reservation_id],
+                                    "prepared_recovery": None,
+                                }
+                            },
+                            created_at=now,
+                            effect_state="pending",
+                            transaction_state="prepared",
+                            updated_at=now,
+                        )
+                    )
+                    runtime.operations.expect("effect")
+                    assert runtime.operations.link_evidence(
+                        "external_effect",
+                        effect_id,
+                        "effect",
+                        metadata={
+                            "effect_state": "pending",
+                            "provider": "test",
+                            "operation": "prepared_recovery_order",
+                        },
+                    ) is not None
+                    assert runtime.operations.link_evidence(
+                        "capability_reservation",
+                        prepared_reservation_id,
+                        "effect_reservation",
+                        metadata={
+                            "effect_id": effect_id,
+                            "capability_id": prepared_capability.cap_id,
+                            "count": 1,
+                            "contract_name": contract_name,
+                            "actor": actor,
+                        },
+                    ) is not None
+
             stale_capability, stale_reservation_id = _reserve_capability_use(
                 runtime,
                 subject="crashed-worker",
                 resource="test:stale-recovery-order",
                 used_by="crashed-worker",
                 reason="injected unrelated stale reservation",
-            )
-            effect_id = "effect-prepared-recovery-order"
-            now = "2026-01-01T00:00:00Z"
-            runtime.store.insert_external_effect(
-                ExternalEffectRecord(
-                    effect_id=effect_id,
-                    record_id=None,
-                    event_id=None,
-                    pid=actor,
-                    provider="test",
-                    operation="prepared_recovery_order",
-                    target="test:prepared-recovery-order",
-                    rollback_class=ExternalEffectRollbackClass.UNKNOWN,
-                    rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                    state_mutation=True,
-                    information_flow=False,
-                    provider_metadata={
-                        "protected_operation": {
-                            "contract_name": contract_name,
-                            "actor": actor,
-                            "reservation_ids": [prepared_reservation_id],
-                            "prepared_recovery": None,
-                        }
-                    },
-                    created_at=now,
-                    effect_state="pending",
-                    transaction_state="prepared",
-                    updated_at=now,
-                )
             )
         finally:
             runtime.close()

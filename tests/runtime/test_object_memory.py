@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import threading
@@ -10,8 +11,10 @@ from dataclasses import replace
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, UnsupportedStoreVersion, ValidationError
-from agent_libos.models import CapabilityRight, MemoryView, MemoryViewSpec, ObjectFilter, ObjectHandle, ObjectMetadata, ObjectOwnerKind, ObjectPatch, ObjectQuery, ObjectRight, ObjectType, ViewMode
+from agent_libos.models import CapabilityEffect, CapabilityRight, MemoryView, MemoryViewSpec, ObjectFilter, ObjectHandle, ObjectMetadata, ObjectOwnerKind, ObjectPatch, ObjectQuery, ObjectRight, ObjectType, ViewMode
 from agent_libos.tools.observability import json_size_bytes
+from agent_libos.runtime.syscalls import LibOSSyscallSession
+from tests.support.public_errors import assert_public_error_message
 
 class TestObjectMemoryName:
 
@@ -20,6 +23,232 @@ class TestObjectMemoryName:
 
     def teardown_method(self) -> None:
         self.runtime.close()
+
+    @pytest.mark.parametrize(
+        "metadata_kwargs",
+        (
+            {"title": {"not": "text"}},
+            {"summary": 7},
+            {"tags": ["valid", 7]},
+            {"embedding_refs": "not-a-list"},
+            {"indexes": [False]},
+            {"mime_type": ["application/json"]},
+            {"token_estimate": True},
+            {"retention_policy": 7},
+        ),
+    )
+    def test_object_metadata_rejects_noncanonical_field_types(
+        self,
+        metadata_kwargs: dict[str, object],
+    ) -> None:
+        with pytest.raises(ValueError):
+            ObjectMetadata(**metadata_kwargs)  # type: ignore[arg-type]
+
+    def test_mutated_metadata_is_revalidated_before_object_side_effects(self) -> None:
+        pid = self.runtime.process.spawn(image="base-agent:v0", goal="invalid metadata")
+        metadata = ObjectMetadata(title="initially valid")
+        metadata.tags = ["valid", 7]  # type: ignore[list-item]
+
+        with pytest.raises(ValidationError):
+            self.runtime.memory.create_object(
+                pid,
+                ObjectType.ARTIFACT,
+                {"must": "not persist"},
+                metadata=metadata,
+                name="invalid.metadata.mutated",
+            )
+
+        namespace = self.runtime.memory.resolve_namespace(pid)
+        assert self.runtime.store.get_object_ref_by_name(
+            "invalid.metadata.mutated",
+            namespace=namespace,
+        ) is None
+
+    def test_model_memory_tool_rejects_invalid_metadata_without_creating_object(self) -> None:
+        pid = self.runtime.process.spawn(image="base-agent:v0", goal="invalid tool metadata")
+
+        result = self.runtime.tools.call(
+            pid,
+            "create_memory_object",
+            {
+                "name": "invalid.metadata.tool",
+                "type": "artifact",
+                "payload": {"must": "not persist"},
+                "metadata": {"tags": ["valid", 7]},
+            },
+        )
+
+        assert not result.ok
+        namespace = self.runtime.memory.resolve_namespace(pid)
+        assert self.runtime.store.get_object_ref_by_name(
+            "invalid.metadata.tool",
+            namespace=namespace,
+        ) is None
+
+    @pytest.mark.parametrize(
+        "metadata",
+        (
+            ObjectMetadata(title="12345678901234567"),
+            ObjectMetadata(tags=["one", "two"]),
+            ObjectMetadata(tags=["fives"]),
+        ),
+    )
+    def test_configured_metadata_field_bounds_are_enforced_before_create(
+        self,
+        metadata: ObjectMetadata,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            memory=replace(
+                DEFAULT_CONFIG.memory,
+                metadata_text_max_chars=16,
+                metadata_collection_max_items=1,
+                metadata_collection_item_max_chars=4,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="bounded metadata")
+            with pytest.raises(ValidationError):
+                runtime.memory.create_object(
+                    pid,
+                    ObjectType.ARTIFACT,
+                    {"must": "not persist"},
+                    metadata=metadata,
+                    name="invalid.metadata.bound",
+                )
+            assert runtime.store.get_object_ref_by_name(
+                "invalid.metadata.bound",
+                namespace=runtime.memory.resolve_namespace(pid),
+            ) is None
+        finally:
+            runtime.close()
+
+    def test_metadata_canonical_byte_bound_is_enforced_before_create(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            memory=replace(
+                DEFAULT_CONFIG.memory,
+                metadata_text_max_chars=1_000,
+                metadata_collection_item_max_chars=1_000,
+                metadata_max_bytes=512,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="metadata bytes")
+            with pytest.raises(ValidationError, match="object metadata exceeds 512 bytes"):
+                runtime.memory.create_object(
+                    pid,
+                    ObjectType.ARTIFACT,
+                    {"must": "not persist"},
+                    metadata=ObjectMetadata(title="雪" * 200),
+                    name="invalid.metadata.bytes",
+                )
+            assert runtime.store.get_object_ref_by_name(
+                "invalid.metadata.bytes",
+                namespace=runtime.memory.resolve_namespace(pid),
+            ) is None
+        finally:
+            runtime.close()
+
+    def test_namespace_metadata_rejects_unbounded_or_non_json_values_before_side_effects(
+        self,
+    ) -> None:
+        pid = self.runtime.process.spawn(image="base-agent:v0", goal="namespace metadata")
+        cyclic: dict[str, object] = {}
+        cyclic["self"] = cyclic
+        deeply_nested: dict[str, object] = {}
+        for _ in range(self.runtime.memory._BOUNDED_JSON_MAX_DEPTH + 1):
+            deeply_nested = {"child": deeply_nested}
+        invalid_metadata: tuple[dict[object, object], ...] = (
+            {"blob": "x" * 300_000},
+            {"number": float("nan")},
+            {1: "non-string-key"},
+            {"value": ("tuple",)},
+            {"value": object()},
+            cyclic,
+            deeply_nested,
+        )
+
+        for index, metadata in enumerate(invalid_metadata):
+            namespace = f"invalid-namespace-metadata-{index}"
+            before_audit = self.runtime.store.list_audit()
+            before_events = self.runtime.store.list_events()
+            before_capabilities = self.runtime.store.list_capabilities(pid)
+            before_payload_oids = set(self.runtime.store._object_payloads)
+
+            with pytest.raises(ValidationError):
+                self.runtime.memory.create_namespace(
+                    pid,
+                    namespace,
+                    metadata=metadata,  # type: ignore[arg-type]
+                )
+
+            assert self.runtime.store.get_namespace(namespace) is None
+            assert self.runtime.store.list_audit() == before_audit
+            assert self.runtime.store.list_events() == before_events
+            assert self.runtime.store.list_capabilities(pid) == before_capabilities
+            assert set(self.runtime.store._object_payloads) == before_payload_oids
+
+    def test_namespace_metadata_node_budget_fails_before_side_effects(self) -> None:
+        pid = self.runtime.process.spawn(image="base-agent:v0", goal="namespace nodes")
+        max_nodes = self.runtime.config.memory.metadata_max_bytes
+        before_audit = self.runtime.store.list_audit()
+        with pytest.raises(
+            ValidationError,
+            match=rf"maximum JSON nodes={max_nodes}",
+        ):
+            self.runtime.memory.create_namespace(
+                pid,
+                "too-many-namespace-metadata-nodes",
+                metadata={"items": [None] * max_nodes},
+            )
+        assert self.runtime.store.get_namespace("too-many-namespace-metadata-nodes") is None
+        assert self.runtime.store.list_audit() == before_audit
+
+    def test_namespace_metadata_bound_is_shared_by_tool_and_jit_syscall(self) -> None:
+        pid = self.runtime.process.spawn(image="base-agent:v0", goal="namespace entrypoints")
+        payload = {"blob": "x" * 300_000}
+        before_create_audits = [
+            record.record_id
+            for record in self.runtime.store.list_audit()
+            if record.action == "memory.create_namespace"
+        ]
+        before_payload_oids = set(self.runtime.store._object_payloads)
+
+        tool_namespace = "oversized-tool-namespace-metadata"
+        tool_result = self.runtime.tools.call(
+            pid,
+            "create_memory_namespace",
+            {"namespace": tool_namespace, "metadata": payload},
+        )
+        assert not tool_result.ok
+        assert self.runtime.store.get_namespace(tool_namespace) is None
+        assert not any(
+            cap.resource == f"object_namespace:{tool_namespace}"
+            for cap in self.runtime.store.list_capabilities(pid)
+        )
+
+        syscall_namespace = "oversized-syscall-namespace-metadata"
+        with pytest.raises(ValidationError, match="Object namespace metadata exceeds"):
+            asyncio.run(
+                LibOSSyscallSession(self.runtime, pid).handle(
+                    "memory.create_namespace",
+                    {"namespace": syscall_namespace, "metadata": payload},
+                )
+            )
+        assert self.runtime.store.get_namespace(syscall_namespace) is None
+        assert not any(
+            cap.resource == f"object_namespace:{syscall_namespace}"
+            for cap in self.runtime.store.list_capabilities(pid)
+        )
+        assert [
+            record.record_id
+            for record in self.runtime.store.list_audit()
+            if record.action == "memory.create_namespace"
+        ] == before_create_audits
+        assert set(self.runtime.store._object_payloads) == before_payload_oids
 
     def test_runtime_memory_metadata_defaults_are_applied(self) -> None:
         config = replace(
@@ -289,12 +518,20 @@ class TestObjectMemoryName:
 
     def test_read_memory_object_normalizes_non_finite_legacy_values_to_valid_json(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='valid memory JSON')
-        self.runtime.memory.create_object(
+        handle = self.runtime.memory.create_object(
             pid=pid,
             object_type=ObjectType.ARTIFACT,
-            payload={'value': float('nan')},
+            payload={'value': 'legacy placeholder'},
             name='non-finite.read',
         )
+        # New public writes reject non-finite numbers. Inject one controlled
+        # pre-hardening payload directly into the runtime-only cache to verify
+        # that legacy reads remain JSON-safe.
+        with self.runtime.store.transaction(include_object_payloads=True):
+            self.runtime.store._set_cached_object_payload(  # noqa: SLF001
+                handle.oid,
+                {'value': float('nan')},
+            )
 
         result = self.runtime.tools.call(pid, 'read_memory_object', {'name': 'non-finite.read'})
 
@@ -303,6 +540,159 @@ class TestObjectMemoryName:
             'value': {'_non_finite_number': 'NaN'},
         }
         json.dumps(result.payload, allow_nan=False)
+
+    def test_create_memory_object_rejects_non_finite_payload_before_persistence(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='finite memory JSON')
+
+        with pytest.raises(ValidationError, match='bounded finite JSON'):
+            self.runtime.memory.create_object(
+                pid=pid,
+                object_type=ObjectType.ARTIFACT,
+                payload={'value': float('nan')},
+                name='non-finite.rejected',
+            )
+
+        namespace = self.runtime.memory.resolve_namespace(pid)
+        assert self.runtime.store.get_object_ref_by_name(
+            'non-finite.rejected',
+            namespace=namespace,
+        ) is None
+
+    def test_memory_tools_preserve_json_looking_strings_literally(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='literal JSON text')
+        literal_payload = '{"entries": []}'
+        literal_entry = '{"status": "verified"}'
+
+        created = self.runtime.tools.call(
+            pid,
+            'create_memory_object',
+            {
+                'name': 'literal.json.text',
+                'type': 'artifact',
+                'payload': literal_payload,
+            },
+        )
+        assert created.ok, created.error
+        stored = self.runtime.store.get_object(created.payload['oid'])
+        assert stored is not None
+        assert stored.payload == literal_payload
+
+        ledger = self.runtime.memory.create_object(
+            pid,
+            ObjectType.PLAN,
+            {'entries': []},
+            name='literal.append.text',
+            immutable=False,
+        )
+        appended = self.runtime.tools.call(
+            pid,
+            'append_memory_object',
+            {'name': 'literal.append.text', 'entry': literal_entry},
+        )
+        assert appended.ok, appended.error
+        updated = self.runtime.store.get_object(ledger.oid)
+        assert updated is not None
+        assert updated.payload == {'entries': [literal_entry]}
+
+    def test_create_memory_object_rolls_back_when_view_attachment_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='atomic namespace owner')
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='atomic memory root')
+        namespace = 'atomic-view-failure'
+        self.runtime.memory.create_namespace(owner, namespace)
+        namespace_cap = self.runtime.capability.grant_once(
+            pid,
+            f'object_namespace:{namespace}',
+            [CapabilityRight.WRITE],
+            issued_by='test',
+        )
+        roots_before = tuple(
+            root.oid for root in self.runtime.process.get(pid).memory_view.roots
+        )
+
+        def reject_root_attachment(*_args, **_kwargs):
+            raise RuntimeError('injected MemoryView attachment failure')
+
+        monkeypatch.setattr(
+            self.runtime.store,
+            'append_process_memory_roots',
+            reject_root_attachment,
+        )
+
+        result = self.runtime.tools.call(
+            pid,
+            'create_memory_object',
+            {
+                'name': 'atomic.view.failure',
+                'namespace': namespace,
+                'type': 'artifact',
+                'payload': {'must': 'roll back'},
+            },
+        )
+
+        assert not result.ok
+        assert self.runtime.store.get_object_ref_by_name(
+            'atomic.view.failure',
+            namespace=namespace,
+        ) is None
+        assert tuple(
+            root.oid for root in self.runtime.process.get(pid).memory_view.roots
+        ) == roots_before
+        restored_namespace_cap = self.runtime.store.get_capability(namespace_cap.cap_id)
+        assert restored_namespace_cap is not None
+        assert restored_namespace_cap.active
+        assert restored_namespace_cap.uses_remaining == 1
+        assert not any(
+            record.action == 'memory.create_object'
+            and record.decision.get('name') == 'atomic.view.failure'
+            for record in self.runtime.store.list_audit()
+        )
+        assert not any(
+            event.type.value == 'object_created'
+            and event.payload.get('name') == 'atomic.view.failure'
+            for event in self.runtime.store.list_events()
+        )
+
+    def test_create_memory_object_rolls_back_when_initial_view_patch_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='atomic initial view')
+        process = self.runtime.process.get(pid)
+        self.runtime.store.patch_process(
+            pid,
+            {'memory_view': None},
+            expected_revision=process.revision,
+        )
+        namespace = self.runtime.memory.resolve_namespace(pid)
+
+        original_patch_process = self.runtime.store.patch_process
+
+        def reject_view_patch(target_pid, patch, **kwargs):
+            if target_pid == pid and 'memory_view' in patch:
+                raise RuntimeError('injected initial MemoryView patch failure')
+            return original_patch_process(target_pid, patch, **kwargs)
+
+        monkeypatch.setattr(self.runtime.store, 'patch_process', reject_view_patch)
+
+        result = self.runtime.tools.call(
+            pid,
+            'create_memory_object',
+            {
+                'name': 'atomic.initial.view.failure',
+                'type': 'artifact',
+                'payload': {'must': 'roll back'},
+            },
+        )
+
+        assert not result.ok
+        assert self.runtime.store.get_object_ref_by_name(
+            'atomic.initial.view.failure',
+            namespace=namespace,
+        ) is None
+        assert self.runtime.process.get(pid).memory_view is None
 
     def test_read_memory_object_rejects_stale_hash_and_non_boundary_cursor(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='safe memory continuation')
@@ -338,11 +728,21 @@ class TestObjectMemoryName:
         )
 
         assert not stale.ok
-        assert 'sha256 mismatch' in (stale.error or '')
+        assert_public_error_message(
+            stale.error,
+            code='validation_error',
+            error_type='ToolExecutionError',
+            forbidden=('sha256 mismatch', '0' * 64),
+        )
         assert not missing_hash.ok
         assert 'Invalid arguments' in (missing_hash.error or '')
         assert not split_codepoint.ok
-        assert 'UTF-8 character boundary' in (split_codepoint.error or '')
+        assert_public_error_message(
+            split_codepoint.error,
+            code='validation_error',
+            error_type='ToolExecutionError',
+            forbidden=('UTF-8 character boundary',),
+        )
 
     def test_duplicate_object_name_is_rejected(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='duplicate names')
@@ -424,7 +824,12 @@ class TestObjectMemoryName:
         oversized_entry = {'blob': 'x' * self.runtime.config.tools.memory_append_entry_max_bytes}
         appended = self.runtime.tools.call(pid, 'append_memory_object', {'name': 'append.log', 'entry': oversized_entry})
         assert not appended.ok
-        assert 'memory append entry exceeds' in (appended.error or '')
+        assert_public_error_message(
+            appended.error,
+            code='validation_error',
+            error_type='ValidationError',
+            forbidden=('memory append entry exceeds',),
+        )
         assert self.runtime.memory.get_object(pid, handle).payload == {'entries': []}
 
     def test_mutable_payload_update_refreshes_token_estimate_for_materialization_budget(self) -> None:
@@ -973,6 +1378,87 @@ class TestObjectMemoryName:
         with pytest.raises(CapabilityDenied):
             self.runtime.memory.get_object_by_name(reader, 'evidence', namespace=namespace)
 
+    def test_name_lookup_does_not_fallback_from_revoked_selected_object_grant(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        owner = self.runtime.process.spawn(image='base-agent:v0', goal='selected grant owner')
+        reader = self.runtime.process.spawn(image='base-agent:v0', goal='selected grant reader')
+        handle = self.runtime.memory.create_object(
+            owner,
+            ObjectType.EVIDENCE,
+            {'secret': 'exact selected authority'},
+            name='selected.no.fallback',
+        )
+        namespace = self.runtime.memory.resolve_namespace(owner)
+        namespace_cap = self.runtime.capability.grant_once(
+            reader,
+            f'object_namespace:{namespace}',
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+        selected = self.runtime.capability.grant(
+            reader,
+            f'object:{handle.oid}',
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+        self.runtime.capability.issue_trusted(
+            reader,
+            'object:*',
+            [CapabilityRight.READ],
+            issued_by='test',
+        )
+        original_transaction = self.runtime.capability.selected_authority_transaction
+        invalidated = False
+
+        def revoke_selected_before_transaction(decisions, *, actor, operation):
+            nonlocal invalidated
+            if not invalidated and operation == 'object memory get object by name':
+                invalidated = True
+                self.runtime.capability.revoke(
+                    selected.cap_id,
+                    revoked_by='test',
+                    reason='invalidate selected object grant after preflight',
+                    require_authority=False,
+                )
+            return original_transaction(decisions, actor=actor, operation=operation)
+
+        monkeypatch.setattr(
+            self.runtime.capability,
+            'selected_authority_transaction',
+            revoke_selected_before_transaction,
+        )
+        before_memory_audits = [
+            record.record_id
+            for record in self.runtime.audit.trace()
+            if record.action == 'memory.get_object_by_name'
+        ]
+
+        with pytest.raises(CapabilityDenied, match='selected capability'):
+            self.runtime.memory.get_object_by_name(
+                reader,
+                'selected.no.fallback',
+                namespace=namespace,
+            )
+
+        namespace_after = self.runtime.store.get_capability(namespace_cap.cap_id)
+        selected_after = self.runtime.store.get_capability(selected.cap_id)
+        assert namespace_after is not None and namespace_after.uses_remaining == 1
+        assert namespace_after.active
+        assert selected_after is not None and selected_after.uses_remaining is None
+        assert selected_after.revoked
+        assert self.runtime.capability.check(
+            reader,
+            f'object:{handle.oid}',
+            CapabilityRight.READ,
+        )
+        assert [
+            record.record_id
+            for record in self.runtime.audit.trace()
+            if record.action == 'memory.get_object_by_name'
+        ] == before_memory_audits
+
     def test_query_name_miss_and_filtered_read_do_not_consume_one_time_namespace_read(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='query namespace owner')
         reader = self.runtime.process.spawn(image='base-agent:v0', goal='query namespace once')
@@ -1148,7 +1634,7 @@ class TestObjectMemoryName:
         self.runtime.capability.grant_once(by_name_reader, f'object:{handle.oid}', [CapabilityRight.READ], issued_by='test')
         obj = self.runtime.memory.get_object_by_name(by_name_reader, 'one.shot', namespace=owner_namespace)
         assert obj.payload == {'secret': 'read once'}
-        with pytest.raises(CapabilityDenied):
+        with pytest.raises(NotFound):
             self.runtime.memory.get_object_by_name(by_name_reader, 'one.shot', namespace=owner_namespace)
         source_cap = self.runtime.capability.grant_once(handle_reader, f'object:{handle.oid}', [CapabilityRight.READ], issued_by='test')
         one_shot_handle = self.runtime.memory.handle_for_name(handle_reader, 'one.shot', namespace=owner_namespace)
@@ -1156,6 +1642,167 @@ class TestObjectMemoryName:
         assert self.runtime.memory.get_object(handle_reader, one_shot_handle).payload == {'secret': 'read once'}
         with pytest.raises(CapabilityDenied):
             self.runtime.memory.get_object(handle_reader, one_shot_handle)
+
+    @pytest.mark.parametrize('state_change', ('revoked', 'expired', 'exhausted', 'denied'))
+    def test_get_object_revalidates_named_handle_without_broad_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        state_change: str,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal=f'named handle {state_change}')
+        original = self.runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'secret': state_change},
+            name=f'named.handle.{state_change}',
+        )
+        named = self.runtime.capability.handle_for_object(
+            pid,
+            original.oid,
+            [ObjectRight.READ],
+            issued_by='test',
+            expires_at='2999-01-01T00:00:00Z',
+            uses_remaining=1,
+        )
+        self.runtime.capability.issue_trusted(
+            pid,
+            'object:*',
+            [ObjectRight.READ],
+            issued_by='test',
+        )
+        original_transaction = self.runtime.capability.selected_authority_transaction
+        invalidated = False
+
+        def invalidate_named_handle(decisions, *, actor, operation):
+            nonlocal invalidated
+            if not invalidated and operation == 'object memory get object':
+                invalidated = True
+                if state_change == 'revoked':
+                    self.runtime.capability.revoke(
+                        named.capability_id,
+                        revoked_by='test',
+                        reason='invalidate named handle after preflight',
+                        require_authority=False,
+                    )
+                elif state_change == 'expired':
+                    current = self.runtime.store.get_capability(named.capability_id)
+                    assert current is not None
+                    self.runtime.store.update_capability(
+                        replace(current, expires_at='2000-01-01T00:00:00+00:00')
+                    )
+                elif state_change == 'exhausted':
+                    self.runtime.capability.consume_use(
+                        named.capability_id,
+                        used_by='test',
+                        reason='exhaust named handle after preflight',
+                    )
+                else:
+                    self.runtime.capability.issue_trusted(
+                        pid,
+                        f'object:{original.oid}',
+                        [ObjectRight.READ],
+                        issued_by='test',
+                        effect=CapabilityEffect.DENY,
+                    )
+            return original_transaction(decisions, actor=actor, operation=operation)
+
+        monkeypatch.setattr(
+            self.runtime.capability,
+            'selected_authority_transaction',
+            invalidate_named_handle,
+        )
+        before_memory_audits = [
+            record.record_id
+            for record in self.runtime.audit.trace()
+            if record.action == 'memory.get_object'
+        ]
+
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.get_object(pid, named)
+
+        assert [
+            record.record_id
+            for record in self.runtime.audit.trace()
+            if record.action == 'memory.get_object'
+        ] == before_memory_audits
+        if state_change != 'denied':
+            assert self.runtime.capability.check(
+                pid,
+                f'object:{original.oid}',
+                ObjectRight.READ,
+            )
+
+    def test_concurrent_one_time_named_handle_read_has_one_winner(self) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='named handle read race')
+        original = self.runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'secret': 'one concurrent read'},
+            name='named.handle.concurrent',
+        )
+        named = self.runtime.capability.handle_for_object(
+            pid,
+            original.oid,
+            [ObjectRight.READ],
+            issued_by='test',
+            uses_remaining=1,
+        )
+        barrier = threading.Barrier(2)
+
+        def read_once() -> bool:
+            barrier.wait()
+            try:
+                return self.runtime.memory.get_object(pid, named).oid == original.oid
+            except CapabilityDenied:
+                return False
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda _index: read_once(), range(2)))
+
+        persisted = self.runtime.store.get_capability(named.capability_id)
+        assert outcomes.count(True) == 1
+        assert outcomes.count(False) == 1
+        assert persisted is not None and persisted.uses_remaining == 0
+
+    def test_get_object_rolls_back_one_time_handle_when_audit_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='base-agent:v0', goal='read audit rollback')
+        original = self.runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {'secret': 'rollback read claim'},
+            name='named.handle.audit.rollback',
+        )
+        named = self.runtime.capability.handle_for_object(
+            pid,
+            original.oid,
+            [ObjectRight.READ],
+            issued_by='test',
+            uses_remaining=1,
+        )
+        reservations_before = self.runtime.store.select_table_rows(
+            'capability_use_reservations'
+        )
+        original_record = self.runtime.audit.record
+
+        def fail_get_audit(*args, **kwargs):
+            if kwargs.get('action') == 'memory.get_object':
+                raise RuntimeError('injected get object audit failure')
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(self.runtime.audit, 'record', fail_get_audit)
+
+        with pytest.raises(RuntimeError, match='injected get object audit failure'):
+            self.runtime.memory.get_object(pid, named)
+
+        persisted = self.runtime.store.get_capability(named.capability_id)
+        assert persisted is not None and persisted.active
+        assert persisted.uses_remaining == 1
+        assert self.runtime.store.select_table_rows(
+            'capability_use_reservations'
+        ) == reservations_before
 
     def test_one_time_namespace_name_handle_does_not_become_persistent_handle(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='namespace handle owner')
@@ -1305,13 +1952,22 @@ class TestObjectMemoryName:
             namespace=owner_namespace,
         )
 
-        consumes = [
+        reservations = [
             record
             for record in self.runtime.audit.trace()
-            if record.action == 'capability.consume' and source_cap.cap_id in record.capability_refs
+            if record.action == 'capability.reserve_use' and source_cap.cap_id in record.capability_refs
         ]
         assert one_shot_handle.rights == {'read', 'write'}
-        assert len(consumes) == 1
+        assert len(reservations) == 1
+        reservation_id = reservations[0].decision['reservation_id']
+        commits = [
+            record
+            for record in self.runtime.audit.trace()
+            if record.action == 'capability.commit_reserved_use'
+            and record.target == f'capability_reservation:{reservation_id}'
+        ]
+        assert len(commits) == 1
+        assert self.runtime.store.get_capability(source_cap.cap_id).uses_remaining == 0
         assert not self.runtime.store.get_capability(source_cap.cap_id).active
 
     def test_concurrent_one_time_name_handle_authority_issues_one_active_handle(self) -> None:
@@ -1468,7 +2124,7 @@ class TestObjectMemoryName:
             try:
                 self.runtime.memory.append_object_by_name(pid, 'one.shot.append.race', {'index': index})
                 return True
-            except CapabilityDenied:
+            except NotFound:
                 return False
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -1517,7 +2173,7 @@ class TestObjectMemoryName:
 
         monkeypatch.setattr(self.runtime.store, 'has_object_payload', fail_if_payload_checked)
 
-        with pytest.raises(CapabilityDenied):
+        with pytest.raises(NotFound):
             self.runtime.memory.get_object_by_name(other, 'claim.hidden.payload', namespace=owner_namespace)
         with pytest.raises(CapabilityDenied):
             self.runtime.memory.handle_for_name(other, 'claim.hidden.payload', namespace=owner_namespace)
@@ -1543,6 +2199,164 @@ class TestObjectMemoryName:
         results = self.runtime.memory.query_objects(pid, ObjectQuery(type=ObjectType.OBSERVATION, limit=1))
 
         assert [handle.oid for handle in results] == [newer.oid]
+
+    def test_small_namespace_list_and_query_do_not_materialize_unrelated_payloads(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image="base-agent:v0", goal="payload-free scans")
+        for index in range(6):
+            self.runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {"index": index},
+                metadata=ObjectMetadata(tags=["bounded"]),
+                name=f"payload.free.scan.{index}",
+            )
+
+        def reject_unbounded_list(*_args: object, **_kwargs: object) -> list[object]:
+            raise AssertionError("bounded Object Memory scans must not call list_objects")
+
+        original_get_object = self.runtime.memory.store.get_object
+        payload_reads: list[str] = []
+
+        def track_payload_read(oid: str):
+            payload_reads.append(oid)
+            return original_get_object(oid)
+
+        monkeypatch.setattr(self.runtime.memory.store, "list_objects", reject_unbounded_list)
+        monkeypatch.setattr(self.runtime.memory.store, "get_object", track_payload_read)
+
+        listing = self.runtime.memory.list_namespace(pid, limit=1)
+        assert len(listing["objects"]) == 1
+        assert payload_reads == [listing["objects"][0].oid]
+
+        payload_reads.clear()
+        results = self.runtime.memory.query_objects(
+            pid,
+            ObjectQuery(type=ObjectType.EVIDENCE, tags=["bounded"], limit=1),
+        )
+        assert len(results) == 1
+        assert payload_reads == []
+
+    def test_namespace_listing_uses_bounded_child_namespace_pages(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image="base-agent:v0", goal="bounded children")
+        parent = self.runtime.memory.resolve_namespace(pid)
+        for index in range(3):
+            self.runtime.memory.create_namespace(
+                pid,
+                f"{parent}/child-{index}",
+                parent_namespace=parent,
+            )
+
+        def reject_unbounded_list(*_args: object, **_kwargs: object) -> list[object]:
+            raise AssertionError("bounded namespace scans must not call list_namespaces")
+
+        monkeypatch.setattr(
+            self.runtime.memory.store,
+            "list_namespaces",
+            reject_unbounded_list,
+        )
+
+        listing = self.runtime.memory.list_namespace(pid, limit=2)
+
+        assert len(listing["objects"]) == 1
+        assert len(listing["namespaces"]) == 1
+
+    def test_text_query_preserves_payload_matching_with_bounded_authorized_reads(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image="base-agent:v0", goal="bounded text scan")
+        handle = self.runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {"body": "payload-only-needle"},
+            name="bounded.text.payload",
+        )
+        original_get_object = self.runtime.memory.store.get_object
+        payload_reads: list[str] = []
+
+        def track_payload_read(oid: str):
+            payload_reads.append(oid)
+            return original_get_object(oid)
+
+        monkeypatch.setattr(self.runtime.memory.store, "get_object", track_payload_read)
+
+        results = self.runtime.memory.query_objects(
+            pid,
+            ObjectQuery(text="payload-only-needle", limit=1),
+        )
+
+        assert [result.oid for result in results] == [handle.oid]
+        assert payload_reads == [handle.oid]
+
+    def test_object_scan_ceiling_fails_explicitly_instead_of_claiming_complete_results(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            memory=replace(
+                DEFAULT_CONFIG.memory,
+                query_limit=1,
+                query_scan_page_size=1,
+                query_scan_ceiling=2,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            owner = runtime.process.spawn(image="base-agent:v0", goal="scan owner")
+            viewer = runtime.process.spawn(image="base-agent:v0", goal="scan viewer")
+            for index in range(3):
+                runtime.memory.create_object(
+                    owner,
+                    ObjectType.ARTIFACT,
+                    {"index": index},
+                    name=f"scan.ceiling.{index}",
+                )
+            namespace_parent = runtime.memory.create_namespace(
+                owner,
+                "scan-ceiling-parent",
+            )
+            for index in range(3):
+                runtime.memory.create_namespace(
+                    owner,
+                    f"{namespace_parent.namespace}/child-{index}",
+                    parent_namespace=namespace_parent.namespace,
+                )
+            namespace = runtime.memory.resolve_namespace(owner)
+            runtime.capability.grant(
+                viewer,
+                f"object_namespace:{namespace}",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            runtime.capability.grant(
+                viewer,
+                f"object_namespace:{namespace_parent.namespace}",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+            with pytest.raises(ValidationError, match="scan reached the configured ceiling"):
+                runtime.memory.query_objects(
+                    owner,
+                    ObjectQuery(type=ObjectType.EVIDENCE, limit=1),
+                )
+            with pytest.raises(ValidationError, match="scan reached the configured ceiling"):
+                runtime.memory.list_namespace(viewer, namespace, limit=1)
+            with pytest.raises(
+                ValidationError,
+                match="configured ceiling of 2 child namespaces",
+            ):
+                runtime.memory.list_namespace(
+                    viewer,
+                    namespace_parent.namespace,
+                    limit=1,
+                )
+        finally:
+            runtime.close()
 
     def test_list_namespace_defaults_to_configured_query_limit_and_validates_explicit_limit(self) -> None:
         config = replace(DEFAULT_CONFIG, memory=replace(DEFAULT_CONFIG.memory, query_limit=2))
@@ -1692,7 +2506,67 @@ class TestObjectMemoryName:
                 MemoryViewSpec(roots=[read_only], rights={'read', 'materialize'}),
             )
 
-    def test_merge_view_revokes_derived_handle_when_finite_use_consumption_fails(
+    def test_fork_view_batch_failure_rolls_back_child_grants_source_uses_and_audit(self) -> None:
+        parent = self.runtime.process.spawn(image="base-agent:v0", goal="fork parent")
+        child = self.runtime.process.spawn(image="base-agent:v0", goal="fork child")
+        original = self.runtime.memory.create_object(
+            parent,
+            ObjectType.EVIDENCE,
+            {"value": "finite"},
+            name="fork.finite.atomic",
+        )
+        self.runtime.capability.revoke(
+            original.capability_id,
+            revoked_by=parent,
+            reason="replace with finite-use handle",
+            require_authority=False,
+        )
+        finite = self.runtime.capability.issue_trusted(
+            parent,
+            f"object:{original.oid}",
+            [ObjectRight.READ],
+            issued_by="test",
+            uses_remaining=1,
+        )
+        finite_handle = ObjectHandle(
+            oid=original.oid,
+            rights={ObjectRight.READ.value},
+            capability_id=finite.cap_id,
+        )
+        invalid_handle = ObjectHandle(
+            oid="obj_missing_fork_root",
+            rights={ObjectRight.READ.value},
+            capability_id="cap_missing_fork_root",
+        )
+        parent_view = MemoryView(
+            view_id="view_fork_atomic_parent",
+            owner_pid=parent,
+            roots=[finite_handle, invalid_handle],
+            filters=[],
+            rights_policy="attenuate",
+            created_from=None,
+            mode=ViewMode.READ_ONLY,
+        )
+        child_cap_ids_before = {
+            cap.cap_id
+            for cap in self.runtime.capability.list_subject(child, include_inactive=True)
+        }
+        audit_ids_before = {record.record_id for record in self.runtime.store.list_audit()}
+
+        with pytest.raises(CapabilityDenied):
+            self.runtime.memory.fork_view(parent, child, parent_view)
+
+        source_after = self.runtime.store.get_capability(finite.cap_id)
+        assert source_after is not None
+        assert source_after.active
+        assert source_after.uses_remaining == 1
+        assert {
+            cap.cap_id
+            for cap in self.runtime.capability.list_subject(child, include_inactive=True)
+        } == child_cap_ids_before
+        assert {record.record_id for record in self.runtime.store.list_audit()} == audit_ids_before
+
+    def test_merge_view_rolls_back_derived_handle_when_finite_use_reservation_fails(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1732,11 +2606,15 @@ class TestObjectMemoryName:
             mode=ViewMode.READ_ONLY,
         )
 
-        def fail_consume(*_args, **_kwargs):
-            raise RuntimeError('injected finite-use consumption failure')
+        def fail_reservation(*_args, **_kwargs):
+            raise RuntimeError('injected finite-use reservation failure')
 
-        monkeypatch.setattr(self.runtime.capability, 'consume_use', fail_consume)
-        with pytest.raises(RuntimeError, match='injected finite-use consumption failure'):
+        monkeypatch.setattr(
+            self.runtime.capability,
+            '_reserve_current_decision_use',
+            fail_reservation,
+        )
+        with pytest.raises(RuntimeError, match='injected finite-use reservation failure'):
             self.runtime.memory.merge_view(parent, child_view)
 
         derived = [
@@ -1744,7 +2622,8 @@ class TestObjectMemoryName:
             for cap in self.runtime.capability.list_subject(parent, include_inactive=True)
             if cap.resource == f'object:{original.oid}'
         ]
-        assert all(not cap.active for cap in derived)
+        assert derived == []
+        assert self.runtime.store.get_capability(finite.cap_id).uses_remaining == 1
 
     def test_release_owner_does_not_delete_object_transferred_after_enumeration(
         self,
@@ -1807,7 +2686,7 @@ class TestObjectMemoryName:
         assert obj.owner_kind == ObjectOwnerKind.PROCESS
         assert obj.owner_id == destination
 
-    def test_release_owner_version_condition_rejects_owner_aba(
+    def test_release_owner_linearizes_before_competing_owner_transfer(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1820,17 +2699,19 @@ class TestObjectMemoryName:
             name='release.owner.aba',
         )
         delete_reached = threading.Event()
-        transfers_done = threading.Event()
+        allow_delete = threading.Event()
+        transfer_done = threading.Event()
         original_delete = self.runtime.memory.delete_object_trusted
 
         def pause_before_delete(actor, oid, *, reason, **conditions):
             if oid == handle.oid:
                 delete_reached.set()
-                assert transfers_done.wait(timeout=2)
+                assert allow_delete.wait(timeout=2)
             return original_delete(actor, oid, reason=reason, **conditions)
 
         monkeypatch.setattr(self.runtime.memory, 'delete_object_trusted', pause_before_delete)
         errors: list[BaseException] = []
+        transferred: list[list[str]] = []
 
         def release() -> None:
             try:
@@ -1842,32 +2723,37 @@ class TestObjectMemoryName:
             except BaseException as exc:  # pragma: no cover - asserted below
                 errors.append(exc)
 
+        def transfer() -> None:
+            try:
+                transferred.append(
+                    self.runtime.memory.transfer_owner(
+                        ObjectOwnerKind.PROCESS,
+                        source,
+                        ObjectOwnerKind.PROCESS,
+                        temporary,
+                        [handle.oid],
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                transfer_done.set()
+
         release_thread = threading.Thread(target=release)
         release_thread.start()
         assert delete_reached.wait(timeout=2)
-        assert self.runtime.memory.transfer_owner(
-            ObjectOwnerKind.PROCESS,
-            source,
-            ObjectOwnerKind.PROCESS,
-            temporary,
-            [handle.oid],
-        ) == [handle.oid]
-        assert self.runtime.memory.transfer_owner(
-            ObjectOwnerKind.PROCESS,
-            temporary,
-            ObjectOwnerKind.PROCESS,
-            source,
-            [handle.oid],
-        ) == [handle.oid]
-        transfers_done.set()
+        transfer_thread = threading.Thread(target=transfer)
+        transfer_thread.start()
+        assert not transfer_done.wait(timeout=0.1)
+        allow_delete.set()
         release_thread.join(timeout=3)
+        transfer_thread.join(timeout=3)
 
         assert not release_thread.is_alive()
+        assert not transfer_thread.is_alive()
         assert errors == []
-        obj = self.runtime.store.get_object(handle.oid)
-        assert obj is not None
-        assert obj.owner_kind == ObjectOwnerKind.PROCESS
-        assert obj.owner_id == source
+        assert transferred == [[]]
+        assert self.runtime.store.get_object(handle.oid) is None
 
     def test_delete_object_trusted_waits_for_ownership_transition_lock(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='delete ownership lock')

@@ -55,7 +55,11 @@ from agent_libos.models.exceptions import (
 )
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import display_store_target
-from agent_libos.utils.serde import to_jsonable
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
+from agent_libos.utils.serde import bounded_json_loads, to_jsonable
 
 _GUI_DEFAULTS = DEFAULT_CONFIG.gui
 _GUI_PRODUCTION_RENDERER_ORIGIN = "agent-libos://app"
@@ -278,6 +282,16 @@ def _required_body_string(body: dict[str, Any], key: str) -> str:
     return value
 
 
+def _required_package_sha256(body: dict[str, Any], key: str) -> str:
+    value = _required_body_string(body, key)
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} must be a lowercase SHA-256 hex digest",
+        )
+    return value
+
+
 class GuiServerError(Exception):
     def __init__(self, status: int, message: str, *, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -477,8 +491,13 @@ class SchedulerController:
             )
             self._thread = thread
             thread.start()
+            # Capture the start acknowledgement while the worker is still
+            # excluded by this lock. A fast terminal batch may finish while
+            # status publication is in progress, but that must not rewrite the
+            # response to the request that successfully started it.
+            started_status = self.status()
         self.service.publish_scheduler_status()
-        return self.status()
+        return started_status
 
     def shutdown(self, timeout_s: float | None = None) -> bool:
         selected_timeout = self.service.runtime.config.gui.scheduler_shutdown_join_timeout_s if timeout_s is None else timeout_s
@@ -517,8 +536,9 @@ class SchedulerController:
                 with self._lock:
                     self.last_result = [result]
         except Exception as exc:
+            public_error = public_error_envelope(exc)
             with self._lock:
-                self.last_error = str(exc)
+                self.last_error = public_error["message"]
             raise
         finally:
             with self._lock:
@@ -562,8 +582,13 @@ class SchedulerController:
                 if remaining is not None:
                     remaining -= len(result)
         except Exception as exc:  # pragma: no cover - covered through API status assertions
+            public_error = self.service.record_internal_error(
+                exc,
+                action="gui.scheduler_background_internal_error",
+                target="scheduler",
+            )
             with self._lock:
-                self.last_error = str(exc)
+                self.last_error = public_error["message"]
         finally:
             with self._lock:
                 self.last_result = list(collected)
@@ -616,6 +641,7 @@ class GuiRuntimeService:
             display_target = db if db is not None else runtime.store.path
             self.db = display_store_target(display_target, config=selected_config)
             self.runtime = runtime
+        self.audit = self.runtime.audit
         self.owns_runtime = runtime is None
         try:
             self._initialize_service_state(
@@ -825,6 +851,34 @@ class GuiRuntimeService:
             "runtime_busy": runtime_busy,
         }
 
+    def record_internal_error(
+        self,
+        error: BaseException,
+        *,
+        action: str,
+        target: str,
+    ) -> dict[str, str]:
+        public_error = public_error_envelope(error)
+        try:
+            self.audit.record(
+                actor="gui",
+                action=action,
+                target=target,
+                decision={
+                    "public_error": dict(public_error),
+                    "internal_error": internal_exception_observation(
+                        error,
+                        correlation_id=public_error["correlation_id"],
+                    ),
+                },
+                correlation_id=public_error["correlation_id"],
+            )
+        except Exception:
+            # The outward boundary must remain safe even when the failing
+            # dependency is the audit store itself.
+            pass
+        return public_error
+
     def snapshot(self) -> dict[str, Any]:
         with self.runtime_lock:
             collection_limit = self.runtime.config.gui.snapshot_collection_max_items
@@ -872,7 +926,7 @@ class GuiRuntimeService:
 
     def _snapshot_audit(self) -> list[Any]:
         limit = self.runtime.config.gui.snapshot_audit_limit
-        return self.runtime.audit.trace(
+        return self.audit.trace(
             limit=limit,
             include_gui_presentation=False,
         )
@@ -1356,8 +1410,13 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
         except Exception as exc:
+            public_error = self.server.service.record_internal_error(
+                exc,
+                action="gui.request_internal_error",
+                target="gui.request",
+            )
             self._write_json(
-                {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}},
+                {"ok": False, "error": public_error},
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
@@ -1632,12 +1691,19 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             service.publish_runtime_changes("rating.upsert")
             return to_jsonable(rating)
         if method == "GET" and route == ["audit"]:
+            limit = _bounded_query_limit(
+                query,
+                "limit",
+                default=service.runtime.config.gui.snapshot_audit_limit,
+                maximum=service.runtime.config.gui.snapshot_audit_limit,
+            )
             return to_jsonable(
                 service.runtime.audit.trace(
-                    limit=_query_int(query, "limit"),
+                    limit=limit,
                     actor=pid,
                     target=f"process:{pid}",
                     match_any=True,
+                    before_record_id=_query_str(query, "before"),
                 )
             )
         if method == "GET" and route == ["events"]:
@@ -1875,10 +1941,24 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return result
         if method == "POST" and len(route) == 2 and route[1] in {"activate", "unload"}:
             body = self._read_body()
+            expected_package_sha256 = (
+                _required_package_sha256(body, "expected_package_sha256")
+                if route[1] == "activate"
+                else None
+            )
             self._require_confirmed(
                 f"skill.{route[1]}",
                 body,
-                {"pid": body.get("pid"), "skill_id": route[0], "admin_mode": body.get("actor") is None},
+                {
+                    "pid": body.get("pid"),
+                    "skill_id": route[0],
+                    **(
+                        {"expected_package_sha256": expected_package_sha256}
+                        if expected_package_sha256 is not None
+                        else {}
+                    ),
+                    "admin_mode": body.get("actor") is None,
+                },
             )
             require_capability = body.get("actor") is not None
             actor = str(body.get("actor") or "gui")
@@ -1888,6 +1968,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                     route[0],
                     actor=actor,
                     require_capability=require_capability,
+                    expected_package_sha256=expected_package_sha256,
                 )
             else:
                 result = service.runtime.skills.unload_skill(
@@ -1903,8 +1984,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
     def _dispatch_capabilities(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
         service = self.server.service
         if method == "GET" and not route:
-            subject = _query_str(query, "subject")
-            return to_jsonable(service.runtime.capability.list_subject(subject, include_inactive=True) if subject else service.runtime.store.list_capabilities())
+            return self._list_capabilities(query)
         if method == "GET" and len(route) == 1:
             return service.runtime.capability.inspect(route[0])
         if method == "POST" and route == ["grant"]:
@@ -1962,6 +2042,42 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 _required_body_string(body, "right"),
             )
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown capability endpoint")
+
+    def _list_capabilities(self, query: dict[str, list[str]]) -> Any:
+        runtime = self.server.service.runtime
+        subject = _query_str(query, "subject")
+        configured_limit = runtime.config.capability.list_limit
+        limit = _bounded_query_limit(
+            query,
+            "limit",
+            default=configured_limit,
+            maximum=configured_limit,
+        )
+        if _query_str(query, "mode") == "page":
+            page = runtime.capability.presentation_page(
+                subject=subject,
+                include_inactive=True,
+                limit=limit,
+                after_cap_id=_query_str(query, "after"),
+                max_bytes=runtime.config.gui.sse_payload_max_bytes,
+            )
+            return to_jsonable(
+                {
+                    "items": page.capabilities,
+                    "next_after": page.next_cursor,
+                    "has_more": page.has_more,
+                }
+            )
+        capabilities = (
+            runtime.capability.list_subject(
+                subject,
+                include_inactive=True,
+                limit=limit,
+            )
+            if subject
+            else runtime.store.list_capabilities(limit=limit)
+        )
+        return to_jsonable(capabilities)
 
     def _dispatch_images(self, method: str, route: list[str]) -> Any:
         service = self.server.service
@@ -2256,8 +2372,8 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if length == 0:
             return {} if optional else {}
         try:
-            value = json.loads(self.rfile.read(length).decode("utf-8"))
-        except json.JSONDecodeError as exc:
+            value = bounded_json_loads(self.rfile.read(length))
+        except (ValueError, UnicodeError, RecursionError) as exc:
             raise GuiServerError(HTTPStatus.BAD_REQUEST, f"invalid JSON body: {exc}") from exc
         if not isinstance(value, dict):
             raise GuiServerError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
@@ -2356,7 +2472,17 @@ def create_gui_http_server(
         max_quanta=max_quanta,
         llm_profiles_file=llm_profiles_file,
     )
-    return GuiHTTPServer(("127.0.0.1", int(port)), service)
+    try:
+        return GuiHTTPServer(("127.0.0.1", int(port)), service)
+    except BaseException as bind_error:
+        try:
+            _shutdown_gui_service_before_exit(service)
+        except BaseException as shutdown_error:
+            bind_error.add_note(
+                "GUI service teardown also failed after server bind failure: "
+                f"{type(shutdown_error).__name__}: {shutdown_error}"
+            )
+        raise
 
 
 def serve(
@@ -2379,14 +2505,19 @@ def serve(
         config=config,
         llm_profiles_file=llm_profiles_file,
     )
-    host, selected_port = server.server_address
-    payload = {"url": f"http://{host}:{selected_port}", "token": server.service.token, "db": server.service.db}
-    if ready is not None:
-        ready(payload)
-    else:
-        print(json.dumps(payload, ensure_ascii=True), flush=True)
     try:
-        server.serve_forever()
+        host, selected_port = server.server_address
+        payload = {"url": f"http://{host}:{selected_port}", "token": server.service.token, "db": server.service.db}
+        if ready is not None:
+            ready(payload)
+        else:
+            print(json.dumps(payload, ensure_ascii=True), flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            # Ctrl-C is the normal foreground-server shutdown path. The
+            # finally block still performs the bounded Runtime teardown.
+            pass
     finally:
         try:
             _shutdown_gui_service_before_exit(server.service)

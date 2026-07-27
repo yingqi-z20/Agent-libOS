@@ -289,28 +289,111 @@ without Git metadata, inspect its member list and prove that `.git/`, repository
 credentials, and local Git configuration are absent; an anonymous current
 checkout does not sanitize an archive that embeds history by itself.
 
-Binary formats require format-aware inspection. First inventory every relevant
-file, then record the tool versions and output for each file:
+Binary formats require format-aware inspection. Raw `git grep`, `rg -a`, and
+blob scans do not parse compressed OOXML members, PDF metadata, nested archives,
+or rendered content. Materialize the regular-file blobs from the exact commit
+into the private review directory before running the format-aware pass; do not
+substitute the current working tree or treat `git archive` as an identity-
+preserving materialization. Archive generation obeys committed
+`.gitattributes`, so `export-ignore` can omit tracked paths and `export-subst`
+can rewrite bytes.
+
+```bash
+test -n "${ANON_GIT_SCAN_DIR:-}" && test -d "$ANON_GIT_SCAN_DIR" || exit 1
+ANON_COMMIT_TREE="$ANON_GIT_SCAN_DIR/exact-commit-tree"
+test ! -e "$ANON_COMMIT_TREE" || exit 1
+mkdir "$ANON_COMMIT_TREE" || exit 1
+python3 - "$ANON_COMMIT" "$ANON_COMMIT_TREE" <<'PY' || exit 1
+import os
+from pathlib import Path, PurePosixPath
+import subprocess
+import sys
+
+commit, destination = sys.argv[1:]
+root = Path(destination).resolve(strict=True)
+listing = subprocess.run(
+    ["git", "--no-replace-objects", "ls-tree", "-rz", "--full-tree", commit],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+for record in listing.split(b"\0"):
+    if not record:
+        continue
+    header, raw_path = record.split(b"\t", 1)
+    mode, object_type, oid = header.decode("ascii").split()
+    if object_type != "blob" or mode == "120000":
+        # Symlink target blobs and gitlinks are reviewed separately by the
+        # mandatory inventory above; never create a live symlink here.
+        continue
+    if mode not in {"100644", "100755"}:
+        raise SystemExit(f"unsupported tree mode {mode}")
+    path_text = os.fsdecode(raw_path)
+    relative = PurePosixPath(path_text)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise SystemExit("unsafe tree path")
+    target = root.joinpath(*relative.parts)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = subprocess.run(
+        ["git", "--no-replace-objects", "cat-file", "blob", oid],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    with target.open("xb") as stream:
+        stream.write(payload)
+PY
+
+# Separately inspect the projection that git archive would deliver. This view
+# may intentionally differ from the raw tree because of committed attributes.
+ANON_COMMIT_EXPORT="$ANON_GIT_SCAN_DIR/archive-projection"
+test ! -e "$ANON_COMMIT_EXPORT" || exit 1
+mkdir "$ANON_COMMIT_EXPORT" || exit 1
+git --no-replace-objects archive --format=tar "$ANON_COMMIT" \
+  > "$ANON_GIT_SCAN_DIR/archive-projection.tar" || exit 1
+tar -tf "$ANON_GIT_SCAN_DIR/archive-projection.tar" \
+  > "$ANON_GIT_SCAN_DIR/archive-projection-members" || exit 1
+tar -xf "$ANON_GIT_SCAN_DIR/archive-projection.tar" \
+  -C "$ANON_COMMIT_EXPORT" || exit 1
+```
+
+The blob materializer deliberately skips live symlink creation; review every
+mode `120000` target from the earlier inventory and scan the referenced bytes
+under the stated symlink policy. Review gitlinks recursively. Keep the tar
+member inventory private, inspect unusual names and symlink entries, and
+confirm extraction stayed inside the fresh empty directory. Compare the
+archive projection with the cached attribute inventory and disposition every
+path affected by `export-ignore` or `export-subst`. Both views are tied to
+`ANON_COMMIT`; regenerating either from another revision requires restarting
+the review.
+
+Apply every MIME, metadata, extraction, rendering, and manual visual check below
+to the raw `$ANON_COMMIT_TREE`, the `$ANON_COMMIT_EXPORT` archive projection,
+and `$ANON_OUTPUT_DIR`. First inventory every relevant file, then record the
+tool versions and output for each file:
 
 ```bash
 file --version
-find "$ANON_OUTPUT_DIR" -type f -exec file --mime-type -- '{}' \; | LC_ALL=C sort
-find "$ANON_OUTPUT_DIR" -type f \( \
-  -iname '*.pdf' -o -iname '*.doc' -o -iname '*.docx' -o \
-  -iname '*.ppt' -o -iname '*.pptx' -o -iname '*.xls' -o \
-  -iname '*.xlsx' -o -iname '*.odt' -o -iname '*.ods' -o \
-  -iname '*.ipynb' -o -iname '*.png' -o -iname '*.jpg' -o \
-  -iname '*.jpeg' -o -iname '*.gif' -o -iname '*.tiff' -o \
-  -iname '*.webp' -o -iname '*.svg' -o -iname '*.heic' -o \
-  -iname '*.mp4' -o -iname '*.mov' -o -iname '*.webm' -o \
-  -iname '*.whl' -o -iname '*.zip' -o -iname '*.7z' -o \
-  -iname '*.tar' -o -iname '*.tar.gz' -o -iname '*.tgz' -o \
-  -iname '*.gz' -o -iname '*.bz2' -o -iname '*.xz' -o \
-  -iname '*.parquet' -o -iname '*.pkl' -o -iname '*.pickle' -o \
-  -iname '*.npy' -o -iname '*.npz' -o -iname '*.onnx' -o \
-  -iname '*.bin' -o -iname '*.exe' -o -iname '*.dll' -o \
-  -iname '*.so' -o -iname '*.dylib' \
-\) -print
+for ANON_BINARY_ROOT in \
+  "$ANON_COMMIT_TREE" "$ANON_COMMIT_EXPORT" "$ANON_OUTPUT_DIR"; do
+  test -d "$ANON_BINARY_ROOT" || exit 1
+  find "$ANON_BINARY_ROOT" -type f -exec file --mime-type -- '{}' \; |
+    LC_ALL=C sort || exit 1
+  find "$ANON_BINARY_ROOT" -type f \( \
+    -iname '*.pdf' -o -iname '*.doc' -o -iname '*.docx' -o \
+    -iname '*.ppt' -o -iname '*.pptx' -o -iname '*.xls' -o \
+    -iname '*.xlsx' -o -iname '*.odt' -o -iname '*.ods' -o \
+    -iname '*.ipynb' -o -iname '*.png' -o -iname '*.jpg' -o \
+    -iname '*.jpeg' -o -iname '*.gif' -o -iname '*.tiff' -o \
+    -iname '*.webp' -o -iname '*.svg' -o -iname '*.heic' -o \
+    -iname '*.mp4' -o -iname '*.mov' -o -iname '*.webm' -o \
+    -iname '*.whl' -o -iname '*.zip' -o -iname '*.7z' -o \
+    -iname '*.tar' -o -iname '*.tar.gz' -o -iname '*.tgz' -o \
+    -iname '*.gz' -o -iname '*.bz2' -o -iname '*.xz' -o \
+    -iname '*.parquet' -o -iname '*.pkl' -o -iname '*.pickle' -o \
+    -iname '*.npy' -o -iname '*.npz' -o -iname '*.onnx' -o \
+    -iname '*.bin' -o -iname '*.exe' -o -iname '*.dll' -o \
+    -iname '*.so' -o -iname '*.dylib' \
+  \) -print || exit 1
+done
 exiftool -ver
 pdfinfo -v
 ```
@@ -433,14 +516,16 @@ M0 is complete when:
 - benchmark harness documentation exists,
 - a one-page paper thesis with the fixed Agent libOS title exists,
 - this anonymity checklist exists and is linked from README,
-- the tracked-file and generated-output inventories cover the exact commit and
-  exact artifacts to be shared,
+- the raw tracked-blob tree, archive projection, and generated-output
+  inventories cover the exact commit and exact artifacts to be shared,
 - the recorded identity, absolute-path, credential, and secret scans have been
-  run against both inventories and every hit has a reviewed disposition,
+  run against all three inventories and every hit has a reviewed disposition,
 - Git remotes, refs, and reachable history are anonymous when Git metadata is
   shipped, or the final archive member list proves Git metadata is absent,
-- every Office, PDF, image, and archive file has completed the format-aware
-  metadata/content inspection above with no unresolved identity or secret,
+- every Office, PDF, image, and archive file in the raw exact-commit tree,
+  deliverable archive projection, and generated-output inventory has completed
+  the format-aware metadata/content inspection above with no unresolved
+  identity or secret,
 - the final archive has been safely extracted and rescanned recursively, and
 - a second human has reviewed the scan record and the recorded SHA-256 hashes
   match the exact files being submitted.

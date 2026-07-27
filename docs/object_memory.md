@@ -38,7 +38,29 @@ model-facing `create_memory_object` tool accepts a partial metadata mapping and
 uses those same active Runtime values when `sensitivity` or `retention_policy`
 is absent. In both APIs, `token_estimate` is Runtime-managed derived metadata:
 the manager computes it from the payload rather than trusting a caller-supplied
-value.
+value. Metadata is revalidated immediately before persistence: optional text
+must be text, collection fields must be lists of strings, and the active
+`memory.metadata_text_max_chars` (32,000),
+`memory.metadata_collection_max_items` (128),
+`memory.metadata_collection_item_max_chars` (2,048), and
+`memory.metadata_max_bytes` (131,072 canonical UTF-8 bytes) defaults bound the
+envelope. Model-facing tools reject unsupported metadata fields rather than
+silently discarding them.
+
+The model-facing tool preserves JSON strings literally, including strings that
+contain syntactically valid object or array text. Callers must pass an actual
+JSON object/array value when a container is intended. Its named Object,
+capability/audit publication, and caller MemoryView root attachment share the
+Object ownership lock and one outer store transaction; a root-attachment
+failure rolls all of them back.
+
+Namespace metadata uses the same canonical-byte ceiling. The manager first
+normalizes it to a detached JSON object and rejects non-string keys, non-JSON
+values, non-finite numbers, cycles, trees deeper than 64 containers, or trees
+whose node count cannot fit within the configured byte budget. This preflight
+runs before a namespace row, capability, event, audit record, or payload-cache
+entry can be created, and is shared by the Host API, model-facing tool, and JIT
+syscall paths.
 
 `created_by` is provenance and does not drive cleanup. Runtime cleanup uses the
 explicit owner pair. Ordinary process-created objects start as
@@ -203,7 +225,16 @@ filters are ANDed; text search covers the namespace, name, title, summary,
 tags, and a bounded payload preview. Results use deterministic recent-first
 ordering. A missing `limit` uses the active `memory.query_limit`; an explicit
 limit must be an integer from 1 through that configured maximum. It is
-validated before the namespace scan.
+validated before the namespace scan. Non-exact queries and namespace listings
+scan payload-free Object keyset pages and bounded direct-child namespace
+keyset pages, defaulting to
+`memory.query_scan_page_size=128`, with the independent hard ceiling
+`memory.query_scan_ceiling=1024`. If the store still has another page when the
+ceiling is reached and the requested result is not already full, the operation
+raises `ValidationError` instead of presenting a partial scan as complete.
+Type/tag filtering never loads payloads; text filtering loads a payload only
+after Object authorization and only when the metadata-only projection did not
+already match.
 
 Querying requires `read` on `object_namespace:<namespace>`, and each returned
 Object independently requires `read` on `object:<oid>`. Objects without that
@@ -289,11 +320,19 @@ The runner is a child process whose tool table is narrowed to the requested
 tool. Starting a task requires the creator to hold `read`, `write`, and `link`
 rights on the owner object, `process:spawn` `write`, available per-object and
 global ObjectTask concurrency slots, and the requested tool must already be
-visible in the creator process tool table. External capabilities are inherited
-only when explicitly delegated. Start validates this envelope and visibility,
-then returns a queued task; the runner applies the target tool's argument schema
-asynchronously through ToolBroker. Invalid target arguments therefore appear as
-a terminal task failure rather than a synchronous start rejection.
+visible in the creator process tool table. Creator-held external capabilities
+are inherited only when explicitly delegated. This does not make the runner an
+authority-free shell: ordinary child bootstrap gives it its own goal/View,
+process namespace, and self-scoped checkpoint authority, and an
+`image_package` boot can materialize a fresh package workspace and grant that
+runner the workspace rights declared by the package. Those capabilities arise
+from runner/image bootstrap rather than inheritance from the creator;
+ObjectTask separately adds exact owner `read`/`materialize`. The single target
+call can use every authority actually present. Start validates the ObjectTask
+envelope and visibility, then returns a queued task; the runner applies the
+target tool's argument schema asynchronously through ToolBroker. Invalid target
+arguments therefore appear as a terminal task failure rather than a synchronous
+start rejection.
 
 Objects are immutable by default, so their initial owner handle does not include
 `write`. An Object intended to own an ObjectTask must be created with
@@ -310,6 +349,14 @@ task to the explicit terminal status `result_unavailable_after_reopen`, clears
 the live `result_oid`, and preserves the previous status and oid in wait
 metadata. Checkpoint/image reconstruction is different because those formats
 explicitly capture the payloads they promise to restore.
+
+The `abandoned` and `result_unavailable_after_reopen` transitions each begin a
+new terminal notification phase. Delivery still revalidates the original owner
+and result source lineage. Because runtime-only source payloads may already be
+unavailable during reopen, that safe attempt can remain `failed`; callers must
+use exact task recovery records rather than stripping source labels. A
+restore-generated `superseded_by_restore` row does not publish a new ObjectTask
+message.
 
 Successful tasks keep the tool result as a new Object Memory object and link
 the owner object to it with `PRODUCED`. That link is part of the start-time
@@ -331,6 +378,13 @@ fails the ObjectTask rather than silently publishing an unreadable result. The
 recipient's Task Authority data-flow domain must also accept the result labels;
 a label-domain denial suppresses the optional handle and normally makes the
 notification fail without retracting an otherwise successful task.
+
+Waiting and terminal transitions use distinct messages. The durable task row
+keeps only the latest notification phase's status and message id; earlier
+messages remain in the process mailbox. Terminal reconciliation verifies that
+a delivered message id actually references the expected task, terminal status,
+and phase. This also repairs legacy rows whose delivered slot still points at a
+waiting message, without duplicating an already-correct terminal delivery.
 
 Finite-use `grant` authority is reserved before terminal publication. The
 recipient handle, durable `succeeded` transition, delivered terminal message,
@@ -359,15 +413,17 @@ attempts to remove the runner and restores the exact owner reservations only
 after that cleanup is confirmed. If cleanup cannot be confirmed, it leaves
 those reservations fail-closed and records diagnostics instead of reactivating
 authority alongside a residual runner; diagnostics are best-effort if the
-audit sink itself is unavailable. The independent `process:spawn`
-admission use is consumed immediately and is not refunded by either path. An
+audit sink itself is unavailable. The independent `process:spawn` decision is
+also reserved before runner creation and commits with ObjectTask publication.
+A pre-publication failure restores that exact reservation only after runner
+cleanup is confirmed; uncertain cleanup leaves it reserved fail-closed. An
 executor handoff failure occurs after the authorization commit, so it marks the
 task failed, removes the unstarted runner, and does not refund the consumed
-owner use. Result creation and linking use a lifetime scope: failed wiring or a
-cancellation that wins the terminal transition releases the unpublished result
-and derived handles, terminalizes the runner, and releases the owner pin. Once
-the succeeded row is durable, later observability failures do not retract the
-published result.
+owner or spawn use. Result creation and linking use a lifetime scope: failed
+wiring or a cancellation that wins the terminal transition releases the
+unpublished result and derived handles, terminalizes the runner, and releases
+the owner pin. Once the succeeded row is durable, later observability failures
+do not retract the published result.
 
 The creator can inspect and control its own task without a second owner-object
 grant. For another process, `get` and `wait` require owner-object `read`, list
@@ -375,8 +431,14 @@ filters to rows visible with `read`, and `cancel` requires `write` after termina
 and unsafe-cancellation preflight. A finite read selected by `get`/`wait` is
 claimed once; list claims each distinct finite read used by the returned rows
 at most once, and its internal filtering does not spend authority for omitted
-rows. Wait polling does not claim the same read repeatedly. Updating an owner
-watch also requires owner-object `write` for a non-creator.
+rows. The list's owner/status predicates are applied before a Host-bounded
+candidate lookup, but actor visibility is applied afterward. Without an exact
+owner filter whose rows have uniform visibility, even an empty or underfilled
+result can therefore omit older visible tasks hidden behind newer inaccessible
+candidates. There is no cursor or `has_more`; use retained task ids or a
+complete Host-side query for global absence claims. Wait polling does not claim
+the same read repeatedly. Updating an owner watch also requires owner-object
+`write` for a non-creator.
 
 Runtime-internal multi-step writes can use an Object Memory lifetime scope.
 Objects created in the scope are released automatically unless the scope is
@@ -414,7 +476,9 @@ returning full file content as a process-visible tool result:
   filesystem primitive's read hard limit; under defaults the effective ceiling
   is 1 MiB even though the separate Object-file absolute limit is higher.
 - `write_object_to_file` materializes object payload into a workspace file
-  through the filesystem primitive.
+  through the filesystem primitive. The primitive revalidates the exact Object
+  snapshot immediately before egress, so a concurrent source version/content
+  change rejects the operation before creating or replacing the destination.
 
 This is useful for large content movement and reduces accidental prompt
 exposure. It does not bypass filesystem or object capabilities.
@@ -548,6 +612,10 @@ If a reopen cannot materialize a live payload cache for a marker row, the
 storage-layer startup recovery sweep releases the object fail-closed instead of
 treating the marker as user payload. This is the recovery-only release path
 described above, not an invocation of the manager's online release finalizers.
+Low-level payload-cache replacement is conditional on an existing live Object
+row. A missing or released row is rejected before its oid can enter the cache;
+known transaction rollback restores the per-oid cache before-image, while an
+ambiguous commit poisons the store until reopen recovery converges it.
 
 Scoped checkpoint snapshots and image artifacts can explicitly capture object
 payloads needed to reconstruct a process subtree, subject to configured

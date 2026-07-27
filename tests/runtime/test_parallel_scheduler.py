@@ -24,6 +24,72 @@ def _parallel_config(max_workers: int = 4) -> AgentLibOSConfig:
 
 
 class TestParallelScheduler:
+    def test_awaitable_quantum_drains_default_executor_before_closing_loop(self) -> None:
+        runtime = Runtime.open("local", config=_parallel_config(max_workers=1))
+        pid = runtime.process.spawn(goal="default executor drain")
+        executor_started = threading.Event()
+        release_executor = threading.Event()
+        scheduler_finished = threading.Event()
+        errors: list[BaseException] = []
+        try:
+            def default_executor_work() -> None:
+                executor_started.set()
+                assert release_executor.wait(timeout=2)
+
+            async def quantum(selected_pid: str) -> dict[str, str]:
+                asyncio.get_running_loop().run_in_executor(
+                    None,
+                    default_executor_work,
+                )
+                return {"pid": selected_pid}
+
+            def run_quantum() -> None:
+                try:
+                    runtime.scheduler.run_pid_once(pid, quantum)
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    scheduler_finished.set()
+
+            scheduler_thread = threading.Thread(target=run_quantum)
+            scheduler_thread.start()
+            assert executor_started.wait(timeout=2)
+            assert not scheduler_finished.wait(timeout=0.1)
+
+            release_executor.set()
+            assert scheduler_finished.wait(timeout=2)
+            scheduler_thread.join(timeout=2)
+
+            assert not scheduler_thread.is_alive()
+            assert errors == []
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            release_executor.set()
+            runtime.close()
+
+    def test_resource_charge_failure_releases_execution_lease(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(goal="resource charge failure")
+
+            def fail_charge(*_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("injected resource accounting failure")
+
+            runtime.resources.charge = fail_charge  # type: ignore[method-assign]
+
+            with pytest.raises(
+                RuntimeError,
+                match="injected resource accounting failure",
+            ):
+                runtime.scheduler.run_pid_once(pid, lambda selected_pid: selected_pid)
+
+            process = runtime.process.get(pid)
+            assert process.status == ProcessStatus.RUNNABLE
+            assert process.execution_owner_id is None
+            assert process.execution_lease_id is None
+        finally:
+            runtime.close()
+
     def test_terminal_process_rejects_direct_tool_table_mutation(self) -> None:
         runtime = Runtime.open("local")
         try:

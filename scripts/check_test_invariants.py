@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -16,7 +17,16 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tests" / "invariants.yaml"
 DOCUMENTATION = ROOT / "docs" / "invariants.md"
 VALID_LANES = {"unit", "runtime", "security", "self-evolution", "providers", "benchmark"}
+MANIFEST_SCHEMA_VERSION = 2
+DEFAULT_DETERMINISTIC_MARKER_EXPRESSION = "not postgres and not real_llm and not mcp"
+PLATFORM_MARKERS = {
+    "darwin": "platform_darwin",
+    "linux": "platform_linux",
+}
+INVARIANT_EXECUTION_RECEIPT_ENV = "AGENT_LIBOS_INVARIANT_EXECUTION_RECEIPT"
+EXECUTION_RECEIPT_SCHEMA_VERSION = 1
 _DOCUMENTED_INVARIANT_PATTERN = re.compile(r"^- `([^`]+)`:", re.MULTILINE)
+_EXECUTED_NODEIDS: set[str] = set()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,13 +41,22 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = _load_manifest(Path(args.manifest))
     collected = _collect_pytest_nodeids()
-    deterministic_collected = _collect_pytest_nodeids("not real_llm")
+    deterministic_collected = _collect_pytest_nodeids(
+        DEFAULT_DETERMINISTIC_MARKER_EXPRESSION
+    )
+    platform_collected = {
+        platform: _collect_pytest_nodeids(
+            f"{DEFAULT_DETERMINISTIC_MARKER_EXPRESSION} and {marker}"
+        )
+        for platform, marker in PLATFORM_MARKERS.items()
+    }
     errors: list[str] = []
     invariant_ids, declared_attack_classes = _check_invariants(
         manifest,
         collected,
         deterministic_collected,
         errors,
+        platform_collected=platform_collected,
     )
     _check_benchmark_attack_classes(manifest, invariant_ids, declared_attack_classes, errors)
     _check_documented_invariants(manifest, Path(args.documentation), errors)
@@ -46,7 +65,11 @@ def main(argv: list[str] | None = None) -> int:
         for error in errors:
             print(f"invariant check failed: {error}", file=sys.stderr)
         return 1
-    print(f"validated {len(invariant_ids)} invariants against {len(collected)} collected pytest nodes")
+    print(
+        f"validated {len(invariant_ids)} invariant declarations against "
+        f"{len(collected)} collected pytest nodes; non-skipped execution "
+        "evidence is enforced by scripts/test_matrix.py"
+    )
     return 0
 
 
@@ -84,12 +107,187 @@ def _collect_pytest_nodeids(marker_expression: str | None = None) -> set[str]:
     }
 
 
+def _check_invariant_execution(
+    manifest: dict[str, Any],
+    executed_nodeids: set[str],
+    errors: list[str],
+    *,
+    lane: str | None = None,
+    platform: str | None = None,
+    selected_test_paths: tuple[str, ...] | None = None,
+) -> None:
+    """Require an actual passing call receipt for every selected invariant."""
+
+    invariants = manifest.get("invariants")
+    if not isinstance(invariants, list):
+        errors.append("manifest requires a non-empty invariants list")
+        return
+    normalized_executed = {
+        node_id.replace("\\", "/") for node_id in executed_nodeids
+    }
+    normalized_selected_paths = (
+        None
+        if selected_test_paths is None
+        else {path.replace("\\", "/") for path in selected_test_paths}
+    )
+    selected_platform = platform or _current_platform_key()
+    for invariant in invariants:
+        if not isinstance(invariant, dict):
+            continue
+        invariant_id = invariant.get("id")
+        invariant_lane = invariant.get("lane")
+        if not isinstance(invariant_id, str) or not invariant_id:
+            continue
+        if lane is not None and invariant_lane != lane:
+            continue
+        node_ids = invariant.get("node_ids")
+        if not isinstance(node_ids, list):
+            continue
+        normalized_nodes = {
+            node_id.replace("\\", "/")
+            for node_id in node_ids
+            if isinstance(node_id, str) and node_id
+        }
+        required = invariant.get("required_platform_nodes", {})
+        applicable_nodes = normalized_nodes
+        if isinstance(required, dict) and required:
+            platform_scoped_nodes = {
+                node_id.replace("\\", "/")
+                for platform_nodes in required.values()
+                if isinstance(platform_nodes, list)
+                for node_id in platform_nodes
+                if isinstance(node_id, str) and node_id
+            }
+            generic_nodes = normalized_nodes - platform_scoped_nodes
+            selected_platform_nodes = required.get(selected_platform, [])
+            applicable_nodes = generic_nodes | {
+                node_id.replace("\\", "/")
+                for node_id in selected_platform_nodes
+                if isinstance(node_id, str) and node_id
+            }
+            # A fully platform-scoped invariant does not apply on a Host for
+            # which it declares no regression nodes. This keeps, for example,
+            # Darwin/Linux filesystem identity evidence from making a native
+            # Windows lane fail solely because every declared node correctly
+            # skipped there.
+            if not applicable_nodes:
+                continue
+        if normalized_selected_paths is not None:
+            applicable_nodes = {
+                node_id
+                for node_id in applicable_nodes
+                if node_id.split("::", 1)[0] in normalized_selected_paths
+            }
+            if not applicable_nodes:
+                continue
+        if applicable_nodes.isdisjoint(normalized_executed):
+            selected_lane = lane or "all deterministic"
+            errors.append(
+                f"{invariant_id}: no declared regression node completed "
+                f"without skip in the {selected_lane} lane"
+            )
+        if not isinstance(required, dict) or selected_platform is None:
+            continue
+        platform_nodes = required.get(selected_platform, [])
+        if not isinstance(platform_nodes, list):
+            continue
+        for node_id in platform_nodes:
+            if not isinstance(node_id, str) or not node_id:
+                continue
+            normalized = node_id.replace("\\", "/")
+            if (
+                normalized_selected_paths is not None
+                and normalized.split("::", 1)[0] not in normalized_selected_paths
+            ):
+                continue
+            if normalized not in normalized_executed:
+                errors.append(
+                    f"{invariant_id}: required {selected_platform} pytest node "
+                    f"did not complete without skip: {node_id}"
+                )
+
+
+def _current_platform_key() -> str | None:
+    if sys.platform == "darwin":
+        return "darwin"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return None
+
+
+def load_execution_receipt(path: Path) -> set[str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read invariant execution receipt: {exc}") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "passed_node_ids",
+    }:
+        raise ValueError("invalid invariant execution receipt shape")
+    if payload.get("schema_version") != EXECUTION_RECEIPT_SCHEMA_VERSION:
+        raise ValueError("unsupported invariant execution receipt schema_version")
+    node_ids = payload.get("passed_node_ids")
+    if not isinstance(node_ids, list) or any(
+        not isinstance(node_id, str) or not node_id for node_id in node_ids
+    ):
+        raise ValueError("invariant execution receipt node ids must be strings")
+    if len(set(node_ids)) != len(node_ids):
+        raise ValueError("invariant execution receipt contains duplicate node ids")
+    return {node_id.replace("\\", "/") for node_id in node_ids}
+
+
+def pytest_sessionstart(session: Any) -> None:
+    if os.getenv(INVARIANT_EXECUTION_RECEIPT_ENV):
+        _EXECUTED_NODEIDS.clear()
+
+
+def pytest_runtest_logreport(report: Any) -> None:
+    if not os.getenv(INVARIANT_EXECUTION_RECEIPT_ENV):
+        return
+    if (
+        getattr(report, "when", None) == "call"
+        and bool(getattr(report, "passed", False))
+        and not hasattr(report, "wasxfail")
+    ):
+        _EXECUTED_NODEIDS.add(str(report.nodeid).replace("\\", "/"))
+
+
+def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
+    del exitstatus
+    selected = os.getenv(INVARIANT_EXECUTION_RECEIPT_ENV)
+    if not selected or hasattr(session.config, "workerinput"):
+        return
+    path = Path(selected)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "schema_version": EXECUTION_RECEIPT_SCHEMA_VERSION,
+                "passed_node_ids": sorted(_EXECUTED_NODEIDS),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
 def _check_invariants(
     manifest: dict[str, Any],
     collected: set[str],
     deterministic_collected: set[str],
     errors: list[str],
+    *,
+    platform_collected: dict[str, set[str]] | None = None,
 ) -> tuple[set[str], dict[str, str]]:
+    schema_version = manifest.get("schema_version")
+    if type(schema_version) is not int or schema_version != MANIFEST_SCHEMA_VERSION:
+        errors.append(
+            "manifest schema_version must be exact integer "
+            f"{MANIFEST_SCHEMA_VERSION}, got {schema_version!r}"
+        )
     invariants = manifest.get("invariants")
     if not isinstance(invariants, list) or not invariants:
         errors.append("manifest requires a non-empty invariants list")
@@ -126,6 +324,13 @@ def _check_invariants(
                 errors.append(f"{invariant_id}: pytest node not collected: {node_id}")
         if normalized_node_ids and not any(node_id in deterministic_collected for node_id in normalized_node_ids):
             errors.append(f"{invariant_id}: requires at least one deterministic regression node")
+        _check_required_platform_nodes(
+            invariant,
+            invariant_id,
+            set(normalized_node_ids),
+            platform_collected or {},
+            errors,
+        )
         attack_classes = invariant.get("benchmark_attack_classes", [])
         if not isinstance(attack_classes, list):
             errors.append(f"{invariant_id}: benchmark_attack_classes must be a list")
@@ -142,6 +347,62 @@ def _check_invariants(
                 )
             attack_class_owners[attack_class] = invariant_id
     return ids, attack_class_owners
+
+
+def _check_required_platform_nodes(
+    invariant: dict[str, Any],
+    invariant_id: str,
+    invariant_node_ids: set[str],
+    platform_collected: dict[str, set[str]],
+    errors: list[str],
+) -> None:
+    required = invariant.get("required_platform_nodes", {})
+    if not isinstance(required, dict):
+        errors.append(f"{invariant_id}: required_platform_nodes must be an object")
+        return
+    for platform, node_ids in required.items():
+        if not isinstance(platform, str) or platform not in PLATFORM_MARKERS:
+            errors.append(
+                f"{invariant_id}: required platform must be one of "
+                f"{sorted(PLATFORM_MARKERS)}, got {platform!r}"
+            )
+            continue
+        if not isinstance(node_ids, list) or not node_ids:
+            errors.append(
+                f"{invariant_id}: required_platform_nodes[{platform!r}] "
+                "must be a non-empty list"
+            )
+            continue
+        normalized_platform_nodes: list[str] = []
+        for node_id in node_ids:
+            if not isinstance(node_id, str) or not node_id:
+                errors.append(
+                    f"{invariant_id}: required_platform_nodes[{platform!r}] "
+                    "entries must be non-empty strings"
+                )
+                continue
+            normalized = node_id.replace("\\", "/")
+            normalized_platform_nodes.append(normalized)
+            if normalized not in invariant_node_ids:
+                errors.append(
+                    f"{invariant_id}: required {platform} pytest node is not "
+                    f"declared in node_ids: {node_id}"
+                )
+            if normalized not in platform_collected.get(platform, set()):
+                errors.append(
+                    f"{invariant_id}: required {platform} pytest node is not "
+                    f"deterministically collected with {PLATFORM_MARKERS[platform]}: {node_id}"
+                )
+        duplicate_nodes = sorted(
+            node_id
+            for node_id, count in Counter(normalized_platform_nodes).items()
+            if count > 1
+        )
+        if duplicate_nodes:
+            errors.append(
+                f"{invariant_id}: required_platform_nodes[{platform!r}] contains "
+                "duplicate nodes: " + ", ".join(duplicate_nodes)
+            )
 
 
 def _check_benchmark_attack_classes(

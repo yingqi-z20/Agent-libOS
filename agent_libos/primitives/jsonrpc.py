@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -49,6 +50,7 @@ from agent_libos.models.external_effect import default_external_effect_rollback_
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.storage import UnitOfWork
 from agent_libos.substrate import JsonRpcProvider, ProviderEffectNotStarted
+from agent_libos.substrate.base import _bounded_provider_getaddrinfo
 from agent_libos.sdk import (
     ProviderRegistryBinding,
     ProtectedOperationEvidence,
@@ -72,6 +74,8 @@ _CALL_RIGHTS = {CapabilityRight.READ.value, CapabilityRight.WRITE.value, Capabil
 _ALLOWED_HEADER_PREFIXES = {"", "Bearer ", "Token ", "Basic "}
 _ALLOWED_HEADER_SUFFIXES = {""}
 _PROVIDER_RESULT_RETURNED_ATTR = "_agent_libos_provider_result_returned"
+class _JsonRpcTransportNotStarted(TimeoutError, ProviderEffectNotStarted):
+    """The shared deadline expired after DNS but before provider dispatch."""
 
 
 def _mark_provider_result_returned(error: ProviderHostError) -> ProviderHostError:
@@ -79,6 +83,21 @@ def _mark_provider_result_returned(error: ProviderHostError) -> ProviderHostErro
 
     object.__setattr__(error, _PROVIDER_RESULT_RETURNED_ATTR, True)
     return error
+
+
+def _bounded_jsonrpc_getaddrinfo(
+    host: str,
+    port: int,
+    *,
+    deadline: float,
+) -> list[Any]:
+    """Resolve one Host name behind bounded daemon capacity and one deadline."""
+    return _bounded_provider_getaddrinfo(
+        host,
+        port,
+        deadline=deadline,
+        operation="JSON-RPC",
+    )
 
 
 def _provider_result_was_returned(error: BaseException) -> bool:
@@ -117,6 +136,7 @@ class JsonRpcPrimitive:
         self.provider = provider
         self.resources = resources
         self._registry_phase_lock = threading.RLock()
+        self._resolution_deadline = threading.local()
 
     def endpoint_resource(self, endpoint_id: str) -> str:
         return f"jsonrpc_endpoint:{endpoint_id}"
@@ -411,7 +431,10 @@ class JsonRpcPrimitive:
                 method,
                 request_body,
             )
-            transport = self._validated_transport_result(transport)
+            transport = self._validated_transport_result(
+                transport,
+                max_response_bytes=spec.max_response_bytes,
+            )
             resource_progress["response_bytes"] = transport.response_bytes
             classification_override = None
             if transport.error is not None:
@@ -815,14 +838,20 @@ class JsonRpcPrimitive:
         *,
         resolved_addresses: tuple[str, ...],
         resolved_headers: Mapping[str, str],
+        deadline: float,
         started: float,
     ) -> JsonRpcTransportResult:
+        remaining = min(endpoint.timeout_s, deadline - time.monotonic())
+        if remaining <= 0:
+            raise _JsonRpcTransportNotStarted(
+                "JSON-RPC absolute deadline expired before transport dispatch"
+            )
         try:
             raw_result = self.provider.call(
                 endpoint,
                 method,
                 request_body,
-                timeout_s=endpoint.timeout_s,
+                timeout_s=remaining,
                 max_response_bytes=endpoint.max_response_bytes,
                 resolved_addresses=resolved_addresses,
                 resolved_headers=resolved_headers,
@@ -839,7 +868,10 @@ class JsonRpcPrimitive:
                 error_type=type(error).__name__,
                 correlation_id=new_id("corr"),
             )
-        return self._validated_transport_result(raw_result)
+        return self._validated_transport_result(
+            raw_result,
+            max_response_bytes=endpoint.max_response_bytes,
+        )
 
     def _dispatch_transport(
         self,
@@ -848,12 +880,23 @@ class JsonRpcPrimitive:
         method: JsonRpcMethodSpec,
         request_body: bytes,
     ) -> JsonRpcTransportResult:
+        started = time.monotonic()
+        deadline = started + endpoint.timeout_s
         resolved_headers = self._require_header_environment(endpoint)
-        resolved_addresses = protected.call(
-            ProviderPhase("dns_resolution", information_flow=True),
-            self._validate_runtime_resolution,
-            endpoint,
-        )
+        previous_deadline = getattr(self._resolution_deadline, "current", None)
+        self._resolution_deadline.current = deadline
+        try:
+            resolved_addresses = protected.call(
+                ProviderPhase("dns_resolution", information_flow=True),
+                self._validate_runtime_resolution,
+                endpoint,
+            )
+        finally:
+            if previous_deadline is None:
+                with contextlib.suppress(AttributeError):
+                    del self._resolution_deadline.current
+            else:
+                self._resolution_deadline.current = previous_deadline
         return protected.call(
             ProviderPhase(
                 "transport_not_started_after_dns",
@@ -869,7 +912,8 @@ class JsonRpcPrimitive:
             request_body,
             resolved_addresses=resolved_addresses,
             resolved_headers=resolved_headers,
-            started=time.monotonic(),
+            deadline=deadline,
+            started=started,
         )
 
     @staticmethod
@@ -914,7 +958,10 @@ class JsonRpcPrimitive:
         request_id: str,
         transport: JsonRpcTransportResult,
     ) -> JsonRpcCallResult:
-        transport = self._validated_transport_result(transport)
+        transport = self._validated_transport_result(
+            transport,
+            max_response_bytes=endpoint.max_response_bytes,
+        )
         if transport.error and transport.status_code is None:
             return JsonRpcCallResult(
                 endpoint_id=endpoint.endpoint_id,
@@ -1033,8 +1080,12 @@ class JsonRpcPrimitive:
         )
 
     @staticmethod
-    def _validated_transport_result(result: Any) -> JsonRpcTransportResult:
-        """Decode all provider-owned transport fields before public handling."""
+    def _validated_transport_result(
+        result: Any,
+        *,
+        max_response_bytes: int,
+    ) -> JsonRpcTransportResult:
+        """Decode provider output and derive bounded accounting from its body."""
 
         try:
             if not isinstance(result, JsonRpcTransportResult):
@@ -1042,8 +1093,6 @@ class JsonRpcPrimitive:
             status_code = result.status_code
             body = result.body
             elapsed_s = result.elapsed_s
-            response_bytes = result.response_bytes
-            too_large = result.too_large
             error = result.error
             error_type = result.error_type
             correlation_id = result.correlation_id
@@ -1057,10 +1106,6 @@ class JsonRpcPrimitive:
                 or elapsed_s < 0
             ):
                 raise TypeError("JSON-RPC provider elapsed_s is invalid")
-            if type(response_bytes) is not int or response_bytes < 0:
-                raise TypeError("JSON-RPC provider response_bytes is invalid")
-            if type(too_large) is not bool:
-                raise TypeError("JSON-RPC provider too_large is invalid")
             for field_name, selected in (
                 ("error", error),
                 ("error_type", error_type),
@@ -1070,11 +1115,15 @@ class JsonRpcPrimitive:
                     raise TypeError(
                         f"JSON-RPC provider {field_name} is invalid"
                     )
+            actual_response_bytes = len(body)
+            too_large = actual_response_bytes > max_response_bytes
             return JsonRpcTransportResult(
                 status_code=status_code,
-                body=bytes(body),
+                # Preserve one sentinel byte so repeated validation cannot
+                # lose an already-observed over-limit condition.
+                body=bytes(body[: max_response_bytes + 1]),
                 elapsed_s=float(elapsed_s),
-                response_bytes=response_bytes,
+                response_bytes=min(actual_response_bytes, max_response_bytes),
                 too_large=too_large,
                 error=error,
                 error_type=error_type,
@@ -1320,6 +1369,7 @@ class JsonRpcPrimitive:
             raise ValidationError("JSON-RPC endpoint max_request_bytes exceeds configured bounds")
         if endpoint.max_response_bytes > self.config.jsonrpc.max_response_hard_limit_bytes:
             raise ValidationError("JSON-RPC endpoint max_response_bytes exceeds configured bounds")
+        self._validate_json_value(endpoint.metadata, "metadata")
         seen: set[str] = set()
         for name, header in endpoint.headers.items():
             self._validate_header_name(name)
@@ -1382,10 +1432,12 @@ class JsonRpcPrimitive:
         if rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED and bool(method.state_mutation):
             raise ValidationError("no_rollback_required JSON-RPC methods cannot declare state_mutation=true")
         self._validate_params_schema(method.params_schema)
+        self._validate_json_value(method.metadata, "method metadata")
 
     def _validate_params_schema(self, schema: dict[str, Any]) -> None:
         if not schema:
             return
+        self._validate_json_value(schema, "method params_schema")
         try:
             jsonschema_validator_for(schema).check_schema(schema)
         except JsonSchemaSchemaError as exc:
@@ -1515,8 +1567,19 @@ class JsonRpcPrimitive:
         if not host:
             raise ValidationError("JSON-RPC endpoint URL host is empty")
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        deadline = getattr(
+            self._resolution_deadline,
+            "current",
+            time.monotonic() + endpoint.timeout_s,
+        )
         try:
-            addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            addresses = _bounded_jsonrpc_getaddrinfo(
+                host,
+                port,
+                deadline=deadline,
+            )
+        except TimeoutError:
+            raise
         except OSError as exc:
             raise ValidationError(f"JSON-RPC endpoint host could not be resolved: {host}") from exc
         if not addresses:
@@ -1601,12 +1664,9 @@ class JsonRpcPrimitive:
         return selected
 
     def _coerce_positive_int(self, value: Any, field: str) -> int:
-        if isinstance(value, bool):
+        if type(value) is not int:
             raise ValidationError(f"JSON-RPC {field} must be an integer")
-        try:
-            selected = int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError(f"JSON-RPC {field} must be an integer") from exc
+        selected = value
         self._validate_positive_integer(selected, field)
         return selected
 

@@ -11,7 +11,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 32768,
-          "description": "Bash command to run for this step."
+          "description": "Bash command to run for this step, limited by Unicode code points."
         },
         "submit": {
           "type": "boolean",
@@ -28,7 +28,7 @@
         "output": {"type": "string"},
         "output_head": {"type": "string"},
         "output_tail": {"type": "string"},
-        "elided_chars": {"type": "integer"},
+        "elided_chars": {"type": "integer", "description": "Unicode code points omitted between output_head and output_tail."},
         "warning": {"type": "string"},
         "stdout_truncated": {"type": "boolean"},
         "stderr_truncated": {"type": "boolean"},
@@ -76,7 +76,7 @@
             "error": "denied"
           }
         ],
-        "expected": {"returncode": -1, "output": "", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": "denied"}
+        "expected": {"returncode": -1, "output": "", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": "syscall_error: SandboxError (correlation_id=corr_jit_test_1_1)"}
       },
       {
         "args": {"command": "printf done", "submit": true},
@@ -93,7 +93,7 @@
             "error": "exit denied"
           }
         ],
-        "expected": {"returncode": -1, "output": "done", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": "submission failed: exit denied"}
+        "expected": {"returncode": -1, "output": "done", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": "submission failed: syscall_error: SandboxError (correlation_id=corr_jit_test_1_2)"}
       },
       {
         "args": {"command": "printf clipped"},
@@ -110,7 +110,8 @@
     "metadata": {
       "compatibility": "mini-swe-agent mini.yaml bash tool",
       "command_max_chars": 32768,
-      "final_output_max_chars": 10000
+      "final_output_max_chars": 10000,
+      "character_unit": "unicode_code_points"
     }
   }
 ]

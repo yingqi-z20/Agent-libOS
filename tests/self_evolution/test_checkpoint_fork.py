@@ -45,6 +45,7 @@ class _CommitThenRaiseConnection:
     def __init__(self, connection: object) -> None:
         self._connection = connection
         self._fault_pending = True
+        self.sql_calls_after_fault: list[str] = []
 
     def __getattr__(self, name: str):
         return getattr(self._connection, name)
@@ -55,6 +56,18 @@ class _CommitThenRaiseConnection:
             self._fault_pending = False
             raise RuntimeError('injected checkpoint fork commit acknowledgement loss')
 
+    def execute(self, *args, **kwargs):
+        if not self._fault_pending:
+            self.sql_calls_after_fault.append('execute')
+            raise AssertionError('poisoned checkpoint connection was read')
+        return self._connection.execute(*args, **kwargs)
+
+    def cursor(self, *args, **kwargs):
+        if not self._fault_pending:
+            self.sql_calls_after_fault.append('cursor')
+            raise AssertionError('poisoned checkpoint connection was read')
+        return self._connection.cursor(*args, **kwargs)
+
 
 def _fork_operation(runtime: Runtime, pid: str):
     operations = [
@@ -64,6 +77,29 @@ def _fork_operation(runtime: Runtime, pid: str):
     ]
     assert len(operations) == 1
     return operations[0]
+
+
+def _assert_only_checkpoint_authorization_audit(
+    runtime: Runtime,
+    *,
+    before_record_ids: set[str],
+    actor: str,
+    checkpoint_id: str,
+    capability_id: str,
+) -> None:
+    new_records = [
+        record
+        for record in runtime.store.list_audit()
+        if record.record_id not in before_record_ids
+    ]
+    assert len(new_records) == 1
+    decision = new_records[0]
+    assert decision.actor == actor
+    assert decision.action == 'capability.authorize'
+    assert decision.target == f'checkpoint:{checkpoint_id}'
+    assert decision.capability_refs == [capability_id]
+    assert decision.decision['allowed'] is True
+    assert decision.decision['right'] == CapabilityRight.EXECUTE.value
 
 
 class TestCheckpointFork:
@@ -219,6 +255,198 @@ class TestCheckpointFork:
         finally:
             runtime.close()
 
+    def test_fork_rejects_malformed_capability_row_without_side_effects(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject capability type laundering during fork',
+            )
+            capability = runtime.capability.grant(
+                pid,
+                'test:typed-snapshot-fork',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=False,
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'malformed capability row',
+                actor=pid,
+            )
+            fork_authority = runtime.capability.grant_once(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            row = next(
+                item
+                for item in snapshot['rows']['capabilities']
+                if item['cap_id'] == capability.cap_id
+            )
+            row['delegable'] = 'false'
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+
+            cache_calls: list[str] = []
+
+            def unexpected_cache_or_publication(*_args: object, **_kwargs: object) -> None:
+                cache_calls.append('called')
+                raise AssertionError('malformed snapshot reached cache or publication')
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_images',
+                unexpected_cache_or_publication,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_jit_sources',
+                unexpected_cache_or_publication,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_insert_fork_rows',
+                unexpected_cache_or_publication,
+            )
+            before_processes = runtime.store.list_processes()
+            before_capabilities = runtime.store.list_capabilities()
+            before_audit_ids = {
+                record.record_id for record in runtime.store.list_audit()
+            }
+            before_events = runtime.events.list()
+            before_publications = runtime.store.list_runtime_publications()
+
+            with pytest.raises(
+                ValidationError,
+                match=r'rows\.capabilities\[\d+\]\.delegable must be a boolean',
+            ):
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert runtime.store.list_processes() == before_processes
+            assert runtime.store.list_capabilities() == before_capabilities
+            # Authorization decisions are append-only evidence even when
+            # downstream snapshot validation rejects the fork. No fork
+            # publication or finite-use settlement may survive the failure.
+            _assert_only_checkpoint_authorization_audit(
+                runtime,
+                before_record_ids=before_audit_ids,
+                actor=pid,
+                checkpoint_id=checkpoint_id,
+                capability_id=fork_authority.cap_id,
+            )
+            assert runtime.events.list() == before_events
+            assert runtime.store.list_runtime_publications() == before_publications
+            assert cache_calls == []
+        finally:
+            runtime.close()
+
+    def test_fork_rejects_active_exhausted_capability_without_side_effects(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject active exhausted capability during fork',
+            )
+            capability = runtime.capability.grant(
+                pid,
+                'test:active-exhausted-snapshot-fork',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'active exhausted capability row',
+                actor=pid,
+            )
+            fork_authority = runtime.capability.grant_once(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            row = next(
+                item
+                for item in snapshot['rows']['capabilities']
+                if item['cap_id'] == capability.cap_id
+            )
+            row.update(
+                {
+                    'effect': CapabilityEffect.DENY.value,
+                    'uses_remaining': 0,
+                    'status': 'active',
+                }
+            )
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+
+            cache_calls: list[str] = []
+
+            def unexpected_cache_or_publication(*_args: object, **_kwargs: object) -> None:
+                cache_calls.append('called')
+                raise AssertionError('malformed snapshot reached cache or publication')
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_images',
+                unexpected_cache_or_publication,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_jit_sources',
+                unexpected_cache_or_publication,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_insert_fork_rows',
+                unexpected_cache_or_publication,
+            )
+            before_processes = runtime.store.list_processes()
+            before_capabilities = runtime.store.list_capabilities()
+            before_audit_ids = {
+                record.record_id for record in runtime.store.list_audit()
+            }
+            before_events = runtime.events.list()
+            before_publications = runtime.store.list_runtime_publications()
+
+            with pytest.raises(
+                ValidationError,
+                match='active capability uses_remaining must be positive',
+            ):
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert runtime.store.list_processes() == before_processes
+            assert runtime.store.list_capabilities() == before_capabilities
+            _assert_only_checkpoint_authorization_audit(
+                runtime,
+                before_record_ids=before_audit_ids,
+                actor=pid,
+                checkpoint_id=checkpoint_id,
+                capability_id=fork_authority.cap_id,
+            )
+            assert runtime.events.list() == before_events
+            assert runtime.store.list_runtime_publications() == before_publications
+            assert cache_calls == []
+        finally:
+            runtime.close()
+
     def test_checkpoint_fork_operation_rejects_forged_receipt(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -255,11 +483,12 @@ class TestCheckpointFork:
         finally:
             runtime.close()
 
-    def test_fork_real_commit_ack_loss_rehydrates_payload_and_returns_warning(
+    def test_fork_in_memory_commit_ack_loss_fences_without_cache_rollback(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         runtime = Runtime.open('local')
+        fault_connections: list[_CommitThenRaiseConnection] = []
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='fork payload ack loss')
             original = runtime.memory.create_object(
@@ -282,7 +511,9 @@ class TestCheckpointFork:
             quarantined_statuses: list[ProcessStatus] = []
 
             def insert_with_commit_fault(*args, **kwargs):
-                runtime.store.conn = _CommitThenRaiseConnection(runtime.store.conn)
+                fault_connection = _CommitThenRaiseConnection(runtime.store.conn)
+                fault_connections.append(fault_connection)
+                runtime.store.conn = fault_connection
                 return original_insert(*args, **kwargs)
 
             def observe_quarantine(rows):
@@ -308,24 +539,43 @@ class TestCheckpointFork:
                 observe_quarantine,
             )
 
-            result = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+            with pytest.raises(
+                ValidationError,
+                match='unusable after uncertain transaction commit',
+            ) as caught:
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
 
-            assert result['status'] == 'forked_with_warnings'
-            assert result['main_state_committed'] is True
-            assert result['reconciliation_pending'] is False
-            assert result['post_commit_failures'][0]['phase'] == 'fork_commit_acknowledgement'
-            assert quarantined_statuses
-            assert set(quarantined_statuses) == {ProcessStatus.CREATED}
-            fork_oid = result['object_map'][original.oid]
-            fork_object = runtime.store.get_object(fork_oid)
-            assert fork_object is not None
-            assert fork_object.payload == {'value': 41}
-            root = runtime.store.get_process(result['fork_root_pid'])
-            assert root is not None
-            assert root.status == ProcessStatus.RUNNABLE
-            operation = _fork_operation(runtime, pid)
-            assert operation.state == OperationState.TERMINAL
-            assert operation.outcome == OperationOutcome.SUCCEEDED
+            receipt = getattr(
+                caught.value,
+                runtime.checkpoint.FORK_COMMITTED_RECEIPT_ATTRIBUTE,
+            )
+            assert receipt['status'] == 'fork_outcome_unknown'
+            assert receipt['main_state_committed'] is None
+            assert receipt['reconciliation_pending'] is True
+            assert receipt['outcome_diagnostic']['phase'] == 'fork_commit_confirmation'
+            assert receipt['outcome_diagnostic']['lifecycle_fenced'] is True
+            assert runtime.lifecycle.state == 'close_failed'
+
+            # A :memory: database has no independent observer after the only
+            # connection is poisoned and closed. The runtime must neither read
+            # that connection nor publish a guessed result. Keep the post-commit
+            # payload image for explicit recovery instead of rolling back only
+            # the volatile cache and manufacturing mixed state.
+            assert len(fault_connections) == 1
+            assert fault_connections[0].sql_calls_after_fault == []
+            assert quarantined_statuses == []
+            fork_oid = receipt['object_map'][original.oid]
+            assert runtime.store._object_payloads[fork_oid] == {'value': 41}
+            with pytest.raises(
+                ValidationError,
+                match='unusable after uncertain transaction commit',
+            ):
+                runtime.store.get_object(fork_oid)
+            with pytest.raises(
+                ValidationError,
+                match='unusable after uncertain transaction commit',
+            ):
+                runtime.store.object_payload(fork_oid)
         finally:
             runtime.close()
 
@@ -572,13 +822,14 @@ class TestCheckpointFork:
                 runtime.checkpoint.FORK_COMMITTED_RECEIPT_ATTRIBUTE,
             )
             assert receipt['main_state_committed'] is True
-            assert receipt['post_commit_failures'] == [
-                {
-                    'phase': 'fork_commit_acknowledgement',
-                    'error_type': fault_type.__name__,
-                    'message': 'injected fork commit acknowledgement interruption',
-                }
-            ]
+            assert len(receipt['post_commit_failures']) == 1
+            failure = receipt['post_commit_failures'][0]
+            assert failure['phase'] == 'fork_commit_acknowledgement'
+            assert failure['error_type'] == fault_type.__name__
+            assert failure['code'] == 'checkpoint_fork_post_commit_failed'
+            assert failure['correlation_id'] in failure['message']
+            assert len(failure['internal_error']['exception_text']['sha256']) == 64
+            assert 'injected fork commit acknowledgement interruption' not in str(failure)
             assert runtime.store.get_process(receipt['fork_root_pid']) is not None
             assert cleanup_calls == []
         finally:

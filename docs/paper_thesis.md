@@ -15,18 +15,25 @@ use remote resources, ask humans, and resume across long executions. Those
 behaviors are useful, but they make prompt-only control, wrapper-level tool
 lists, and host isolation insufficient as the primary authority boundary.
 
-Agent libOS argues for two coupled, Host-enforced boundaries:
+Agent libOS argues for two coupled, Host-enforced admission boundaries and a
+separate evidence plane. Applicable policy, approval, and budget terms are
+conjunctive checks; none is implied by tool visibility:
 
 ```text
-authority:        process identity + capability + primitive + audit
-information flow: trusted data labels + Host Sink trust + exact release
+operation admission: process identity + capability + Task Authority ceiling
+                     + operation policy/Human approval + ResourceBudget + primitive
+information flow:   trusted data labels + Host Sink trust + exact release
+evidence (not authority): durable intent + classified outcome + event/audit
+                          + explicit causal links
 ```
 
 A process may see a model-facing tool, Skill, JIT tool, image definition,
 child-process handle, checkpoint, or remote endpoint. Resource access is still
-decided only when a libOS primitive runs under that process id. Capability
-checks, policy, human approval, provider containment, external-effect
-classification, events, and audit all happen at that primitive boundary.
+decided only when a libOS primitive runs under that process id. Capability and
+Task Authority checks, policy, human approval, resource accounting, provider
+containment, external-effect classification, events, and audit all happen at
+that primitive boundary. Audit and other evidence record what the boundary did;
+they do not grant authority or make an otherwise denied operation admissible.
 Trusted source labels propagate through runtime Objects, messages, Tool/JIT
 results, Human answers, and provider ingress. Before runtime-mediated external
 egress, the Host resolves a canonical Sink identity and clearance from its
@@ -46,7 +53,8 @@ substrate for capability-controlled self-evolution.
    Memory namespaces, process-local working directories, message queues, child
    lifecycle, AgentImage registration, exec, and checkpoint commit, standard Skill activation,
    process-local Deno/TypeScript JIT tools, checkpoints, human I/O, and
-   capability-controlled primitives.
+   Task Authority ceilings, Human approval and policy, hierarchical resource
+   budgets, and capability-controlled primitives.
 
 2. Implementation.
    The current implementation realizes the model in Python with Capability,

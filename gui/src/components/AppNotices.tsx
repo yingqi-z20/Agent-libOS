@@ -20,7 +20,7 @@ export function LoadingScreen({ error, onRetry }: { error: string | null; onRetr
       <div className="loadingCard">
         {error ? <AlertCircle size={28} aria-hidden="true" /> : <LoaderCircle className="spin" size={28} aria-hidden="true" />}
         <h1>{error ? t("app.connectionFailed") : t("app.connecting")}</h1>
-        <p>{error ?? t("app.connectingHint")}</p>
+        <p role={error ? "alert" : "status"}>{error ?? t("app.connectingHint")}</p>
         {error ? <button className="primary" onClick={onRetry}><RefreshCw size={15} />{t("app.retry")}</button> : null}
       </div>
     </main>
@@ -32,6 +32,7 @@ export function AppNotices({
   snapshot,
   streamStatus,
   refreshing,
+  showSnapshotDiagnostics = false,
   onDismissError,
   onRetry
 }: {
@@ -39,6 +40,7 @@ export function AppNotices({
   snapshot: RuntimeSnapshot | null;
   streamStatus: StreamConnectionStatus;
   refreshing: boolean;
+  showSnapshotDiagnostics?: boolean;
   onDismissError(): void;
   onRetry(): void;
 }) {
@@ -48,13 +50,21 @@ export function AppNotices({
   const truncatedCount = truncatedSections.length;
   const truncatedSummary = summarizeTruncatedSections(truncatedSections);
   const truncationKey = truncatedSections.join("\n");
-  const showTruncation = truncatedCount > 0 && dismissedTruncationKey !== truncationKey;
+  const showTruncation = showSnapshotDiagnostics
+    && truncatedCount > 0
+    && dismissedTruncationKey !== truncationKey;
   const schedulerError = snapshot?.scheduler.last_error;
   const streamUnavailable = streamStatus === "reconnecting" || streamStatus === "failed";
+  const pendingHumanCount = (snapshot?.human_requests ?? []).filter((request) => request.status === "pending").length;
+  const hasVisibleNotice = Boolean(
+    error || schedulerError || streamUnavailable || showTruncation || (refreshing && !error)
+  );
 
-  if (!error && !schedulerError && !showTruncation && !streamUnavailable && !refreshing) return null;
   return (
-    <section className="appNotices" aria-label={t("app.notices")} aria-live="polite">
+    <section className="appNotices" aria-label={t("app.notices")} data-has-visible={hasVisibleNotice || undefined}>
+      <span className="srOnly" role="status" aria-live="polite" aria-atomic="true">
+        {pendingHumanCount > 0 ? `${t("user.pendingRequests")}: ${pendingHumanCount}` : ""}
+      </span>
       {error ? (
         <div className="appNotice error" role="alert">
           <AlertCircle size={16} aria-hidden="true" />

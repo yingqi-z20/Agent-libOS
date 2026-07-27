@@ -349,6 +349,72 @@ blank-line frame boundary. Requests force `Accept-Encoding: identity`, and a
 response carrying any other `Content-Encoding` is rejected before decoding to
 avoid an encoded response expanding past the raw limit.
 
+### Provider Result Bounds
+
+Objects returned by an MCP provider remain untrusted even when the provider is
+a custom Host integration. Before a live tool list or call result reaches
+accounting, evidence, or a process, the primitive detaches it into a strict JSON
+tree and applies all of these bounds:
+
+- maximum nesting depth is 128;
+- maximum node count is `min(100,000, max_response_bytes)`;
+- aggregate UTF-8 bytes across all string values and mapping keys cannot exceed
+  `max_response_bytes`;
+- a live `tools/list` response contains at most `config.mcp.list_limit` tools
+  (100 with `DEFAULT_CONFIG`), with unique non-empty names;
+- the canonical JSON encoding of the complete returned tool list, or of a call's
+  `content` plus `structured_content`, cannot exceed `max_response_bytes`; and
+- provider byte receipts cannot exceed `max_response_bytes` or under-report
+  that canonical encoding.
+
+Cycles, non-string mapping keys, non-finite numbers, unexpected Python objects,
+invalid field types, or a violated byte receipt fail closed through a sanitized
+provider error. They are never exposed as a partial result. These post-provider
+checks complement, rather than replace, the earlier raw stdio frame/stdout and
+HTTP body/SSE-frame limits.
+
+There are consequently two distinct oversize outcomes. A provider that has
+already materialized a valid call result may return a bounded receipt with
+`too_large: true`; the primitive validates that receipt and exposes
+`response_too_large`. By contrast, the default SDK provider cannot produce a
+safe result receipt when a raw stdio frame/stdout stream or HTTP body/SSE frame
+crosses its transport bound. During `call_tool`, its atomic path exposes that
+as sanitized `transport_error` with an error type such as `McpStdioFrameTooLarge`,
+`McpStdioStdoutTooLarge`, `McpHttpResponseTooLarge`, or
+`McpHttpSseFrameTooLarge`. A live `list_tools(refresh=true)` failure is instead
+raised as a sanitized provider exception and never returns a partial list.
+Neither outcome makes a consequential call safe to replay.
+
+### stdio Resource Limits And Provider Compatibility
+
+When an actor process has any of `max_subprocess_wall_seconds`,
+`max_subprocess_cpu_seconds`, or `max_subprocess_memory_bytes`, each stdio
+provider dispatch receives the process's remaining cumulative wall/CPU budgets
+and peak-memory bound as `SubprocessLimits`. The SDK provider supervises the
+whole stdio process tree and terminates it on a limit. CPU/memory limits fail
+closed when complete process-tree metrics cannot be obtained; a timeout or
+resource-limit failure is not reclassified as a normal MCP result.
+
+The public `McpProvider` protocol retains the legacy
+`validate_and_call`/`list_tools`/`call_tool` signatures, including immutable
+`runtime_environment` and optional `executable_snapshot` keyword arguments.
+An unbudgeted stdio operation can therefore use a legacy custom provider. A
+budgeted stdio operation additionally requires the provider to satisfy
+`McpSubprocessLimitsProvider`, set `supports_subprocess_limits = True`, and
+accept the optional `limits` keyword on all three dispatch methods; otherwise
+the primitive rejects the operation before provider dispatch.
+
+Custom stdio providers that resolve executable identity should accept the same
+immutable environment snapshot and advertise
+`supports_runtime_environment_snapshots = True`. If their
+`executable_snapshot_required(...)` reports that the target is mutable, they
+must also advertise `supports_executable_snapshots = True` and execute the
+supplied Host-owned snapshot rather than reopening the source path. A provider
+that cannot resolve an exact stdio executable may still handle
+normal-sensitivity data, but the Sink remains unidentified and elevated
+clearance fails closed. The bundled `SdkMcpProvider` implements all three
+support contracts.
+
 ## External Effects
 
 A refreshed `list_tools` call first validates runtime environment values, then
@@ -403,9 +469,9 @@ same `McpCallResult` fields: `server_id`, `tool_id`, `mcp_name`, `status`,
 | --- | --- |
 | `ok` | The tool returned successfully. `result` contains the bounded model-facing `content` and `structured_content` projections. |
 | `mcp_error` | The MCP server returned a tool error. `error` contains the stable error envelope plus any bounded projected returned content. |
-| `transport_error` | The provider or transport failed. An atomic provider also uses this status with `error_type: "LiveToolValidationError"` when combined live validation blocks dispatch. `error` is sanitized rather than exposing raw exception or credential text. |
+| `transport_error` | The provider or transport failed. This includes raw stdio frame/stdout and HTTP body/SSE-frame limit failures, because no safe materialized call-result receipt exists. An atomic provider also uses this status with `error_type: "LiveToolValidationError"` when combined live validation blocks dispatch. `error` is sanitized rather than exposing raw exception or credential text. |
 | `invalid_response` | The legacy two-call path records this status when mandatory live tool metadata is missing, malformed, or does not match a pinned manifest schema, then raises the validation/provider exception to the caller. |
-| `response_too_large` | The provider response exceeded the registered response limit. |
+| `response_too_large` | A provider materialized a valid call result and returned a bounded, primitive-validated `too_large` receipt for canonical result content over the registered limit. Raw transport-limit failures are instead `transport_error`. |
 
 Local argument/schema validation, capability, Human approval, data-flow,
 environment, and pre-provider resource failures are raised instead of encoded

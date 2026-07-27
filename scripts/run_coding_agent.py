@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +57,7 @@ async def amain(args: argparse.Namespace) -> None:
         if not args.no_run:
             results = await runtime.arun_until_idle(
                 max_quanta=args.max_quanta,
+                pids=(pid,),
                 human_auto_policy=args.human_auto_policy,
                 human_auto_approve=_optional_bool(args.human_auto_approve),
                 human_auto_answer=args.human_auto_answer,
@@ -94,7 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--db",
         default=None,
-        help="SQLite runtime DB path. Relative paths are resolved under the workspace. Defaults to .agent_libos.sqlite.",
+        help=(
+            "SQLite runtime DB path outside the exposed workspace. Relative "
+            "paths resolve from the Host working directory. The default is a "
+            "workspace-keyed file in a Host state directory."
+        ),
     )
     parser.add_argument(
         "--env-file",
@@ -194,6 +201,8 @@ async def _aopen_runtime(args: argparse.Namespace, workspace: Path) -> Runtime:
         if args.ephemeral_db
         else _resolve_db_path(args, workspace)
     )
+    if isinstance(target, Path):
+        target.parent.mkdir(parents=True, exist_ok=True)
     return await aopen_runtime(target, substrate=substrate)
 
 
@@ -208,9 +217,46 @@ def _resolve_workspace(value: str) -> Path:
 
 def _resolve_db_path(args: argparse.Namespace, workspace: Path) -> Path:
     if args.db is None:
-        return workspace / _RUNTIME_DEFAULTS.runtime_db_filename
-    db_path = Path(args.db).expanduser()
-    return db_path.resolve() if db_path.is_absolute() else (workspace / db_path).resolve()
+        selected = _default_db_path(workspace)
+    else:
+        db_path = Path(args.db).expanduser()
+        selected = db_path.resolve()
+    if _path_is_within(selected, workspace):
+        raise SystemExit(
+            "Runtime database must stay outside the model-visible workspace; "
+            "use --ephemeral-db or an external --db path"
+        )
+    return selected
+
+
+def _default_db_path(workspace: Path) -> Path:
+    workspace = workspace.resolve()
+    digest = hashlib.sha256(str(workspace).encode("utf-8")).hexdigest()[:24]
+    candidates = (
+        Path(tempfile.gettempdir()).resolve()
+        / "agent-libos"
+        / "coding-runtime"
+        / f"{digest}.sqlite",
+        Path.home().resolve()
+        / ".agent-libos"
+        / "coding-runtime"
+        / f"{digest}.sqlite",
+    )
+    for candidate in candidates:
+        if not _path_is_within(candidate, workspace):
+            return candidate
+    raise SystemExit(
+        "cannot select a Runtime database outside this workspace; "
+        "use --ephemeral-db"
+    )
+
+
+def _path_is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _load_goal(args: argparse.Namespace, workspace: Path | None = None) -> str:

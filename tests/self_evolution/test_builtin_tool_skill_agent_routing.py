@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,16 @@ _SKILL_BOOTSTRAP = [
     "unload_skill",
     "process_exit",
 ]
+
+
+def _activate_action(skill_id: str) -> dict[str, str]:
+    package = get_builtin_skill_catalog().get(skill_id)
+    assert package is not None
+    return {
+        "action": "activate_skill",
+        "skill_id": skill_id,
+        "expected_package_sha256": package.package_sha256,
+    }
 
 
 def _one_phase_coding_image(
@@ -68,10 +80,7 @@ def test_agent_routes_file_editing_through_builtin_skill_and_verifies_content(
                 "action": "discover_skills",
                 "text": "agent-libos-workspace-editing",
             },
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-workspace-editing",
-            },
+            _activate_action("agent-libos-workspace-editing"),
             {
                 "action": "write_text_file",
                 "path": "routed.txt",
@@ -81,10 +90,7 @@ def test_agent_routes_file_editing_through_builtin_skill_and_verifies_content(
                 "action": "discover_skills",
                 "text": "agent-libos-workspace-navigation",
             },
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-workspace-navigation",
-            },
+            _activate_action("agent-libos-workspace-navigation"),
             {"action": "read_text_file", "path": "routed.txt"},
             {"action": "process_exit", "payload": {"verified": True}},
         ]
@@ -145,10 +151,7 @@ def test_agent_routes_git_inspection_through_builtin_skill_and_verifies_state(
                 "action": "discover_skills",
                 "text": "agent-libos-git-inspection",
             },
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-git-inspection",
-            },
+            _activate_action("agent-libos-git-inspection"),
             {"action": "git_status"},
             {"action": "git_repository_info"},
             {"action": "process_exit", "payload": {"verified": True}},
@@ -209,10 +212,7 @@ def test_agent_routes_shell_execution_through_builtin_skill_and_verifies_output(
                 "action": "discover_skills",
                 "text": "agent-libos-command-execution",
             },
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-command-execution",
-            },
+            _activate_action("agent-libos-command-execution"),
             {
                 "action": "run_shell_command",
                 "argv": ["routing-check", "--inspect"],
@@ -306,10 +306,7 @@ def test_agent_routes_checkpoint_inspection_through_builtin_skill(
                     "action": "discover_skills",
                     "text": "agent-libos-checkpoints",
                 },
-                {
-                    "action": "activate_skill",
-                    "skill_id": "agent-libos-checkpoints",
-                },
+                    _activate_action("agent-libos-checkpoints"),
                 {"action": "list_checkpoints"},
                 {
                     "action": "inspect_checkpoint",
@@ -362,7 +359,7 @@ def test_agent_routes_mcp_registry_reads_through_builtin_skill(
     client = RecordingActionClient(
         [
             {"action": "discover_skills", "text": "agent-libos-mcp"},
-            {"action": "activate_skill", "skill_id": "agent-libos-mcp"},
+                _activate_action("agent-libos-mcp"),
             {"action": "list_mcp_servers"},
             {"action": "inspect_mcp_server", "server_id": "routing-mcp"},
             {"action": "process_exit", "payload": {"verified": True}},
@@ -434,19 +431,13 @@ def test_adjacent_navigation_skill_near_miss_does_not_project_editing_tools(
     client = RecordingActionClient(
         [
             {"action": "discover_skills", "text": "agent-libos-workspace"},
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-workspace-navigation",
-            },
+                _activate_action("agent-libos-workspace-navigation"),
             {
                 "action": "write_text_file",
                 "path": "near-miss.txt",
                 "content": "recovered\n",
             },
-            {
-                "action": "activate_skill",
-                "skill_id": "agent-libos-workspace-editing",
-            },
+                _activate_action("agent-libos-workspace-editing"),
             {
                 "action": "write_text_file",
                 "path": "near-miss.txt",
@@ -679,7 +670,7 @@ schema_version: 1
 server_id: {server_id}
 transport: stdio
 stdio:
-  command: python3
+  command: {json.dumps(sys.executable)}
   args: ["-m", "demo_server"]
 tools:
   - tool_id: echo

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import re
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -10,6 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from agent_libos.config import AgentLibOSConfig, RuntimeDefaults
 from agent_libos.models import ExternalEffectRecoveryQuery
@@ -27,6 +30,21 @@ _RECOVERY_INSERT_SQL = """
         provider_metadata_json, created_at, effect_state, transaction_state,
         canonical_args_hash, idempotency_key, provider_receipt_json, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+_RECOVERY_OPERATION_INSERT_SQL = """
+    INSERT INTO operations (
+        operation_id, root_operation_id, parent_operation_id, kind, name,
+        actor, pid, state, outcome, expected_roles_json, metadata_json,
+        runtime_publication_id, started_at, updated_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+_RECOVERY_EVIDENCE_INSERT_SQL = """
+    INSERT INTO operation_evidence (
+        link_id, operation_id, evidence_type, evidence_id, role, created_at,
+        metadata_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
 """
 
 _SQL_TEXT_LITERAL_RE = re.compile(r"'(?:''|[^'])*'")
@@ -108,6 +126,7 @@ _EXTERNAL_EFFECT_SCHEMA_INDEXES = frozenset(
         "idx_external_effects_pid_idempotency",
     }
 )
+_GLOBAL_PATCH_SCOPE_LOCK = threading.RLock()
 
 
 def _connect_with_trace_installed(
@@ -142,6 +161,30 @@ def _connect_with_trace_installed(
     # Register the returned object as a fallback without double-registering it.
     register_connection(connection)
     return connection
+
+
+def _connect_targets_database(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    database_path: Path,
+) -> bool:
+    raw_database = args[0] if args else kwargs.get("database")
+    if isinstance(raw_database, os.PathLike):
+        raw_database = os.fspath(raw_database)
+    if not isinstance(raw_database, str) or raw_database == ":memory:":
+        return False
+    if raw_database.startswith("file:"):
+        parsed = urlsplit(raw_database)
+        raw_database = unquote(parsed.path or parsed.netloc)
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:/", raw_database):
+            raw_database = raw_database[1:]
+    try:
+        selected = Path(raw_database).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return os.path.normcase(str(selected)) == os.path.normcase(
+        str(database_path.resolve(strict=False))
+    )
 
 
 class _ObservedSQLiteStore(SQLiteStore):
@@ -226,6 +269,24 @@ def run_recovery_scale_benchmark(
     page_size: int,
     transaction_states: tuple[str, ...] = ("prepared",),
 ) -> RecoveryScaleResult:
+    """Run one identity-filtered benchmark in the serialized patch scope."""
+
+    with _GLOBAL_PATCH_SCOPE_LOCK:
+        return _run_recovery_scale_benchmark_locked(
+            total_records=total_records,
+            pending_records=pending_records,
+            page_size=page_size,
+            transaction_states=transaction_states,
+        )
+
+
+def _run_recovery_scale_benchmark_locked(
+    *,
+    total_records: int,
+    pending_records: int,
+    page_size: int,
+    transaction_states: tuple[str, ...] = ("prepared",),
+) -> RecoveryScaleResult:
     """Exercise the real keyset API and validate structural, not timing, bounds.
 
     Rows are inserted directly because fixture construction is not part of the
@@ -279,6 +340,8 @@ def run_recovery_scale_benchmark(
             )
 
         def tracked_connect(*args: Any, **kwargs: Any) -> Any:
+            if not _connect_targets_database(args, kwargs, database_path):
+                return original_connect(*args, **kwargs)
             return _connect_with_trace_installed(
                 original_connect,
                 args,
@@ -413,6 +476,8 @@ def run_recovery_scale_benchmark(
             )
 
         def tracked_handler_connect(*args: Any, **kwargs: Any) -> Any:
+            if not _connect_targets_database(args, kwargs, database_path):
+                return original_connect(*args, **kwargs)
             return _connect_with_trace_installed(
                 original_connect,
                 args,
@@ -595,6 +660,63 @@ def _seed_external_effect_history(
                     for index in range(batch_start, batch_stop)
                 ),
             )
+            pending_stop = min(batch_stop, pending_records)
+            if batch_start < pending_stop:
+                cursor.executemany(
+                    _RECOVERY_OPERATION_INSERT_SQL,
+                    (
+                        _prepared_operation_row(index)
+                        for index in range(batch_start, pending_stop)
+                    ),
+                )
+                cursor.executemany(
+                    _RECOVERY_EVIDENCE_INSERT_SQL,
+                    (
+                        _prepared_effect_evidence_row(index)
+                        for index in range(batch_start, pending_stop)
+                    ),
+                )
+
+
+def _prepared_operation_row(index: int) -> tuple[Any, ...]:
+    operation_id = f"scale-operation-{index:012d}"
+    created_at = f"2026-01-01T00:00:00.{index:012d}Z"
+    return (
+        operation_id,
+        operation_id,
+        None,
+        "primitive",
+        "benchmark.external_effect_recovery",
+        "scale-benchmark-pid",
+        "scale-benchmark-pid",
+        "terminal",
+        "failed",
+        dumps(["effect"]),
+        dumps({}),
+        None,
+        created_at,
+        created_at,
+        created_at,
+    )
+
+
+def _prepared_effect_evidence_row(index: int) -> tuple[Any, ...]:
+    created_at = f"2026-01-01T00:00:00.{index:012d}Z"
+    return (
+        f"scale-effect-link-{index:012d}",
+        f"scale-operation-{index:012d}",
+        "external_effect",
+        f"scale-effect-{index:012d}",
+        "effect",
+        created_at,
+        dumps(
+            {
+                "effect_state": "pending",
+                "provider": "scale_benchmark",
+                "operation": "recover",
+            }
+        ),
+    )
 
 
 def _external_effect_row(

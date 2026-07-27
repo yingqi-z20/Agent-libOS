@@ -396,6 +396,75 @@ def _one(cursor: Any, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any]:
     return rows[0]
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"key": 1, "key": 2}',
+        '{"value": NaN}',
+        "[" * 257 + "0" + "]" * 257,
+        "[" + ",".join("0" for _ in range(100_001)) + "]",
+    ],
+    ids=("duplicate-key", "non-finite", "depth", "nodes"),
+)
+def test_migration_json_boundary_rejects_ambiguous_or_excessive_input(
+    raw: str,
+) -> None:
+    with pytest.raises(
+        ToolSkillMigrationError,
+        match="legacy.test contains malformed JSON",
+    ):
+        migration_module._json_value(raw, "legacy.test")
+
+
+def test_migration_json_boundary_enforces_encoded_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = '{"key": "\u00e9"}'
+    encoded_bytes = len(raw.encode("utf-8"))
+    monkeypatch.setattr(
+        migration_module,
+        "_LEGACY_JSON_HARD_LIMIT_BYTES",
+        encoded_bytes,
+    )
+
+    assert migration_module._json_value(raw, "legacy.test") == {"key": "\u00e9"}
+
+    monkeypatch.setattr(
+        migration_module,
+        "_LEGACY_JSON_HARD_LIMIT_BYTES",
+        encoded_bytes - 1,
+    )
+    with pytest.raises(
+        ToolSkillMigrationError,
+        match="legacy.test contains malformed JSON",
+    ):
+        migration_module._json_value(raw, "legacy.test")
+
+
+def test_migration_rejects_duplicate_persisted_json_without_writes(
+    tmp_path: Path,
+) -> None:
+    store, pid = _open_seeded_store(tmp_path / "ambiguous-json.sqlite")
+    ambiguous = (
+        '{"discover_tool_groups": "first", '
+        '"discover_tool_groups": "second"}'
+    )
+    try:
+        with store.transaction() as cursor:
+            cursor.execute(
+                "UPDATE processes SET tool_table_json = ? WHERE pid = ?",
+                (ambiguous, pid),
+            )
+        before = store.select_table_rows("processes", "pid = ?", (pid,))[0]
+
+        with pytest.raises(ToolSkillMigrationError, match="malformed JSON"):
+            migrate_tool_groups_to_skills(store, apply=True)
+
+        assert store.select_table_rows("processes", "pid = ?", (pid,))[0] == before
+    finally:
+        store.close()
+
+
 def test_migration_dry_run_apply_and_idempotence(tmp_path: Path) -> None:
     database = tmp_path / "tool-skill-migration.sqlite"
     store, pid = _open_seeded_store(database)
@@ -950,6 +1019,127 @@ def test_pending_activity_with_removed_tool_reference_aborts_atomically(
             migrate_tool_groups_to_skills(store, apply=True)
         assert store.select_table_rows("processes", "pid = ?", (pid,))[0] == before
         assert all(store.get_tool_spec(tool_id) is not None for tool_id in _legacy_tool_ids().values())
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param(False, False, id="bool-false"),
+        pytest.param(True, True, id="bool-true"),
+        pytest.param(0, False, id="integer-zero"),
+        pytest.param(1, True, id="integer-one"),
+    ],
+)
+def test_persisted_boolean_accepts_only_normal_backend_boolean_values(
+    stored: object,
+    expected: bool,
+) -> None:
+    assert (
+        migration_module._persisted_boolean(stored, path="test.operation_reconciled")
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param("false", id="string-false"),
+        pytest.param("0", id="string-zero"),
+        pytest.param("1", id="string-one"),
+        pytest.param(0.0, id="float-zero"),
+        pytest.param(1.0, id="float-one"),
+        pytest.param(2, id="integer-two"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_persisted_boolean_rejects_truthy_and_falsey_type_confusion(
+    stored: object,
+) -> None:
+    with pytest.raises(ToolSkillMigrationError, match="must be stored as 0 or 1"):
+        migration_module._persisted_boolean(
+            stored,
+            path="test.operation_reconciled",
+        )
+
+
+@pytest.mark.parametrize("apply", [False, True], ids=["dry-run", "apply"])
+def test_malformed_publication_boolean_aborts_before_any_migration_write(
+    tmp_path: Path,
+    apply: bool,
+) -> None:
+    database = tmp_path / f"malformed-publication-boolean-{apply}.sqlite"
+    runtime = Runtime.open(database)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="strict migration bool")
+        checkpoint_id = runtime.checkpoint.create(pid, "strict migration bool", actor=pid)
+    finally:
+        runtime.close()
+
+    store = SQLiteStore(database)
+    try:
+        _downgrade_builtin_image_and_process(store, pid)
+        _downgrade_checkpoint_snapshot(store, checkpoint_id)
+        checkpoint_before = store.select_table_rows(
+            "checkpoints", "checkpoint_id = ?", (checkpoint_id,)
+        )[0]
+        snapshot_sha256 = hashlib.sha256(
+            checkpoint_before["snapshot_json"].encode("utf-8")
+        ).hexdigest()
+        publication_id = f"malformed-publication-boolean-{apply}"
+        with store.transaction() as cursor:
+            cursor.execute("PRAGMA ignore_check_constraints = ON")
+            cursor.execute(
+                "INSERT INTO runtime_publications "
+                "(publication_id, kind, pid, owner_instance_id, state, phase, "
+                "plan_json, receipt_json, operation_reconciled, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    publication_id,
+                    "checkpoint_restore",
+                    pid,
+                    "offline-test",
+                    "committed",
+                    "reconciled",
+                    dumps(
+                        {
+                            "checkpoint_id": checkpoint_id,
+                            "snapshot_sha256": snapshot_sha256,
+                        }
+                    ),
+                    dumps({"phases": [], "artifacts": []}),
+                    "false",
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            cursor.execute("PRAGMA ignore_check_constraints = OFF")
+
+        process_before = store.select_table_rows(
+            "processes", "pid = ?", (pid,)
+        )[0]
+        publication_before = store.select_table_rows(
+            "runtime_publications", "publication_id = ?", (publication_id,)
+        )[0]
+        tools_before = store.select_table_rows("tools", order_by="tool_id")
+
+        with pytest.raises(
+            ToolSkillMigrationError,
+            match=r"operation_reconciled must be stored as 0 or 1",
+        ):
+            migrate_tool_groups_to_skills(store, apply=apply)
+
+        assert store.select_table_rows(
+            "processes", "pid = ?", (pid,)
+        )[0] == process_before
+        assert store.select_table_rows(
+            "checkpoints", "checkpoint_id = ?", (checkpoint_id,)
+        )[0] == checkpoint_before
+        assert store.select_table_rows(
+            "runtime_publications", "publication_id = ?", (publication_id,)
+        )[0] == publication_before
+        assert store.select_table_rows("tools", order_by="tool_id") == tools_before
     finally:
         store.close()
 

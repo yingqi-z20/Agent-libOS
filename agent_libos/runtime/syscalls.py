@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import inspect
+import math
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -9,7 +11,6 @@ from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
     CapabilityStatus,
-    CapabilitySpec,
     DataFlowContext,
     ForkMode,
     HumanRequestStatus,
@@ -47,6 +48,498 @@ from agent_libos.utils.serde import to_jsonable
 
 if TYPE_CHECKING:
     from agent_libos.runtime.runtime import Runtime
+
+
+@dataclass(frozen=True, slots=True)
+class _SyscallArgumentRule:
+    kind: str
+    required: bool = False
+    nullable: bool = False
+    minimum: int | float | None = None
+    exclusive_minimum: bool = False
+    maximum_config: str | None = None
+    minimum_items: int | None = None
+    maximum_items_config: str | None = None
+
+
+_STRING = _SyscallArgumentRule("string")
+_REQUIRED_STRING = _SyscallArgumentRule("string", required=True)
+_NULLABLE_STRING = _SyscallArgumentRule("string", nullable=True)
+_BOOLEAN = _SyscallArgumentRule("boolean")
+_OBJECT = _SyscallArgumentRule("object")
+_NULLABLE_OBJECT = _SyscallArgumentRule("object", nullable=True)
+_JSON = _SyscallArgumentRule("JSON value", nullable=True)
+_STRING_OR_OBJECT = _SyscallArgumentRule("string or object")
+_NULLABLE_STRING_OR_OBJECT = _SyscallArgumentRule(
+    "string or object",
+    nullable=True,
+)
+_STRING_LIST = _SyscallArgumentRule("list of strings")
+_NULLABLE_STRING_LIST = _SyscallArgumentRule("list of strings", nullable=True)
+_OBJECT_LIST = _SyscallArgumentRule("list of objects")
+
+
+_BUILTIN_SYSCALL_ARGUMENT_RULES: dict[
+    str,
+    dict[str, _SyscallArgumentRule],
+] = {
+    "filesystem.read_text": {
+        "path": _REQUIRED_STRING,
+        "encoding": _STRING,
+        "max_bytes": _SyscallArgumentRule(
+            "integer",
+            minimum=1,
+            maximum_config="tools.filesystem_read_hard_limit_bytes",
+        ),
+    },
+    "filesystem.write_text": {
+        "path": _REQUIRED_STRING,
+        "content": _STRING,
+        "text": _STRING,
+        "encoding": _STRING,
+        "overwrite": _BOOLEAN,
+        "expected_content_sha256": _NULLABLE_STRING,
+    },
+    "filesystem.read_directory": {
+        "path": _REQUIRED_STRING,
+        "limit": _SyscallArgumentRule(
+            "integer",
+            minimum=1,
+            maximum_config="tools.directory_entry_hard_limit",
+        ),
+    },
+    "filesystem.write_directory": {
+        "path": _REQUIRED_STRING,
+        "parents": _BOOLEAN,
+        "exist_ok": _BOOLEAN,
+    },
+    "filesystem.delete_file": {
+        "path": _REQUIRED_STRING,
+        "missing_ok": _BOOLEAN,
+    },
+    "filesystem.delete_directory": {
+        "path": _REQUIRED_STRING,
+        "recursive": _BOOLEAN,
+        "missing_ok": _BOOLEAN,
+    },
+    "memory.create_namespace": {
+        "namespace": _REQUIRED_STRING,
+        "parent_namespace": _NULLABLE_STRING,
+        "metadata": _OBJECT,
+    },
+    "memory.list_namespace": {
+        "namespace": _NULLABLE_STRING,
+        "limit": _SyscallArgumentRule(
+            "integer",
+            nullable=True,
+            minimum=1,
+            maximum_config="memory.query_limit",
+        ),
+    },
+    "memory.create_object": {
+        "type": _STRING,
+        "payload": _JSON,
+        "metadata": _OBJECT,
+        "immutable": _BOOLEAN,
+        "name": _NULLABLE_STRING,
+        "namespace": _NULLABLE_STRING,
+    },
+    "memory.read_object": {
+        "name": _REQUIRED_STRING,
+        "namespace": _NULLABLE_STRING,
+    },
+    "memory.append_object": {
+        "name": _REQUIRED_STRING,
+        "entry": _JSON,
+        "list_field": _STRING,
+        "namespace": _NULLABLE_STRING,
+    },
+    "human.output": {
+        "message": _STRING,
+        "human": _STRING,
+        "channel": _STRING,
+    },
+    "human.ask": {
+        "human": _STRING,
+        "question": _REQUIRED_STRING,
+        "context": _OBJECT,
+    },
+    "human.request_permission": {
+        "human": _STRING,
+        "resource": _REQUIRED_STRING,
+        "rights": _SyscallArgumentRule(
+            "list of strings",
+            minimum_items=1,
+            maximum_items_config="capability.max_rights_per_capability",
+        ),
+        "reason": _STRING,
+    },
+    "capability.list": {
+        "subject": _NULLABLE_STRING,
+        "include_inactive": _BOOLEAN,
+        "limit": _SyscallArgumentRule(
+            "integer",
+            nullable=True,
+            minimum=1,
+            maximum_config="capability.list_limit",
+        ),
+    },
+    "capability.inspect": {"capability_id": _REQUIRED_STRING},
+    "capability.revoke": {
+        "capability_id": _REQUIRED_STRING,
+        "reason": _NULLABLE_STRING,
+    },
+    "clock.now": {"timezone": _STRING},
+    "clock.sleep": {
+        "seconds": _SyscallArgumentRule(
+            "number",
+            minimum=0,
+            maximum_config="tools.max_sleep_seconds",
+        )
+    },
+    "jsonrpc.list": {},
+    "jsonrpc.inspect": {"endpoint_id": _REQUIRED_STRING},
+    "jsonrpc.call": {
+        "endpoint_id": _REQUIRED_STRING,
+        "method_id": _REQUIRED_STRING,
+        "params": _JSON,
+    },
+    "mcp.list": {},
+    "mcp.inspect": {"server_id": _REQUIRED_STRING},
+    "mcp.tools": {
+        "server_id": _REQUIRED_STRING,
+        "refresh": _BOOLEAN,
+    },
+    "mcp.call": {
+        "server_id": _REQUIRED_STRING,
+        "tool_id": _REQUIRED_STRING,
+        "arguments": _OBJECT,
+    },
+    "process.cwd": {},
+    "process.chdir": {"path": _REQUIRED_STRING},
+    "process.fork": {
+        "goal": _STRING_OR_OBJECT,
+        "mode": _STRING,
+        "root_oids": _NULLABLE_STRING_LIST,
+        "include_parent_roots": _BOOLEAN,
+        "inherit_capabilities": _OBJECT_LIST,
+        "resource_budget": _NULLABLE_OBJECT,
+        "image": _NULLABLE_STRING,
+        "working_directory": _NULLABLE_STRING,
+    },
+    "process.spawn_child": {
+        "goal": _STRING_OR_OBJECT,
+        "image": _NULLABLE_STRING,
+        "inherit_capabilities": _OBJECT_LIST,
+        "resource_budget": _NULLABLE_OBJECT,
+        "working_directory": _NULLABLE_STRING,
+    },
+    "process.wait": {
+        "child_pid": _REQUIRED_STRING,
+        "block": _BOOLEAN,
+    },
+    "process.list_children": {"include_terminal": _BOOLEAN},
+    "process.signal": {
+        "child_pid": _REQUIRED_STRING,
+        "signal": _REQUIRED_STRING,
+        "reason": _NULLABLE_STRING,
+    },
+    "process.merge_child_memory": {
+        "child_pid": _REQUIRED_STRING,
+        "include_child_created": _BOOLEAN,
+    },
+    "process.send_message": {
+        "recipient_pid": _REQUIRED_STRING,
+        "kind": _STRING,
+        "channel": _STRING,
+        "correlation_id": _NULLABLE_STRING,
+        "reply_to": _NULLABLE_STRING,
+        "subject": _STRING,
+        "body": _STRING,
+        "payload": _OBJECT,
+    },
+    "process.read_messages": {
+        "block": _BOOLEAN,
+        "include_acked": _BOOLEAN,
+        "kind": _NULLABLE_STRING,
+        "sender": _NULLABLE_STRING,
+        "channel": _NULLABLE_STRING,
+        "correlation_id": _NULLABLE_STRING,
+        "reply_to": _NULLABLE_STRING,
+        "message_ids": _SyscallArgumentRule(
+            "list of strings",
+            nullable=True,
+            maximum_items_config="tools.message_filter_ids_hard_limit",
+        ),
+        "limit": _SyscallArgumentRule(
+            "integer",
+            nullable=True,
+            minimum=0,
+            maximum_config="tools.message_read_hard_limit",
+        ),
+        "ack": _BOOLEAN,
+    },
+    "process.receive_messages": {
+        "block": _BOOLEAN,
+        "include_acked": _BOOLEAN,
+        "kind": _NULLABLE_STRING,
+        "sender": _NULLABLE_STRING,
+        "channel": _NULLABLE_STRING,
+        "correlation_id": _NULLABLE_STRING,
+        "reply_to": _NULLABLE_STRING,
+        "message_ids": _SyscallArgumentRule(
+            "list of strings",
+            nullable=True,
+            maximum_items_config="tools.message_filter_ids_hard_limit",
+        ),
+        "limit": _SyscallArgumentRule(
+            "integer",
+            nullable=True,
+            minimum=0,
+            maximum_config="tools.message_read_hard_limit",
+        ),
+        "ack": _BOOLEAN,
+    },
+    "process.exec": {
+        "image": _REQUIRED_STRING,
+        "args": _OBJECT,
+        "goal": _NULLABLE_STRING_OR_OBJECT,
+        "preserve_memory": _BOOLEAN,
+        "preserve_capabilities": _BOOLEAN,
+    },
+    "process.exit": {
+        "payload": _JSON,
+        "result_oid": _NULLABLE_STRING,
+        "message": _NULLABLE_STRING,
+        "failed": _BOOLEAN,
+        "use_tool_result": _BOOLEAN,
+    },
+    "checkpoint.create": {
+        "reason": _STRING,
+        "metadata": _OBJECT,
+    },
+    "checkpoint.list": {
+        "pid": _NULLABLE_STRING,
+        "limit": _SyscallArgumentRule(
+            "integer",
+            nullable=True,
+            minimum=1,
+            maximum_config="checkpoint.list_limit",
+        ),
+    },
+    "checkpoint.inspect": {"checkpoint_id": _REQUIRED_STRING},
+    "checkpoint.diff": {"checkpoint_id": _REQUIRED_STRING},
+    "checkpoint.restore": {"checkpoint_id": _REQUIRED_STRING},
+    "checkpoint.fork": {
+        "checkpoint_id": _REQUIRED_STRING,
+        "parent_pid": _NULLABLE_STRING,
+    },
+    "checkpoint.replay": {
+        "checkpoint_id": _REQUIRED_STRING,
+        "event_id": _REQUIRED_STRING,
+    },
+    "skill.discover": {
+        "text": _NULLABLE_STRING,
+        "limit": _SyscallArgumentRule(
+            "integer",
+            nullable=True,
+            minimum=1,
+            maximum_config="skills.discover_limit",
+        ),
+    },
+    "skill.inspect": {"skill_id": _REQUIRED_STRING},
+    "skill.register_path": {
+        "path": _REQUIRED_STRING,
+        "replace": _BOOLEAN,
+    },
+    "skill.activate": {
+        "skill_id": _REQUIRED_STRING,
+        "expected_package_sha256": _REQUIRED_STRING,
+    },
+    "skill.unload": {"skill_id": _REQUIRED_STRING},
+    "skill.read_resource": {
+        "skill_id": _REQUIRED_STRING,
+        "path": _REQUIRED_STRING,
+        "max_bytes": _SyscallArgumentRule(
+            "integer",
+            nullable=True,
+            minimum=1,
+            maximum_config="skills.resource_read_max_bytes",
+        ),
+    },
+    "shell.run": {
+        "argv": _SyscallArgumentRule(
+            "list of strings",
+            required=True,
+            minimum_items=1,
+        ),
+        "timeout_s": _SyscallArgumentRule(
+            "number",
+            minimum=0,
+            exclusive_minimum=True,
+            maximum_config="shell.timeout_hard_limit_s",
+        ),
+    },
+    "image.list": {},
+    "image.inspect": {"image_id": _REQUIRED_STRING},
+    "image.commit_checkpoint": {
+        "checkpoint_id": _REQUIRED_STRING,
+        "image_id": _REQUIRED_STRING,
+        "name": _REQUIRED_STRING,
+        "version": _STRING,
+        "replace": _BOOLEAN,
+        "metadata": _OBJECT,
+    },
+    "image.load_package": {
+        "path": _REQUIRED_STRING,
+        "replace": _BOOLEAN,
+    },
+}
+
+_UNVALIDATED_BUILTIN_SYSCALLS = frozenset({"capability.delegate"})
+_ARGUMENT_KIND_LABELS = {
+    "string": "a string",
+    "boolean": "a boolean",
+    "integer": "an integer",
+    "number": "a finite number",
+    "object": "an object with string keys",
+    "list of strings": "a list of strings",
+    "list of objects": "a list of objects with string keys",
+    "string or object": "a string or object with string keys",
+    "JSON value": "a JSON value",
+}
+
+
+def _config_argument_bound(config: AgentLibOSConfig, path: str) -> int | float:
+    group_name, field_name = path.split(".", maxsplit=1)
+    group = getattr(config, group_name)
+    value = getattr(group, field_name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"invalid syscall argument bound: {path}")
+    return value
+
+
+def _argument_has_string_keys(value: dict[Any, Any]) -> bool:
+    return all(isinstance(key, str) for key in value)
+
+
+def _list_argument_matches_kind(value: Any, kind: str) -> bool:
+    if not isinstance(value, list):
+        return False
+    if kind == "list of strings":
+        return all(isinstance(item, str) for item in value)
+    if kind == "list of objects":
+        return all(
+            isinstance(item, dict) and _argument_has_string_keys(item)
+            for item in value
+        )
+    raise RuntimeError(f"unknown syscall list argument kind: {kind}")
+
+
+def _argument_matches_kind(value: Any, kind: str) -> bool:
+    if kind == "JSON value":
+        return True
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        return isinstance(value, int) or math.isfinite(value)
+    if kind == "object":
+        return isinstance(value, dict) and _argument_has_string_keys(value)
+    if kind in {"list of strings", "list of objects"}:
+        return _list_argument_matches_kind(value, kind)
+    if kind == "string or object":
+        return isinstance(value, str) or (
+            isinstance(value, dict) and _argument_has_string_keys(value)
+        )
+    raise RuntimeError(f"unknown syscall argument kind: {kind}")
+
+
+def _validate_syscall_argument_bounds(
+    key: str,
+    value: Any,
+    rule: _SyscallArgumentRule,
+    config: AgentLibOSConfig,
+) -> None:
+    if rule.minimum is not None:
+        too_small = (
+            value <= rule.minimum
+            if rule.exclusive_minimum
+            else value < rule.minimum
+        )
+        if too_small:
+            operator = ">" if rule.exclusive_minimum else ">="
+            raise ValidationError(
+                f"syscall argument '{key}' must be {operator} {rule.minimum}"
+            )
+    if rule.maximum_config is not None:
+        maximum = _config_argument_bound(config, rule.maximum_config)
+        if value > maximum:
+            raise ValidationError(
+                f"syscall argument '{key}' exceeds maximum {maximum}"
+            )
+    if rule.minimum_items is not None and len(value) < rule.minimum_items:
+        raise ValidationError(
+            f"syscall argument '{key}' must contain at least "
+            f"{rule.minimum_items} items"
+        )
+    if rule.maximum_items_config is not None:
+        maximum_items = int(
+            _config_argument_bound(config, rule.maximum_items_config)
+        )
+        if len(value) > maximum_items:
+            raise ValidationError(
+                f"syscall argument '{key}' exceeds maximum items={maximum_items}"
+            )
+
+
+def _validate_builtin_syscall_arguments(
+    name: str,
+    args: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> None:
+    if name in _UNVALIDATED_BUILTIN_SYSCALLS:
+        return
+    rules = _BUILTIN_SYSCALL_ARGUMENT_RULES.get(name)
+    if rules is None:
+        raise RuntimeError(f"missing built-in syscall argument contract: {name}")
+    for key, rule in rules.items():
+        if key not in args:
+            if rule.required:
+                raise ValidationError(f"syscall argument '{key}' is required")
+            continue
+        value = args[key]
+        if value is None and rule.nullable:
+            continue
+        if not _argument_matches_kind(value, rule.kind):
+            expected = _ARGUMENT_KIND_LABELS[rule.kind]
+            raise ValidationError(
+                f"syscall argument '{key}' must be {expected}"
+            )
+        _validate_syscall_argument_bounds(key, value, rule, config)
+
+
+def _validate_builtin_argument_contract_inventory() -> None:
+    canonical_names = {
+        descriptor.name for descriptor in BUILTIN_SYSCALL_ROUTES.values()
+    }
+    expected = canonical_names - _UNVALIDATED_BUILTIN_SYSCALLS
+    actual = set(_BUILTIN_SYSCALL_ARGUMENT_RULES)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise RuntimeError(
+            "built-in syscall argument contract inventory mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+
+
+_validate_builtin_argument_contract_inventory()
 
 
 class LibOSSyscallSession:
@@ -307,6 +800,11 @@ class LibOSSyscallSession:
         descriptor = BUILTIN_SYSCALL_ROUTES.get(name)
         if descriptor is None:
             raise NotFound(f"unknown libOS syscall: {name}")
+        _validate_builtin_syscall_arguments(
+            descriptor.name,
+            args,
+            self.config,
+        )
         handler = getattr(self, descriptor.handler)
         return handler(args)
 
@@ -616,6 +1114,7 @@ class LibOSSyscallSession:
             self.pid,
             str(args["skill_id"]),
             actor=self.pid,
+            expected_package_sha256=str(args["expected_package_sha256"]),
         )
 
     def _skill_unload(self, args: dict[str, Any]) -> Any:
@@ -703,6 +1202,7 @@ class LibOSSyscallSession:
             text=str(args.get("content", args.get("text", ""))),
             encoding=str(args.get("encoding") or self.config.tools.default_text_encoding),
             overwrite=bool(args.get("overwrite", True)),
+            expected_content_sha256=args.get("expected_content_sha256"),
             cwd=cwd,
         )
 
@@ -887,24 +1387,45 @@ class LibOSSyscallSession:
         return {"capability": capability}
 
     def _capability_delegate(self, args: dict[str, Any]) -> dict[str, Any]:
-        child_pid = str(args["child_pid"])
+        child_pid = args.get("child_pid")
+        if type(child_pid) is not str or not child_pid:
+            raise ValidationError(
+                "capability.delegate child_pid must be a non-empty string"
+            )
         child = self.runtime.process.get(child_pid)
         if child.parent_pid != self.pid:
             raise CapabilityDenied("capability.delegate may target only a direct child process")
+        delegable = args.get("delegable", False)
+        if type(delegable) is not bool:
+            raise ValidationError(
+                "capability.delegate delegable must be a boolean"
+            )
+        revocable = args.get("revocable", True)
+        if type(revocable) is not bool:
+            raise ValidationError(
+                "capability.delegate revocable must be a boolean"
+            )
+        uses_remaining = args.get("uses_remaining")
+        if uses_remaining is not None and (
+            type(uses_remaining) is not int or uses_remaining < 1
+        ):
+            raise ValidationError(
+                "capability.delegate uses_remaining must be a positive integer"
+            )
         cap = self.runtime.capability.delegate(
             self.pid,
             child_pid,
-            CapabilitySpec(
-                resource=str(args["resource"]),
-                rights={str(right) for right in args.get("rights", [])},
-                effect=CapabilityEffect(str(args.get("effect", CapabilityEffect.ALLOW.value))),
-                constraints=dict(args.get("constraints") or {}),
-                metadata=dict(args.get("metadata") or {}),
-                expires_at=str(args["expires_at"]) if args.get("expires_at") is not None else None,
-                uses_remaining=int(args["uses_remaining"]) if args.get("uses_remaining") is not None else None,
-                delegable=bool(args.get("delegable", False)),
-                revocable=bool(args.get("revocable", True)),
-            ),
+            {
+                "resource": args.get("resource"),
+                "rights": args.get("rights", []),
+                "effect": args.get("effect", CapabilityEffect.ALLOW.value),
+                "constraints": args.get("constraints", {}),
+                "metadata": args.get("metadata", {}),
+                "expires_at": args.get("expires_at"),
+                "uses_remaining": uses_remaining,
+                "delegable": delegable,
+                "revocable": revocable,
+            },
             actor=self.pid,
         )
         return {"capability": self.runtime.capability.inspect(cap.cap_id)}

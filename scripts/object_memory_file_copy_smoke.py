@@ -110,8 +110,12 @@ async def amain(args: argparse.Namespace) -> None:
         action_names = [result["action"]["action"] for result in results if isinstance(result, dict) and "action" in result]
         if action_names != ["create_object_from_file", "write_object_to_file", "process_exit"]:
             raise SystemExit(f"unexpected action sequence: {action_names}")
-        serialized_results = json.dumps([result.get("result") for result in results if isinstance(result, dict)], ensure_ascii=False)
-        content_hidden = source_text not in serialized_results
+        visible_results = [
+            result.get("result")
+            for result in results
+            if isinstance(result, dict)
+        ]
+        content_hidden = not _contains_text(visible_results, source_text)
         if not content_hidden:
             raise SystemExit("source content appeared in process-visible tool results")
 
@@ -151,10 +155,9 @@ class GuardedActionClient:
 
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
         self.calls += 1
-        serialized_messages = json.dumps(messages, ensure_ascii=False)
         # This assertion is the point of the smoke test: copying through named
         # Object Memory must not materialize file bytes into the prompt.
-        if self.forbidden_text and self.forbidden_text in serialized_messages:
+        if self.forbidden_text and _contains_text(messages, self.forbidden_text):
             raise AssertionError("source file content was materialized into the process prompt")
         if not self.actions:
             raise AssertionError("no planned action remains")
@@ -165,6 +168,23 @@ class GuardedActionClient:
             content="",
             tool_calls=[{"id": f"planned_{self.calls}", "name": name, "arguments": json.dumps(args)}],
         )
+
+
+def _contains_text(value: object, needle: str) -> bool:
+    """Inspect structured evidence without JSON escaping masking raw text."""
+
+    if not needle:
+        return False
+    if isinstance(value, str):
+        return needle in value
+    if isinstance(value, dict):
+        return any(
+            _contains_text(key, needle) or _contains_text(item, needle)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_text(item, needle) for item in value)
+    return False
 
 
 if __name__ == "__main__":

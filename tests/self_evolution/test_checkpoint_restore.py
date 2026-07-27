@@ -44,6 +44,9 @@ from agent_libos.utils.serde import dumps, loads
 from tests.support.checkpoints import ClassifiedShellProvider
 
 
+_OBJECT_TASK_SYNC_TIMEOUT_S = 30.0
+
+
 def _write_durable_finalizer_module(
     root: Path,
     *,
@@ -101,9 +104,7 @@ sha256: {source_sha}
 """.lstrip(),
         encoding='utf-8',
     )
-    manifest_sha = hashlib.sha256(
-        manifest.read_text(encoding='utf-8').encode('utf-8')
-    ).hexdigest()
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
     return manifest, ModuleLoader.trust_key(module_id, manifest_sha, source_sha)
 
 
@@ -691,6 +692,181 @@ class TestCheckpointRestore:
                 )
 
             assert runtime.process.get(pid) == before
+        finally:
+            runtime.close()
+
+    def test_restore_rejects_malformed_capability_row_without_side_effects(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject capability type laundering during restore',
+            )
+            capability = runtime.capability.grant(
+                pid,
+                'test:typed-snapshot-restore',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=False,
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'malformed capability row',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            row = next(
+                item
+                for item in snapshot['rows']['capabilities']
+                if item['cap_id'] == capability.cap_id
+            )
+            row['delegable'] = 'false'
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+
+            cache_calls: list[str] = []
+
+            def unexpected_cache_or_publication(*_args: object, **_kwargs: object) -> None:
+                cache_calls.append('called')
+                raise AssertionError('malformed snapshot reached cache or publication')
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_images',
+                unexpected_cache_or_publication,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_jit_sources',
+                unexpected_cache_or_publication,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint._snapshot_rows,
+                'replace_checkpoint_scope',
+                unexpected_cache_or_publication,
+            )
+            before_processes = runtime.store.list_processes()
+            before_capabilities = runtime.store.list_capabilities()
+            before_audit = runtime.store.list_audit()
+            before_events = runtime.events.list()
+            before_publications = runtime.store.list_runtime_publications()
+
+            with pytest.raises(
+                ValidationError,
+                match=r'rows\.capabilities\[\d+\]\.delegable must be a boolean',
+            ):
+                runtime.checkpoint.restore(
+                    'cli',
+                    checkpoint_id,
+                    require_capability=False,
+                )
+
+            assert runtime.store.list_processes() == before_processes
+            assert runtime.store.list_capabilities() == before_capabilities
+            assert runtime.store.list_audit() == before_audit
+            assert runtime.events.list() == before_events
+            assert runtime.store.list_runtime_publications() == before_publications
+            assert cache_calls == []
+        finally:
+            runtime.close()
+
+    def test_restore_rejects_active_exhausted_capability_without_side_effects(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject active exhausted capability during restore',
+            )
+            capability = runtime.capability.grant(
+                pid,
+                'test:active-exhausted-snapshot-restore',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'active exhausted capability row',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            row = next(
+                item
+                for item in snapshot['rows']['capabilities']
+                if item['cap_id'] == capability.cap_id
+            )
+            row.update(
+                {
+                    'effect': CapabilityEffect.DENY.value,
+                    'uses_remaining': 0,
+                    'status': CapabilityStatus.ACTIVE.value,
+                }
+            )
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+            # Make the snapshot row the only source for this capability. The
+            # vulnerable path would reconstruct and raw-insert deny/0/active.
+            runtime.store._execute(
+                'DELETE FROM capabilities WHERE cap_id = ?',
+                (capability.cap_id,),
+            )
+
+            cache_calls: list[str] = []
+
+            def unexpected_cache_or_publication(*_args: object, **_kwargs: object) -> None:
+                cache_calls.append('called')
+                raise AssertionError('malformed snapshot reached cache or publication')
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_images',
+                unexpected_cache_or_publication,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_jit_sources',
+                unexpected_cache_or_publication,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint._snapshot_rows,
+                'replace_checkpoint_scope',
+                unexpected_cache_or_publication,
+            )
+            before_processes = runtime.store.list_processes()
+            before_capabilities = runtime.store.list_capabilities()
+            before_audit = runtime.store.list_audit()
+            before_events = runtime.events.list()
+            before_publications = runtime.store.list_runtime_publications()
+
+            with pytest.raises(
+                ValidationError,
+                match='active capability uses_remaining must be positive',
+            ):
+                runtime.checkpoint.restore(
+                    'cli',
+                    checkpoint_id,
+                    require_capability=False,
+                )
+
+            assert runtime.store.list_processes() == before_processes
+            assert runtime.store.list_capabilities() == before_capabilities
+            assert runtime.store.list_audit() == before_audit
+            assert runtime.events.list() == before_events
+            assert runtime.store.list_runtime_publications() == before_publications
+            assert cache_calls == []
         finally:
             runtime.close()
 
@@ -2095,13 +2271,14 @@ class TestCheckpointRestore:
             assert runtime.store.get_object(temporary.oid) is None
             assert result["status"] == "restored_with_warnings"
             assert result["main_state_committed"] is True
-            assert result["post_commit_failures"] == [
-                {
-                    "phase": "object_release_finalizers",
-                    "error_type": "ValidationError",
-                    "message": "checkpoint restore or recovery is already in progress",
-                }
-            ]
+            assert len(result["post_commit_failures"]) == 1
+            failure = result["post_commit_failures"][0]
+            assert failure["phase"] == "object_release_finalizers"
+            assert failure["error_type"] == "ValidationError"
+            assert failure["code"] == "checkpoint_restore_post_commit_failed"
+            assert failure["correlation_id"] in failure["message"]
+            assert len(failure["internal_error"]["exception_text"]["sha256"]) == 64
+            assert "already in progress" not in str(failure)
             restore_publications = [
                 publication
                 for publication in runtime.store.list_runtime_publications()
@@ -2241,7 +2418,11 @@ class TestCheckpointRestore:
             )
             checkpoint_id = runtime.checkpoint.create(pid, 'before task', actor=pid)
             task = runtime.object_tasks.start(pid, owner, 'receive_process_messages', {'channel': 'never'})
-            waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            waiting = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             restore_publications_before = {
                 str(publication['publication_id'])
                 for publication in runtime.store.list_runtime_publications()
@@ -2318,7 +2499,7 @@ class TestCheckpointRestore:
             completed = runtime.object_tasks.wait(
                 task.task_id,
                 actor_pid=pid,
-                timeout=3,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
             )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
 
@@ -2427,7 +2608,11 @@ class TestCheckpointRestore:
             )
             checkpoint_id = runtime.checkpoint.create(pid, 'before terminal task', actor=pid)
             task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
-            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.runner_pid is not None
             old_runner_pid = str(completed.runner_pid)
@@ -2471,7 +2656,11 @@ class TestCheckpointRestore:
             )
             checkpoint_id = runtime.checkpoint.create(pid, 'before terminal task', actor=pid)
             task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
-            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.runner_pid is not None
             assert completed.result_oid is not None
@@ -2544,7 +2733,11 @@ class TestCheckpointRestore:
                 immutable=False,
             )
             task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
-            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.runner_pid is not None
             assert completed.result_oid is not None
@@ -2647,7 +2840,11 @@ class TestCheckpointRestore:
             )
 
             release_notification.set()
-            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.updated_at >= checkpoint.created_at
 

@@ -39,7 +39,7 @@
   },
   {
     "name": "swe_edit",
-    "description": "Apply a precise file edit by exact text replacement, line range replacement, or create-if-missing write.",
+    "description": "Apply a precise compare-and-swap file edit by exact text replacement, line range replacement, or create-if-missing write.",
     "source_path": "scripts/swe_edit.ts",
     "input_schema": {
       "type": "object",
@@ -54,7 +54,76 @@
       }
     },
     "output_schema": {"type": "object"},
-    "tests": [],
+    "tests": [
+      {
+        "args": {
+          "path": "document.txt",
+          "old_text": "alpha",
+          "new_text": "updated"
+        },
+        "syscalls": [
+          {
+            "name": "filesystem.read_text",
+            "args": {"path": "document.txt", "max_bytes": 1048576},
+            "result": {
+              "path": "document.txt",
+              "content": "alpha\nbeta\n",
+              "truncated": false,
+              "content_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          },
+          {
+            "name": "filesystem.write_text",
+            "args": {
+              "path": "document.txt",
+              "content": "updated\nbeta\n",
+              "overwrite": true,
+              "expected_content_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+            },
+            "result": {
+              "path": "document.txt",
+              "bytes_written": 13,
+              "created": false
+            }
+          }
+        ],
+        "expected": {
+          "path": "document.txt",
+          "changed": true,
+          "edit": "replace_text",
+          "replacements": 1,
+          "bytes_written": 13
+        }
+      },
+      {
+        "args": {
+          "path": "created.txt",
+          "new_text": "new\n",
+          "create_if_missing": true
+        },
+        "syscalls": [
+          {
+            "name": "filesystem.write_text",
+            "args": {
+              "path": "created.txt",
+              "content": "new\n",
+              "overwrite": false,
+              "expected_content_sha256": "missing"
+            },
+            "result": {
+              "path": "created.txt",
+              "bytes_written": 4,
+              "created": true
+            }
+          }
+        ],
+        "expected": {
+          "path": "created.txt",
+          "created": true,
+          "edit": "create"
+        }
+      }
+    ],
     "metadata": {"aci_role": "file_editor"}
   },
   {

@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import SkillPackageChanged, ValidationError
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolExecutionError, ToolPolicy
 from agent_libos.utils.skill_search import SKILL_SEARCH_TEXT_MAX_CHARS
 
@@ -24,7 +24,8 @@ class DiscoverSkillsArgs(BaseModel):
     limit: int | None = Field(
         default=None,
         description=(
-            "Maximum matching Skill summaries to return across every visible source."
+            "Maximum matching Skill summaries to return across every visible source. "
+            "Pass an unquoted JSON integer, for example 5, never the string \"5\"."
         ),
     )
 
@@ -60,16 +61,26 @@ class DiscoverSkillsOutput(BaseModel):
             "Skill source. This does not identify the source of any returned Skill."
         ),
     )
-    next_step: Literal["activate_skill", "refine_search"] = Field(
+    next_step: Literal["activate_skill", "use_loaded_skill", "refine_search"] = Field(
         description=(
-            "Recommended next lifecycle step. Activate one plausible returned exact id; "
-            "refine only when no returned Skill fits, and never repeat an unchanged search."
+            "Recommended next lifecycle step. Activate one plausible inactive exact id, use "
+            "the loaded snapshot when every returned match is current, or refine when no "
+            "returned Skill fits; never repeat an unchanged search."
         )
     )
 
 
 class ActivateSkillArgs(BaseModel):
     skill_id: str = Field(description="Exact Skill id returned by discover_skills.")
+    expected_package_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        description=(
+            "Exact package_sha256 from the selected discover_skills result. Activation "
+            "fails without mutation if the visible package changed since discovery."
+        ),
+    )
 
 
 class ActivatedSkill(BaseModel):
@@ -127,9 +138,11 @@ class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
     description = (
         "Search visible Agent Skills by task intent and return one relevance-ranked metadata "
         "page. Start with two to four concrete domain/action terms and omit limit or use at "
-        "least 5. When a plausible result appears, activate its exact id instead of repeating "
-        "discovery; visibility_limited does not invalidate returned matches. Discovery does "
-        "not load instructions, expose domain tools, or grant authority."
+        "least 5 as an unquoted JSON integer. A multi-capability query can return separate narrowly owned Skills; activate "
+        "each relevant exact id with that row's package hash instead of repeating discovery. "
+        "visibility_limited does not "
+        "invalidate returned matches. Discovery does not load instructions, expose domain "
+        "tools, or grant authority."
     )
     args_schema = DiscoverSkillsArgs
     output_schema = DiscoverSkillsOutput
@@ -147,20 +160,29 @@ class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
             actor=ctx.pid,
             limit=args.limit,
         )
+        skills = discovered["skills"]
+        next_step: Literal["activate_skill", "use_loaded_skill", "refine_search"]
+        if not skills:
+            next_step = "refine_search"
+        elif all(bool(skill.get("active")) for skill in skills):
+            next_step = "use_loaded_skill"
+        else:
+            next_step = "activate_skill"
         return DiscoverSkillsOutput(
-            skills=discovered["skills"],
+            skills=skills,
             has_more=bool(discovered["has_more"]),
             visibility_limited=(
                 discovered.get("catalog_scope") == "visibility_limited"
             ),
-            next_step=("activate_skill" if discovered["skills"] else "refine_search"),
+            next_step=next_step,
         )
 
 
 class ActivateSkillTool(SyncAgentTool[ActivateSkillArgs]):
     name = "activate_skill"
     description = (
-        "Load one Skill's instructions and tool bindings into this process by exact id. "
+        "Load one Skill's instructions and tool bindings into this process by exact id and "
+        "the package hash returned by discovery. "
         "Activation changes visibility only where applicable and never bypasses primitive capability or approval checks."
     )
     args_schema = ActivateSkillArgs
@@ -179,7 +201,12 @@ class ActivateSkillTool(SyncAgentTool[ActivateSkillArgs]):
                 ctx.pid,
                 args.skill_id,
                 actor=ctx.pid,
+                expected_package_sha256=args.expected_package_sha256,
             )
+        except SkillPackageChanged as exc:
+            raise SkillPackageChanged(
+                _source_neutral_error_message(str(exc))
+            ) from exc
         except ValidationError as exc:
             raise ValidationError(_source_neutral_error_message(str(exc))) from exc
         return ActivateSkillOutput(result=result)

@@ -20,14 +20,19 @@ projection. Only an authorized caller can cause the runtime to resolve endpoint
 metadata and validate the method schema. It then performs exact authorization,
 optionally asks the human, makes a primitive/provider call through the JSON-RPC
 provider, records audit/events, and writes a provider-classified external-effect
-row. For a
-remote host with several validated addresses, the default HTTP provider may
-try the next pinned address after any exception during connect, TLS, request
-write, response-header parsing, or response-body read. The retry window is the
-single endpoint timeout, and an earlier POST may already have reached the
-server. Endpoint methods therefore must not rely on a single wire-level POST
-attempt for non-idempotency guarantees. A complete HTTP response, including a
-non-2xx or redirect response, is returned without trying another address.
+row. For a remote host with several validated addresses, the default HTTP
+provider may try the next pinned address only when the current address fails
+before request dispatch starts, for example during TCP connect or TLS
+handshake. As soon as request dispatch starts, including an exception from the
+request write itself, the provider stops address failover; it never retries
+after a response-header or response-body failure. All pre-dispatch address
+attempts share the single endpoint timeout. A complete HTTP response, including
+a non-2xx or redirect response, is likewise returned without another address
+attempt. Thus one logical call can make several connection attempts, but at
+most one attempt enters request dispatch. A transport failure after dispatch
+remains an uncertain outcome because the server may have received part or all
+of the POST, so consequential methods should still use service-level
+idempotency and independent read-back rather than caller replay.
 A caller without invocation authority gets a generic denial and cannot use call
 errors to enumerate registered endpoint metadata. This early authority gate
 does not consume a one-shot method grant; the exact method is then authorized

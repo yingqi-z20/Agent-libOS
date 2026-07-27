@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.tools.base import BaseAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
@@ -10,6 +10,8 @@ _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 
 class RunShellCommandArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     argv: list[str] = Field(
         min_length=1,
         description=(
@@ -84,7 +86,7 @@ class RunShellCommandTool(BaseAgentTool[RunShellCommandArgs]):
             raise ToolExecutionError(
                 "Shell command timed out.",
                 code=ToolErrorCode.TIMEOUT,
-                retryable=True,
+                retryable=self.policy.idempotent,
                 details={"argv": args.argv, "timeout_s": args.timeout_s},
             ) from exc
         stdout, stdout_truncated = _truncate(result.stdout, args.max_stdout_chars)

@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 import hashlib
 import hmac
+import math
+import threading
 from typing import Any, Callable, Iterable, Iterator, Mapping, TypeVar
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
+    AgentObject,
     CapabilityDecision,
     CapabilityRight,
     DataFlowContext,
@@ -43,6 +46,13 @@ from agent_libos.utils.serde import dumps, to_jsonable
 _EMPTY_CONTEXT = DataFlowContext()
 _TARGET_STATE_VERSION_UNRESOLVED = object()
 _ThreadResultT = TypeVar("_ThreadResultT")
+
+
+@dataclass
+class _DirectoryLabelWatch:
+    normalized_path: str
+    changed: bool = False
+    context: DataFlowContext = field(default_factory=DataFlowContext)
 
 
 class DataFlowDenied(CapabilityDenied):
@@ -107,6 +117,8 @@ class DataFlowManager:
         self.human: DataReleaseApprovalPort | None = None
         self.authority_manifests = authority_manifests
         self._blocking_work_supervisor = blocking_work_supervisor
+        self._directory_label_watch_lock = threading.Lock()
+        self._directory_label_watches: dict[int, _DirectoryLabelWatch] = {}
 
     def bind_human(self, human: DataReleaseApprovalPort) -> None:
         """Complete the intentional DataFlow/Human construction cycle once."""
@@ -402,6 +414,30 @@ class DataFlowManager:
             for oid in selected
         ]
         return DataFlowContext.aggregate(contexts)
+
+    def context_from_object_snapshot(self, obj: AgentObject) -> DataFlowContext:
+        """Freeze lineage for an already-authorized exact Object snapshot.
+
+        This Host-only handoff deliberately performs no second authorization or
+        Object-store lookup.  Callers must have obtained ``obj`` from an
+        authorized Object Memory read and must pass the exact payload snapshot
+        whose bytes they are about to move across another primitive boundary.
+        """
+
+        if not isinstance(obj, AgentObject):
+            raise ValidationError("trusted data-flow Object snapshot must use AgentObject")
+        if obj.lifecycle_state is not ObjectLifecycleState.LIVE:
+            raise ValidationError("trusted data-flow Object snapshot must be live")
+        return DataFlowContext(
+            labels=DataLabels.from_object_metadata(obj.metadata),
+            source_refs=(
+                DataSourceRef(
+                    obj.oid,
+                    obj.version,
+                    self._object_payload_sha256(obj.payload),
+                ),
+            ),
+        )
 
     def context_from_materialization(self, pid: str, materialized: Any) -> DataFlowContext:
         contexts: list[DataFlowContext] = []
@@ -820,6 +856,11 @@ class DataFlowManager:
             created_at=utc_now(),
         )
         self.store.upsert_file_label_binding(binding)
+        self._record_file_label_mutation(
+            normalized_path,
+            previous=previous,
+            current=binding,
+        )
         return binding
 
     def bind_written_file_digest(
@@ -863,6 +904,11 @@ class DataFlowManager:
             created_at=utc_now(),
         )
         self.store.upsert_file_label_binding(binding)
+        self._record_file_label_mutation(
+            normalized_path,
+            previous=previous,
+            current=binding,
+        )
         return binding
 
     def observe_ingress(self, context: DataFlowContext) -> DataFlowContext:
@@ -963,10 +1009,30 @@ class DataFlowManager:
     def directory_label_snapshot(
         self,
         normalized_path: str,
+        child_paths: Iterable[str] = (),
     ) -> tuple[dict[str, DataFlowContext], str]:
-        """Capture active directory/subtree bindings for one listing attempt."""
+        """Capture only the directory and bounded returned-child bindings.
 
-        bindings = self.store.list_file_label_bindings_for_tree(normalized_path)
+        Directory listing callers already cap provider output.  Looking up the
+        exact bounded path set preserves label fidelity without materializing an
+        arbitrarily large label subtree before applying that cap.
+        """
+
+        if isinstance(child_paths, (str, bytes)):
+            raise ValidationError("directory label child_paths must be a collection")
+        selected_paths = tuple(
+            dict.fromkeys(
+                [str(normalized_path), *(str(path) for path in child_paths)]
+            )
+        )
+        bindings = [
+            binding
+            for path in selected_paths
+            if (
+                binding := self.store.get_file_label_binding(path)
+            ) is not None
+            and not binding.tombstoned
+        ]
         return (
             {
                 item.normalized_path: self._file_binding_context(item)
@@ -975,10 +1041,33 @@ class DataFlowManager:
             self._file_tree_state_version(bindings),
         )
 
-    def directory_label_state_version(self, normalized_path: str) -> str:
-        return self._file_tree_state_version(
-            self.store.list_file_label_bindings_for_tree(normalized_path)
+    @contextmanager
+    def watch_directory_labels(
+        self,
+        normalized_path: str,
+    ) -> Iterator[_DirectoryLabelWatch]:
+        """Track bounded label mutations that overlap one active listing."""
+
+        watch = _DirectoryLabelWatch(str(normalized_path).rstrip("/"))
+        identity = id(watch)
+        with self._directory_label_watch_lock:
+            self._directory_label_watches[identity] = watch
+        try:
+            yield watch
+        finally:
+            with self._directory_label_watch_lock:
+                self._directory_label_watches.pop(identity, None)
+
+    def directory_label_state_version(
+        self,
+        normalized_path: str,
+        child_paths: Iterable[str] = (),
+    ) -> str:
+        _contexts, state_version = self.directory_label_snapshot(
+            normalized_path,
+            child_paths,
         )
+        return state_version
 
     @staticmethod
     def external_file_context() -> DataFlowContext:
@@ -1078,6 +1167,8 @@ class DataFlowManager:
     def provenance_sources(
         self,
         context: DataFlowContext,
+        *,
+        exclude_oids: Iterable[str] = (),
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """Split flow refs into Object parents and durable non-Object sources.
 
@@ -1086,6 +1177,15 @@ class DataFlowManager:
         immutable binding's Object ancestry for provenance consumers.
         """
 
+        if not isinstance(context, DataFlowContext):
+            raise ValidationError("provenance context must use DataFlowContext")
+        if isinstance(exclude_oids, (str, bytes)):
+            raise ValidationError("provenance exclude_oids must be a collection")
+        excluded = {
+            str(oid).strip()
+            for oid in exclude_oids
+            if str(oid).strip()
+        }
         parent_oids: dict[str, None] = {}
         durable_refs: dict[str, None] = {}
         visited: set[tuple[str, int, str]] = set()
@@ -1096,7 +1196,8 @@ class DataFlowManager:
                 return
             visited.add(key)
             if not ref.oid.startswith(self.FILE_BINDING_SOURCE_REF_PREFIX):
-                parent_oids.setdefault(ref.oid, None)
+                if ref.oid not in excluded:
+                    parent_oids.setdefault(ref.oid, None)
                 return
             durable_refs.setdefault(ref.oid, None)
             binding_id = ref.oid.removeprefix(self.FILE_BINDING_SOURCE_REF_PREFIX)
@@ -1151,6 +1252,7 @@ class DataFlowManager:
         expected_binding_id: str | None = None,
         expected_generation: int | None = None,
     ) -> None:
+        previous = self.store.get_file_label_binding(normalized_path)
         self.store.tombstone_file_label_binding(
             normalized_path,
             binding_id=new_id("filelabel"),
@@ -1159,6 +1261,46 @@ class DataFlowManager:
             expected_binding_id=expected_binding_id,
             expected_generation=expected_generation,
         )
+        self._record_file_label_mutation(
+            normalized_path,
+            previous=previous,
+            current=None,
+        )
+
+    def _record_file_label_mutation(
+        self,
+        normalized_path: str,
+        *,
+        previous: FileLabelBinding | None,
+        current: FileLabelBinding | None,
+    ) -> None:
+        contexts = [
+            self._file_binding_context(binding)
+            for binding in (previous, current)
+            if binding is not None and not binding.tombstoned and binding.active
+        ]
+        if not contexts:
+            contexts = [self.external_file_context()]
+        mutation_labels = DataFlowContext.aggregate(contexts).labels
+        selected_path = str(normalized_path).rstrip("/")
+        with self._directory_label_watch_lock:
+            for watch in self._directory_label_watches.values():
+                prefix = f"{watch.normalized_path}/" if watch.normalized_path else ""
+                if watch.normalized_path and not (
+                    selected_path == watch.normalized_path
+                    or selected_path.startswith(prefix)
+                ):
+                    continue
+                combined = DataFlowContext.aggregate(
+                    (
+                        watch.context,
+                        DataFlowContext(labels=mutation_labels),
+                    )
+                )
+                # Mutation taint needs labels only; exact current bindings below
+                # retain bounded durable refs for returned entries.
+                watch.context = DataFlowContext(labels=combined.labels)
+                watch.changed = True
 
     def tombstone_path_tree(
         self,
@@ -1197,11 +1339,7 @@ class DataFlowManager:
         obj = self.objects.get_object(oid)
         if obj is None:
             raise ValidationError(f"data-flow source Object not found: {oid}")
-        content_hash = hashlib.sha256(dumps(to_jsonable(obj.payload)).encode("utf-8")).hexdigest()
-        return DataFlowContext(
-            labels=DataLabels.from_object_metadata(obj.metadata),
-            source_refs=(DataSourceRef(obj.oid, obj.version, content_hash),),
-        )
+        return self.context_from_object_snapshot(obj)
 
     def _validate_source_refs(
         self,
@@ -1261,10 +1399,34 @@ class DataFlowManager:
                 if state.payload_present:
                     return f"data-flow source Object payload is unavailable: {ref.oid}"
                 continue
-            actual_hash = hashlib.sha256(dumps(to_jsonable(obj.payload)).encode("utf-8")).hexdigest()
+            actual_hash = self._object_payload_sha256(obj.payload)
             if obj.version != ref.version or not hmac.compare_digest(actual_hash, ref.content_sha256):
                 return f"data-flow source Object changed before dispatch: {ref.oid}"
         return None
+
+    @classmethod
+    def _object_payload_sha256(cls, payload: Any) -> str:
+        """Hash a stable finite JSON projection, including legacy NaN rows."""
+
+        projected = cls._finite_json_projection(to_jsonable(payload))
+        return hashlib.sha256(dumps(projected).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _finite_json_projection(cls, value: Any) -> Any:
+        if type(value) is float and not math.isfinite(value):
+            if math.isnan(value):
+                label = "NaN"
+            else:
+                label = "Infinity" if value > 0 else "-Infinity"
+            return {"_non_finite_number": label}
+        if isinstance(value, dict):
+            return {
+                key: cls._finite_json_projection(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._finite_json_projection(item) for item in value]
+        return value
 
     def _clearance_error(
         self,
@@ -1365,11 +1527,15 @@ class DataFlowManager:
         ):
             return None
         reservation = self.store.get_capability_use_reservation(reservation_id)
+        reservation_count = (
+            reservation.get("count") if reservation is not None else None
+        )
         if (
             reservation is None
             or reservation.get("status") not in {"reserved", "committed"}
             or str(reservation.get("cap_id") or "") != str(cap_id)
-            or int(reservation.get("count") or 0) != 1
+            or type(reservation_count) is not int
+            or reservation_count != 1
         ):
             return None
         raw_binding = decision.context.get(self.RELEASE_BINDING_KEY)

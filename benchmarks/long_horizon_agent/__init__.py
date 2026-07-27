@@ -3,6 +3,7 @@
 from benchmarks.long_horizon_agent.runner import (
     DEFAULT_MAX_QUANTA,
     DEFAULT_PHASE_ONE_QUANTA,
+    HostOracleRunner,
     evaluate_run,
     prepare_workspace,
     report_all_successful,
@@ -12,6 +13,7 @@ from benchmarks.long_horizon_agent.runner import (
 __all__ = [
     "DEFAULT_MAX_QUANTA",
     "DEFAULT_PHASE_ONE_QUANTA",
+    "HostOracleRunner",
     "evaluate_run",
     "prepare_workspace",
     "report_all_successful",

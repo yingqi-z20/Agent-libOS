@@ -25,6 +25,7 @@ from agent_libos.models import (
     ObjectMetadata,
     ObjectPayloadRecoverySummary,
     ObjectTaskRecoverySummary,
+    ProcessStatus,
     SinkTrustRule,
     SinkTrustSpec,
     ResourceUsageReservationRecoverySummary,
@@ -40,9 +41,16 @@ from agent_libos.models.exceptions import (
     RuntimeRecoveryRequired,
     ValidationError,
 )
-from agent_libos.process_execution import current_process_execution_token
+from agent_libos.process_execution import (
+    bind_process_execution,
+    current_process_execution_token,
+)
 from agent_libos.storage import RuntimeStore
 from agent_libos.substrate import ResourceProviderSubstrate
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 
 if TYPE_CHECKING:
     from agent_libos.capability.manager import CapabilityManager
@@ -175,6 +183,7 @@ class Runtime:
     recovered_checkpoint_restore_publications: list[str]
     recovered_stale_operations: StaleOperationRecoverySummary
     recovered_stale_executions: StaleExecutionRecoverySummary
+    recovered_terminal_cleanups: dict[str, Any]
     reconciled_external_effects: ExternalEffectRecoverySummary
     payload_retention: PayloadRetentionMaintenance
     explainable_boundary_names: frozenset[str]
@@ -305,21 +314,56 @@ class Runtime:
         self.lifecycle.bind_finalizer(finalizer)
 
     def _notify_process_terminal(self, pid: str) -> None:
-        errors: list[str] = []
+        errors: list[tuple[str, BaseException]] = []
         try:
             self.human.cancel_pending_for_process(
                 pid,
                 actor="runtime.process_terminal",
                 reason="process reached a terminal state",
             )
-        except Exception as exc:
-            errors.append(f"human: {type(exc).__name__}: {exc}")
+        except BaseException as exc:
+            errors.append(("human", exc))
         try:
             self.object_tasks.notify_process_terminal(pid)
-        except Exception as exc:
-            errors.append(f"object_tasks: {type(exc).__name__}: {exc}")
-        if errors:
-            raise RuntimeError("terminal process notification failed: " + "; ".join(errors))
+        except BaseException as exc:
+            errors.append(("object_tasks", exc))
+        if not errors:
+            return
+
+        aggregate = RuntimeError("terminal process notification failed")
+        envelope = public_error_envelope(
+            aggregate,
+            code="terminal_cleanup_failed",
+        )
+        # Keep the raised RuntimeError and every downstream public projection on
+        # the exact same cached envelope/correlation identity.  Per-component
+        # diagnostic text is fingerprinted only; it is never embedded in the
+        # exception or the structured cleanup receipt.
+        aggregate.args = (envelope["message"],)
+        failures: list[dict[str, Any]] = []
+        interruptions: list[BaseException] = []
+        for phase, error in errors:
+            observation = internal_exception_observation(
+                error,
+                correlation_id=envelope["correlation_id"],
+            )
+            failures.append(
+                {
+                    "phase": phase,
+                    "error_type": observation["error_type"],
+                    "correlation_id": envelope["correlation_id"],
+                    "exception_text": observation["exception_text"],
+                }
+            )
+            if not isinstance(error, Exception):
+                interruptions.append(error)
+        aggregate.cleanup_failures = tuple(failures)  # type: ignore[attr-defined]
+        if interruptions:
+            raise BaseExceptionGroup(
+                "terminal process notification interrupted after full cleanup",
+                [aggregate, *interruptions],
+            )
+        raise aggregate
 
     async def _ashutdown_component(self, component: Any) -> bool:
         return await self.lifecycle.ashutdown_component(component)
@@ -374,6 +418,7 @@ class Runtime:
         self,
         max_quanta: int | None = None,
         *,
+        pids: Iterable[str] | None = None,
         process_human_queue: bool = True,
         cancel_inflight_on_budget_exhaustion: bool = True,
         human: str | None = None,
@@ -386,6 +431,7 @@ class Runtime:
         except RuntimeError:
             return self._run_until_idle_sync(
                 max_quanta=max_quanta,
+                pids=pids,
                 process_human_queue=process_human_queue,
                 cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
                 human=human,
@@ -399,6 +445,7 @@ class Runtime:
         self,
         max_quanta: int | None = None,
         *,
+        pids: Iterable[str] | None = None,
         process_human_queue: bool = True,
         cancel_inflight_on_budget_exhaustion: bool = True,
         human: str | None = None,
@@ -406,9 +453,16 @@ class Runtime:
         human_auto_policy: str | None = None,
         human_auto_answer: str | None = None,
     ) -> list[Any]:
+        selected_pids = self._normalize_run_until_idle_pids(pids)
+        self._validate_run_until_idle_controls(
+            max_quanta=max_quanta,
+            process_human_queue=process_human_queue,
+            cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
+        )
         return await self.blocking_work.run(
             self._run_until_idle_sync,
             max_quanta=max_quanta,
+            pids=selected_pids,
             process_human_queue=process_human_queue,
             cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
             human=human,
@@ -421,6 +475,7 @@ class Runtime:
         self,
         max_quanta: int | None = None,
         *,
+        pids: Iterable[str] | None = None,
         process_human_queue: bool = True,
         cancel_inflight_on_budget_exhaustion: bool = True,
         human: str | None = None,
@@ -428,6 +483,12 @@ class Runtime:
         human_auto_policy: str | None = None,
         human_auto_answer: str | None = None,
     ) -> list[Any]:
+        selected_pids = self._normalize_run_until_idle_pids(pids)
+        self._validate_run_until_idle_controls(
+            max_quanta=max_quanta,
+            process_human_queue=process_human_queue,
+            cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
+        )
         results: list[Any] = []
         remaining = self.config.runtime.run_until_idle_max_quanta if max_quanta is None else max_quanta
         selected_human = human or self.config.runtime.default_human
@@ -445,18 +506,22 @@ class Runtime:
                     self.arun_process_once,
                     max_quanta=remaining,
                     cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
+                    pids=selected_pids,
                 )
                 results.extend(batch)
                 if remaining is not None:
                     remaining -= len(batch)
                 if not process_human_queue:
                     break
-                processed = self.human.drain_terminal_queue(
-                    human=selected_human,
-                    auto_approve=human_auto_approve,
-                    auto_policy=human_auto_policy,
-                    auto_answer=human_auto_answer,
-                )
+                human_filters: dict[str, Any] = {
+                    "human": selected_human,
+                    "auto_approve": human_auto_approve,
+                    "auto_policy": human_auto_policy,
+                    "auto_answer": human_auto_answer,
+                }
+                if selected_pids is not None:
+                    human_filters["pids"] = selected_pids
+                processed = self.human.drain_terminal_queue(**human_filters)
                 if not processed:
                     break
                 self.audit.record(
@@ -479,11 +544,65 @@ class Runtime:
 
     async def arun_process_until_idle(self, pid: str, *, max_quanta: int | None = None) -> list[Any]:
         selected_quanta = self.config.runtime.run_until_idle_max_quanta if max_quanta is None else max_quanta
+        self.scheduler.validate_max_quanta(selected_quanta)
         return await self.scheduler.arun_pid_until_idle(
             pid,
             self.arun_process_once,
             max_quanta=selected_quanta,
         )
+
+    def _validate_run_until_idle_controls(
+        self,
+        *,
+        max_quanta: int | None,
+        process_human_queue: bool,
+        cancel_inflight_on_budget_exhaustion: bool,
+    ) -> None:
+        selected_quanta = (
+            self.config.runtime.run_until_idle_max_quanta
+            if max_quanta is None
+            else max_quanta
+        )
+        self.scheduler.validate_run_controls(
+            max_quanta=selected_quanta,
+            cancel_inflight_on_budget_exhaustion=cancel_inflight_on_budget_exhaustion,
+        )
+        if type(process_human_queue) is not bool:
+            raise ValidationError("process_human_queue must be a boolean")
+
+    @staticmethod
+    def _normalize_run_until_idle_pids(
+        pids: Iterable[str] | None,
+    ) -> frozenset[str] | None:
+        """Normalize an explicit scheduler scope without silently widening it."""
+
+        if pids is None:
+            return None
+        if isinstance(pids, (str, bytes)):
+            raise ValidationError("run_until_idle pids must be an iterable of PIDs")
+        try:
+            selected = list(pids)
+        except TypeError as exc:
+            raise ValidationError(
+                "run_until_idle pids must be an iterable of PIDs"
+            ) from exc
+        if not selected:
+            raise ValidationError("run_until_idle pids must not be empty")
+        normalized: list[str] = []
+        for pid in selected:
+            if (
+                not isinstance(pid, str)
+                or not pid
+                or pid != pid.strip()
+                or "\x00" in pid
+            ):
+                raise ValidationError(
+                    "run_until_idle pids must contain canonical non-empty strings"
+                )
+            normalized.append(pid)
+        if len(set(normalized)) != len(normalized):
+            raise ValidationError("run_until_idle pids must not contain duplicates")
+        return frozenset(normalized)
 
     def run_workflow(
         self,
@@ -537,7 +656,8 @@ class Runtime:
             tool_args,
             authority_manifest,
         )
-        pid = self.process.spawn(
+        pid, execution_token = self.process.spawn_claimed(
+            owner_id=f"{self.instance_id}:workflow",
             image=selected_image,
             goal=goal if goal is not None else f"workflow:{tool_name}",
             working_directory=working_directory,
@@ -547,51 +667,109 @@ class Runtime:
         initial_image = initial.image_id
         initial_goal_oid = initial.goal_oid
         try:
+            try:
+                with bind_process_execution(execution_token):
+                    return await self._arun_claimed_workflow(
+                        pid,
+                        selected_image=selected_image,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        initial_image=initial_image,
+                        initial_goal_oid=initial_goal_oid,
+                    )
+            except asyncio.CancelledError:
+                # Cancel as Host control after dropping the ambient worker
+                # token.  The tool may already have rotated or fenced that
+                # token while entering a typed wait or committing exec.
+                process = self.process.get(pid)
+                if process.status not in self.process.TERMINAL_STATUSES:
+                    self.process.cancel(pid, "workflow task cancelled")
+                raise
+        finally:
+            # Wait/exit/exec transitions fence or rotate this token themselves.
+            # A plain or exceptional return still releases the exact workflow
+            # lease so no process can remain RUNNING without an owner.
+            self.uow.processes.complete_execution(
+                execution_token,
+                status=ProcessStatus.RUNNABLE,
+            )
+
+    async def _arun_claimed_workflow(
+        self,
+        pid: str,
+        *,
+        selected_image: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        initial_image: str,
+        initial_goal_oid: str | None,
+    ) -> WorkflowRunResult:
+        try:
             result = await self.tools.acall(pid, tool_name, tool_args)
         except HumanApprovalRequired as exc:
+            error = public_error_envelope(
+                exc,
+                code="workflow_wait_required",
+            )["message"]
             workflow_result = self._workflow_wait_result(
                 pid,
                 selected_image,
                 tool_name,
-                error=str(exc),
+                error=error,
                 waiting_human=True,
                 request_id=exc.request_id,
             )
             self._record_workflow_run(workflow_result)
             return workflow_result
         except ProcessWaitRequired as exc:
+            error = public_error_envelope(
+                exc,
+                code="workflow_wait_required",
+            )["message"]
             workflow_result = self._workflow_wait_result(
                 pid,
                 selected_image,
                 tool_name,
-                error=str(exc),
+                error=error,
                 waiting_process=True,
                 child_pid=exc.child_pid,
             )
             self._record_workflow_run(workflow_result)
             return workflow_result
         except ProcessMessageWaitRequired as exc:
+            error = public_error_envelope(
+                exc,
+                code="workflow_wait_required",
+            )["message"]
             workflow_result = self._workflow_wait_result(
                 pid,
                 selected_image,
                 tool_name,
-                error=str(exc),
+                error=error,
                 waiting_message=True,
                 filters=exc.filters,
             )
             self._record_workflow_run(workflow_result)
             return workflow_result
         except Exception as exc:
-            error = str(exc)
+            error = public_error_envelope(
+                exc,
+                code="workflow_failed",
+            )["message"]
             if not self._workflow_tool_controlled_lifecycle(pid, initial_image=initial_image, initial_goal_oid=initial_goal_oid):
                 self.process.exit(pid, failed=True, message=error or f"workflow failed: {tool_name}")
             workflow_result = self._workflow_failure_result(pid, selected_image, tool_name, error=error)
             self._record_workflow_run(workflow_result)
             return workflow_result
 
-        if result.result_handle is not None:
+        tool_controlled_lifecycle = self._workflow_tool_controlled_lifecycle(
+            pid,
+            initial_image=initial_image,
+            initial_goal_oid=initial_goal_oid,
+        )
+        if result.result_handle is not None and not tool_controlled_lifecycle:
             self._add_handle_to_process_view(pid, result.result_handle)
-        if not self._workflow_tool_controlled_lifecycle(pid, initial_image=initial_image, initial_goal_oid=initial_goal_oid):
+        if not tool_controlled_lifecycle:
             if result.ok:
                 self.process.exit(
                     pid,
@@ -794,8 +972,20 @@ class Runtime:
     def inspect_skill(self, skill_id: str) -> dict[str, Any]:
         return self.skills.inspect_skill(skill_id, require_capability=False)
 
-    def activate_skill(self, pid: str, skill_id: str) -> dict[str, Any]:
-        return self.skills.activate_skill(pid, skill_id, actor=pid, require_capability=False)
+    def activate_skill(
+        self,
+        pid: str,
+        skill_id: str,
+        *,
+        expected_package_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        return self.skills.activate_skill(
+            pid,
+            skill_id,
+            actor=pid,
+            require_capability=False,
+            expected_package_sha256=expected_package_sha256,
+        )
 
     def unload_skill(self, pid: str, skill_id: str) -> dict[str, Any]:
         return self.skills.unload_skill(pid, skill_id, actor=pid, require_capability=False)

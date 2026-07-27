@@ -215,7 +215,7 @@ operational surface.
 
 Deliverables:
 
-Status as of 0.3.4: the local Git/worktree, patch artifact, and simulated-PR
+Status as of 1.0.0: the local Git/worktree, patch artifact, and simulated-PR
 deliverables below are implemented through `Runtime.git`; hosted Git provider
 integration remains intentionally out of scope.
 

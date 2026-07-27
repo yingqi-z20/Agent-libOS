@@ -10,11 +10,12 @@ type ConfirmDialogProps = {
   details?: Record<string, unknown>;
   confirmLabel?: string;
   busy?: boolean;
+  error?: string | null;
   onConfirm(): void;
   onCancel(): void;
 };
 
-export function ConfirmDialog({ title, message, details, confirmLabel, busy = false, onConfirm, onCancel }: ConfirmDialogProps) {
+export function ConfirmDialog({ title, message, details, confirmLabel, busy = false, error = null, onConfirm, onCancel }: ConfirmDialogProps) {
   const { t } = useI18n();
   const descriptionId = useId();
   return (
@@ -34,6 +35,7 @@ export function ConfirmDialog({ title, message, details, confirmLabel, busy = fa
       }
     >
       <p id={descriptionId}>{message}</p>
+      {error ? <p className="inlineError modalError" role="alert">{error}</p> : null}
       {details ? <CollapsibleJson value={details} label={t("confirm.preview")} /> : null}
     </Modal>
   );

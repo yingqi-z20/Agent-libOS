@@ -176,6 +176,32 @@ class ObjectMetadata:
     declassification_authority: str | None = None
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate the mutable metadata envelope before it crosses a boundary."""
+
+        for field_name in ("title", "summary", "mime_type"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"object metadata {field_name} must be a string or null")
+        for field_name in ("tags", "embedding_refs", "indexes"):
+            values = getattr(self, field_name)
+            if not isinstance(values, list):
+                raise ValueError(f"object metadata {field_name} must be a list")
+            if any(not isinstance(value, str) for value in values):
+                raise ValueError(f"object metadata {field_name} items must be strings")
+        if (
+            self.token_estimate is not None
+            and (
+                isinstance(self.token_estimate, bool)
+                or not isinstance(self.token_estimate, int)
+                or self.token_estimate < 0
+            )
+        ):
+            raise ValueError("object metadata token_estimate must be a non-negative integer or null")
+        if not isinstance(self.retention_policy, str) or not self.retention_policy.strip():
+            raise ValueError("object metadata retention_policy must be a non-empty string")
         _validate_object_label(
             "sensitivity",
             self.sensitivity,
@@ -287,6 +313,37 @@ class ObjectNamespace:
     updated_at: str
 
 
+@dataclass(frozen=True, order=True, slots=True)
+class ObjectNamespaceCursor:
+    """Stable keyset cursor for one namespace's direct children."""
+
+    namespace: NamespaceID
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.namespace, str)
+            or not self.namespace
+            or "\x00" in self.namespace
+        ):
+            raise ValueError("object namespace cursor must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectNamespacePage:
+    """One hard-bounded page of direct child namespaces."""
+
+    records: tuple[ObjectNamespace, ...]
+    next_cursor: ObjectNamespaceCursor | None = None
+
+    def __post_init__(self) -> None:
+        if self.next_cursor is not None and not self.records:
+            raise ValueError("empty object namespace page cannot have a cursor")
+
+    @property
+    def exhausted(self) -> bool:
+        return self.next_cursor is None
+
+
 @dataclass(frozen=True)
 class AgentObject:
     oid: OID
@@ -306,6 +363,80 @@ class AgentObject:
     owner_id: PID | str | None = None
     lifecycle_state: ObjectLifecycleState = ObjectLifecycleState.LIVE
     deleted_at: str | None = None
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class ObjectRefCursor:
+    """Stable keyset cursor for a namespace's live Object directory."""
+
+    updated_at: str
+    created_at: str
+    oid: OID
+
+    def __post_init__(self) -> None:
+        for field_name in ("updated_at", "created_at", "oid"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value or "\x00" in value:
+                raise ValueError(
+                    f"object reference cursor {field_name} must not be empty"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectRef:
+    """Payload-free live Object projection for bounded authorization scans."""
+
+    oid: OID
+    namespace: NamespaceID
+    name: str
+    type: ObjectType
+    schema_version: str
+    metadata: ObjectMetadata
+    version: int
+    immutable: bool
+    created_by: PID | str
+    owner_kind: ObjectOwnerKind
+    owner_id: PID | str | None
+    created_at: str
+    updated_at: str
+
+    @property
+    def cursor(self) -> ObjectRefCursor:
+        return ObjectRefCursor(
+            updated_at=self.updated_at,
+            created_at=self.created_at,
+            oid=self.oid,
+        )
+
+    @property
+    def search_text(self) -> str:
+        """Metadata-only search projection; Object payloads are never rendered."""
+
+        return " ".join(
+            (
+                self.namespace,
+                self.name,
+                self.metadata.title or "",
+                self.metadata.summary or "",
+                " ".join(self.metadata.tags),
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectRefPage:
+    """One hard-bounded page of payload-free live Object projections."""
+
+    records: tuple[ObjectRef, ...]
+    next_cursor: ObjectRefCursor | None = None
+
+    def __post_init__(self) -> None:
+        if self.next_cursor is not None and not self.records:
+            raise ValueError("empty object reference page cannot have a cursor")
+
+    @property
+    def exhausted(self) -> bool:
+        return self.next_cursor is None
 
 
 @dataclass(frozen=True)
@@ -384,6 +515,10 @@ class MergeResult:
     merged_oids: list[OID]
     skipped_oids: list[OID]
     merged_handles: list[ObjectHandle] = field(default_factory=list)
+    adopted_oids: list[OID] = field(default_factory=list)
+    released_oids: list[OID] = field(default_factory=list)
+    retained_child_owned_oids: list[OID] = field(default_factory=list)
+    pinned_child_owned_oids: list[OID] = field(default_factory=list)
 
 
 @dataclass

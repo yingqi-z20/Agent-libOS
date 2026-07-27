@@ -1,4 +1,4 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 
 export type Language = "zh-CN" | "en";
 
@@ -23,7 +23,7 @@ const en = {
     "app.notices": "Runtime notices",
     "app.streamReconnecting": "Live updates were interrupted. Reconnecting; displayed data may be stale.",
     "app.streamFailed": "Live updates are unavailable. Use refresh while the connection is repaired.",
-    "app.snapshotTruncated": "To keep this view responsive, {count} sections were shortened ({sections}). Source data remains stored; some on-screen details may be partial.",
+    "app.snapshotTruncated": "Some operator-console data was shortened to keep the console responsive ({count} sections: {sections}). Full source data remains stored in the runtime.",
     "app.schedulerError": "Scheduler error: {message}",
     "connection.connecting": "Connecting",
     "connection.connected": "Live",
@@ -95,6 +95,10 @@ const en = {
     "human.approveDenyInvalid": "Always deny cannot be submitted as an approval.",
     "human.rejectAllowInvalid": "Always allow cannot be submitted as a rejection.",
     "human.submitFailed": "The response was not accepted. Your selection and input have been kept.",
+    "human.submitAmbiguous": "The response may have been accepted. Retry to check authoritative status before the same decision is sent again.",
+    "human.reconcile": "Check status",
+    "human.approvalContext": "Approval context",
+    "human.approvalContextHint": "Review the exact bounded operation context before deciding.",
     "human.releaseRequiredTitle": "Data release required",
     "human.releaseRequiredMessage": "Respond to release request {requestId} before answering this protected request.",
     "human.releaseRequiredMessageNoId": "Respond to the pending data release request before answering this protected request.",
@@ -148,8 +152,22 @@ const en = {
     "user.starterPromptReview": "Review the current project and summarize the highest-impact improvements.",
     "user.starterPromptTests": "Run the relevant tests, diagnose failures, and propose fixes.",
     "user.starterPromptExplain": "Explain this project’s architecture and the main execution flow.",
-    "user.taskSettings": "Runtime and permissions",
+    "user.taskSettings": "Task settings",
     "user.taskSettingsHint": "Model, image, workspace, and Git request ceiling",
+    "user.taskSettingsEdit": "Edit settings",
+    "user.taskSettingsDialogTitle": "New task settings",
+    "user.taskSettingsDialogDescription": "These settings apply to the next task in this session.",
+    "user.taskSettingsRuntime": "Runtime",
+    "user.taskSettingsPermissions": "Permissions",
+    "user.taskSettingsSave": "Save settings",
+    "user.taskSettingsImageSummary": "Image",
+    "user.taskSettingsProfileSummary": "Model profile",
+    "user.taskSettingsWorkspaceSummary": "Workspace",
+    "user.taskSettingsGitBadge": "Git requests",
+    "user.taskSettingsCommandBadge": "Reviewed commands",
+    "user.taskSettingsContextBadge": "Context maintenance",
+    "user.taskSettingsNoExtraPermissions": "No additional request options",
+    "user.invalidWorkingDirectory": "Use a relative path inside the workspace.",
     "user.startTaskHint": "The Agent will only receive authority after the runtime approval flow.",
     "user.startShortcut": "Press Ctrl/⌘+Enter to start.",
     "user.start": "Start",
@@ -233,6 +251,7 @@ const en = {
     "llmProfile.disabled": "Disabled",
     "scheduler.unlimitedPlaceholder": "server default",
     "scheduler.unlimitedHint": "Leave empty to use the server default; it is unlimited only when that default is unset.",
+    "scheduler.invalidQuanta": "Maximum quanta must be a positive whole number, or left empty.",
     "top.runtimeDatabase": "Runtime database",
     "top.operatorWorkspace": "Operator workspace",
     "top.runtimeControls": "Runtime controls",
@@ -522,7 +541,7 @@ const zhCN: Record<TranslationKey, string> = {
     "app.notices": "运行时通知",
     "app.streamReconnecting": "实时更新已中断，正在重连；当前数据可能已过期。",
     "app.streamFailed": "实时更新不可用；连接恢复前请手动刷新。",
-    "app.snapshotTruncated": "为保持界面流畅，{count} 个区域已缩略显示（{sections}）。原始数据仍保存在运行时，部分界面详情可能不完整。",
+    "app.snapshotTruncated": "为保持高级控制台流畅，部分运行时数据已精简显示（{count} 项：{sections}）。完整原始数据仍保存在运行时。",
     "app.schedulerError": "调度器错误：{message}",
     "connection.connecting": "连接中",
     "connection.connected": "实时",
@@ -594,6 +613,10 @@ const zhCN: Record<TranslationKey, string> = {
     "human.approveDenyInvalid": "“始终拒绝”不能作为批准决定提交。",
     "human.rejectAllowInvalid": "“始终允许”不能作为拒绝决定提交。",
     "human.submitFailed": "响应未被接受；已保留当前选择和输入。",
+    "human.submitAmbiguous": "响应可能已被接受。重试时将先核对权威状态，再决定是否重新发送同一决定。",
+    "human.reconcile": "核对状态",
+    "human.approvalContext": "审批上下文",
+    "human.approvalContextHint": "请在决定前核对完整的受限操作上下文。",
     "human.releaseRequiredTitle": "需要先处理数据释放",
     "human.releaseRequiredMessage": "请先响应数据释放请求 {requestId}，再回答此受保护请求。",
     "human.releaseRequiredMessageNoId": "请先响应待处理的数据释放请求，再回答此受保护请求。",
@@ -647,8 +670,22 @@ const zhCN: Record<TranslationKey, string> = {
     "user.starterPromptReview": "审查当前项目，并总结影响最大的改进项。",
     "user.starterPromptTests": "运行相关测试，诊断失败原因并提出修复方案。",
     "user.starterPromptExplain": "解释项目架构和主要执行流程。",
-    "user.taskSettings": "运行时与权限",
+    "user.taskSettings": "任务设置",
     "user.taskSettingsHint": "模型、镜像、工作区与 Git 申请上限",
+    "user.taskSettingsEdit": "修改设置",
+    "user.taskSettingsDialogTitle": "新任务设置",
+    "user.taskSettingsDialogDescription": "这些设置仅应用于本次会话中的下一个任务。",
+    "user.taskSettingsRuntime": "运行时",
+    "user.taskSettingsPermissions": "权限",
+    "user.taskSettingsSave": "保存设置",
+    "user.taskSettingsImageSummary": "镜像",
+    "user.taskSettingsProfileSummary": "模型 Profile",
+    "user.taskSettingsWorkspaceSummary": "工作区",
+    "user.taskSettingsGitBadge": "Git 申请",
+    "user.taskSettingsCommandBadge": "受审查命令",
+    "user.taskSettingsContextBadge": "上下文维护",
+    "user.taskSettingsNoExtraPermissions": "无附加申请项",
+    "user.invalidWorkingDirectory": "请输入工作区内的相对路径，不能使用绝对路径或越过工作区边界。",
     "user.startTaskHint": "只有通过运行时审批流程后，Agent 才会获得相应权限。",
     "user.startShortcut": "按 Ctrl/⌘+Enter 开始。",
     "user.start": "开始",
@@ -732,6 +769,7 @@ const zhCN: Record<TranslationKey, string> = {
     "llmProfile.disabled": "禁用",
     "scheduler.unlimitedPlaceholder": "服务器默认值",
     "scheduler.unlimitedHint": "留空表示使用服务器默认值；仅当该默认值未设置时才不限制步数。",
+    "scheduler.invalidQuanta": "最大步数必须是正整数，或留空。",
     "top.runtimeDatabase": "运行时数据库",
     "top.operatorWorkspace": "操作员工作区",
     "top.runtimeControls": "运行时控制",
@@ -1024,8 +1062,12 @@ export function I18nProvider({
 
   function setLanguage(next: Language) {
     setLanguageState(next);
-    storage()?.setItem(LANGUAGE_STORAGE_KEY, next);
+    persistLanguage(next);
   }
+
+  useEffect(() => {
+    syncDocumentLanguage(language);
+  }, [language]);
 
   const value = useMemo<I18nContextValue>(() => ({
     language,
@@ -1050,11 +1092,32 @@ export function translate(language: Language, key: string, vars: Record<string, 
 }
 
 export function resolveInitialLanguage(
-  saved = storage()?.getItem(LANGUAGE_STORAGE_KEY) ?? null,
+  saved = readStoredLanguage(),
   navigatorLanguage = globalThis.navigator?.language ?? "en"
 ): Language {
   if (saved === "zh-CN" || saved === "en") return saved;
   return navigatorLanguage.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+}
+
+function readStoredLanguage(): string | null {
+  try {
+    return storage()?.getItem(LANGUAGE_STORAGE_KEY) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function persistLanguage(language: Language, selectedStorage: Storage | null = storage()): boolean {
+  try {
+    selectedStorage?.setItem(LANGUAGE_STORAGE_KEY, language);
+    return selectedStorage !== null;
+  } catch {
+    return false;
+  }
+}
+
+export function syncDocumentLanguage(language: Language, documentValue: Document | undefined = globalThis.document): void {
+  if (documentValue?.documentElement) documentValue.documentElement.lang = language;
 }
 
 export function formatTime(value: string, language: Language): string {

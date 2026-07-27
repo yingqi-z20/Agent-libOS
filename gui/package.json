@@ -1,18 +1,18 @@
 {
   "name": "agent-libos-gui",
-  "version": "0.3.4",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "main": "dist-electron/main.js",
   "engines": {
-    "node": "^20.19.0 || >=22.12.0",
+    "node": ">=22.12.0",
     "npm": ">=8"
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "clean:electron": "node scripts/clean-electron-build.mjs",
     "build": "npm run clean:electron && tsc -p tsconfig.json && vite build && tsc -p tsconfig.electron.json",
-    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.electron.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.electron-tests.json",
     "test": "vitest run",
     "electron:dev": "npm run build && electron dist-electron/main.js"
   },
@@ -28,9 +28,14 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.0.0",
-    "electron": "^39.0.0",
+    "electron": "^43.0.0",
+    "jsdom": "^28.1.0",
     "typescript": "^5.9.0",
     "vite": "^7.0.0",
     "vitest": "^3.0.0"
+  },
+  "overrides": {
+    "esbuild": "0.28.1",
+    "postcss": "8.5.18"
   }
 }

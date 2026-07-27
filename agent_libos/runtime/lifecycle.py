@@ -14,6 +14,10 @@ from agent_libos.models import EventType
 from agent_libos.ports.blocking_work import run_blocking_once
 from agent_libos.storage.base import StoreCloseClaimOutcome, StoreCloseOutcome
 from agent_libos.utils.ids import new_id
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 
 
 class _LifecycleState(str, Enum):
@@ -36,6 +40,14 @@ class _ShutdownAttempt:
     done: threading.Event = field(default_factory=threading.Event)
     result: dict[str, Any] | None = None
     error: BaseException | None = None
+
+
+@dataclass(slots=True)
+class _FailedAssemblyCleanupAttempt:
+    owner_thread_id: int
+    owner_task: asyncio.Task[Any] | None
+    done: threading.Event = field(default_factory=threading.Event)
+    result: list[dict[str, str]] | None = None
 
 
 @dataclass(slots=True)
@@ -64,6 +76,13 @@ class _StartupOpenCommit:
 
 @dataclass(slots=True)
 class _StartupLeaseScope:
+    owner_thread_id: int
+    owner_task: asyncio.Task[Any] | None
+    active: bool = True
+
+
+@dataclass(slots=True)
+class _RecoveryLeaseScope:
     owner_thread_id: int
     owner_task: asyncio.Task[Any] | None
     active: bool = True
@@ -139,6 +158,9 @@ class RuntimeLifecycle:
         self._state = _LifecycleState.NEW
         self._shutdown_reason: str | None = None
         self._active_attempt: _ShutdownAttempt | None = None
+        self._active_failed_assembly_cleanup: (
+            _FailedAssemblyCleanupAttempt | None
+        ) = None
         self._active_leases = 0
         self._recovery_fence_epoch = 0
         self._admission_drain_timeout_s = max(0.0, float(admission_drain_timeout_s))
@@ -174,12 +196,24 @@ class RuntimeLifecycle:
                 default=None,
             )
         )
+        self._recovery_lease_scope: ContextVar[_RecoveryLeaseScope | None] = (
+            ContextVar(
+                f"agent_libos_recovery_lease_scope_{id(self)}",
+                default=None,
+            )
+        )
         self._recovery_cleanup_admission: ContextVar[object | None] = ContextVar(
             f"agent_libos_recovery_cleanup_{id(self)}",
             default=None,
         )
         self._shutdown_attempt_context: ContextVar[_ShutdownAttempt | None] = ContextVar(
             f"agent_libos_runtime_shutdown_attempt_{id(self)}",
+            default=None,
+        )
+        self._failed_assembly_cleanup_context: ContextVar[
+            _FailedAssemblyCleanupAttempt | None
+        ] = ContextVar(
+            f"agent_libos_failed_assembly_cleanup_{id(self)}",
             default=None,
         )
         self._recovery_terminalization_publication: ContextVar[str | None] = (
@@ -279,13 +313,14 @@ class RuntimeLifecycle:
     def mark_recovery_required(self, *, publication_id: str) -> None:
         """Fail mutation admission closed while preserving the diagnostic store."""
 
+        selected_publication = self._require_publication_id(publication_id)
         with self._admission_condition:
             lease = self._current_admission.get()
             if lease is None or not lease.active:
                 raise RuntimeError(
                     "runtime recovery fence requires an active admission lease"
                 )
-            recovery_reason = _RECOVERY_REQUIRED_REASON_PREFIX + str(publication_id)
+            recovery_reason = _RECOVERY_REQUIRED_REASON_PREFIX + selected_publication
             if (
                 self._state is _LifecycleState.CLOSE_FAILED
                 and self._shutdown_reason == recovery_reason
@@ -314,10 +349,47 @@ class RuntimeLifecycle:
                 )
             self._state = selected
 
+    @staticmethod
+    def _require_publication_id(publication_id: Any) -> str:
+        if (
+            type(publication_id) is not str
+            or not publication_id
+            or publication_id != publication_id.strip()
+        ):
+            raise TypeError(
+                "runtime publication id must be an exact non-empty string"
+            )
+        return publication_id
+
     @contextmanager
     def recovery_lease(self) -> Iterator[None]:
-        with self._internal_lease(self._recovery_token, _LifecycleState.RECOVERING):
-            yield
+        with self._lock:
+            if self._state is not _LifecycleState.RECOVERING:
+                raise RuntimeError(
+                    "internal lifecycle lease requires recovering, got "
+                    f"{self._state.value}"
+                )
+            inherited = self._recovery_lease_scope.get()
+            if inherited is not None and inherited.active:
+                raise RuntimeError("recovery lifecycle lease cannot be nested")
+        scope = _RecoveryLeaseScope(
+            owner_thread_id=threading.get_ident(),
+            owner_task=self._current_task(),
+        )
+        scope_reset = self._recovery_lease_scope.set(scope)
+        try:
+            with self._internal_lease(
+                self._recovery_token,
+                _LifecycleState.RECOVERING,
+            ):
+                yield
+        finally:
+            with self._lock:
+                # ContextVar values are copied into child tasks.  Mutating the
+                # shared scope invalidates every copied context before the
+                # parent resets its own binding.
+                scope.active = False
+            self._recovery_lease_scope.reset(scope_reset)
 
     def require_recovery_lease(self) -> None:
         """Reject recovery work outside the startup recovery context."""
@@ -325,11 +397,21 @@ class RuntimeLifecycle:
         with self._lock:
             if (
                 self._state is not _LifecycleState.RECOVERING
-                or self._internal_admission.get() is not self._recovery_token
+                or not self._current_recovery_lease_is_valid_locked()
             ):
                 raise RuntimeError(
                     "runtime recovery requires the active startup recovery lease"
                 )
+
+    def _current_recovery_lease_is_valid_locked(self) -> bool:
+        scope = self._recovery_lease_scope.get()
+        return bool(
+            scope is not None
+            and scope.active
+            and scope.owner_thread_id == threading.get_ident()
+            and scope.owner_task is self._current_task()
+            and self._internal_admission.get() is self._recovery_token
+        )
 
     def require_recovery_cleanup_lease(self) -> None:
         """Reject raw transient cleanup outside an explicit handoff callback."""
@@ -497,6 +579,8 @@ class RuntimeLifecycle:
     def admit(self, *, read_only: bool = False) -> Iterator[None]:
         """Acquire an operation lease before any operation/effect mutation."""
 
+        if type(read_only) is not bool:
+            raise TypeError("runtime admission read_only must be an exact boolean")
         inherited = self._current_admission.get()
         if inherited is not None and inherited.active:
             self._revalidate_admission(inherited, read_only=read_only)
@@ -506,7 +590,11 @@ class RuntimeLifecycle:
         with self._admission_condition:
             internal = self._internal_admission.get()
             allowed_internal = (
-                (self._state is _LifecycleState.RECOVERING and internal is self._recovery_token)
+                (
+                    self._state is _LifecycleState.RECOVERING
+                    and internal is self._recovery_token
+                    and self._current_recovery_lease_is_valid_locked()
+                )
                 or (
                     self._state is _LifecycleState.STARTING
                     and internal is self._startup_token
@@ -1269,12 +1357,7 @@ class RuntimeLifecycle:
 
         if capability is not self.__recovery_terminalization_capability:
             raise RuntimeError("invalid recovery terminalization capability")
-        selected_publication = str(publication_id)
-        if (
-            not selected_publication
-            or selected_publication != selected_publication.strip()
-        ):
-            raise RuntimeError("recovery terminalization publication id is invalid")
+        selected_publication = self._require_publication_id(publication_id)
         lease = self._current_admission.get()
         with self._admission_condition:
             self._validate_recovery_terminalization_locked(
@@ -1311,12 +1394,7 @@ class RuntimeLifecycle:
 
         if capability is not self.__recovery_terminalization_capability:
             raise RuntimeError("invalid recovery terminalization capability")
-        selected_publication = str(publication_id)
-        if (
-            not selected_publication
-            or selected_publication != selected_publication.strip()
-        ):
-            raise RuntimeError("recovery terminalization publication id is invalid")
+        selected_publication = self._require_publication_id(publication_id)
         lease = self._current_admission.get()
         with self._admission_condition:
             fenced = bool(
@@ -1530,6 +1608,10 @@ class RuntimeLifecycle:
         *,
         recovery_safe: bool = False,
     ) -> None:
+        if type(recovery_safe) is not bool:
+            raise TypeError(
+                "runtime finalizer recovery_safe must be an exact boolean"
+            )
         with self._lock:
             if self._active_attempt is not None or self._state in {
                 _LifecycleState.STOPPING,
@@ -1541,7 +1623,7 @@ class RuntimeLifecycle:
                 _FinalizerEntry(
                     handle=new_id("finalizer"),
                     callback=finalizer,
-                    recovery_safe=bool(recovery_safe),
+                    recovery_safe=recovery_safe,
                 )
             )
 
@@ -1752,14 +1834,44 @@ class RuntimeLifecycle:
                 "failed assembly cleanup requires await acleanup_failed_assembly() "
                 "inside an active event loop"
             )
-        return self._cleanup_failed_assembly_sync()
+        caller_task = self._current_task()
+        attempt, is_leader = self._start_failed_assembly_cleanup_attempt(
+            caller_task=caller_task,
+        )
+        if not is_leader:
+            self._reject_reentrant_failed_assembly_cleanup_wait(
+                attempt,
+                caller_task=caller_task,
+                async_wait=False,
+            )
+            attempt.done.wait()
+            return self._failed_assembly_cleanup_attempt_result(attempt)
+        context_token = self._failed_assembly_cleanup_context.set(attempt)
+        try:
+            try:
+                errors, caught = self._cleanup_failed_assembly_sync()
+            except BaseException as exc:
+                errors = []
+                self._record_error(errors, "failed_assembly_cleanup", exc)
+                self._finish_failed_assembly_cleanup()
+                self._complete_failed_assembly_cleanup_attempt(
+                    attempt,
+                    errors,
+                )
+                raise
+            self._complete_failed_assembly_cleanup_attempt(attempt, errors)
+            self._raise_failed_assembly_interrupts(caught)
+            return errors
+        finally:
+            self._failed_assembly_cleanup_context.reset(context_token)
 
-    def _cleanup_failed_assembly_sync(self) -> list[dict[str, str]]:
+    def _cleanup_failed_assembly_sync(
+        self,
+    ) -> tuple[list[dict[str, str]], list[BaseException]]:
         """Synchronous failed-assembly cleanup for ordinary sync hosts."""
 
         errors: list[dict[str, str]] = []
         caught: list[BaseException] = []
-        self._begin_failed_assembly_cleanup()
         for name, component in (("scheduler", self._scheduler), ("object_tasks", self._object_tasks)):
             self._stop_failed_assembly_sync_component(
                 name,
@@ -1811,8 +1923,7 @@ class RuntimeLifecycle:
                 errors,
                 caught,
             )
-        self._raise_failed_assembly_interrupts(caught)
-        return errors
+        return errors, caught
 
     async def acleanup_failed_assembly(self) -> list[dict[str, str]]:
         """Await failed-assembly teardown in an async host.
@@ -1822,10 +1933,42 @@ class RuntimeLifecycle:
         close; callers that supplied a store retain diagnostic access.
         """
 
-        self._require_failed_assembly_cleanup_eligible()
+        caller_task = self._current_task()
+        attempt, is_leader = self._start_failed_assembly_cleanup_attempt(
+            caller_task=caller_task,
+        )
+        if not is_leader:
+            self._reject_reentrant_failed_assembly_cleanup_wait(
+                attempt,
+                caller_task=caller_task,
+                async_wait=True,
+            )
+            await run_blocking_once(attempt.done.wait)
+            return self._failed_assembly_cleanup_attempt_result(attempt)
+        context_token = self._failed_assembly_cleanup_context.set(attempt)
+        try:
+            try:
+                errors, caught = await self._cleanup_failed_assembly_async()
+            except BaseException as exc:
+                errors = []
+                self._record_error(errors, "failed_assembly_cleanup", exc)
+                self._finish_failed_assembly_cleanup()
+                self._complete_failed_assembly_cleanup_attempt(
+                    attempt,
+                    errors,
+                )
+                raise
+            self._complete_failed_assembly_cleanup_attempt(attempt, errors)
+            self._raise_failed_assembly_interrupts(caught)
+            return errors
+        finally:
+            self._failed_assembly_cleanup_context.reset(context_token)
+
+    async def _cleanup_failed_assembly_async(
+        self,
+    ) -> tuple[list[dict[str, str]], list[BaseException]]:
         errors: list[dict[str, str]] = []
         caught: list[BaseException] = []
-        self._begin_failed_assembly_cleanup()
         for name, component in (("scheduler", self._scheduler), ("object_tasks", self._object_tasks)):
             await self._stop_failed_assembly_async_component(
                 name,
@@ -1879,13 +2022,30 @@ class RuntimeLifecycle:
                 errors,
                 caught,
             )
-        self._raise_failed_assembly_interrupts(caught)
-        return errors
+        return errors, caught
 
-    def _begin_failed_assembly_cleanup(self) -> None:
+    def _start_failed_assembly_cleanup_attempt(
+        self,
+        *,
+        caller_task: asyncio.Task[Any] | None,
+    ) -> tuple[_FailedAssemblyCleanupAttempt, bool]:
         with self._lock:
+            if self._ever_opened:
+                raise RuntimeError(
+                    "failed assembly cleanup is unavailable after Runtime open; "
+                    "use release_recovery_diagnostics() for a recovery fence"
+                )
+            active = self._active_failed_assembly_cleanup
+            if active is not None:
+                return active, False
+            attempt = _FailedAssemblyCleanupAttempt(
+                owner_thread_id=threading.get_ident(),
+                owner_task=caller_task,
+            )
+            self._active_failed_assembly_cleanup = attempt
             if self._state is not _LifecycleState.CLOSED:
                 self._state = _LifecycleState.STOPPING
+            return attempt, True
 
     def _require_failed_assembly_cleanup_eligible(self) -> None:
         with self._lock:
@@ -1894,6 +2054,51 @@ class RuntimeLifecycle:
                     "failed assembly cleanup is unavailable after Runtime open; "
                     "use release_recovery_diagnostics() for a recovery fence"
                 )
+
+    def _reject_reentrant_failed_assembly_cleanup_wait(
+        self,
+        attempt: _FailedAssemblyCleanupAttempt,
+        *,
+        caller_task: asyncio.Task[Any] | None,
+        async_wait: bool,
+    ) -> None:
+        same_thread = attempt.owner_thread_id == threading.get_ident()
+        same_task = caller_task is not None and caller_task is attempt.owner_task
+        different_async_task = (
+            async_wait
+            and same_thread
+            and caller_task is not None
+            and attempt.owner_task is not None
+            and not same_task
+        )
+        inherited_attempt = (
+            self._failed_assembly_cleanup_context.get() is attempt
+        )
+        if inherited_attempt or same_task or (same_thread and not different_async_task):
+            raise RuntimeError(
+                "reentrant failed assembly cleanup cannot wait for its own attempt"
+            )
+
+    def _complete_failed_assembly_cleanup_attempt(
+        self,
+        attempt: _FailedAssemblyCleanupAttempt,
+        result: list[dict[str, str]],
+    ) -> None:
+        with self._lock:
+            attempt.result = [dict(item) for item in result]
+            if self._active_failed_assembly_cleanup is attempt:
+                self._active_failed_assembly_cleanup = None
+            attempt.done.set()
+
+    @staticmethod
+    def _failed_assembly_cleanup_attempt_result(
+        attempt: _FailedAssemblyCleanupAttempt,
+    ) -> list[dict[str, str]]:
+        if attempt.result is None:
+            raise RuntimeError(
+                "failed assembly cleanup completed without a shared outcome"
+            )
+        return [dict(item) for item in attempt.result]
 
     def _finish_failed_assembly_cleanup(self) -> None:
         with self._lock:
@@ -1923,7 +2128,10 @@ class RuntimeLifecycle:
         caught: list[BaseException],
     ) -> bool:
         try:
-            stopped = self.shutdown_component(component)
+            if self._component_requires_async_shutdown(component):
+                stopped = asyncio.run(self.ashutdown_component(component))
+            else:
+                stopped = self.shutdown_component(component)
             if not stopped:
                 errors.append(
                     {
@@ -2404,11 +2612,21 @@ class RuntimeLifecycle:
         component: str,
         exc: BaseException,
     ) -> None:
+        public_error = public_error_envelope(exc)
+        internal_error = internal_exception_observation(
+            exc,
+            correlation_id=public_error["correlation_id"],
+        )
+        exception_text = internal_error["exception_text"]
         errors.append(
             {
                 "component": component,
-                "error": str(exc),
-                "error_type": type(exc).__name__,
+                "error": public_error["message"],
+                "error_type": public_error["error_type"],
+                "code": public_error["code"],
+                "correlation_id": public_error["correlation_id"],
+                "error_text_bytes": str(exception_text["bytes"]),
+                "error_text_sha256": str(exception_text["sha256"]),
             }
         )
 

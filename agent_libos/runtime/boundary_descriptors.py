@@ -128,23 +128,23 @@ CHECKPOINT_BOUNDARIES = (
     boundary("checkpoint", "create", "runtime", "checkpoint.create", "actor", "pid"),
     boundary(
         "checkpoint", "inspect", "runtime", "checkpoint.inspect", "actor", "actor",
-        preflight_method="preflight_checkpoint",
+        preflight_method="preflight_checkpoint_inspect",
     ),
     boundary(
         "checkpoint", "diff", "runtime", "checkpoint.diff", "actor", "actor",
-        preflight_method="preflight_checkpoint",
+        preflight_method="preflight_checkpoint_diff",
     ),
     boundary(
         "checkpoint", "restore", "runtime", "checkpoint.restore", "actor", "actor",
-        preflight_method="preflight_checkpoint",
+        preflight_method="preflight_checkpoint_restore",
     ),
     boundary(
         "checkpoint", "fork_from_checkpoint", "runtime", "checkpoint.fork", "actor", "actor",
-        preflight_method="preflight_checkpoint",
+        preflight_method="preflight_checkpoint_fork",
     ),
     boundary(
         "checkpoint", "replay_to_event", "runtime", "checkpoint.replay", "actor", "actor",
-        preflight_method="preflight_checkpoint",
+        preflight_method="preflight_checkpoint_replay",
     ),
 )
 
@@ -180,7 +180,15 @@ AUTHORITY_BOUNDARIES = (
 )
 
 EXTENSION_BOUNDARIES = (
-    boundary("skills", "register_skill_package", "runtime", "skill.register", "actor", "actor"),
+    boundary(
+        "skills",
+        "register_skill_package",
+        "runtime",
+        "skill.register",
+        "actor",
+        "actor",
+        lifecycle_lock_attr="_lifecycle_lock",
+    ),
     boundary(
         "skills",
         "activate_skill",
@@ -361,7 +369,14 @@ SCHEDULER_CONTROL_MUTATION_ADMISSION_BOUNDARIES = tuple(
 )
 
 SCHEDULER_READ_ONLY_PUBLIC_METHODS = frozenset(
-    {"active_pids", "is_active_quantum", "next_runnable", "runnable_pids"}
+    {
+        "active_pids",
+        "is_active_quantum",
+        "next_runnable",
+        "runnable_pids",
+        "validate_max_quanta",
+        "validate_run_controls",
+    }
 )
 SCHEDULER_COORDINATION_PUBLIC_METHODS = frozenset({"quiescent_state"})
 SCHEDULER_LIFECYCLE_PUBLIC_METHODS = frozenset({"shutdown"})
@@ -369,6 +384,9 @@ SCHEDULER_LIFECYCLE_PUBLIC_METHODS = frozenset({"shutdown"})
 
 # DataFlow has several methods that look like queries but deliberately append
 # decisions or capability evidence.  Keep them in the mutation inventory;
+# exact Object snapshots and directory watches are also tied to the current
+# Runtime and therefore use the same close-failed admission fence even though
+# they do not themselves persist mutations.
 # ambient-flow ContextVar helpers are classified separately so reset/finally
 # cleanup remains possible after a recovery fence.
 DATA_FLOW_PUBLIC_MUTATION_METHODS = frozenset(
@@ -377,6 +395,7 @@ DATA_FLOW_PUBLIC_MUTATION_METHODS = frozenset(
         "bind_written_file",
         "bind_written_file_digest",
         "bootstrap_configured_rules",
+        "context_from_object_snapshot",
         "context_from_source_oids",
         "persist_denied_decision",
         "precheck_egress_clearance",
@@ -386,6 +405,7 @@ DATA_FLOW_PUBLIC_MUTATION_METHODS = frozenset(
         "tombstone_file",
         "tombstone_path_tree",
         "unregister_sink_trust",
+        "watch_directory_labels",
     }
 )
 
@@ -440,6 +460,11 @@ _OBJECT_TASK_EXPLAIN_MUTATION_METHODS = frozenset(
 OBJECT_TASK_CONTROL_MUTATION_ADMISSION_BOUNDARIES = (
     ("object_tasks", "get", "control.object_tasks.get"),
     ("object_tasks", "has_active_for_owner", "control.object_tasks.has_active_for_owner"),
+    (
+        "object_tasks",
+        "has_published_active_for_owner",
+        "control.object_tasks.has_published_active_for_owner",
+    ),
     ("object_tasks", "list", "control.object_tasks.list"),
     ("object_tasks", "notify_owner_changed", "control.object_tasks.notify_owner_changed"),
     ("object_tasks", "notify_process_message", "control.object_tasks.notify_process_message"),

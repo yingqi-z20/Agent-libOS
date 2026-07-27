@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.models import ResourceUsage, ToolCallResult
@@ -24,6 +25,9 @@ class LLMActionService:
         tools: Any,
         resources: Any | None,
         content_preview_chars: int,
+        tool_call_args_hard_limit_bytes: int = (
+            DEFAULT_CONFIG.tools.tool_call_args_hard_limit_bytes
+        ),
         pre_tool_notice: Callable[[str, str, dict[str, Any]], dict[str, Any] | None],
         post_tool_notice: Callable[[str], dict[str, Any] | None],
         publish_result: Callable[[str, Any], None],
@@ -32,6 +36,7 @@ class LLMActionService:
         self._tools = tools
         self._resources = resources
         self._content_preview_chars = content_preview_chars
+        self._tool_call_args_hard_limit_bytes = tool_call_args_hard_limit_bytes
         self._pre_tool_notice = pre_tool_notice
         self._post_tool_notice = post_tool_notice
         self._publish_result = publish_result
@@ -82,7 +87,7 @@ class LLMActionService:
         errors: list[str] = []
         for tool_call in reversed(tool_calls):
             try:
-                return tool_call_to_action(tool_call)
+                return self._tool_call_to_action(tool_call)
             except Exception as exc:
                 errors.append(str(exc))
         if fallback_json_actions:
@@ -96,13 +101,15 @@ class LLMActionService:
             f"no valid native tool call found{detail}; content preview: {preview!r}"
         )
 
-    @staticmethod
-    def _parallel_actions(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _parallel_actions(
+        self,
+        tool_calls: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
         errors: list[str] = []
         for index, tool_call in enumerate(tool_calls, start=1):
             try:
-                actions.append(tool_call_to_action(tool_call))
+                actions.append(self._tool_call_to_action(tool_call))
             except Exception as exc:
                 errors.append(f"{index}: {exc}")
         if errors:
@@ -110,6 +117,15 @@ class LLMActionService:
         if not actions:
             raise ValueError("parallel tool call response did not include any function calls")
         return actions
+
+    def _tool_call_to_action(
+        self,
+        tool_call: dict[str, Any],
+    ) -> dict[str, Any]:
+        return tool_call_to_action(
+            tool_call,
+            max_argument_bytes=self._tool_call_args_hard_limit_bytes,
+        )
 
     def validate(self, pid: str, action: dict[str, Any]) -> None:
         name = str(action.get("action") or "").strip()

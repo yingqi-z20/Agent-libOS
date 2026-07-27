@@ -3,7 +3,11 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from agent_libos.llm.client import LLMClient
+from agent_libos.llm.client import (
+    LLMClient,
+    LLMTransientError,
+    llm_provider_failure_error,
+)
 from agent_libos.ports.blocking_work import run_blocking_once
 
 
@@ -19,6 +23,36 @@ class LLMProviderService:
         return await run_blocking_once(function, *args, **kwargs)
 
     async def complete_action(
+        self,
+        client: Any,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float,
+        max_tokens: int,
+        previous_response_id: str | None = None,
+        parallel_tool_calls: bool,
+    ) -> Any:
+        try:
+            return await self._complete_action_unwrapped(
+                client,
+                messages,
+                tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                previous_response_id=previous_response_id,
+                parallel_tool_calls=parallel_tool_calls,
+            )
+        except Exception as exc:
+            wrapped = llm_provider_failure_error(
+                exc,
+                transient=isinstance(exc, LLMTransientError),
+            )
+            if wrapped is exc:
+                raise
+            raise wrapped from exc
+
+    async def _complete_action_unwrapped(
         self,
         client: Any,
         messages: list[dict[str, Any]],

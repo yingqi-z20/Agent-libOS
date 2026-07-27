@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from agent_libos.llm.usage import aggregate_cache_usage, canonicalize_llm_usage
+from agent_libos.llm.usage import (
+    LLM_USAGE_COUNTER_MAX,
+    aggregate_cache_usage,
+    canonicalize_llm_usage,
+)
 
 
 def test_chat_cache_usage_prefers_formal_details_and_preserves_zero() -> None:
@@ -139,3 +143,17 @@ def test_cache_hit_rate_uses_only_calls_with_reported_input_tokens() -> None:
     assert metrics["cache_metric_input_tokens"] == 100
     assert metrics["uncached_input_tokens"] == 60
     assert metrics["cache_hit_rate"] == 0.4
+
+
+def test_usage_counters_reject_values_outside_finite_accounting_range() -> None:
+    usage, invalid = canonicalize_llm_usage(
+        {
+            "prompt_tokens": LLM_USAGE_COUNTER_MAX,
+            "completion_tokens": LLM_USAGE_COUNTER_MAX + 1,
+            "total_tokens": 10**400,
+        },
+        api="chat",
+    )
+
+    assert usage == {"prompt_tokens": LLM_USAGE_COUNTER_MAX}
+    assert invalid == {"completion_tokens", "total_tokens"}

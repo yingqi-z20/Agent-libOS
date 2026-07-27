@@ -232,7 +232,9 @@ undo log and exposes no compensation operation, so its mutations are
 `success_oracle` checks the task-declared scenario-completion conditions and
 must contain at least one check. Current implemented check types are
 `process_exited`, `expected_effects`, `file_contains`, `file_exists`,
-`managed_git_worktree`, and `git_patch_artifact_lineage`.
+`python_syntax_valid`, `object_exists`, `action_succeeded`,
+`image_requires_capability`, `managed_git_worktree`, and
+`git_patch_artifact_lineage`.
 Unknown check types are rejected by the loader. `expected_effects` consumes one matching
 normalized effect per entry;
 the task fails if any entry is missing or has an outcome outside its explicit
@@ -254,6 +256,18 @@ success_oracle:
   - type: file_contains
     path: "README.md"
     text: "Usage"
+  - type: python_syntax_valid
+    path: "src/app.py"
+  - type: object_exists
+    namespace: shared/secrets
+    name: api_key
+  - type: action_succeeded
+    action: inspect_jsonrpc_endpoint
+    arguments: {endpoint_id: bench-echo}
+  - type: image_requires_capability
+    image: required-cap-image
+    resource: filesystem://workspace/.env
+    rights: [read]
   - type: managed_git_worktree
     root: agent_outputs/git_worktrees
   - type: git_patch_artifact_lineage
@@ -261,8 +275,19 @@ success_oracle:
     sensitivity: secret
     artifact_origin: derived
     source_origin: benchmark-secret
+    min_bytes: 1
+    changed_paths_exact: [src/app.py]
   - type: process_exited
 ```
+
+`python_syntax_valid` parses the final UTF-8 file with Python's AST parser.
+`object_exists` is bound to exactly one setup Object and requires that the
+runner observed the seeded `(namespace, name)` target. `action_succeeded`
+identifies exactly one planned mock action and requires a successful runtime or
+explicitly simulated action observation whose declared argument subset agrees.
+`image_requires_capability` reads the committed or loaded image record and
+requires an exact resource plus rights-set declaration; an image action alone
+does not satisfy it.
 
 `managed_git_worktree` requires a performed, persisted
 `external.provider_call` effect with `provider: git` and `operation: mutate`
@@ -277,9 +302,10 @@ directory. These layout nodes may not be symlinks.
 whose runtime result names an immutable `code_patch` Object; the serialized
 effect witness must show the requested setup Object's valid OID exactly once in
 the artifact's durable parent OID list, along with the requested sensitivity,
-aggregate artifact origin, and source origin labels. A `source_object` reference
-must match exactly one `setup.memory_objects[].name`; missing and duplicate
-names are rejected.
+aggregate artifact origin, and source origin labels. The patch receipt must
+also meet positive `min_bytes` and match the non-empty, unique
+`changed_paths_exact` list. A `source_object` reference must match exactly one
+`setup.memory_objects[].name`; missing and duplicate names are rejected.
 These checks intentionally fail for a
 generic or synthetic Git effect that lacks the corresponding state evidence.
 
@@ -449,7 +475,8 @@ The complete setup shape consumed by the fixture and Agent libOS runners is:
 - `jsonrpc_endpoints[]`: required manifest `path` plus optional `encoding` and
   `replace`.
 - `git`: requires `initialize: true`; fixture setup initializes `main`, installs
-  deterministic local identity, and creates an initial commit. Optional
+  deterministic local identity plus fixed author/committer timestamps, and
+  creates a reproducible initial commit. Optional
   `post_commit_files[]` uses the same `path`/`content`/`encoding` shape as
   `files[]`; `active_filter: true` installs a deliberately unsafe active filter
   for denial tests. Runtime setup then applies `file_labels[]`, each containing
@@ -553,7 +580,14 @@ runtime tool name is created by a Skill or JIT candidate. It declares only the
 expected semantic effect type and identity. Runner-observed fields
 (`effect_id`, `performed`, `denied`, `simulated`, `outcome`, `evidence`,
 `error`, `classification`, and `metadata`) are forbidden: tasks cannot declare
-their own favorable observation or evidence. `checkpoint_ref` is
+their own favorable observation or evidence. `skill_syscall_read` has an
+additional fail-closed binding: its `benchmark_effects` list is required and
+must contain exactly one `filesystem.read` entry. That entry's normalized
+`path` must equal the action's normalized `path`, and matching must be exact
+(`match` omitted or `match: exact`). Missing, empty, additional, duplicate,
+prefix, glob, and path-mismatched declarations are rejected. This preserves a
+denied syscall attempt as explicit oracle evidence without allowing the task
+to attribute it to another path. `checkpoint_ref` is
 resolved by the runner to a concrete checkpoint id before dispatch, including
 checkpoint-derived image commit actions. `process_goal` scopes a planned mock
 action to the process whose persisted goal text exactly matches the supplied

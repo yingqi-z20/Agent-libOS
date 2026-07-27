@@ -61,6 +61,24 @@ _COMPACT_COMMANDS = frozenset(
         "tools",
     }
 )
+_PRIMARY_COMMANDS = frozenset(
+    {"init", "demo", "explain", "workflow", "object-task"}
+)
+_PROCESS_COMMANDS = frozenset(
+    {"spawn", "cd", "exec", "exit", "llm-once", "run", "message", "interrupt"}
+)
+_MANAGEMENT_COMMANDS = frozenset(
+    {
+        "checkpoint",
+        "skills",
+        "capabilities",
+        "images",
+        "jsonrpc",
+        "mcp",
+        "modules",
+        "human",
+    }
+)
 
 
 def _load_runtime_config(config_path: str | None, parser: argparse.ArgumentParser) -> AgentLibOSConfig:
@@ -159,7 +177,26 @@ def _run_compact_command(
     raise AssertionError(f"unsupported compact command: {args.command}")
 
 
-def main(argv: list[str] | None = None) -> None:
+def _shutdown_runtime_before_exit(runtime: Runtime) -> None:
+    """Require the host Runtime to report a complete CLI teardown."""
+
+    result = runtime.shutdown(actor="cli", reason="cli.command_complete")
+    try:
+        completed = result["ok"] is True
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "CLI runtime teardown returned an invalid result without an 'ok' status"
+        ) from exc
+    if not completed:
+        raise RuntimeError(
+            "CLI runtime teardown remained incomplete: "
+            f"{to_jsonable(result)!r}"
+        )
+
+
+def _parse_cli_args(
+    argv: list[str] | None,
+) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     parser = argparse.ArgumentParser(prog="agent-libos")
     parser.add_argument(
         "--config",
@@ -303,7 +340,185 @@ def main(argv: list[str] | None = None) -> None:
     modules_parser = sub.add_parser("modules", help="List, inspect, or verify startup runtime modules")
     _add_modules_parser_args(modules_parser)
     sub.add_parser("human", help="Process pending human messages in terminal order")
-    args = parser.parse_args(argv)
+    return parser, parser.parse_args(argv)
+
+
+def _run_primary_cli_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    selected_db_display: str,
+) -> None:
+    if args.command == "init":
+        print(f"initialized {selected_db_display}")
+        return
+    if args.command == "demo":
+        print(json.dumps(run_demo(runtime), indent=2, ensure_ascii=False))
+        return
+    if args.command == "explain":
+        try:
+            result = _run_explain_command(runtime, args)
+        except NotFound as exc:
+            _print_json(
+                {
+                    "schema_version": 1,
+                    "error": {"type": "NotFound", "message": str(exc)},
+                }
+            )
+            raise SystemExit(1) from None
+        _print_json(result)
+        if result.get("ambiguous"):
+            raise SystemExit(2)
+        return
+    if args.command == "workflow":
+        result = _run_workflow_command(runtime, args)
+        _print_json(to_jsonable(result))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+    if args.command == "object-task":
+        _print_json(_run_object_task_command(runtime, args))
+        return
+    raise AssertionError(f"unsupported primary command: {args.command}")
+
+
+def _run_process_cli_command(runtime: Runtime, args: argparse.Namespace) -> None:
+    if args.command == "spawn":
+        pid = runtime.process.spawn(
+            image=args.image,
+            goal=args.goal,
+            llm_profile_id=args.llm_profile,
+            authority_manifest=(
+                _parse_json_mapping(
+                    args.authority_manifest_json,
+                    "--authority-manifest-json",
+                )
+                if args.authority_manifest_json is not None
+                else None
+            ),
+        )
+        process = runtime.process.get(pid)
+        _print_json(
+            {
+                "pid": pid,
+                "image": process.image_id,
+                "llm_profile_id": process.llm_profile_id,
+                "goal": args.goal,
+            }
+        )
+        return
+    if args.command == "cd":
+        _print_json(_run_cd_command(runtime, args))
+        return
+    if args.command == "exec":
+        _print_json(asyncio.run(_run_exec_command(runtime, args)))
+        return
+    if args.command == "exit":
+        _print_json(_run_exit_command(runtime, args))
+        return
+    if args.command == "llm-once":
+        _print_json(asyncio.run(runtime.arun_process_once(args.pid)))
+        return
+    if args.command == "run":
+        if args.interactive:
+            result = asyncio.run(_run_interactive_command(runtime, args))
+        else:
+            result = asyncio.run(
+                runtime.arun_until_idle(max_quanta=args.max_quanta)
+            )
+        _print_json(result)
+        return
+    if args.command == "message":
+        _print_json(asyncio.run(_run_message_command(runtime, args)))
+        return
+    if args.command == "interrupt":
+        _print_json(
+            asyncio.run(
+                _run_message_command(
+                    runtime,
+                    args,
+                    fixed_kind=ProcessMessageKind.INTERRUPT,
+                )
+            )
+        )
+        return
+    raise AssertionError(f"unsupported process command: {args.command}")
+
+
+def _run_management_cli_command(runtime: Runtime, args: argparse.Namespace) -> None:
+    if args.command == "checkpoint":
+        _print_json(_run_checkpoint_command(runtime, args))
+        return
+    if args.command == "skills":
+        _print_json(_run_skills_command(runtime, args))
+        return
+    if args.command == "capabilities":
+        _print_json(_run_capabilities_command(runtime, args))
+        return
+    if args.command == "images":
+        _print_json(_run_images_command(runtime, args))
+        return
+    if args.command == "jsonrpc":
+        _print_json(_run_jsonrpc_command(runtime, args))
+        return
+    if args.command == "mcp":
+        _print_json(_run_mcp_command(runtime, args))
+        return
+    if args.command == "modules":
+        _print_json(_run_modules_command(runtime, args))
+        return
+    if args.command == "human":
+        _print_json(
+            [request.__dict__ for request in runtime.human.drain_terminal_queue()]
+        )
+        return
+    raise AssertionError(f"unsupported management command: {args.command}")
+
+
+def _dispatch_cli_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    selected_db_display: str,
+) -> None:
+    if args.command in _COMPACT_COMMANDS:
+        _print_json(to_jsonable(_run_compact_command(runtime, args)))
+        return
+    if args.command in _PRIMARY_COMMANDS:
+        _run_primary_cli_command(runtime, args, selected_db_display)
+        return
+    if args.command in _PROCESS_COMMANDS:
+        _run_process_cli_command(runtime, args)
+        return
+    if args.command in _MANAGEMENT_COMMANDS:
+        _run_management_cli_command(runtime, args)
+        return
+    raise AssertionError(f"unsupported CLI command: {args.command}")
+
+
+def _dispatch_cli_command_with_shutdown(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    selected_db_display: str,
+) -> None:
+    command_error: BaseException | None = None
+    try:
+        _dispatch_cli_command(runtime, args, selected_db_display)
+    except BaseException as exc:
+        command_error = exc
+        raise
+    finally:
+        try:
+            _shutdown_runtime_before_exit(runtime)
+        except BaseException as shutdown_error:
+            if command_error is None:
+                raise
+            command_error.add_note(
+                "CLI runtime teardown also failed: "
+                f"{type(shutdown_error).__name__}: {shutdown_error}"
+            )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser, args = _parse_cli_args(argv)
     selected_config = _load_runtime_config(args.config, parser)
     if args.command == "modules" and args.modules_command == "verify":
         return _print_json(_verify_module_manifest(selected_config, args))
@@ -318,89 +533,7 @@ def main(argv: list[str] | None = None) -> None:
         trusted_modules=args.trusted_module,
         trusted_module_sha256=args.trusted_module_sha256,
     )
-    try:
-        if args.command in _COMPACT_COMMANDS:
-            _print_json(to_jsonable(_run_compact_command(runtime, args)))
-        elif args.command == "init":
-            print(f"initialized {selected_db_display}")
-        elif args.command == "demo":
-            print(json.dumps(run_demo(runtime), indent=2, ensure_ascii=False))
-        elif args.command == "explain":
-            try:
-                result = _run_explain_command(runtime, args)
-            except NotFound as exc:
-                _print_json(
-                    {
-                        "schema_version": 1,
-                        "error": {"type": "NotFound", "message": str(exc)},
-                    }
-                )
-                raise SystemExit(1) from None
-            _print_json(result)
-            if result.get("ambiguous"):
-                raise SystemExit(2)
-        elif args.command == "workflow":
-            result = _run_workflow_command(runtime, args)
-            _print_json(to_jsonable(result))
-            if not result.ok:
-                raise SystemExit(1)
-        elif args.command == "object-task":
-            _print_json(_run_object_task_command(runtime, args))
-        elif args.command == "spawn":
-            pid = runtime.process.spawn(
-                image=args.image,
-                goal=args.goal,
-                llm_profile_id=args.llm_profile,
-                authority_manifest=(
-                    _parse_json_mapping(args.authority_manifest_json, "--authority-manifest-json")
-                    if args.authority_manifest_json is not None
-                    else None
-                ),
-            )
-            process = runtime.process.get(pid)
-            _print_json(
-                {
-                    "pid": pid,
-                    "image": process.image_id,
-                    "llm_profile_id": process.llm_profile_id,
-                    "goal": args.goal,
-                }
-            )
-        elif args.command == "cd":
-            _print_json(_run_cd_command(runtime, args))
-        elif args.command == "exec":
-            _print_json(asyncio.run(_run_exec_command(runtime, args)))
-        elif args.command == "exit":
-            _print_json(_run_exit_command(runtime, args))
-        elif args.command == "llm-once":
-            _print_json(asyncio.run(runtime.arun_process_once(args.pid)))
-        elif args.command == "run":
-            if args.interactive:
-                _print_json(asyncio.run(_run_interactive_command(runtime, args)))
-            else:
-                _print_json(asyncio.run(runtime.arun_until_idle(max_quanta=args.max_quanta)))
-        elif args.command == "message":
-            _print_json(asyncio.run(_run_message_command(runtime, args)))
-        elif args.command == "interrupt":
-            _print_json(asyncio.run(_run_message_command(runtime, args, fixed_kind=ProcessMessageKind.INTERRUPT)))
-        elif args.command == "checkpoint":
-            _print_json(_run_checkpoint_command(runtime, args))
-        elif args.command == "skills":
-            _print_json(_run_skills_command(runtime, args))
-        elif args.command == "capabilities":
-            _print_json(_run_capabilities_command(runtime, args))
-        elif args.command == "images":
-            _print_json(_run_images_command(runtime, args))
-        elif args.command == "jsonrpc":
-            _print_json(_run_jsonrpc_command(runtime, args))
-        elif args.command == "mcp":
-            _print_json(_run_mcp_command(runtime, args))
-        elif args.command == "modules":
-            _print_json(_run_modules_command(runtime, args))
-        elif args.command == "human":
-            _print_json([request.__dict__ for request in runtime.human.drain_terminal_queue()])
-    finally:
-        runtime.shutdown(actor="cli", reason="cli.command_complete")
+    _dispatch_cli_command_with_shutdown(runtime, args, selected_db_display)
 
 
 def cli(argv: list[str] | None = None) -> None:
@@ -1079,6 +1212,16 @@ def _run_checkpoint_command(runtime: Runtime, args: argparse.Namespace) -> dict[
     raise SystemExit(f"unknown checkpoint command: {command}")
 
 
+def _parse_exact_sha256(value: str) -> str:
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise argparse.ArgumentTypeError(
+            "must be exactly 64 lowercase hexadecimal characters"
+        )
+    return value
+
+
 def _add_skills_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--actor-pid",
@@ -1102,6 +1245,15 @@ def _add_skills_parser_args(parser: argparse.ArgumentParser) -> None:
     activate = sub.add_parser("activate", help="Activate a registered skill in a process")
     activate.add_argument("pid")
     activate.add_argument("skill_id")
+    activate.add_argument(
+        "--expected-package-sha256",
+        required=True,
+        type=_parse_exact_sha256,
+        help=(
+            "Exact package_sha256 returned by skills discover for the package "
+            "version to activate."
+        ),
+    )
     unload = sub.add_parser("unload", help="Unload a skill from a process")
     unload.add_argument("pid")
     unload.add_argument("skill_id")
@@ -1158,7 +1310,13 @@ def _run_skills_command(runtime: Runtime, args: argparse.Namespace) -> dict[str,
             source_type=args.source_type,
         )
     if command == "activate":
-        return runtime.skills.activate_skill(args.pid, args.skill_id, actor=actor, require_capability=require_capability)
+        return runtime.skills.activate_skill(
+            args.pid,
+            args.skill_id,
+            actor=actor,
+            require_capability=require_capability,
+            expected_package_sha256=args.expected_package_sha256,
+        )
     if command == "unload":
         return runtime.skills.unload_skill(args.pid, args.skill_id, actor=actor, require_capability=require_capability)
     if command == "trust":
@@ -1224,24 +1382,57 @@ def _add_capability_spec_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--metadata-json", default="{}", help="Capability metadata JSON object.")
 
 
+def _validated_capability_list_limit(
+    runtime: Runtime,
+    value: object,
+) -> int:
+    configured_limit = runtime.config.capability.list_limit
+    selected = configured_limit if value is None else value
+    if type(selected) is not int or selected <= 0:
+        raise LibOSValidationError(
+            "capability list limit must be a positive integer"
+        )
+    if selected > configured_limit:
+        raise LibOSValidationError(
+            f"capability list limit must be at most {configured_limit}"
+        )
+    return selected
+
+
+def _list_capabilities_for_cli(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    actor: str,
+    process_mode: bool,
+) -> list[dict[str, Any]]:
+    selected_limit = _validated_capability_list_limit(runtime, args.limit)
+    subject = args.subject or (actor if process_mode else None)
+    if process_mode and subject != actor:
+        runtime.capability.require(
+            actor,
+            f"process:{subject}",
+            CapabilityRight.ADMIN,
+        )
+    caps = runtime.capability.list_for_presentation(
+        subject=subject,
+        include_inactive=args.include_inactive,
+        limit=selected_limit,
+    )
+    return [runtime.capability.inspect(cap.cap_id) for cap in caps]
+
+
 def _run_capabilities_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
     actor = args.actor_pid or "cli.admin"
     process_mode = args.actor_pid is not None
     command = args.capabilities_command
     if command == "list":
-        subject = args.subject or (actor if process_mode else None)
-        if process_mode and subject != actor:
-            runtime.capability.require(actor, f"process:{subject}", CapabilityRight.ADMIN)
-        caps = runtime.capability.list_subject(
-            subject,
-            include_inactive=args.include_inactive,
-            limit=args.limit,
-        ) if subject is not None else runtime.store.list_capabilities()
-        if subject is None:
-            if not args.include_inactive:
-                caps = [cap for cap in caps if cap.active]
-            caps = caps[: (args.limit or runtime.config.capability.list_limit)]
-        return [runtime.capability.inspect(cap.cap_id) for cap in caps]
+        return _list_capabilities_for_cli(
+            runtime,
+            args,
+            actor=actor,
+            process_mode=process_mode,
+        )
     if command == "inspect":
         cap = runtime.store.get_capability(args.capability_id)
         if cap is None:

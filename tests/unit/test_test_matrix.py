@@ -22,6 +22,8 @@ def _args(**overrides: object) -> argparse.Namespace:
         "dist": "loadfile",
         "max_lane_seconds": test_matrix.DEFAULT_MAX_LANE_SECONDS,
         "durations": None,
+        "shard_count": 1,
+        "shard_index": 0,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -62,6 +64,21 @@ class TestTestMatrix:
             "AGENT_LIBOS_KEEP_AGENT_OUTPUTS": "1"
         }
 
+    def test_pytest_command_receives_execution_receipt_plugin(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        command = test_matrix._commands_for(_args(lane="unit"))[0]
+        receipt = tmp_path / "receipt.json"
+
+        wrapped = test_matrix._with_invariant_receipt(command, receipt)
+
+        assert wrapped.argv[3:5] == ["-p", "scripts.check_test_invariants"]
+        assert wrapped.env == {
+            "AGENT_LIBOS_INVARIANT_EXECUTION_RECEIPT": str(receipt)
+        }
+        assert command.env is None
+
     def test_pytest_environment_combines_real_llm_and_output_retention(self) -> None:
         assert test_matrix._pytest_env(
             _args(run_real_llm=True, keep_agent_outputs=True)
@@ -80,6 +97,51 @@ class TestTestMatrix:
         command = test_matrix._pytest_args(("tests/security",), _args(durations=25))
 
         assert command[4:6] == ["--durations", "25"]
+
+    @pytest.mark.parametrize(
+        ("lane", "shard_count"),
+        [("runtime", 2), ("providers", 3)],
+    )
+    def test_lane_shards_are_complete_disjoint_and_weight_balanced(
+        self,
+        lane: str,
+        shard_count: int,
+    ) -> None:
+        commands = [
+            test_matrix._commands_for(
+                _args(
+                    lane=lane,
+                    shard_count=shard_count,
+                    shard_index=shard_index,
+                )
+            )[0]
+            for shard_index in range(shard_count)
+        ]
+        shard_paths = [
+            set(command.invariant_test_paths or ()) for command in commands
+        ]
+        expected = {
+            path.relative_to(test_matrix.ROOT).as_posix()
+            for path in (
+                test_matrix.ROOT / test_matrix.LANE_PATHS[lane][0]
+            ).glob("test_*.py")
+        }
+
+        assert [command.name for command in commands] == [
+            f"pytest {lane} shard {index + 1}/{shard_count}"
+            for index in range(shard_count)
+        ]
+        assert all(shard_paths)
+        combined = set().union(*shard_paths)
+        assert sum(len(paths) for paths in shard_paths) == len(combined)
+        assert combined == expected
+        weights = [
+            sum((test_matrix.ROOT / path).stat().st_size for path in paths)
+            for paths in shard_paths
+        ]
+        assert max(weights) - min(weights) <= max(
+            (test_matrix.ROOT / path).stat().st_size for path in expected
+        )
 
     def test_runtime_lane_defaults_to_bounded_parallel_worksteal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         parser = argparse.ArgumentParser()
@@ -198,6 +260,12 @@ class TestTestMatrix:
             with pytest.raises(argparse.ArgumentTypeError):
                 test_matrix._nonnegative_integer(value)
 
+    def test_shard_count_requires_a_positive_integer(self) -> None:
+        assert test_matrix._positive_integer("2") == 2
+        for value in ("0", "-1", "1.5", "not-a-number"):
+            with pytest.raises(argparse.ArgumentTypeError):
+                test_matrix._positive_integer(value)
+
     def test_individual_lane_timeout_terminates_the_command(self) -> None:
         started = time.monotonic()
 
@@ -274,6 +342,57 @@ time.sleep(30)
             final_status = None
         assert final_status in {None, psutil.STATUS_ZOMBIE}
 
+    def test_successful_command_terminates_a_spawned_descendant(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        child_pid_file = tmp_path / "successful-child.pid"
+        child_code = """
+import signal
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+"""
+        parent_code = """
+import pathlib
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, "-c", sys.argv[1]])
+pathlib.Path(sys.argv[2]).write_text(str(child.pid), encoding="utf-8")
+"""
+
+        status = test_matrix._run(
+            test_matrix.Command(
+                "successful process-tree regression",
+                [
+                    test_matrix.sys.executable,
+                    "-c",
+                    parent_code,
+                    child_code,
+                    str(child_pid_file),
+                ],
+            ),
+            max_seconds=2,
+        )
+
+        assert status == 0
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 2
+        while psutil.pid_exists(child_pid) and time.monotonic() < deadline:
+            try:
+                if psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.01)
+        try:
+            final_status = psutil.Process(child_pid).status()
+        except psutil.NoSuchProcess:
+            final_status = None
+        assert final_status in {None, psutil.STATUS_ZOMBIE}
+
     @pytest.mark.skipif(test_matrix.os.name != "posix", reason="POSIX process-group assertion")
     def test_timeout_commands_start_in_a_new_posix_session(self) -> None:
         assert test_matrix._process_group_options() == {"start_new_session": True}
@@ -291,4 +410,18 @@ time.sleep(30)
             test_matrix._validate_args(
                 parser,
                 _args(lane="gui", keep_agent_outputs=True),
+            )
+
+    def test_sharding_rejects_invalid_index_and_aggregate_lanes(self) -> None:
+        parser = argparse.ArgumentParser()
+
+        with pytest.raises(SystemExit):
+            test_matrix._validate_args(
+                parser,
+                _args(shard_count=2, shard_index=2),
+            )
+        with pytest.raises(SystemExit):
+            test_matrix._validate_args(
+                parser,
+                _args(lane="all", shard_count=2, shard_index=0),
             )

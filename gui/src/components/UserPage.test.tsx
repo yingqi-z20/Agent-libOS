@@ -27,20 +27,23 @@ describe("UserPage", () => {
     const html = renderToStaticMarkup(
       <I18nProvider initialLanguage="en">
         <UserPage
+          notices={<section data-testid="embedded-notices">Runtime notice</section>}
           connection={{ url: "http://127.0.0.1:1", token: "test", db: "local" }}
           snapshot={emptySnapshot()}
           selectedPid={null}
           selectedProcess={null}
           taskLabels={{}}
-          maxQuanta={4}
+          taskSettings={{
+            image: "coding-agent:v0",
+            llmProfile: "",
+            maxQuantaInput: "4",
+            workingDirectory: "",
+            workspaceAccess: "edit",
+            allowGitRequests: true,
+            commandAccess: "none",
+            contextMaintenance: true
+          }}
           spawnGoal="Review this project"
-          spawnImage="coding-agent:v0"
-          spawnLlmProfile=""
-          spawnWorkingDirectory=""
-          spawnWorkspaceAccess="edit"
-          spawnAllowGitRequests
-          spawnCommandAccess="none"
-          spawnContextMaintenance
           message=""
           images={[]}
           llmProfiles={[]}
@@ -48,12 +51,7 @@ describe("UserPage", () => {
           onMaxQuantaChange={() => undefined}
           onSpawnGoalChange={() => undefined}
           onSpawnImageChange={() => undefined}
-          onSpawnLlmProfileChange={() => undefined}
-          onSpawnWorkingDirectoryChange={() => undefined}
-          onSpawnWorkspaceAccessChange={() => undefined}
-          onSpawnAllowGitRequestsChange={() => undefined}
-          onSpawnCommandAccessChange={() => undefined}
-          onSpawnContextMaintenanceChange={() => undefined}
+          onApplyTaskSettings={() => undefined}
           onMessageChange={() => undefined}
           onSpawn={() => undefined}
           onImportImage={() => undefined}
@@ -75,10 +73,22 @@ describe("UserPage", () => {
     );
 
     expect(html).toContain('href="#primary-workspace"');
+    expect(html).toContain('data-testid="embedded-notices"');
+    expect(html.indexOf("userTopBar")).toBeLessThan(html.indexOf('data-testid="embedded-notices"'));
+    expect(html.indexOf('data-testid="embedded-notices"')).toBeLessThan(html.indexOf("userWorkspace"));
     expect(html).toContain('aria-label="Task navigation and controls"');
     expect(html).toContain('aria-controls="task-sidebar"');
     expect(html).toContain("What should the Agent work on?");
-    expect(html).toContain("Runtime and permissions");
+    expect(html).toContain("Task settings");
+    expect(html).toContain('aria-haspopup="dialog"');
+    expect(html).toContain("Edit settings");
+    expect(html).toContain("coding-agent:v0");
+    expect(html).toContain("Image/runtime default");
+    expect(html).toContain("Read and write (approval required)");
+    expect(html).toContain("Git requests");
+    expect(html).toContain("Context maintenance");
+    expect(html).not.toContain('type="checkbox"');
+    expect(html).not.toContain("Enable persistent context enrichment and bounded maintenance");
     expect(html).toContain("Ctrl/⌘+Enter");
     expect(html).not.toContain("userImageControls");
   });

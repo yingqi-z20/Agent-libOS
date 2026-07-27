@@ -1,19 +1,29 @@
 import { Plus, Save, Settings, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { LLMProfileInput, LLMProfileSummary } from "../api/types";
 import { useI18n } from "../i18n";
 import { Modal } from "./Modal";
 
-type LLMProfileSelectProps = {
+export type LLMProfileSelectProps = {
   profiles: LLMProfileSummary[];
   value: string;
   label?: string;
   disabled?: boolean;
   initialManageOpen?: boolean;
+  onManage?: () => void;
   onChange(value: string): void;
   onCreate(profile: LLMProfileInput): Promise<boolean>;
   onUpdate(profileId: string, profile: LLMProfileInput): Promise<boolean>;
   onDelete(profileId: string): Promise<boolean>;
+};
+
+export type LLMProfileManagerDialogProps = {
+  profiles: LLMProfileSummary[];
+  selectedProfileId: string;
+  onCreate(profile: LLMProfileInput): Promise<boolean>;
+  onUpdate(profileId: string, profile: LLMProfileInput): Promise<boolean>;
+  onDelete(profileId: string): Promise<boolean>;
+  onClose(): void;
 };
 
 type ProfileFormState = {
@@ -68,20 +78,22 @@ export function LLMProfileSelect({
   label,
   disabled = false,
   initialManageOpen = false,
+  onManage,
   onChange,
   onCreate,
   onUpdate,
   onDelete
 }: LLMProfileSelectProps) {
   const { t } = useI18n();
+  const labelId = useId();
   const [manageOpen, setManageOpen] = useState(initialManageOpen);
   const selected = profiles.find((profile) => profile.profile_id === value) ?? null;
   return (
     <div className="llmProfileSelect">
-      <label>
-        <span>{label ?? t("llmProfile.label")}</span>
+      <div className="llmProfileSelectField">
+        <span id={labelId}>{label ?? t("llmProfile.label")}</span>
         <div className="llmProfileSelectRow">
-          <select value={selected ? value : ""} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)}>
+          <select aria-labelledby={labelId} value={selected ? value : ""} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)}>
             <option value="">{t("llmProfile.defaultOption")}</option>
             {profiles.map((profile) => (
               <option key={profile.profile_id} value={profile.profile_id}>
@@ -89,15 +101,24 @@ export function LLMProfileSelect({
               </option>
             ))}
           </select>
-          <button type="button" className="iconTextButton" disabled={disabled} onClick={() => setManageOpen(true)} title={t("llmProfile.manage")}>
+          <button
+            type="button"
+            className="iconTextButton"
+            disabled={disabled}
+            onClick={() => {
+              if (onManage) onManage();
+              else setManageOpen(true);
+            }}
+            title={t("llmProfile.manage")}
+          >
             <Settings size={14} />{t("llmProfile.manage")}
           </button>
         </div>
-      </label>
+      </div>
       {selected && !selected.api_key_env_present ? (
         <div className="llmProfileWarning">{t("llmProfile.envMissing", { env: selected.api_key_env })}</div>
       ) : null}
-      {manageOpen ? (
+      {!onManage && manageOpen ? (
         <LLMProfileManagerDialog
           profiles={profiles}
           selectedProfileId={selected?.profile_id ?? ""}
@@ -111,21 +132,14 @@ export function LLMProfileSelect({
   );
 }
 
-function LLMProfileManagerDialog({
+export function LLMProfileManagerDialog({
   profiles,
   selectedProfileId,
   onCreate,
   onUpdate,
   onDelete,
   onClose
-}: {
-  profiles: LLMProfileSummary[];
-  selectedProfileId: string;
-  onCreate(profile: LLMProfileInput): Promise<boolean>;
-  onUpdate(profileId: string, profile: LLMProfileInput): Promise<boolean>;
-  onDelete(profileId: string): Promise<boolean>;
-  onClose(): void;
-}) {
+}: LLMProfileManagerDialogProps) {
   const { t } = useI18n();
   const initialProfile = profiles.find((profile) => profile.profile_id === selectedProfileId && profile.editable) ?? null;
   const [editingId, setEditingId] = useState(initialProfile?.profile_id ?? "");
@@ -133,8 +147,16 @@ function LLMProfileManagerDialog({
   const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const deleteConfirmTitleId = useId();
+  const deleteConfirmDescriptionId = useId();
+  const deleteCancelRef = useRef<HTMLButtonElement>(null);
+  const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const editing = useMemo(() => profiles.find((profile) => profile.profile_id === editingId) ?? null, [editingId, profiles]);
   const canSave = Boolean(form.profile_id.trim() && form.model.trim() && form.api_key_env.trim() && !busy && (!editing || editing.editable));
+
+  useEffect(() => {
+    if (pendingDeleteId) deleteCancelRef.current?.focus();
+  }, [pendingDeleteId]);
 
   function edit(profile: LLMProfileSummary) {
     setEditingId(profile.profile_id);
@@ -148,6 +170,16 @@ function LLMProfileManagerDialog({
     setForm(emptyForm);
     setLocalError(null);
     setPendingDeleteId(null);
+  }
+
+  function cancelDelete() {
+    const profileId = pendingDeleteId;
+    setPendingDeleteId(null);
+    if (!profileId) return;
+    globalThis.setTimeout(() => {
+      const trigger = deleteButtonRefs.current.get(profileId);
+      if (trigger?.isConnected && !trigger.disabled) trigger.focus();
+    }, 0);
   }
 
   async function save() {
@@ -201,19 +233,23 @@ function LLMProfileManagerDialog({
     >
         <div className="llmProfileManager">
           <section className="llmProfileList" aria-label={t("llmProfile.list")}>
-            <button type="button" className={!editingId ? "active" : ""} onClick={startNew}><Plus size={14} />{t("llmProfile.add")}</button>
+            <button type="button" className={!editingId ? "active" : ""} aria-pressed={!editingId} disabled={busy} onClick={startNew}><Plus size={14} />{t("llmProfile.add")}</button>
             {profiles.map((profile) => (
               <div className="llmProfileListItem" key={profile.profile_id}>
-                <button type="button" className={editingId === profile.profile_id ? "active" : ""} onClick={() => edit(profile)}>
+                <button type="button" className={editingId === profile.profile_id ? "active" : ""} aria-pressed={editingId === profile.profile_id} disabled={busy} onClick={() => edit(profile)}>
                   <span>{profile.profile_id}</span>
                   <small>{profile.source}{profile.is_default ? ` · ${t("llmProfile.defaultBadge")}` : ""}</small>
                 </button>
                 <button
+                  ref={(node) => {
+                    if (node) deleteButtonRefs.current.set(profile.profile_id, node);
+                    else deleteButtonRefs.current.delete(profile.profile_id);
+                  }}
                   type="button"
                   className="iconOnly danger"
                   disabled={!profile.editable || busy}
-                  aria-label={profile.editable ? t("llmProfile.delete") : t("llmProfile.readOnly")}
-                  title={profile.editable ? t("llmProfile.delete") : t("llmProfile.readOnly")}
+                  aria-label={`${profile.editable ? t("llmProfile.delete") : t("llmProfile.readOnly")}: ${profile.profile_id}`}
+                  title={`${profile.editable ? t("llmProfile.delete") : t("llmProfile.readOnly")}: ${profile.profile_id}`}
                   onClick={() => setPendingDeleteId(profile.profile_id)}
                 >
                   <Trash2 size={14} />
@@ -223,100 +259,114 @@ function LLMProfileManagerDialog({
           </section>
           <section className="llmProfileForm" aria-label={t("llmProfile.form")}>
             {pendingDeleteId ? (
-              <div className="inlineConfirm" role="group" aria-label={t("llmProfile.deleteConfirmTitle")}>
-                <strong>{t("llmProfile.deleteConfirmTitle")}</strong>
-                <span>{t("llmProfile.deleteConfirmMessage", { profile: pendingDeleteId })}</span>
+              <div
+                className="inlineConfirm"
+                role="alertdialog"
+                aria-labelledby={deleteConfirmTitleId}
+                aria-describedby={deleteConfirmDescriptionId}
+                onKeyDown={(event) => {
+                  if (event.key !== "Escape" || busy) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  cancelDelete();
+                }}
+              >
+                <strong id={deleteConfirmTitleId}>{t("llmProfile.deleteConfirmTitle")}</strong>
+                <span id={deleteConfirmDescriptionId}>{t("llmProfile.deleteConfirmMessage", { profile: pendingDeleteId })}</span>
                 <div className="adminActions">
-                  <button className="secondary" disabled={busy} onClick={() => setPendingDeleteId(null)}>{t("confirm.cancel")}</button>
+                  <button ref={deleteCancelRef} className="secondary" disabled={busy} onClick={cancelDelete}>{t("confirm.cancel")}</button>
                   <button className="danger" disabled={busy} onClick={() => void remove(pendingDeleteId)}>{t("llmProfile.delete")}</button>
                 </div>
               </div>
             ) : null}
             {editing && !editing.editable ? <div className="llmProfileWarning">{t("llmProfile.readOnly")}</div> : null}
-            <label>
-              {t("llmProfile.profileId")}
-              <input value={form.profile_id} disabled={Boolean(editingId)} onChange={(event) => setForm({ ...form, profile_id: event.currentTarget.value })} />
-            </label>
-            <label>
-              {t("llmProfile.model")}
-              <input value={form.model} onChange={(event) => setForm({ ...form, model: event.currentTarget.value })} />
-            </label>
-            <label>
-              {t("llmProfile.baseUrl")}
-              <input value={form.base_url} placeholder="https://provider.example/v1" onChange={(event) => setForm({ ...form, base_url: event.currentTarget.value })} />
-            </label>
-            <label>
-              {t("llmProfile.apiKeyEnv")}
-              <input value={form.api_key_env} onChange={(event) => setForm({ ...form, api_key_env: event.currentTarget.value })} />
-            </label>
-            <label>
-              {t("llmProfile.apiMode")}
-              <select value={form.api_mode} onChange={(event) => setForm({ ...form, api_mode: event.currentTarget.value as ProfileFormState["api_mode"] })}>
-                <option value="">{t("llmProfile.inherit")}</option>
-                <option value="auto">auto</option>
-                <option value="responses">responses</option>
-                <option value="chat">chat</option>
-              </select>
-            </label>
-            <div className="llmProfileFormGrid">
+            <fieldset className="llmProfileFormFields" disabled={busy || Boolean(editing && !editing.editable)}>
+              <legend className="srOnly">{t("llmProfile.form")}</legend>
               <label>
-                {t("llmProfile.reasoningEffort")}
-                <input value={form.reasoning_effort} onChange={(event) => setForm({ ...form, reasoning_effort: event.currentTarget.value })} />
+                {t("llmProfile.profileId")}
+                <input required value={form.profile_id} disabled={Boolean(editingId)} onChange={(event) => setForm({ ...form, profile_id: event.currentTarget.value })} />
               </label>
               <label>
-                {t("llmProfile.verbosity")}
-                <select value={form.verbosity} onChange={(event) => setForm({ ...form, verbosity: event.currentTarget.value as ProfileFormState["verbosity"] })}>
+                {t("llmProfile.model")}
+                <input required value={form.model} onChange={(event) => setForm({ ...form, model: event.currentTarget.value })} />
+              </label>
+              <label>
+                {t("llmProfile.baseUrl")}
+                <input value={form.base_url} placeholder="https://provider.example/v1" onChange={(event) => setForm({ ...form, base_url: event.currentTarget.value })} />
+              </label>
+              <label>
+                {t("llmProfile.apiKeyEnv")}
+                <input required value={form.api_key_env} onChange={(event) => setForm({ ...form, api_key_env: event.currentTarget.value })} />
+              </label>
+              <label>
+                {t("llmProfile.apiMode")}
+                <select value={form.api_mode} onChange={(event) => setForm({ ...form, api_mode: event.currentTarget.value as ProfileFormState["api_mode"] })}>
                   <option value="">{t("llmProfile.inherit")}</option>
-                  <option value="low">low</option>
-                  <option value="medium">medium</option>
-                  <option value="high">high</option>
+                  <option value="auto">auto</option>
+                  <option value="responses">responses</option>
+                  <option value="chat">chat</option>
                 </select>
               </label>
-              <label>
-                {t("llmProfile.safetyIdentifierEnv")}
-                <input value={form.safety_identifier_env} placeholder="OPENAI_SAFETY_IDENTIFIER" onChange={(event) => setForm({ ...form, safety_identifier_env: event.currentTarget.value })} />
-              </label>
-              <label>
-                {t("llmProfile.promptCacheRetention")}
-                <select value={form.prompt_cache_retention} onChange={(event) => setForm({ ...form, prompt_cache_retention: event.currentTarget.value as ProfileFormState["prompt_cache_retention"] })}>
-                  <option value="">{t("llmProfile.inherit")}</option>
-                  <option value="in_memory">in_memory</option>
-                  <option value="24h">24h</option>
-                </select>
-              </label>
-              <label>
-                {t("llmProfile.temperature")}
-                <input type="number" step="0.1" value={form.temperature} onChange={(event) => setForm({ ...form, temperature: event.currentTarget.value })} />
-              </label>
-              <label>
-                {t("llmProfile.maxTokens")}
-                <input type="number" min={1} step={1} value={form.max_tokens} onChange={(event) => setForm({ ...form, max_tokens: event.currentTarget.value })} />
-              </label>
-              <label>
-                {t("llmProfile.contextWindowTokens")}
-                <input type="number" min={1} step={1} value={form.context_window_tokens} onChange={(event) => setForm({ ...form, context_window_tokens: event.currentTarget.value })} />
-              </label>
-              <label>
-                {t("llmProfile.timeout")}
-                <input type="number" min={0.1} step="0.1" value={form.timeout_s} onChange={(event) => setForm({ ...form, timeout_s: event.currentTarget.value })} />
-              </label>
-              <label>
-                {t("llmProfile.maxRetries")}
-                <input type="number" min={0} step={1} value={form.max_retries} onChange={(event) => setForm({ ...form, max_retries: event.currentTarget.value })} />
-              </label>
-            </div>
-            <div className="llmProfileFormGrid">
-              <BooleanSelect label={t("llmProfile.store")} value={form.store} onChange={(store) => setForm({ ...form, store })} />
-              <BooleanSelect label={t("llmProfile.previousResponseId")} value={form.responses_previous_response_id} onChange={(responses_previous_response_id) => setForm({ ...form, responses_previous_response_id })} />
-              <BooleanSelect label={t("llmProfile.parallelTools")} value={form.parallel_tool_calls} onChange={(parallel_tool_calls) => setForm({ ...form, parallel_tool_calls })} />
-              <BooleanSelect label={t("llmProfile.autoWait")} value={form.auto_wait_on_empty_tool_calls} onChange={(auto_wait_on_empty_tool_calls) => setForm({ ...form, auto_wait_on_empty_tool_calls })} />
-              <BooleanSelect label={t("llmProfile.fallbackJsonActions")} value={form.fallback_json_actions} onChange={(fallback_json_actions) => setForm({ ...form, fallback_json_actions })} />
-              <label className="toggle">
-                <input type="checkbox" checked={form.allow_custom_base_url} onChange={(event) => setForm({ ...form, allow_custom_base_url: event.currentTarget.checked })} />
-                {t("llmProfile.allowCustomBaseUrl")}
-              </label>
-            </div>
-            {localError ? <div className="llmProfileWarning">{localError}</div> : null}
+              <div className="llmProfileFormGrid">
+                <label>
+                  {t("llmProfile.reasoningEffort")}
+                  <input value={form.reasoning_effort} onChange={(event) => setForm({ ...form, reasoning_effort: event.currentTarget.value })} />
+                </label>
+                <label>
+                  {t("llmProfile.verbosity")}
+                  <select value={form.verbosity} onChange={(event) => setForm({ ...form, verbosity: event.currentTarget.value as ProfileFormState["verbosity"] })}>
+                    <option value="">{t("llmProfile.inherit")}</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                  </select>
+                </label>
+                <label>
+                  {t("llmProfile.safetyIdentifierEnv")}
+                  <input value={form.safety_identifier_env} placeholder="OPENAI_SAFETY_IDENTIFIER" onChange={(event) => setForm({ ...form, safety_identifier_env: event.currentTarget.value })} />
+                </label>
+                <label>
+                  {t("llmProfile.promptCacheRetention")}
+                  <select value={form.prompt_cache_retention} onChange={(event) => setForm({ ...form, prompt_cache_retention: event.currentTarget.value as ProfileFormState["prompt_cache_retention"] })}>
+                    <option value="">{t("llmProfile.inherit")}</option>
+                    <option value="in_memory">in_memory</option>
+                    <option value="24h">24h</option>
+                  </select>
+                </label>
+                <label>
+                  {t("llmProfile.temperature")}
+                  <input type="number" step="0.1" value={form.temperature} onChange={(event) => setForm({ ...form, temperature: event.currentTarget.value })} />
+                </label>
+                <label>
+                  {t("llmProfile.maxTokens")}
+                  <input type="number" min={1} step={1} value={form.max_tokens} onChange={(event) => setForm({ ...form, max_tokens: event.currentTarget.value })} />
+                </label>
+                <label>
+                  {t("llmProfile.contextWindowTokens")}
+                  <input type="number" min={1} step={1} value={form.context_window_tokens} onChange={(event) => setForm({ ...form, context_window_tokens: event.currentTarget.value })} />
+                </label>
+                <label>
+                  {t("llmProfile.timeout")}
+                  <input type="number" min={0.1} step="0.1" value={form.timeout_s} onChange={(event) => setForm({ ...form, timeout_s: event.currentTarget.value })} />
+                </label>
+                <label>
+                  {t("llmProfile.maxRetries")}
+                  <input type="number" min={0} step={1} value={form.max_retries} onChange={(event) => setForm({ ...form, max_retries: event.currentTarget.value })} />
+                </label>
+              </div>
+              <div className="llmProfileFormGrid">
+                <BooleanSelect label={t("llmProfile.store")} value={form.store} onChange={(store) => setForm({ ...form, store })} />
+                <BooleanSelect label={t("llmProfile.previousResponseId")} value={form.responses_previous_response_id} onChange={(responses_previous_response_id) => setForm({ ...form, responses_previous_response_id })} />
+                <BooleanSelect label={t("llmProfile.parallelTools")} value={form.parallel_tool_calls} onChange={(parallel_tool_calls) => setForm({ ...form, parallel_tool_calls })} />
+                <BooleanSelect label={t("llmProfile.autoWait")} value={form.auto_wait_on_empty_tool_calls} onChange={(auto_wait_on_empty_tool_calls) => setForm({ ...form, auto_wait_on_empty_tool_calls })} />
+                <BooleanSelect label={t("llmProfile.fallbackJsonActions")} value={form.fallback_json_actions} onChange={(fallback_json_actions) => setForm({ ...form, fallback_json_actions })} />
+                <label className="toggle">
+                  <input type="checkbox" checked={form.allow_custom_base_url} onChange={(event) => setForm({ ...form, allow_custom_base_url: event.currentTarget.checked })} />
+                  {t("llmProfile.allowCustomBaseUrl")}
+                </label>
+              </div>
+            </fieldset>
+            {localError ? <div className="llmProfileWarning" role="alert">{localError}</div> : null}
           </section>
         </div>
     </Modal>

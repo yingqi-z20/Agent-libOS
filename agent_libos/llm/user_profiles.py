@@ -9,11 +9,14 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from pydantic import ValidationError as PydanticValidationError
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile
+from agent_libos.config.defaults import (
+    sanitize_llm_base_url_for_summary,
+    validate_llm_base_url,
+)
 from agent_libos.models.exceptions import NotFound, ValidationError
 
 SCHEMA_VERSION = 1
@@ -250,7 +253,7 @@ def summarize_llm_profile(
     return {
         "profile_id": profile_id,
         "model": profile.model,
-        "base_url": profile.base_url,
+        "base_url": sanitize_llm_base_url_for_summary(profile.base_url),
         "api_key_env": api_key_env,
         "api_key_env_present": bool(str(selected_env.get(api_key_env) or "").strip()),
         "api_mode": profile.api_mode,
@@ -318,9 +321,10 @@ def _optional_base_url(value: Any) -> str | None:
     selected = _optional_string(value, "base_url")
     if selected is None:
         return None
-    parsed = urlparse(selected)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValidationError("LLM profile base_url must be an HTTP(S) URL")
+    try:
+        validate_llm_base_url(selected)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
     return selected.rstrip("/")
 
 

@@ -12,7 +12,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.capability.rules import AUTHORITY_RULES_KEY, ShellRuleEngine
+from agent_libos.capability.rules import AUTHORITY_RULES_KEY, RuleMatch, ShellRuleEngine
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellPolicyLevel
 from agent_libos.models import (
     AuthorityRisk,
@@ -230,7 +230,10 @@ class ShellAdapter:
         self.provider = provider or LocalShellProvider(cwd or ".")
         provider_cwd = getattr(self.provider, "cwd", None)
         self.cwd = Path(cwd if cwd is not None else provider_cwd or ".").resolve()
-        self.rule_engine = ShellRuleEngine(self._configured_rules())
+        self.rule_engine = ShellRuleEngine(
+            self._configured_rules(),
+            evaluator=self.capabilities.evaluator,
+        )
 
     def run(
         self,
@@ -412,21 +415,16 @@ class ShellAdapter:
                     if executable_snapshot is not None:
                         executable_snapshot.close()
                 proc = replace(self._bounded_result(proc), argv=list(checked))
-            except SubprocessTimeoutExpired as exc:
-                self._charge_subprocess_metrics(pid, exc.metrics, resource=resource, argv=checked, cwd=cwd, allow_overage=True)
-                raise TimeoutError(f"shell command timed out after {selected_timeout}s: {checked}") from exc
-            except subprocess.TimeoutExpired as exc:
-                raise TimeoutError(f"shell command timed out after {selected_timeout}s: {checked}") from exc
-            except SubprocessLimitExceeded as exc:
-                self._charge_subprocess_metrics(pid, exc.metrics, resource=resource, argv=checked, cwd=cwd, allow_overage=True)
-                reason = str(exc)
-                if self.resources is not None:
-                    self.resources.kill_if_exceeded(
-                        pid,
-                        reason=reason,
-                        limit={"kind": exc.metrics.limit_kind, "metrics": self._metrics_json(exc.metrics)},
-                    )
-                raise ResourceLimitExceeded(reason) from exc
+            except Exception as exc:
+                self._raise_subprocess_failure(
+                    exc,
+                    pid=pid,
+                    resource=resource,
+                    argv=checked,
+                    cwd=cwd,
+                    timeout=selected_timeout,
+                )
+                raise
 
             result_observation = {
                 "returncode": proc.returncode,
@@ -494,6 +492,73 @@ class ShellAdapter:
                 resource=resource_settlement,
             )
             return completed
+
+    def _raise_subprocess_failure(
+        self,
+        error: Exception,
+        *,
+        pid: str,
+        resource: str,
+        argv: list[str],
+        cwd: str | os.PathLike[str] | None,
+        timeout: float,
+    ) -> None:
+        """Translate nested provider timeout/limit failures at one boundary."""
+
+        timeout_error = self._exception_from_cause_chain(
+            error,
+            (SubprocessTimeoutExpired, subprocess.TimeoutExpired),
+        )
+        if timeout_error is not None:
+            try:
+                self._charge_subprocess_metrics(
+                    pid,
+                    getattr(timeout_error, "metrics", None),
+                    resource=resource,
+                    argv=argv,
+                    cwd=cwd,
+                    allow_overage=True,
+                )
+            except ResourceLimitExceeded:
+                # The usage and terminal resource transition are already
+                # durable. Preserve the provider timeout as the boundary's
+                # explicit classification instead of masking it with the
+                # accounting overage raised after charge.
+                pass
+            raise TimeoutError(
+                f"shell command timed out after {timeout}s: {argv}"
+            ) from error
+
+        limit_error = self._exception_from_cause_chain(
+            error,
+            (SubprocessLimitExceeded,),
+        )
+        if limit_error is None:
+            return
+        assert isinstance(limit_error, SubprocessLimitExceeded)
+        accounting_killed = False
+        try:
+            self._charge_subprocess_metrics(
+                pid,
+                limit_error.metrics,
+                resource=resource,
+                argv=argv,
+                cwd=cwd,
+                allow_overage=True,
+            )
+        except ResourceLimitExceeded:
+            accounting_killed = True
+        reason = str(limit_error)
+        if self.resources is not None and not accounting_killed:
+            self.resources.kill_if_exceeded(
+                pid,
+                reason=reason,
+                limit={
+                    "kind": limit_error.metrics.limit_kind,
+                    "metrics": self._metrics_json(limit_error.metrics),
+                },
+            )
+        raise ResourceLimitExceeded(reason) from error
 
     def _harden_read_only_git_argv(self, argv: list[str]) -> list[str]:
         return self.harden_read_only_git_argv(argv)
@@ -687,20 +752,30 @@ class ShellAdapter:
         error: BaseException,
         phase: str,
     ) -> ProtectedOperationEvidence:
-        if isinstance(error, (SubprocessTimeoutExpired, subprocess.TimeoutExpired)):
+        classified_error = self._exception_from_cause_chain(
+            error,
+            (
+                SubprocessTimeoutExpired,
+                subprocess.TimeoutExpired,
+                SubprocessLimitExceeded,
+            ),
+        ) or error
+        if isinstance(classified_error, (SubprocessTimeoutExpired, subprocess.TimeoutExpired)):
             action = "primitive.shell.timeout"
-        elif isinstance(error, SubprocessLimitExceeded):
+        elif isinstance(classified_error, SubprocessLimitExceeded):
             action = "primitive.shell.resource_limit_exceeded"
         else:
             action = "primitive.shell.failed"
-        metrics = self._metrics_json(getattr(error, "metrics", None))
+        metrics = self._metrics_json(getattr(classified_error, "metrics", None))
         decision: dict[str, Any] = {
             "argv": list(argv),
             "cwd": os.fspath(cwd) if cwd is not None else None,
             "effect_outcome": "unknown",
-            "error_type": type(error).__name__,
+            "error_type": type(classified_error).__name__,
             "phase": phase,
         }
+        if classified_error is not error:
+            decision["wrapper_error_type"] = type(error).__name__
         if metrics is not None:
             decision["metrics"] = metrics
         return ProtectedOperationEvidence(
@@ -711,7 +786,7 @@ class ShellAdapter:
                 "adapter": "shell",
                 "operation": "run",
                 "outcome": "unknown",
-                "error_type": type(error).__name__,
+                "error_type": type(classified_error).__name__,
             },
             audit_action=action,
             audit_actor=pid,
@@ -720,6 +795,28 @@ class ShellAdapter:
             correlation_id=intent_record.record_id,
             parent_record_id=intent_record.record_id,
         )
+
+    @staticmethod
+    def _exception_from_cause_chain(
+        error: BaseException,
+        expected: tuple[type[BaseException], ...],
+    ) -> BaseException | None:
+        pending: list[BaseException] = [error]
+        seen: set[int] = set()
+        while pending and len(seen) < 64:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, expected):
+                return current
+            context = current.__context__
+            if context is not None and not current.__suppress_context__:
+                pending.append(context)
+            cause = current.__cause__
+            if cause is not None:
+                pending.append(cause)
+        return None
 
     async def arun(
         self,
@@ -792,78 +889,29 @@ class ShellAdapter:
         continuous_session: bool = False,
         extra_context: dict[str, Any] | None = None,
     ) -> ShellPolicyDecision:
-        rule_match = self.rule_engine.classify(argv)
-        rule = rule_match.rule
-        profile = self.capabilities.profiles.shell(
-            resource=resource,
-            effect=rule.effect,
-            risk=rule.risk,
-            rule_id=rule.rule_id,
-            argv=argv,
-            timeout_s=timeout,
-            cwd=cwd,
-        )
-        if operation != "shell.run" or continuous_session or not include_timeout_in_authority:
-            restrictions = dict(profile.restrictions)
-            if not include_timeout_in_authority:
-                restrictions.pop("timeout_s", None)
-                restrictions["startup_timeout_s"] = timeout
-            if continuous_session:
-                restrictions["continuous_session"] = True
-            profile = SandboxProfile(
-                operation=operation,
-                resource=resource,
-                effect=rule.effect,
-                risk=rule.risk,
-                rule_id=rule.rule_id,
-                restrictions=restrictions,
-            )
-        operation_context = self.operation_context(
+        rule_match, profile, operation_context = self._classify_shell_operation(
             pid,
             argv,
             resource,
             timeout=timeout,
             cwd=cwd,
-            profile=profile,
             adapter=adapter,
             primitive=primitive,
             operation=operation,
             authority_operation=authority_operation,
-            include_timeout=include_timeout_in_authority,
+            include_timeout_in_authority=include_timeout_in_authority,
             continuous_session=continuous_session,
-            extra=extra_context,
+            extra_context=extra_context,
         )
+        rule = rule_match.rule
         policy_caps = self._matching_shell_policy_caps(pid, resource, operation_context)
-        if any(
-            cap.effect == CapabilityEffect.DENY
-            or
-            cap.constraints.get(self.config.shell.policy_capability_key) == self.config.shell.always_deny_level
-            for cap in policy_caps
-        ):
-            return ShellPolicyDecision(
-                allowed=False,
-                ask_human=False,
-                reason="shell policy is always_deny",
-                policy_level=self.config.shell.always_deny_level,
-                matched_rule=rule_match.matched_argv,
-                risk=rule.risk,
-                rule_id=rule.rule_id,
-                rule_effect=rule.effect,
-                sandbox_profile=profile,
-            )
-        if rule.effect == CapabilityEffect.DENY:
-            return ShellPolicyDecision(
-                allowed=False,
-                ask_human=False,
-                reason=rule.description or "shell rule denied command",
-                policy_level=None,
-                matched_rule=rule_match.matched_argv,
-                high_risk=True,
-                risk=rule.risk,
-                rule_id=rule.rule_id,
-                rule_effect=rule.effect,
-                sandbox_profile=profile,
-            )
+        preflight_denial = self._shell_rule_preflight_denial(
+            policy_caps,
+            rule_match,
+            profile,
+        )
+        if preflight_denial is not None:
+            return preflight_denial
 
         explicit_decision = self._explicit_command_decision(pid, resource, operation_context)
         explicit_policy = explicit_decision.policy
@@ -1008,6 +1056,158 @@ class ShellAdapter:
             rule_effect=rule.effect,
             sandbox_profile=profile,
         )
+
+    def _shell_rule_preflight_denial(
+        self,
+        policy_caps: list[Capability],
+        rule_match: RuleMatch,
+        profile: SandboxProfile,
+    ) -> ShellPolicyDecision | None:
+        rule = rule_match.rule
+        if any(
+            cap.effect == CapabilityEffect.DENY
+            or
+            cap.constraints.get(self.config.shell.policy_capability_key) == self.config.shell.always_deny_level
+            for cap in policy_caps
+        ):
+            return ShellPolicyDecision(
+                allowed=False,
+                ask_human=False,
+                reason="shell policy is always_deny",
+                policy_level=self.config.shell.always_deny_level,
+                matched_rule=rule_match.matched_argv,
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
+            )
+        if rule.effect == CapabilityEffect.DENY:
+            return ShellPolicyDecision(
+                allowed=False,
+                ask_human=False,
+                reason=rule.description or "shell rule denied command",
+                policy_level=None,
+                matched_rule=rule_match.matched_argv,
+                high_risk=True,
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                rule_effect=rule.effect,
+                sandbox_profile=profile,
+            )
+        return None
+
+    def _classify_shell_operation(
+        self,
+        pid: str,
+        argv: list[str],
+        resource: str,
+        *,
+        timeout: float,
+        cwd: str,
+        adapter: str,
+        primitive: str,
+        operation: str,
+        authority_operation: str,
+        include_timeout_in_authority: bool,
+        continuous_session: bool,
+        extra_context: dict[str, Any] | None,
+    ) -> tuple[RuleMatch, SandboxProfile, dict[str, Any]]:
+        builtin_rule = self.rule_engine.classify_builtin(argv).rule
+        provisional_profile = self._profile_for_shell_rule(
+            rule=builtin_rule,
+            resource=resource,
+            argv=argv,
+            timeout=timeout,
+            cwd=cwd,
+            operation=operation,
+            include_timeout_in_authority=include_timeout_in_authority,
+            continuous_session=continuous_session,
+        )
+        classification_context = self.operation_context(
+            pid,
+            argv,
+            resource,
+            timeout=timeout,
+            cwd=cwd,
+            profile=provisional_profile,
+            adapter=adapter,
+            primitive=primitive,
+            operation=operation,
+            authority_operation=authority_operation,
+            include_timeout=include_timeout_in_authority,
+            continuous_session=continuous_session,
+            extra=extra_context,
+        )
+        # Classification conditions always see the requested launch timeout
+        # and the explicit session mode, even when those fields are omitted
+        # from the capability authority projection (for example PTY startup).
+        classification_context["timeout_s"] = timeout
+        classification_context["continuous_session"] = continuous_session
+        rule_match = self.rule_engine.classify(argv, context=classification_context)
+        profile = self._profile_for_shell_rule(
+            rule=rule_match.rule,
+            resource=resource,
+            argv=argv,
+            timeout=timeout,
+            cwd=cwd,
+            operation=operation,
+            include_timeout_in_authority=include_timeout_in_authority,
+            continuous_session=continuous_session,
+        )
+        operation_context = self.operation_context(
+            pid,
+            argv,
+            resource,
+            timeout=timeout,
+            cwd=cwd,
+            profile=profile,
+            adapter=adapter,
+            primitive=primitive,
+            operation=operation,
+            authority_operation=authority_operation,
+            include_timeout=include_timeout_in_authority,
+            continuous_session=continuous_session,
+            extra=extra_context,
+        )
+        return rule_match, profile, operation_context
+
+    def _profile_for_shell_rule(
+        self,
+        *,
+        rule: AuthorityRule,
+        resource: str,
+        argv: list[str],
+        timeout: float,
+        cwd: str,
+        operation: str,
+        include_timeout_in_authority: bool,
+        continuous_session: bool,
+    ) -> SandboxProfile:
+        profile = self.capabilities.profiles.shell(
+            resource=resource,
+            effect=rule.effect,
+            risk=rule.risk,
+            rule_id=rule.rule_id,
+            argv=argv,
+            timeout_s=timeout,
+            cwd=cwd,
+        )
+        if operation != "shell.run" or continuous_session or not include_timeout_in_authority:
+            restrictions = dict(profile.restrictions)
+            if not include_timeout_in_authority:
+                restrictions.pop("timeout_s", None)
+                restrictions["startup_timeout_s"] = timeout
+            if continuous_session:
+                restrictions["continuous_session"] = True
+            profile = SandboxProfile(
+                operation=operation,
+                resource=resource,
+                effect=rule.effect,
+                risk=rule.risk,
+                rule_id=rule.rule_id,
+                restrictions=restrictions,
+            )
+        return profile
 
     def _request_human_approval(
         self,

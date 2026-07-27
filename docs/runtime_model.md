@@ -288,10 +288,16 @@ routing.
 The default provider posture is stateless: `llm.store=false` and
 `responses_previous_response_id=false`. This limits provider-side retention; it
 is not an end-to-end privacy guarantee. By default `llm.persist_full_io=true`
-also retains full prompts, tool/reasoning records, responses, and provider error
-payloads in the RuntimeStore subject to Host retention policy and database
-access controls. Set it to `false` when that local evidence is not acceptable,
-while accounting for image modes that require durable transcript material.
+also retains prepared prompts and visible tools and, for successful responses,
+tool/reasoning records, response content, and raw provider response fields in
+the RuntimeStore subject to Host retention policy and database access controls.
+A failed call's ordinary request fields follow the same policy, but provider or
+extension exception text is never persisted or exposed to the model regardless
+of this setting; durable failure evidence contains only a stable public
+envelope and content-free internal observations such as type, length/hash, and
+correlation id. Set `persist_full_io` to `false` when full local I/O evidence is
+not acceptable, while accounting for image modes that require durable
+transcript material.
 
 The low-level OpenAI client sends an explicitly supplied
 `previous_response_id` only for an official, stored Responses request whose
@@ -612,6 +618,21 @@ async APIs remain available for event-loop hosts, but they are wrappers around
 the same scheduler and do not mean process quanta are serialized on one asyncio
 loop.
 
+When a quantum itself returns an awaitable, its worker creates a private event
+loop, tracks the main task for cross-thread cancellation, and runs it to a
+result. Before closing that loop the worker repeatedly cancels and drains every
+remaining background task, then attempts async-generator and default-executor
+shutdown using one shared scheduler shutdown-join deadline for the caller's
+bounded wait. Cleanup is not limited to the main awaitable: a
+cancellation-resistant background task or async generator makes the quantum
+fail after the bounded cleanup attempt. A default executor is detached from the
+loop and joined by a daemon monitor so its blocking `shutdown(wait=True)` cannot
+strand the quantum caller. Until that join actually succeeds, a tracked
+lifecycle future remains active; scheduler shutdown reports incomplete and
+ordinary Runtime shutdown leaves the store open rather than closing it under a
+live executor. After the monitor proves that the executor drained, shutdown can
+be retried.
+
 Unblock quanta use a second executor with the same configured capacity. During
 the bounded unblock window, normal and unblock work can therefore occupy up to
 approximately twice `max_workers`; the setting is a per-pool capacity, not a
@@ -745,11 +766,30 @@ available and continues cleanup. Success returns `ok: true`,
 `already_shutdown`, and `reason`, plus optional `warnings`; a recovery fence
 instead returns `recovery_required: true` and requires the explicit handoff
 described below.
+
 Persistent stores also take an active-runtime lease: SQLite uses a secure
-sidecar `flock` where available or an exclusive database lock as fallback, and
+path-sidecar `flock` where available and, on that hardened POSIX path, a second
+owner-only identity lease keyed by the validated database `(st_dev, st_ino)`.
+The database and lease files must be regular, current-user-owned, single-link
+files; the canonical database path is rechecked against the opened identity
+before use. This rejects database hard links and prevents a replaced lock path,
+a rename plus symlink retarget, or a different path to the same leased inode
+from admitting another Runtime. Platforms without that mechanism fall back to
+an exclusive SQLite database lock without claiming POSIX path/inode hardening.
 PostgreSQL uses a database/schema-scoped session advisory lock. Another
 writable Runtime cannot open the same database until the active Runtime closes
 and releases the lease.
+
+SQL transactions nest through savepoints. An outer commit error triggers SQL
+and Object-payload rollback only when the driver proves that the transaction is
+still active. If commit may already have applied, the Runtime treats the
+outcome as ambiguous: it neither reports rollback nor restores a cache-only
+before-image, and it poisons/closes the store data plane unless a narrow typed
+caller confirms and accepts the exact committed state. A failed nested
+`RELEASE SAVEPOINT` attempts `ROLLBACK TO` followed by `RELEASE`; payload
+before-images are restored only after that SQL recovery succeeds. Failure of
+the rollback/savepoint cleanup poisons and closes the store, so later ordinary
+reads and writes fail closed rather than observing a manufactured mixed state.
 
 Ordinary shutdown claims the exact store guard immediately before close. Its
 async form runs backend close off-loop and drains the result through caller
@@ -966,9 +1006,10 @@ syscall session, so concurrent runs cannot overwrite one another's human,
 auto-policy, or answer. Resolving one of several blocking requests leaves the
 process in `waiting_human` until no blocking request remains. After process
 exit, failure, kill, or terminal cancellation, a post-commit cleanup phase
-attempts to cancel all still-pending requests. That cancellation is best-effort
-and may leave diagnostic pending rows, but terminal-state checks still prevent
-the process from creating or receiving a new Human decision.
+attempts to cancel all still-pending requests as part of the durable
+`terminal_notify` phase. A failure leaves the process-terminal cleanup intent
+retryable and may leave diagnostic pending rows, but terminal-state checks still
+prevent the process from creating or receiving a new Human decision.
 
 ## Process Messages And IPC
 
@@ -1093,11 +1134,34 @@ Pause/resume and terminal signal state, child-budget release, signal evidence,
 and a matching parent wake are one store transaction. Cancel/terminate then
 run Human/ObjectTask terminal notification and Object/host finalization as
 independent post-commit phases: failure in one does not skip the other or make
-the durable terminal transition retryable. Cleanup failures are appended as
-`process.signal_finalize_failed` audit warnings when that sink remains
-available. A process paused after rejection of an exact conditional LLM release
-also carries a Host-only resume marker: direct-child pause/resume signals cannot
-erase or cross it, while a Host `ProcessManager.resume` clears it deliberately.
+the durable terminal transition retryable. A process paused after rejection of
+an exact conditional LLM release also carries a Host-only resume marker:
+direct-child pause/resume signals cannot erase or cross it, while a Host
+`ProcessManager.resume` clears it deliberately.
+
+Every transition to `exited`, `failed`, or `killed` creates a
+`process_terminal_cleanups` intent atomically with the terminal process row.
+The receipt moves through `pending`, `running`, `failed`, and `completed`,
+records an attempt count and ordered completed phases, and permits only the
+claimant with the exact Runtime owner and fresh lease id to mark a phase. The
+two current phases are `terminal_notify` (pending Human cancellation plus
+ObjectTask notification, with those components attempted independently) and
+`process_finalize` (Object/host memory finalization). The phase contract is
+idempotent; a completed phase is never rerun, while a partially failed phase may
+be invoked again and therefore must tolerate duplicate component calls.
+
+All unfinished phases are attempted even when an earlier phase fails. The
+receipt then retains only content-free error observations and the caller
+receives `ProcessTerminalCleanupRequired`; a control-flow `BaseException` is
+repropagated in an exception group with that typed cleanup requirement after
+the independent phases and diagnostics have run. The terminal outcome remains
+committed. While the receipt is incomplete, repeating terminal
+cancel/terminate/exit on that process retries the cleanup instead of publishing
+a second outcome, event, or wake. On reopen, startup holds the lifecycle
+recovery lease, reclaims stale cleanup leases, and retries incomplete rows in
+configured hard-bounded keyset pages before normal mutation admission opens.
+Ordinary recovery failures remain durable and appear in
+`recovered_terminal_cleanups`; they do not erase the terminal process state.
 
 ## Process Exit
 
@@ -1114,14 +1178,15 @@ memory remains available for its direct parent to merge or discard, and is
 released if that parent terminates without adopting it. Cleanup follows
 explicit Object Memory owner fields, not the object's creator provenance, and
 release revokes stale object capabilities.
+
 The terminal row, child-budget release, exit evidence, and parent wake commit
-together. Object/host finalizers and ObjectTask terminal notification run after
-that commit because their provider cleanup cannot be rolled back. Human-request
-cancellation and ObjectTask notification are attempted independently, as are
-notification and Object finalization; a later cleanup error does not make the
-terminal transition uncommitted. Best-effort cleanup failures are appended as
-`process.exit_finalize_failed` audit warnings with the failed phase when the
-audit sink remains available.
+together with the pending terminal-cleanup intent. The `terminal_notify` and
+`process_finalize` phases run after that commit because their provider cleanup
+cannot be rolled back. Their durable lease, retry, idempotency, and failure
+contract is the same one described above; a later cleanup error does not make
+the terminal transition uncommitted. Compatibility audit warnings such as
+`process.exit_finalize_failed` are best-effort diagnostics, not the
+authoritative cleanup state.
 
 When a Deno JIT tool calls `process.exit` or `process.exec`, the syscall records
 a deferred lifecycle change. The runtime applies that change only after the JIT

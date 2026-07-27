@@ -447,10 +447,17 @@ def test_async_assembly_reservation_closes_readiness_to_worker_gap(
     original_claim = store.claim_runtime_assembly
 
     @contextmanager
-    def delayed_claim(reservation: object):
+    def delayed_claim(
+        reservation: object,
+        *,
+        require_unbound_runtime: bool = False,
+    ):
         worker_reached_claim.set()
         assert allow_worker_claim.wait(timeout=5)
-        with original_claim(reservation):  # type: ignore[arg-type]
+        with original_claim(
+            reservation,  # type: ignore[arg-type]
+            require_unbound_runtime=require_unbound_runtime,
+        ):
             yield
 
     monkeypatch.setattr(store, "claim_runtime_assembly", delayed_claim)

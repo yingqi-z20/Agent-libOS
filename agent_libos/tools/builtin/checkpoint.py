@@ -6,6 +6,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import (
+    RuntimePublicationPending,
+    RuntimeRecoveryRequired,
+)
 from agent_libos.tools.base import (
     SyncAgentTool,
     ToolContext,
@@ -20,6 +24,7 @@ _MODEL_PREVIEW_ITEMS = DEFAULT_CONFIG.checkpoint.diff_preview_items
 _MODEL_PREVIEW_TEXT_CHARS = DEFAULT_CONFIG.tools.tool_observability_preview_chars
 _CHECKPOINT_REASON_MAX_CHARS = 512
 _CHECKPOINT_REASON_MAX_BYTES = 1_024
+_RESTORE_EXCEPTION_TREE_MAX_NODES = 1_024
 _DIFF_TABLE_NAMES = (
     "processes",
     "objects",
@@ -301,6 +306,55 @@ class RestoreCheckpointOutput(BaseModel):
     )
 
 
+def _restore_recovery_signal(
+    error: Exception,
+) -> RuntimePublicationPending | RuntimeRecoveryRequired | None:
+    """Find one unambiguous recovery signal in an ordinary exception tree."""
+
+    signals: list[RuntimePublicationPending | RuntimeRecoveryRequired] = []
+    pending: list[Exception] = [error]
+    visited = 0
+    try:
+        while pending:
+            current = pending.pop()
+            visited += 1
+            if visited > _RESTORE_EXCEPTION_TREE_MAX_NODES:
+                return None
+            if isinstance(
+                current,
+                (RuntimePublicationPending, RuntimeRecoveryRequired),
+            ):
+                signals.append(current)
+                continue
+            if isinstance(current, ExceptionGroup):
+                nested = current.exceptions
+                remaining = (
+                    _RESTORE_EXCEPTION_TREE_MAX_NODES
+                    - visited
+                    - len(pending)
+                )
+                if len(nested) > remaining:
+                    return None
+                pending.extend(reversed(nested))
+    except Exception:
+        # Receipt extraction is diagnostic-only. Never replace the original
+        # restore failure with an extractor traversal error.
+        return None
+    if not signals:
+        return None
+    identities = {
+        (
+            type(signal),
+            signal.publication_id,
+            signal.operation_id,
+            signal.state,
+            signal.phase,
+        )
+        for signal in signals
+    }
+    return signals[0] if len(identities) == 1 else None
+
+
 class ForkCheckpointArgs(BaseModel):
     checkpoint_id: str = Field(
         description="Checkpoint id to copy into a new subtree without changing the source subtree."
@@ -468,8 +522,37 @@ class RestoreCheckpointTool(SyncAgentTool[RestoreCheckpointArgs]):
     tags = ["checkpoint", "restore", "high_risk"]
 
     def run(self, args: RestoreCheckpointArgs, ctx: ToolContext) -> RestoreCheckpointOutput:
+        try:
+            restored = _runtime(ctx).checkpoint.restore(ctx.pid, args.checkpoint_id)
+        except Exception as exc:
+            recovery = _restore_recovery_signal(exc)
+            if recovery is None:
+                raise
+            status = (
+                "restore_recovery_required"
+                if isinstance(recovery, RuntimeRecoveryRequired)
+                else "restore_publication_pending"
+            )
+            raise ToolExecutionError(
+                "Checkpoint restore outcome requires Host reconciliation; "
+                "inspect the structured receipt and do not retry.",
+                code=ToolErrorCode.EXECUTION_ERROR,
+                retryable=False,
+                details={
+                    "checkpoint_restore_receipt": {
+                        "checkpoint_id": args.checkpoint_id,
+                        "publication_id": recovery.publication_id,
+                        "operation_id": recovery.operation_id,
+                        "state": recovery.state,
+                        "phase": recovery.phase,
+                        "status": status,
+                        "main_state_committed": None,
+                        "reconciliation_pending": True,
+                    }
+                },
+            ) from exc
         return _restore_output(
-            _runtime(ctx).checkpoint.restore(ctx.pid, args.checkpoint_id),
+            restored,
             limit=_model_preview_limit(ctx),
             text_limit=_model_preview_text_limit(ctx),
         )

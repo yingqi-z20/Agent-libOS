@@ -1,9 +1,10 @@
 import { Eye, ListTree, Plug, RadioTower, Send } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { LibOSClient } from "../api/client";
 import type { JsonRpcEndpointSummary, McpServerSummary, RuntimeProcess } from "../api/types";
 import type { ConfirmationRequest } from "../adminTypes";
 import { useI18n } from "../i18n";
+import { RequestEpoch } from "../requestEpoch";
 import { CollapsibleJson } from "./CollapsibleJson";
 
 type RemoteKind = "jsonrpc" | "mcp";
@@ -33,6 +34,13 @@ export function RemoteRegistryPanel({
   const [result, setResult] = useState<unknown>(null);
   const [loading, setLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const inspectionRequests = useRef(new RequestEpoch());
+  const selectedIdRef = useRef(selectedId);
+  const clientRef = useRef(client);
+  const kindRef = useRef(kind);
+  selectedIdRef.current = selectedId;
+  clientRef.current = client;
+  kindRef.current = kind;
   const ids = useMemo(() => entries.map((entry) => entryId(kind, entry)).filter(isString), [entries, kind]);
   const selectedEntry = entries.find((entry) => entryId(kind, entry) === selectedId);
   const operationIds = useMemo(() => remoteOperationIds(kind, selectedEntry), [kind, selectedEntry]);
@@ -45,31 +53,46 @@ export function RemoteRegistryPanel({
     setOperationId((current) => reconcileRemoteOperationId(current, operationIds));
   }, [selectedId, operationIds.join("\n")]);
 
+  useEffect(() => {
+    inspectionRequests.current.invalidate();
+    setLoading(false);
+    return () => inspectionRequests.current.invalidate();
+  }, [client, kind, selectedId]);
+
   async function inspect() {
     if (!selectedId) return;
+    const inspectedId = selectedId;
+    const inspectedClient = client;
+    const inspectedKind = kind;
+    const request = inspectionRequests.current.begin();
     setLoading(true);
     setLocalError(null);
     try {
-      setResult(kind === "jsonrpc"
+      const response = kind === "jsonrpc"
         ? await client.inspectJsonRpcEndpoint(selectedId)
-        : await client.inspectMcpServer(selectedId));
+        : await client.inspectMcpServer(selectedId);
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === inspectedKind) setResult(response);
     } catch (error) {
-      setLocalError(describe(error));
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === inspectedKind) setLocalError(describe(error));
     } finally {
-      setLoading(false);
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === inspectedKind) setLoading(false);
     }
   }
 
   async function listTools() {
     if (kind !== "mcp" || !selectedId) return;
+    const inspectedId = selectedId;
+    const inspectedClient = client;
+    const request = inspectionRequests.current.begin();
     setLoading(true);
     setLocalError(null);
     try {
-      setResult(await client.listMcpTools(selectedId, refreshTools));
+      const response = await client.listMcpTools(selectedId, refreshTools);
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") setResult(response);
     } catch (error) {
-      setLocalError(describe(error));
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") setLocalError(describe(error));
     } finally {
-      setLoading(false);
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") setLoading(false);
     }
   }
 

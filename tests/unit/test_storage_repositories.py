@@ -5,14 +5,21 @@ import inspect
 import sqlite3
 import textwrap
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from agent_libos import Runtime
 from agent_libos.models import (
     AgentProcess,
+    Checkpoint,
+    HumanRequest,
+    HumanRequestStatus,
     ObjectNamespace,
+    ObjectRefCursor,
     ProcessStatus,
     ResourceBudget,
     ResourceUsage,
@@ -26,6 +33,7 @@ from agent_libos.storage import (
     EvidenceRepository,
     ExtensionRepository,
     ObjectRepository,
+    PayloadRetentionRepository,
     ProcessRepository,
     ProcessStateRepository,
     ResourceRepository,
@@ -45,8 +53,19 @@ from agent_libos.storage.repositories import (
     _checkpoint_object_payload_was_superseded,
     unit_of_work_backend_conformance_errors,
 )
+from agent_libos.storage.contracts import (
+    CheckpointPublicationWriterBackendProtocol,
+    OperationEvidenceBackendProtocol,
+    ProcessBackendProtocol,
+    ResourceBackendProtocol,
+    RuntimePublicationBackendProtocol,
+)
+from agent_libos.evidence.payload_retention import PayloadRetentionStore
+from agent_libos.evidence.payload_retention import PayloadRetentionTier
+from agent_libos.ports.authority import CapabilityStorePort
 from agent_libos.storage.postgres import _PostgresConnection, _PostgresCursor, _PostgresDialect
 from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.snapshot import ProcessSnapshot
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import dumps
 
@@ -70,6 +89,84 @@ class _RecordingStore:
             return name
 
         return record
+
+
+class _EmptyMutationResult:
+    rowcount = 0
+
+    def __iter__(self):
+        return iter(())
+
+
+class _InvalidCasBackend:
+    """Minimal backend that proves facade validation remains transactional."""
+
+    def __init__(self, result: Any) -> None:
+        self.result = result
+        self.mutation_visible = False
+        self.rolled_back = False
+        self.transaction_entries = 0
+        self.writer_token = object()
+
+    @contextmanager
+    def transaction(self, *, include_object_payloads: bool = False):
+        del include_object_payloads
+        self.transaction_entries += 1
+        before = self.mutation_visible
+        try:
+            yield self
+        except BaseException:
+            self.mutation_visible = before
+            self.rolled_back = True
+            raise
+
+    def execute(self, _sql: str, _params: Any = ()) -> _EmptyMutationResult:
+        return _EmptyMutationResult()
+
+    def complete_execution(self, *_args: Any, **_kwargs: Any) -> Any:
+        self.mutation_visible = True
+        return self.result
+
+    ack_process_message = complete_execution
+    release_execution = complete_execution
+    commit_capability_use_reservation = complete_execution
+    consume_capability_uses = complete_execution
+    reserve_capability_uses = complete_execution
+
+    def settle_resource_usage_reservation(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        self.mutation_visible = True
+        return self.result
+
+    def get_process(self, pid: str) -> AgentProcess:
+        return _process(pid)
+
+    def select_table_rows(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+        return []
+
+    def restore_process_for_exec(self, *_args: Any, **_kwargs: Any) -> Any:
+        self.mutation_visible = True
+        return self.result
+
+    delete_tool_if_unreferenced = restore_process_for_exec
+    mark_runtime_publication_operation_reconciled = restore_process_for_exec
+    advance_runtime_publication = restore_process_for_exec
+    update_runtime_publication_plan = restore_process_for_exec
+    record_runtime_publication_artifact = restore_process_for_exec
+    transition_checkpoint_restore_payload_delivery = restore_process_for_exec
+    begin_checkpoint_payload_delivery_attempt = restore_process_for_exec
+    ack_checkpoint_payload_delivery_attempt = restore_process_for_exec
+    abort_checkpoint_payload_delivery_attempt = restore_process_for_exec
+    update_operation = restore_process_for_exec
+    insert_operation_evidence = restore_process_for_exec
+    update_llm_call_payload_retention = restore_process_for_exec
+    update_external_effect_payload_retention = restore_process_for_exec
+
+    def _issue_checkpoint_restore_writer_token(self) -> object:
+        return self.writer_token
 
 
 def _publication_record(publication_id: str) -> dict[str, Any]:
@@ -116,6 +213,58 @@ class _CheckpointPublicationBackend:
         return self.claim_result
 
 
+class _MiswiredPublicationBackend:
+    def __init__(self) -> None:
+        self.records = {
+            "publication_expected": _publication_record("publication_expected"),
+            "publication_other": _publication_record("publication_other"),
+        }
+        self.rolled_back = False
+
+    @contextmanager
+    def transaction(self, *, include_object_payloads: bool = False):
+        del include_object_payloads
+        before = deepcopy(self.records)
+        try:
+            yield self
+        except BaseException:
+            self.records = before
+            self.rolled_back = True
+            raise
+
+    def get_runtime_publication(self, publication_id: str) -> dict[str, Any] | None:
+        return deepcopy(self.records.get(publication_id))
+
+    def insert_runtime_publication(self, **_kwargs: Any) -> dict[str, Any]:
+        other = deepcopy(self.records["publication_other"])
+        self.records["publication_other"] = other
+        return deepcopy(other)
+
+    def claim_runtime_publication_recovery(
+        self,
+        publication_id: str,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        self.records[publication_id]["owner_instance_id"] = "runtime.claimant"
+        self.records[publication_id]["state"] = "rollback_pending"
+        return deepcopy(self.records["publication_other"])
+
+
+class _CheckpointBindingBackend:
+    def __init__(self, found: tuple[Any, dict[str, Any]] | None) -> None:
+        self.found = found
+        self.insert_calls = 0
+
+    def get_checkpoint_snapshot(
+        self,
+        _checkpoint_id: str,
+    ) -> tuple[Any, dict[str, Any]] | None:
+        return deepcopy(self.found)
+
+    def insert_checkpoint(self, _checkpoint: Any, _snapshot: dict[str, Any]) -> None:
+        self.insert_calls += 1
+
+
 def _process(pid: str) -> AgentProcess:
     now = utc_now()
     return AgentProcess(
@@ -135,6 +284,337 @@ def _process(pid: str) -> AgentProcess:
         created_at=now,
         updated_at=now,
     )
+
+
+def test_snapshot_repository_normalizes_capability_booleans_at_sql_boundary() -> None:
+    backend = _RecordingStore()
+    repository = SnapshotCheckpointRepository(backend)  # type: ignore[arg-type]
+    row = {
+        "cap_id": "cap_snapshot_bool",
+        "delegable": True,
+        "revocable": False,
+    }
+    observed: dict[str, Any] = {}
+
+    repository._insert_backend_row(
+        object(),
+        "capabilities",
+        row,
+        before_insert=lambda _cursor, _table, item: observed.update(item),
+    )
+
+    assert observed == row
+    assert type(observed["delegable"]) is bool
+    assert type(observed["revocable"]) is bool
+    name, args, kwargs = backend.calls[-1]
+    assert name == "insert_table_row"
+    assert kwargs == {}
+    assert args == (
+        "capabilities",
+        {
+            "cap_id": "cap_snapshot_bool",
+            "delegable": 1,
+            "revocable": 0,
+        },
+    )
+    assert row == {
+        "cap_id": "cap_snapshot_bool",
+        "delegable": True,
+        "revocable": False,
+    }
+
+
+@pytest.mark.parametrize("invalid_result", ["false", 1, None])
+def test_process_repository_rejects_non_boolean_completion_cas_and_rolls_back(
+    invalid_result: Any,
+) -> None:
+    backend = _InvalidCasBackend(invalid_result)
+    repository = ProcessRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match="complete execution backend returned a non-boolean CAS result",
+    ):
+        repository.complete_execution(object())  # type: ignore[arg-type]
+
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+@pytest.mark.parametrize("invalid_result", ["false", 1, None])
+def test_resource_repository_rejects_non_boolean_settlement_cas_and_rolls_back(
+    invalid_result: Any,
+) -> None:
+    backend = _InvalidCasBackend(invalid_result)
+    repository = ResourceRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "settle resource usage reservation backend returned "
+            "a non-boolean CAS result"
+        ),
+    ):
+        repository.settle_resource_usage_reservation(
+            "reservation-invalid-cas",
+            status="released",
+            settled_usage=ResourceUsage(),
+            updated_at=utc_now(),
+        )
+
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+@pytest.mark.parametrize("invalid_result", ["false", 1, None])
+def test_snapshot_repository_rejects_non_boolean_restore_cas_and_rolls_back(
+    invalid_result: Any,
+) -> None:
+    backend = _InvalidCasBackend(invalid_result)
+    repository = SnapshotCheckpointRepository(backend)  # type: ignore[arg-type]
+    rows = SimpleNamespace(
+        processes=({"pid": "pid-invalid-restore-cas"},),
+        object_namespaces=(),
+        objects=(),
+        object_links=(),
+        capabilities=(),
+        llm_pending_actions=(),
+        tool_candidates=(),
+    )
+    snapshot = SimpleNamespace(
+        header=SimpleNamespace(root_pid="pid-invalid-restore-cas"),
+        rows=rows,
+        owned_object_oids=(),
+        owned_namespaces=(),
+        object_payloads={},
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="restore process for exec backend returned a non-boolean CAS result",
+    ):
+        repository.restore_process_exec_snapshot(
+            snapshot,  # type: ignore[arg-type]
+            process_namespace="process/pid-invalid-restore-cas",
+            captured_tool_ids=(),
+            capability_rollback_token=None,
+        )
+
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+@pytest.mark.parametrize("invalid_result", ["false", 1, None])
+def test_authority_repository_rejects_non_boolean_commit_cas_and_rolls_back(
+    invalid_result: Any,
+) -> None:
+    backend = _InvalidCasBackend(invalid_result)
+    repository = AuthorityRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "commit capability use reservation backend returned "
+            "a non-boolean CAS result"
+        ),
+    ):
+        repository.commit_capability_use_reservation(
+            "reservation-invalid-cas",
+            updated_at=utc_now(),
+        )
+
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+@pytest.mark.parametrize("operation", ["consume", "reserve"])
+@pytest.mark.parametrize("invalid_count", [True, False, 0, -1, 1.0, "1", None])
+def test_authority_repository_rejects_non_integer_or_non_positive_use_counts(
+    operation: str,
+    invalid_count: Any,
+) -> None:
+    backend = _InvalidCasBackend(None)
+    repository = AuthorityRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError, match="count must be a positive integer"):
+        if operation == "consume":
+            repository.consume_capability_uses(
+                "cap-invalid-count",
+                invalid_count,  # type: ignore[arg-type]
+            )
+        else:
+            repository.reserve_capability_uses(
+                "cap-invalid-count",
+                "reservation-invalid-count",
+                count=invalid_count,  # type: ignore[arg-type]
+                reserved_by="test",
+                reason="test invalid facade count",
+                created_at=utc_now(),
+            )
+
+    assert backend.transaction_entries == 0
+    assert backend.mutation_visible is False
+
+
+@pytest.mark.parametrize("operation", ["consume", "reserve"])
+def test_authority_repository_wraps_valid_use_counts_in_a_transaction(
+    operation: str,
+) -> None:
+    backend = _InvalidCasBackend(None)
+    repository = AuthorityRepository(backend)  # type: ignore[arg-type]
+
+    if operation == "consume":
+        result = repository.consume_capability_uses("cap-valid-count", 2)
+    else:
+        result = repository.reserve_capability_uses(
+            "cap-valid-count",
+            "reservation-valid-count",
+            count=2,
+            reserved_by="test",
+            reason="test valid facade count",
+            created_at=utc_now(),
+        )
+
+    assert result is None
+    assert backend.transaction_entries == 1
+    assert backend.mutation_visible is True
+
+
+@pytest.mark.parametrize("operation", ["consume", "reserve"])
+def test_authority_repository_rejects_malformed_capability_mutation_result(
+    operation: str,
+) -> None:
+    backend = _InvalidCasBackend("not-a-capability")
+    repository = AuthorityRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError, match="backend returned a non-capability result"):
+        if operation == "consume":
+            repository.consume_capability_uses("cap-invalid-result", 1)
+        else:
+            repository.reserve_capability_uses(
+                "cap-invalid-result",
+                "reservation-invalid-result",
+                count=1,
+                reserved_by="test",
+                reason="test invalid facade result",
+                created_at=utc_now(),
+            )
+
+    assert backend.transaction_entries == 1
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+@pytest.mark.parametrize("invalid_result", ["false", 1, None])
+def test_publication_repository_rejects_non_boolean_transition_and_rolls_back(
+    invalid_result: Any,
+) -> None:
+    backend = _InvalidCasBackend(invalid_result)
+    repository = RuntimePublicationRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match="advance runtime publication backend returned a non-boolean CAS result",
+    ):
+        repository.advance_runtime_publication(
+            "publication-invalid-cas",
+            state="applying",
+            phase="test",
+        )
+
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+@pytest.mark.parametrize("invalid_result", ["false", 1, None])
+def test_checkpoint_writer_rejects_non_boolean_transition_and_rolls_back(
+    invalid_result: Any,
+) -> None:
+    backend = _InvalidCasBackend(invalid_result)
+    writer = CheckpointRestorePublicationWriter(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "advance checkpoint restore publication backend returned "
+            "a non-boolean CAS result"
+        ),
+    ):
+        writer.advance_runtime_publication(
+            "publication-invalid-cas",
+            state="reconciliation_pending",
+            phase="test",
+        )
+
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+@pytest.mark.parametrize("invalid_result", ["false", 1, None])
+def test_evidence_repository_rejects_non_boolean_update_cas_and_rolls_back(
+    invalid_result: Any,
+) -> None:
+    backend = _InvalidCasBackend(invalid_result)
+    repository = EvidenceRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match="update operation backend returned a non-boolean CAS result",
+    ):
+        repository.update_operation(object())  # type: ignore[arg-type]
+
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+@pytest.mark.parametrize("invalid_result", ["false", 1, None])
+def test_retention_repository_rejects_non_boolean_update_cas_and_rolls_back(
+    invalid_result: Any,
+) -> None:
+    backend = _InvalidCasBackend(invalid_result)
+    repository = PayloadRetentionRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "update LLM call payload retention backend returned "
+            "a non-boolean CAS result"
+        ),
+    ):
+        repository.update_llm_call_payload_retention(
+            object(),  # type: ignore[arg-type]
+            expected_payload_sha256="0" * 64,
+            expected_tier=PayloadRetentionTier.FULL,
+        )
+
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+def test_truthy_text_backend_cas_result_cannot_escape_typed_facade() -> None:
+    backend = _InvalidCasBackend("false")
+    assert bool(backend.result) is True
+
+    with pytest.raises(ValidationError, match="non-boolean CAS result"):
+        ProcessRepository(backend).release_execution(object())  # type: ignore[arg-type]
+
+    assert backend.rolled_back is True
+    assert backend.mutation_visible is False
+
+
+def test_backend_exception_preserves_commit_before_error_reconciliation_semantics() -> None:
+    class CommitThenRaiseBackend(_InvalidCasBackend):
+        def release_execution(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.mutation_visible = True
+            raise RuntimeError("injected lost acknowledgement")
+
+    backend = CommitThenRaiseBackend(False)
+
+    with pytest.raises(RuntimeError, match="injected lost acknowledgement"):
+        ProcessRepository(backend).release_execution(object())  # type: ignore[arg-type]
+
+    assert backend.rolled_back is False
+    assert backend.mutation_visible is True
 
 
 @pytest.mark.parametrize(
@@ -320,6 +800,121 @@ def test_checkpoint_restore_writer_rejects_miswired_backend_record_ids(
             )
 
 
+def test_publication_repository_rejects_miswired_insert_and_rolls_back() -> None:
+    backend = _MiswiredPublicationBackend()
+    repository = RuntimePublicationRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match="returned publication 'publication_other' for request 'publication_expected'",
+    ):
+        repository.insert_runtime_publication(
+            publication_id="publication_expected",
+            kind="checkpoint_restore",
+            pid="pid_checkpoint_writer",
+            owner_instance_id="runtime.test",
+            plan={"checkpoint_id": "checkpoint_writer"},
+        )
+
+    assert backend.rolled_back is True
+
+
+def test_publication_repository_rejects_miswired_get() -> None:
+    backend = _MiswiredPublicationBackend()
+    backend.get_runtime_publication = lambda _publication_id: deepcopy(  # type: ignore[method-assign]
+        backend.records["publication_other"]
+    )
+    repository = RuntimePublicationRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match="returned publication 'publication_other' for request 'publication_expected'",
+    ):
+        repository.get_runtime_publication("publication_expected")
+
+
+def test_publication_repository_rolls_back_miswired_claim_before_cleanup() -> None:
+    backend = _MiswiredPublicationBackend()
+    before = deepcopy(backend.records)
+    repository = RuntimePublicationRepository(backend)  # type: ignore[arg-type]
+    cleanup_calls = 0
+
+    with pytest.raises(
+        ValidationError,
+        match="returned publication 'publication_other' for request 'publication_expected'",
+    ):
+        claimed = repository.claim_runtime_publication_recovery(
+            "publication_expected",
+            claimant_instance_id="runtime.claimant",
+            expected_owner_instance_id="runtime.test",
+            expected_state="planning",
+            classification="compensate_process_launch",
+        )
+        if claimed is not None:  # pragma: no cover - explicit side-effect fence
+            cleanup_calls += 1
+
+    assert cleanup_calls == 0
+    assert backend.rolled_back is True
+    assert backend.records == before
+
+
+def _persisted_checkpoint_pair(
+    reason: str,
+) -> tuple[Any, dict[str, Any]]:
+    runtime = Runtime.open(":memory:")
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal=reason)
+        checkpoint_id = runtime.checkpoint.create(pid, reason, actor=pid)
+        found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+        assert found is not None
+        return found
+    finally:
+        runtime.close()
+
+
+def test_checkpoint_repository_rejects_backend_a_to_b_binding() -> None:
+    checkpoint_b, snapshot_b = _persisted_checkpoint_pair("checkpoint B")
+    backend = _CheckpointBindingBackend((checkpoint_b, snapshot_b))
+    repository = SnapshotCheckpointRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match="returned checkpoint .* for request 'checkpoint_A'",
+    ):
+        repository.get_checkpoint_snapshot("checkpoint_A")
+
+
+def test_checkpoint_repository_rejects_same_id_header_drift() -> None:
+    checkpoint, snapshot = _persisted_checkpoint_pair("original reason")
+    snapshot["reason"] = "drifted reason"
+    backend = _CheckpointBindingBackend((checkpoint, snapshot))
+    repository = SnapshotCheckpointRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match="checkpoint snapshot changed: .*reason",
+    ):
+        repository.get_checkpoint_snapshot(checkpoint.checkpoint_id)
+
+
+def test_checkpoint_repository_rejects_mismatch_before_insert_side_effect() -> None:
+    checkpoint, snapshot = _persisted_checkpoint_pair("insert binding")
+    snapshot["checkpoint_id"] = "checkpoint_other"
+    backend = _CheckpointBindingBackend(None)
+    repository = SnapshotCheckpointRepository(backend)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValidationError,
+        match="checkpoint snapshot changed: .*checkpoint_id",
+    ):
+        repository.insert_checkpoint(
+            checkpoint,
+            ProcessSnapshot.from_mapping(snapshot),
+        )
+
+    assert backend.insert_calls == 0
+
+
 def test_unit_of_work_rejects_boundary_only_dynamic_backend_fail_fast() -> None:
     store = _RecordingStore()
 
@@ -489,6 +1084,11 @@ def test_process_resource_and_publication_methods_are_explicit_facades() -> None
         "current_effect_ledger_seq",
         "list_external_effects_changed_after",
     }
+    authority_mutation_methods = {
+        "consume_capability_uses",
+        "reserve_capability_uses",
+        "commit_capability_use_reservation",
+    }
 
     assert process_methods.isdisjoint(ProcessRepository._METHODS)
     assert publication_methods.isdisjoint(ProcessRepository._METHODS)
@@ -502,6 +1102,107 @@ def test_process_resource_and_publication_methods_are_explicit_facades() -> None
     } <= ResourceRepository.__dict__.keys()
     assert operation_methods.isdisjoint(EvidenceRepository._METHODS)
     assert operation_methods <= EvidenceRepository.__dict__.keys()
+    assert authority_mutation_methods.isdisjoint(AuthorityRepository._METHODS)
+    assert authority_mutation_methods <= AuthorityRepository.__dict__.keys()
+
+
+def test_mutating_backend_bool_protocol_inventory_is_exact_and_transactional() -> None:
+    protocols = (
+        ProcessBackendProtocol,
+        ResourceBackendProtocol,
+        RuntimePublicationBackendProtocol,
+        CheckpointPublicationWriterBackendProtocol,
+        SnapshotCheckpointBackendProtocol,
+        OperationEvidenceBackendProtocol,
+        PayloadRetentionStore,
+        CapabilityStorePort,
+    )
+    declared_bool_methods = {
+        name
+        for protocol in protocols
+        for name, method in inspect.getmembers(protocol, predicate=inspect.isfunction)
+        if inspect.signature(method).return_annotation in {bool, "bool"}
+    }
+    read_only_bool_methods = {
+        "has_object_payload",
+        "namespace_exists",
+        "operation_has_unknown_external_effect",
+        "runtime_publication_exists_for_pid",
+        "tool_id_referenced_outside_process",
+        "tool_id_referenced_outside_scope",
+    }
+    mutating_bool_methods = {
+        "abort_checkpoint_payload_delivery_attempt",
+        "ack_checkpoint_payload_delivery_attempt",
+        "ack_process_message",
+        "advance_runtime_publication",
+        "begin_checkpoint_payload_delivery_attempt",
+        "commit_capability_use_reservation",
+        "complete_execution",
+        "delete_tool_if_unreferenced",
+        "insert_operation_evidence",
+        "mark_runtime_publication_operation_reconciled",
+        "record_runtime_publication_artifact",
+        "release_execution",
+        "restore_process_for_exec",
+        "settle_resource_usage_reservation",
+        "transition_checkpoint_restore_payload_delivery",
+        "update_external_effect_payload_retention",
+        "update_llm_call_payload_retention",
+        "update_operation",
+        "update_runtime_publication_plan",
+    }
+    assert declared_bool_methods == read_only_bool_methods | mutating_bool_methods
+
+    facade_inventory = (
+        (ProcessRepository, "ack_process_message"),
+        (ProcessRepository, "complete_execution"),
+        (ProcessRepository, "release_execution"),
+        (AuthorityRepository, "commit_capability_use_reservation"),
+        (ResourceRepository, "settle_resource_usage_reservation"),
+        (RuntimePublicationRepository, "mark_runtime_publication_operation_reconciled"),
+        (RuntimePublicationRepository, "advance_runtime_publication"),
+        (RuntimePublicationRepository, "update_runtime_publication_plan"),
+        (RuntimePublicationRepository, "record_runtime_publication_artifact"),
+        (CheckpointRestorePublicationWriter, "advance_runtime_publication"),
+        (CheckpointRestorePublicationWriter, "record_runtime_publication_artifact"),
+        (
+            CheckpointRestorePublicationWriter,
+            "mark_runtime_publication_operation_reconciled",
+        ),
+        (CheckpointRestorePublicationWriter, "transition_payload_delivery"),
+        (
+            CheckpointRestorePublicationWriter,
+            "begin_checkpoint_payload_delivery_attempt",
+        ),
+        (
+            CheckpointRestorePublicationWriter,
+            "ack_checkpoint_payload_delivery_attempt",
+        ),
+        (
+            CheckpointRestorePublicationWriter,
+            "abort_checkpoint_payload_delivery_attempt",
+        ),
+        (SnapshotCheckpointRepository, "restore_process_exec_snapshot"),
+        (SnapshotCheckpointRepository, "delete_tool_if_unreferenced"),
+        (EvidenceRepository, "update_operation"),
+        (EvidenceRepository, "insert_operation_evidence"),
+        (PayloadRetentionRepository, "update_llm_call_payload_retention"),
+        (PayloadRetentionRepository, "update_external_effect_payload_retention"),
+    )
+    for repository, method_name in facade_inventory:
+        source = inspect.getsource(getattr(repository, method_name))
+        if (
+            repository is SnapshotCheckpointRepository
+            and method_name == "restore_process_exec_snapshot"
+        ):
+            assert "_exact_backend_cas_result" in source
+            assert "with self.transaction(" in source
+        else:
+            assert "_transactional_backend_cas_result" in source, (
+                repository.__name__,
+                method_name,
+            )
 
 
 def test_checkpoint_effect_ledger_reads_use_the_typed_evidence_facade() -> None:
@@ -512,6 +1213,107 @@ def test_checkpoint_effect_ledger_reads_use_the_typed_evidence_facade() -> None:
 
         assert isinstance(ledger_seq, int)
         assert unit.evidence.list_external_effects_changed_after(ledger_seq) == []
+    finally:
+        store.close()
+
+
+def test_checkpoint_human_cancellation_preserves_a_competing_terminal_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteStore(":memory:")
+    try:
+        unit = UnitOfWork(store)
+        requests = (
+            HumanRequest(
+                request_id="human-before-checkpoint",
+                pid="pid-human-cas",
+                human="operator",
+                payload={"question": "old"},
+                status=HumanRequestStatus.PENDING,
+                decision=None,
+                blocking=True,
+                created_at="2026-01-01T00:00:00Z",
+                updated_at="2026-01-01T00:00:00Z",
+            ),
+            HumanRequest(
+                request_id="human-competing-approval",
+                pid="pid-human-cas",
+                human="operator",
+                payload={"question": "approve"},
+                status=HumanRequestStatus.PENDING,
+                decision=None,
+                blocking=True,
+                created_at="2026-01-03T00:00:00Z",
+                updated_at="2026-01-03T00:00:00Z",
+            ),
+            HumanRequest(
+                request_id="human-still-pending",
+                pid="pid-human-cas",
+                human="operator",
+                payload={"question": "cancel"},
+                status=HumanRequestStatus.PENDING,
+                decision=None,
+                blocking=True,
+                created_at="2026-01-04T00:00:00Z",
+                updated_at="2026-01-04T00:00:00Z",
+            ),
+        )
+        for request in requests:
+            store.insert_human_request(request)
+
+        original_list = store.list_human_requests
+
+        def list_then_approve(*args: Any, **kwargs: Any) -> list[HumanRequest]:
+            selected = original_list(*args, **kwargs)
+            pending = next(
+                request
+                for request in selected
+                if request.request_id == "human-competing-approval"
+            )
+            store.update_human_request(
+                HumanRequest(
+                    request_id=pending.request_id,
+                    pid=pending.pid,
+                    human=pending.human,
+                    payload=pending.payload,
+                    status=HumanRequestStatus.APPROVED,
+                    decision={"approved": True},
+                    blocking=pending.blocking,
+                    created_at=pending.created_at,
+                    updated_at="2026-01-05T00:00:00Z",
+                )
+            )
+            persisted = store.get_human_request(pending.request_id)
+            assert persisted is not None
+            assert persisted.status is HumanRequestStatus.APPROVED
+            return selected
+
+        monkeypatch.setattr(store, "list_human_requests", list_then_approve)
+        cancelled = unit.snapshots.cancel_pending_human_requests_after_checkpoint(
+            ("pid-human-cas",),
+            Checkpoint(
+                checkpoint_id="checkpoint-human-cas",
+                pid="pid-human-cas",
+                reason="test",
+                created_at="2026-01-02T00:00:00Z",
+            ),
+        )
+
+        assert cancelled == ["human-still-pending"]
+        approved = store.get_human_request("human-competing-approval")
+        assert approved is not None
+        assert approved.status is HumanRequestStatus.APPROVED
+        assert approved.decision == {"approved": True}
+        cancelled_request = store.get_human_request("human-still-pending")
+        assert cancelled_request is not None
+        assert cancelled_request.status is HumanRequestStatus.CANCELLED
+        assert cancelled_request.decision == {
+            "cancelled_by": "checkpoint:checkpoint-human-cas"
+        }
+        before_checkpoint = store.get_human_request("human-before-checkpoint")
+        assert before_checkpoint is not None
+        assert before_checkpoint.status is HumanRequestStatus.PENDING
+        assert before_checkpoint.decision is None
     finally:
         store.close()
 
@@ -550,6 +1352,234 @@ def _insert_persisted_projection_object(
                 now,
             ),
         )
+
+
+def _insert_object_ref_projection(
+    store: SQLiteStore,
+    *,
+    oid: str,
+    namespace: str,
+    created_at: str,
+    updated_at: str,
+    lifecycle_state: str = "live",
+) -> None:
+    with store.transaction() as cursor:
+        cursor.execute(
+            "INSERT INTO objects ("
+            "oid, namespace, name, type, schema_version, payload_json, "
+            "metadata_json, provenance_json, version, immutable, created_by, "
+            "owner_kind, owner_id, lifecycle_state, deleted_at, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                oid,
+                namespace,
+                f"name-{oid}",
+                "summary",
+                "1",
+                dumps({"storage": "runtime_memory", "present": True}),
+                dumps(
+                    {
+                        "title": f"title-{oid}",
+                        "summary": f"summary-{oid}",
+                        "tags": ["page", oid],
+                    }
+                ),
+                "{}",
+                1,
+                0,
+                "test",
+                "process",
+                "pid-object-query",
+                lifecycle_state,
+                None,
+                created_at,
+                updated_at,
+            ),
+        )
+
+
+def test_object_ref_pages_are_payload_free_stable_and_hard_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteStore(":memory:")
+    namespace = "process:pid-object-query"
+    try:
+        rows = (
+            ("oid-a", "2026-01-01T00:00:00Z", "2026-05-01T00:00:00Z"),
+            ("oid-b", "2026-01-01T00:00:00Z", "2026-05-01T00:00:00Z"),
+            ("oid-c", "2026-03-01T00:00:00Z", "2026-04-01T00:00:00Z"),
+            ("oid-d", "2026-02-01T00:00:00Z", "2026-04-01T00:00:00Z"),
+            ("oid-e", "2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z"),
+        )
+        for oid, created_at, updated_at in rows:
+            _insert_object_ref_projection(
+                store,
+                oid=oid,
+                namespace=namespace,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+        _insert_object_ref_projection(
+            store,
+            oid="oid-other-namespace",
+            namespace="process:other",
+            created_at="2026-06-01T00:00:00Z",
+            updated_at="2026-06-01T00:00:00Z",
+        )
+        _insert_object_ref_projection(
+            store,
+            oid="oid-released",
+            namespace=namespace,
+            created_at="2026-07-01T00:00:00Z",
+            updated_at="2026-07-01T00:00:00Z",
+            lifecycle_state="released",
+        )
+
+        def reject_payload_access(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("Object reference page accessed a payload")
+
+        monkeypatch.setattr(store, "object_payload", reject_payload_access)
+        monkeypatch.setattr(store, "has_object_payload", reject_payload_access)
+        unit = UnitOfWork(store)
+
+        observed: list[str] = []
+        cursor: ObjectRefCursor | None = None
+        page_sizes: list[int] = []
+        while True:
+            page = unit.objects.query_object_refs_page(
+                namespace,
+                after=cursor,
+                limit=2,
+            )
+            page_sizes.append(len(page.records))
+            observed.extend(record.oid for record in page.records)
+            assert all("storage" not in record.search_text for record in page.records)
+            if page.exhausted:
+                assert page.next_cursor is None
+                break
+            assert page.next_cursor == page.records[-1].cursor
+            cursor = page.next_cursor
+
+        assert observed == ["oid-a", "oid-b", "oid-c", "oid-d", "oid-e"]
+        assert page_sizes == [2, 2, 1]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "limit",
+    [True, 0, -1, 1.5],
+)
+def test_object_ref_page_rejects_invalid_limits(limit: object) -> None:
+    store = SQLiteStore(":memory:")
+    try:
+        with pytest.raises(ValidationError, match="limit"):
+            store.query_object_refs_page(
+                "system",
+                after=None,
+                limit=limit,  # type: ignore[arg-type]
+            )
+    finally:
+        store.close()
+
+
+def test_object_ref_page_rejects_limit_above_configured_hard_cap() -> None:
+    store = SQLiteStore(":memory:")
+    try:
+        with pytest.raises(ValidationError, match="hard cap"):
+            store.query_object_refs_page(
+                "system",
+                after=None,
+                limit=store.config.memory.query_scan_page_size + 1,
+            )
+    finally:
+        store.close()
+
+
+def test_child_namespace_pages_are_stable_direct_and_hard_bounded() -> None:
+    store = SQLiteStore(":memory:")
+    try:
+        unit = UnitOfWork(store)
+        parent = "process:parent"
+        now = utc_now()
+        for namespace in (
+            "process:parent/zeta",
+            "process:parent/alpha",
+            "process:parent/middle",
+        ):
+            unit.objects.insert_namespace(
+                ObjectNamespace(
+                    namespace=namespace,
+                    parent_namespace=parent,
+                    metadata={"namespace": namespace},
+                    created_by="test",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        unit.objects.insert_namespace(
+            ObjectNamespace(
+                namespace="process:other/child",
+                parent_namespace="process:other",
+                metadata={},
+                created_by="test",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+        first = unit.objects.query_child_namespaces_page(
+            parent,
+            after=None,
+            limit=2,
+        )
+        assert [record.namespace for record in first.records] == [
+            "process:parent/alpha",
+            "process:parent/middle",
+        ]
+        assert first.next_cursor is not None
+        assert first.next_cursor.namespace == "process:parent/middle"
+        assert not first.exhausted
+
+        second = unit.objects.query_child_namespaces_page(
+            parent,
+            after=first.next_cursor,
+            limit=2,
+        )
+        assert [record.namespace for record in second.records] == [
+            "process:parent/zeta"
+        ]
+        assert second.exhausted
+        assert second.next_cursor is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("limit", [True, 0, -1, 1.5])
+def test_child_namespace_page_rejects_invalid_limits(limit: object) -> None:
+    store = SQLiteStore(":memory:")
+    try:
+        with pytest.raises(ValidationError, match="limit"):
+            store.query_child_namespaces_page(
+                "system",
+                after=None,
+                limit=limit,  # type: ignore[arg-type]
+            )
+    finally:
+        store.close()
+
+
+def test_child_namespace_page_rejects_limit_above_scan_page_cap() -> None:
+    store = SQLiteStore(":memory:")
+    try:
+        with pytest.raises(ValidationError, match="hard cap"):
+            store.query_child_namespaces_page(
+                "system",
+                after=None,
+                limit=store.config.memory.query_scan_page_size + 1,
+            )
+    finally:
+        store.close()
 
 
 def test_persisted_object_state_projection_does_not_fill_payload_cache(

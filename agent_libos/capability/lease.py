@@ -22,6 +22,14 @@ CAPABILITY_LEASE_MUTATION_PUBLIC_METHODS = frozenset(
 )
 
 
+def _positive_count(value: object, *, operation: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ValidationError(
+            f"capability {operation} count must be a positive integer"
+        )
+    return value
+
+
 class CapabilityLeaseService:
     """Atomic finite-use consumption, reservation, and settlement."""
 
@@ -53,8 +61,7 @@ class CapabilityLeaseService:
         reason: str = "capability use consumed",
         count: int = 1,
     ) -> Capability:
-        if count < 1:
-            raise ValidationError("capability consume count must be >= 1")
+        count = _positive_count(count, operation="consume")
         with self.store.transaction():
             revalidate_admission(self._admission)
             cap = self._require_capability(cap_id)
@@ -84,8 +91,7 @@ class CapabilityLeaseService:
         reason: str = "capability use reserved",
         count: int = 1,
     ) -> str:
-        if count < 1:
-            raise ValidationError("capability reservation count must be >= 1")
+        count = _positive_count(count, operation="reservation")
         with self.store.transaction():
             revalidate_admission(self._admission)
             cap = self._require_capability(cap_id)

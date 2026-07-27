@@ -24,6 +24,119 @@ def _reservation_rows(runtime: Runtime) -> list[dict[str, object]]:
     )
 
 
+@pytest.mark.parametrize("sink", ["event", "audit"])
+def test_checkpoint_create_failure_rolls_back_one_time_authority_and_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    sink: str,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        owner = runtime.process.spawn(goal=f"checkpoint create {sink} owner")
+        controller = runtime.process.spawn(goal=f"checkpoint create {sink} controller")
+        authority = runtime.capability.grant_once(
+            controller,
+            f"checkpoint:process:{owner}",
+            [CapabilityRight.WRITE],
+            issued_by="test.host",
+        )
+        before_process = runtime.process.get(owner)
+        before_event_ids = {event.event_id for event in runtime.events.list()}
+        before_audit_ids = {record.record_id for record in runtime.audit.trace()}
+        before_reservations = _reservation_rows(runtime)
+
+        if sink == "event":
+            original_emit = runtime.events.emit
+
+            def fail_after_create_event(event_type, *args, **kwargs):
+                result = original_emit(event_type, *args, **kwargs)
+                if event_type == EventType.CHECKPOINT_CREATED:
+                    raise RuntimeError("injected checkpoint create event failure")
+                return result
+
+            monkeypatch.setattr(runtime.events, "emit", fail_after_create_event)
+        else:
+            original_record = runtime.audit.record
+
+            def fail_after_create_audit(*args, **kwargs):
+                result = original_record(*args, **kwargs)
+                if kwargs.get("action") == "checkpoint.create":
+                    raise RuntimeError("injected checkpoint create audit failure")
+                return result
+
+            monkeypatch.setattr(runtime.audit, "record", fail_after_create_audit)
+
+        with pytest.raises(RuntimeError, match=f"create {sink} failure"):
+            runtime.checkpoint.create(
+                owner,
+                "atomic create",
+                actor=controller,
+            )
+
+        persisted = runtime.store.get_capability(authority.cap_id)
+        assert persisted is not None
+        assert persisted.status == CapabilityStatus.ACTIVE
+        assert persisted.uses_remaining == 1
+        assert _reservation_rows(runtime) == before_reservations
+        assert runtime.store.list_checkpoints(pid=owner) == []
+        assert runtime.process.get(owner).checkpoint_head == before_process.checkpoint_head
+        assert {event.event_id for event in runtime.events.list()} == before_event_ids
+        new_audits = [
+            record
+            for record in runtime.audit.trace()
+            if record.record_id not in before_audit_ids
+        ]
+        # The advisory authorization decision is append-only evidence and may
+        # remain, but publication and finite-use settlement evidence must roll
+        # back with the failed checkpoint.
+        assert all(
+            record.action
+            not in {
+                "checkpoint.create",
+                "capability.reserve_use",
+                "capability.commit_reserved_use",
+            }
+            for record in new_audits
+        )
+    finally:
+        runtime.close()
+
+
+def test_checkpoint_create_commits_one_time_authority_with_publication() -> None:
+    runtime = Runtime.open("local")
+    try:
+        owner = runtime.process.spawn(goal="checkpoint create owner")
+        controller = runtime.process.spawn(goal="checkpoint create controller")
+        authority = runtime.capability.grant_once(
+            controller,
+            f"checkpoint:process:{owner}",
+            [CapabilityRight.WRITE],
+            issued_by="test.host",
+        )
+
+        checkpoint_id = runtime.checkpoint.create(
+            owner,
+            "atomic create success",
+            actor=controller,
+        )
+
+        persisted = runtime.store.get_capability(authority.cap_id)
+        assert persisted is not None
+        assert persisted.uses_remaining == 0
+        reservations = [
+            row
+            for row in _reservation_rows(runtime)
+            if row["cap_id"] == authority.cap_id
+        ]
+        assert [row["status"] for row in reservations] == ["committed"]
+        assert runtime.process.get(owner).checkpoint_head == checkpoint_id
+        assert [
+            checkpoint.checkpoint_id
+            for checkpoint in runtime.store.list_checkpoints(pid=owner)
+        ] == [checkpoint_id]
+    finally:
+        runtime.close()
+
+
 def test_object_handle_capability_preserves_publication_ownership_metadata() -> None:
     runtime = Runtime.open("local")
     try:

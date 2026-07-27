@@ -19,7 +19,19 @@ from typing import Any
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSource, ModuleSourceFile
+from agent_libos.utils.secure_host_files import (
+    SecureDirectoryGuard,
+    SecureFileChanged,
+    SecureFileLimitExceeded,
+    SecureFileReadUnavailable,
+    StablePathSnapshot,
+    open_secure_directory,
+    open_secure_file,
+    read_stable_file_limited,
+    stable_identity_available,
+)
 from agent_libos.utils.ids import new_id
+from agent_libos.utils.serde import bounded_json_loads
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _MODULE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
@@ -61,6 +73,11 @@ _SENSITIVE_PACKAGE_FILENAMES = {
 _SENSITIVE_PACKAGE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 _IMPORT_LOCK = threading.RLock()
 _IMPORT_CLEANUP_ATTR = "__agent_libos_package_cleanup__"
+_MODULE_FILE_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _is_ignored_package_path(parts: tuple[str, ...]) -> bool:
+    return any(part.lower() in _CACHE_PACKAGE_SEGMENTS for part in parts)
 
 
 class _FreshSourceLoader(importlib.machinery.SourceFileLoader):
@@ -78,6 +95,12 @@ class _SnapshotPackageImporter(importlib.abc.MetaPathFinder, importlib.abc.Loade
         for record in records:
             module_name = self._module_name_for_record(record)
             if module_name is not None:
+                existing = self._modules.get(module_name)
+                if existing is not None:
+                    raise ValidationError(
+                        "module package contains paths with the same import identity: "
+                        f"{existing.module_path!r} and {record.module_path!r}"
+                    )
                 self._modules[module_name] = record
             self._add_package_dirs(record.module_path)
 
@@ -202,20 +225,24 @@ class ModuleLoader:
         }
 
     def resolve(self, manifest_path: str | Path) -> ModuleSource:
-        path = Path(manifest_path).expanduser().resolve()
-        if not path.is_file():
-            raise NotFound(f"module manifest not found: {manifest_path}")
-        text = self._read_manifest(path)
+        selected_path = Path(manifest_path).expanduser()
+        if not selected_path.is_absolute():
+            selected_path = Path.cwd() / selected_path
+        selected_path = self._absolute_lexical_path(selected_path)
+        text = self._read_manifest(selected_path)
+        # Keep the checked lexical path. Canonicalizing it here would erase a
+        # symlinked ancestor before the source/package secure-open boundary.
+        path = selected_path
         manifest = self.parse_manifest(text)
         source_path, entrypoint_object = self._resolve_entrypoint(path, manifest.entrypoint)
         source_bytes = self._read_source_bytes(source_path)
         source_sha = self._sha256_bytes(source_bytes)
         expected_sha = manifest.sha256.lower()
-        source_root = self._infer_source_root(path.parent.resolve(), source_path, manifest.entrypoint)
-        source_files = self._entry_source_files(path.parent.resolve(), source_root, source_path, source_bytes)
+        source_root = self._infer_source_root(path.parent, source_path, manifest.entrypoint)
+        source_files = self._entry_source_files(path.parent, source_root, source_path, source_bytes)
         source_kind = "file"
         if source_sha != expected_sha:
-            source_files = self._read_package_source_files(path.parent.resolve(), source_root)
+            source_files = self._read_package_source_files(path.parent, source_root)
             package_sha = self._package_sha256(source_files)
             if package_sha != expected_sha:
                 raise ValidationError(
@@ -224,7 +251,15 @@ class ModuleLoader:
                 )
             source_sha = package_sha
             source_kind = "package"
-            entry = next((record for record in source_files if Path(record.absolute_path).resolve() == source_path.resolve()), None)
+            entry = next(
+                (
+                    record
+                    for record in source_files
+                    if self._absolute_lexical_path(Path(record.absolute_path))
+                    == self._absolute_lexical_path(source_path)
+                ),
+                None,
+            )
             if entry is None:
                 raise ValidationError(f"module entrypoint source is missing from package snapshot: {source_path}")
             source_bytes = entry.content
@@ -298,7 +333,7 @@ class ModuleLoader:
             if not callable(entrypoint):
                 raise ValidationError(f"module entrypoint is not callable: {source.manifest.entrypoint}")
             return entrypoint
-        except Exception:
+        except BaseException:
             self._cleanup_imported_package(module)
             raise
 
@@ -339,13 +374,16 @@ class ModuleLoader:
         return bool(accepted & set(self.trusted_modules)) or bool(accepted_hashes & set(self.trusted_sha256))
 
     def _read_manifest(self, path: Path) -> str:
-        size = path.stat().st_size
-        if size > self.config.modules.manifest_max_bytes:
-            raise ValidationError(
-                "module manifest exceeded "
-                f"manifest_max_bytes={self.config.modules.manifest_max_bytes}"
-            )
-        return path.read_text(encoding="utf-8")
+        raw = self._read_module_file_limited(
+            path,
+            kind="manifest",
+            max_bytes=self.config.modules.manifest_max_bytes,
+            limit_name="manifest_max_bytes",
+        )
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError(f"module manifest is not valid UTF-8: {path}") from exc
 
     def _load_mapping(self, text: str) -> dict[str, Any]:
         stripped = text.lstrip()
@@ -358,10 +396,15 @@ class ModuleLoader:
 
     def _load_json_mapping(self, text: str) -> dict[str, Any]:
         try:
+            # Preflight through the shared strict parser before preserving the
+            # module-specific duplicate-key error contract below.  This fixes
+            # depth, node, integer, and non-finite-number limits even when the
+            # interpreter-wide integer guard has been disabled.
+            bounded_json_loads(text, reject_duplicate_keys=False)
             data = json.loads(text, object_pairs_hook=_unique_json_object)
         except ValidationError:
             raise
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ValidationError(f"invalid module manifest JSON: {exc}") from exc
         if not isinstance(data, dict):
             raise ValidationError("module manifest JSON must be a mapping")
@@ -425,10 +468,10 @@ class ModuleLoader:
     def _resolve_entrypoint(self, manifest_path: Path, entrypoint: str) -> tuple[Path, str]:
         module_ref, object_name = self._split_entrypoint(entrypoint)
         if self._is_path_ref(module_ref):
-            source = (manifest_path.parent / module_ref).resolve()
-            self._require_under(source, manifest_path.parent.resolve())
+            source = self._absolute_lexical_path(manifest_path.parent / module_ref)
+            self._require_under(source, manifest_path.parent)
         else:
-            source = self._resolve_import_source(manifest_path.parent.resolve(), module_ref)
+            source = self._resolve_import_source(manifest_path.parent, module_ref)
         if not source.is_file():
             raise NotFound(f"module entrypoint source not found: {source}")
         return source, object_name
@@ -459,11 +502,11 @@ class ModuleLoader:
         file_source = module_path.with_suffix(".py")
         package_source = module_path / "__init__.py"
         if file_source.is_file():
-            source = file_source.resolve()
+            source = self._absolute_lexical_path(file_source)
             self._require_under(source, manifest_dir)
             return source
         if package_source.is_file():
-            source = package_source.resolve()
+            source = self._absolute_lexical_path(package_source)
             self._require_under(source, manifest_dir)
             return source
         raise NotFound(f"module entrypoint import not found under manifest directory: {module_ref}")
@@ -477,21 +520,38 @@ class ModuleLoader:
                     "module entrypoint import requires package parent "
                     f"{package_name!r} with __init__.py under the manifest directory: {module_ref}"
                 )
-            self._require_under(init_path.resolve(), manifest_dir)
+            self._require_under(
+                self._absolute_lexical_path(init_path),
+                manifest_dir,
+            )
 
     def _require_under(self, path: Path, root: Path) -> None:
+        path = self._absolute_lexical_path(path)
+        root = self._absolute_lexical_path(root)
         try:
             path.relative_to(root)
         except ValueError as exc:
             raise ValidationError(f"module entrypoint path escapes manifest directory: {path}") from exc
 
+    @staticmethod
+    def _absolute_lexical_path(path: Path) -> Path:
+        """Return an absolute normalized path without following symlinks."""
+
+        selected = Path(os.path.abspath(path))
+        if sys.platform == "darwin" and len(selected.parts) > 1:
+            alias = selected.parts[1]
+            if alias in {"etc", "tmp", "var"}:
+                return Path("/private", alias, *selected.parts[2:])
+        return selected
+
     def _infer_source_root(self, manifest_dir: Path, source_path: Path, entrypoint: str) -> Path:
         module_ref, _object_name = self._split_entrypoint(entrypoint)
-        source = source_path.resolve()
+        manifest_dir = self._absolute_lexical_path(manifest_dir)
+        source = self._absolute_lexical_path(source_path)
         self._require_under(source, manifest_dir)
         if not self._is_path_ref(module_ref):
             first = module_ref.split(".", 1)[0]
-            candidate = (manifest_dir / first).resolve()
+            candidate = self._absolute_lexical_path(manifest_dir / first)
             if candidate.is_dir():
                 self._require_under(candidate, manifest_dir)
                 return candidate
@@ -511,13 +571,16 @@ class ModuleLoader:
         source_path: Path,
         source_bytes: bytes,
     ) -> tuple[ModuleSourceFile, ...]:
-        relative = self._manifest_relative_path(manifest_dir, source_path.resolve())
-        module_path = self._source_root_relative_path(source_root.resolve(), source_path.resolve())
+        manifest_dir = self._absolute_lexical_path(manifest_dir)
+        source_root = self._absolute_lexical_path(source_root)
+        source_path = self._absolute_lexical_path(source_path)
+        relative = self._manifest_relative_path(manifest_dir, source_path)
+        module_path = self._source_root_relative_path(source_root, source_path)
         return (
             ModuleSourceFile(
                 path=relative,
                 module_path=module_path,
-                absolute_path=str(source_path.resolve()),
+                absolute_path=str(source_path),
                 size_bytes=len(source_bytes),
                 sha256=self._sha256_bytes(source_bytes),
                 content=source_bytes,
@@ -525,55 +588,176 @@ class ModuleLoader:
         )
 
     def _read_package_source_files(self, manifest_dir: Path, source_root: Path) -> tuple[ModuleSourceFile, ...]:
-        root = source_root.resolve()
+        manifest_dir = Path(os.path.abspath(manifest_dir))
+        root = Path(os.path.abspath(source_root))
         self._require_under(root, manifest_dir)
         records: list[ModuleSourceFile] = []
         total_bytes = 0
-        for item in sorted(root.rglob("*")):
-            try:
-                source_relative_parts = item.relative_to(root).parts
-            except ValueError as exc:
-                raise ValidationError(f"module package path escapes source root: {item}") from exc
-            if any(part.lower() in _CACHE_PACKAGE_SEGMENTS for part in source_relative_parts):
-                continue
-            before = item.lstat()
-            relative = self._manifest_relative_path(manifest_dir, item.resolve() if not stat.S_ISLNK(before.st_mode) else item)
-            self._validate_source_relative_path(relative)
-            if stat.S_ISLNK(before.st_mode):
-                raise ValidationError(f"module package symlinks are not supported: {item}")
-            if stat.S_ISDIR(before.st_mode):
-                continue
-            if not stat.S_ISREG(before.st_mode):
-                raise ValidationError(f"module package path is not a regular file or directory: {item}")
-            if before.st_nlink > 1:
-                raise ValidationError(f"module package hard links are not supported: {item}")
-            if item.suffix != ".py":
-                continue
-            content = self._read_source_bytes(item)
-            total_bytes += len(content)
-            if total_bytes > self.config.modules.package_max_bytes:
-                raise ValidationError(
-                    "module package exceeded "
-                    f"package_max_bytes={self.config.modules.package_max_bytes}"
-                )
-            records.append(
-                ModuleSourceFile(
-                    path=relative,
-                    module_path=self._source_root_relative_path(root, item.resolve()),
-                    absolute_path=str(item.resolve()),
-                    size_bytes=len(content),
-                    sha256=self._sha256_bytes(content),
-                    content=content,
-                )
+        visited_paths = 0
+
+        def visit(directory: SecureDirectoryGuard) -> None:
+            nonlocal total_bytes, visited_paths
+            opened_directory = self._validate_module_directory_snapshot(
+                directory.snapshot(),
+                path=directory.path,
+                after_read=False,
             )
-            if len(records) > self.config.modules.max_package_files:
-                raise ValidationError(
-                    "module package exceeded "
-                    f"max_package_files={self.config.modules.max_package_files}"
+            try:
+                linked_directory = self._validate_module_directory_snapshot(
+                    directory.linked_snapshot(),
+                    path=directory.path,
+                    after_read=False,
                 )
+            except OSError as exc:
+                raise ValidationError(
+                    f"module package directory changed during enumeration: {directory.path}"
+                ) from exc
+            if linked_directory != opened_directory:
+                raise ValidationError(
+                    f"module package directory changed during enumeration: {directory.path}"
+                )
+            try:
+                entries = directory.scandir()
+            except OSError as exc:
+                raise ValidationError(
+                    f"module package directory changed during enumeration: {directory.path}"
+                ) from exc
+            with entries:
+                for entry in entries:
+                    item = directory.path / entry.name
+                    try:
+                        source_relative_parts = item.relative_to(root).parts
+                    except ValueError as exc:
+                        raise ValidationError(
+                            f"module package path escapes source root: {item}"
+                        ) from exc
+                    visited_paths += 1
+                    if visited_paths > self.config.modules.max_package_files:
+                        raise ValidationError(
+                            "module package exceeded "
+                            f"max_package_files={self.config.modules.max_package_files}"
+                        )
+                    if _is_ignored_package_path(source_relative_parts):
+                        continue
+                    relative = self._manifest_relative_path(manifest_dir, item)
+                    self._validate_source_relative_path(relative)
+                    try:
+                        before = directory.lstat_child(entry.name)
+                    except OSError as exc:
+                        raise ValidationError(
+                            f"module package path changed during enumeration: {item}"
+                        ) from exc
+                    if before.is_reparse_point or stat.S_ISLNK(before.mode):
+                        raise ValidationError(
+                            f"module package symlinks are not supported: {item}"
+                        )
+                    if stat.S_ISDIR(before.mode):
+                        try:
+                            child = directory.open_child_directory(entry.name)
+                        except OSError as exc:
+                            raise ValidationError(
+                                f"module package directory changed during enumeration: {item}"
+                            ) from exc
+                        with child:
+                            visit(child)
+                        continue
+                    if not stat.S_ISREG(before.mode):
+                        raise ValidationError(
+                            "module package path is not a regular file or directory: "
+                            f"{item}"
+                        )
+                    if before.links > 1:
+                        raise ValidationError(
+                            f"module package hard links are not supported: {item}"
+                        )
+                    if item.suffix != ".py":
+                        continue
+                    remaining_package_bytes = (
+                        self.config.modules.package_max_bytes - total_bytes
+                    )
+                    if remaining_package_bytes < self.config.modules.source_max_bytes:
+                        selected_max_bytes = max(remaining_package_bytes, 0)
+                        limit_name = "package_max_bytes"
+                        reported_max_bytes = self.config.modules.package_max_bytes
+                    else:
+                        selected_max_bytes = self.config.modules.source_max_bytes
+                        limit_name = "source_max_bytes"
+                        reported_max_bytes = selected_max_bytes
+                    content = self._read_source_bytes(
+                        item,
+                        max_bytes=selected_max_bytes,
+                        limit_name=limit_name,
+                        reported_max_bytes=reported_max_bytes,
+                        parent=directory,
+                        relative_name=entry.name,
+                    )
+                    total_bytes += len(content)
+                    records.append(
+                        ModuleSourceFile(
+                            path=relative,
+                            module_path=self._source_root_relative_path(root, item),
+                            absolute_path=str(item),
+                            size_bytes=len(content),
+                            sha256=self._sha256_bytes(content),
+                            content=content,
+                        )
+                    )
+            after_directory = self._validate_module_directory_snapshot(
+                directory.snapshot(),
+                path=directory.path,
+                after_read=True,
+            )
+            try:
+                linked_after = self._validate_module_directory_snapshot(
+                    directory.linked_snapshot(),
+                    path=directory.path,
+                    after_read=True,
+                )
+            except OSError as exc:
+                raise ValidationError(
+                    f"module package directory changed during enumeration: {directory.path}"
+                ) from exc
+            if (
+                after_directory != opened_directory
+                or linked_after != after_directory
+            ):
+                raise ValidationError(
+                    f"module package directory changed during enumeration: {directory.path}"
+                )
+
+        try:
+            root_guard = open_secure_directory(root)
+        except OSError as exc:
+            raise ValidationError(
+                f"cannot securely open module package directory: {root}"
+            ) from exc
+        with root_guard:
+            visit(root_guard)
         if not records:
             raise NotFound(f"module package contains no Python source files: {root}")
         return tuple(sorted(records, key=lambda record: record.path))
+
+    def _validate_module_directory_snapshot(
+        self,
+        snapshot: StablePathSnapshot,
+        *,
+        path: Path,
+        after_read: bool,
+    ) -> StablePathSnapshot:
+        if snapshot.is_reparse_point or not stat.S_ISDIR(snapshot.mode):
+            raise ValidationError(
+                f"module package directory is not a regular directory: {path}"
+            )
+        if snapshot.links < 1:
+            message = "changed during enumeration" if after_read else "is not linked"
+            raise ValidationError(f"module package directory {message}: {path}")
+        if not stable_identity_available(snapshot):
+            raise ValidationError(
+                "secure Runtime Module directory identity is unavailable on this platform"
+            )
+        if snapshot.size < 0:
+            raise ValidationError(f"module package directory has an invalid size: {path}")
+        return snapshot
 
     def _manifest_relative_path(self, manifest_dir: Path, path: Path) -> str:
         try:
@@ -648,7 +832,10 @@ class ModuleLoader:
             f"{hashlib.sha256((source.manifest.module_id + source.source_root + source.source_sha256).encode('utf-8')).hexdigest()}"
             f"_{new_id('load')}"
         )
-        entry_module_path = self._source_root_relative_path(Path(source.source_root).resolve(), Path(source.source_path).resolve())
+        entry_module_path = self._source_root_relative_path(
+            self._absolute_lexical_path(Path(source.source_root)),
+            self._absolute_lexical_path(Path(source.source_path)),
+        )
         importer = _SnapshotPackageImporter(package_name, tuple(source.source_files), entry_module_path)
         if entry_module_path == "__init__.py":
             entry_name = package_name
@@ -660,9 +847,18 @@ class ModuleLoader:
         sys.meta_path.insert(0, importer)
         try:
             module = importlib.import_module(entry_name)
-            setattr(module, _IMPORT_CLEANUP_ATTR, (package_name, importer))
+            cleanup = (package_name, importer)
+            # The manifest entry may re-export a callable defined by a sibling
+            # module. Cleanup ownership still belongs to this package load, so
+            # publish the same immutable handle on every module imported from
+            # the synthetic namespace before returning the callable.
+            for name, imported_module in tuple(sys.modules.items()):
+                if (
+                    name == package_name or name.startswith(f"{package_name}.")
+                ) and isinstance(imported_module, ModuleType):
+                    setattr(imported_module, _IMPORT_CLEANUP_ATTR, cleanup)
             return module
-        except Exception:
+        except BaseException:
             self._clear_import_namespace(package_name)
             try:
                 sys.meta_path.remove(importer)
@@ -698,16 +894,18 @@ class ModuleLoader:
         module_file = getattr(module, "__file__", None)
         if module_file is None:
             raise ValidationError(f"module entrypoint has no source file: {source.manifest.entrypoint}")
-        imported_path = Path(module_file).resolve()
-        expected_path = Path(source.source_path).resolve()
+        imported_path = self._absolute_lexical_path(Path(module_file))
+        expected_path = self._absolute_lexical_path(Path(source.source_path))
         if imported_path != expected_path:
             raise ValidationError(
                 "module entrypoint import resolved to a different source file: "
                 f"expected {expected_path}, got {imported_path}"
             )
         if source.source_kind == "package":
-            source_root = Path(source.source_root).resolve()
-            manifest_dir = Path(source.manifest_path).resolve().parent
+            source_root = self._absolute_lexical_path(Path(source.source_root))
+            manifest_dir = self._absolute_lexical_path(
+                Path(source.manifest_path)
+            ).parent
             imported_sha = self._package_sha256(self._read_package_source_files(manifest_dir, source_root))
             if imported_sha != source.source_sha256:
                 raise ValidationError(
@@ -752,6 +950,10 @@ class ModuleLoader:
             return {}
         if not isinstance(value, dict):
             raise ValidationError(f"{field} must be a mapping")
+        try:
+            json.dumps(value, ensure_ascii=True, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValidationError(f"{field} must contain only finite JSON values") from exc
         return dict(value)
 
     def _sha256(self, value: Any, field: str) -> str:
@@ -762,40 +964,123 @@ class ModuleLoader:
     def _sha256_file(self, path: Path) -> str:
         return self._sha256_bytes(self._read_source_bytes(path))
 
-    def _read_source_bytes(self, path: Path) -> bytes:
-        if not path.exists() or not path.is_file():
-            raise NotFound(f"module source not found: {path}")
-        before = path.lstat()
-        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-            raise ValidationError(f"module source is not a regular file: {path}")
-        if before.st_nlink > 1:
-            raise ValidationError(f"module source hard links are not supported: {path}")
-        if before.st_size > self.config.modules.source_max_bytes:
+    def _read_source_bytes(
+        self,
+        path: Path,
+        *,
+        max_bytes: int | None = None,
+        limit_name: str = "source_max_bytes",
+        reported_max_bytes: int | None = None,
+        parent: SecureDirectoryGuard | None = None,
+        relative_name: str | None = None,
+    ) -> bytes:
+        selected_max_bytes = (
+            self.config.modules.source_max_bytes
+            if max_bytes is None
+            else max_bytes
+        )
+        return self._read_module_file_limited(
+            path,
+            kind="source",
+            max_bytes=selected_max_bytes,
+            limit_name=limit_name,
+            reported_max_bytes=reported_max_bytes,
+            parent=parent,
+            relative_name=relative_name,
+        )
+
+    def _module_file_snapshot(
+        self,
+        snapshot: StablePathSnapshot,
+        *,
+        path: Path,
+        kind: str,
+        after_read: bool,
+    ) -> StablePathSnapshot:
+        if snapshot.is_reparse_point or not stat.S_ISREG(snapshot.mode):
+            raise ValidationError(f"module {kind} is not a regular file: {path}")
+        if snapshot.links > 1:
+            raise ValidationError(f"module {kind} hard links are not supported: {path}")
+        if snapshot.links < 1:
+            message = "changed during read" if after_read else "is not linked"
+            raise ValidationError(f"module {kind} {message}: {path}")
+        if not stable_identity_available(snapshot):
             raise ValidationError(
-                "module source exceeded "
-                f"source_max_bytes={self.config.modules.source_max_bytes}"
+                "secure Runtime Module file identity is unavailable on this platform"
             )
+        if snapshot.size < 0:
+            raise ValidationError(f"module {kind} has an invalid size: {path}")
+        return snapshot
+
+    @staticmethod
+    def _module_file_limit_error(
+        *,
+        kind: str,
+        path: Path,
+        limit_name: str,
+        max_bytes: int,
+    ) -> ValidationError:
+        return ValidationError(
+            f"module {kind} exceeded {limit_name}={max_bytes}: {path}"
+        )
+
+    def _read_module_file_limited(
+        self,
+        path: Path,
+        *,
+        kind: str,
+        max_bytes: int,
+        limit_name: str,
+        reported_max_bytes: int | None = None,
+        parent: SecureDirectoryGuard | None = None,
+        relative_name: str | None = None,
+    ) -> bytes:
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes < 0
+        ):
+            raise ValidationError("Runtime Module file read limit must be non-negative")
+        displayed_max_bytes = max_bytes if reported_max_bytes is None else reported_max_bytes
         try:
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            secure_file = open_secure_file(
+                path,
+                parent=parent,
+                relative_name=relative_name,
+            )
         except OSError as exc:
             if exc.errno == errno.ELOOP:
-                raise ValidationError(f"module source symlinks are not supported: {path}") from exc
-            raise
-        with os.fdopen(fd, "rb") as handle:
-            opened = os.fstat(handle.fileno())
-            if not stat.S_ISREG(opened.st_mode):
-                raise ValidationError(f"module source is not a regular file: {path}")
-            if opened.st_nlink > 1:
-                raise ValidationError(f"module source hard links are not supported: {path}")
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-                raise ValidationError(f"module source changed during read: {path}")
-            raw = handle.read()
-        if len(raw) > self.config.modules.source_max_bytes:
-            raise ValidationError(
-                "module source exceeded "
-                f"source_max_bytes={self.config.modules.source_max_bytes}"
+                raise ValidationError(f"module {kind} symlinks are not supported: {path}") from exc
+            if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
+                raise NotFound(f"module {kind} not found: {path}") from exc
+            if exc.errno == getattr(errno, "ESTALE", -1):
+                raise ValidationError(f"module {kind} changed during read: {path}") from exc
+            raise ValidationError(f"cannot securely open module {kind}: {path}") from exc
+        try:
+            return read_stable_file_limited(
+                secure_file,
+                max_bytes=max_bytes,
+                chunk_bytes=_MODULE_FILE_READ_CHUNK_BYTES,
+                validate_snapshot=lambda snapshot, after_read: self._module_file_snapshot(
+                    snapshot,
+                    path=path,
+                    kind=kind,
+                    after_read=after_read,
+                ),
             )
-        return raw
+        except SecureFileLimitExceeded as exc:
+            raise self._module_file_limit_error(
+                kind=kind,
+                path=path,
+                limit_name=limit_name,
+                max_bytes=displayed_max_bytes,
+            ) from exc
+        except SecureFileReadUnavailable as exc:
+            raise ValidationError(
+                f"cannot securely read module {kind} to EOF: {path}"
+            ) from exc
+        except (SecureFileChanged, OSError) as exc:
+            raise ValidationError(f"module {kind} changed during read: {path}") from exc
 
     def _sha256_bytes(self, value: bytes) -> str:
         return hashlib.sha256(value).hexdigest()

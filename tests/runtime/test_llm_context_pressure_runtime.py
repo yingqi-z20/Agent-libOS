@@ -38,6 +38,7 @@ from agent_libos.models.exceptions import ProcessMessageWaitRequired, Validation
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from tests.support.fakes import RecordingActionClient
+from tests.support.public_errors import assert_public_error_message
 
 
 def _forced_pressure(**kwargs: Any) -> ContextPressureAssessment:
@@ -289,6 +290,134 @@ def test_explicit_context_enrichment_authority_enables_delta_object() -> None:
         runtime.close()
 
 
+def test_finite_context_enrichment_authority_is_consumed_by_materialization() -> None:
+    image = AgentImage(
+        image_id="finite-context-enrichment:v0",
+        name="finite-context-enrichment",
+        default_tools=["get_current_time"],
+        prompt_mode=PROMPT_MODE_LIBOS_DEFAULT,
+    )
+    runtime = Runtime(SQLiteStore(":memory:"))
+    runtime.register_image(image, actor="test")
+    runtime.llm.client = RecordingActionClient([{"action": "get_current_time"}])
+    pid = runtime.process.spawn(
+        image=image.image_id,
+        goal="consume one persistent context materialization",
+    )
+    capability = runtime.capability.grant_once(
+        pid,
+        LLM_CONTEXT_ENRICHMENT_RESOURCE,
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+    )
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["action"]["action"] == "get_current_time"
+        persisted = runtime.store.get_capability(capability.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 0
+        assert runtime.store.get_object_by_name(
+            context_object_name(pid),
+            namespace=runtime.memory.resolve_namespace(pid),
+        ) is not None
+    finally:
+        runtime.close()
+
+
+def test_finite_context_maintenance_authority_is_consumed_by_auto_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="finite-context-maintenance:v0",
+        name="finite-context-maintenance",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime, client, pid = _runtime_with_image(image)
+    unlimited = next(
+        capability
+        for capability in runtime.capability.capabilities_for(pid)
+        if capability.resource == LLM_CONTEXT_MAINTENANCE_RESOURCE
+        and capability.active
+    )
+    runtime.capability.revoke(
+        unlimited.cap_id,
+        revoked_by="test",
+        require_authority=False,
+    )
+    finite = runtime.capability.grant_once(
+        pid,
+        LLM_CONTEXT_MAINTENANCE_RESOURCE,
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+    )
+    assert runtime.capability.check(
+        pid,
+        LLM_CONTEXT_MAINTENANCE_RESOURCE,
+        CapabilityRight.EXECUTE,
+    )
+    original_dispatch = runtime.llm.adispatch
+
+    async def dispatch(
+        selected_pid: str,
+        action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if action.get("action") != "compact_process_context":
+            return await original_dispatch(
+                selected_pid,
+                action,
+                context_metadata=context_metadata,
+            )
+        runtime.store.set_llm_context_generation(
+            selected_pid,
+            "finite-maintenance-complete",
+        )
+        return {
+            "ok": True,
+            "tool_id": "tool_context",
+            "result_oid": None,
+            "payload": {"compacted": True},
+            "error": None,
+        }
+
+    monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        result = runtime.run_next_process_once()
+
+        latest_call = runtime.store.get_latest_llm_call(
+            pid=pid,
+            purpose="action_selection",
+        )
+        failed_audits = [
+            record.decision
+            for record in runtime.audit.trace(actor=pid)
+            if record.action == "llm.context_pressure_failed"
+        ]
+        assert not failed_audits, [
+            {
+                "reason": audit.get("reason"),
+                "error_type": audit.get("error_type"),
+                "internal_error": audit.get("internal_error"),
+            }
+            for audit in failed_audits
+        ]
+        assert result.get("context_compacted") is True, {
+            "result": result,
+            "pressure": (
+                latest_call.request_options.get("context_pressure")
+                if latest_call is not None
+                else None
+            ),
+        }
+        assert client.user_prompts == []
+        persisted = runtime.store.get_capability(finite.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 0
+    finally:
+        runtime.close()
+
+
 def _storage_pressure_config(threshold_bytes: int = 5_000) -> AgentLibOSConfig:
     return replace(
         DEFAULT_CONFIG,
@@ -409,7 +538,12 @@ def test_storage_pressure_compaction_failure_fails_without_provider_retry(
         failed = runtime.run_next_process_once()
 
         assert failed["ok"] is False
-        assert "storage compaction failed" in failed["error"]
+        assert_public_error_message(
+            failed["error"],
+            code="llm_context_management_error",
+            error_type="RuntimeError",
+            forbidden=["compaction refused", "storage compaction failed"],
+        )
         assert runtime.process.get(pid).status.value == "failed"
         assert compact_calls == 1
         assert client.user_prompts == []
@@ -632,7 +766,15 @@ def test_storage_pressure_resume_failure_fails_closed_without_recursion(
         failed = runtime.run_next_process_once()
 
         assert failed["ok"] is False
-        assert "storage compaction failed" in failed["error"]
+        assert_public_error_message(
+            failed["error"],
+            code="llm_error",
+            error_type="RuntimeError",
+            forbidden=[
+                "resumed storage compaction failed",
+                "storage compaction failed",
+            ],
+        )
         assert runtime.process.get(pid).status.value == "failed"
         assert compact_calls == 2
         assert client.user_prompts == []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from copy import deepcopy
 from math import ceil
@@ -11,9 +12,18 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.context_memory import context_object_name
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.models import ObjectMetadata, ObjectPatch, ObjectRight, ObjectType, ProcessStatus
-from agent_libos.models.exceptions import NotFound, ProcessWaitRequired, ValidationError as LibOSValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    NotFound,
+    ProcessWaitRequired,
+    ValidationError as LibOSValidationError,
+)
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 from agent_libos.utils.ids import estimate_tokens, utc_now
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
@@ -124,7 +134,7 @@ class CompactProcessContextTool(SyncAgentTool[CompactProcessContextArgs]):
         try:
             _assert_source_unchanged(context, job)
         except ToolExecutionError as exc:
-            _fail_job(runtime, ctx.pid, job_handle, job, str(exc))
+            _fail_job(runtime, ctx.pid, job_handle, job, exc)
             raise
         chunks = _entry_chunks(job["source_payload"], int(job["max_chunks"]))
         if not chunks:
@@ -133,11 +143,13 @@ class CompactProcessContextTool(SyncAgentTool[CompactProcessContextArgs]):
         while int(job.get("stage_index", 0)) < len(chunks):
             child_pid = str(job.get("current_child_pid") or "")
             if not child_pid:
-                try:
-                    child_pid = _spawn_stage(runtime, ctx.pid, job, chunks)
-                except Exception as exc:
-                    _fail_job(runtime, ctx.pid, job_handle, job, str(exc))
-                    raise
+                child_pid = _spawn_stage_or_fail(
+                    runtime,
+                    ctx.pid,
+                    job_handle,
+                    job,
+                    chunks,
+                )
                 job["current_child_pid"] = child_pid
                 job.setdefault("compressor_pids", []).append(child_pid)
                 job["updated_at"] = utc_now()
@@ -151,47 +163,35 @@ class CompactProcessContextTool(SyncAgentTool[CompactProcessContextArgs]):
                     resume_action=_resume_action(job),
                 ) from exc
             if wait_result.status != ProcessStatus.EXITED or wait_result.result is None:
-                reason = (
+                failure = ToolExecutionError(
                     "context compressor child ended without a result: "
-                    f"{child_pid} status={wait_result.status.value}"
+                    f"{child_pid} status={wait_result.status.value}",
+                    code=ToolErrorCode.EXECUTION_ERROR,
                 )
-                _fail_job(runtime, ctx.pid, job_handle, job, reason)
-                raise ToolExecutionError(reason, code=ToolErrorCode.EXECUTION_ERROR)
-            try:
-                summary = _read_child_summary(runtime, ctx.pid, wait_result.result, child_pid=child_pid)
-            except _ChildSummaryUnavailable:
-                job["current_child_pid"] = None
-                job.setdefault("discarded_compressor_pids", []).append(child_pid)
-                job["updated_at"] = utc_now()
-                _update_job(runtime, ctx.pid, job_handle, job)
+                _fail_job(runtime, ctx.pid, job_handle, job, failure)
+                raise failure
+            summary = _read_stage_summary_or_discard(
+                runtime,
+                ctx.pid,
+                job_handle,
+                job,
+                child_pid=child_pid,
+                result_handle=wait_result.result,
+            )
+            if summary is None:
                 continue
             _record_stage_summary(runtime, ctx.pid, job_handle, job, summary)
 
         compact_summary = _latest_stage_summary(job.get("summaries") or [])
-        try:
-            result = runtime.llm.context_memory.replace_with_compacted_summary(
-                ctx.pid,
-                context_oid=str(job["context_oid"]),
-                expected_version=int(job["source_version"]),
-                summary=compact_summary,
-                compaction_method="agent_image_child",
-                compaction_metadata={
-                    "tool_name": self.name,
-                    "compressor_image_id": CONTEXT_COMPRESSOR_IMAGE_ID,
-                    "stage_count": int(job.get("stage_index", 0)),
-                    "chunk_count": len(chunks),
-                    "requested_max_chunks": int(job["max_chunks"]),
-                    "discarded_compressor_pids": [str(pid) for pid in job.get("discarded_compressor_pids", [])],
-                },
-                preserve_recent_entries=int(job["preserve_recent_entries"]),
-                source_tokens=int(job["source_tokens"]),
-                target_tokens=int(job["target_tokens"]),
-                compressor_pids=[str(pid) for pid in job.get("compressor_pids", [])],
-                source_payload=job.get("source_payload"),
-            )
-        except LibOSValidationError as exc:
-            _fail_job(runtime, ctx.pid, job_handle, job, str(exc))
-            raise ToolExecutionError(str(exc), code=ToolErrorCode.VALIDATION_ERROR) from exc
+        result = _replace_context_or_fail(
+            runtime,
+            ctx.pid,
+            job_handle,
+            job,
+            chunks=chunks,
+            compact_summary=compact_summary,
+            tool_name=self.name,
+        )
         job["status"] = "completed"
         job["completed_at"] = utc_now()
         job["result"] = dict(result)
@@ -301,11 +301,58 @@ def _update_job(runtime: Any, pid: str, handle: Any, payload: dict[str, Any]) ->
     )
 
 
-def _fail_job(runtime: Any, pid: str, handle: Any, payload: dict[str, Any], reason: str) -> None:
+def _fail_job(
+    runtime: Any,
+    pid: str,
+    handle: Any,
+    payload: dict[str, Any],
+    error: BaseException,
+) -> dict[str, str]:
+    code = _job_failure_code(error)
+    public_error = public_error_envelope(error, code=code)
     payload["status"] = "failed"
-    payload["error"] = reason
+    payload["error"] = public_error["message"]
+    payload["error_details"] = {
+        key: public_error[key]
+        for key in ("code", "error_type", "correlation_id")
+    }
+    payload["internal_error"] = internal_exception_observation(
+        error,
+        correlation_id=public_error["correlation_id"],
+    )
     payload["updated_at"] = utc_now()
     _update_job(runtime, pid, handle, payload)
+    return public_error
+
+
+def _job_failure_code(error: BaseException) -> str:
+    if isinstance(error, ToolExecutionError):
+        return error.code.value
+    if isinstance(error, CapabilityDenied):
+        return ToolErrorCode.PERMISSION_DENIED.value
+    if isinstance(error, LibOSValidationError):
+        return ToolErrorCode.VALIDATION_ERROR.value
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(error, KeyboardInterrupt):
+        return "interrupted"
+    return ToolErrorCode.EXECUTION_ERROR.value
+
+
+def _sanitize_control_failure(
+    error: BaseException,
+    public_message: str,
+) -> BaseException | None:
+    if not isinstance(error, (asyncio.CancelledError, KeyboardInterrupt)):
+        return None
+    # These BaseException subclasses intentionally bypass the ordinary tool
+    # failure result. Preserve that control-flow semantic while ensuring the
+    # propagated object cannot reveal Host/provider-authored text.
+    error.args = (public_message,)
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    return error
 
 
 def _assert_source_unchanged(context: Any | None, job: dict[str, Any]) -> None:
@@ -362,6 +409,78 @@ def _spawn_stage(runtime: Any, pid: str, job: dict[str, Any], chunks: list[list[
     )
 
 
+def _spawn_stage_or_fail(
+    runtime: Any,
+    pid: str,
+    job_handle: Any,
+    job: dict[str, Any],
+    chunks: list[list[dict[str, Any]]],
+) -> str:
+    control_failure: BaseException | None = None
+    try:
+        return _spawn_stage(runtime, pid, job, chunks)
+    except BaseException as exc:
+        public_error = _fail_job(runtime, pid, job_handle, job, exc)
+        control_failure = _sanitize_control_failure(
+            exc,
+            public_error["message"],
+        )
+        if control_failure is None:
+            raise
+    assert control_failure is not None
+    raise control_failure
+
+
+def _replace_context_or_fail(
+    runtime: Any,
+    pid: str,
+    job_handle: Any,
+    job: dict[str, Any],
+    *,
+    chunks: list[list[dict[str, Any]]],
+    compact_summary: dict[str, Any],
+    tool_name: str,
+) -> dict[str, Any]:
+    control_failure: BaseException | None = None
+    try:
+        return runtime.llm.context_memory.replace_with_compacted_summary(
+            pid,
+            context_oid=str(job["context_oid"]),
+            expected_version=int(job["source_version"]),
+            summary=compact_summary,
+            compaction_method="agent_image_child",
+            compaction_metadata={
+                "tool_name": tool_name,
+                "compressor_image_id": CONTEXT_COMPRESSOR_IMAGE_ID,
+                "stage_count": int(job.get("stage_index", 0)),
+                "chunk_count": len(chunks),
+                "requested_max_chunks": int(job["max_chunks"]),
+                "discarded_compressor_pids": [
+                    str(selected_pid)
+                    for selected_pid in job.get("discarded_compressor_pids", [])
+                ],
+            },
+            preserve_recent_entries=int(job["preserve_recent_entries"]),
+            source_tokens=int(job["source_tokens"]),
+            target_tokens=int(job["target_tokens"]),
+            compressor_pids=[
+                str(selected_pid)
+                for selected_pid in job.get("compressor_pids", [])
+            ],
+            source_payload=job.get("source_payload"),
+        )
+    except BaseException as exc:
+        public_error = _fail_job(runtime, pid, job_handle, job, exc)
+        control_failure = _sanitize_control_failure(
+            exc,
+            public_error["message"],
+        )
+        if control_failure is None:
+            raise
+    assert control_failure is not None
+    raise control_failure
+
+
 def _read_child_summary(runtime: Any, pid: str, handle: Any, *, child_pid: str) -> dict[str, Any]:
     try:
         obj = runtime.memory.get_object(pid, handle)
@@ -385,6 +504,41 @@ def _read_child_summary(runtime: Any, pid: str, handle: Any, *, child_pid: str) 
     return {key: payload.get(key) for key in sorted(_SUMMARY_FIELDS)}
 
 
+def _read_stage_summary_or_discard(
+    runtime: Any,
+    pid: str,
+    job_handle: Any,
+    job: dict[str, Any],
+    *,
+    child_pid: str,
+    result_handle: Any,
+) -> dict[str, Any] | None:
+    control_failure: BaseException | None = None
+    try:
+        return _read_child_summary(
+            runtime,
+            pid,
+            result_handle,
+            child_pid=child_pid,
+        )
+    except _ChildSummaryUnavailable:
+        job["current_child_pid"] = None
+        job.setdefault("discarded_compressor_pids", []).append(child_pid)
+        job["updated_at"] = utc_now()
+        _update_job(runtime, pid, job_handle, job)
+        return None
+    except BaseException as exc:
+        public_error = _fail_job(runtime, pid, job_handle, job, exc)
+        control_failure = _sanitize_control_failure(
+            exc,
+            public_error["message"],
+        )
+        if control_failure is None:
+            raise
+    assert control_failure is not None
+    raise control_failure
+
+
 def _record_stage_summary(
     runtime: Any,
     pid: str,
@@ -402,6 +556,12 @@ def _record_stage_summary(
 
 
 def _read_child_summary_from_llm_calls(runtime: Any, child_pid: str) -> dict[str, Any]:
+    runtime_config = getattr(runtime, "config", None)
+    argument_limit = (
+        runtime_config.tools.tool_call_args_hard_limit_bytes
+        if runtime_config is not None
+        else _TOOL_DEFAULTS.tool_call_args_hard_limit_bytes
+    )
     calls = runtime.store.list_llm_calls(pid=child_pid, limit=1000)
     for call in reversed(calls):
         tool_calls = call.tool_calls
@@ -416,7 +576,10 @@ def _read_child_summary_from_llm_calls(runtime: Any, child_pid: str) -> dict[str
             if not isinstance(tool_call, dict):
                 continue
             try:
-                action = tool_call_to_action(tool_call)
+                action = tool_call_to_action(
+                    tool_call,
+                    max_argument_bytes=argument_limit,
+                )
             except Exception:
                 continue
             if action.get("action") != "process_exit":

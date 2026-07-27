@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import subprocess
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -39,6 +40,180 @@ class HeldOutScenario:
     expected_probe_tool: str
     adjacent_skill_ids: tuple[str, ...]
     setup_kind: str
+
+
+@dataclass(frozen=True)
+class SkillRoutingCase:
+    """One source-neutral intent with an explicit adjacent routing boundary."""
+
+    scenario_id: str
+    intent: str
+    expected_skill_id: str
+    adjacent_skill_ids: tuple[str, ...]
+
+
+# This catalog is deliberately broader than the five end-to-end probe
+# scenarios below.  It gives every distributed built-in Skill one opt-in
+# real-LLM activation case while keeping the expensive paired, effect-verified
+# benchmark focused on its smaller set of representative workflows.
+REAL_LLM_ROUTING_CATALOG: tuple[SkillRoutingCase, ...] = (
+    SkillRoutingCase(
+        "skill_navigation",
+        "discover applicable guidance, activate the loaded Skill, read its resource, then unload it",
+        "agent-libos-skill-navigation",
+        ("agent-libos-authority-basics",),
+    ),
+    SkillRoutingCase(
+        "authority_basics",
+        "inspect missing Capability authority and request one exact permission decision",
+        "agent-libos-authority-basics",
+        ("agent-libos-capability-delegation",),
+    ),
+    SkillRoutingCase(
+        "capability_delegation",
+        "delegate one attenuated Capability to a direct child or revoke one exact Capability",
+        "agent-libos-capability-delegation",
+        ("agent-libos-child-processes",),
+    ),
+    SkillRoutingCase(
+        "human_collaboration",
+        "ask a Human one blocking intent question or send a one-way update",
+        "agent-libos-human-collaboration",
+        ("agent-libos-authority-basics",),
+    ),
+    SkillRoutingCase(
+        "runtime_session",
+        "read wall-clock time, compact context, finish the current process, or make one bounded delay",
+        "agent-libos-runtime-session",
+        ("agent-libos-child-processes",),
+    ),
+    SkillRoutingCase(
+        "workspace_navigation",
+        "inspect the working directory and read a bounded workspace text file",
+        "agent-libos-workspace-navigation",
+        ("agent-libos-workspace-editing",),
+    ),
+    SkillRoutingCase(
+        "workspace_editing",
+        "write, replace, or delete an ordinary workspace text file or directory",
+        "agent-libos-workspace-editing",
+        ("agent-libos-object-file-transfer",),
+    ),
+    SkillRoutingCase(
+        "command_execution",
+        "run an approved argv-only non-interactive shell command for a build, test, or utility",
+        "agent-libos-command-execution",
+        ("agent-libos-git-inspection",),
+    ),
+    SkillRoutingCase(
+        "test_log_analysis",
+        "triage an already captured pytest log for failed, assertion, and error lines",
+        "agent-libos-test-log-analysis",
+        ("agent-libos-command-execution",),
+    ),
+    SkillRoutingCase(
+        "tool_protocol_diagnostics",
+        "round-trip a small top-level JSON object through echo to isolate model/tool argument and result plumbing",
+        "agent-libos-tool-protocol-diagnostics",
+        ("agent-libos-jit-tool-authoring",),
+    ),
+    SkillRoutingCase(
+        "object_memory",
+        "create, discover, read, or append named JSON Object Memory in a namespace",
+        "agent-libos-object-memory",
+        ("agent-libos-object-file-transfer",),
+    ),
+    SkillRoutingCase(
+        "object_file_transfer",
+        "import workspace text into Object Memory or export Object text to a file",
+        "agent-libos-object-file-transfer",
+        ("agent-libos-workspace-editing",),
+    ),
+    SkillRoutingCase(
+        "object_tasks",
+        "run one tool asynchronously as a background task, then wait, watch, or cancel it by owner Object",
+        "agent-libos-object-tasks",
+        ("agent-libos-child-processes",),
+    ),
+    SkillRoutingCase(
+        "child_processes",
+        "spawn or fork a direct child process, coordinate messages, and merge selected results",
+        "agent-libos-child-processes",
+        ("agent-libos-object-tasks",),
+    ),
+    SkillRoutingCase(
+        "checkpoints",
+        "capture, inspect, compare, restore, or fork a durable process recovery checkpoint",
+        "agent-libos-checkpoints",
+        ("agent-libos-agent-images",),
+    ),
+    SkillRoutingCase(
+        "agent_images",
+        "register an AgentImage package, publish a checkpoint-derived image, or replace the current process image",
+        "agent-libos-agent-images",
+        ("agent-libos-checkpoints",),
+    ),
+    SkillRoutingCase(
+        "jit_tool_authoring",
+        "propose, validate, and register a process-local Deno TypeScript bounded tool",
+        "agent-libos-jit-tool-authoring",
+        ("agent-libos-tool-protocol-diagnostics",),
+    ),
+    SkillRoutingCase(
+        "jsonrpc",
+        "call a Host-registered plain JSON-RPC HTTP endpoint method integration",
+        "agent-libos-jsonrpc",
+        ("agent-libos-mcp",),
+    ),
+    SkillRoutingCase(
+        "mcp",
+        "discover cached MCP server metadata, refresh it, or call a registered MCP tool",
+        "agent-libos-mcp",
+        ("agent-libos-jsonrpc",),
+    ),
+    SkillRoutingCase(
+        "git_inspection",
+        "read-only inspect Git status, diffs, history, refs, remotes, or blame",
+        "agent-libos-git-inspection",
+        ("agent-libos-git-change-recording",),
+    ),
+    SkillRoutingCase(
+        "git_change_recording",
+        "stage, unstage, and commit reviewed changes from the entire intended Git index",
+        "agent-libos-git-change-recording",
+        ("agent-libos-git-integration-recovery",),
+    ),
+    SkillRoutingCase(
+        "git_branches_worktrees",
+        "manage local Git branches, tags, switch targets, and trusted managed worktrees",
+        "agent-libos-git-branches-worktrees",
+        ("agent-libos-git-integration-recovery",),
+    ),
+    SkillRoutingCase(
+        "git_integration_recovery",
+        "restore paths, integrate or abort history, stash, reset, or clean Git state",
+        "agent-libos-git-integration-recovery",
+        ("agent-libos-git-branches-worktrees",),
+    ),
+    SkillRoutingCase(
+        "git_patch_objects",
+        "create an immutable byte-safe Git patch Object and apply it to an authorized worktree",
+        "agent-libos-git-patch-objects",
+        ("agent-libos-git-change-recording",),
+    ),
+    SkillRoutingCase(
+        "git_remotes",
+        "fetch, pull, or push through an existing configured Git remote and exact destination ref",
+        "agent-libos-git-remotes",
+        ("agent-libos-git-inspection",),
+    ),
+    SkillRoutingCase(
+        "git_pull_requests",
+        "create, inspect, review, merge, or close a repository-local simulated pull request",
+        "agent-libos-git-pull-requests",
+        ("agent-libos-git-remotes",),
+    ),
+)
 
 
 # The goals describe user intent and boundaries without exposing the expected
@@ -826,10 +1001,28 @@ def _git_read_outcome(payload: dict[str, Any]) -> dict[str, Any]:
     entries = payload.get("entries")
     state = payload.get("state")
     state_token = state.get("token") if isinstance(state, dict) else None
+    exact_entry = False
+    if isinstance(entries, list) and len(entries) == 1:
+        entry = entries[0]
+        path = entry.get("path") if isinstance(entry, dict) else None
+        exact_entry = (
+            isinstance(entry, dict)
+            and isinstance(path, dict)
+            and path.get("display") == "tracked-intent.txt"
+            and path.get("path_b64") == "dHJhY2tlZC1pbnRlbnQudHh0"
+            and path.get("lossy") is False
+            and entry.get("kind") == "untracked"
+            and entry.get("index_status") == "?"
+            and entry.get("worktree_status") == "?"
+        )
     checks = {
         "successful_probe_result": True,
-        "reported_dirty_fixture": isinstance(entries, list) and bool(entries),
-        "returned_state_token": isinstance(state_token, str) and bool(state_token),
+        "exact_fixture_entry": exact_entry,
+        "complete_status_result": payload.get("truncated") is False,
+        "valid_state_token": (
+            isinstance(state_token, str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", state_token) is not None
+        ),
     }
     return {
         "passed": all(checks.values()),
@@ -879,7 +1072,11 @@ def _checkpoint_outcome(
 def _mcp_registry_outcome(payload: dict[str, Any]) -> dict[str, Any]:
     checks = {
         "successful_probe_result": True,
-        "returned_server_metadata_list": isinstance(payload.get("servers"), list),
+        "exact_empty_registry": (
+            set(payload) == {"servers", "has_more"}
+            and payload.get("servers") == []
+            and payload.get("has_more") is False
+        ),
     }
     return {
         "passed": all(checks.values()),

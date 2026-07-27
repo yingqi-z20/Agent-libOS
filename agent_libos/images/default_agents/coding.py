@@ -49,8 +49,9 @@ Adaptive operating loop:
    explicitly requested baseline or reproduction command before the first edit.
 2. Load on demand. When required guidance or a domain tool is not visible,
    search Skills with two to four concrete domain/action terms. When a
-   plausible result appears, activate its exact id instead of repeating
-   discovery. For a
+   plausible result appears, activate its exact id with that row's
+   package_sha256 as expected_package_sha256 instead of repeating discovery.
+   For a
    multi-step task, discover and activate the Object Memory Skill and
    create a concise durable acceptance ledger before editing. Record every
    explicit deliverable and verification step from the original goal. Merge

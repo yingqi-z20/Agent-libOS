@@ -45,6 +45,14 @@ benchmark captures the exact SQL and parameters issued by
 fails if the exact composite-index columns, partial domain predicate, search
 constraints, or no-sort plan contract changes.
 
+The process-global query, reconciliation, and SQLite connection wrappers are
+installed for one serialized benchmark invocation at a time. Every wrapper is
+filtered to the exact benchmark store/database/manager identity, so unrelated
+in-process SQLite or Runtime work delegates to the original callable. Cleanup
+attempts every restoration, close, and temporary-directory step even after an
+earlier failure; primary benchmark exceptions are preserved and cleanup-only
+failures are grouped.
+
 The real handler must reconcile the exact backlog, expose no more than one page
 of sampled IDs, issue exactly one query per pending page, fetch only the pending
 rows plus one look-ahead row per non-final page, leave no marker outstanding,
@@ -105,6 +113,11 @@ The run id and hashes support identity and comparison; they are not a digital
 signature or an attestation against a party that can rewrite the artifact. A
 structural-contract failure raises and the command exits nonzero instead of
 writing a favorable result.
+
+The CLI reserves the destination before seeding and publishes complete JSON by
+atomic replacement. A failed rerun leaves a non-favorable marker and retains
+the previous complete artifact beside it instead of exposing stale success or
+partial JSON.
 
 See the repository [benchmark guide](../../docs/benchmark.md#recovery-scale-gates)
 for how this gate relates to the runtime-safety and practical-workflow suites.

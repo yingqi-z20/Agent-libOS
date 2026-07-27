@@ -259,7 +259,7 @@ class TestHumanQuestionTool:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='ask without authority')
         denied = self.runtime.tools.call(pid, 'ask_human', {'question': 'May I ask?'})
         assert not denied.ok
-        assert 'lacks write on human:owner' in (denied.error or '')
+        assert (denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert self.runtime.human.pending() == []
         assert 'human.query' not in self._audit_actions()
 
@@ -393,10 +393,14 @@ class TestHumanQuestionTool:
             lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('injected finalizer failure')),
         )
 
-        self.runtime.process.cancel(pid, 'terminal cleanup failure is post-commit')
+        with pytest.raises(ProcessError, match='terminal cleanup'):
+            self.runtime.process.cancel(pid, 'terminal cleanup failure is post-commit')
 
         assert self.runtime.process.get(pid).status == ProcessStatus.KILLED
         assert notified == [pid]
+        cleanup = self.runtime.process.terminal_cleanup_state(pid)
+        assert cleanup['state'] == 'failed'
+        assert cleanup['completed_phases'] == ['terminal_notify']
         warnings = [
             record
             for record in self.runtime.audit.trace()
@@ -415,10 +419,14 @@ class TestHumanQuestionTool:
             lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('injected exit finalizer failure')),
         )
 
-        self.runtime.process.exit(pid, message='exit cleanup failure is post-commit')
+        with pytest.raises(ProcessError, match='terminal cleanup'):
+            self.runtime.process.exit(pid, message='exit cleanup failure is post-commit')
 
         assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
         assert notified == [pid]
+        cleanup = self.runtime.process.terminal_cleanup_state(pid)
+        assert cleanup['state'] == 'failed'
+        assert cleanup['completed_phases'] == ['terminal_notify']
         warnings = [
             record
             for record in self.runtime.audit.trace()
@@ -441,10 +449,14 @@ class TestHumanQuestionTool:
             lambda process, **_kwargs: finalized.append(process.pid),
         )
 
-        self.runtime.process.exit(pid, message='exit notifier failure is post-commit')
+        with pytest.raises(ProcessError, match='terminal cleanup'):
+            self.runtime.process.exit(pid, message='exit notifier failure is post-commit')
 
         assert self.runtime.process.get(pid).status == ProcessStatus.EXITED
         assert finalized == [pid]
+        cleanup = self.runtime.process.terminal_cleanup_state(pid)
+        assert cleanup['state'] == 'failed'
+        assert cleanup['completed_phases'] == ['process_finalize']
         warnings = [
             record
             for record in self.runtime.audit.trace()
@@ -455,17 +467,24 @@ class TestHumanQuestionTool:
 
     def test_terminal_notifier_attempts_object_tasks_when_human_cancellation_fails(self, monkeypatch) -> None:
         notified: list[str] = []
+        secret = 'SECRET /private/runtime/human-token'
         monkeypatch.setattr(
             self.runtime.human,
             'cancel_pending_for_process',
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('injected human failure')),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
         )
         monkeypatch.setattr(self.runtime.object_tasks, 'notify_process_terminal', notified.append)
 
-        with pytest.raises(RuntimeError, match='terminal process notification failed'):
+        with pytest.raises(RuntimeError, match='terminal_cleanup_failed') as caught:
             self.runtime._notify_process_terminal('agent_test')
 
         assert notified == ['agent_test']
+        assert secret not in str(caught.value)
+        failure = caught.value.cleanup_failures[0]
+        assert failure['phase'] == 'human'
+        assert failure['correlation_id'] in str(caught.value)
+        assert failure['error_type'] == 'RuntimeError'
+        assert len(failure['exception_text']['sha256']) == 64
 
     def test_terminal_exit_does_not_wait_for_blocked_human_provider_read(self) -> None:
         pid = self.runtime.process.spawn(image='base-agent:v0', goal='cancel blocked human read')

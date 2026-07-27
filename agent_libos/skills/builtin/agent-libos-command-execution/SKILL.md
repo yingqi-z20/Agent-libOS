@@ -11,13 +11,13 @@ This is a governed native-process boundary, not a command-string convenience API
 
 ### `run_shell_command`
 
-- Input `argv`: a non-empty array of strings. `argv[0]` must be nonblank and no token may contain NUL. The provider executes an argv vector with `shell=false`; the primitive does not rebuild a shell command string.
+- Input `argv`: a non-empty array of strings. `argv[0]` must be nonblank and no token may contain NUL. Unknown input fields are rejected rather than ignored. The provider executes an argv vector with `shell=false`; the primitive does not rebuild a shell command string.
 - Input `timeout_s`: a finite number greater than zero and no greater than the configured hard limit. The normal default is runtime-configured.
 - Inputs `max_stdout_chars` and `max_stderr_chars`: nonnegative character limits within their schema hard bounds. They can further reduce returned output, but cannot recover text already capped by the primitive or local provider.
 - There is no call-level cwd, environment map, stdin, TTY, streaming, or interactive prompt. Select cwd with workspace navigation before the call. The subprocess receives a constrained Host-owned environment and safe `PATH`.
 - Output contains the logical `argv`, integer `returncode`, decoded UTF-8 `stdout` and `stderr`, and independent truncation flags. A completed subprocess with nonzero `returncode` is still a successful tool dispatch; decide command success from `returncode` and domain evidence, not only the outer tool `ok`.
 
-Output has multiple bounds. The default local provider monitors byte-backed hard capture limits and decodes UTF-8 with replacement for invalid sequences. If a stream exceeds a provider hard limit, the provider normally kills the process and raises a resource-limit failure; no successful tool output or truncation flag is then available, and effects remain unknown. Only after a provider returns successfully can its own truncation flag, the Shell primitive's configured character cap, and finally the call's requested character cap describe retained prefixes. Output is not byte-preserving, and raising a call limit cannot restore omitted text or turn a provider-limit failure into a successful truncated result.
+Output has multiple bounds. The default local provider drains byte pipes through an incremental UTF-8 decoder with replacement for invalid sequences, then enforces hard limits on decoded characters. If a stream exceeds a provider hard limit, the provider normally kills the process and raises a resource-limit failure; no successful tool output or truncation flag is then available, and effects remain unknown. Only after a provider returns successfully can its own truncation flag, the Shell primitive's configured character cap, and finally the call's requested character cap describe retained prefixes. Output is not byte-preserving, and raising a call limit cannot restore omitted text or turn a provider-limit failure into a successful truncated result.
 
 ## Recommended workflow
 
@@ -36,7 +36,8 @@ For ordinary Git intent, activate an `agent-libos-git-*` Skill. Direct Git is a 
 - Before human approval or provider dispatch, data-flow policy also authorizes the executable sink against the command argv and source-Object labels. Shell authority can therefore still be denied for sensitivity or sink-trust reasons. Do not remove lineage, encode the payload, or wrap the executable to evade that decision; use a Host-configured trusted sink or stop.
 - Before policy evaluation, cwd and path-like tokens must stay inside the workspace; `file:` URLs and escape syntax are rejected. Other URL-like arguments are not filesystem paths, so authorization of a network-capable program still carries its native network risk.
 - An authorized subprocess runs as the host user. These controls are not an OS filesystem/network sandbox and do not mediate a child's direct I/O, even when typed libOS primitives would deny it. Use only trusted executables; hostile-code isolation requires a stronger boundary.
-- On timeout, resource-limit, cancellation, or ordinary provider failure after dispatch, output may be unavailable and external effect is conservatively unknown. Finite authority is consumed. Inspect state with a domain read before any retry; replay only a proven-idempotent read whose first dispatch outcome is harmless.
+- On timeout, resource-limit, or ordinary provider failure after dispatch, output may be unavailable and external effect is conservatively unknown. Finite authority is consumed. Inspect state with a domain read before any retry; replay only a proven-idempotent read whose first dispatch outcome is harmless.
+- Caller cancellation does not kill or abandon the default synchronous Shell worker. The async boundary shields and joins that worker until the provider settles, then propagates cancellation instead of returning the completed command result. The subprocess may therefore run through completion or its own timeout, primitive effect evidence may already be committed, and no normal model-facing ToolResult may be available. Reconcile authoritative domain state and primitive audit evidence before any retry.
 - Even when stream caps pass, the normalized result has a global persistence bound. A side-effecting Shell result can be replaced by `result_omitted` evidence after execution; treat command outcome/effects as unverified and inspect state instead of replaying.
 - On truncation, narrowing the command is preferred. Increasing the call cap helps only when that final tool-level cap caused truncation; it cannot undo provider byte limits or configured primitive character limits.
 - A denial is a stop condition. Do not wrap, split, rename, path-qualify, or move the command into an interpreter to evade classification.
@@ -46,7 +47,7 @@ For ordinary Git intent, activate an `agent-libos-git-*` Skill. Direct Git is a 
 Record the exact requested argv, intended cwd, timeout, return code, and both truncation flags. Completion additionally requires:
 
 - decisive output is complete, or conclusions are explicitly limited to the returned prefix;
-- invalid UTF-8 replacement or byte truncation cannot affect the claimed result;
+- invalid UTF-8 replacement or character-prefix truncation cannot affect the claimed result;
 - the authoritative domain state, artifact, or test result was checked after the command;
 - no interactive prompt, hidden environment dependency, or unreviewed remote access was required;
 - an unknown-effect failure was reconciled rather than blindly retried.

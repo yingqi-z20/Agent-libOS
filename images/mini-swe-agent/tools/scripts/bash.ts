@@ -7,12 +7,20 @@ type LibOS = {
   syscall(name: string, args?: Record<string, unknown>): Promise<any>;
 };
 
+function codePoints(value: string): string[] {
+  return Array.from(value);
+}
+
 function commandText(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0) {
+  if (typeof value !== "string") {
     throw new Error("command must be a non-empty string");
   }
-  if (value.length > COMMAND_MAX_CHARS) {
-    throw new Error(`command exceeds ${COMMAND_MAX_CHARS} characters`);
+  const commandPoints = codePoints(value);
+  if (commandPoints.length === 0) {
+    throw new Error("command must be a non-empty string");
+  }
+  if (commandPoints.length > COMMAND_MAX_CHARS) {
+    throw new Error(`command exceeds ${COMMAND_MAX_CHARS} Unicode code points`);
   }
   return value;
 }
@@ -24,14 +32,15 @@ function observation(
   stdoutTruncated = false,
   stderrTruncated = false,
 ): Record<string, unknown> {
+  const outputPoints = codePoints(output);
   const upstreamIncomplete = stdoutTruncated || stderrTruncated;
-  const outputIncomplete = upstreamIncomplete || output.length > OUTPUT_LIMIT;
+  const outputIncomplete = upstreamIncomplete || outputPoints.length > OUTPUT_LIMIT;
   const truncation = {
     stdout_truncated: stdoutTruncated,
     stderr_truncated: stderrTruncated,
     output_incomplete: outputIncomplete,
   };
-  if (output.length <= OUTPUT_LIMIT) {
+  if (outputPoints.length <= OUTPUT_LIMIT) {
     return {
       returncode,
       output,
@@ -44,12 +53,12 @@ function observation(
   }
   return {
     returncode,
-    output_head: output.slice(0, OUTPUT_EDGE),
-    output_tail: output.slice(-OUTPUT_EDGE),
-    elided_chars: output.length - OUTPUT_EDGE * 2,
+    output_head: outputPoints.slice(0, OUTPUT_EDGE).join(""),
+    output_tail: outputPoints.slice(-OUTPUT_EDGE).join(""),
+    elided_chars: outputPoints.length - OUTPUT_EDGE * 2,
     warning: upstreamIncomplete
-      ? `Captured output was longer than ${OUTPUT_LIMIT} characters and was truncated to head/tail windows. Shell capture was also truncated upstream; elided_chars counts only characters omitted from the captured output.`
-      : `Captured output was longer than ${OUTPUT_LIMIT} characters and was truncated to head/tail windows.`,
+      ? `Captured output was longer than ${OUTPUT_LIMIT} Unicode code points and was truncated to head/tail windows. Shell capture was also truncated upstream; elided_chars counts only Unicode code points omitted from the captured output.`
+      : `Captured output was longer than ${OUTPUT_LIMIT} Unicode code points and was truncated to head/tail windows.`,
     ...truncation,
     exception_info: exceptionInfo,
   };

@@ -1,6 +1,6 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { LibOSClient } from "../api/client";
-import type { ExplainOperationResponse, ImageInspectResult, OperationListResponse, RuntimeProcess, RuntimeSnapshot } from "../api/types";
+import type { AuditRecord, ExplainOperationResponse, ImageInspectResult, OperationListResponse, RuntimeProcess, RuntimeSnapshot } from "../api/types";
 import type { ConfirmationRequest, RunGuiAction } from "../adminTypes";
 import { useI18n, type TranslationKey } from "../i18n";
 import { CollapsibleJson } from "./CollapsibleJson";
@@ -14,6 +14,7 @@ import { ObjectTasksPanel } from "./ObjectTasksPanel";
 import { ProcessOverview } from "./ProcessOverview";
 import { RemoteRegistryPanel } from "./RemoteRegistryPanel";
 import { SkillsPanel } from "./SkillsPanel";
+import { RequestEpoch } from "../requestEpoch";
 
 const tabs = [
   { key: "overview", label: "details.overview" },
@@ -31,6 +32,7 @@ const tabs = [
   { key: "images", label: "details.images" },
   { key: "objectMemory", label: "details.objectMemory" }
 ] as const satisfies ReadonlyArray<{ key: string; label: TranslationKey }>;
+const hostTabs = new Set<TabKey>(["toolsSkills", "jsonRpc", "mcp", "modules", "images"]);
 
 type TabKey = (typeof tabs)[number]["key"];
 
@@ -47,9 +49,11 @@ export function DetailTabs({
   onExplainOperation,
   onResolveOperation,
   explainLookup,
+  connectionEpoch = 0,
   client,
   runAction,
-  confirmAction
+  confirmAction,
+  busy = false
 }: {
   process: RuntimeProcess | null;
   snapshot: RuntimeSnapshot | null;
@@ -59,40 +63,80 @@ export function DetailTabs({
   onUseImageForExec(imageId: string): void;
   onRate(pid: string, score: number, comment: string): Promise<boolean>;
   onInspectImage(imageId: string): Promise<ImageInspectResult>;
-  onListOperations(pid: string, cursor?: string): Promise<OperationListResponse>;
-  onExplainOperation(operationId: string, cursor?: string): Promise<ExplainOperationResponse>;
-  onResolveOperation(kind: string, id: string): Promise<ExplainOperationResponse>;
+  onListOperations(pid: string, cursor?: string, signal?: AbortSignal): Promise<OperationListResponse>;
+  onExplainOperation(operationId: string, cursor?: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
+  onResolveOperation(kind: string, id: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
   explainLookup: { kind: string; id: string; nonce: number } | null;
+  connectionEpoch?: number;
   client?: LibOSClient | null;
   runAction?: RunGuiAction;
   confirmAction?(request: ConfirmationRequest): void;
+  busy?: boolean;
 }) {
   const { t } = useI18n();
-  const [tab, setTab] = useState<TabKey>("overview");
+  const [tab, setTab] = useState<TabKey>(() => process ? "overview" : "toolsSkills");
   const tabsId = useId();
+  const tabSelectId = `${tabsId}-select`;
+  const tabSelectLabelId = `${tabsId}-select-label`;
+  const tabPanelId = `${tabsId}-panel`;
+  const tabListRef = useRef<HTMLDivElement>(null);
+  const previousProcessPidRef = useRef(process?.pid ?? null);
+  const visibleTabs = useMemo(
+    () => process ? tabs : tabs.filter(({ key }) => hostTabs.has(key)),
+    [process]
+  );
   useEffect(() => {
     if (explainLookup) setTab("explain");
   }, [explainLookup?.nonce]);
+  useEffect(() => {
+    const previousPid = previousProcessPidRef.current;
+    const nextPid = process?.pid ?? null;
+    previousProcessPidRef.current = nextPid;
+    if (!nextPid && !visibleTabs.some(({ key }) => key === tab)) {
+      setTab(visibleTabs[0]?.key ?? "toolsSkills");
+    } else if (!previousPid && nextPid && tab === "toolsSkills") {
+      setTab("overview");
+    }
+  }, [process?.pid, tab, visibleTabs]);
+  useEffect(() => {
+    const active = tabListRef.current?.querySelector<HTMLElement>("[role='tab'][aria-selected='true']");
+    if (active && typeof active.scrollIntoView === "function") {
+      const reducedMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+      active.scrollIntoView({ block: "nearest", inline: "nearest", behavior: reducedMotion ? "auto" : "smooth" });
+    }
+  }, [tab]);
   if (!snapshot) return <div className="empty">{t("details.snapshotMissing")}</div>;
   return (
-    <aside className="details">
-      <div className="tabs" role="tablist" aria-label={t("details.tabsLabel")}>
-        {tabs.map(({ key, label }, index) => (
+    <aside className="details" aria-busy={busy || undefined} inert={busy ? true : undefined}>
+      <label className="detailTabSelect" htmlFor={tabSelectId}>
+        <span id={tabSelectLabelId}>{t("details.tabsLabel")}</span>
+        <select
+          id={tabSelectId}
+          aria-labelledby={tabSelectLabelId}
+          aria-controls={tabPanelId}
+          value={tab}
+          onChange={(event) => setTab(event.currentTarget.value as TabKey)}
+        >
+          {visibleTabs.map(({ key, label }) => <option value={key} key={key}>{t(label)}</option>)}
+        </select>
+      </label>
+      <div ref={tabListRef} className="tabs" role="tablist" aria-label={t("details.tabsLabel")}>
+        {visibleTabs.map(({ key, label }, index) => (
           <button
             type="button"
             role="tab"
             id={`${tabsId}-tab-${key}`}
-            aria-controls={`${tabsId}-panel`}
+            aria-controls={tabPanelId}
             aria-selected={tab === key}
             tabIndex={tab === key ? 0 : -1}
             key={key}
             className={tab === key ? "active" : ""}
             onClick={() => setTab(key)}
             onKeyDown={(event) => {
-              const nextIndex = tabIndexForKey(index, event.key, tabs.length);
+              const nextIndex = tabIndexForKey(index, event.key, visibleTabs.length);
               if (nextIndex === null) return;
               event.preventDefault();
-              setTab(tabs[nextIndex].key);
+              setTab(visibleTabs[nextIndex].key);
               const buttons = event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("[role='tab']");
               buttons?.[nextIndex]?.focus();
             }}
@@ -103,9 +147,9 @@ export function DetailTabs({
       </div>
       <div
         className="tabPanel"
-        id={`${tabsId}-panel`}
+        id={tabPanelId}
         role="tabpanel"
-        aria-labelledby={`${tabsId}-tab-${tab}`}
+        aria-labelledby={`${tabSelectLabelId} ${tabsId}-tab-${tab}`}
         tabIndex={0}
       >
         {renderTab(tab, process, snapshot, t, {
@@ -119,6 +163,7 @@ export function DetailTabs({
           onExplainOperation,
           onResolveOperation,
           explainLookup,
+          connectionEpoch,
           client: client ?? null,
           runAction,
           confirmAction
@@ -149,10 +194,11 @@ function renderTab(
     onUseImageForExec(imageId: string): void;
     onRate(pid: string, score: number, comment: string): Promise<boolean>;
     onInspectImage(imageId: string): Promise<ImageInspectResult>;
-    onListOperations(pid: string, cursor?: string): Promise<OperationListResponse>;
-    onExplainOperation(operationId: string, cursor?: string): Promise<ExplainOperationResponse>;
-    onResolveOperation(kind: string, id: string): Promise<ExplainOperationResponse>;
+    onListOperations(pid: string, cursor?: string, signal?: AbortSignal): Promise<OperationListResponse>;
+    onExplainOperation(operationId: string, cursor?: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
+    onResolveOperation(kind: string, id: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
     explainLookup: { kind: string; id: string; nonce: number } | null;
+    connectionEpoch: number;
     client: LibOSClient | null;
     runAction?: RunGuiAction;
     confirmAction?(request: ConfirmationRequest): void;
@@ -162,35 +208,38 @@ function renderTab(
   const adminReady = imageActions.client && imageActions.runAction && imageActions.confirmAction;
   if (tab === "overview" && process) return <ProcessOverview process={process} />;
   if (tab === "rating") return <RatingPanel process={process} onSave={imageActions.onRate} />;
-  if (tab === "capabilities" && process && adminReady) return <CapabilityPanel key={process.pid} process={process} client={imageActions.client!} confirmAction={imageActions.confirmAction!} reloadKey={adminRefreshKey(process, snapshot)} />;
-  if (tab === "toolsSkills" && process && adminReady) return <SkillsPanel key={process.pid} process={process} skills={snapshot.skills} tools={snapshot.tools} client={imageActions.client!} confirmAction={imageActions.confirmAction!} />;
+  if (tab === "capabilities" && process && adminReady) return <CapabilityPanel key={adminPanelKey(process, imageActions.connectionEpoch)} process={process} client={imageActions.client!} confirmAction={imageActions.confirmAction!} reloadKey={adminRefreshKey(process, snapshot)} />;
+  if (tab === "toolsSkills" && process && adminReady) return <SkillsPanel key={`${imageActions.connectionEpoch}:${process.pid}`} process={process} skills={snapshot.skills} tools={snapshot.tools} client={imageActions.client!} confirmAction={imageActions.confirmAction!} />;
   if (tab === "toolsSkills") return <JsonBlock value={{ process_tools: process?.tool_table, loaded_skills: process?.loaded_skills, registry: snapshot.skills, tools: snapshot.tools }} />;
-  if (tab === "checkpoints" && process && adminReady) return <CheckpointPanel key={process.pid} process={process} client={imageActions.client!} runAction={imageActions.runAction!} confirmAction={imageActions.confirmAction!} reloadKey={adminRefreshKey(process, snapshot)} />;
-  if (tab === "tasks" && process && adminReady) return <ObjectTasksPanel key={process.pid} process={process} tasks={snapshot.object_tasks} tools={snapshot.tools} client={imageActions.client!} runAction={imageActions.runAction!} confirmAction={imageActions.confirmAction!} />;
+  if (tab === "checkpoints" && process && adminReady) return <CheckpointPanel key={adminPanelKey(process, imageActions.connectionEpoch)} process={process} client={imageActions.client!} runAction={imageActions.runAction!} confirmAction={imageActions.confirmAction!} reloadKey={adminRefreshKey(process, snapshot)} />;
+  if (tab === "tasks" && process && adminReady) return <ObjectTasksPanel key={`${imageActions.connectionEpoch}:${process.pid}`} process={process} tasks={snapshot.object_tasks} tools={snapshot.tools} client={imageActions.client!} runAction={imageActions.runAction!} confirmAction={imageActions.confirmAction!} />;
+  if (tab === "audit" && process && imageActions.client) return <AuditPanel key={`${imageActions.connectionEpoch}:${process.pid}`} process={process} snapshot={snapshot} client={imageActions.client} />;
   if (tab === "audit") return <JsonBlock value={snapshot.audit.filter((item) => item.actor === process?.pid || item.target === `process:${process?.pid}`)} />;
   if (tab === "explain" && process) {
     return (
       <ExplainPanel
-        key={explainRefreshKey(process, snapshot)}
+        key={explainPanelKey(process, imageActions.connectionEpoch)}
         pid={process.pid}
         listOperations={imageActions.onListOperations}
         explainOperation={imageActions.onExplainOperation}
         resolveOperation={imageActions.onResolveOperation}
         lookup={imageActions.explainLookup}
+        refreshKey={explainRefreshKey(process, snapshot)}
+        connectionKey={String(imageActions.connectionEpoch)}
       />
     );
   }
   if (tab === "llmCalls") return <JsonBlock value={snapshot.llm_calls.filter((item) => item.pid === process?.pid)} />;
-  if (tab === "jsonRpc" && imageActions.client && imageActions.confirmAction) return <RemoteRegistryPanel key={`jsonrpc:${process?.pid ?? "host"}`} kind="jsonrpc" process={process} entries={snapshot.jsonrpc_endpoints} client={imageActions.client} confirmAction={imageActions.confirmAction} />;
+  if (tab === "jsonRpc" && imageActions.client && imageActions.confirmAction) return <RemoteRegistryPanel key={`${imageActions.connectionEpoch}:jsonrpc:${process?.pid ?? "host"}`} kind="jsonrpc" process={process} entries={snapshot.jsonrpc_endpoints} client={imageActions.client} confirmAction={imageActions.confirmAction} />;
   if (tab === "jsonRpc") return <JsonBlock value={snapshot.jsonrpc_endpoints} />;
-  if (tab === "mcp" && imageActions.client && imageActions.confirmAction) return <RemoteRegistryPanel key={`mcp:${process?.pid ?? "host"}`} kind="mcp" process={process} entries={snapshot.mcp_servers} client={imageActions.client} confirmAction={imageActions.confirmAction} />;
+  if (tab === "mcp" && imageActions.client && imageActions.confirmAction) return <RemoteRegistryPanel key={`${imageActions.connectionEpoch}:mcp:${process?.pid ?? "host"}`} kind="mcp" process={process} entries={snapshot.mcp_servers} client={imageActions.client} confirmAction={imageActions.confirmAction} />;
   if (tab === "mcp") return <JsonBlock value={snapshot.mcp_servers} />;
-  if (tab === "modules" && imageActions.client) return <ModulesPanel modules={snapshot.modules} client={imageActions.client} />;
+  if (tab === "modules" && imageActions.client) return <ModulesPanel key={imageActions.connectionEpoch} modules={snapshot.modules} client={imageActions.client} />;
   if (tab === "modules") return <JsonBlock value={snapshot.modules} />;
   if (tab === "images") {
     return (
       <ImagePanel
-        key={process?.pid ?? "no-process"}
+        key={`${imageActions.connectionEpoch}:${process?.pid ?? "no-process"}`}
         images={snapshot.images}
         selectedProcess={process}
         allowReplace
@@ -205,25 +254,108 @@ function renderTab(
   return <JsonBlock value={{ goal_oid: process?.goal_oid, note: t("details.objectMemoryNote") }} />;
 }
 
-function adminRefreshKey(process: RuntimeProcess, snapshot: RuntimeSnapshot): string {
+export function adminPanelKey(process: RuntimeProcess, connectionEpoch = 0): string {
+  return `${connectionEpoch}:${process.pid}`;
+}
+
+export function adminRefreshKey(process: RuntimeProcess, snapshot: RuntimeSnapshot): string {
+  const processAudit = snapshot.audit.filter((item) =>
+    item.actor === process.pid || item.target === `process:${process.pid}`
+  );
+  const processEvents = snapshot.events.filter((item) =>
+    item.source === process.pid || item.target === process.pid || item.target === `process:${process.pid}`
+  );
   return [
     process.pid,
     process.state_generation,
     process.checkpoint_head,
     process.capabilities.join(","),
-    snapshot.audit.at(-1)?.record_id,
-    snapshot.events.at(-1)?.event_id
+    processAudit.at(-1)?.record_id,
+    processEvents.at(-1)?.event_id
   ].join(":");
 }
 
 export function explainRefreshKey(process: RuntimeProcess, snapshot: RuntimeSnapshot): string {
+  const processAudit = snapshot.audit.filter((item) => item.actor === process.pid || item.target === `process:${process.pid}`);
+  const processEvents = snapshot.events.filter((item) => item.source === process.pid || item.target === process.pid || item.target === `process:${process.pid}`);
+  const processLlmCalls = snapshot.llm_calls.filter((item) => item.pid === process.pid);
+  const processHumanRequests = snapshot.human_requests.filter((item) => item.pid === process.pid);
   return [
     process.pid,
-    snapshot.audit.at(-1)?.record_id,
-    snapshot.events.at(-1)?.event_id,
-    snapshot.llm_calls.at(-1)?.call_id,
-    snapshot.human_requests.at(-1)?.updated_at
+    process.state_generation,
+    processAudit.at(-1)?.record_id,
+    processEvents.at(-1)?.event_id,
+    processLlmCalls.at(-1)?.call_id,
+    processHumanRequests.at(-1)?.updated_at
   ].join(":");
+}
+
+export function explainPanelKey(process: RuntimeProcess, connectionEpoch = 0): string {
+  return connectionEpoch === 0 ? process.pid : `${connectionEpoch}:${process.pid}`;
+}
+
+function AuditPanel({ process, snapshot, client }: { process: RuntimeProcess; snapshot: RuntimeSnapshot; client: LibOSClient }) {
+  const { t } = useI18n();
+  const snapshotRecords = useMemo(
+    () => snapshot.audit.filter((item) => item.actor === process.pid || item.target === `process:${process.pid}`),
+    [process.pid, snapshot.audit]
+  );
+  const [loadedRecords, setLoadedRecords] = useState<AuditRecord[]>([]);
+  const [canLoadMore, setCanLoadMore] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const requests = useRef(new RequestEpoch());
+  const abort = useRef<AbortController | null>(null);
+  const records = useMemo(() => mergeAuditRecords(loadedRecords, snapshotRecords), [loadedRecords, snapshotRecords]);
+
+  useEffect(() => {
+    abort.current?.abort();
+    requests.current.invalidate();
+    setLoadedRecords([]);
+    setCanLoadMore(true);
+    setLoading(false);
+    setError(null);
+    return () => {
+      abort.current?.abort();
+      requests.current.invalidate();
+    };
+  }, [client, process.pid]);
+
+  async function loadOlder() {
+    const before = records[0]?.record_id;
+    abort.current?.abort();
+    const controller = new AbortController();
+    abort.current = controller;
+    const request = requests.current.begin();
+    setLoading(true);
+    setError(null);
+    try {
+      const page = await client.listProcessAudit(process.pid, undefined, before, { signal: controller.signal, timeoutMs: 15_000 });
+      if (!requests.current.isCurrent(request)) return;
+      setLoadedRecords((current) => mergeAuditRecords(page, current));
+      setCanLoadMore(page.length > 0);
+    } catch (reason) {
+      if (requests.current.isCurrent(request)) setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (requests.current.isCurrent(request)) setLoading(false);
+    }
+  }
+
+  return (
+    <section className="auditPanel" aria-busy={loading || undefined}>
+      <JsonBlock value={records} />
+      {error ? <div className="inlineError" role="alert">{error}</div> : null}
+      {canLoadMore ? <button type="button" disabled={loading} onClick={() => void loadOlder()}>{t("explain.loadMore")}</button> : null}
+    </section>
+  );
+}
+
+export function mergeAuditRecords(...pages: AuditRecord[][]): AuditRecord[] {
+  const records = new Map<string, AuditRecord>();
+  for (const page of pages) for (const record of page) records.set(record.record_id, record);
+  return Array.from(records.values()).sort((left, right) =>
+    left.timestamp.localeCompare(right.timestamp) || left.record_id.localeCompare(right.record_id)
+  );
 }
 
 function JsonBlock({ value }: { value: unknown }) {

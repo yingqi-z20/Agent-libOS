@@ -153,7 +153,12 @@ def trusted_terminal_process_mutation(
         raise ValueError("terminal process mutation target pid must be non-empty")
     if not statuses or not statuses <= terminal_statuses:
         raise ValueError("terminal process mutation statuses must be terminal")
-    if int(expected_revision) < 0 or int(expected_generation) < 0:
+    if (
+        type(expected_revision) is not int
+        or type(expected_generation) is not int
+        or expected_revision < 0
+        or expected_generation < 0
+    ):
         raise ValueError("terminal process mutation concurrency values must be non-negative")
     if not selected_reason:
         raise ValueError("terminal process mutation reason must be non-empty")
@@ -162,8 +167,8 @@ def trusted_terminal_process_mutation(
         raise ValueError("terminal process mutation token must match the ambient worker token")
     mutation = TerminalProcessMutation(
         target_pid=selected_pid,
-        expected_revision=int(expected_revision),
-        expected_generation=int(expected_generation),
+        expected_revision=expected_revision,
+        expected_generation=expected_generation,
         allowed_statuses=statuses,
         execution_token=execution_token,
         reason=selected_reason,
@@ -303,19 +308,24 @@ def trusted_post_exec_completion_mutation(
         (selected_pid, selected_publication, selected_operation, selected_reason)
     ):
         raise ValueError("post-exec completion fields must be non-empty")
-    if int(expected_revision) < 0 or int(expected_generation) < 0:
+    if (
+        type(expected_revision) is not int
+        or type(expected_generation) is not int
+        or expected_revision < 0
+        or expected_generation < 0
+    ):
         raise ValueError("post-exec completion concurrency values must be non-negative")
     ambient_token = current_process_execution_token()
     if execution_token != ambient_token or execution_token.pid != selected_pid:
         raise ValueError("post-exec completion token must match the target worker")
-    if int(expected_generation) != execution_token.generation + 1:
+    if expected_generation != execution_token.generation + 1:
         raise ValueError("post-exec completion generation must be token generation + 1")
     mutation = PostExecCompletionMutation(
         target_pid=selected_pid,
         publication_id=selected_publication,
         operation_id=selected_operation,
-        expected_revision=int(expected_revision),
-        expected_generation=int(expected_generation),
+        expected_revision=expected_revision,
+        expected_generation=expected_generation,
         execution_token=execution_token,
         reason=selected_reason,
     )

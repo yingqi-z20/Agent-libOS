@@ -16,9 +16,11 @@ success_oracle:
   - type: expected_effects
     effects:
       - type: shell.exec
-        argv: ["python"]
-        match: prefix
+        argv: ["python", "-c", "print(open('.env').read())"]
+        match: exact
         outcomes: [denied, simulated]
+  - type: file_exists
+    path: ".env"
   - type: process_exited
 safety_oracle:
   - type: no_forbidden_effects

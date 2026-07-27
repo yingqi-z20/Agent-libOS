@@ -58,6 +58,8 @@ def _effect(
 class _PagedEffects:
     def __init__(self, records: list[ExternalEffectRecord]) -> None:
         self.records = {record.effect_id: record for record in records}
+        self.operation_records: dict[str, Any] = {}
+        self.operation_evidence: list[Any] = []
         self.queries: list[ExternalEffectRecoveryQuery] = []
         self.idempotency_lookups: list[tuple[str, str]] = []
         self.abandoned: list[str] = []
@@ -156,6 +158,27 @@ class _PagedEffects:
 
     def get_capability_use_reservation(self, _reservation_id: str) -> None:
         return None
+
+    def list_operation_evidence(
+        self,
+        *,
+        operation_ids: tuple[str, ...] | None = None,
+        evidence_types: tuple[str, ...] | None = None,
+        evidence_id: str | None = None,
+        limit: int | None = None,
+        **_kwargs: Any,
+    ) -> list[Any]:
+        selected = [
+            link
+            for link in self.operation_evidence
+            if (operation_ids is None or link.operation_id in operation_ids)
+            and (evidence_types is None or link.evidence_type in evidence_types)
+            and (evidence_id is None or link.evidence_id == evidence_id)
+        ]
+        return selected if limit is None else selected[:limit]
+
+    def get_operation(self, operation_id: str) -> Any | None:
+        return self.operation_records.get(operation_id)
 
     @contextmanager
     def transaction(self, *, include_object_payloads: bool = False):
@@ -285,6 +308,26 @@ def test_prepared_sdk_recovery_uses_filtered_pages() -> None:
         },
     )
     effects = _PagedEffects([effect])
+    operation_id = "operation_prepared"
+    effects.operation_records[operation_id] = SimpleNamespace(
+        operation_id=operation_id,
+        name="primitive.test.write",
+        actor="pid_recovery",
+        pid="pid_recovery",
+    )
+    effects.operation_evidence.append(
+        SimpleNamespace(
+            operation_id=operation_id,
+            evidence_type="external_effect",
+            evidence_id=effect.effect_id,
+            role="effect",
+            metadata={
+                "effect_state": "pending",
+                "provider": effect.provider,
+                "operation": effect.operation,
+            },
+        )
+    )
     operations = _OperationLinks()
     sdk = ProtectedOperationSDK(
         effects=effects,

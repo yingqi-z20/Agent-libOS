@@ -6,8 +6,11 @@ real LLM paths, and documentation rules for Agent libOS contributors.
 ## Setup
 
 Use Python 3.11–3.14 and uv. The full matrix also requires system Git 2.26 or
-newer. GUI work requires Node `^20.19.0` or `>=22.12.0` with npm 8 or newer (CI
-uses Node 24). Deno is optional unless validating real TypeScript/JIT execution.
+newer. The GUI package declares Node `>=22.12.0` with npm 8 or newer. Per-change
+CI exercises Node 24 with the npm version supplied by that toolchain; the lower
+declared Node and npm bounds are compatibility targets, not separately tested
+CI matrix entries. Deno is optional unless validating real TypeScript/JIT
+execution.
 
 Install dependencies:
 
@@ -24,10 +27,10 @@ uv sync --frozen --all-groups
 npm --prefix gui ci
 ```
 
-`uv sync --frozen` does not freeze the isolated PEP 517 build backend:
-`pyproject.toml` currently requests an unconstrained `hatchling`. Do not describe
-`uv build` as build-backend reproducible unless a build constraint or pinned
-backend is added separately.
+The release path installs its exact build backend from the frozen `release`
+dependency group and invokes `uv build --no-build-isolation` with that virtual
+environment's interpreter. Keep the `hatchling` version in `[build-system]` and
+the `release` group aligned whenever the backend is upgraded.
 
 Deno-backed tests run by default when `deno` is installed. If `deno` is absent,
 tests marked `real_deno` skip with a clear pytest reason; use
@@ -115,12 +118,13 @@ the Python `all` lane is one command, while the GUI test, typecheck, and build
 commands each receive the full timeout independently. Timeout exits with status
 124 after terminating the process group/tree. Standard lanes deselect
 `postgres` tests because the PostgreSQL CI
-service runs them separately with `pytest -m postgres --run-postgres`. CI runs
-each standard lane with a 360-second process deadline and a 15-minute outer
-step deadline. Run the `gui` lane separately; it cleans Electron output before
-production compilation, excludes generated `dist-electron` files from Vitest,
-and never emits test files into the production Electron tree. Install GUI
-dependencies first with `npm --prefix gui install`.
+service runs them separately with `pytest -m postgres --run-postgres`. CI gives
+the runtime lane a 480-second process deadline and the other standard lanes a
+360-second deadline, all within a 15-minute outer step deadline. Run the `gui`
+lane separately; it cleans Electron output before production compilation,
+excludes generated `dist-electron` files from Vitest, and never emits test
+files into the production Electron tree. Install GUI dependencies first with
+`npm --prefix gui install`.
 
 The architecture check covers the core package and repository-level Runtime
 Modules. Its default function-size ceiling is 200 lines; larger existing
@@ -185,17 +189,28 @@ tests, and documentation. Electron sources remain repository-checkout assets
 validated by the separate GUI lane. Validate that contract before a release:
 
 ```bash
-uv build --clear --out-dir dist
-uv run python scripts/check_release_artifacts.py dist
+uv sync --frozen --no-dev --group release
+uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
+.venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
+uv run --frozen --no-dev --group release twine check \
+  dist/agent_libos-1.0.0-py3-none-any.whl dist/agent_libos-1.0.0.tar.gz
+uv run --frozen --no-dev --group release check-wheel-contents \
+  dist/agent_libos-1.0.0-py3-none-any.whl
+.venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 ```
 
 The artifact checker requires the Python package, project metadata, and
 lockfile versions to agree; when GUI sources are present, both GUI package
-versions must agree as well. CI installs the built wheel and source
-distribution into fresh environments, checks dependency consistency, runs all
-three entrypoint help commands from outside the source tree, executes the
-deterministic demo against an in-memory store, and preserves the validated
-distributions for release use.
+versions must agree as well. The artifact directory is a closed set: extra
+files, directories, symbolic links, and other non-regular entries are rejected.
+CI builds the pair once, records `SHA256SUMS`, and makes all four Python-version
+jobs download and verify that same pair before installing hash-checked locked
+dependencies and the artifact itself into fresh
+environments, checking dependency consistency, running all three entrypoint
+help commands from outside the source tree, and executing the deterministic
+demo against an in-memory store. The build job waits for its declared pre-build
+gates; the clean-install matrix is downstream of that build, so the candidate
+is not release-validated until every smoke job also succeeds.
 
 The deterministic matrix is not the full platform release matrix. See
 [support_matrix.md](support_matrix.md) before claiming Windows/macOS, packaged
@@ -541,6 +556,13 @@ as current behavior. Paper-facing documentation should stay aligned with the
 fixed title:
 `Agent libOS: A Runtime Substrate for Capability-Controlled Self-Evolving LLM
 Agents`.
+
+Invariant manifest schema v2 uses `required_platform_nodes` when a claim needs
+native host evidence. Each platform list must contain exact node ids from the
+invariant's main `node_ids` list and those tests must carry the corresponding
+`platform_darwin` or `platform_linux` marker. Release CI runs each marker in its
+own native shard with `--fail-on-skip`; ordinary cross-platform collection does
+not substitute for that platform evidence.
 
 Current behavior must not claim:
 

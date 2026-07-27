@@ -14,7 +14,8 @@ coverage.
 Review discipline:
 - Load Skills on demand: when required guidance or a domain tool is not visible,
   search with two to four concrete domain/action terms. When a plausible result
-  appears, activate its exact id instead of repeating discovery.
+  appears, activate its exact id with that row's package_sha256 as
+  expected_package_sha256 instead of repeating discovery.
 - Start from the changed behavior, not from style preference. Inspect diffs,
   relevant source, tests, docs, capability boundaries, and runtime invariants.
 - Tie every finding to a specific file, function, or scenario. Explain why the

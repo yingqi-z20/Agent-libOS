@@ -10,7 +10,7 @@ from reprlib import Repr
 from collections.abc import Callable, Mapping
 import threading
 from types import TracebackType
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -44,6 +44,7 @@ from agent_libos.models import (
     ObjectMetadata,
     ObjectPatch,
     ObjectQuery,
+    ObjectRef,
     ObjectRight,
     ObjectOwnerKind,
     ObjectType,
@@ -151,6 +152,12 @@ class ObjectLifetimeScope:
 
 class ObjectMemoryManager:
     """Typed Object Memory with capability-checked handles and namespace-local names."""
+
+    # Keep externally supplied namespace metadata comfortably below Python's
+    # recursion ceiling.  The byte limit supplies the independent width/node
+    # budget, so neither a deep nor a very wide tree can reach serialization
+    # unboundedly.
+    _BOUNDED_JSON_MAX_DEPTH = 64
 
     def __init__(
         self,
@@ -292,13 +299,9 @@ class ObjectMemoryManager:
                 intent = self._normalize_durable_finalizer_intent(
                     raw_intent,
                     finalizer_id=finalizer_id,
+                    limit_bytes=intent_limit_bytes,
                 )
                 encoded_intent = self._canonical_json_bytes(intent)
-                if len(encoded_intent) > intent_limit_bytes:
-                    raise ValidationError(
-                        f"durable finalizer intent {finalizer_id} exceeds "
-                        f"{intent_limit_bytes} bytes (got {len(encoded_intent)})"
-                    )
                 work_item = {
                     "work_id": idempotency_key,
                     "finalizer_id": finalizer_id,
@@ -343,6 +346,7 @@ class ObjectMemoryManager:
             intent,
             finalizer_id=finalizer_id,
             label=f"durable object release work item intent {work_id}",
+            limit_bytes=self.config.checkpoint.payload_capture_limit_bytes,
         )
         expected_sha256 = str(selected.get("intent_sha256") or "")
         actual_sha256 = hashlib.sha256(
@@ -406,9 +410,11 @@ class ObjectMemoryManager:
         value: Any,
         *,
         finalizer_id: str,
+        limit_bytes: int,
         label: str | None = None,
     ) -> dict[str, Any]:
         selected_label = label or f"durable finalizer intent {finalizer_id}"
+        cls._require_non_negative_byte_limit(limit_bytes, selected_label + " limit")
         if not isinstance(value, Mapping):
             if label is not None:
                 raise ValidationError(f"{selected_label} is invalid")
@@ -421,9 +427,21 @@ class ObjectMemoryManager:
             label=selected_label,
             path="$",
             active_containers=set(),
+            max_depth=cls._BOUNDED_JSON_MAX_DEPTH,
+            max_nodes=max(1, limit_bytes),
         )
         if not isinstance(normalized, dict):  # pragma: no cover - guarded above
             raise ValidationError(f"{selected_label} must be a JSON object")
+        try:
+            encoded = cls._canonical_json_bytes(normalized)
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"{selected_label} is not bounded JSON: {type(exc).__name__}"
+            ) from exc
+        if len(encoded) > limit_bytes:
+            raise ValidationError(
+                f"{selected_label} exceeds {limit_bytes} bytes (got {len(encoded)})"
+            )
         return normalized
 
     @classmethod
@@ -434,7 +452,18 @@ class ObjectMemoryManager:
         label: str,
         path: str,
         active_containers: set[int],
+        parent_depth: int = 0,
+        max_depth: int | None = None,
+        node_count: list[int] | None = None,
+        max_nodes: int | None = None,
     ) -> Any:
+        if node_count is None:
+            node_count = [0]
+        node_count[0] += 1
+        if max_nodes is not None and node_count[0] > max_nodes:
+            raise ValidationError(
+                f"{label} exceeds maximum JSON nodes={max_nodes}"
+            )
         value_type = type(value)
         if value is None or value_type in {str, bool, int}:
             return value
@@ -446,6 +475,11 @@ class ObjectMemoryManager:
             return value
 
         if isinstance(value, Mapping):
+            depth = parent_depth + 1
+            if max_depth is not None and depth > max_depth:
+                raise ValidationError(
+                    f"{label} exceeds maximum JSON depth={max_depth} at {path}"
+                )
             identity = id(value)
             if identity in active_containers:
                 raise ValidationError(f"{label} contains a cycle at {path}")
@@ -466,12 +500,21 @@ class ObjectMemoryManager:
                         label=label,
                         path=f"{path}[{key!r}]",
                         active_containers=active_containers,
+                        parent_depth=depth,
+                        max_depth=max_depth,
+                        node_count=node_count,
+                        max_nodes=max_nodes,
                     )
                 return normalized_mapping
             finally:
                 active_containers.remove(identity)
 
         if value_type is list:
+            depth = parent_depth + 1
+            if max_depth is not None and depth > max_depth:
+                raise ValidationError(
+                    f"{label} exceeds maximum JSON depth={max_depth} at {path}"
+                )
             identity = id(value)
             if identity in active_containers:
                 raise ValidationError(f"{label} contains a cycle at {path}")
@@ -483,6 +526,10 @@ class ObjectMemoryManager:
                         label=label,
                         path=f"{path}[{index}]",
                         active_containers=active_containers,
+                        parent_depth=depth,
+                        max_depth=max_depth,
+                        node_count=node_count,
+                        max_nodes=max_nodes,
                     )
                     for index, item in enumerate(value)
                 ]
@@ -492,6 +539,74 @@ class ObjectMemoryManager:
         raise ValidationError(
             f"{label} contains non-JSON value {value_type.__name__} at {path}"
         )
+
+    def _normalize_namespace_metadata(
+        self,
+        metadata: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        label = "Object namespace metadata"
+        selected: Any = {} if metadata is None else metadata
+        if not isinstance(selected, Mapping):
+            raise ValidationError(f"{label} must be a JSON object")
+        limit_bytes = self.config.memory.metadata_max_bytes
+        self._require_non_negative_byte_limit(limit_bytes, "memory.metadata_max_bytes")
+        normalized = self._strict_json_value(
+            selected,
+            label=label,
+            path="$",
+            active_containers=set(),
+            max_depth=self._BOUNDED_JSON_MAX_DEPTH,
+            # Every JSON node consumes at least one canonical byte.  Using the
+            # configured byte ceiling as the node ceiling rejects impossible
+            # trees before serialization without imposing a second user-facing
+            # policy knob.
+            max_nodes=max(1, limit_bytes),
+        )
+        if not isinstance(normalized, dict):  # pragma: no cover - guarded above
+            raise ValidationError(f"{label} must be a JSON object")
+        try:
+            encoded = self._canonical_json_bytes(normalized)
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"{label} is not bounded JSON: {type(exc).__name__}"
+            ) from exc
+        if len(encoded) > limit_bytes:
+            raise ValidationError(
+                f"{label} exceeds {limit_bytes} bytes (got {len(encoded)})"
+            )
+        return normalized
+
+    def _normalize_link_metadata(
+        self,
+        metadata: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        label = "Object link metadata"
+        selected: Any = {} if metadata is None else metadata
+        if not isinstance(selected, Mapping):
+            raise ValidationError(f"{label} must be a JSON object")
+        limit_bytes = self.config.memory.metadata_max_bytes
+        self._require_non_negative_byte_limit(limit_bytes, "memory.metadata_max_bytes")
+        normalized = self._strict_json_value(
+            selected,
+            label=label,
+            path="$",
+            active_containers=set(),
+            max_depth=self._BOUNDED_JSON_MAX_DEPTH,
+            max_nodes=max(1, limit_bytes),
+        )
+        if not isinstance(normalized, dict):  # pragma: no cover - guarded above
+            raise ValidationError(f"{label} must be a JSON object")
+        try:
+            encoded = self._canonical_json_bytes(normalized)
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"{label} is not bounded JSON: {type(exc).__name__}"
+            ) from exc
+        if len(encoded) > limit_bytes:
+            raise ValidationError(
+                f"{label} exceeds {limit_bytes} bytes (got {len(encoded)})"
+            )
+        return normalized
 
     def create_object(
         self,
@@ -508,6 +623,8 @@ class ObjectMemoryManager:
     ) -> ObjectHandle:
         obj_type = ObjectType(object_type)
         self._validate_payload_size(payload, "object payload")
+        if metadata is not None:
+            self._validate_metadata(metadata)
         with self._ownership_lock, self.store.transaction(include_object_payloads=True):
             now = utc_now()
             oid = new_id("obj")
@@ -547,6 +664,7 @@ class ObjectMemoryManager:
                 self._metadata_for_payload(payload, metadata),
                 [parent.metadata for parent in parent_objects],
             )
+            self._validate_metadata(meta)
             obj = AgentObject(
                 oid=oid,
                 namespace=object_namespace,
@@ -576,30 +694,34 @@ class ObjectMemoryManager:
             }
             if not immutable:
                 rights.add(ObjectRight.WRITE.value)
-            self._consume_one_time_decisions([namespace_decision, *parent_read_decisions])
-            self.store.insert_object(obj)
-            handle = self.capabilities.handle_for_object(pid, obj.oid, rights, issued_by="memory")
-            self.events.emit(
-                EventType.OBJECT_CREATED,
-                source=pid,
-                target=pid,
-                payload={
-                    "oid": obj.oid,
-                    "namespace": obj.namespace,
-                    "name": obj.name,
-                    "qualified_name": self.qualified_name(obj),
-                    "type": obj.type.value,
-                    "data_labels": labels_for_explain(obj.metadata),
-                },
-            )
-            self.audit.record(
+            with self.capabilities.selected_authority_transaction(
+                [namespace_decision, *parent_read_decisions],
                 actor=pid,
-                action="memory.create_object",
-                target=f"object:{obj.oid}",
-                output_refs=[obj.oid],
-                capability_refs=[handle.capability_id],
-                decision={"namespace": obj.namespace, "name": obj.name, "type": obj.type.value},
-            )
+                operation="object memory create object",
+            ):
+                self.store.insert_object(obj)
+                handle = self.capabilities.handle_for_object(pid, obj.oid, rights, issued_by="memory")
+                self.events.emit(
+                    EventType.OBJECT_CREATED,
+                    source=pid,
+                    target=pid,
+                    payload={
+                        "oid": obj.oid,
+                        "namespace": obj.namespace,
+                        "name": obj.name,
+                        "qualified_name": self.qualified_name(obj),
+                        "type": obj.type.value,
+                        "data_labels": labels_for_explain(obj.metadata),
+                    },
+                )
+                self.audit.record(
+                    actor=pid,
+                    action="memory.create_object",
+                    target=f"object:{obj.oid}",
+                    output_refs=[obj.oid],
+                    capability_refs=[handle.capability_id],
+                    decision={"namespace": obj.namespace, "name": obj.name, "type": obj.type.value},
+                )
         return handle
 
     def process_namespace(self, pid: str) -> str:
@@ -647,6 +769,7 @@ class ObjectMemoryManager:
         parent_namespace: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ObjectNamespace:
+        namespace_metadata = self._normalize_namespace_metadata(metadata)
         with self.store.transaction():
             namespace_name = self._normalize_namespace(namespace)
             if self.store.namespace_exists(namespace_name):
@@ -660,42 +783,49 @@ class ObjectMemoryManager:
             ns = ObjectNamespace(
                 namespace=namespace_name,
                 parent_namespace=parent,
-                metadata=dict(metadata or {}),
+                metadata=namespace_metadata,
                 created_by=pid,
                 created_at=now,
                 updated_at=now,
             )
-            if parent_decision is not None:
-                self._consume_one_time_decision(parent_decision)
-            self.store.insert_namespace(ns)
-            self.capabilities.grant(
-                subject=pid,
-                resource=self._namespace_resource(namespace_name),
-                rights=["read", "write", "admin"],
-                issued_by="memory.namespace",
-            )
-            self.audit.record(
+            with self.capabilities.selected_authority_transaction(
+                [parent_decision],
                 actor=pid,
-                action="memory.create_namespace",
-                target=self._namespace_resource(namespace_name),
-                decision={"namespace": namespace_name, "parent_namespace": parent},
-            )
+                operation="object memory create namespace",
+            ):
+                self.store.insert_namespace(ns)
+                self.capabilities.grant(
+                    subject=pid,
+                    resource=self._namespace_resource(namespace_name),
+                    rights=["read", "write", "admin"],
+                    issued_by="memory.namespace",
+                )
+                self.audit.record(
+                    actor=pid,
+                    action="memory.create_namespace",
+                    target=self._namespace_resource(namespace_name),
+                    decision={"namespace": namespace_name, "parent_namespace": parent},
+                )
         return ns
 
     def get_namespace(self, pid: str, namespace: str | None = None) -> ObjectNamespace:
         with self.store.locked():
             namespace_name = self.resolve_namespace(pid, namespace)
             namespace_decision = self._require_namespace_right(pid, namespace_name, "read")
-            ns = self.store.get_namespace(namespace_name)
-            if ns is None:
-                raise NotFound(f"Object Memory namespace not found: {namespace_name}")
-            self.audit.record(
+            with self.capabilities.selected_authority_transaction(
+                [namespace_decision],
                 actor=pid,
-                action="memory.get_namespace",
-                target=self._namespace_resource(namespace_name),
-                decision={"namespace": namespace_name},
-            )
-            self._consume_one_time_decision(namespace_decision)
+                operation="object memory get namespace",
+            ):
+                ns = self.store.get_namespace(namespace_name)
+                if ns is None:
+                    raise NotFound(f"Object Memory namespace not found: {namespace_name}")
+                self.audit.record(
+                    actor=pid,
+                    action="memory.get_namespace",
+                    target=self._namespace_resource(namespace_name),
+                    decision={"namespace": namespace_name},
+                )
         return ns
 
     def list_namespace(self, pid: str, namespace: str | None = None, *, limit: int | None = None) -> dict[str, Any]:
@@ -706,45 +836,61 @@ class ObjectMemoryManager:
             selected_limit = self._validate_query_limit(
                 self.config.memory.query_limit if limit is None else limit
             )
-            objects: list[AgentObject] = []
+            object_oids: list[str] = []
             object_decisions: list[Any] = []
-            child_namespaces: list[ObjectNamespace] = []
+            child_namespace_names: list[str] = []
             child_namespace_decisions: list[Any] = []
-            for obj in self.store.list_objects(namespace=namespace_name):
-                if len(objects) >= selected_limit:
-                    break
-                decision = self.capabilities.authorize(pid, f"object:{obj.oid}", ObjectRight.READ)
+            for obj_ref in self._bounded_object_refs(namespace_name):
+                decision = self.capabilities.authorize(
+                    pid,
+                    f"object:{obj_ref.oid}",
+                    ObjectRight.READ,
+                )
                 if decision.allowed:
-                    objects.append(obj)
+                    object_oids.append(obj_ref.oid)
                     object_decisions.append(decision)
-            remaining = selected_limit - len(objects)
-            if remaining > 0:
-                for ns in self.store.list_namespaces(parent_namespace=namespace_name):
-                    if len(child_namespaces) >= remaining:
+                    if len(object_oids) >= selected_limit:
                         break
+            remaining = selected_limit - len(object_oids)
+            if remaining > 0:
+                for ns in self._bounded_child_namespaces(namespace_name):
                     decision = self.capabilities.authorize(
                         pid,
                         self._namespace_resource(ns.namespace),
                         "read",
                     )
                     if decision.allowed:
-                        child_namespaces.append(ns)
+                        child_namespace_names.append(ns.namespace)
                         child_namespace_decisions.append(decision)
-            self.audit.record(
+                        if len(child_namespace_names) >= remaining:
+                            break
+            with self.capabilities.selected_authority_transaction(
+                [namespace_decision, *object_decisions, *child_namespace_decisions],
                 actor=pid,
-                action="memory.list_namespace",
-                target=self._namespace_resource(namespace_name),
-                output_refs=[obj.oid for obj in objects],
-                decision={
-                    "namespace": namespace_name,
-                    "objects": len(objects),
-                    "namespaces": len(child_namespaces),
-                    "limit": selected_limit,
-                },
-            )
-            self._consume_one_time_decisions(
-                [namespace_decision, *object_decisions, *child_namespace_decisions]
-            )
+                operation="object memory list namespace",
+            ):
+                objects = [
+                    obj
+                    for oid in object_oids
+                    if (obj := self.store.get_object(oid)) is not None
+                ]
+                child_namespaces = [
+                    ns
+                    for child_name in child_namespace_names
+                    if (ns := self.store.get_namespace(child_name)) is not None
+                ]
+                self.audit.record(
+                    actor=pid,
+                    action="memory.list_namespace",
+                    target=self._namespace_resource(namespace_name),
+                    output_refs=[obj.oid for obj in objects],
+                    decision={
+                        "namespace": namespace_name,
+                        "objects": len(objects),
+                        "namespaces": len(child_namespaces),
+                        "limit": selected_limit,
+                    },
+                )
         return {
             "namespace": namespace_name,
             "objects": objects,
@@ -753,43 +899,62 @@ class ObjectMemoryManager:
         }
 
     def get_object(self, pid: str, handle: ObjectHandle) -> AgentObject:
-        self.capabilities.assert_handle(pid, handle, ObjectRight.READ)
-        obj = self.store.get_object(handle.oid)
-        if obj is None:
-            raise NotFound(f"object not found: {handle.oid}")
-        self.audit.record(
+        decision = self.capabilities.authorize_handle(pid, handle, ObjectRight.READ)
+        if not decision.allowed:
+            raise CapabilityDenied(decision.reason)
+        if decision.selected_capability_id != handle.capability_id:
+            raise CapabilityDenied(
+                "object handle authority does not match its named capability"
+            )
+        with self.capabilities.selected_authority_transaction(
+            [decision],
             actor=pid,
-            action="memory.get_object",
-            target=f"object:{handle.oid}",
-            input_refs=[handle.oid],
-            capability_refs=[handle.capability_id],
-        )
+            operation="object memory get object",
+        ):
+            obj = self.store.get_object(handle.oid)
+            if obj is None:
+                raise NotFound(f"object not found: {handle.oid}")
+            self.audit.record(
+                actor=pid,
+                action="memory.get_object",
+                target=f"object:{handle.oid}",
+                input_refs=[handle.oid],
+                capability_refs=[handle.capability_id],
+            )
         return obj
 
     def get_object_by_name(self, pid: str, name: str, namespace: str | None = None) -> AgentObject:
         with self.store.locked():
             object_namespace = self.resolve_namespace(pid, namespace)
             object_name = self._normalize_name(name)
+            hidden_error = self._name_lookup_not_found(object_namespace, object_name)
             namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
             self._require_namespace_exists(object_namespace)
             obj_ref = self.store.get_object_ref_by_name(object_name, namespace=object_namespace)
             if obj_ref is None:
-                raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
+                raise hidden_error
             # Name lookup never bypasses the object capability model.
             oid = str(obj_ref["oid"])
-            decision = self.capabilities.require(pid, f"object:{oid}", ObjectRight.READ, consume=False)
-            obj = self.store.get_object(oid)
-            if obj is None:
-                raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
-            self.audit.record(
+            decision = self.capabilities.authorize(pid, f"object:{oid}", ObjectRight.READ)
+            if not decision.allowed:
+                # Namespace membership is not Object visibility.  Keep a real
+                # hidden name indistinguishable from a missing directory entry.
+                raise hidden_error
+            with self.capabilities.selected_authority_transaction(
+                [namespace_decision, decision],
                 actor=pid,
-                action="memory.get_object_by_name",
-                target=f"object:{self.qualified_name(obj)}",
-                input_refs=[obj.oid],
-                decision={"namespace": obj.namespace, "name": obj.name, "oid": obj.oid},
-            )
-            self._consume_one_time_decision(namespace_decision)
-            self._consume_one_time_decision(decision)
+                operation="object memory get object by name",
+            ):
+                obj = self.store.get_object(oid)
+                if obj is None:
+                    raise hidden_error
+                self.audit.record(
+                    actor=pid,
+                    action="memory.get_object_by_name",
+                    target=f"object:{self.qualified_name(obj)}",
+                    input_refs=[obj.oid],
+                    decision={"namespace": obj.namespace, "name": obj.name, "oid": obj.oid},
+                )
         return obj
 
     def handle_for_name(
@@ -820,22 +985,27 @@ class ObjectMemoryManager:
             obj = self.store.get_object(oid)
             if obj is None:
                 raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
-            handle = self._issue_handle_and_consume_one_time_decisions(
-                pid,
-                oid,
-                requested,
-                issued_by=issued_by,
-                one_time_decisions=[*decisions, namespace_decision],
-                consume_decisions=[*decisions, namespace_decision],
-            )
-        self.audit.record(
-            actor=pid,
-            action="memory.handle_for_name",
-            target=f"object:{self.qualified_name(obj)}",
-            output_refs=[obj.oid],
-            capability_refs=[handle.capability_id],
-            decision={"namespace": obj.namespace, "name": obj.name, "rights": sorted(requested)},
-        )
+            authority_decisions = [*decisions, namespace_decision]
+            with self.capabilities.selected_authority_transaction(
+                authority_decisions,
+                actor=pid,
+                operation="object memory handle for name",
+            ):
+                handle = self.capabilities.handle_for_object(
+                    pid,
+                    oid,
+                    requested,
+                    issued_by=issued_by,
+                    uses_remaining=1 if self._has_one_time_decision(authority_decisions) else None,
+                )
+                self.audit.record(
+                    actor=pid,
+                    action="memory.handle_for_name",
+                    target=f"object:{self.qualified_name(obj)}",
+                    output_refs=[obj.oid],
+                    capability_refs=[handle.capability_id],
+                    decision={"namespace": obj.namespace, "name": obj.name, "rights": sorted(requested)},
+                )
         return handle
 
     def handle_for_oid(
@@ -859,22 +1029,26 @@ class ObjectMemoryManager:
                 optional_rights=optional,
                 allow_one_time_handle_sources=False,
             )
-            handle = self._issue_handle_and_consume_one_time_decisions(
-                pid,
-                oid,
-                rights,
-                issued_by=issued_by,
-                one_time_decisions=decisions,
-                consume_decisions=decisions,
-            )
-        self.audit.record(
-            actor=pid,
-            action="memory.handle_for_oid",
-            target=f"object:{oid}",
-            output_refs=[oid],
-            capability_refs=[handle.capability_id],
-            decision={"rights": sorted(rights)},
-        )
+            with self.capabilities.selected_authority_transaction(
+                decisions,
+                actor=pid,
+                operation="object memory handle for oid",
+            ):
+                handle = self.capabilities.handle_for_object(
+                    pid,
+                    oid,
+                    rights,
+                    issued_by=issued_by,
+                    uses_remaining=1 if self._has_one_time_decision(decisions) else None,
+                )
+                self.audit.record(
+                    actor=pid,
+                    action="memory.handle_for_oid",
+                    target=f"object:{oid}",
+                    output_refs=[oid],
+                    capability_refs=[handle.capability_id],
+                    decision={"rights": sorted(rights)},
+                )
         return handle
 
     def update_object(
@@ -886,10 +1060,16 @@ class ObjectMemoryManager:
         expected_version: int | None = None,
         _trusted_label_propagation: bool = False,
     ) -> ObjectHandle:
+        if patch.metadata is not None:
+            self._validate_metadata(patch.metadata)
         with self._ownership_lock, self.store.transaction(include_object_payloads=True):
             write_decision = self.capabilities.authorize_handle(pid, handle, ObjectRight.WRITE)
             if not write_decision.allowed:
                 raise CapabilityDenied(write_decision.reason)
+            if write_decision.selected_capability_id != handle.capability_id:
+                raise CapabilityDenied(
+                    "object handle authority does not match its named capability"
+                )
             current = self.store.get_object(handle.oid)
             if current is None:
                 raise NotFound(f"object not found: {handle.oid}")
@@ -913,18 +1093,10 @@ class ObjectMemoryManager:
             if next_namespace != current.namespace or next_name != current.name:
                 namespace_decisions.append(self._require_namespace_right(pid, current.namespace, "write"))
                 self._require_unique_name(next_name, next_namespace, except_oid=current.oid)
-            payload_is_set = patch.payload is not UNSET
-            if payload_is_set:
-                self._validate_payload_size(patch.payload, "object payload")
-            next_payload = current.payload if not payload_is_set else patch.payload
-            if patch.metadata is None:
-                next_metadata = (
-                    current.metadata
-                    if not payload_is_set
-                    else self._metadata_for_payload(next_payload, current.metadata)
-                )
-            else:
-                next_metadata = self._metadata_for_payload(next_payload, patch.metadata)
+            next_payload, next_metadata, payload_is_set = self._object_patch_content(
+                current,
+                patch,
+            )
             next_provenance = current.provenance if patch.provenance is None else deepcopy(patch.provenance)
             operation_id = self.operations.current_id() if self.operations is not None else None
             if operation_id is not None and operation_id not in next_provenance.source_operation_ids:
@@ -939,17 +1111,13 @@ class ObjectMemoryManager:
                 next_metadata,
                 [parent.metadata for parent in parent_objects],
             )
-            if is_label_downgrade(current.metadata, next_metadata) and not (
-                _trusted_label_propagation
-                and is_conservative_label_propagation(current.metadata, next_metadata)
-            ):
-                self.capabilities.require(
-                    pid,
-                    f"declassification:object:{current.oid}",
-                    CapabilityRight.ADMIN,
-                    used_by="object_memory.declassify",
-                    reason="finite declassification authority consumed",
-                )
+            self._validate_metadata(next_metadata)
+            declassification_decision = self._declassification_decision(
+                pid,
+                current,
+                next_metadata,
+                trusted_label_propagation=_trusted_label_propagation,
+            )
             changed_fields: list[str] = []
             if payload_is_set:
                 changed_fields.append("payload")
@@ -971,43 +1139,47 @@ class ObjectMemoryManager:
                 version=current.version + 1,
                 updated_at=utc_now(),
             )
-            self._consume_one_time_decisions([write_decision, *namespace_decisions])
-            if not self.store.update_object(
-                updated,
-                expected_version=current.version,
-                expected_owner_kind=current.owner_kind,
-                expected_owner_id=current.owner_id,
-            ):
-                latest = self.store.get_object(handle.oid)
-                if latest is None:
-                    raise NotFound(f"object not found: {handle.oid}")
-                raise ObjectVersionConflict(
-                    handle.oid,
-                    expected_version=current.version,
-                    actual_version=latest.version,
-                )
-            event = self.events.emit(
-                EventType.OBJECT_UPDATED,
-                source=pid,
-                target=pid,
-                payload={
-                    "oid": updated.oid,
-                    "namespace": updated.namespace,
-                    "name": updated.name,
-                    "qualified_name": self.qualified_name(updated),
-                    "version": updated.version,
-                    "data_labels": labels_for_explain(updated.metadata),
-                },
-            )
-            self.audit.record(
+            with self.capabilities.selected_authority_transaction(
+                [write_decision, *namespace_decisions, declassification_decision],
                 actor=pid,
-                action="memory.update_object",
-                target=f"object:{updated.oid}",
-                input_refs=[updated.oid],
-                output_refs=[updated.oid],
-                capability_refs=[handle.capability_id],
-                decision={"namespace": updated.namespace, "name": updated.name, "version": updated.version},
-            )
+                operation="object memory update object",
+            ):
+                if not self.store.update_object(
+                    updated,
+                    expected_version=current.version,
+                    expected_owner_kind=current.owner_kind,
+                    expected_owner_id=current.owner_id,
+                ):
+                    latest = self.store.get_object(handle.oid)
+                    if latest is None:
+                        raise NotFound(f"object not found: {handle.oid}")
+                    raise ObjectVersionConflict(
+                        handle.oid,
+                        expected_version=current.version,
+                        actual_version=latest.version,
+                    )
+                event = self.events.emit(
+                    EventType.OBJECT_UPDATED,
+                    source=pid,
+                    target=pid,
+                    payload={
+                        "oid": updated.oid,
+                        "namespace": updated.namespace,
+                        "name": updated.name,
+                        "qualified_name": self.qualified_name(updated),
+                        "version": updated.version,
+                        "data_labels": labels_for_explain(updated.metadata),
+                    },
+                )
+                self.audit.record(
+                    actor=pid,
+                    action="memory.update_object",
+                    target=f"object:{updated.oid}",
+                    input_refs=[updated.oid],
+                    output_refs=[updated.oid],
+                    capability_refs=[handle.capability_id],
+                    decision={"namespace": updated.namespace, "name": updated.name, "version": updated.version},
+                )
         self._notify_object_changed(
             updated.oid,
             {
@@ -1033,129 +1205,91 @@ class ObjectMemoryManager:
         provenance_source_refs: Iterable[str] | None = None,
         source_context: DataFlowContext | None = None,
     ) -> tuple[AgentObject, str | None, int]:
+        if source_context is not None and not isinstance(source_context, DataFlowContext):
+            raise ValidationError("trusted append source_context must use DataFlowContext")
+        requested_source_oids = tuple(source_oids or ())
+        requested_source_refs = tuple(provenance_source_refs or ())
         with self._ownership_lock, self.store.transaction(include_object_payloads=True):
-            object_namespace = self.resolve_namespace(pid, namespace)
-            object_name = self._normalize_name(name)
-            namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
-            self._require_namespace_exists(object_namespace)
-            obj = self.store.get_object_by_name(object_name, namespace=object_namespace)
-            if obj is None:
-                raise NotFound(f"object not found: {self.qualified_name_parts(object_namespace, object_name)}")
-            rights, decisions = self._authorized_object_rights(
-                pid,
-                obj.oid,
-                required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
-                optional_rights=set(),
+            obj, namespace_decision, read_decision, write_decision = (
+                self._resolve_append_target(pid, name, namespace)
             )
-            if obj.immutable:
-                raise CapabilityDenied(f"immutable object cannot be updated: {obj.oid}")
-            ensure_json_size(entry, self.config.tools.memory_append_entry_max_bytes, "memory append entry")
-            payload = deepcopy(obj.payload)
-            if isinstance(payload, dict):
-                values = payload.setdefault(list_field, [])
-                if not isinstance(values, list):
-                    raise ValidationError("target object list_field is not a list")
-                values.append(entry)
-                length = len(values)
-                output_list_field: str | None = list_field
-            elif isinstance(payload, list):
-                payload.append(entry)
-                length = len(payload)
-                output_list_field = None
-            else:
-                raise ValidationError("target object payload is not appendable")
-            self._validate_payload_size(payload, "memory payload")
-            if source_context is not None and not isinstance(source_context, DataFlowContext):
-                raise ValidationError("trusted append source_context must use DataFlowContext")
-            selected_source_oids = list(
-                dict.fromkeys(
-                    str(oid)
-                    for oid in tuple(source_oids or ())
-                    if str(oid) != obj.oid
-                )
+            rights = {ObjectRight.READ.value, ObjectRight.WRITE.value}
+            decisions = [read_decision, write_decision]
+            payload, output_list_field, length = self._append_payload_value(
+                obj,
+                entry,
+                list_field,
             )
-            if source_context is None:
-                source_objects, source_read_decisions = self._resolve_parent_objects(
+            updated_metadata, provenance, source_read_decisions = (
+                self._append_source_lineage(
                     pid,
-                    selected_source_oids,
-                    require_read=True,
-                )
-                inherited_metadata = [source.metadata for source in source_objects]
-            else:
-                source_read_decisions = []
-                inherited_metadata = [ObjectMetadata(**source_context.labels.to_dict())]
-            provenance = deepcopy(obj.provenance)
-            provenance.parent_oids = list(
-                dict.fromkeys([*provenance.parent_oids, *selected_source_oids])
-            )
-            provenance.source_refs = list(
-                dict.fromkeys(
-                    [
-                        *provenance.source_refs,
-                        *(str(ref) for ref in tuple(provenance_source_refs or ())),
-                    ]
+                    obj,
+                    payload,
+                    requested_source_oids,
+                    requested_source_refs,
+                    source_context,
                 )
             )
             updated = replace(
                 obj,
                 payload=payload,
-                metadata=propagate_object_labels(
-                    self._metadata_for_payload(payload, obj.metadata),
-                    inherited_metadata,
-                ),
+                metadata=updated_metadata,
                 provenance=provenance,
                 version=obj.version + 1,
                 updated_at=utc_now(),
             )
-            self._consume_one_time_decisions(
-                [*decisions, namespace_decision, *source_read_decisions]
-            )
-            if not self.store.update_object(
-                updated,
-                expected_version=obj.version,
-                expected_owner_kind=obj.owner_kind,
-                expected_owner_id=obj.owner_id,
-            ):
-                latest = self.store.get_object(obj.oid)
-                if latest is None:
-                    raise NotFound(f"object not found: {obj.oid}")
-                raise ObjectVersionConflict(
-                    obj.oid,
-                    expected_version=obj.version,
-                    actual_version=latest.version,
-                )
-            event = self.events.emit(
-                EventType.OBJECT_UPDATED,
-                source=pid,
-                target=pid,
-                payload={
-                    "oid": updated.oid,
-                    "namespace": updated.namespace,
-                    "name": updated.name,
-                    "qualified_name": self.qualified_name(updated),
-                    "version": updated.version,
-                    "data_labels": labels_for_explain(updated.metadata),
-                },
-            )
-            self.audit.record(
+            authority_decisions = [*decisions, namespace_decision, *source_read_decisions]
+            with self.capabilities.selected_authority_transaction(
+                authority_decisions,
                 actor=pid,
-                action="memory.append_object",
-                target=f"object:{updated.oid}",
-                input_refs=[updated.oid],
-                output_refs=[updated.oid],
-                capability_refs=[
-                    cap_id
-                    for cap_id in (decision.selected_capability_id for decision in decisions)
-                    if cap_id is not None
-                ],
-                decision={
-                    "namespace": updated.namespace,
-                    "name": updated.name,
-                    "version": updated.version,
-                    "rights": sorted(rights),
-                    "issued_by": issued_by,
-                },
-            )
+                operation="object memory append object",
+            ):
+                if not self.store.update_object(
+                    updated,
+                    expected_version=obj.version,
+                    expected_owner_kind=obj.owner_kind,
+                    expected_owner_id=obj.owner_id,
+                ):
+                    latest = self.store.get_object(obj.oid)
+                    if latest is None:
+                        raise NotFound(f"object not found: {obj.oid}")
+                    raise ObjectVersionConflict(
+                        obj.oid,
+                        expected_version=obj.version,
+                        actual_version=latest.version,
+                    )
+                event = self.events.emit(
+                    EventType.OBJECT_UPDATED,
+                    source=pid,
+                    target=pid,
+                    payload={
+                        "oid": updated.oid,
+                        "namespace": updated.namespace,
+                        "name": updated.name,
+                        "qualified_name": self.qualified_name(updated),
+                        "version": updated.version,
+                        "data_labels": labels_for_explain(updated.metadata),
+                    },
+                )
+                self.audit.record(
+                    actor=pid,
+                    action="memory.append_object",
+                    target=f"object:{updated.oid}",
+                    input_refs=[updated.oid],
+                    output_refs=[updated.oid],
+                    capability_refs=[
+                        cap_id
+                        for cap_id in (decision.selected_capability_id for decision in decisions)
+                        if cap_id is not None
+                    ],
+                    decision={
+                        "namespace": updated.namespace,
+                        "name": updated.name,
+                        "version": updated.version,
+                        "rights": sorted(rights),
+                        "issued_by": issued_by,
+                    },
+                )
         self._notify_object_changed(
             updated.oid,
             {
@@ -1172,20 +1306,129 @@ class ObjectMemoryManager:
         )
         return updated, output_list_field, length
 
+    def _resolve_append_target(
+        self,
+        pid: str,
+        name: str,
+        namespace: str | None,
+    ) -> tuple[AgentObject, Any, Any, Any]:
+        object_namespace = self.resolve_namespace(pid, namespace)
+        object_name = self._normalize_name(name)
+        hidden_error = self._name_lookup_not_found(object_namespace, object_name)
+        namespace_decision = self._require_namespace_right(pid, object_namespace, "read")
+        self._require_namespace_exists(object_namespace)
+        obj_ref = self.store.get_object_ref_by_name(
+            object_name,
+            namespace=object_namespace,
+        )
+        if obj_ref is None:
+            raise hidden_error
+        oid = str(obj_ref["oid"])
+        read_decision = self._authorize_object_right(
+            pid,
+            f"object:{oid}",
+            ObjectRight.READ,
+            allow_one_time_handle_sources=True,
+        )
+        if not read_decision.allowed:
+            raise hidden_error
+        write_decision = self._authorize_object_right(
+            pid,
+            f"object:{oid}",
+            ObjectRight.WRITE,
+            allow_one_time_handle_sources=True,
+        )
+        if not write_decision.allowed:
+            raise CapabilityDenied(write_decision.reason)
+        # Load the payload only after READ and WRITE are both established.
+        obj = self.store.get_object(oid)
+        if obj is None:
+            raise hidden_error
+        if obj.immutable:
+            raise CapabilityDenied(f"immutable object cannot be updated: {obj.oid}")
+        return obj, namespace_decision, read_decision, write_decision
+
+    def _append_payload_value(
+        self,
+        obj: AgentObject,
+        entry: Any,
+        list_field: str,
+    ) -> tuple[Any, str | None, int]:
+        self._validate_json_size(
+            entry,
+            self.config.tools.memory_append_entry_max_bytes,
+            "memory append entry",
+        )
+        payload = deepcopy(obj.payload)
+        if isinstance(payload, dict):
+            values = payload.setdefault(list_field, [])
+            if not isinstance(values, list):
+                raise ValidationError("target object list_field is not a list")
+            values.append(entry)
+            output_list_field: str | None = list_field
+            length = len(values)
+        elif isinstance(payload, list):
+            payload.append(entry)
+            output_list_field = None
+            length = len(payload)
+        else:
+            raise ValidationError("target object payload is not appendable")
+        self._validate_payload_size(payload, "memory payload")
+        return payload, output_list_field, length
+
+    def _append_source_lineage(
+        self,
+        pid: str,
+        obj: AgentObject,
+        payload: Any,
+        source_oids: Iterable[str],
+        source_refs: Iterable[str],
+        source_context: DataFlowContext | None,
+    ) -> tuple[ObjectMetadata, Provenance, list[Any]]:
+        selected_source_oids = list(
+            dict.fromkeys(str(oid) for oid in source_oids if str(oid) != obj.oid)
+        )
+        if source_context is None:
+            source_objects, source_read_decisions = self._resolve_parent_objects(
+                pid,
+                selected_source_oids,
+                require_read=True,
+            )
+            inherited_metadata = [source.metadata for source in source_objects]
+        else:
+            source_read_decisions = []
+            inherited_metadata = [ObjectMetadata(**source_context.labels.to_dict())]
+        provenance = deepcopy(obj.provenance)
+        provenance.parent_oids = list(
+            dict.fromkeys([*provenance.parent_oids, *selected_source_oids])
+        )
+        provenance.source_refs = list(
+            dict.fromkeys(
+                [*provenance.source_refs, *(str(ref) for ref in source_refs)]
+            )
+        )
+        updated_metadata = propagate_object_labels(
+            self._metadata_for_payload(payload, obj.metadata),
+            inherited_metadata,
+        )
+        self._validate_metadata(updated_metadata)
+        return updated_metadata, provenance, source_read_decisions
+
     def link_objects(
         self,
         pid: str,
         src: ObjectHandle,
         relation: RelationType | str,
         dst: ObjectHandle,
-        metadata: dict[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
+        selected_metadata = self._normalize_link_metadata(metadata)
         link = ObjectLink(
             link_id=new_id("lnk"),
             src=src.oid,
             relation=RelationType(relation),
             dst=dst.oid,
-            metadata=metadata or {},
+            metadata=selected_metadata,
             created_by=pid,
             created_at=utc_now(),
         )
@@ -1198,28 +1441,29 @@ class ObjectMemoryManager:
             src_decision = self.capabilities.authorize_handle(pid, src, ObjectRight.LINK)
             if not src_decision.allowed:
                 raise CapabilityDenied(src_decision.reason)
+            if src_decision.selected_capability_id != src.capability_id:
+                raise CapabilityDenied("source handle authority does not match its named capability")
             dst_decision = self.capabilities.authorize_handle(pid, dst, ObjectRight.READ)
             if not dst_decision.allowed:
                 raise CapabilityDenied(dst_decision.reason)
+            if dst_decision.selected_capability_id != dst.capability_id:
+                raise CapabilityDenied("destination handle authority does not match its named capability")
             # A re-entrant Host callback may release an object during the
             # two-sided preflight. Keep that completed release outside the
             # publication transaction so rejecting the link cannot resurrect
             # the object. The exact handles are reauthorized again inside the
             # atomic link/evidence transaction.
-            with self.store.transaction():
-                src_decision = self.capabilities.authorize_handle(pid, src, ObjectRight.LINK)
-                if not src_decision.allowed:
-                    raise CapabilityDenied(src_decision.reason)
-                dst_decision = self.capabilities.authorize_handle(pid, dst, ObjectRight.READ)
-                if not dst_decision.allowed:
-                    raise CapabilityDenied(dst_decision.reason)
+            with self.capabilities.selected_authority_transaction(
+                [src_decision, dst_decision],
+                actor=pid,
+                operation="object memory link objects",
+            ):
                 current_src = self.store.get_object(src.oid)
                 current_dst = self.store.get_object(dst.oid)
                 if current_src is None or current_src.lifecycle_state != ObjectLifecycleState.LIVE:
                     raise NotFound(f"object not found: {src.oid}")
                 if current_dst is None or current_dst.lifecycle_state != ObjectLifecycleState.LIVE:
                     raise NotFound(f"object not found: {dst.oid}")
-                self._consume_one_time_decisions([src_decision, dst_decision])
                 self.store.insert_link(link)
                 event = self.events.emit(
                     EventType.OBJECT_LINKED,
@@ -1256,10 +1500,11 @@ class ObjectMemoryManager:
         src_oid: str,
         relation: RelationType | str,
         dst_oid: str,
-        metadata: dict[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
         *,
         reason: str,
     ) -> None:
+        selected_metadata = self._normalize_link_metadata(metadata)
         with self.store.transaction():
             if self.store.get_object(src_oid) is None:
                 raise NotFound(f"object not found: {src_oid}")
@@ -1270,7 +1515,7 @@ class ObjectMemoryManager:
                 src=src_oid,
                 relation=RelationType(relation),
                 dst=dst_oid,
-                metadata=metadata or {},
+                metadata=selected_metadata,
                 created_by=actor,
                 created_at=utc_now(),
             )
@@ -1305,86 +1550,140 @@ class ObjectMemoryManager:
 
     def query_objects(self, pid: str, query: ObjectQuery) -> list[ObjectHandle]:
         results: list[ObjectHandle] = []
-        with self.store.locked():
+        with self.store.transaction():
             namespace = self.resolve_namespace(pid, query.namespace)
             namespace_decision = self._require_namespace_right(pid, namespace, "read")
             self._require_namespace_exists(namespace)
             limit = self._validate_query_limit(query.limit)
-            if query.name is None:
-                candidates = self.store.list_objects(namespace=namespace)
-                preauthorized: dict[str, tuple[set[str], list[Any]]] = {}
-            else:
-                object_name = self._normalize_name(query.name)
-                obj_ref = self.store.get_object_ref_by_name(object_name, namespace=namespace)
-                candidates = []
-                preauthorized = {}
-                if obj_ref is not None:
-                    oid = str(obj_ref["oid"])
-                    try:
-                        rights, decisions = self._authorized_object_rights(
-                            pid,
-                            oid,
-                            required_rights={ObjectRight.READ.value},
-                            optional_rights=set(),
-                            allow_one_time_handle_sources=False,
-                        )
-                    except CapabilityDenied:
-                        pass
-                    else:
-                        obj = self.store.get_object(oid)
-                        if obj is not None:
-                            candidates = [obj]
-                            preauthorized[oid] = (rights, decisions)
             query_text = query.text.lower() if query.text else None
-            for obj in candidates:
-                if query.type is not None and obj.type.value != str(query.type):
-                    continue
-                if query.tags and not set(query.tags).issubset(set(obj.metadata.tags)):
-                    continue
-                if query_text and query_text not in self._search_text(obj).lower():
-                    continue
-                decisions: list[Any]
-                rights: set[str]
-                try:
-                    preauthorized_rights = preauthorized.get(obj.oid)
-                    if preauthorized_rights is None:
-                        rights, decisions = self._authorized_object_rights(
-                            pid,
-                            obj.oid,
-                            required_rights={ObjectRight.READ.value},
-                            optional_rights=set(),
-                            allow_one_time_handle_sources=False,
-                        )
-                    else:
-                        rights, decisions = preauthorized_rights
-                    handle = self._issue_handle_and_consume_one_time_decisions(
-                        pid,
-                        obj.oid,
-                        rights,
-                        issued_by="memory.query",
-                        one_time_decisions=[*decisions, namespace_decision],
-                        consume_decisions=decisions,
-                    )
-                except CapabilityDenied:
+            for candidate, preauthorized in self._query_object_candidates(
+                pid,
+                namespace,
+                query,
+            ):
+                handle = self._query_candidate_handle(
+                    pid,
+                    candidate,
+                    query,
+                    query_text=query_text,
+                    namespace_decision=namespace_decision,
+                    preauthorized=preauthorized,
+                )
+                if handle is None:
                     continue
                 results.append(handle)
                 if len(results) >= limit:
                     break
             should_consume_namespace = query.name is None or bool(results)
-            if should_consume_namespace:
-                try:
-                    self._consume_one_time_decision(namespace_decision)
-                except Exception:
-                    self._revoke_derived_handles(pid, results, reason="query namespace permission consume failed")
-                    raise
-        self.audit.record(
-            actor=pid,
-            action="memory.query_objects",
-            target=f"object_namespace:{namespace}",
-            output_refs=[handle.oid for handle in results],
-            decision={"count": len(results), "namespace": namespace, "namespace_grant_consumed": should_consume_namespace},
-        )
+            with self.capabilities.selected_authority_transaction(
+                [namespace_decision] if should_consume_namespace else [],
+                actor=pid,
+                operation="object memory query namespace",
+            ):
+                if not should_consume_namespace:
+                    # A name miss intentionally does not spend finite namespace
+                    # authority, but its cached allow must still be exact and
+                    # current before the empty result is published.
+                    self.capabilities.reauthorize_selected_decision(
+                        namespace_decision
+                    )
+                self.audit.record(
+                    actor=pid,
+                    action="memory.query_objects",
+                    target=f"object_namespace:{namespace}",
+                    output_refs=[handle.oid for handle in results],
+                    decision={"count": len(results), "namespace": namespace, "namespace_grant_consumed": should_consume_namespace},
+                )
         return results
+
+    def _query_object_candidates(
+        self,
+        pid: str,
+        namespace: str,
+        query: ObjectQuery,
+    ) -> Iterator[
+        tuple[AgentObject | ObjectRef, tuple[set[str], list[Any]] | None]
+    ]:
+        if query.name is None:
+            for obj_ref in self._bounded_object_refs(namespace):
+                yield obj_ref, None
+            return
+        object_name = self._normalize_name(query.name)
+        obj_ref = self.store.get_object_ref_by_name(object_name, namespace=namespace)
+        if obj_ref is None:
+            return
+        oid = str(obj_ref["oid"])
+        try:
+            rights, decisions = self._authorized_object_rights(
+                pid,
+                oid,
+                required_rights={ObjectRight.READ.value},
+                optional_rights=set(),
+                allow_one_time_handle_sources=False,
+            )
+        except CapabilityDenied:
+            return
+        obj = self.store.get_object(oid)
+        if obj is not None:
+            yield obj, (rights, decisions)
+
+    def _query_candidate_handle(
+        self,
+        pid: str,
+        candidate: AgentObject | ObjectRef,
+        query: ObjectQuery,
+        *,
+        query_text: str | None,
+        namespace_decision: Any,
+        preauthorized: tuple[set[str], list[Any]] | None,
+    ) -> ObjectHandle | None:
+        if query.type is not None and candidate.type.value != str(query.type):
+            return None
+        if query.tags and not set(query.tags).issubset(set(candidate.metadata.tags)):
+            return None
+        try:
+            rights, decisions = preauthorized or self._authorized_object_rights(
+                pid,
+                candidate.oid,
+                required_rights={ObjectRight.READ.value},
+                optional_rights=set(),
+                allow_one_time_handle_sources=False,
+            )
+            if not self._query_text_matches(candidate, query_text):
+                return None
+            return self._issue_handle_with_selected_authority(
+                pid,
+                candidate.oid,
+                rights,
+                issued_by="memory.query",
+                one_time_decisions=[*decisions, namespace_decision],
+                consume_decisions=decisions,
+            )
+        except CapabilityDenied:
+            return None
+
+    def _query_text_matches(
+        self,
+        candidate: AgentObject | ObjectRef,
+        query_text: str | None,
+    ) -> bool:
+        if query_text is None:
+            return True
+        if isinstance(candidate, AgentObject):
+            return query_text in self._search_text(candidate).lower()
+        if query_text in candidate.search_text.lower():
+            return True
+        obj = self.store.get_object(candidate.oid)
+        return obj is not None and query_text in self._search_text(obj).lower()
+
+    @staticmethod
+    def _unique_view_roots(roots: Iterable[ObjectHandle]) -> list[ObjectHandle]:
+        """Preserve the first handle for each Object and discard duplicates."""
+
+        selected: dict[str, ObjectHandle] = {}
+        for handle in roots:
+            selected.setdefault(handle.oid, handle)
+        return list(selected.values())
 
     def create_view(
         self,
@@ -1394,25 +1693,47 @@ class ObjectMemoryManager:
         filters: list[ObjectFilter] | None = None,
     ) -> MemoryView:
         view_mode = ViewMode(mode)
-        for handle in roots:
-            self.capabilities.assert_handle(pid, handle, ObjectRight.READ)
-        view = MemoryView(
-            view_id=new_id("view"),
-            owner_pid=pid,
-            roots=roots,
-            filters=filters or [],
-            rights_policy="attenuate" if view_mode == ViewMode.READ_ONLY else "inherit",
-            created_from=None,
-            mode=view_mode,
-        )
-        self.audit.record(
+        selected_roots = self._unique_view_roots(roots)
+        decisions = []
+        finite_capability_ids: set[str] = set()
+        for handle in selected_roots:
+            decision = self.capabilities.authorize_handle(pid, handle, ObjectRight.READ)
+            if not decision.allowed:
+                raise CapabilityDenied(decision.reason)
+            if decision.selected_capability_id != handle.capability_id:
+                raise CapabilityDenied(
+                    "object handle authority does not match its named capability"
+                )
+            finite_id = decision.consume_capability_id
+            if finite_id is not None and finite_id in finite_capability_ids:
+                raise CapabilityDenied(
+                    "one-time object handle cannot authorize multiple view roots"
+                )
+            if finite_id is not None:
+                finite_capability_ids.add(finite_id)
+            decisions.append(decision)
+        with self.capabilities.selected_authority_transaction(
+            decisions,
             actor=pid,
-            action="memory.create_view",
-            target=f"view:{view.view_id}",
-            input_refs=[handle.oid for handle in roots],
-            capability_refs=[handle.capability_id for handle in roots],
-            decision={"mode": view.mode.value},
-        )
+            operation="object memory create view",
+        ):
+            view = MemoryView(
+                view_id=new_id("view"),
+                owner_pid=pid,
+                roots=selected_roots,
+                filters=filters or [],
+                rights_policy="attenuate" if view_mode == ViewMode.READ_ONLY else "inherit",
+                created_from=None,
+                mode=view_mode,
+            )
+            self.audit.record(
+                actor=pid,
+                action="memory.create_view",
+                target=f"view:{view.view_id}",
+                input_refs=[handle.oid for handle in selected_roots],
+                capability_refs=[handle.capability_id for handle in selected_roots],
+                decision={"mode": view.mode.value},
+            )
         return view
 
     def fork_view(
@@ -1423,40 +1744,49 @@ class ObjectMemoryManager:
         spec: MemoryViewSpec | None = None,
     ) -> MemoryView:
         spec = spec or MemoryViewSpec()
-        source_roots = spec.roots if spec.roots is not None else parent_view.roots
+        source_roots = list(spec.roots if spec.roots is not None else parent_view.roots)
         if not spec.include_parent_roots and spec.roots is None:
             source_roots = []
-        child_roots: list[ObjectHandle] = []
-        for handle in source_roots:
-            rights, decisions = self._fork_child_rights(parent_pid, handle, spec)
-            child_roots.append(
-                self.capabilities.handle_for_object(
-                    child_pid,
-                    handle.oid,
-                    rights,
-                    issued_by=f"process:{parent_pid}:fork",
-                    uses_remaining=1 if self._has_one_time_decision(decisions) else None,
-                )
+        source_roots = self._unique_view_roots(source_roots)
+        with self._ownership_lock, self.store.transaction():
+            planned_roots = [
+                (handle, *self._fork_child_rights(parent_pid, handle, spec))
+                for handle in source_roots
+            ]
+            child_roots: list[ObjectHandle] = []
+            for handle, rights, decisions in planned_roots:
+                with self.capabilities.selected_authority_transaction(
+                    decisions,
+                    actor=parent_pid,
+                    operation="object memory fork view root",
+                ):
+                    child_roots.append(
+                        self.capabilities.handle_for_object(
+                            child_pid,
+                            handle.oid,
+                            rights,
+                            issued_by=f"process:{parent_pid}:fork",
+                            uses_remaining=1 if self._has_one_time_decision(decisions) else None,
+                        )
+                    )
+            view = MemoryView(
+                view_id=new_id("view"),
+                owner_pid=child_pid,
+                roots=child_roots,
+                filters=list(parent_view.filters),
+                rights_policy="fork_attenuated",
+                created_from=parent_view.view_id,
+                mode=spec.mode,
             )
-            self._consume_one_time_decisions(decisions)
-        view = MemoryView(
-            view_id=new_id("view"),
-            owner_pid=child_pid,
-            roots=child_roots,
-            filters=list(parent_view.filters),
-            rights_policy="fork_attenuated",
-            created_from=parent_view.view_id,
-            mode=spec.mode,
-        )
-        self.audit.record(
-            actor=parent_pid,
-            action="memory.fork_view",
-            target=f"view:{view.view_id}",
-            input_refs=[handle.oid for handle in source_roots],
-            output_refs=[handle.oid for handle in child_roots],
-            capability_refs=[handle.capability_id for handle in child_roots],
-            decision={"child_pid": child_pid, "mode": view.mode.value},
-        )
+            self.audit.record(
+                actor=parent_pid,
+                action="memory.fork_view",
+                target=f"view:{view.view_id}",
+                input_refs=[handle.oid for handle in source_roots],
+                output_refs=[handle.oid for handle in child_roots],
+                capability_refs=[handle.capability_id for handle in child_roots],
+                decision={"child_pid": child_pid, "mode": view.mode.value},
+            )
         return view
 
     def merge_view(
@@ -1469,8 +1799,13 @@ class ObjectMemoryManager:
         merged: list[str] = []
         merged_handles: list[ObjectHandle] = []
         skipped: list[str] = []
-        candidate_oids = {handle.oid for handle in child_view.roots}
-        child_handles = {handle.oid: handle for handle in child_view.roots}
+        child_roots = self._unique_view_roots(child_view.roots)
+        candidate_oids = (
+            {handle.oid for handle in child_roots}
+            if policy.include_updated
+            else set()
+        )
+        child_handles = {handle.oid: handle for handle in child_roots}
         if policy.include_child_created:
             candidate_oids.update(
                 obj.oid
@@ -1500,7 +1835,7 @@ class ObjectMemoryManager:
             except CapabilityDenied:
                 skipped.append(oid)
                 continue
-            handle = self._issue_handle_and_consume_one_time_decisions(
+            handle = self._issue_handle_with_selected_authority(
                 parent_pid,
                 oid,
                 rights,
@@ -1522,11 +1857,12 @@ class ObjectMemoryManager:
 
     def snapshot_view(self, pid: str, view: MemoryView) -> str:
         snapshot_id = new_id("snap")
+        roots = self._unique_view_roots(view.roots)
         self.audit.record(
             actor=pid,
             action="memory.snapshot_view",
             target=f"snapshot:{snapshot_id}",
-            input_refs=[handle.oid for handle in view.roots],
+            input_refs=[handle.oid for handle in roots],
             decision={"view_id": view.view_id},
         )
         return snapshot_id
@@ -1568,28 +1904,33 @@ class ObjectMemoryManager:
         preserved: list[str] = []
         selected_owner_kind = ObjectOwnerKind(owner_kind)
         for oid in self.store.list_object_oids_owned_by(selected_owner_kind, owner_id):
-            if self._is_object_pinned(oid):
-                pinned.append(oid)
-                continue
-            if oid in preserve:
-                preserved.append(oid)
-                continue
-            snapshot = self.store.get_object(oid)
-            if (
-                snapshot is None
-                or snapshot.owner_kind != selected_owner_kind
-                or snapshot.owner_id != owner_id
-            ):
-                continue
-            if self.delete_object_trusted(
-                actor,
-                oid,
-                reason=reason,
-                expected_owner_kind=selected_owner_kind,
-                expected_owner_id=owner_id,
-                expected_version=snapshot.version,
-            ):
-                released.append(oid)
+            # Pin admission and release share this ownership fence.  ObjectTask
+            # publication takes the same lock before its records transaction,
+            # so either the task becomes durable first and pins this Object, or
+            # release commits first and task publication observes it missing.
+            with self._ownership_lock:
+                if self._is_object_pinned(oid):
+                    pinned.append(oid)
+                    continue
+                if oid in preserve:
+                    preserved.append(oid)
+                    continue
+                snapshot = self.store.get_object(oid)
+                if (
+                    snapshot is None
+                    or snapshot.owner_kind != selected_owner_kind
+                    or snapshot.owner_id != owner_id
+                ):
+                    continue
+                if self.delete_object_trusted(
+                    actor,
+                    oid,
+                    reason=reason,
+                    expected_owner_kind=selected_owner_kind,
+                    expected_owner_id=owner_id,
+                    expected_version=snapshot.version,
+                ):
+                    released.append(oid)
         if released or preserve or pinned:
             self.audit.record(
                 actor=actor,
@@ -1737,6 +2078,7 @@ class ObjectMemoryManager:
                 intent = self._normalize_durable_finalizer_intent(
                     raw_intent,
                     finalizer_id=finalizer_id,
+                    limit_bytes=self.config.checkpoint.payload_capture_limit_bytes,
                 )
                 finalize(intent, actor, reason, idempotency_key)
             except Exception as exc:
@@ -1897,6 +2239,7 @@ class ObjectMemoryManager:
     ) -> MaterializedContext:
         selected_policy = policy or self.config.memory.context_policy
         selected_budget = budget_tokens if budget_tokens is not None else self.config.memory.materialize_budget_tokens
+        roots = self._unique_view_roots(view.roots)
         resources = getattr(self, "resources", None)
         if resources is not None:
             selected_budget = min(selected_budget, resources.context_materialization_window_limit(pid))
@@ -1911,40 +2254,55 @@ class ObjectMemoryManager:
         omitted: list[str] = []
         filtered: list[str] = []
         manifest_by_oid: dict[str, dict[str, Any]] = {}
-        for handle in view.roots:
+        for handle in roots:
             try:
-                self.capabilities.assert_handle(pid, handle, ObjectRight.MATERIALIZE)
-                obj = self.store.get_object(handle.oid)
-                if obj is None:
-                    omitted.append(handle.oid)
-                    manifest_by_oid[handle.oid] = {
-                        "oid": handle.oid,
-                        "version": None,
-                        "type": None,
-                        "disposition": "omitted",
-                        "reason": "missing",
-                        "transform": "verbatim",
-                        "tokens": 0,
-                        "rendered_sha256": None,
-                        "labels": None,
-                    }
-                    continue
-                if not self._matches_view_filters(obj, view.filters):
-                    omitted.append(obj.oid)
-                    filtered.append(obj.oid)
-                    manifest_by_oid[obj.oid] = {
-                        "oid": obj.oid,
-                        "version": obj.version,
-                        "type": obj.type.value,
-                        "disposition": "omitted",
-                        "reason": "filter_mismatch",
-                        "transform": "verbatim",
-                        "tokens": 0,
-                        "rendered_sha256": None,
-                        "labels": labels_for_explain(obj.metadata),
-                    }
-                else:
-                    objects.append(obj)
+                decision = self.capabilities.authorize_handle(
+                    pid,
+                    handle,
+                    ObjectRight.MATERIALIZE,
+                )
+                if not decision.allowed:
+                    raise CapabilityDenied(decision.reason)
+                if decision.selected_capability_id != handle.capability_id:
+                    raise CapabilityDenied(
+                        "object handle authority does not match its named capability"
+                    )
+                with self.capabilities.selected_authority_transaction(
+                    [decision],
+                    actor=pid,
+                    operation="object memory materialize root",
+                ):
+                    obj = self.store.get_object(handle.oid)
+                    if obj is None:
+                        omitted.append(handle.oid)
+                        manifest_by_oid[handle.oid] = {
+                            "oid": handle.oid,
+                            "version": None,
+                            "type": None,
+                            "disposition": "omitted",
+                            "reason": "missing",
+                            "transform": "verbatim",
+                            "tokens": 0,
+                            "rendered_sha256": None,
+                            "labels": None,
+                        }
+                        continue
+                    if not self._matches_view_filters(obj, view.filters):
+                        omitted.append(obj.oid)
+                        filtered.append(obj.oid)
+                        manifest_by_oid[obj.oid] = {
+                            "oid": obj.oid,
+                            "version": obj.version,
+                            "type": obj.type.value,
+                            "disposition": "omitted",
+                            "reason": "filter_mismatch",
+                            "transform": "verbatim",
+                            "tokens": 0,
+                            "rendered_sha256": None,
+                            "labels": labels_for_explain(obj.metadata),
+                        }
+                    else:
+                        objects.append(obj)
             except CapabilityDenied:
                 omitted.append(handle.oid)
                 manifest_by_oid[handle.oid] = {
@@ -2005,7 +2363,7 @@ class ObjectMemoryManager:
             budget_tokens=selected_budget,
             object_manifest=[
                 manifest_by_oid[handle.oid]
-                for handle in view.roots
+                for handle in roots
                 if handle.oid in manifest_by_oid
             ],
         )
@@ -2013,7 +2371,7 @@ class ObjectMemoryManager:
             actor=pid,
             action="memory.materialize_context",
             target=f"view:{view.view_id}",
-            input_refs=[handle.oid for handle in view.roots],
+            input_refs=[handle.oid for handle in roots],
             output_refs=refs,
             decision={
                 "tokens": total,
@@ -2098,25 +2456,7 @@ class ObjectMemoryManager:
             return sorted(objects, key=lambda obj: priority.get(obj.type, 10))
         return objects
 
-    def _consume_one_time_decision(self, decision: Any) -> None:
-        if decision.consume_capability_id is None:
-            return
-        self.capabilities.consume_use(
-            decision.consume_capability_id,
-            used_by="object_memory",
-            reason="one-time object memory permission consumed",
-        )
-
-    def _consume_one_time_decisions(self, decisions: Iterable[Any]) -> None:
-        consumed: set[str] = set()
-        for decision in decisions:
-            cap_id = decision.consume_capability_id
-            if cap_id is None or cap_id in consumed:
-                continue
-            consumed.add(cap_id)
-            self._consume_one_time_decision(decision)
-
-    def _issue_handle_and_consume_one_time_decisions(
+    def _issue_handle_with_selected_authority(
         self,
         pid: str,
         oid: str,
@@ -2128,11 +2468,14 @@ class ObjectMemoryManager:
     ) -> ObjectHandle:
         one_time_decisions = list(one_time_decisions)
         consume_decisions = list(consume_decisions)
-        # The derived handle and finite-use source consumption are one durable
-        # authority transition. Nested capability/audit/event writes use
-        # savepoints under this transaction, so any failure removes the handle
-        # instead of relying only on best-effort compensating revocation.
-        with self.store.transaction():
+        # The derived handle and exact selected source authority are one durable
+        # transition. Reauthorization rejects broad-grant fallback; finite uses
+        # are reserved and settled with the handle publication.
+        with self.capabilities.selected_authority_transaction(
+            consume_decisions,
+            actor=pid,
+            operation="object memory issue derived handle",
+        ):
             handle = self.capabilities.handle_for_object(
                 pid,
                 oid,
@@ -2140,20 +2483,7 @@ class ObjectMemoryManager:
                 issued_by=issued_by,
                 uses_remaining=1 if self._has_one_time_decision(one_time_decisions) else None,
             )
-            self._consume_one_time_decisions(consume_decisions)
         return handle
-
-    def _revoke_derived_handles(self, pid: str, handles: Iterable[ObjectHandle], *, reason: str) -> None:
-        for handle in handles:
-            try:
-                self.capabilities.revoke(
-                    handle.capability_id,
-                    revoked_by=pid,
-                    reason=reason,
-                    require_authority=False,
-                )
-            except Exception:
-                continue
 
     def _has_one_time_decision(self, decisions: Iterable[Any]) -> bool:
         return any(decision.consume_capability_id is not None for decision in decisions)
@@ -2237,6 +2567,10 @@ class ObjectMemoryManager:
             decision = self.capabilities.authorize_handle(pid, handle, right)
             if not decision.allowed:
                 raise CapabilityDenied(decision.reason)
+            if decision.selected_capability_id != handle.capability_id:
+                raise CapabilityDenied(
+                    "object handle authority does not match its named capability"
+                )
             rights.add(right)
             decisions.append(decision)
         for right in sorted({str(item) for item in optional_rights} - rights):
@@ -2246,6 +2580,10 @@ class ObjectMemoryManager:
                 continue
             decision = self.capabilities.authorize_handle(pid, handle, right)
             if decision.allowed:
+                if decision.selected_capability_id != handle.capability_id:
+                    raise CapabilityDenied(
+                        "object handle authority does not match its named capability"
+                    )
                 rights.add(right)
                 decisions.append(decision)
             elif require_all:
@@ -2422,8 +2760,150 @@ class ObjectMemoryManager:
         if self.store.object_name_exists(name, except_oid=except_oid, namespace=namespace):
             raise ValidationError(f"object name already exists in namespace {namespace}: {name}")
 
+    def _name_lookup_not_found(self, namespace: str, name: str) -> NotFound:
+        return NotFound(
+            f"object not found: {self.qualified_name_parts(namespace, name)}"
+        )
+
+    @staticmethod
+    def _validate_json_size(value: Any, limit_bytes: int, label: str) -> None:
+        try:
+            ensure_json_size(value, limit_bytes, label)
+        except ValidationError:
+            raise
+        except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"{label} must be a bounded finite JSON value"
+            ) from exc
+
     def _validate_payload_size(self, payload: Any, label: str) -> None:
-        ensure_json_size(payload, self.config.tools.memory_payload_hard_limit_bytes, label)
+        self._validate_json_size(
+            payload,
+            self.config.tools.memory_payload_hard_limit_bytes,
+            label,
+        )
+
+    def _object_patch_content(
+        self,
+        current: AgentObject,
+        patch: ObjectPatch,
+    ) -> tuple[Any, ObjectMetadata, bool]:
+        payload_is_set = patch.payload is not UNSET
+        if payload_is_set:
+            self._validate_payload_size(patch.payload, "object payload")
+        next_payload = current.payload if not payload_is_set else patch.payload
+        if patch.metadata is not None:
+            next_metadata = self._metadata_for_payload(next_payload, patch.metadata)
+        elif payload_is_set:
+            next_metadata = self._metadata_for_payload(next_payload, current.metadata)
+        else:
+            next_metadata = current.metadata
+        return next_payload, next_metadata, payload_is_set
+
+    def _declassification_decision(
+        self,
+        pid: str,
+        current: AgentObject,
+        next_metadata: ObjectMetadata,
+        *,
+        trusted_label_propagation: bool,
+    ) -> Any:
+        if not is_label_downgrade(current.metadata, next_metadata) or (
+            trusted_label_propagation
+            and is_conservative_label_propagation(current.metadata, next_metadata)
+        ):
+            return None
+        return self.capabilities.require(
+            pid,
+            f"declassification:object:{current.oid}",
+            CapabilityRight.ADMIN,
+            consume=False,
+            used_by="object_memory.declassify",
+            reason="finite declassification authority consumed",
+        )
+
+    def _bounded_object_refs(self, namespace: str) -> Iterator[ObjectRef]:
+        """Yield payload-free refs, failing explicitly when the scan is incomplete."""
+
+        after = None
+        scanned = 0
+        ceiling = self.config.memory.query_scan_ceiling
+        while scanned < ceiling:
+            page = self.store.query_object_refs_page(
+                namespace,
+                after=after,
+                limit=min(
+                    self.config.memory.query_scan_page_size,
+                    ceiling - scanned,
+                ),
+            )
+            for record in page.records:
+                scanned += 1
+                yield record
+            if page.exhausted:
+                return
+            after = page.next_cursor
+        raise ValidationError(
+            "Object Memory scan reached the configured ceiling of "
+            f"{ceiling} objects before the result was complete; narrow the query"
+        )
+
+    def _bounded_child_namespaces(
+        self,
+        parent_namespace: str,
+    ) -> Iterator[ObjectNamespace]:
+        after = None
+        scanned = 0
+        ceiling = self.config.memory.query_scan_ceiling
+        while scanned < ceiling:
+            page = self.store.query_child_namespaces_page(
+                parent_namespace,
+                after=after,
+                limit=min(
+                    self.config.memory.query_scan_page_size,
+                    ceiling - scanned,
+                ),
+            )
+            for namespace in page.records:
+                scanned += 1
+                yield namespace
+            if page.exhausted:
+                return
+            after = page.next_cursor
+        raise ValidationError(
+            "Object Memory scan reached the configured ceiling of "
+            f"{ceiling} child namespaces before the result was complete; "
+            "narrow the namespace"
+        )
+
+    def _validate_metadata(self, metadata: ObjectMetadata) -> None:
+        if not isinstance(metadata, ObjectMetadata):
+            raise ValidationError("object metadata must use ObjectMetadata")
+        try:
+            metadata.validate()
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        for field_name in ("title", "summary", "mime_type"):
+            value = getattr(metadata, field_name)
+            if value is not None and len(value) > self.config.memory.metadata_text_max_chars:
+                raise ValidationError(
+                    f"object metadata {field_name} exceeds "
+                    f"{self.config.memory.metadata_text_max_chars} characters"
+                )
+        for field_name in ("tags", "embedding_refs", "indexes"):
+            values = getattr(metadata, field_name)
+            if len(values) > self.config.memory.metadata_collection_max_items:
+                raise ValidationError(
+                    f"object metadata {field_name} exceeds "
+                    f"{self.config.memory.metadata_collection_max_items} items"
+                )
+            for index, value in enumerate(values):
+                if len(value) > self.config.memory.metadata_collection_item_max_chars:
+                    raise ValidationError(
+                        f"object metadata {field_name}[{index}] exceeds "
+                        f"{self.config.memory.metadata_collection_item_max_chars} characters"
+                    )
+        ensure_json_size(metadata, self.config.memory.metadata_max_bytes, "object metadata")
 
     def _validate_query_limit(self, limit: int | None) -> int:
         if limit is None:
@@ -2454,6 +2934,7 @@ class ObjectMemoryManager:
         # value as authoritative would let create or a payload+metadata update
         # retain an estimate for different content.
         meta.token_estimate = estimate_tokens(payload)
+        self._validate_metadata(meta)
         return meta
 
     def _included_context_oids_for_operation(self, operation_id: str) -> list[str]:
@@ -2508,18 +2989,18 @@ class ObjectMemoryManager:
                 if require_read:
                     raise ValidationError(f"invalid LLM-derived object parent oid: {raw_oid!r}")
                 continue
-            parent = self.store.get_object(raw_oid)
-            if parent is None:
-                if require_read:
-                    raise ValidationError(f"LLM-derived object parent not found: {raw_oid}")
-                continue
             if require_read:
                 decision = self.capabilities.authorize(pid, f"object:{raw_oid}", ObjectRight.READ)
                 if not decision.allowed:
                     raise CapabilityDenied(
-                        f"LLM-derived object parent is not readable by {pid}: {raw_oid}"
+                        "LLM-derived object parent is unavailable"
                     )
                 read_decisions.append(decision)
+            parent = self.store.get_object(raw_oid)
+            if parent is None:
+                if require_read:
+                    raise ValidationError("authorized LLM-derived object parent was not found")
+                continue
             parents.append(parent)
         return parents, read_decisions
 

@@ -11,6 +11,24 @@ export type SchedulerStatus = {
   default_max_quanta: number | null;
 };
 
+export function assertSchedulerStatus(value: unknown): asserts value is SchedulerStatus {
+  if (!isRecord(value)) throw new Error("GUI scheduler status must be an object.");
+  if (
+    typeof value.auto_run !== "boolean"
+    || typeof value.running !== "boolean"
+    || typeof value.paused !== "boolean"
+    || ("task_id" in value && !(value.task_id === null || typeof value.task_id === "string"))
+    || ("reason" in value && !(value.reason === null || typeof value.reason === "string"))
+    || ("last_result" in value && !Array.isArray(value.last_result))
+    || ("last_error" in value && !(value.last_error === null || typeof value.last_error === "string"))
+    || ("started_at" in value && !(value.started_at === null || typeof value.started_at === "number"))
+    || ("finished_at" in value && !(value.finished_at === null || typeof value.finished_at === "number"))
+    || ("default_max_quanta" in value && !(value.default_max_quanta === null || (Number.isSafeInteger(value.default_max_quanta) && Number(value.default_max_quanta) > 0)))
+  ) {
+    throw new Error("GUI scheduler status is malformed.");
+  }
+}
+
 export type ProcessWaitState =
   | { schema_version: 1; kind: "child"; child_pid: string }
   | { schema_version: 1; kind: "message"; filters: Record<string, unknown> }
@@ -39,7 +57,7 @@ export type RuntimeProcess = {
   state_generation: number;
   created_at?: string;
   updated_at?: string;
-  loaded_skills: Record<string, unknown>;
+  loaded_skills: Record<string, LoadedSkillSummary>;
   tool_table: Record<string, string>;
   capabilities: string[];
   terminal: boolean;
@@ -114,6 +132,11 @@ export type SkillSummary = Record<string, unknown> & {
   name?: string;
   description?: string;
   source?: string;
+  package_sha256?: string;
+};
+
+export type LoadedSkillSummary = Record<string, unknown> & {
+  package_sha256?: string;
 };
 
 export type JsonRpcEndpointSummary = Record<string, unknown> & {
@@ -490,6 +513,7 @@ export type ImagePackageFileValue = string | { base64: string };
 export type ImagePackageFile = {
   name: string;
   manifest: string;
+  manifest_sha256: string;
   files: Record<string, ImagePackageFileValue>;
 };
 
@@ -529,12 +553,9 @@ const snapshotCollections = [
 export function assertRuntimeSnapshot(value: unknown): asserts value is RuntimeSnapshot {
   if (!isRecord(value)) throw new Error("GUI snapshot must be a JSON object.");
   if (typeof value.db !== "string") throw new Error("GUI snapshot is missing db.");
-  if (!isRecord(value.scheduler)) throw new Error("GUI snapshot is missing scheduler state.");
-  if (
-    typeof value.scheduler.auto_run !== "boolean"
-    || typeof value.scheduler.running !== "boolean"
-    || typeof value.scheduler.paused !== "boolean"
-  ) {
+  try {
+    assertSchedulerStatus(value.scheduler);
+  } catch {
     throw new Error("GUI snapshot scheduler state is malformed.");
   }
   for (const key of snapshotCollections) {

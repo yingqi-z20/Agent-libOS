@@ -253,13 +253,14 @@ protected operations, stale capability-use reservations, pending external
 effects, resource-usage reservations, process-exec publications, process-launch
 publications, checkpoint-restore publications, missing volatile Object
 payloads, registered JIT rehydration, stale Explainable Operations, stale
-process execution leases, and Object Tasks. Recovery queries use configured,
-hard-bounded keyset pages. External providers may reconcile an existing receipt
-but are never replayed; ambiguous resource reservations are charged to their
-maximum envelope. Process/image/checkpoint publications carry durable plans,
-phase receipts, exact recovery leases, and operation bindings so recovery can
-compensate or terminalize a specific owner rather than infer success from
-adjacent rows. A failed or manual publication keeps mutation admission closed.
+process execution leases, Object Tasks, and incomplete process-terminal cleanup
+intents. Recovery queries use configured, hard-bounded keyset pages. External
+providers may reconcile an existing receipt but are never replayed; ambiguous
+resource reservations are charged to their maximum envelope.
+Process/image/checkpoint publications carry durable plans, phase receipts,
+exact recovery leases, and operation bindings so recovery can compensate or
+terminalize a specific owner rather than infer success from adjacent rows. A
+failed or manual publication keeps mutation admission closed.
 
 That recovery-lease pass is followed by a second, still pre-`OPEN` STARTING
 phase. Under the startup lease the Runtime runs trusted startup hooks, starts
@@ -447,6 +448,16 @@ stopped safely, shutdown reports the exact failed stage and leaves owned storage
 open so live work is not racing a closed store connection. Host shutdown never
 marks AgentProcess records as exited.
 
+Scheduler worker threads may execute a quantum that returns an awaitable. Such
+a worker owns a private event loop for that quantum; after the main awaitable
+settles, it makes bounded cleanup attempts for every remaining loop task, async
+generator, and default-executor worker before closing the loop. Incomplete
+task/generator/executor cleanup makes the quantum fail rather than silently
+claiming a clean boundary. A default executor that has not actually stopped is
+also represented by a tracked scheduler lifecycle fence. Runtime shutdown then
+reports `scheduler_stopped: false` and preserves the open store until that
+executor drains and shutdown is retried.
+
 The final ordinary store close uses an exact nonblocking ownership claim. Async
 shutdown performs the blocking backend release off-loop and drains that
 irreversible step before propagating caller cancellation. Once ownership is
@@ -567,16 +578,20 @@ including:
   their append-only transition history, and record-level payload-retention
   tier/digest provenance,
 - events and audit records,
-- LLM call records with provider ids, model/API mode, usage, errors, and
-  full prompt, visible tools, output, tool calls, reasoning metadata, raw
-  response, and bounded observability envelopes. Full LLM input/output
-  persistence is enabled by default for self-evolution training and
-  fine-tuning pipelines; this may include sensitive prompt, tool, reasoning,
-  and provider payload fields. Set `llm.persist_full_io: false` to opt out and
-  store content-free byte counts, JSON-kind/item-count metadata where
-  applicable, and hashes for those fields. That setting cannot run an
-  `image_only` Image, whose next quantum requires a lossless durable transcript
-  head and therefore fails before provider dispatch.
+- LLM call records with provider ids, model/API mode, usage, outcome metadata,
+  and bounded observability envelopes. Full ordinary LLM I/O persistence is
+  enabled by default for self-evolution training and fine-tuning pipelines: it
+  retains prepared prompts and visible tools and, on success, output, tool
+  calls, reasoning metadata, and the raw response. Those fields may contain
+  sensitive material. A failed call's request fields follow the same setting,
+  but provider or extension exception text is never durable or model-visible,
+  regardless of `llm.persist_full_io`; only a stable public error envelope and
+  content-free internal observations such as type, length/hash, and correlation
+  id may cross those boundaries. Set `llm.persist_full_io: false` to store
+  content-free byte counts, JSON-kind/item-count metadata where applicable, and
+  hashes for ordinary I/O fields. That setting cannot run an `image_only`
+  Image, whose next quantum requires a lossless durable transcript head and
+  therefore fails before provider dispatch.
   Conditional LLM release
   rows apply the same policy before Human approval: with full-I/O persistence
   enabled, SQL stores the prepared request; with it disabled, SQL receives only
@@ -606,20 +621,42 @@ canonicalizes the database path for both the connection and lease. On the
 tested POSIX path, `O_NOFOLLOW` plus `fchmod` enables file-type/symlink checks
 and owner-only (`0600`) tightening for the database and sidecars; current-user
 ownership is also required where `getuid` is available. Separately, `fcntl`
-plus `O_NOFOLLOW` enables the hardened no-follow sidecar `flock` lease. Where
-that lease mechanism is unavailable, SQLite's kernel-managed exclusive database
-lock is the fallback, without claiming unavailable POSIX mode/ownership
-hardening. PostgreSQL derives its advisory-lock key from the current database
-and schema. A clean close releases the lease and permits a later reopen.
-Checkpoint and image artifact payloads are explicit durable snapshot
-exceptions.
+plus `O_NOFOLLOW` enables both the hardened no-follow path-sidecar `flock` and
+an owner-only private identity lease keyed by the validated database
+`(st_dev, st_ino)`. Database, lease, identity-lease, and SQLite sidecar files
+must be regular, current-user-owned, single-link files on that path. The
+database path is rechecked against the opened identity before use, so a hard
+link is rejected and a path/lockfile replacement, rename plus symlink retarget,
+or alternate path to the already leased inode cannot admit a second Runtime.
+Where that lease mechanism is unavailable, SQLite's kernel-managed exclusive
+database lock is the fallback, without claiming the unavailable POSIX
+path/inode and mode/ownership hardening. PostgreSQL derives its advisory-lock
+key from the current database and schema. A clean close releases the lease and
+permits a later reopen. Checkpoint and image artifact payloads are explicit
+durable snapshot exceptions.
 
 Store transactions nest through savepoints, and repository helpers defer their
-commits to the outer lifecycle transaction. Commit or savepoint-release failure
-is followed by rollback, including restoration of an opted-in Object payload
-cache snapshot. If rollback or savepoint cleanup also fails, the store is
-poisoned and closed; every later operation fails closed. See
-[Runtime Storage](storage.md) for the complete recovery and lease contract.
+commits to the outer lifecycle transaction. After an outer commit error, the
+store rolls back SQL and the corresponding Object-payload before-images only
+when the driver proves the transaction is still active. If commit may already
+have applied, the outcome is ambiguous: the store does not manufacture a
+rollback, restores no cache-only before-image, and instead poisons/closes its
+data plane unless a narrow typed caller proves and accepts the exact committed
+state. A failed nested `RELEASE SAVEPOINT` similarly attempts
+`ROLLBACK TO`/`RELEASE` and restores payload before-images only after that SQL
+rollback succeeds; failure of the recovery sequence poisons and closes the
+store. Every later ordinary operation then fails closed. See [Runtime
+Storage](storage.md) for the complete recovery and lease contract.
+
+Every process transition to `exited`, `failed`, or `killed` creates a durable
+terminal-cleanup intent in the same transaction as the terminal process row.
+Post-commit cleanup claims an exact owner/lease and records completion of the
+independent `terminal_notify` and `process_finalize` phases. Completed phases
+are not replayed; a failed attempt retains content-free diagnostics and raises
+`ProcessTerminalCleanupRequired` (with control-flow interruptions retained in
+an exception group after all phases are attempted). Startup reclaims incomplete
+leases under the recovery lease, retries only unfinished idempotent phases in
+bounded keyset pages, and keeps normal admission closed until that pass ends.
 
 Audit and events are append-only through the Runtime Store API, and checkpoint
 restore must not delete them. This is a runtime invariant rather than a claim

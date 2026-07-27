@@ -191,3 +191,127 @@ def test_skill_activation_failure_releases_registry_lifecycle(
             thread.join(timeout=0.1)
         if thread is None or not thread.is_alive():
             runtime.close()
+
+
+def test_skill_package_replace_waits_for_hash_pinned_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_id = "registry-cas-skill"
+    skill_dir = write_skill_package(
+        tmp_path,
+        skill_id,
+        allowed_tools=["echo"],
+        body="# registry-cas-skill\n\nUse package A.\n",
+    )
+    runtime = Runtime.open("local")
+    activation_at_publication = threading.Event()
+    release_activation = threading.Event()
+    replacement_attempted = threading.Event()
+    replacement_entered_store = threading.Event()
+    errors: list[tuple[str, BaseException]] = []
+    results: dict[str, Any] = {}
+    threads: list[threading.Thread] = []
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="linearize Skill activation with package replacement",
+        )
+        package_a = runtime.skills.register_skill_from_path(
+            skill_dir,
+            actor="test.host",
+            require_capability=False,
+        )
+        write_skill_package(
+            tmp_path,
+            skill_id,
+            allowed_tools=["echo"],
+            body="# registry-cas-skill\n\nUse package B.\n",
+        )
+
+        original_prepare = runtime.skills._prepare_jit_tools
+        original_upsert = runtime.skills.store.upsert_skill
+
+        def pause_after_hash_check(*args: Any, **kwargs: Any) -> Any:
+            activation_at_publication.set()
+            if not release_activation.wait(timeout=5):
+                raise AssertionError("activation publication was not released")
+            return original_prepare(*args, **kwargs)
+
+        def observe_replacement_store(*args: Any, **kwargs: Any) -> Any:
+            if threading.current_thread().name == "skill-package-replacement":
+                replacement_entered_store.set()
+            return original_upsert(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.skills, "_prepare_jit_tools", pause_after_hash_check)
+        monkeypatch.setattr(runtime.skills.store, "upsert_skill", observe_replacement_store)
+
+        def capture(label: str, operation: Callable[[], Any]) -> None:
+            try:
+                results[label] = operation()
+            except BaseException as exc:
+                errors.append((label, exc))
+
+        activation = threading.Thread(
+            name="skill-hash-pinned-activation",
+            target=capture,
+            args=(
+                "activation",
+                lambda: runtime.skills.activate_skill(
+                    pid,
+                    skill_id,
+                    actor=pid,
+                    require_capability=False,
+                    expected_package_sha256=package_a["package_sha256"],
+                ),
+            ),
+            daemon=True,
+        )
+
+        def replace_package() -> Any:
+            replacement_attempted.set()
+            return runtime.skills.register_skill_from_path(
+                skill_dir,
+                actor="test.host",
+                replace=True,
+                require_capability=False,
+            )
+
+        replacement = threading.Thread(
+            name="skill-package-replacement",
+            target=capture,
+            args=("replacement", replace_package),
+            daemon=True,
+        )
+        threads = [activation, replacement]
+
+        activation.start()
+        assert activation_at_publication.wait(timeout=2)
+        replacement.start()
+        assert replacement_attempted.wait(timeout=2)
+        assert not replacement_entered_store.wait(timeout=0.2)
+
+        release_activation.set()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        assert not [thread.name for thread in threads if thread.is_alive()]
+        assert errors == []
+        assert results["activation"]["package_sha256"] == package_a["package_sha256"]
+        assert results["replacement"]["package_sha256"] != package_a["package_sha256"]
+        loaded = runtime.process.get(pid).loaded_skills[skill_id]
+        assert loaded["package_sha256"] == package_a["package_sha256"]
+        discovered = runtime.skills.discover_skills(
+            skill_id,
+            actor=pid,
+            require_capability=False,
+            limit=1,
+        )
+        assert discovered[0]["package_sha256"] == results["replacement"]["package_sha256"]
+        assert discovered[0]["active"] is False
+    finally:
+        release_activation.set()
+        for thread in threads:
+            thread.join(timeout=0.1)
+        if not any(thread.is_alive() for thread in threads):
+            runtime.close()

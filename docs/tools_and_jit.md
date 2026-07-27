@@ -72,9 +72,15 @@ Fresh shipped images contain neither Skill catalog metadata nor Skill bodies in
 the prompt. `discover_skills` searches every source visible under current
 catalog authority using one common, `text`/`limit`-bounded result schema.
 Concrete query terms are matched independently against id, name, and
-description metadata and results are relevance-ranked; `next_step` tells the
-model to activate a plausible exact id rather than rediscovering it.
-`activate_skill` then loads the exact selected instructions and tool bindings.
+description metadata and results are relevance-ranked. A one-term query must
+match that term; a longer query requires at least two matching terms, allowing
+one task intent to surface separate narrowly owned Skills without admitting a
+result on one generic word alone. `next_step` tells the model to activate an
+inactive plausible exact id, use a current loaded snapshot, or refine a
+zero-result query. `active` is true only when loaded and catalog package hashes
+match. `activate_skill` passes the discovered hash as
+`expected_package_sha256`, then atomically loads the exact selected instructions
+and tool bindings; stale discovery hashes fail before publication.
 Model-visible discovery, activation, loaded-prompt, and unload contracts never
 identify a Skill as built-in or registered.
 
@@ -247,8 +253,12 @@ Object tasks let an AgentObject hold asynchronous tool work. `start_object_task`
 creates a host-managed runner child process, narrows that runner's process tool
 table to the requested creator-bound tool, and calls it through ToolBroker. The
 runner is excluded from the LLM scheduler even if a message wakes it back to a
-`RUNNABLE` process status, and it does not grant external authority unless the
-creator explicitly delegates capabilities into the runner.
+`RUNNABLE` process status. It does not inherit creator-held external authority
+unless the creator explicitly delegates it. Like an ordinary child it receives
+its own goal/View, namespace, self-checkpoint, and image bootstrap grants; an
+image package may also receive package-workspace grants, and ObjectTask adds
+task-local owner read/materialization authority. Those runner-local grants are
+not a transfer of the creator's ambient authority.
 
 Start validates the ObjectTask envelope, owner/authority/capacity, and that the
 named tool is visible before returning the durable queued task. The target
@@ -350,6 +360,20 @@ The manual lifecycle is:
    import-free.
 3. `register_jit_tool`: add the validated tool only to the registering process
    tool table.
+
+JIT input and output schemas use a bounded, reference-free, regex-free subset
+of JSON Schema 2020-12. Common object, array, scalar, composition, and numeric
+keywords are supported, including `type`, `properties`, `required`,
+`additionalProperties`, `items`, `prefixItems`, `enum`, `const`, `allOf`,
+`anyOf`, `oneOf`, `not`, length/item/property limits, and numeric bounds.
+Schemas are limited to 32 levels and 1,024 nodes and may contain only finite
+JSON numbers. `$ref`, `$dynamicRef`, `$recursiveRef`, `pattern`, and
+`patternProperties` are forbidden; `uniqueItems` and other unlisted keywords
+are unsupported because their Host validation cost is not bounded by this
+dialect. Existing tools that use references should inline a bounded schema;
+tools that use regexes should replace them with `enum`, structural fields, or
+fixed validation inside the sandboxed implementation. Proposal rejects an
+unsupported schema before persisting or executing candidate code.
 
 The three transitions publish different artifacts:
 
@@ -530,13 +554,16 @@ Python responds with final syscall results:
 
 ```json
 {"type":"syscall_result","id":"1","ok":true,"payload":{}}
-{"type":"syscall_result","id":"1","ok":false,"error":"provider failed","error_type":"RuntimeError","code":"provider_error","correlation_id":"..."}
+{"type":"syscall_result","id":"1","ok":false,"error":"syscall_error: CapabilityDenied (correlation_id=corr_...)","error_type":"CapabilityDenied","code":"syscall_error","correlation_id":"corr_..."}
 ```
 
-Handler exceptions include `error_type`; `code` and `correlation_id` are
-present only when the Host exception has a public provider-error envelope.
-Protocol-level failures such as an unavailable handler or an exceeded RPC-call
-limit may contain only `error`.
+Every exception raised by a Python syscall handler is converted to this
+text-free public envelope: `error` contains only the Host-selected code and
+exception-class identifier plus the Host correlation id, and `error_type`,
+`code`, and `correlation_id` are always present. Provider- or
+extension-authored exception text never enters the frame. Protocol-level
+failures that occur before handler invocation, such as an unavailable handler
+or an exceeded RPC-call limit, may contain only `error`.
 
 The runner returns either a result frame:
 
@@ -599,6 +626,20 @@ Those descriptors intentionally define only canonical spelling, stable aliases,
 and the routed handler; the documentation does not copy a count that would
 become stale when a route changes. Aliases enter the identical canonical
 handler and do not relax validation or authority.
+
+Before a common-contract built-in handler runs, the Host validates every field
+that handler consumes against its canonical JSON type and any configured hard
+bound. Boolean controls accept only JSON booleans, integer limits reject
+booleans and strings, identifiers and paths accept only strings, and structured
+arguments keep their declared object/list shape. Duration arguments accept
+finite JSON integers or floats within the applicable Host limit. An invalid
+call is still resource-charged and request-audited, but it cannot reach a
+primitive, publish deferred lifecycle/session state, acknowledge a message,
+select destructive or replacement behavior, or emit a successful
+`syscall.result`. Stable aliases share the same canonical argument contract.
+`capability.delegate` keeps its capability-domain validation rather than the
+common contract. Runtime-Module syscalls remain responsible for their own
+trusted module-defined argument contracts.
 
 This inventory is Host-side route discovery, not a parameter-schema API.
 Neither it nor `libos` supplies runtime introspection for arguments, results,
@@ -690,9 +731,15 @@ recorded as bounded observable envelopes: preview, SHA-256, byte size, and
 truncation status. Sensitive fields such as `content`, `body`, `payload`,
 `params`, `question`, `answer`, `source_code`, `tests`, `context`, `metadata`,
 `stdout`, and `stderr` are redacted before audit/event persistence.
-JIT validation errors, validation logs, and input/output schema failure details
-are persisted through the same bounded/redacted envelope; the direct tool call
-result can still return the original error to the caller.
+Candidate-validation diagnostics and logs returned by `validate_jit_tool` are
+separate from runtime invocation validation; their durable copies use the same
+bounded/redacted envelope. At runtime, an input-schema mismatch returns the
+fixed generic `InputValidationError` projection before candidate code or a
+syscall runs. An output-schema mismatch is surfaced after candidate code (and
+therefore possibly after syscalls) as a text-free execution-error envelope.
+Neither runtime path returns the original `jsonschema` diagnostic to the model;
+only a bounded internal type/length/digest observation is retained, and an
+output rejection does not roll back preceding effects.
 
 The canonical successful result carrier is a Tool Result Object Memory object,
 subject to a hard serialized payload limit. It is not necessarily the only

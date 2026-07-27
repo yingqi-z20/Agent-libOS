@@ -18,6 +18,7 @@ from agent_libos.api.gui.server import (
     _shutdown_gui_service_before_exit,
     _sse_payload_data,
     create_gui_http_server,
+    serve,
 )
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import (
@@ -53,10 +54,11 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ProcessWaitRequired, ValidationError
 from agent_libos.utils.ids import utc_now
-from agent_libos.utils.serde import to_jsonable
+from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from tests.support.checkpoints import checkpoint_cli_json
+from tests.support.mcp import MCP_TEST_STDIO_COMMAND, MCP_TEST_STDIO_COMMAND_YAML
 from tests.support.skills import write_skill_package
 
 
@@ -109,6 +111,141 @@ def test_gui_closes_owned_runtime_when_profile_registration_fails(
 
     assert len(opened) == 1
     assert opened[0].lifecycle.closed is True
+
+
+def test_gui_closes_owned_runtime_when_http_server_bind_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[Runtime] = []
+    original_open = Runtime.open
+    bind_error = OSError('injected bind failure')
+
+    def record_open(*args: object, **kwargs: object) -> Runtime:
+        runtime = original_open('local')
+        opened.append(runtime)
+        return runtime
+
+    def fail_bind(*_args: object, **_kwargs: object) -> None:
+        raise bind_error
+
+    monkeypatch.setattr('agent_libos.api.gui.server.Runtime.open', record_open)
+    monkeypatch.setattr('agent_libos.api.gui.server.GuiHTTPServer', fail_bind)
+
+    with pytest.raises(OSError) as raised:
+        create_gui_http_server(
+            db='local',
+            port=0,
+            auto_run=False,
+            llm_profiles_file=tmp_path / 'missing-profiles.json',
+        )
+
+    assert raised.value is bind_error
+    assert len(opened) == 1
+    assert opened[0].lifecycle.closed is True
+
+
+def test_gui_bind_failure_does_not_close_borrowed_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime.open('local')
+    bind_error = OSError('injected bind failure')
+
+    def fail_bind(*_args: object, **_kwargs: object) -> None:
+        raise bind_error
+
+    monkeypatch.setattr('agent_libos.api.gui.server.GuiHTTPServer', fail_bind)
+    try:
+        with pytest.raises(OSError) as raised:
+            create_gui_http_server(
+                runtime=runtime,
+                port=0,
+                auto_run=False,
+                llm_profiles_file=tmp_path / 'missing-profiles.json',
+            )
+
+        assert raised.value is bind_error
+        assert runtime.lifecycle.closed is False
+    finally:
+        runtime.shutdown(actor='test', reason='test.cleanup')
+
+
+@pytest.mark.parametrize('failure_point', ['ready', 'print', 'serve'])
+def test_serve_closes_owned_runtime_for_startup_and_serve_failures(
+    failure_point: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = create_gui_http_server(
+        db='local',
+        port=0,
+        auto_run=False,
+        llm_profiles_file=tmp_path / 'missing-profiles.json',
+    )
+    runtime = server.service.runtime
+    injected_error = RuntimeError(f'injected {failure_point} failure')
+    monkeypatch.setattr(
+        'agent_libos.api.gui.server.create_gui_http_server',
+        lambda **_kwargs: server,
+    )
+
+    def fail(_value: object | None = None, **_kwargs: object) -> None:
+        raise injected_error
+
+    if failure_point == 'print':
+        monkeypatch.setattr('agent_libos.api.gui.server.print', fail, raising=False)
+        ready = None
+    else:
+        ready = fail if failure_point == 'ready' else lambda _payload: None
+        if failure_point == 'serve':
+            monkeypatch.setattr(server, 'serve_forever', fail)
+
+    with pytest.raises(RuntimeError) as raised:
+        serve(
+            port=0,
+            token=None,
+            auto_run=False,
+            max_quanta=None,
+            ready=ready,
+        )
+
+    assert raised.value is injected_error
+    assert runtime.lifecycle.closed is True
+    assert server.socket.fileno() == -1
+
+
+def test_serve_treats_keyboard_interrupt_as_graceful_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = create_gui_http_server(
+        db="local",
+        port=0,
+        auto_run=False,
+        llm_profiles_file=tmp_path / "missing-profiles.json",
+    )
+    runtime = server.service.runtime
+    monkeypatch.setattr(
+        "agent_libos.api.gui.server.create_gui_http_server",
+        lambda **_kwargs: server,
+    )
+
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(server, "serve_forever", interrupt)
+
+    serve(
+        port=0,
+        token=None,
+        auto_run=False,
+        max_quanta=None,
+        ready=lambda _payload: None,
+    )
+
+    assert runtime.lifecycle.closed is True
+    assert server.socket.fileno() == -1
 
 
 def test_gui_rejects_mismatched_config_for_borrowed_runtime(
@@ -217,11 +354,14 @@ class TestGuiServer:
         return response.status, response_headers, data
 
     def request_json_text(self, method: str, path: str, raw: str) -> tuple[int, Any]:
+        return self.request_json_bytes(method, path, raw.encode('utf-8'))
+
+    def request_json_bytes(self, method: str, path: str, raw: bytes) -> tuple[int, Any]:
         conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
         conn.request(
             method,
             path,
-            body=raw.encode('utf-8'),
+            body=raw,
             headers={'Authorization': 'Bearer test-token', 'Content-Type': 'application/json'},
         )
         response = conn.getresponse()
@@ -229,6 +369,82 @@ class TestGuiServer:
         conn.close()
         decoded = json.loads(data.decode('utf-8')) if data else None
         return response.status, decoded
+
+    def test_capability_list_limit_is_validated_and_applied_before_decode(self) -> None:
+        runtime = self.server.service.runtime
+        configured_limit = runtime.config.capability.list_limit
+        for index in range(configured_limit + 25):
+            runtime.capability.grant(
+                "gui-capability-list-subject",
+                f"object:gui-capability-list-{index:04d}",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+        decoded: list[str] = []
+        decode = runtime.store._row_to_capability
+        runtime.store._row_to_capability = lambda row: (
+            decoded.append(str(row["cap_id"])),
+            decode(row),
+        )[1]
+
+        status, default_page = self.request("GET", "/api/capabilities")
+        assert status == 200
+        assert len(default_page) == configured_limit
+        assert len(decoded) == configured_limit
+
+        decoded.clear()
+        status, selected_page = self.request("GET", "/api/capabilities?limit=7")
+        assert status == 200
+        assert len(selected_page) == 7
+        assert len(decoded) == 7
+
+        decoded.clear()
+        status, subject_page = self.request(
+            "GET",
+            "/api/capabilities?subject=gui-capability-list-subject&limit=7",
+        )
+        assert status == 200
+        assert len(subject_page) == 7
+        assert len(decoded) == 7
+
+        for invalid in (0, configured_limit + 1):
+            status, body = self.request(
+                "GET",
+                f"/api/capabilities?limit={invalid}",
+            )
+            assert status == 400
+            assert "limit must" in body["error"]["message"]
+
+        # Existing clients continue to receive the legacy array, while the
+        # explicit page mode exposes a cursor envelope for complete GUI walks.
+        assert isinstance(subject_page, list)
+        runtime.store._row_to_capability = decode
+        expected_count = configured_limit + 25
+        seen_ids: list[str] = []
+        after: str | None = None
+        while True:
+            page_path = (
+                "/api/capabilities?mode=page"
+                "&subject=gui-capability-list-subject&limit=7"
+            )
+            if after is not None:
+                page_path += f"&after={after}"
+            status, page = self.request("GET", page_path)
+            assert status == 200
+            assert set(page) == {"items", "next_after", "has_more"}
+            page_ids = [item["cap_id"] for item in page["items"]]
+            assert len(page_ids) <= 7
+            assert not set(page_ids).intersection(seen_ids)
+            seen_ids.extend(page_ids)
+            if not page["has_more"]:
+                assert page["next_after"] is None
+                break
+            assert page["next_after"]
+            assert page["next_after"] != after
+            after = page["next_after"]
+
+        assert len(seen_ids) == expected_count
 
     def test_auth_health_snapshot_and_process_flow(self) -> None:
         status, _body = self.request('GET', '/api/health', token='wrong')
@@ -2687,6 +2903,95 @@ class TestGuiServer:
         assert status == 200
         assert [record['action'] for record in records] == ['process.audit.target']
 
+    def test_process_audit_before_cursor_returns_gap_free_older_page(self) -> None:
+        _status, spawned = self.request(
+            'POST',
+            '/api/processes',
+            {'goal': 'audit cursor target', 'auto_run': False},
+        )
+        pid = spawned['pid']
+        emitted = [
+            self.server.service.runtime.audit.record(
+                actor=pid,
+                action=f'process.audit.cursor.{index}',
+                target=f'process:{pid}',
+            )
+            for index in range(4)
+        ]
+
+        first_status, first = self.request(
+            'GET',
+            f'/api/processes/{pid}/audit?limit=2',
+        )
+        second_status, second = self.request(
+            'GET',
+            f'/api/processes/{pid}/audit?limit=2&before={first[0]["record_id"]}',
+        )
+
+        expected = [record.record_id for record in emitted]
+        actual = [record['record_id'] for record in second + first]
+        assert first_status == second_status == 200
+        assert actual == expected
+
+    def test_process_audit_default_limit_uses_active_config_and_pages_gap_free(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        target = str(tmp_path / "gui-audit-limit.sqlite")
+        config = AgentLibOSConfig(
+            runtime=RuntimeDefaults(local_store_target=target),
+            gui=replace(DEFAULT_CONFIG.gui, snapshot_audit_limit=7),
+        )
+        server = create_gui_http_server(
+            config=config,
+            port=0,
+            token="configured-audit-token",
+            auto_run=False,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            pid = "pid_configured_audit"
+            emitted = [
+                server.service.runtime.audit.record(
+                    actor=pid,
+                    action=f"process.audit.configured.{index:02d}",
+                    target=f"process:{pid}",
+                )
+                for index in range(15)
+            ]
+
+            first_status, first = _request_to_server(
+                server,
+                "GET",
+                f"/api/processes/{pid}/audit",
+                token="configured-audit-token",
+            )
+            second_status, second = _request_to_server(
+                server,
+                "GET",
+                f"/api/processes/{pid}/audit?before={first[0]['record_id']}",
+                token="configured-audit-token",
+            )
+            third_status, third = _request_to_server(
+                server,
+                "GET",
+                f"/api/processes/{pid}/audit?before={second[0]['record_id']}",
+                token="configured-audit-token",
+            )
+
+            assert first_status == second_status == third_status == 200
+            assert [len(first), len(second), len(third)] == [7, 7, 1]
+            expected = [record.record_id for record in emitted]
+            actual = [record["record_id"] for record in third + second + first]
+            assert actual == expected
+            assert len(actual) == len(set(actual))
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.service.shutdown()
+            server.server_close()
+
     def test_high_risk_exec_requires_confirmation(self) -> None:
         status, _profile = self.request(
             'POST',
@@ -3249,6 +3554,182 @@ class TestGuiServer:
         assert calls == [(1, False), (1, False)]
         assert self.server.service.scheduler.status()['last_result'] == [{'call': 1}]
 
+    def test_scheduler_step_internal_error_is_safe_and_correlation_stable(
+        self,
+    ) -> None:
+        runtime = self.server.service.runtime
+        secret = "N5q8Vm2Lc7Xp4Rw9Kd6Hz3Ta"
+        path = "/Users/private/gui-runtime.sqlite"
+        sql = "SELECT * FROM gui_credentials"
+        failure = RuntimeError(
+            f"driver failed at {path}; opaque={secret}; SQL={sql}"
+        )
+        pid = runtime.process.spawn(image="base-agent:v0", goal="GUI scheduler failure")
+
+        async def fail_step(_pid: str) -> None:
+            raise failure
+
+        runtime.arun_process_once = fail_step
+
+        status, body = self.request(
+            "POST",
+            f"/api/processes/{pid}/step",
+            {},
+        )
+
+        assert status == 500
+        error = body["error"]
+        assert error["code"] == "internal_error"
+        assert error["error_type"] == "RuntimeError"
+        assert error["correlation_id"].startswith("corr_")
+        assert error["correlation_id"] in error["message"]
+
+        health_status, health = self.request("GET", "/api/health")
+        assert health_status == 200
+        assert health["scheduler"]["last_error"] == error["message"]
+
+        outward = dumps({"body": body, "health": health})
+        assert secret not in outward
+        assert path not in outward
+        assert sql not in outward
+
+        audit = next(
+            record
+            for record in runtime.audit.trace()
+            if record.action == "gui.request_internal_error"
+        )
+        assert audit.correlation_id == error["correlation_id"]
+        internal = dumps(audit.decision)
+        assert secret not in internal
+        assert path not in internal
+        assert sql not in internal
+        observation = audit.decision["internal_error"]
+        assert observation["correlation_id"] == error["correlation_id"]
+        assert observation["exception_text"]["bytes"] > 0
+        assert len(observation["exception_text"]["sha256"]) == 64
+
+    def test_llm_provider_failure_is_text_free_across_gui_surfaces(self) -> None:
+        runtime = self.server.service.runtime
+        secret = "GUI_PROVIDER_ERROR_SENTINEL_7Xp4Rw9Kd6Hz3Ta"
+        private_path = "/Users/private/provider-credentials.json"
+
+        class FailingProviderClient:
+            def complete_action(self, *_args: Any, **_kwargs: Any) -> None:
+                raise RuntimeError(
+                    f"provider failed at {private_path}; opaque={secret}"
+                )
+
+        runtime.llm.client = FailingProviderClient()
+        status, spawned = self.request(
+            "POST",
+            "/api/processes",
+            {"goal": "GUI provider failure", "auto_run": False},
+        )
+        assert status == 200
+        pid = spawned["pid"]
+
+        status, step = self.request(
+            "POST",
+            f"/api/processes/{pid}/step",
+            {},
+        )
+        assert status == 200
+        assert step["result"]["ok"] is False
+        correlation_id = step["result"]["error_details"]["correlation_id"]
+        assert correlation_id in step["result"]["error"]
+
+        snapshot_status, snapshot = self.request("GET", "/api/snapshot")
+        audit_status, audit = self.request("GET", f"/api/processes/{pid}/audit")
+        calls_status, calls = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls",
+        )
+        assert snapshot_status == audit_status == calls_status == 200
+
+        failed_audit = next(
+            record for record in audit if record["action"] == "llm.action_failed"
+        )
+        assert failed_audit["correlation_id"] == correlation_id
+        assert failed_audit["decision"]["error_details"] == step["result"]["error_details"]
+        assert calls[0]["error"] == step["result"]["error"]
+        assert calls[0]["observability"]["failure"]["public_error"] == step["result"]["error_details"]
+
+        process = runtime.process.get(pid)
+        assert process.outcome is not None
+        assert process.outcome.result_oid is not None
+        result_object = runtime.store.get_object(process.outcome.result_oid)
+        assert result_object is not None
+        assert correlation_id in result_object.payload["message"]
+
+        outward = dumps(
+            to_jsonable(
+                {
+                    "step": step,
+                    "snapshot": snapshot,
+                    "audit": audit,
+                    "calls": calls,
+                    "result_object": result_object,
+                }
+            )
+        )
+        assert secret not in outward
+        assert private_path not in outward
+
+    def test_scheduler_background_internal_error_is_safe_in_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = self.server.service.runtime
+        secret = "C6w9Rp3Nk8Xm5Vq2Ld7Hs4Ta"
+        path = "/Users/private/gui-background.sqlite"
+        failure = RuntimeError(
+            f"provider failed at {path}; opaque={secret}; SQL=SELECT private_value"
+        )
+
+        def fail_background(**_kwargs: Any) -> None:
+            raise failure
+
+        runtime.run_until_idle = fail_background
+
+        original_publish = self.server.service.publish_scheduler_status
+
+        def publish_after_background_settles() -> None:
+            thread = self.server.service.scheduler._thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=2)
+            original_publish()
+
+        monkeypatch.setattr(
+            self.server.service,
+            "publish_scheduler_status",
+            publish_after_background_settles,
+        )
+
+        status = self.server.service.scheduler.start(max_quanta=1, reason="failure-test")
+        assert status["running"]
+        thread = self.server.service.scheduler._thread
+        assert thread is not None
+        thread.join(timeout=2)
+
+        scheduler = self.server.service.scheduler.status()
+        assert scheduler["running"] is False
+        assert scheduler["last_error"] is not None
+        assert "internal_error" in scheduler["last_error"]
+        assert "correlation_id=" in scheduler["last_error"]
+        encoded = dumps(scheduler)
+        assert secret not in encoded
+        assert path not in encoded
+
+        audit = next(
+            record
+            for record in runtime.audit.trace()
+            if record.action == "gui.scheduler_background_internal_error"
+        )
+        assert audit.correlation_id in scheduler["last_error"]
+        internal = dumps(audit.decision)
+        assert secret not in internal
+        assert path not in internal
+
     def test_scheduler_background_completes_slow_inflight_quantum_at_batch_boundary(self) -> None:
         runtime = self.server.service.runtime
         runtime.scheduler.poll_interval_s = 0.001
@@ -3646,7 +4127,7 @@ class TestGuiServer:
         runtime = Runtime.open('local')
         server = create_gui_http_server(runtime=runtime, db=dsn, port=0, token='custom-token', auto_run=False)
         try:
-            redacted = 'postgresql://agent:***@localhost:5432/agent_libos'
+            redacted = 'postgresql://***@localhost:5432/agent_libos'
             assert server.service.db == redacted
             assert server.service.health()['db'] == redacted
             assert server.service.snapshot()['db'] == redacted
@@ -3673,7 +4154,7 @@ class TestGuiServer:
         monkeypatch.setattr(Runtime, 'open', staticmethod(fake_open))
         server = create_gui_http_server(config=config, port=0, token='custom-token', auto_run=False)
         try:
-            redacted = 'postgresql://agent:***@localhost:5432/agent_libos'
+            redacted = 'postgresql://***@localhost:5432/agent_libos'
 
             assert calls['target'] is None
             assert server.service.db == redacted
@@ -3788,7 +4269,7 @@ class TestGuiServer:
 
         self.server.service.runtime.capability.grant(
             pid,
-            self.server.service.runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_mcp']),
+            self.server.service.runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ['-m', 'demo_mcp']),
             [CapabilityRight.EXECUTE],
             issued_by='test',
         )
@@ -3844,7 +4325,10 @@ class TestGuiServer:
                             input_schema={},
                         )
                     ],
-                    response_bytes=32,
+                    # The provider contract reports at least the canonical
+                    # serialized tool-list size. This security fixture is not
+                    # testing byte accounting, so use the manifest ceiling.
+                    response_bytes=server.max_response_bytes,
                     duration_s=0.01,
                 )
 
@@ -3897,7 +4381,7 @@ class TestGuiServer:
         )
         runtime.capability.grant(
             pid,
-            runtime.mcp.stdio_resource_for_argv('python3', ['-m', 'demo_mcp']),
+            runtime.mcp.stdio_resource_for_argv(MCP_TEST_STDIO_COMMAND, ['-m', 'demo_mcp']),
             [CapabilityRight.EXECUTE],
             issued_by='test',
         )
@@ -3930,6 +4414,77 @@ class TestGuiServer:
 
             assert status == 400
             assert 'requires an actor' in denied['error']['message']
+
+    def test_skill_activate_requires_and_forwards_discovered_package_hash(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = self.server.service.runtime
+        package_sha256 = "b" * 64
+        calls: list[dict[str, Any]] = []
+
+        def activate_skill(
+            pid: str,
+            skill_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append({"pid": pid, "skill_id": skill_id, **kwargs})
+            return {"pid": pid, "skill_id": skill_id}
+
+        monkeypatch.setattr(runtime.skills, "activate_skill", activate_skill)
+
+        status, missing = self.request(
+            "POST",
+            "/api/skills/gui-cas-skill/activate",
+            {"pid": "pid_1", "confirmed": True},
+        )
+        assert status == 400
+        assert "expected_package_sha256" in missing["error"]["message"]
+
+        status, invalid = self.request(
+            "POST",
+            "/api/skills/gui-cas-skill/activate",
+            {
+                "pid": "pid_1",
+                "expected_package_sha256": "B" * 64,
+                "confirmed": True,
+            },
+        )
+        assert status == 400
+        assert "lowercase SHA-256" in invalid["error"]["message"]
+
+        status, confirmation = self.request(
+            "POST",
+            "/api/skills/gui-cas-skill/activate",
+            {
+                "pid": "pid_1",
+                "expected_package_sha256": package_sha256,
+            },
+        )
+        assert status == 409
+        assert confirmation["error"]["preview"]["expected_package_sha256"] == package_sha256
+
+        status, activated = self.request(
+            "POST",
+            "/api/skills/gui-cas-skill/activate",
+            {
+                "pid": "pid_1",
+                "actor": "pid_1",
+                "expected_package_sha256": package_sha256,
+                "confirmed": True,
+            },
+        )
+        assert status == 200
+        assert activated == {"pid": "pid_1", "skill_id": "gui-cas-skill"}
+        assert calls == [
+            {
+                "pid": "pid_1",
+                "skill_id": "gui-cas-skill",
+                "actor": "pid_1",
+                "require_capability": True,
+                "expected_package_sha256": package_sha256,
+            }
+        ]
 
     def test_skill_register_actor_mode_requires_skill_write_capability(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
@@ -4218,6 +4773,23 @@ class TestGuiServer:
         assert 'JSON object' in body['error']['message']
         assert runtime.process.get(pid).status == ProcessStatus.PAUSED
 
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            b'{"goal":"\xff"}',
+            ('{"goal":' + ('[' * 257) + '0' + (']' * 257) + '}').encode('utf-8'),
+            b'{"goal":"constant", "max_quanta":NaN}',
+            ('{"goal":' + ('[' * 2_000) + '0' + (']' * 2_000) + '}').encode('utf-8'),
+        ],
+        ids=['invalid-unicode', 'excessive-depth', 'invalid-constant', 'parser-recursion'],
+    )
+    def test_json_parser_failures_are_stable_bad_requests(self, raw: bytes) -> None:
+        status, body = self.request_json_bytes('POST', '/api/processes', raw)
+
+        assert status == 400
+        assert body['ok'] is False
+        assert 'invalid JSON body' in body['error']['message']
+
     def test_request_body_size_is_bounded(self) -> None:
         self.server.service.runtime.config = replace(
             self.server.service.runtime.config,
@@ -4344,7 +4916,7 @@ schema_version: 1
 server_id: {server_id}
 transport: stdio
 stdio:
-  command: python3
+  command: {MCP_TEST_STDIO_COMMAND_YAML}
   args: ["-m", "demo_mcp"]
 tools:
   - tool_id: echo

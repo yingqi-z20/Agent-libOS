@@ -52,7 +52,7 @@ On success, `created_oid` is the resulting HEAD commit and `after.token` observe
 4. Call `git_stage` with the newest same-worktree `state.token`. If Human approval is requested before dispatch, obtain it and reissue the exact same arguments only while the observed token remains current.
 5. Re-read status and both diffs. Check the complete staged patch, not merely `changed_paths`. If the index contains a mistake, call `git_unstage` only for the exact mistaken paths with the newest token, then re-read both diffs again.
 6. Before committing, verify the entire staged tree is intended, the byte-level message contract is satisfied, no integration state is known or suspected, and `amend` is explicitly chosen. Call `git_commit` with the latest state digest.
-7. Read back the returned `created_oid` with `git_show`, then read status plus staged/worktree diffs. Confirm the commit tree and the intentionally dirty remainder separately.
+7. Read back the returned `created_oid` with `git_show`, then read status plus staged/worktree diffs. For an ordinary commit require its sole parent diff; if an explicitly intended merge completion produced a multi-parent commit, inspect every required `parent_diffs` entry rather than treating the top-level first-parent patch as the whole merge. Confirm the commit tree and the intentionally dirty remainder separately.
 
 Do not stage unrelated changes merely to make status clean. Do not unstage user changes as a convenience. When unrelated entries are already staged, report the whole-index constraint and obtain intent instead of promising to preserve them. Do not amend because a previous commit message seems inconvenient unless replacing that exact tip is within the request.
 
@@ -84,8 +84,8 @@ For staging or unstaging, completion requires:
 
 For a commit, completion additionally requires:
 
-- `git_show(created_oid)` identifies the resulting commit and an untruncated patch;
-- the commit's complete tree change and parents match the requested normal/amend action;
+- `git_show(created_oid)` identifies the resulting commit and every required root/per-parent patch is untruncated;
+- the commit's complete parent-relative tree changes and parents match the requested normal/amend or explicitly intended merge-completion action;
 - the commit message, author, and committer match the intended normal/amend semantics;
 - status and both diffs explain every remaining change;
 - amend, when used, had exact destructive authority and one-use approval;

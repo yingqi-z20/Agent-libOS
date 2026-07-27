@@ -5,18 +5,22 @@ import contextlib
 import pytest
 import asyncio
 import os
+import psutil
+import re
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
+from agent_libos.llm.actions import _model_facing_error
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
@@ -25,11 +29,13 @@ from agent_libos.models import (
     ObjectOwnerKind,
     ProcessStatus,
     ResourceBudget,
+    ToolHandle,
     ToolSpec,
     ValidationResult,
 )
 from agent_libos.models.exceptions import (
     CapabilityDenied,
+    ProviderHostError,
     ResourceLimitExceeded,
     SandboxError,
     ValidationError,
@@ -44,7 +50,10 @@ from agent_libos.substrate import (
     WindowsJobObject,
 )
 from agent_libos.tools.broker import ToolBroker
-from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
+from agent_libos.tools.sandbox import (
+    DenoTypescriptSandbox,
+    SandboxBackend,
+)
 from agent_libos.utils.serde import dumps
 from tests.support.deno import (
     BAD_OUTPUT_SOURCE,
@@ -119,13 +128,69 @@ class TestJitSecurity:
         allowed_validation = self.runtime.tools.call(owner, 'validate_jit_tool', {'candidate_id': candidate})
         allowed_registration = self.runtime.tools.call(owner, 'register_jit_tool', {'candidate_id': candidate})
         assert not denied_validation.ok
-        assert 'belongs to process' in (denied_validation.error or '')
+        assert (denied_validation.error or '').startswith(
+            'validation_error: ValidationError'
+        )
         assert not denied_registration.ok
-        assert 'belongs to process' in (denied_registration.error or '')
+        assert (denied_registration.error or '').startswith(
+            'validation_error: ValidationError'
+        )
         assert 'owned_count_chars' not in self.runtime.process.get(other).tool_table
         assert allowed_validation.ok, allowed_validation.error
         assert allowed_registration.ok, allowed_registration.error
         assert 'owned_count_chars' in self.runtime.process.get(owner).tool_table
+
+    @pytest.mark.parametrize(
+        'tool_name',
+        ['validate_jit_tool', 'register_jit_tool'],
+    )
+    def test_jit_candidate_denials_do_not_distinguish_foreign_from_missing(
+        self,
+        tool_name: str,
+    ) -> None:
+        owner = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='own private candidate',
+        )
+        other = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='probe private candidate',
+        )
+        candidate = self.runtime.tools.propose(
+            owner,
+            {
+                'name': f'private_{tool_name}',
+                'description': 'Remain indistinguishable from a missing candidate.',
+                'input_schema': {'type': 'object'},
+                'output_schema': {'type': 'object'},
+            },
+            source_code='export function run(args, libos) { return {}; }',
+        )
+
+        foreign = self.runtime.tools.call(
+            other,
+            tool_name,
+            {'candidate_id': candidate},
+        )
+        missing_id = 'jitcand_missing_equivalent'
+        missing = self.runtime.tools.call(
+            other,
+            tool_name,
+            {'candidate_id': missing_id},
+        )
+
+        for result in (foreign, missing):
+            assert not result.ok
+            assert (result.error or '').startswith(
+                'validation_error: ValidationError'
+            )
+            assert result.payload['error']['code'] == 'validation_error'
+            assert result.payload['error']['type'] == 'ValidationError'
+            assert result.payload['error']['retryable'] is False
+            projected = dumps(result.payload)
+            assert candidate not in projected
+            assert missing_id not in projected
+            assert owner not in projected
 
     def test_jit_candidate_specs_are_conservative_side_effects(self) -> None:
         owner = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='make conservative tool')
@@ -376,7 +441,7 @@ class TestJitSecurity:
             if handle.name == 'atomic_jit'
         ]
 
-    def test_deno_runtime_execution_uses_cached_only_while_validation_can_resolve_imports(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_deno_runtime_execution_isolates_storage_and_denies_import_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
         commands: list[list[str]] = []
         launch_kwargs: list[dict[str, Any]] = []
         jobs: list[Any] = []
@@ -428,15 +493,223 @@ class TestJitSecurity:
 
         assert validation.ok, validation.errors
         assert Path(commands[0][2]).name == '_process_supervisor.py'
-        assert commands[0][-5:] == ['deno', 'run', '--no-prompt', '--cached-only', 'runner.ts']
-        assert commands[1][-4:] == ['deno', 'run', '--no-prompt', 'runner.ts']
+        runtime_flags = [
+            'deno',
+            'run',
+            '--no-prompt',
+            '--no-code-cache',
+            '--no-remote',
+            '--no-npm',
+            '--deny-import',
+        ]
+        assert commands[0][-9:] == [*runtime_flags, '--cached-only', 'runner.ts']
+        assert commands[1][-8:] == [*runtime_flags, 'runner.ts']
         group_key = 'creationflags' if os.name == 'nt' else 'start_new_session'
         assert all(kwargs.get(group_key) for kwargs in launch_kwargs)
+        assert all(
+            kwargs.get('limit')
+            == max(sandbox.max_stdout_bytes, sandbox.max_stderr_bytes) + 1
+            for kwargs in launch_kwargs
+        )
+        for kwargs in launch_kwargs:
+            environment = kwargs['env']
+            cwd = Path(kwargs['cwd']).resolve()
+            assert Path(environment['DENO_DIR']).resolve().is_relative_to(cwd)
+            assert Path(environment['HOME']).resolve().is_relative_to(cwd)
+            assert Path(environment['TMPDIR']).resolve().is_relative_to(cwd)
         if os.name == 'posix':
             assert all(kwargs.get('pass_fds') for kwargs in launch_kwargs)
         else:
             assert len(jobs) == 2
             assert all(job.assigned == [4242] and job.closed for job in jobs)
+
+    def test_deno_failed_candidate_test_retains_subprocess_metrics(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sandbox = DenoTypescriptSandbox()
+
+        class FakeJob:
+            def assign_pid(self, pid: int) -> None:
+                assert pid == 4242
+
+            def close(self) -> None:
+                return None
+
+        async def fake_create_subprocess_exec(*_command: str, **_kwargs: Any) -> Any:
+            return SimpleNamespace(pid=4242, returncode=None)
+
+        async def fake_monitor_process(proc: Any, _limits: Any) -> CommandMetrics:
+            while proc.returncode is None:
+                await asyncio.sleep(0)
+            return CommandMetrics(
+                wall_seconds=0.4,
+                cpu_seconds=0.2,
+                peak_memory_bytes=2_048,
+            )
+
+        async def fake_serve_process(
+            _proc: Any,
+            _args: dict[str, Any],
+            _syscall_handler: Any,
+        ) -> Any:
+            await asyncio.sleep(0)
+            raise SandboxError('candidate failed after consuming resources')
+
+        async def fake_kill_process(proc: Any) -> None:
+            proc.returncode = -9
+
+        monkeypatch.setattr(sandbox, '_resolve_deno', lambda: 'deno')
+        monkeypatch.setattr(sandbox, 'deno_version', lambda: 'deno 2.0.0')
+        monkeypatch.setattr(
+            asyncio,
+            'create_subprocess_exec',
+            fake_create_subprocess_exec,
+        )
+        monkeypatch.setattr(sandbox, '_monitor_process', fake_monitor_process)
+        monkeypatch.setattr(sandbox, '_serve_process', fake_serve_process)
+        monkeypatch.setattr(sandbox, '_kill_process', fake_kill_process)
+        if os.name == 'nt':
+            monkeypatch.setattr(WindowsJobObject, 'create', FakeJob)
+
+        validation = sandbox.run_tests(
+            'export function run(args, libos) { return {}; }',
+            [{'args': {}, 'expected': {}}],
+            return_metrics=True,
+        )
+
+        assert not validation.ok
+        assert validation.metadata['metrics'] == {
+            'wall_seconds': pytest.approx(0.4),
+            'cpu_seconds': pytest.approx(0.2),
+            'peak_memory_bytes': 2_048,
+            'killed': False,
+            'limit_kind': None,
+        }
+
+    @pytest.mark.real_deno
+    def test_failed_live_deno_call_charges_retained_subprocess_metrics(self) -> None:
+        pid = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='charge ordinary failed execution',
+            resource_budget=ResourceBudget(max_subprocess_wall_seconds=10.0),
+        )
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'ordinary_deno_failure_metrics',
+                'description': 'Throw only when the registered tool executes.',
+                'input_schema': {'type': 'object'},
+            },
+            source_code=(
+                'export function run(args, libos) { '
+                'throw new Error("ordinary candidate failure"); '
+                '}'
+            ),
+        )
+        assert self.runtime.tools.validate(candidate).ok
+        self.runtime.tools.register(pid, candidate)
+        before = self.runtime.process.get(pid).resource_usage.subprocess_wall_seconds
+
+        result = self.runtime.tools.call(pid, 'ordinary_deno_failure_metrics', {})
+
+        after = self.runtime.process.get(pid).resource_usage.subprocess_wall_seconds
+        assert not result.ok
+        assert after > before
+
+    def test_deno_resource_samples_preserve_exited_child_cpu_and_fail_closed(
+        self,
+    ) -> None:
+        sandbox = DenoTypescriptSandbox()
+
+        class FakeProcess:
+            def __init__(
+                self,
+                pid: int,
+                cpu_seconds: float,
+                memory_bytes: int,
+                children: list[Any] | None = None,
+            ) -> None:
+                self.pid = pid
+                self.cpu_seconds = cpu_seconds
+                self.memory_bytes = memory_bytes
+                self.child_processes = children or []
+
+            def children(self, *, recursive: bool) -> list[Any]:
+                assert recursive is True
+                return list(self.child_processes)
+
+            def cpu_times(self) -> Any:
+                return SimpleNamespace(user=self.cpu_seconds, system=0.0)
+
+            def memory_info(self) -> Any:
+                return SimpleNamespace(rss=self.memory_bytes)
+
+        child = FakeProcess(43, 10.0, 5_000)
+        root = FakeProcess(42, 1.0, 1_000, [child])
+        cpu_by_pid: dict[int, float] = {}
+
+        first_cpu, first_peak = sandbox._sample_process_tree(
+            root,
+            0,
+            cpu_by_pid,
+        )
+        root.child_processes.clear()
+        second_cpu, second_peak = sandbox._sample_process_tree(
+            root,
+            first_peak,
+            cpu_by_pid,
+        )
+
+        assert first_cpu == pytest.approx(11.0)
+        assert second_cpu == pytest.approx(11.0)
+        assert second_peak == 6_000
+
+        class DeniedProcess(FakeProcess):
+            def cpu_times(self) -> Any:
+                raise psutil.AccessDenied(self.pid)
+
+        root.child_processes.append(DeniedProcess(44, 0.0, 0))
+        with pytest.raises(OSError, match='resource usage'):
+            sandbox._sample_process_tree(root, second_peak, cpu_by_pid)
+
+    @pytest.mark.real_deno
+    def test_deno_ndjson_accepts_frames_up_to_configured_limit(self) -> None:
+        sandbox = DenoTypescriptSandbox(
+            deno_executable='deno',
+            max_stdout_bytes=100_000,
+        )
+
+        result = sandbox.run_source(
+            'export function run(args, libos) { '
+            'return { blob: "x".repeat(70000) }; '
+            '}',
+            {},
+        )
+
+        assert result == {'blob': 'x' * 70_000}
+
+    @pytest.mark.real_deno
+    def test_deno_persistent_storage_stays_inside_ephemeral_run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inherited_deno_dir = tmp_path / 'inherited-deno-dir'
+        inherited_deno_dir.mkdir()
+        monkeypatch.setenv('DENO_DIR', str(inherited_deno_dir))
+        sandbox = DenoTypescriptSandbox(deno_executable='deno')
+
+        result = sandbox.run_source(
+            'export function run(args, libos) { '
+            'localStorage.setItem("candidate-canary", "retained"); '
+            'return { value: localStorage.getItem("candidate-canary") }; '
+            '}',
+            {},
+        )
+
+        assert result == {'value': 'retained'}
+        assert list(inherited_deno_dir.rglob('*')) == []
 
     def test_cancelled_deno_execution_kills_process_and_drains_workers(
         self,
@@ -737,6 +1010,293 @@ class TestJitSecurity:
                 source_code='export function run(args, libos) { return {}; }',
             )
 
+    def test_jit_proposal_rejects_remote_schema_ref_without_host_network(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='reject remote schema')
+        urlopen_calls: list[str] = []
+        remote_schema = {'$ref': 'https://schemas.example.invalid/tool.json'}
+
+        def record_urlopen(url: Any, *args: Any, **kwargs: Any) -> Any:
+            urlopen_calls.append(str(url))
+            raise AssertionError('JIT schema validation must not perform Host network I/O')
+
+        monkeypatch.setattr(urllib.request, 'urlopen', record_urlopen)
+
+        with pytest.raises(ValidationError, match=r'\$ref'):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': 'remote_ref_schema',
+                    'description': 'Must not resolve a remote schema.',
+                    'input_schema': remote_schema,
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
+        monkeypatch.setattr(
+            self.runtime.tools.execution,
+            '_extensions',
+            SimpleNamespace(
+                get_tool_spec=lambda _tool_id: ToolSpec(
+                    name='persisted_remote_ref_schema',
+                    description='Simulate a schema persisted before this restriction.',
+                    input_schema=remote_schema,
+                )
+            ),
+        )
+        with pytest.raises(ValueError, match=r'\$ref'):
+            self.runtime.tools.execution.validate_jit_arguments(
+                ToolHandle(
+                    tool_id='tool_persisted_remote_ref',
+                    name='persisted_remote_ref_schema',
+                    capability_id=None,
+                ),
+                {},
+            )
+
+        assert urlopen_calls == []
+
+    def test_jit_proposal_rejects_file_schema_ref(self) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='reject file schema')
+
+        with pytest.raises(ValidationError, match=r'\$ref'):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': 'file_ref_schema',
+                    'description': 'Must not resolve a Host file schema.',
+                    'input_schema': {'$ref': 'file:///etc/passwd'},
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
+    @pytest.mark.parametrize(
+        'unsafe_schema, keyword',
+        [
+            ({'type': 'string', 'pattern': '(a+)+$'}, 'pattern'),
+            (
+                {
+                    'type': 'object',
+                    'patternProperties': {'(a+)+$': {'type': 'string'}},
+                },
+                'patternProperties',
+            ),
+        ],
+    )
+    def test_jit_proposal_rejects_regex_schema_keywords(
+        self,
+        unsafe_schema: dict[str, Any],
+        keyword: str,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='reject schema regex')
+
+        with pytest.raises(ValidationError, match=keyword):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': f'unsafe_{keyword.lower()}',
+                    'description': 'Must reject attacker-controlled regular expressions.',
+                    'input_schema': unsafe_schema,
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
+    def test_jit_proposal_rejects_recursive_ref_without_recursion_error(self) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='reject recursive schema')
+        recursive_schema: dict[str, Any] = {
+            '$defs': {'loop': {'$ref': '#/$defs/loop'}},
+            '$ref': '#/$defs/loop',
+        }
+
+        with pytest.raises(ValidationError, match=r'\$ref'):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': 'recursive_ref_schema',
+                    'description': 'Must reject recursive schema references.',
+                    'input_schema': recursive_schema,
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
+    @pytest.mark.parametrize('schema_name', ['input_schema', 'output_schema'])
+    def test_jit_proposal_rejects_unbounded_unique_items_validation(
+        self,
+        schema_name: str,
+    ) -> None:
+        pid = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='reject pairwise schema validation',
+        )
+        spec = {
+            'name': f'unique_items_{schema_name}',
+            'description': 'Must reject pairwise uniqueItems evaluation.',
+            'input_schema': {'type': 'object'},
+            'output_schema': {'type': 'object'},
+        }
+        spec[schema_name] = {
+            'type': 'array',
+            'uniqueItems': True,
+        }
+
+        with pytest.raises(ValidationError, match='uniqueItems'):
+            self.runtime.tools.propose(
+                pid,
+                spec,
+                source_code='export function run(args, libos) { return []; }',
+            )
+
+    @pytest.mark.parametrize('schema_name', ['input_schema', 'output_schema'])
+    def test_persisted_jit_schema_rejects_unique_items_before_host_validation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        schema_name: str,
+    ) -> None:
+        spec_kwargs = {
+            'name': 'persisted_unique_items',
+            'description': 'Simulate a schema persisted before this restriction.',
+            'input_schema': {'type': 'object'},
+            'output_schema': {'type': 'object'},
+        }
+        spec_kwargs[schema_name] = {'type': 'array', 'uniqueItems': True}
+        monkeypatch.setattr(
+            self.runtime.tools.execution,
+            '_extensions',
+            SimpleNamespace(get_tool_spec=lambda _tool_id: ToolSpec(**spec_kwargs)),
+        )
+        handle = ToolHandle(
+            tool_id='tool_persisted_unique_items',
+            name='persisted_unique_items',
+            capability_id=None,
+        )
+
+        with pytest.raises(ValueError, match='uniqueItems'):
+            if schema_name == 'input_schema':
+                self.runtime.tools.execution.validate_jit_arguments(handle, [])
+            else:
+                self.runtime.tools.execution.validate_jit_output(handle, [])
+
+    def test_jit_proposal_limits_schema_structure(self) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='bound schema structure')
+        too_deep: dict[str, Any] = {'type': 'number'}
+        for _ in range(40):
+            too_deep = {'type': 'array', 'items': too_deep}
+
+        with pytest.raises(ValidationError, match='maximum depth'):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': 'deep_schema',
+                    'description': 'Must reject deeply nested schemas.',
+                    'input_schema': too_deep,
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
+        too_wide = {
+            'type': 'object',
+            'properties': {
+                f'value_{index}': {'type': 'number'}
+                for index in range(600)
+            },
+        }
+        with pytest.raises(ValidationError, match='maximum node count'):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': 'wide_schema',
+                    'description': 'Must reject schemas with too many nodes.',
+                    'input_schema': too_wide,
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
+    @pytest.mark.parametrize('number', [float('nan'), float('inf'), float('-inf')])
+    def test_jit_proposal_rejects_non_finite_schema_numbers(
+        self,
+        number: float,
+    ) -> None:
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='reject non-finite schema')
+
+        with pytest.raises(ValidationError, match='finite JSON numbers'):
+            self.runtime.tools.propose(
+                pid,
+                {
+                    'name': 'non_finite_schema_number',
+                    'description': 'Must reject numbers outside JSON.',
+                    'input_schema': {'type': 'number', 'maximum': number},
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args, libos) { return {}; }',
+            )
+
+    def test_restricted_jit_schema_dialect_preserves_common_schemas(self) -> None:
+        self.runtime.tools.sandbox = NoLimitValidationSandbox()
+        pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='use safe schema')
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'safe_numeric_batch',
+                'description': 'Validate a bounded numeric batch.',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'mode': {'type': 'string', 'enum': ['fast', 'safe']},
+                        'values': {
+                            'type': 'array',
+                            'items': {
+                                'type': 'number',
+                                'minimum': -100,
+                                'maximum': 100,
+                            },
+                            'minItems': 1,
+                            'maxItems': 4,
+                        },
+                        'scale': {
+                            'type': 'number',
+                            'exclusiveMinimum': 0,
+                            'multipleOf': 0.5,
+                        },
+                    },
+                    'required': ['mode', 'values', 'scale'],
+                    'additionalProperties': False,
+                },
+                'output_schema': {
+                    'type': 'object',
+                    'properties': {'ok': {'type': 'boolean'}},
+                    'required': ['ok'],
+                    'additionalProperties': False,
+                },
+            },
+            source_code='export function run(args, libos) { return { ok: true }; }',
+        )
+        assert self.runtime.tools.validate(candidate).ok
+        self.runtime.tools.register(pid, candidate)
+
+        accepted = self.runtime.tools.call(
+            pid,
+            'safe_numeric_batch',
+            {'mode': 'safe', 'values': [1, 2.5], 'scale': 1.5},
+        )
+        rejected = self.runtime.tools.call(
+            pid,
+            'safe_numeric_batch',
+            {'mode': 'safe', 'values': [1], 'scale': 0},
+        )
+
+        assert accepted.ok
+        assert accepted.payload == {'ok': True}
+        assert not rejected.ok
+        assert rejected.error == 'JIT tool arguments failed Host schema validation.'
+
     @pytest.mark.real_deno
     def test_deno_jit_syscall_bypasses_tool_table_but_not_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -766,7 +1326,49 @@ class TestJitSecurity:
         self.runtime.tools.register(pid, candidate)
         result = self.runtime.tools.call(pid, 'read_denied', {'path': 'README.md'})
         assert not result.ok
-        assert 'lacks read' in (result.error or '')
+        error = result.payload['error']
+        assert error['code'] == 'execution_error'
+        assert error['type'] == 'CapabilityDenied'
+        assert result.error == error['safe_message']
+        assert re.fullmatch(
+            r'syscall_error: CapabilityDenied \(correlation_id=corr_[0-9a-f]+\)',
+            result.error or '',
+        )
+        assert re.fullmatch(r'[0-9a-f]{64}', error['error_hash'])
+
+        failed_events = [
+            event
+            for event in self.runtime.events.list(target=pid)
+            if event.payload.get('call_id') == result.call_id
+            and event.payload.get('error') is not None
+        ]
+        failed_tool_calls = [
+            record
+            for record in self.runtime.audit.trace(actor=pid)
+            if record.action == 'tool.call'
+            and record.decision.get('tool') == 'read_denied'
+            and record.decision.get('ok') is False
+        ]
+        assert len(failed_events) == 1
+        assert len(failed_tool_calls) == 1
+        for fingerprint in (
+            failed_events[0].payload['error'],
+            failed_tool_calls[0].decision['error'],
+        ):
+            assert re.fullmatch(
+                r'[0-9a-f]{64}',
+                fingerprint['exception_text']['sha256'],
+            )
+            assert fingerprint['exception_text']['bytes'] > 0
+
+        observed = dumps(
+            {
+                'result': result.payload,
+                'events': [event.payload for event in failed_events],
+                'audit': [record.decision for record in failed_tool_calls],
+            }
+        )
+        assert 'lacks read' not in observed
 
     def test_shell_syscall_rejects_non_list_argv_before_policy(self) -> None:
         pid = self.runtime.process.spawn(image='toolmaker-agent:v0', goal='bad shell argv')
@@ -1015,8 +1617,9 @@ class TestJitSecurity:
 
         assert not result.ok
         assert result.result_handle is None
-        assert result.error == 'JIT tool failed while applying deferred lifecycle.'
+        assert (result.error or '').startswith('lifecycle_error: CapabilityDenied')
         assert result.payload['policy_decision'] == 'lifecycle_error'
+        assert 'missing-image:v0' not in dumps(result.payload)
         assert [obj for obj in self.runtime.store.list_objects() if obj.type.value == 'tool_result'] == []
         tool_audits = [
             record
@@ -1025,6 +1628,13 @@ class TestJitSecurity:
         ]
         assert tool_audits[-1].decision['policy_decision'] == 'lifecycle_error'
         assert not any(record.decision.get('ok') is True for record in tool_audits)
+        process = self.runtime.process.get(pid)
+        assert process.image_id == 'toolmaker-agent:v0'
+        assert process.status == ProcessStatus.RUNNABLE
+        assert not any(
+            record.action == 'process.exec' and record.actor == pid
+            for record in self.runtime.audit.trace(actor=pid)
+        )
 
     @pytest.mark.real_deno
     def test_direct_deno_jit_call_validates_input_schema(self) -> None:
@@ -1052,9 +1662,9 @@ class TestJitSecurity:
         extra = self.runtime.tools.call(pid, 'strict_direct_count', {'text': 'abc', 'extra': True})
 
         assert not missing.ok
-        assert 'do not match input_schema' in (missing.error or '')
+        assert missing.error == 'JIT tool arguments failed Host schema validation.'
         assert not extra.ok
-        assert 'Additional properties are not allowed' in (extra.error or '')
+        assert extra.error == 'JIT tool arguments failed Host schema validation.'
         with pytest.raises(ValueError, match='do not match input_schema'):
             self.runtime.tools.normalize_model_action(pid, {'action': 'strict_direct_count'})
 
@@ -1082,7 +1692,7 @@ class TestJitSecurity:
 
         assert not result.ok
         assert result.result_handle is None
-        assert 'output_schema' in (result.error or '')
+        assert (result.error or '').startswith('execution_error: ValueError')
         assert [obj for obj in self.runtime.store.list_objects() if obj.type.value == 'tool_result'] == []
 
     def test_deno_static_check_is_format_and_dependency_lint_not_security_blacklist(self) -> None:
@@ -1597,6 +2207,19 @@ class TestJitSecurity:
         assert not jsr_import.ok
         assert any('imports are not allowed in JIT tool source: jsr:@std/path@1.0.0' in error for error in jsr_import.errors)
 
+    def test_deno_static_check_rejects_asi_dynamic_import_before_block(self) -> None:
+        checker = DenoTypescriptSandbox(deno_executable='deno')
+
+        validation = checker.static_check(
+            'export async function run(args, libos) {\n'
+            '  import("data:text/javascript,export default 7")\n'
+            '  { return { value: 7 }; }\n'
+            '}\n'
+        )
+
+        assert not validation.ok
+        assert 'dynamic import() is not allowed' in validation.errors
+
     def test_deno_static_check_rejects_runtime_code_generation_import_bypasses(self) -> None:
         checker = DenoTypescriptSandbox(deno_executable='deno')
         eval_import = checker.static_check('export async function run(args, libos) { return await eval("import(args.spec)"); }')
@@ -1680,7 +2303,10 @@ class TestJitSecurity:
         metadata = sandbox.metadata_for_source('export function run(args, libos) { return {}; }')
 
         assert 'deno_version_error' in metadata
-        assert 'forbidden root' in metadata['deno_version_error']
+        assert metadata['deno_version_error'].startswith(
+            'deno_version_error: SandboxError'
+        )
+        assert str(tmp_path) not in metadata['deno_version_error']
 
     @pytest.mark.real_deno
     def test_deno_candidate_tests_fail_when_expected_syscall_is_not_performed(self) -> None:
@@ -1710,6 +2336,13 @@ class TestJitSecurity:
                 {'name': 'huge_test', 'description': 'Huge test.', 'input_schema': {'type': 'object'}},
                 source_code='export function run(args, libos) { return {}; }',
                 tests=[{'args': {'blob': 'x' * self.runtime.config.tools.jit_test_case_max_bytes}}],
+            )
+        with pytest.raises(ValidationError, match='JIT test 1 must include expected'):
+            self.runtime.tools.propose(
+                pid,
+                {'name': 'missing_expected', 'description': 'Invalid test.', 'input_schema': {'type': 'object'}},
+                source_code='export function run(args, libos) { return {}; }',
+                tests=[{'args': {}}],
             )
 
     def test_jit_validation_fails_closed_without_budget_limit_support(self) -> None:
@@ -1760,7 +2393,10 @@ class TestJitSecurity:
             pid,
             {'name': 'per_case_budget', 'description': 'Metrics.', 'input_schema': {'type': 'object'}},
             source_code='export function run(args, libos) { return {}; }',
-            tests=[{'args': {'case': 1}}, {'args': {'case': 2}}],
+            tests=[
+                {'args': {'case': 1}, 'expected': {}},
+                {'args': {'case': 2}, 'expected': {}},
+            ],
         )
 
         with pytest.raises(ResourceLimitExceeded):
@@ -1768,6 +2404,112 @@ class TestJitSecurity:
 
         assert sandbox.calls == 1
         assert self.runtime.process.get(pid).resource_usage.subprocess_wall_seconds == pytest.approx(0.25)
+        persisted = self.runtime.store.get_tool_candidate(candidate)
+        assert persisted.status.value == 'rejected'
+        assert persisted.validation is not None
+        assert persisted.validation['ok'] is False
+        assert any(
+            record.action == 'tool.validate'
+            and record.target == f'tool_candidate:{candidate}'
+            for record in self.runtime.audit.trace()
+        )
+
+    @pytest.mark.parametrize(
+        ("error_type", "limit_kind"),
+        [
+            (SubprocessTimeoutExpired, "subprocess_timeout"),
+            (SubprocessLimitExceeded, "subprocess_memory_bytes"),
+        ],
+        ids=["timeout", "subprocess-limit"],
+    )
+    def test_jit_validation_timeout_persists_rejection_and_audit(
+        self,
+        error_type: type[BaseException],
+        limit_kind: str,
+    ) -> None:
+        self.runtime.tools.sandbox = InterruptingValidationSandbox(
+            error_type=error_type,
+            limit_kind=limit_kind,
+        )
+        pid = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='terminalize interrupted validation',
+        )
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'interrupted_validation',
+                'description': 'Validation interruption must be durable.',
+                'input_schema': {'type': 'object'},
+            },
+            source_code='export function run(args, libos) { return {}; }',
+            tests=[{'args': {}, 'expected': {}}],
+        )
+
+        with pytest.raises(error_type):
+            self.runtime.tools.validate(candidate)
+
+        persisted = self.runtime.store.get_tool_candidate(candidate)
+        assert persisted.status.value == 'rejected'
+        assert persisted.validation is not None
+        assert persisted.validation['ok'] is False
+        assert persisted.validation['metrics']['limit_kind'] == limit_kind
+        assert any(
+            record.action == 'tool.validate'
+            and record.target == f'tool_candidate:{candidate}'
+            for record in self.runtime.audit.trace()
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match='validation requires proposed status',
+        ):
+            self.runtime.tools.validate(candidate)
+
+    def test_jit_timeout_that_exhausts_cumulative_budget_is_not_retryable(
+        self,
+    ) -> None:
+        self.runtime.tools.sandbox = TimeoutExecutionSandbox(
+            metrics=CommandMetrics(
+                wall_seconds=0.75,
+                cpu_seconds=0.1,
+                peak_memory_bytes=1_024,
+                killed=True,
+                limit_kind='subprocess_timeout',
+            )
+        )
+        pid = self.runtime.process.spawn(
+            image='toolmaker-agent:v0',
+            goal='classify cumulative timeout overage',
+            resource_budget=ResourceBudget(max_subprocess_wall_seconds=0.5),
+        )
+        candidate = self.runtime.tools.propose(
+            pid,
+            {
+                'name': 'cumulative_timeout_overage',
+                'description': 'Timeout must become a terminal resource failure.',
+                'input_schema': {'type': 'object'},
+                'output_schema': {'type': 'object'},
+                'policy': {'sandbox_timeout_s': 1.0},
+            },
+            source_code='export function run(args, libos) { return {}; }',
+        )
+        assert self.runtime.tools.validate(candidate).ok
+        self.runtime.tools.register(pid, candidate)
+
+        result = self.runtime.tools.call(pid, 'cumulative_timeout_overage', {})
+
+        assert not result.ok
+        assert result.payload['error']['code'] == 'execution_error'
+        assert result.payload['error']['retryable'] is False
+        failed_events = [
+            event
+            for event in self.runtime.events.list(target=pid)
+            if event.payload.get('call_id') == result.call_id
+            and event.type.value == 'tool_failed'
+        ]
+        assert len(failed_events) == 1
+        assert failed_events[0].payload['policy_decision'] == 'resource_limit'
 
     def test_tool_events_and_audit_do_not_store_raw_sensitive_tool_args(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1847,17 +2589,100 @@ class TestJitSecurity:
         self.runtime.tools.register(pid, candidate)
 
         result = self.runtime.tools.call(pid, 'bad_secret_output', {})
+        action_feedback = _model_facing_error(result)
+        failed_events = [
+            event
+            for event in self.runtime.events.list(target=pid)
+            if event.payload.get('call_id') == result.call_id
+            and event.payload.get('error') is not None
+        ]
+        failed_audit = [
+            record
+            for record in self.runtime.audit.trace(actor=pid)
+            if record.action == 'tool.call'
+            and record.decision.get('tool') == 'bad_secret_output'
+            and record.decision.get('ok') is False
+        ]
         observed = dumps(
             {
+                'payload': result.payload,
+                'error': result.error,
+                'action_feedback': action_feedback,
                 'events': [event.payload for event in self.runtime.events.list(target=pid)],
                 'audit': [record.decision for record in self.runtime.audit.trace()],
             }
         )
 
         assert not result.ok
-        assert secret in (result.error or '')
+        assert (result.error or '').startswith('execution_error: ValueError')
+        assert action_feedback == result.error
+        assert len(failed_events) == 1
+        assert len(failed_audit) == 1
+        correlation_id = result.payload['error']['details']['correlation_id']
+        assert failed_events[0].payload['error']['correlation_id'] == correlation_id
+        assert failed_audit[0].decision['error']['correlation_id'] == correlation_id
+        assert failed_audit[0].correlation_id == correlation_id
+        assert secret not in dumps(result.payload)
+        assert secret not in (result.error or '')
         assert secret not in observed
         assert 'sha256' in observed
+
+    def test_jit_denial_mock_ignores_spec_authored_error_text(self) -> None:
+        secret = 'SECRET_JIT_DENIAL_MOCK_TEXT'
+        sandbox = DenoTypescriptSandbox(deno_executable='deno')
+        handler, assert_consumed = sandbox._test_syscall_handler(
+            {
+                'syscalls': [
+                    {
+                        'name': 'clock.now',
+                        'ok': False,
+                        'error': f'provider diagnostic contains {secret}',
+                    }
+                ]
+            },
+            7,
+        )
+
+        with pytest.raises(ProviderHostError) as raised:
+            asyncio.run(handler('clock.now', {}))
+
+        assert_consumed()
+        assert raised.value.code == 'syscall_error'
+        assert raised.value.error_type == 'SandboxError'
+        assert raised.value.correlation_id == 'corr_jit_test_7_1'
+        assert secret not in str(raised.value)
+
+    def test_jit_syscall_frame_never_returns_domain_exception_text(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        secret = 'SECRET_JIT_SYSCALL_DOMAIN_TEXT'
+        sandbox = DenoTypescriptSandbox(deno_executable='deno')
+        frames: list[dict[str, Any]] = []
+
+        async def record_frame(_proc: Any, frame: dict[str, Any]) -> None:
+            frames.append(frame)
+
+        async def deny(_name: str, _args: dict[str, Any]) -> None:
+            raise CapabilityDenied(f'domain denial contains {secret}')
+
+        monkeypatch.setattr(sandbox, '_write_frame', record_frame)
+        asyncio.run(
+            sandbox._handle_syscall_frame(
+                SimpleNamespace(),
+                {'id': 'frame-1', 'name': 'filesystem.read_text', 'args': {}},
+                deny,
+            )
+        )
+
+        assert len(frames) == 1
+        frame = frames[0]
+        assert frame['ok'] is False
+        assert frame['code'] == 'syscall_error'
+        assert frame['error_type'] == 'CapabilityDenied'
+        assert frame['correlation_id'].startswith('corr_')
+        assert frame['error'].startswith('syscall_error: CapabilityDenied')
+        assert secret not in dumps(frame)
 
     @pytest.mark.real_deno
     def test_real_deno_tool_runs_and_has_no_host_read_permission(self) -> None:
@@ -1938,14 +2763,16 @@ class TestJitSecurity:
         sandbox = DenoTypescriptSandbox(deno_executable='agent-libos-deno-definitely-missing')
         validation = sandbox.run_tests('export function run(args, libos) { return {}; }', [])
         assert not validation.ok
-        assert any(('Deno executable not found' in error for error in validation.errors))
+        assert len(validation.errors) == 1
+        assert validation.errors[0].startswith('deno_version_error: SandboxError')
+        assert 'agent-libos-deno-definitely-missing' not in validation.errors[0]
 
     @pytest.mark.real_deno
     def test_deno_validation_logs_are_bounded(self) -> None:
         sandbox = DenoTypescriptSandbox(deno_executable='deno', max_validation_log_chars=64)
         validation = sandbox.run_tests(
             'export function run(args, libos) { return { blob: "x".repeat(1000) }; }',
-            [{'args': {}}],
+            [{'args': {}, 'expected': {'blob': 'x' * 1000}}],
         )
 
         assert validation.ok
@@ -2087,6 +2914,85 @@ class PerCaseValidationSandbox(SandboxBackend):
                 "limit_kind": None,
             }
         return ValidationResult(ok=True, logs=f"case {self.calls}", metadata=metadata)
+
+
+class TimeoutExecutionSandbox(SandboxBackend):
+    def __init__(self, *, metrics: CommandMetrics) -> None:
+        self.metrics = metrics
+
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(
+        self,
+        source_code: str,
+        args: dict[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        raise SubprocessTimeoutExpired(
+            'Deno JIT tool timed out',
+            metrics=self.metrics,
+        )
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        metadata = {}
+        if return_metrics:
+            metadata['metrics'] = {
+                'wall_seconds': 0.0,
+                'cpu_seconds': 0.0,
+                'peak_memory_bytes': 0,
+                'killed': False,
+                'limit_kind': None,
+            }
+        return ValidationResult(ok=True, metadata=metadata)
+
+
+class InterruptingValidationSandbox(SandboxBackend):
+    def __init__(
+        self,
+        *,
+        error_type: type[BaseException],
+        limit_kind: str,
+    ) -> None:
+        self.error_type = error_type
+        self.limit_kind = limit_kind
+
+    def static_check(self, source_code: str) -> ValidationResult:
+        return ValidationResult(ok=True)
+
+    async def arun_source(
+        self,
+        source_code: str,
+        args: dict[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        return {}
+
+    def run_tests(
+        self,
+        source_code: str,
+        tests: list[dict[str, Any]],
+        timeout: float | None = None,
+        *,
+        limits: SubprocessLimits | None = None,
+        return_metrics: bool = False,
+    ) -> ValidationResult:
+        raise self.error_type(
+            'validation timed out',
+            metrics=CommandMetrics(
+                wall_seconds=0.1,
+                killed=True,
+                limit_kind=self.limit_kind,
+            ),
+        )
 
 
 class LeakyValidationSandbox(SandboxBackend):

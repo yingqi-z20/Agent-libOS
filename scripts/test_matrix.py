@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import os
 import signal
@@ -8,8 +9,10 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 LANE_PATHS = {
@@ -23,7 +26,8 @@ LANE_PATHS = {
 PYTHON_LANES = tuple(LANE_PATHS)
 # Standard lanes target five minutes on the bounded-parallel development
 # baseline. Keep a larger local default for serial diagnosis and host variance;
-# CI supplies its tighter 360-second regression deadline explicitly.
+# CI supplies explicit 360-second deadlines for most lanes and 480 seconds for
+# the larger runtime lane.
 DEFAULT_MAX_LANE_SECONDS = 600.0
 DEFAULT_WORKERS = "1"
 DEFAULT_PARALLEL_WORKER_CAP = 4
@@ -49,6 +53,7 @@ class Command:
     argv: list[str]
     env: dict[str, str] | None = None
     enforce_timeout: bool = True
+    invariant_test_paths: tuple[str, ...] | None = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -86,6 +91,18 @@ def main(argv: list[str] | None = None) -> int:
         help="report the N slowest pytest durations; use 0 to report all durations",
     )
     parser.add_argument(
+        "--shard-count",
+        type=_positive_integer,
+        default=1,
+        help="split one Python lane into this many deterministic file-weighted shards",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=_nonnegative_integer,
+        default=0,
+        help="zero-based shard to execute when --shard-count is greater than one",
+    )
+    parser.add_argument(
         "-n",
         "--workers",
         type=_worker_count,
@@ -106,10 +123,23 @@ def main(argv: list[str] | None = None) -> int:
     _validate_args(parser, args)
 
     commands = _commands_for(args)
-    for command in commands:
-        status = _run(command, max_seconds=args.max_lane_seconds)
-        if status != 0:
-            return status
+    with tempfile.TemporaryDirectory(prefix="agent-libos-invariant-receipts-") as receipt_dir:
+        for index, command in enumerate(commands):
+            receipt_path: Path | None = None
+            if _is_pytest_command(command):
+                receipt_path = Path(receipt_dir) / f"command-{index}.json"
+                command = _with_invariant_receipt(command, receipt_path)
+            status = _run(command, max_seconds=args.max_lane_seconds)
+            if status != 0:
+                return status
+            if receipt_path is not None:
+                status = _validate_invariant_receipt(
+                    receipt_path,
+                    lane=None if args.lane == "all" else args.lane,
+                    selected_test_paths=command.invariant_test_paths,
+                )
+                if status != 0:
+                    return status
     return 0
 
 
@@ -129,13 +159,62 @@ def _commands_for(args: argparse.Namespace) -> list[Command]:
                 env=_pytest_env(args),
             )
         ]
+    selected_paths = _sharded_lane_paths(
+        LANE_PATHS[args.lane],
+        shard_count=args.shard_count,
+        shard_index=args.shard_index,
+    )
+    shard_suffix = (
+        ""
+        if args.shard_count == 1
+        else f" shard {args.shard_index + 1}/{args.shard_count}"
+    )
     return [
         Command(
-            f"pytest {args.lane}{_worker_suffix(args)}",
-            _pytest_args(LANE_PATHS[args.lane], args),
+            f"pytest {args.lane}{shard_suffix}{_worker_suffix(args)}",
+            _pytest_args(selected_paths, args),
             env=_pytest_env(args),
+            invariant_test_paths=(
+                selected_paths if args.shard_count > 1 else None
+            ),
         )
     ]
+
+
+def _sharded_lane_paths(
+    paths: tuple[str, ...],
+    *,
+    shard_count: int,
+    shard_index: int,
+) -> tuple[str, ...]:
+    if shard_count == 1:
+        return paths
+    files = sorted(
+        {
+            candidate.relative_to(ROOT).as_posix()
+            for raw_path in paths
+            for candidate in (
+                sorted((ROOT / raw_path).rglob("test_*.py"))
+                if (ROOT / raw_path).is_dir()
+                else (ROOT / raw_path,)
+            )
+            if candidate.is_file()
+        }
+    )
+    if shard_count > len(files):
+        raise ValueError(
+            f"shard count {shard_count} exceeds the {len(files)} selected test files"
+        )
+    buckets: list[list[str]] = [[] for _ in range(shard_count)]
+    weights = [0 for _ in range(shard_count)]
+    weighted_files = sorted(
+        ((ROOT / path).stat().st_size, path) for path in files
+    )
+    for size, path in reversed(weighted_files):
+        selected = min(range(shard_count), key=lambda index: (weights[index], index))
+        buckets[selected].append(path)
+        weights[selected] += size
+    return tuple(sorted(buckets[shard_index]))
 
 
 def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
@@ -168,6 +247,21 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("pytest-xdist is required for --workers; run `uv sync --all-groups` first")
     if args.lane == "gui" and args.keep_agent_outputs:
         parser.error("--keep-agent-outputs only applies to pytest lanes")
+    if args.shard_index >= args.shard_count:
+        parser.error("--shard-index must be less than --shard-count")
+    if args.lane in {"gui", "all"} and (
+        args.shard_count != 1 or args.shard_index != 0
+    ):
+        parser.error("test sharding applies only to an individual Python lane")
+    if args.shard_count > 1:
+        try:
+            _sharded_lane_paths(
+                LANE_PATHS[args.lane],
+                shard_count=args.shard_count,
+                shard_index=args.shard_index,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
 
 
 def _resolve_defaults(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -233,23 +327,95 @@ def _pytest_env(args: argparse.Namespace) -> dict[str, str] | None:
     return env or None
 
 
+def _is_pytest_command(command: Command) -> bool:
+    return len(command.argv) >= 3 and command.argv[1:3] == ["-m", "pytest"]
+
+
+def _with_invariant_receipt(command: Command, path: Path) -> Command:
+    if not _is_pytest_command(command):
+        return command
+    argv = list(command.argv)
+    argv[3:3] = ["-p", "scripts.check_test_invariants"]
+    env = dict(command.env or {})
+    from scripts.check_test_invariants import INVARIANT_EXECUTION_RECEIPT_ENV
+
+    env[INVARIANT_EXECUTION_RECEIPT_ENV] = str(path)
+    return replace(command, argv=argv, env=env)
+
+
+def _validate_invariant_receipt(
+    path: Path,
+    *,
+    lane: str | None,
+    selected_test_paths: tuple[str, ...] | None = None,
+) -> int:
+    from scripts import check_test_invariants as checker
+
+    try:
+        executed = checker.load_execution_receipt(path)
+        manifest = checker._load_manifest(checker.MANIFEST)
+    except (OSError, ValueError) as exc:
+        print(f"invariant execution evidence failed: {exc}", file=sys.stderr)
+        return 1
+    errors: list[str] = []
+    checker._check_invariant_execution(
+        manifest,
+        executed,
+        errors,
+        lane=lane,
+        selected_test_paths=selected_test_paths,
+    )
+    if errors:
+        for error in errors:
+            print(f"invariant execution evidence failed: {error}", file=sys.stderr)
+        return 1
+    selected = lane or "all deterministic"
+    print(
+        f"==> validated non-skipped invariant execution evidence for {selected} "
+        f"({len(executed)} passed pytest nodes)",
+        flush=True,
+    )
+    return 0
+
+
 def _run(command: Command, *, max_seconds: float) -> int:
     print(f"==> {command.name}", flush=True)
     env = os.environ.copy()
     if command.env:
         env.update(command.env)
     started = time.perf_counter()
-    process = subprocess.Popen(command.argv, cwd=ROOT, env=env, **_process_group_options())
+    windows_job: Any | None = None
+    if os.name == "nt":
+        from agent_libos.substrate.local import WindowsJobObject
+
+        windows_job = WindowsJobObject.create()
+    try:
+        process = subprocess.Popen(
+            command.argv,
+            cwd=ROOT,
+            env=env,
+            **_process_group_options(),
+        )
+        if windows_job is not None:
+            windows_job.assign(process)
+    except BaseException:
+        if windows_job is not None:
+            windows_job.close()
+        raise
     try:
         returncode = process.wait(timeout=max_seconds if command.enforce_timeout else None)
     except subprocess.TimeoutExpired:
-        _terminate_process_tree(process)
+        _terminate_process_tree(process, windows_job=windows_job)
         elapsed = time.perf_counter() - started
         print(
             f"{command.name} timed out after {elapsed:.2f}s (limit {max_seconds:.2f}s); process tree terminated",
             file=sys.stderr,
         )
         return PROCESS_TIMEOUT_EXIT_CODE
+    # A successful root command is not sufficient release evidence when a test
+    # or build helper left descendants in the dedicated group.  Reuse the same
+    # bounded tree cleanup as the timeout path before reporting the root code.
+    _terminate_process_tree(process, windows_job=windows_job)
     elapsed = time.perf_counter() - started
     print(f"==> {command.name} finished in {elapsed:.2f}s", flush=True)
     return returncode
@@ -263,12 +429,29 @@ def _process_group_options() -> dict[str, object]:
     return {}
 
 
-def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
-    parent_exited = process.poll() is not None
-    if parent_exited and not (
-        os.name == "posix" and _posix_process_group_exists(process.pid)
-    ):
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    windows_job: Any | None = None,
+) -> None:
+    if windows_job is not None:
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE remains effective after the root
+        # command exits, unlike taskkill /T which can no longer discover an
+        # orphaned descendant from a dead parent PID.
+        windows_job.close()
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
         return
+    parent_exited = process.poll() is not None
+    if parent_exited:
+        if os.name == "posix" and not _posix_process_group_exists(process.pid):
+            return
+        if os.name not in {"posix", "nt"}:
+            return
     if os.name == "posix":
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -353,6 +536,13 @@ def _nonnegative_integer(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
     if selected < 0:
         raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return selected
+
+
+def _positive_integer(value: str) -> int:
+    selected = _nonnegative_integer(value)
+    if selected < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
     return selected
 
 

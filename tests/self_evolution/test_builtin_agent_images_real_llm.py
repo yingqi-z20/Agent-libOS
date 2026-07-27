@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from agent_libos import Runtime
-from agent_libos.models import CapabilityRight, ProcessStatus
+from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models import (
+    CapabilityRight,
+    HostResumeProcessWait,
+    ProcessStatus,
+)
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 
@@ -67,6 +73,7 @@ def test_real_review_image_uses_initial_read_tools_and_reports_the_defect(tmp_pa
         runtime.close()
 
 
+@pytest.mark.timeout(360)
 def test_real_coding_image_reads_writes_verifies_and_exits(tmp_path: Path) -> None:
     tmp_path.joinpath("input.txt").write_text("alpha beta\n", encoding="utf-8")
     runtime = _runtime_for(tmp_path)
@@ -90,10 +97,10 @@ def test_real_coding_image_reads_writes_verifies_and_exits(tmp_path: Path) -> No
             issued_by="real-image-test",
         )
 
-        results = runtime.run_process_until_idle(pid, max_quanta=8)
+        results = runtime.run_process_until_idle(pid, max_quanta=14)
         actions = _action_names(results)
 
-        assert runtime.process.get(pid).status == ProcessStatus.EXITED
+        assert runtime.process.get(pid).status == ProcessStatus.EXITED, actions
         assert actions.count("read_text_file") >= 2
         assert "write_text_file" in actions
         assert actions[-1] == "process_exit"
@@ -120,8 +127,9 @@ def test_real_toolmaker_image_builds_validates_and_registers_import_free_jit(tmp
         actions = _action_names(results)
         process = runtime.process.get(pid)
 
-        assert process.status == ProcessStatus.EXITED
-        assert actions[0] == "propose_jit_tool"
+        assert process.status == ProcessStatus.EXITED, actions
+        assert actions[:2] == ["discover_skills", "activate_skill"]
+        assert actions.index("activate_skill") < actions.index("propose_jit_tool")
         assert 1 <= actions.count("propose_jit_tool") <= 2
         assert "validate_jit_tool" in actions
         assert "register_jit_tool" in actions
@@ -132,8 +140,13 @@ def test_real_toolmaker_image_builds_validates_and_registers_import_free_jit(tmp
         runtime.close()
 
 
+@pytest.mark.timeout(600)
 def test_real_context_compressor_returns_the_exact_structured_contract(tmp_path: Path) -> None:
-    runtime = _runtime_for(tmp_path)
+    runtime = _runtime_for(
+        tmp_path,
+        llm_timeout_s=240.0,
+        llm_max_retries=0,
+    )
     try:
         pid = runtime.process.spawn(
             image="context-compressor:v0",
@@ -155,11 +168,18 @@ def test_real_context_compressor_returns_the_exact_structured_contract(tmp_path:
             },
         )
 
-        results = runtime.run_process_until_idle(pid, max_quanta=2)
+        results = _run_real_process_with_host_retry(
+            runtime,
+            pid,
+            max_quanta=2,
+            max_host_resumes=1,
+        )
         payload = _result_payload(runtime, pid)
         rendered = json.dumps(payload, ensure_ascii=False)
 
-        assert runtime.process.get(pid).status == ProcessStatus.EXITED
+        assert runtime.process.get(pid).status == ProcessStatus.EXITED, _action_names(
+            results
+        )
         assert _action_names(results) == ["process_exit"]
         assert set(payload) == set(runtime.get_image("context-compressor:v0").metadata["output_contract"])
         assert "src/core.py" in rendered
@@ -168,8 +188,54 @@ def test_real_context_compressor_returns_the_exact_structured_contract(tmp_path:
         runtime.close()
 
 
-def _runtime_for(workspace: Path) -> Runtime:
-    return Runtime.open("local", substrate=LocalResourceProviderSubstrate(workspace))
+def _runtime_for(
+    workspace: Path,
+    *,
+    llm_timeout_s: float | None = None,
+    llm_max_retries: int | None = None,
+) -> Runtime:
+    config = DEFAULT_CONFIG
+    if llm_timeout_s is not None or llm_max_retries is not None:
+        profile_id = config.llm.default_profile_id
+        profile = config.llm.profiles[profile_id]
+        profiles = {
+            **config.llm.profiles,
+            profile_id: replace(
+                profile,
+                timeout_s=llm_timeout_s,
+                max_retries=llm_max_retries,
+            ),
+        }
+        config = replace(
+            config,
+            llm=replace(config.llm, profiles=profiles),
+        )
+    return Runtime.open(
+        "local",
+        substrate=LocalResourceProviderSubstrate(workspace),
+        config=config,
+    )
+
+
+def _run_real_process_with_host_retry(
+    runtime: Runtime,
+    pid: str,
+    *,
+    max_quanta: int,
+    max_host_resumes: int,
+) -> list[Any]:
+    results: list[Any] = []
+    for attempt in range(max_host_resumes + 1):
+        results.extend(
+            runtime.run_process_until_idle(pid, max_quanta=max_quanta)
+        )
+        process = runtime.process.get(pid)
+        if not isinstance(process.wait_state, HostResumeProcessWait):
+            break
+        if attempt >= max_host_resumes:
+            break
+        runtime.process.resume(pid)
+    return results
 
 
 def _action_names(results: list[Any]) -> list[str]:

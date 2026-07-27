@@ -22,7 +22,7 @@ class TestExternalBoundary:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='read a file')
         denied = self.runtime.tools.call(pid, 'read_text_file', {'path': path})
         assert not denied.ok
-        assert 'lacks read' in (denied.error or '')
+        assert (denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert 'primitive.filesystem.read_text' not in self._audit_actions()
         self.runtime.filesystem.grant_path(pid, path, [CapabilityRight.READ], issued_by='test')
         allowed = self.runtime.tools.call(pid, 'read_text_file', {'path': path})
@@ -63,7 +63,7 @@ class TestExternalBoundary:
         denied = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new', 'overwrite': False})
 
         assert not denied.ok
-        assert 'already exists' in (denied.error or '')
+        assert (denied.error or '').startswith('execution_error: ToolExecutionError')
         assert target.read_text(encoding='utf-8') == 'racer'
 
     def test_write_precondition_does_not_leak_existing_file_without_capability(self) -> None:
@@ -71,7 +71,7 @@ class TestExternalBoundary:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='probe existing file')
         denied = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new', 'overwrite': False})
         assert not denied.ok
-        assert 'lacks write' in (denied.error or '')
+        assert (denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert 'already exists' not in (denied.error or '')
         assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'existing'
 
@@ -80,7 +80,7 @@ class TestExternalBoundary:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='probe missing file')
         denied = self.runtime.tools.call(pid, 'delete_file', {'path': path})
         assert not denied.ok
-        assert 'lacks delete' in (denied.error or '')
+        assert (denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert 'does not exist' not in (denied.error or '')
 
     def test_human_output_tool_cannot_bypass_human_capability(self) -> None:
@@ -182,7 +182,7 @@ class TestExternalBoundary:
         result = self.runtime.tools.call(pid, 'human_output', {'message': 'not visible'})
 
         assert not result.ok
-        assert 'failed during execution' in (result.error or '')
+        assert (result.error or '').startswith('execution_error: RuntimeError')
         assert self.human_output == []
         assert self.runtime.human.list(pid)[0].status == HumanRequestStatus.CANCELLED
         assert self.runtime.store.get_capability(cap.cap_id).uses_remaining == 1
@@ -281,7 +281,23 @@ class TestExternalBoundary:
         effect = self.runtime.store.list_external_effects()[0]
         assert effect.provider_metadata['context']['channel'] == 'gui'
 
-    def test_human_output_rejects_empty_or_too_long_channel(self) -> None:
+    def test_human_output_exact_empty_channel_uses_configured_default(self) -> None:
+        pid = self.runtime.process.spawn(image='review-agent:v0', goal='default human channel')
+        self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
+
+        delivered = self.runtime.tools.call(
+            pid,
+            'human_output',
+            {'message': 'default channel', 'channel': ''},
+        )
+
+        assert delivered.ok, delivered.error
+        assert delivered.payload['channel'] == self.runtime.config.runtime.terminal_channel
+        assert self.human_output == ['default channel']
+        request = self.runtime.human.list(pid)[0]
+        assert request.payload['channel'] == self.runtime.config.runtime.terminal_channel
+
+    def test_human_output_rejects_whitespace_only_or_too_long_channel(self) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='bad human channel')
         self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
 
@@ -289,9 +305,9 @@ class TestExternalBoundary:
         too_long = self.runtime.tools.call(pid, 'human_output', {'message': 'long channel', 'channel': 'x' * 129})
 
         assert not empty.ok
-        assert 'human output channel must be non-empty' in (empty.error or '')
+        assert (empty.error or '').startswith('validation_error: ValidationError')
         assert not too_long.ok
-        assert 'human output channel is too long' in (too_long.error or '')
+        assert (too_long.error or '').startswith('validation_error: ValidationError')
         assert self.human_output == []
         assert self.runtime.human.list(pid) == []
 
@@ -329,7 +345,7 @@ class TestExternalBoundary:
         self.runtime.filesystem.grant_workspace(pid, [CapabilityRight.WRITE], issued_by='test')
         denied = self.runtime.tools.call(pid, 'write_text_file', {'path': '../outside.txt', 'content': 'denied'})
         assert not denied.ok
-        assert 'escapes filesystem adapter root' in (denied.error or '')
+        assert (denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert 'primitive.filesystem.write_text' not in self._audit_actions()
 
     def test_revoked_filesystem_capability_denies_write(self) -> None:

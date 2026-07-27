@@ -67,7 +67,13 @@ def skill_metadata_search_score(
     description: str,
     text: str | None,
 ) -> int | None:
-    """Score visible Skill metadata using source-independent query semantics."""
+    """Score visible Skill metadata using source-independent query semantics.
+
+    Multi-term intent queries may span more than one narrowly owned Skill (for
+    example, workspace reading and workspace editing).  Keep those useful
+    partial matches while requiring at least two matching terms, so one generic
+    word in a longer query does not turn into an unrelated catalog result.
+    """
 
     if not str(text or "").strip():
         return 0
@@ -87,7 +93,8 @@ def skill_metadata_search_score(
         if term_hits:
             matched_terms += 1
             weighted_hits += term_hits
-    if matched_terms != len(terms):
+    minimum_matches = 1 if len(terms) == 1 else 2
+    if matched_terms < minimum_matches:
         return None
 
     normalized_query = " ".join(terms)

@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from pytest import MonkeyPatch
 
 from scripts import check_test_invariants as checker
+from scripts import test_matrix
 
 
 class TestInvariantChecker:
@@ -36,6 +38,7 @@ benchmark_attack_classes:
 
     def test_invariant_nodes_must_exist_and_include_deterministic_regression(self) -> None:
         manifest = {
+            "schema_version": checker.MANIFEST_SCHEMA_VERSION,
             "invariants": [
                 {
                     "id": "real-only",
@@ -64,6 +67,426 @@ benchmark_attack_classes:
 
         assert any("real-only: requires at least one deterministic regression node" in error for error in errors)
         assert any("missing-node: pytest node not collected" in error for error in errors)
+
+    def test_default_deterministic_collection_matches_the_test_matrix(self) -> None:
+        args = SimpleNamespace(
+            workers="1",
+            dist="loadfile",
+            durations=None,
+            skip_real_deno=False,
+            run_real_llm=False,
+            run_mcp=False,
+        )
+
+        command = test_matrix._pytest_args(("tests",), args)
+
+        assert command[-2:] == [
+            "-m",
+            checker.DEFAULT_DETERMINISTIC_MARKER_EXPRESSION,
+        ]
+
+    def test_main_collects_the_default_matrix_marker_expression(
+        self,
+        monkeypatch: MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        collected_expressions: list[str | None] = []
+        monkeypatch.setattr(checker, "_load_manifest", lambda _path: {})
+        monkeypatch.setattr(
+            checker,
+            "_collect_pytest_nodeids",
+            lambda expression=None: collected_expressions.append(expression) or set(),
+        )
+        monkeypatch.setattr(
+            checker,
+            "_check_invariants",
+            lambda *_args, **_kwargs: (set(), {}),
+        )
+        monkeypatch.setattr(
+            checker,
+            "_check_benchmark_attack_classes",
+            lambda *_args: None,
+        )
+        monkeypatch.setattr(
+            checker,
+            "_check_documented_invariants",
+            lambda *_args: None,
+        )
+
+        status = checker.main(
+            [
+                "--manifest",
+                str(tmp_path / "manifest.yaml"),
+                "--documentation",
+                str(tmp_path / "invariants.md"),
+            ]
+        )
+
+        assert status == 0
+        assert collected_expressions == [
+            None,
+            checker.DEFAULT_DETERMINISTIC_MARKER_EXPRESSION,
+            (
+                checker.DEFAULT_DETERMINISTIC_MARKER_EXPRESSION
+                + " and platform_darwin"
+            ),
+            (
+                checker.DEFAULT_DETERMINISTIC_MARKER_EXPRESSION
+                + " and platform_linux"
+            ),
+        ]
+
+    def test_optional_only_nodes_do_not_satisfy_deterministic_evidence(self) -> None:
+        default_node = "tests/security/test_default.py::test_default"
+        postgres_node = "tests/runtime/test_postgres.py::test_postgres"
+        mcp_node = "tests/providers/test_mcp.py::test_mcp"
+        manifest = {
+            "schema_version": checker.MANIFEST_SCHEMA_VERSION,
+            "invariants": [
+                {
+                    "id": "postgres-only",
+                    "title": "PostgreSQL only",
+                    "lane": "runtime",
+                    "node_ids": [postgres_node],
+                    "benchmark_attack_classes": [],
+                },
+                {
+                    "id": "mcp-only",
+                    "title": "MCP only",
+                    "lane": "providers",
+                    "node_ids": [mcp_node],
+                    "benchmark_attack_classes": [],
+                },
+                {
+                    "id": "default-backed",
+                    "title": "Default backed",
+                    "lane": "security",
+                    "node_ids": [postgres_node, mcp_node, default_node],
+                    "benchmark_attack_classes": [],
+                },
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariants(
+            manifest,
+            collected={default_node, postgres_node, mcp_node},
+            deterministic_collected={default_node},
+            errors=errors,
+        )
+
+        assert errors == [
+            "postgres-only: requires at least one deterministic regression node",
+            "mcp-only: requires at least one deterministic regression node",
+        ]
+
+    def test_collected_but_skipped_node_does_not_satisfy_execution_evidence(self) -> None:
+        node = "tests/security/test_runtime.py::test_invariant"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "executed-invariant",
+                    "title": "Executed invariant",
+                    "lane": "security",
+                    "node_ids": [node],
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids=set(),
+            errors=errors,
+            lane="security",
+            platform="linux",
+        )
+
+        assert errors == [
+            "executed-invariant: no declared regression node completed without "
+            "skip in the security lane"
+        ]
+
+    def test_passing_node_satisfies_execution_evidence(self) -> None:
+        node = "tests/security/test_runtime.py::test_invariant"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "executed-invariant",
+                    "title": "Executed invariant",
+                    "lane": "security",
+                    "node_ids": [node],
+                    "required_platform_nodes": {"linux": [node]},
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids={node},
+            errors=errors,
+            lane="security",
+            platform="linux",
+        )
+
+        assert errors == []
+
+    def test_sharded_execution_checks_only_selected_test_files(self) -> None:
+        first = "tests/runtime/test_first.py::test_first"
+        second = "tests/runtime/test_second.py::test_second"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "sharded-invariant",
+                    "title": "Sharded invariant",
+                    "lane": "runtime",
+                    "node_ids": [first, second],
+                    "required_platform_nodes": {"linux": [first, second]},
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids={first},
+            errors=errors,
+            lane="runtime",
+            platform="linux",
+            selected_test_paths=("tests/runtime/test_first.py",),
+        )
+
+        assert errors == []
+
+    def test_platform_scoped_invariant_is_not_required_on_other_platform(
+        self,
+    ) -> None:
+        darwin_node = "tests/security/test_identity.py::test_darwin"
+        linux_node = "tests/security/test_identity.py::test_linux"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "platform-identity",
+                    "title": "Platform identity",
+                    "lane": "security",
+                    "node_ids": [darwin_node, linux_node],
+                    "required_platform_nodes": {
+                        "darwin": [darwin_node],
+                        "linux": [linux_node],
+                    },
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids=set(),
+            errors=errors,
+            lane="security",
+            platform="windows",
+        )
+
+        assert errors == []
+
+    def test_generic_invariant_node_remains_required_on_other_platform(
+        self,
+    ) -> None:
+        generic_node = "tests/security/test_identity.py::test_generic"
+        darwin_node = "tests/security/test_identity.py::test_darwin"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "mixed-platform-identity",
+                    "title": "Mixed platform identity",
+                    "lane": "security",
+                    "node_ids": [generic_node, darwin_node],
+                    "required_platform_nodes": {"darwin": [darwin_node]},
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids=set(),
+            errors=errors,
+            lane="security",
+            platform="windows",
+        )
+
+        assert errors == [
+            "mixed-platform-identity: no declared regression node completed "
+            "without skip in the security lane"
+        ]
+
+    def test_pytest_receipt_records_only_non_xfail_passing_calls(
+        self,
+        monkeypatch: MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        receipt = tmp_path / "receipt.json"
+        # This unit test invokes the live pytest plugin hooks directly.  Give
+        # it an isolated receipt set so its synthetic session start cannot
+        # erase nodes already recorded by the surrounding test-matrix run.
+        monkeypatch.setattr(checker, "_EXECUTED_NODEIDS", set())
+        monkeypatch.setenv(checker.INVARIANT_EXECUTION_RECEIPT_ENV, str(receipt))
+        session = SimpleNamespace(config=SimpleNamespace())
+        checker.pytest_sessionstart(session)
+
+        checker.pytest_runtest_logreport(
+            SimpleNamespace(
+                nodeid="tests/unit/test_ok.py::test_ok",
+                when="call",
+                passed=True,
+            )
+        )
+        checker.pytest_runtest_logreport(
+            SimpleNamespace(
+                nodeid="tests/unit/test_skip.py::test_skip",
+                when="call",
+                passed=False,
+            )
+        )
+        checker.pytest_runtest_logreport(
+            SimpleNamespace(
+                nodeid="tests/unit/test_xfail.py::test_xfail",
+                when="call",
+                passed=True,
+                wasxfail="known defect",
+            )
+        )
+        checker.pytest_sessionfinish(session, 0)
+
+        assert checker.load_execution_receipt(receipt) == {
+            "tests/unit/test_ok.py::test_ok"
+        }
+
+    @pytest.mark.parametrize("schema_version", [True, 1, "2", None])
+    def test_manifest_schema_version_must_be_exact(
+        self,
+        schema_version: object,
+    ) -> None:
+        node = "tests/security/test_default.py::test_default"
+        manifest = {
+            "schema_version": schema_version,
+            "invariants": [
+                {
+                    "id": "default-backed",
+                    "title": "Default backed",
+                    "lane": "security",
+                    "node_ids": [node],
+                    "benchmark_attack_classes": [],
+                }
+            ],
+        }
+        errors: list[str] = []
+
+        checker._check_invariants(
+            manifest,
+            collected={node},
+            deterministic_collected={node},
+            errors=errors,
+        )
+
+        assert errors == [
+            "manifest schema_version must be exact integer "
+            f"{checker.MANIFEST_SCHEMA_VERSION}, got {schema_version!r}"
+        ]
+
+    def test_required_platform_nodes_accept_exact_marker_collection(self) -> None:
+        node = "tests/security/test_platform.py::test_darwin"
+        manifest = {
+            "schema_version": checker.MANIFEST_SCHEMA_VERSION,
+            "invariants": [
+                {
+                    "id": "platform-backed",
+                    "title": "Platform backed",
+                    "lane": "security",
+                    "node_ids": [node],
+                    "required_platform_nodes": {"darwin": [node]},
+                    "benchmark_attack_classes": [],
+                }
+            ],
+        }
+        errors: list[str] = []
+
+        checker._check_invariants(
+            manifest,
+            collected={node},
+            deterministic_collected={node},
+            errors=errors,
+            platform_collected={"darwin": {node}, "linux": set()},
+        )
+
+        assert errors == []
+
+    @pytest.mark.parametrize(
+        ("required_platform_nodes", "node_ids", "platform_collected", "expected"),
+        [
+            pytest.param(
+                {"windows": ["tests/security/test_platform.py::test_default"]},
+                ["tests/security/test_platform.py::test_default"],
+                {},
+                "required platform must be one of",
+                id="unknown-platform",
+            ),
+            pytest.param(
+                {"darwin": []},
+                ["tests/security/test_platform.py::test_default"],
+                {"darwin": set()},
+                "must be a non-empty list",
+                id="empty-platform-nodes",
+            ),
+            pytest.param(
+                {"darwin": ["tests/security/test_platform.py::test_other"]},
+                ["tests/security/test_platform.py::test_default"],
+                {"darwin": {"tests/security/test_platform.py::test_other"}},
+                "is not declared in node_ids",
+                id="not-an-invariant-node",
+            ),
+            pytest.param(
+                {"darwin": ["tests/security/test_platform.py::test_default"]},
+                ["tests/security/test_platform.py::test_default"],
+                {"darwin": set()},
+                "is not deterministically collected with platform_darwin",
+                id="missing-platform-marker",
+            ),
+        ],
+    )
+    def test_required_platform_nodes_fail_closed(
+        self,
+        required_platform_nodes: dict[str, list[str]],
+        node_ids: list[str],
+        platform_collected: dict[str, set[str]],
+        expected: str,
+    ) -> None:
+        manifest = {
+            "schema_version": checker.MANIFEST_SCHEMA_VERSION,
+            "invariants": [
+                {
+                    "id": "platform-backed",
+                    "title": "Platform backed",
+                    "lane": "security",
+                    "node_ids": node_ids,
+                    "required_platform_nodes": required_platform_nodes,
+                    "benchmark_attack_classes": [],
+                }
+            ],
+        }
+        collected = set(node_ids)
+        errors: list[str] = []
+
+        checker._check_invariants(
+            manifest,
+            collected=collected,
+            deterministic_collected=collected,
+            errors=errors,
+            platform_collected=platform_collected,
+        )
+
+        assert any(expected in error for error in errors)
 
     def test_benchmark_attack_class_mapping_must_match_declarations_and_tasks(self, monkeypatch: MonkeyPatch) -> None:
         manifest = {

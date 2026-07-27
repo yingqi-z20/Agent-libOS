@@ -1,7 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, LibOSClient, parseSseFrame } from "./client";
+import {
+  ApiError,
+  capabilityInventoryMaxItems,
+  capabilityInventoryMaxPages,
+  LibOSClient,
+  objectTaskWaitDeadlineMarginMs,
+  objectTaskWaitDeadlineMs,
+  parseSseFrame
+} from "./client";
 
 afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -252,6 +262,26 @@ describe("LibOSClient", () => {
     );
   });
 
+  it("passes the discovered package hash through skill activation", async () => {
+    const fetchMock = mockFetch({});
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+    const packageSha256 = "b".repeat(64);
+
+    await client.activateSkill("reviewer/1", "pid_1", packageSha256, true, "pid_1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/skills/reviewer%2F1/activate",
+      expect.objectContaining({
+        body: JSON.stringify({
+          pid: "pid_1",
+          expected_package_sha256: packageSha256,
+          confirmed: true,
+          actor: "pid_1"
+        })
+      })
+    );
+  });
+
   it("does not add a content-type header to read-only GET requests", async () => {
     const fetchMock = mockFetch({ ok: true });
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
@@ -282,13 +312,185 @@ describe("LibOSClient", () => {
     await expect(request).rejects.toBeInstanceOf(ApiError);
     await expect(request).rejects.toMatchObject({ status: 403, message: "denied" });
   });
+
+  it("supports a per-call requestJson deadline", async () => {
+    vi.stubGlobal("fetch", vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    })));
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.requestJson("GET", "/api/snapshot", undefined, { timeoutMs: 5 })).rejects.toMatchObject({ name: "TimeoutError" });
+  });
+
+  it("keeps the default read deadline while leaving non-idempotent mutations unbounded", async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    vi.stubGlobal("fetch", vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+      const signal = init.signal as AbortSignal;
+      signals.push(signal);
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    })));
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    const readResult = client.requestJson("GET", "/api/snapshot").catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(signals[0].aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(readResult).resolves.toMatchObject({ name: "TimeoutError" });
+
+    const mutationAbort = new AbortController();
+    const mutationResult = client.requestJson(
+      "POST",
+      "/api/processes",
+      { goal: "slow mutation" },
+      { signal: mutationAbort.signal }
+    ).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(signals[1].aborted).toBe(false);
+    mutationAbort.abort(new DOMException("cancelled by caller", "AbortError"));
+    await expect(mutationResult).resolves.toMatchObject({ name: "AbortError" });
+  });
+
+  it("gives explicit object-task waits a transport margin without guessing active server config", async () => {
+    expect(objectTaskWaitDeadlineMs()).toBeNull();
+    expect(objectTaskWaitDeadlineMs(1.25)).toBe(1_250 + objectTaskWaitDeadlineMarginMs);
+    expect(objectTaskWaitDeadlineMs(300)).toBe(300_000 + objectTaskWaitDeadlineMarginMs);
+    expect(objectTaskWaitDeadlineMs(400)).toBe(400_000 + objectTaskWaitDeadlineMarginMs);
+    expect(() => objectTaskWaitDeadlineMs(-1)).toThrow(/finite non-negative/);
+
+    const fetchMock = mockFetch({ task_id: "task_1", status: "running" });
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+    await client.waitObjectTask("task_1", "pid_1", 400);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/object-tasks/task_1/wait",
+      expect.objectContaining({ body: JSON.stringify({ pid: "pid_1", timeout_s: 400 }) })
+    );
+  });
+
+  it("continues process audit pagination with the opaque before cursor", async () => {
+    const fetchMock = mockFetch([]);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.listProcessAudit("pid/1", 50, "audit_cursor");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/processes/pid%2F1/audit?limit=50&before=audit_cursor",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
+  it("omits the process-audit limit so the active server config selects the page size", async () => {
+    const fetchMock = mockFetch([]);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.listProcessAudit("pid/1", undefined, "audit_cursor");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/processes/pid%2F1/audit?before=audit_cursor",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
+  it("walks the paginated capability endpoint until the complete inventory is loaded", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        items: [capability("cap_1")],
+        next_after: "cap_1",
+        has_more: true
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        items: [capability("cap_2")],
+        next_after: null,
+        has_more: false
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.listCapabilities("pid/1")).resolves.toEqual([
+      capability("cap_1"),
+      capability("cap_2")
+    ]);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:1/api/capabilities?mode=page&subject=pid%2F1",
+      expect.objectContaining({ method: "GET" })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:1/api/capabilities?mode=page&subject=pid%2F1&after=cap_1",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
+  it("bounds capability inventory traversal by both page and item count", async () => {
+    const pageBoundClient = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+    let page = 0;
+    vi.spyOn(pageBoundClient, "listCapabilityPage").mockImplementation(async () => {
+      page += 1;
+      return { items: [capability(`cap_${page}`)], next_after: `cursor_${page}`, has_more: true };
+    });
+    await expect(pageBoundClient.listCapabilities("pid_1")).rejects.toThrow(
+      `exceeds ${capabilityInventoryMaxPages} pages`
+    );
+    expect(page).toBe(capabilityInventoryMaxPages);
+
+    const itemBoundClient = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+    vi.spyOn(itemBoundClient, "listCapabilityPage").mockResolvedValue({
+      items: Array.from({ length: capabilityInventoryMaxItems + 1 }, (_, index) => capability(`cap_${index}`)),
+      next_after: null,
+      has_more: false
+    });
+    await expect(itemBoundClient.listCapabilities("pid_1")).rejects.toThrow(
+      `exceeds ${capabilityInventoryMaxItems} items`
+    );
+  });
+
+  it("reconnects SSE from the last delivered id when the stream fails mid-read", async () => {
+    const controller = new AbortController();
+    let reads = 0;
+    const firstBody = new ReadableStream<Uint8Array>({
+      pull(streamController) {
+        if (reads++ === 0) {
+          streamController.enqueue(new TextEncoder().encode('id: 7\nevent: snapshot\ndata: {"snapshot":null}\n\n'));
+        } else {
+          streamController.error(new Error("connection reset"));
+        }
+      }
+    });
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      urls.push(url);
+      if (urls.length === 1) return { ok: true, status: 200, body: firstBody };
+      controller.abort();
+      throw new Error("aborted reconnect");
+    }));
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.stream(() => undefined, controller.signal);
+
+    expect(urls[1]).toContain("cursor=7");
+  });
 });
 
 function mockFetch(payload: unknown) {
-  const fetchMock = vi.fn().mockResolvedValue({
-    ok: true,
-    json: vi.fn().mockResolvedValue(payload)
-  });
+  const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
+}
+
+function jsonResponse(payload: unknown) {
+  return {
+    ok: true,
+    status: 200,
+    json: vi.fn().mockResolvedValue(payload)
+  };
+}
+
+function capability(capId: string) {
+  return {
+    cap_id: capId,
+    subject: "pid/1",
+    resource: `object:${capId}`,
+    rights: ["read"]
+  };
 }

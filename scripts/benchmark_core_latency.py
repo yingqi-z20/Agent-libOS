@@ -136,15 +136,35 @@ def _compare(
     max_median_ratio: float,
     max_p95_ratio: float,
 ) -> dict[str, Any]:
+    _require_finite_positive(max_median_ratio, "max_median_ratio")
+    _require_finite_positive(max_p95_ratio, "max_p95_ratio")
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     baseline_operations = baseline.get("operations", {})
+    if not isinstance(baseline_operations, dict):
+        raise ValueError("baseline operations must be an object")
     compared: dict[str, Any] = {}
     for name, current in operations.items():
         expected = baseline_operations.get(name)
         if not isinstance(expected, dict):
             raise ValueError(f"baseline is missing operation {name!r}")
-        median_ratio = current["median_ms"] / expected["median_ms"]
-        p95_ratio = current["p95_ms"] / expected["p95_ms"]
+        current_median = _require_finite_nonnegative(
+            current.get("median_ms"),
+            f"current {name!r} median_ms",
+        )
+        current_p95 = _require_finite_nonnegative(
+            current.get("p95_ms"),
+            f"current {name!r} p95_ms",
+        )
+        expected_median = _require_finite_positive(
+            expected.get("median_ms"),
+            f"baseline {name!r} median_ms",
+        )
+        expected_p95 = _require_finite_positive(
+            expected.get("p95_ms"),
+            f"baseline {name!r} p95_ms",
+        )
+        median_ratio = current_median / expected_median
+        p95_ratio = current_p95 / expected_p95
         compared[name] = {
             "median_ratio": median_ratio,
             "p95_ratio": p95_ratio,
@@ -159,6 +179,29 @@ def _compare(
         "operations": compared,
         "passed": all(item["passed"] for item in compared.values()),
     }
+
+
+def _require_finite_positive(value: object, field: str) -> float:
+    selected = _require_finite_number(value, field)
+    if selected <= 0:
+        raise ValueError(f"{field} must be positive")
+    return selected
+
+
+def _require_finite_nonnegative(value: object, field: str) -> float:
+    selected = _require_finite_number(value, field)
+    if selected < 0:
+        raise ValueError(f"{field} must be non-negative")
+    return selected
+
+
+def _require_finite_number(value: object, field: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number")
+    selected = float(value)
+    if not math.isfinite(selected):
+        raise ValueError(f"{field} must be a finite number")
+    return selected
 
 
 def main() -> int:

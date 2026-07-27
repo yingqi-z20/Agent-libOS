@@ -1,5 +1,5 @@
 from agent_libos.llm.action_parser import parse_json_action
-from agent_libos.llm.client import LLMClient, LLMCompletion, LLMError
+from agent_libos.llm.client import LLMClient, LLMCompletion, LLMError, LLMTransientError
 from agent_libos.llm.context_protocol import format_context_message
 from agent_libos.llm.context_memory import LLMContextMemory, context_object_name
 from agent_libos.llm.executor import LLMProcessExecutor
@@ -11,6 +11,7 @@ __all__ = [
     "LLMClient",
     "LLMCompletion",
     "LLMError",
+    "LLMTransientError",
     "LLMProcessExecutor",
     "LLMProfileRegistry",
     "ResolvedLLMProfile",

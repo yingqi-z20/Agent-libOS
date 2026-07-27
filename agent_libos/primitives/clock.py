@@ -213,7 +213,7 @@ class ClockPrimitive:
             return timezone.utc
         try:
             return ZoneInfo(tz)
-        except ZoneInfoNotFoundError as exc:
+        except (ZoneInfoNotFoundError, ValueError) as exc:
             if tz in self.FIXED_TIMEZONE_FALLBACKS:
                 return self.FIXED_TIMEZONE_FALLBACKS[tz]
             raise ValidationError(f"unknown timezone: {tz}") from exc

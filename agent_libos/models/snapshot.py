@@ -11,6 +11,11 @@ from dataclasses import dataclass, field
 import re
 from typing import Any, ClassVar, Mapping
 
+from agent_libos.models.capability import (
+    CapabilityEffect,
+    CapabilityRight,
+    CapabilityStatus,
+)
 from agent_libos.models.checkpoint import CHECKPOINT_SNAPSHOT_VERSION
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.models.process import ProcessStatus
@@ -19,6 +24,7 @@ from agent_libos.models.process_state import (
     process_wait_state_from_json,
     validate_process_state_fields,
 )
+from agent_libos.utils.serde import loads
 
 
 SNAPSHOT_SCHEMA_VERSION = CHECKPOINT_SNAPSHOT_VERSION
@@ -139,6 +145,262 @@ def _validate_process_rows(rows: tuple[dict[str, Any], ...]) -> None:
             ) from exc
 
 
+def _capability_field_error(
+    index: int,
+    field_name: str,
+    message: str,
+) -> ValidationError:
+    return ValidationError(
+        f"snapshot rows.capabilities[{index}].{field_name} {message}"
+    )
+
+
+def _capability_text(
+    row: Mapping[str, Any],
+    index: int,
+    field_name: str,
+    *,
+    nullable: bool = False,
+) -> str | None:
+    value = row[field_name]
+    if nullable and value is None:
+        return None
+    if type(value) is not str or not value.strip():
+        suffix = (
+            "must be null or a non-empty string"
+            if nullable
+            else "must be a non-empty string"
+        )
+        raise _capability_field_error(index, field_name, suffix)
+    return value
+
+
+def _capability_non_negative_integer(
+    row: Mapping[str, Any],
+    index: int,
+    field_name: str,
+    *,
+    nullable: bool = False,
+) -> int | None:
+    value = row[field_name]
+    if nullable and value is None:
+        return None
+    if type(value) is not int or value < 0:
+        suffix = (
+            "must be null or a non-negative integer"
+            if nullable
+            else "must be a non-negative integer"
+        )
+        raise _capability_field_error(index, field_name, suffix)
+    return value
+
+
+def _capability_json_container(
+    row: Mapping[str, Any],
+    index: int,
+    field_name: str,
+    container_type: type[list[Any]] | type[dict[str, Any]],
+) -> list[Any] | dict[str, Any]:
+    encoded = row[field_name]
+    if type(encoded) is not str:
+        raise _capability_field_error(
+            index,
+            field_name,
+            "must be canonical JSON text",
+        )
+    try:
+        decoded = loads(encoded)
+    except (TypeError, ValueError) as exc:
+        raise _capability_field_error(
+            index,
+            field_name,
+            "must be valid JSON text",
+        ) from exc
+    if type(decoded) is not container_type:
+        label = "a list" if container_type is list else "an object"
+        raise _capability_field_error(
+            index,
+            field_name,
+            f"must decode to {label}",
+        )
+    return decoded
+
+
+def _validate_capability_columns(
+    row: Any,
+    index: int,
+    expected_columns: frozenset[str],
+) -> None:
+    if not isinstance(row, Mapping):
+        raise ValidationError(
+            f"snapshot rows.capabilities[{index}] must be an object"
+        )
+    columns = frozenset(row)
+    if columns != expected_columns:
+        missing = expected_columns - columns
+        unknown = columns - expected_columns
+        raise ValidationError(
+            f"snapshot rows.capabilities[{index}] is not canonical; "
+            f"missing={sorted(missing)}, unknown={sorted(unknown)}"
+        )
+
+
+def _validate_capability_text_fields(
+    row: Mapping[str, Any],
+    index: int,
+) -> None:
+    for field_name in (
+        "cap_id",
+        "subject",
+        "resource",
+        "issued_by",
+        "issued_at",
+    ):
+        _capability_text(row, index, field_name)
+    for field_name in ("expires_at", "issuer_cap_id", "parent_cap_id"):
+        _capability_text(row, index, field_name, nullable=True)
+
+
+def _validate_capability_boolean_fields(
+    row: Mapping[str, Any],
+    index: int,
+) -> None:
+    for field_name in ("delegable", "revocable"):
+        if type(row[field_name]) is not bool:
+            raise _capability_field_error(
+                index,
+                field_name,
+                "must be a boolean",
+            )
+
+
+def _validate_capability_delegation_fields(
+    row: Mapping[str, Any],
+    index: int,
+) -> None:
+    delegation_depth = _capability_non_negative_integer(
+        row,
+        index,
+        "delegation_depth",
+    )
+    max_delegation_depth = _capability_non_negative_integer(
+        row,
+        index,
+        "max_delegation_depth",
+        nullable=True,
+    )
+    _capability_non_negative_integer(
+        row,
+        index,
+        "uses_remaining",
+        nullable=True,
+    )
+    if (
+        max_delegation_depth is not None
+        and delegation_depth is not None
+        and max_delegation_depth < delegation_depth
+    ):
+        raise _capability_field_error(
+            index,
+            "max_delegation_depth",
+            "must not be less than delegation_depth",
+        )
+
+
+def _validate_capability_rights(
+    row: Mapping[str, Any],
+    index: int,
+) -> None:
+    rights = _capability_json_container(
+        row,
+        index,
+        "rights_json",
+        list,
+    )
+    if not rights:
+        raise _capability_field_error(
+            index,
+            "rights_json",
+            "must contain at least one right",
+        )
+    if any(type(right) is not str for right in rights):
+        raise _capability_field_error(
+            index,
+            "rights_json",
+            "must contain only strings",
+        )
+    try:
+        canonical_rights = [CapabilityRight(right).value for right in rights]
+    except ValueError as exc:
+        raise _capability_field_error(
+            index,
+            "rights_json",
+            "contains an unknown capability right",
+        ) from exc
+    if len(canonical_rights) != len(set(canonical_rights)):
+        raise _capability_field_error(
+            index,
+            "rights_json",
+            "must not contain duplicates",
+        )
+
+
+def _validate_capability_enum(
+    row: Mapping[str, Any],
+    index: int,
+    field_name: str,
+    enum_type: type[CapabilityEffect] | type[CapabilityStatus],
+) -> None:
+    value = row[field_name]
+    if type(value) is not str:
+        raise _capability_field_error(index, field_name, "must be a string")
+    try:
+        enum_type(value)
+    except ValueError as exc:
+        raise _capability_field_error(
+            index,
+            field_name,
+            f"must be a recognized capability {field_name}",
+        ) from exc
+
+
+def _validate_capability_lease_state(
+    row: Mapping[str, Any],
+    index: int,
+) -> None:
+    uses_remaining = row["uses_remaining"]
+    if (
+        row["status"] == CapabilityStatus.ACTIVE.value
+        and uses_remaining is not None
+        and uses_remaining < 1
+    ):
+        # Finite-use settlement atomically changes an exhausted capability to
+        # a non-active status. Zero is valid retained history, never live
+        # authority, regardless of the capability effect.
+        raise _capability_field_error(
+            index,
+            "uses_remaining",
+            "active capability uses_remaining must be positive",
+        )
+
+
+def _validate_capability_rows(
+    rows: tuple[dict[str, Any], ...],
+    expected_columns: frozenset[str],
+) -> None:
+    for index, row in enumerate(rows):
+        _validate_capability_columns(row, index, expected_columns)
+        _validate_capability_text_fields(row, index)
+        _validate_capability_boolean_fields(row, index)
+        _validate_capability_delegation_fields(row, index)
+        _validate_capability_rights(row, index)
+        _capability_json_container(row, index, "constraints_json", dict)
+        _capability_json_container(row, index, "metadata_json", dict)
+        _validate_capability_enum(row, index, "effect", CapabilityEffect)
+        _validate_capability_enum(row, index, "status", CapabilityStatus)
+        _validate_capability_lease_state(row, index)
+
+
 @dataclass(frozen=True)
 class SnapshotHeader:
     schema_version: int
@@ -175,6 +437,11 @@ class SnapshotHeader:
 
 @dataclass(frozen=True)
 class SnapshotRows:
+    # ``process_terminal_cleanups`` is deliberately not checkpoint-scoped.
+    # Its owner/lease and completed phases describe Host work in one Runtime,
+    # not agent state that may be replayed under remapped process identities.
+    # Checkpoint restore/fork repositories atomically create a fresh pending
+    # cleanup intent whenever they publish a terminal target process.
     processes: tuple[dict[str, Any], ...] = ()
     object_namespaces: tuple[dict[str, Any], ...] = ()
     objects: tuple[dict[str, Any], ...] = ()
@@ -271,6 +538,12 @@ class SnapshotRows:
         ),
     }
 
+    def __post_init__(self) -> None:
+        _validate_capability_rows(
+            self.capabilities,
+            self.ROW_COLUMNS["capabilities"],
+        )
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "SnapshotRows":
         unknown = set(value) - set(cls.TABLES)
@@ -287,6 +560,36 @@ class SnapshotRows:
         }
         _validate_process_rows(selected["processes"])
         return cls(**selected)
+
+    @classmethod
+    def from_trusted_durable_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "SnapshotRows":
+        """Decode rows read directly from the trusted durable repository.
+
+        SQLite exposes BOOLEAN columns as integer ``0``/``1`` values. Only
+        this repository-only ingress may canonicalize those two exact integer
+        values; serialized snapshot documents must use ``from_mapping`` and
+        carry real JSON booleans.
+        """
+
+        selected = deepcopy(dict(value))
+        capability_rows = selected.get("capabilities")
+        if isinstance(capability_rows, list):
+            normalized_rows: list[Any] = []
+            for row in capability_rows:
+                if not isinstance(row, Mapping):
+                    normalized_rows.append(row)
+                    continue
+                item = dict(row)
+                for field_name in ("delegable", "revocable"):
+                    field_value = item.get(field_name)
+                    if type(field_value) is int and field_value in {0, 1}:
+                        item[field_name] = bool(field_value)
+                normalized_rows.append(item)
+            selected["capabilities"] = normalized_rows
+        return cls.from_mapping(selected)
 
     def to_mapping(
         self,

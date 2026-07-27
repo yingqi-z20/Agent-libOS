@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.prompt import recover_initial_goal_context
 from agent_libos.memory.data_labels import flow_context_parts, flow_context_value
-from agent_libos.models.exceptions import NotFound
+from agent_libos.models.exceptions import NotFound, ProcessTerminalCleanupRequired
 from agent_libos.skills.builtin_catalog import get_builtin_skill_catalog
 from agent_libos.models import (
     AgentProcess,
@@ -32,10 +32,39 @@ from agent_libos.models import (
     process_state_to_mapping,
 )
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+from agent_libos.tools.observability import json_size_bytes
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _CUMULATIVE_EXIT_REVIEW = "cumulative_review"
 _COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS = 32_000
+_COMPLETION_HINT_NEGATIONS = (
+    "avoid",
+    "do not",
+    "don't",
+    "forbid",
+    "must not",
+    "never",
+    "prohibit",
+    "without",
+)
+_COMPLETION_HINT_NEGATION_RESETS = (
+    " before ",
+    " fail to ",
+    " forget to ",
+    " omit ",
+    " skip ",
+    " unless ",
+    " until ",
+)
+_COMPLETION_TOOL_PHRASES = {
+    "human_output": (
+        "human-facing",
+        "human facing",
+        "user-facing",
+        "user facing",
+    ),
+}
+_COMPLETION_CONTROL_TOOLS = frozenset({"process_exit"})
 
 
 class CompletionAcceptanceCheck(BaseModel):
@@ -106,7 +135,11 @@ class ProcessExitArgs(BaseModel):
             "deliverables to verification evidence, blockers, and residual risks."
         ),
     )
-    result_oid: str | None = Field(default=None, description="Existing object id to use as process result.")
+    result_oid: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Existing non-empty object id to use as process result.",
+    )
     message: str | None = Field(
         default=None,
         description="Optional final message stored in a label-bearing result Object.",
@@ -146,13 +179,35 @@ class ProcessExitArgs(BaseModel):
         return _parse_json_container(value)
 
 
+class ProcessExitCleanupStatus(BaseModel):
+    state: str
+    failed_phase: str | None = None
+    attempt_count: int = 0
+    completed_phases: list[str] = Field(default_factory=list)
+    recovery: dict[str, Any]
+
+
+class ProcessExitTerminalError(BaseModel):
+    code: Literal["terminal_cleanup_required"] = "terminal_cleanup_required"
+    error_type: Literal["ProcessTerminalCleanupRequired"] = (
+        "ProcessTerminalCleanupRequired"
+    )
+    message: str
+    retryable_by_agent: bool = False
+
+
 class ProcessExitOutput(BaseModel):
     status: str
     result_oid: str | None = None
     completion_review: dict[str, Any] | None = None
+    terminal_committed: bool = False
+    cleanup: ProcessExitCleanupStatus | None = None
+    error: ProcessExitTerminalError | None = None
 
 
 class GetWorkingDirectoryArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     pass
 
 
@@ -161,6 +216,8 @@ class GetWorkingDirectoryOutput(BaseModel):
 
 
 class SetWorkingDirectoryArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     path: str = Field(description="Workspace-relative directory, resolved from the current process working directory.")
 
 
@@ -196,6 +253,47 @@ class ExecProcessOutput(BaseModel):
             "not the model-visible schema projection; activate the matching Skill before calling a hidden tool."
         )
     )
+
+
+class InheritedCapabilitySpec(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    resource: str = Field(
+        min_length=1,
+        description="Exact canonical capability resource to delegate.",
+    )
+    rights: list[str] = Field(
+        min_length=1,
+        description="Required nonempty list of known capability rights.",
+    )
+    constraints: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional exact JSON-object delegation constraints.",
+    )
+
+    @field_validator("resource", mode="before")
+    @classmethod
+    def validate_resource(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError("resource must be nonempty canonical text")
+        return value
+
+    @field_validator("rights", mode="before")
+    @classmethod
+    def validate_rights(cls, value: Any) -> Any:
+        if not isinstance(value, list) or not value:
+            raise ValueError("rights must be a nonempty list")
+        normalized: list[str] = []
+        for right in value:
+            if not isinstance(right, str) or not right or right != right.strip():
+                raise ValueError("rights must contain canonical strings")
+            try:
+                normalized.append(CapabilityRight(right).value)
+            except ValueError as exc:
+                raise ValueError(f"unknown capability right: {right}") from exc
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("rights must not contain duplicates")
+        return normalized
 
 
 class ForkChildProcessArgs(BaseModel):
@@ -242,7 +340,7 @@ class ForkChildProcessArgs(BaseModel):
         default_factory=list,
         description="Workspace-relative directories whose write capability should be inherited by the child.",
     )
-    inherit_capabilities: list[dict[str, Any]] = Field(
+    inherit_capabilities: list[InheritedCapabilitySpec] = Field(
         default_factory=list,
         description="Explicit capability specs to inherit, each with resource and rights.",
     )
@@ -264,6 +362,9 @@ class ForkChildProcessOutput(BaseModel):
     status: str
     goal_oid: str | None
     inherited_capabilities: list[dict[str, Any]]
+    selected_parent_root_oids: list[str]
+    memory_root_oids: list[str]
+    resource_budget: dict[str, Any]
     working_directory: str
 
 
@@ -288,7 +389,7 @@ class SpawnChildProcessArgs(BaseModel):
         default_factory=list,
         description="Workspace-relative directories whose write capability should be inherited by the child.",
     )
-    inherit_capabilities: list[dict[str, Any]] = Field(
+    inherit_capabilities: list[InheritedCapabilitySpec] = Field(
         default_factory=list,
         description="Explicit capability specs to inherit, each with resource and rights.",
     )
@@ -309,6 +410,9 @@ class SpawnChildProcessOutput(BaseModel):
     status: str
     goal_oid: str | None
     inherited_capabilities: list[dict[str, Any]]
+    selected_parent_root_oids: list[str]
+    memory_root_oids: list[str]
+    resource_budget: dict[str, Any]
     fresh_memory_view: bool
     working_directory: str
 
@@ -339,6 +443,8 @@ class ChildProcessInfo(BaseModel):
     status_message: str | None = None
     wait_state: dict[str, Any] | None = None
     outcome: dict[str, Any] | None = None
+    memory_root_oids: list[str]
+    resource_budget: dict[str, Any]
     state_generation: int
 
 
@@ -377,6 +483,10 @@ class MergeChildMemoryOutput(BaseModel):
     child_pid: str
     merged_oids: list[str]
     skipped_oids: list[str]
+    adopted_oids: list[str]
+    released_oids: list[str]
+    retained_child_owned_oids: list[str]
+    pinned_child_owned_oids: list[str]
 
 
 class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
@@ -429,7 +539,7 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
         # Human message posting and process exit use this same Runtime store
         # lock. Keep review, freshness validation, and terminal commit inside
         # one critical section so a follow-up cannot land between them.
-        with runtime.store.locked():
+        with runtime.memory.ownership_locked(), runtime.store.locked():
             process = runtime.process.get(ctx.pid)
             review = _build_cumulative_exit_review(runtime, ctx.pid)
             validation_errors = _completion_evidence_errors(
@@ -521,16 +631,78 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
                     else None
                 ),
             }
-        result_handle = runtime.process.exit(
-            ctx.pid,
-            result=result_handle,
-            payload=generated_payload if result_handle is None else None,
-            source_oids=source_oids,
-            source_labels=source_labels,
-            source_context=source_context,
-        )
+        try:
+            result_handle = runtime.process.exit(
+                ctx.pid,
+                result=result_handle,
+                payload=generated_payload if result_handle is None else None,
+                source_oids=source_oids,
+                source_labels=source_labels,
+                source_context=source_context,
+            )
+        except ProcessTerminalCleanupRequired as exc:
+            committed = _committed_exit_cleanup_output(runtime, ctx.pid, exc)
+            if committed is None:
+                raise
+            return committed
         result_oid = result_handle.oid if result_handle is not None else None
-        return ProcessExitOutput(status="exited", result_oid=result_oid)
+        return ProcessExitOutput(
+            status="exited",
+            result_oid=result_oid,
+            terminal_committed=True,
+        )
+
+
+def _committed_exit_cleanup_output(
+    runtime: Any,
+    pid: str,
+    error: ProcessTerminalCleanupRequired,
+) -> ProcessExitOutput | None:
+    """Project a committed exit with incomplete cleanup as a safe tool success."""
+
+    process = runtime.process.get(pid)
+    if process.status.value != "exited" or not isinstance(
+        process.outcome,
+        ExitedProcessOutcome,
+    ):
+        return None
+    cleanup = runtime.process.terminal_cleanup_state(pid)
+    if cleanup["state"] == "completed":
+        return ProcessExitOutput(
+            status="exited",
+            result_oid=process.outcome.result_oid,
+            terminal_committed=True,
+        )
+    return ProcessExitOutput(
+        status="exited",
+        result_oid=process.outcome.result_oid,
+        terminal_committed=True,
+        cleanup=ProcessExitCleanupStatus(
+            state=str(cleanup["state"]),
+            failed_phase=str(cleanup.get("failed_phase") or error.phase),
+            attempt_count=int(cleanup.get("attempt_count") or error.attempt),
+            completed_phases=[
+                str(phase) for phase in cleanup.get("completed_phases") or []
+            ],
+            recovery={
+                "owner": "host",
+                "action": "retry_terminal_cleanup",
+                "idempotent": True,
+                "retry_process_exit": False,
+                "instruction": (
+                    "Stop: the terminal outcome and result are committed. "
+                    "Do not call process_exit again or replace the result; "
+                    "the Host must retry durable terminal cleanup."
+                ),
+            },
+        ),
+        error=ProcessExitTerminalError(
+            message=(
+                "The terminal outcome and result committed, but durable terminal "
+                "cleanup remains incomplete."
+            ),
+        ),
+    )
 
 
 def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
@@ -589,22 +761,12 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
         "acknowledged_human_message_count": len(acknowledged),
         "acknowledged_human_message_ids": acknowledged_message_ids,
         "acknowledged_human_messages_sha256": acknowledged_messages_sha256,
-        "acknowledged_human_message_reference": {
-            "kind": "process_message_ids",
-            "skill_discovery": {
-                "text": "process messages",
-                "limit": 5,
-            },
-            "tool": "read_process_messages",
-            "fixed_arguments": {
-                "include_acked": True,
-                "ack": False,
-            },
-            "copy_arguments": {
-                "message_ids": "acknowledged_human_message_ids",
-                "limit": "acknowledged_human_message_count",
-            },
-        },
+        "acknowledged_human_message_reference": (
+            _acknowledged_human_message_reference(
+                runtime,
+                acknowledged_message_ids,
+            )
+        ),
         "unread_human_message_ids": [message.message_id for message in unread],
         "observed_successful_tool_calls": observed_tools,
         "explicit_unobserved_tool_hints": _explicit_unobserved_tool_hints(
@@ -648,11 +810,107 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
                 "source_refs, and cite only successful tool calls actually observed."
             ),
             (
+                "Treat process_exit as terminal control flow, not as a deliverable, "
+                "acceptance requirement, evidence tool, or final-verification tool."
+            ),
+            (
                 "Send the final human-facing report only after this review is clear, "
                 "then retry process_exit with review_token and completion_evidence."
             ),
         ],
     }
+
+
+def _acknowledged_human_message_reference(
+    runtime: Any,
+    message_ids: list[str],
+) -> dict[str, Any]:
+    batches = _completion_message_id_batches(runtime, message_ids)
+    return {
+        "schema_version": 2,
+        "kind": "process_message_ids",
+        "skill_discovery": {
+            "text": "process messages",
+            "limit": 5,
+        },
+        "tool": "read_process_messages",
+        "batches": [
+            {
+                "batch_index": index,
+                "arguments": {
+                    "include_acked": True,
+                    "ack": False,
+                    "message_ids": batch,
+                    "limit": len(batch),
+                },
+            }
+            for index, batch in enumerate(batches)
+        ],
+        "continuation": {
+            "cursor": False,
+            "on_has_more": (
+                "Subtract returned message IDs from the current batch's "
+                "arguments.message_ids, then call the tool with only those "
+                "remaining IDs and limit equal to their count."
+            ),
+        },
+    }
+
+
+def _completion_message_id_batches(
+    runtime: Any,
+    message_ids: list[str],
+) -> list[list[str]]:
+    tools = runtime.config.tools
+    max_ids = min(
+        tools.message_filter_ids_hard_limit,
+        tools.message_read_hard_limit,
+        _TOOL_DEFAULTS.message_filter_ids_hard_limit,
+        _TOOL_DEFAULTS.message_read_hard_limit,
+    )
+    max_filter_bytes = tools.message_filter_json_max_bytes
+    batches: list[list[str]] = []
+    current: list[str] = []
+    for message_id in message_ids:
+        candidate = [*current, message_id]
+        if (
+            len(candidate) <= max_ids
+            and _message_id_filter_size(candidate) <= max_filter_bytes
+        ):
+            current = candidate
+            continue
+        if not current:
+            raise ToolExecutionError(
+                "Cumulative exit review cannot safely reference one human message "
+                "within the configured process-message filter bound.",
+                code=ToolErrorCode.VALIDATION_ERROR,
+            )
+        batches.append(current)
+        current = [message_id]
+        if _message_id_filter_size(current) > max_filter_bytes:
+            raise ToolExecutionError(
+                "Cumulative exit review cannot safely reference one human message "
+                "within the configured process-message filter bound.",
+                code=ToolErrorCode.VALIDATION_ERROR,
+            )
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _message_id_filter_size(message_ids: list[str]) -> int:
+    # Match MessageManager._filters exactly; limit/ack flags are not part of
+    # the mailbox filter JSON bound.
+    return json_size_bytes(
+        {
+            "kind": None,
+            "sender": None,
+            "channel": None,
+            "correlation_id": None,
+            "reply_to": None,
+            "message_ids": message_ids,
+        }
+    )
 
 
 def _completion_review_human_messages(
@@ -663,7 +921,6 @@ def _completion_review_human_messages(
         message
         for message in runtime.store.list_process_messages(pid)
         if message.sender.startswith("human:")
-        or message.payload.get("source") == "human_input"
     ]
     message_limit = runtime.config.tools.message_read_hard_limit
     if len(human_messages) > message_limit:
@@ -879,6 +1136,18 @@ def _completion_evidence_errors(
         return errors
     errors.extend(_completion_identity_errors(evidence_model, review=review))
     observed_tools = set(review["observed_successful_tool_calls"])
+    required_unobserved_tools = sorted(
+        {
+            str(hint["tool"])
+            for hint in review["explicit_unobserved_tool_hints"]
+            if isinstance(hint, dict) and isinstance(hint.get("tool"), str)
+        }
+    )
+    if required_unobserved_tools:
+        errors.append(
+            "explicit goal requirements still need successful tool calls: "
+            + ", ".join(required_unobserved_tools)
+        )
     expected_sources = {
         str(review["goal"]["oid"]),
         *[
@@ -970,27 +1239,71 @@ def _explicit_unobserved_tool_hints(
         ensure_ascii=False,
         sort_keys=True,
         default=str,
-    ).lower()
+    ).lower().replace("\\n", " ").replace("_", " ")
     observed = set(observed_tools)
     catalog = get_builtin_skill_catalog()
     hints: list[dict[str, str]] = []
     for tool_name in sorted(process.tool_table):
-        if tool_name in observed:
+        if tool_name in observed or tool_name in _COMPLETION_CONTROL_TOOLS:
             continue
-        phrase = tool_name.lower().replace("_", " ").replace(".", " ")
-        if len(phrase) < 5 or phrase not in searchable:
+        phrases = (
+            tool_name.lower().replace("_", " ").replace(".", " "),
+            *_COMPLETION_TOOL_PHRASES.get(tool_name, ()),
+        )
+        matched_phrase = next(
+            (
+                phrase
+                for phrase in phrases
+                if len(phrase) >= 5
+                and phrase in searchable
+                and _has_positive_tool_mention(searchable, phrase)
+            ),
+            None,
+        )
+        if matched_phrase is None:
             continue
         skill_id = catalog.skill_for_tool(tool_name)
         if skill_id is None:
+            continue
+        package = catalog.get(skill_id)
+        if package is None:
             continue
         hints.append(
             {
                 "tool": tool_name,
                 "activate_skill": skill_id,
-                "reason": f"The cumulative goal explicitly mentions '{phrase}'.",
+                "expected_package_sha256": package.package_sha256,
+                "reason": (
+                    "The cumulative goal explicitly requires "
+                    f"'{matched_phrase}', which needs '{tool_name}'."
+                ),
             }
         )
     return hints
+
+
+def _has_positive_tool_mention(searchable: str, phrase: str) -> bool:
+    offset = 0
+    while True:
+        index = searchable.find(phrase, offset)
+        if index < 0:
+            return False
+        prefix = searchable[:index]
+        boundary = max(prefix.rfind(marker) for marker in (".", "!", "?", ";"))
+        clause = prefix[boundary + 1 :]
+        negation_index = max(
+            (clause.rfind(marker) for marker in _COMPLETION_HINT_NEGATIONS),
+            default=-1,
+        )
+        if negation_index < 0:
+            return True
+        negated_tail = clause[negation_index:]
+        if any(
+            reset in negated_tail
+            for reset in _COMPLETION_HINT_NEGATION_RESETS
+        ):
+            return True
+        offset = index + len(phrase)
 
 
 def _bounded_json_value(value: Any, max_chars: int) -> Any:
@@ -1267,6 +1580,18 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
                 details={"mode": args.mode, "allowed": [mode.value for mode in ForkMode]},
             ) from exc
         roots = self._selected_roots(runtime, ctx.pid, args.root_oids)
+        selected_parent_root_oids = (
+            [handle.oid for handle in roots]
+            if roots is not None
+            else [
+                handle.oid
+                for handle in (
+                    parent.memory_view.roots
+                    if args.include_parent_roots and parent.memory_view is not None
+                    else []
+                )
+            ]
+        )
         view_spec = MemoryViewSpec(
             roots=roots,
             mode=_view_mode_for_fork(fork_mode),
@@ -1302,6 +1627,9 @@ class ForkChildProcessTool(SyncAgentTool[ForkChildProcessArgs]):
             status=child.status.value,
             goal_oid=child.goal_oid,
             inherited_capabilities=inherit_specs,
+            selected_parent_root_oids=list(dict.fromkeys(selected_parent_root_oids)),
+            memory_root_oids=_memory_root_oids(child),
+            resource_budget=_resource_budget_evidence(child.resource_budget),
             working_directory=child.working_directory,
         )
 
@@ -1391,6 +1719,9 @@ class SpawnChildProcessTool(SyncAgentTool[SpawnChildProcessArgs]):
             status=child.status.value,
             goal_oid=child.goal_oid,
             inherited_capabilities=inherit_specs,
+            selected_parent_root_oids=[],
+            memory_root_oids=_memory_root_oids(child),
+            resource_budget=_resource_budget_evidence(child.resource_budget),
             fresh_memory_view=True,
             working_directory=child.working_directory,
         )
@@ -1569,6 +1900,10 @@ class MergeChildMemoryTool(SyncAgentTool[MergeChildMemoryArgs]):
             child_pid=args.child_pid,
             merged_oids=result.merged_oids,
             skipped_oids=result.skipped_oids,
+            adopted_oids=result.adopted_oids,
+            released_oids=result.released_oids,
+            retained_child_owned_oids=result.retained_child_owned_oids,
+            pinned_child_owned_oids=result.pinned_child_owned_oids,
         )
 
 
@@ -1602,6 +1937,8 @@ def _child_info(child: AgentProcess) -> ChildProcessInfo:
         goal_oid=child.goal_oid,
         result_oid=result_oid,
         status_message=child.status_message,
+        memory_root_oids=_memory_root_oids(child),
+        resource_budget=_resource_budget_evidence(child.resource_budget),
         **process_state_to_mapping(
             child.status.value,
             child.wait_state,
@@ -1611,26 +1948,21 @@ def _child_info(child: AgentProcess) -> ChildProcessInfo:
     )
 
 
-def _normalize_capability_spec(spec: dict[str, Any]) -> dict[str, Any]:
-    resource = spec.get("resource")
-    if not isinstance(resource, str) or not resource:
-        raise ToolExecutionError(
-            "Inherited capability spec requires a non-empty resource.",
-            code=ToolErrorCode.VALIDATION_ERROR,
-            details={"spec": spec},
-        )
-    rights = spec.get("rights", [CapabilityRight.READ.value])
-    if not isinstance(rights, list) or not rights:
-        raise ToolExecutionError(
-            "Inherited capability spec requires a non-empty rights list.",
-            code=ToolErrorCode.VALIDATION_ERROR,
-            details={"spec": spec},
-        )
-    normalized: dict[str, Any] = {"resource": resource, "rights": [str(right) for right in rights]}
-    constraints = spec.get("constraints")
-    if isinstance(constraints, dict):
-        normalized["constraints"] = constraints
-    return normalized
+def _memory_root_oids(process: AgentProcess) -> list[str]:
+    if process.memory_view is None:
+        return []
+    return list(dict.fromkeys(handle.oid for handle in process.memory_view.roots))
+
+
+def _resource_budget_evidence(budget: ResourceBudget) -> dict[str, Any]:
+    return {
+        name: getattr(budget, name)
+        for name in ResourceBudget.__dataclass_fields__
+    }
+
+
+def _normalize_capability_spec(spec: InheritedCapabilitySpec) -> dict[str, Any]:
+    return spec.model_dump(mode="json", exclude_none=True)
 
 
 def _resource_budget_from_spec(spec: dict[str, Any] | None) -> ResourceBudget | None:
@@ -1658,8 +1990,26 @@ def _coalesce_capability_specs(specs: list[dict[str, Any]]) -> list[dict[str, An
     by_resource: dict[str, dict[str, Any]] = {}
     for spec in specs:
         resource = str(spec["resource"])
-        current = by_resource.setdefault(resource, {"resource": resource, "rights": []})
+        constraints = spec.get("constraints")
+        if resource in by_resource:
+            current_constraints = by_resource[resource].get("constraints")
+            if current_constraints != constraints:
+                raise ToolExecutionError(
+                    "Duplicate inherited capability resources require identical constraints.",
+                    code=ToolErrorCode.VALIDATION_ERROR,
+                    details={"resource": resource},
+                )
+        current = by_resource.setdefault(
+            resource,
+            {
+                "resource": resource,
+                "rights": [],
+                **(
+                    {"constraints": dict(constraints)}
+                    if isinstance(constraints, dict)
+                    else {}
+                ),
+            },
+        )
         current["rights"] = sorted(set(current["rights"]) | {str(right) for right in spec.get("rights", [])})
-        if isinstance(spec.get("constraints"), dict):
-            current["constraints"] = dict(spec["constraints"])
     return list(by_resource.values())

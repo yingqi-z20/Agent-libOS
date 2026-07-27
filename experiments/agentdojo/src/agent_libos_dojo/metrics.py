@@ -1,15 +1,38 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from statistics import fmean
 from typing import Any
 
 
+MAX_TOTAL_TOKENS_PER_ROW = 100_000_000
+MAX_DURATION_SECONDS_PER_ROW = 7 * 24 * 60 * 60
+MAX_COUNTER_VALUE_PER_ROW = 100_000_000
+
+_NONNEGATIVE_COUNTER_FIELDS = (
+    "logical_model_invocation_count",
+    "provider_call_count",
+    "tool_call_count",
+    "target_tool_name_call_count",
+    "repeated_identical_tool_call_count",
+    "max_identical_tool_call_multiplicity",
+    "executed_tool_call_count",
+    "successful_tool_call_count",
+    "failed_tool_call_count",
+    "unexecuted_tool_call_count",
+    "repeated_identical_failed_tool_call_count",
+    "max_identical_failed_tool_call_multiplicity",
+    "query_invocation_count",
+)
+
+
 def aggregate_results(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     """Aggregate AgentDojo outcomes without conflating attack success and safety."""
 
     selected = [dict(row) for row in rows]
+    validate_result_numerics(selected)
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in selected:
         groups[
@@ -117,6 +140,10 @@ def _aggregate_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ]
         aggregated.update(
             {
+                "logical_model_invocation_count": sum(
+                    _nonnegative_int(row.get("logical_model_invocation_count"))
+                    for row in valid
+                ),
                 "provider_call_count": sum(
                     _nonnegative_int(row.get("provider_call_count")) for row in valid
                 ),
@@ -290,16 +317,23 @@ def _total_tokens(row: Mapping[str, Any]) -> int:
     if not isinstance(usage, Mapping):
         return 0
     value = usage.get("total_tokens")
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    if value is None:
+        return 0
+    return _bounded_nonnegative_int(
+        value,
+        field="usage.total_tokens",
+        maximum=MAX_TOTAL_TOKENS_PER_ROW,
+    )
+
+
+def validated_total_tokens(row: Mapping[str, Any]) -> int:
+    """Return the bounded token total used by planning and aggregation."""
+
+    return _total_tokens(row)
 
 
 def _mean_numeric(rows: list[dict[str, Any]], key: str) -> float:
-    values = [
-        float(row[key])
-        for row in rows
-        if isinstance(row.get(key), (int, float))
-        and not isinstance(row.get(key), bool)
-    ]
+    values = [float(row[key]) for row in rows if row.get(key) is not None]
     return fmean(values) if values else 0.0
 
 
@@ -308,6 +342,57 @@ def _rate(numerator: int, denominator: int) -> float | None:
 
 
 def _nonnegative_int(value: Any) -> int:
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-        return value
-    return 0
+    if value is None:
+        return 0
+    return _bounded_nonnegative_int(
+        value,
+        field="metric counter",
+        maximum=MAX_COUNTER_VALUE_PER_ROW,
+    )
+
+
+def validate_result_numerics(rows: Iterable[Mapping[str, Any]]) -> None:
+    """Reject non-finite, negative, or implausibly large metric inputs."""
+
+    for index, row in enumerate(rows):
+        usage = row.get("usage")
+        if usage is not None and not isinstance(usage, Mapping):
+            raise ValueError(f"row {index} usage must be an object")
+        if isinstance(usage, Mapping) and usage.get("total_tokens") is not None:
+            _bounded_nonnegative_int(
+                usage.get("total_tokens"),
+                field=f"row {index} usage.total_tokens",
+                maximum=MAX_TOTAL_TOKENS_PER_ROW,
+            )
+        duration = row.get("duration_s")
+        if duration is not None:
+            if (
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(float(duration))
+                or float(duration) < 0.0
+                or float(duration) > MAX_DURATION_SECONDS_PER_ROW
+            ):
+                raise ValueError(
+                    f"row {index} duration_s must be finite and between 0 and "
+                    f"{MAX_DURATION_SECONDS_PER_ROW}"
+                )
+        for field in _NONNEGATIVE_COUNTER_FIELDS:
+            if field not in row:
+                continue
+            _bounded_nonnegative_int(
+                row[field],
+                field=f"row {index} {field}",
+                maximum=MAX_COUNTER_VALUE_PER_ROW,
+            )
+
+
+def _bounded_nonnegative_int(value: Any, *, field: str, maximum: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > maximum
+    ):
+        raise ValueError(f"{field} must be an integer between 0 and {maximum}")
+    return value

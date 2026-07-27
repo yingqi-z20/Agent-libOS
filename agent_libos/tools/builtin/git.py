@@ -488,7 +488,7 @@ class GitLogTool(_GitReadTool):
 
 class GitShowTool(_GitReadTool):
     name = "git_show"
-    description = "Inspect one commit and its bounded, hardened patch."
+    description = "Inspect one commit with bounded, hardened root or per-parent patches."
     args_schema = GitShowArgs
     method_name = "show"
 

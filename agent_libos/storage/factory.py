@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, unquote, unquote_plus, urlsplit, urlunsplit
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import ValidationError
@@ -15,6 +15,56 @@ SQLITE_SCHEME = "sqlite"
 _LIBPQ_DSN_FIELD = re.compile(
     r"(?:^|\s)(?:dbname|host|hostaddr|options|password|port|service|sslmode|target_session_attrs|user)\s*=",
     re.IGNORECASE,
+)
+_SENSITIVE_QUERY_KEY_NAMES = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "auth",
+        "authorization",
+        "code",
+        "credential",
+        "credentials",
+        "key",
+        "pass",
+        "passfile",
+        "passwd",
+        "password",
+        "pwd",
+        "secret",
+        "sig",
+        "signature",
+        "sslkey",
+        "token",
+        "user",
+        "username",
+    }
+)
+_SENSITIVE_QUERY_KEY_SUFFIXES = (
+    "_api_key",
+    "_auth",
+    "_credential",
+    "_credentials",
+    "_key",
+    "_pass",
+    "_passwd",
+    "_password",
+    "_secret",
+    "_sig",
+    "_signature",
+    "_token",
+    "_user",
+    "_username",
+)
+_SENSITIVE_QUERY_KEY_COMPACT_SUFFIXES = (
+    "apikey",
+    "credential",
+    "credentials",
+    "passwd",
+    "password",
+    "secret",
+    "signature",
+    "token",
 )
 
 
@@ -77,13 +127,39 @@ def redact_store_target(target: str | Path) -> str:
     parsed = urlsplit(text)
     if parsed.scheme.lower() not in POSTGRES_SCHEMES or not parsed.netloc:
         return text
-    userinfo, sep, hostinfo = parsed.netloc.rpartition("@")
-    if not sep:
-        return text
-    user, colon, password = userinfo.partition(":")
-    if not colon or not password:
-        return text
-    return urlunsplit(SplitResult(parsed.scheme, f"{user}:***@{hostinfo}", parsed.path, parsed.query, parsed.fragment))
+    _userinfo, separator, hostinfo = parsed.netloc.rpartition("@")
+    netloc = f"***@{hostinfo}" if separator else parsed.netloc
+    return urlunsplit(
+        SplitResult(
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            _redact_sensitive_query(parsed.query),
+            "",
+        )
+    )
+
+
+def _redact_sensitive_query(query: str) -> str:
+    if not query:
+        return ""
+    fields = re.split(r"([&;])", query)
+    for index in range(0, len(fields), 2):
+        field = fields[index]
+        raw_key, separator, _raw_value = field.partition("=")
+        if _is_sensitive_query_key(raw_key):
+            fields[index] = f"{raw_key}{separator or '='}***"
+    return "".join(fields)
+
+
+def _is_sensitive_query_key(raw_key: str) -> bool:
+    decoded = unquote_plus(raw_key).strip().casefold()
+    normalized = re.sub(r"[^a-z0-9]+", "_", decoded).strip("_")
+    return (
+        normalized in _SENSITIVE_QUERY_KEY_NAMES
+        or normalized.endswith(_SENSITIVE_QUERY_KEY_SUFFIXES)
+        or normalized.endswith(_SENSITIVE_QUERY_KEY_COMPACT_SUFFIXES)
+    )
 
 
 def _selected_target(target: str | Path | None, config: AgentLibOSConfig) -> str | Path:

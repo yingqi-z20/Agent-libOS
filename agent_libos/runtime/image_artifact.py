@@ -35,7 +35,20 @@ class ImageArtifactLoader:
             raise NotFound(f"image artifact not found: {artifact_id}")
         artifact, metadata = found
         actual_kind = str(artifact.get("kind") or "")
-        if selected_kind and actual_kind != selected_kind:
+        persisted_id = str(metadata.get("artifact_id") or "")
+        persisted_kind = str(metadata.get("kind") or "")
+        if persisted_id != artifact_id:
+            raise RuntimeError(
+                f"image artifact id mismatch: {persisted_id} != {artifact_id}"
+            )
+        if persisted_kind != actual_kind:
+            raise RuntimeError(
+                "image artifact persisted kind mismatch: "
+                f"{persisted_kind} != {actual_kind}"
+            )
+        if selected_kind and (
+            actual_kind != selected_kind or persisted_kind != selected_kind
+        ):
             raise RuntimeError(
                 f"image artifact kind mismatch: {actual_kind} != {selected_kind}"
             )

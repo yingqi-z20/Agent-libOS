@@ -24,7 +24,7 @@ import {
   Star,
   X
 } from "lucide-react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   GuiConnection,
   HumanRequest,
@@ -37,15 +37,13 @@ import type {
   StreamConnectionStatus
 } from "../api/types";
 import { useI18n, type TranslationKey } from "../i18n";
-import { parseOptionalQuanta } from "../quanta";
-import type { CommandAccess, WorkspaceAccess } from "../taskAuthority";
 import { shortProcessId, taskDisplayLabel } from "../taskPresentation";
 import { deriveUserConversation, humanRequestPrompt, type UserConversationItem } from "../userConversation";
-import { HumanRequestCard } from "./HumanRequestCard";
+import { HumanRequestCard, type HumanResponseOutcome } from "./HumanRequestCard";
 import { ImageSelect } from "./ImageSelect";
 import { LanguageSwitch } from "./LanguageSwitch";
-import { LLMProfileSelect } from "./LLMProfileSelect";
 import { RatingPanel } from "./RatingPanel";
+import { UserTaskSettingsDialog, type TaskLaunchSettings } from "./UserTaskSettingsDialog";
 
 const MarkdownMessage = lazy(async () => {
   const module = await import("./MarkdownMessage");
@@ -68,40 +66,37 @@ const processStatusKeys: Partial<Record<string, TranslationKey>> = {
   killed: "process.status.killed"
 };
 
+const workspaceAccessTranslationKeys: Record<TaskLaunchSettings["workspaceAccess"], TranslationKey> = {
+  none: "taskAuthority.none",
+  read: "taskAuthority.read",
+  edit: "taskAuthority.edit",
+  manage: "taskAuthority.manage"
+};
+
 type UserPageProps = {
+  notices?: ReactNode;
   connection: GuiConnection | null;
   snapshot: RuntimeSnapshot | null;
   selectedPid: string | null;
   selectedProcess: RuntimeProcess | null;
   taskLabels: Readonly<Record<string, string>>;
-  maxQuanta: number | null;
+  taskSettings: TaskLaunchSettings;
+  quantaValid?: boolean;
   spawnGoal: string;
-  spawnImage: string;
-  spawnLlmProfile: string;
-  spawnWorkingDirectory: string;
-  spawnWorkspaceAccess: WorkspaceAccess;
-  spawnAllowGitRequests: boolean;
-  spawnCommandAccess: CommandAccess;
-  spawnContextMaintenance: boolean;
   message: string;
   images: ImageSummary[];
   llmProfiles: LLMProfileSummary[];
   onSelectPid(pid: string): void;
-  onMaxQuantaChange(value: number | null): void;
+  onMaxQuantaChange(value: string): void;
   onSpawnGoalChange(value: string): void;
   onSpawnImageChange(value: string): void;
-  onSpawnLlmProfileChange(value: string): void;
-  onSpawnWorkingDirectoryChange(value: string): void;
-  onSpawnWorkspaceAccessChange(value: WorkspaceAccess): void;
-  onSpawnAllowGitRequestsChange(value: boolean): void;
-  onSpawnCommandAccessChange(value: CommandAccess): void;
-  onSpawnContextMaintenanceChange(value: boolean): void;
+  onApplyTaskSettings(next: TaskLaunchSettings): void;
   onMessageChange(value: string): void;
   onSpawn(): void;
   onImportImage(): void;
   onCommitImage(request: { imageId: string; name: string; version: string; replace: boolean; checkpointId?: string }): void;
   onSend(kind: "message" | "interrupt"): void;
-  onRespond(request: HumanRequest, response: HumanResponseInput): Promise<boolean>;
+  onRespond(request: HumanRequest, response: HumanResponseInput): Promise<HumanResponseOutcome | boolean>;
   onRate(pid: string, score: number, comment: string): Promise<boolean>;
   onCreateLlmProfile(profile: LLMProfileInput): Promise<boolean>;
   onUpdateLlmProfile(profileId: string, profile: LLMProfileInput): Promise<boolean>;
@@ -118,20 +113,15 @@ type UserPageProps = {
 };
 
 export function UserPage({
+  notices,
   connection,
   snapshot,
   selectedPid,
   selectedProcess,
   taskLabels,
-  maxQuanta,
+  taskSettings,
+  quantaValid = true,
   spawnGoal,
-  spawnImage,
-  spawnLlmProfile,
-  spawnWorkingDirectory,
-  spawnWorkspaceAccess,
-  spawnAllowGitRequests,
-  spawnCommandAccess,
-  spawnContextMaintenance,
   message,
   images,
   llmProfiles,
@@ -139,12 +129,7 @@ export function UserPage({
   onMaxQuantaChange,
   onSpawnGoalChange,
   onSpawnImageChange,
-  onSpawnLlmProfileChange,
-  onSpawnWorkingDirectoryChange,
-  onSpawnWorkspaceAccessChange,
-  onSpawnAllowGitRequestsChange,
-  onSpawnCommandAccessChange,
-  onSpawnContextMaintenanceChange,
+  onApplyTaskSettings,
   onMessageChange,
   onSpawn,
   onImportImage,
@@ -170,10 +155,22 @@ export function UserPage({
   const [commitName, setCommitName] = useState("");
   const [commitVersion, setCommitVersion] = useState("v0");
   const [showNewTask, setShowNewTask] = useState(!selectedProcess);
+  const [taskSettingsOpen, setTaskSettingsOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const sidebarQuantaErrorId = useId();
+  const newTaskStatusId = useId();
   const conversation = useMemo(() => deriveUserConversation(snapshot, selectedPid), [snapshot, selectedPid]);
   const pendingRequests = conversation.filter((item): item is Extract<UserConversationItem, { role: "request" }> => item.role === "request");
+  const allPendingRequests = useMemo(
+    () => (snapshot?.human_requests ?? []).filter((request) => request.status === "pending"),
+    [snapshot?.human_requests]
+  );
+  const pendingRequestsByPid = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const request of allPendingRequests) counts.set(request.pid, (counts.get(request.pid) ?? 0) + 1);
+    return counts;
+  }, [allPendingRequests]);
   const schedulerRunning = Boolean(snapshot?.scheduler.running);
   const hasProcess = Boolean(selectedProcess);
   const processTerminal = Boolean(
@@ -183,6 +180,8 @@ export function UserPage({
   const commitReady = Boolean(hasProcess && commitImageId.trim() && commitName.trim() && commitVersion.trim());
   const conversationRef = useRef<HTMLElement>(null);
   const goalInputRef = useRef<HTMLTextAreaElement>(null);
+  const taskSettingsButtonRef = useRef<HTMLButtonElement>(null);
+  const workspaceRef = useRef<HTMLElement>(null);
   const followConversationRef = useRef(true);
   const processRunning = selectedProcess?.status === "running";
   const statusTone = selectedProcess ? processStatusTone(selectedProcess.status) : "idle";
@@ -193,10 +192,20 @@ export function UserPage({
     ? taskLabels[selectedProcess.pid]?.trim() || t("user.untitledTask")
     : t("user.workspaceLabel");
   const selectedStatusDetail = selectedProcess ? processStatusDetail(selectedProcess, t) : null;
+  const taskSettingsWorkspaceLabel = t(workspaceAccessTranslationKeys[taskSettings.workspaceAccess]);
+
+  function closeTaskSettings() {
+    setTaskSettingsOpen(false);
+    globalThis.queueMicrotask(() => taskSettingsButtonRef.current?.focus());
+  }
 
   useEffect(() => {
-    if (!selectedProcess) setShowNewTask(true);
-  }, [selectedProcess]);
+    setShowNewTask(!selectedProcess);
+  }, [selectedProcess?.pid]);
+
+  useEffect(() => {
+    if (!showTaskComposer) setTaskSettingsOpen(false);
+  }, [showTaskComposer]);
 
   useEffect(() => {
     const container = conversationRef.current;
@@ -213,6 +222,15 @@ export function UserPage({
     setShowNewTask(true);
     setMobileSidebarOpen(false);
     globalThis.requestAnimationFrame?.(() => goalInputRef.current?.focus());
+  }
+
+  function openNextPendingRequest() {
+    const next = allPendingRequests[0];
+    if (!next) return;
+    onSelectPid(next.pid);
+    setShowNewTask(false);
+    setMobileSidebarOpen(false);
+    globalThis.requestAnimationFrame?.(() => document.getElementById("user-pending-requests")?.focus());
   }
 
   function scrollConversationToLatest() {
@@ -251,18 +269,33 @@ export function UserPage({
               {t("connection.updated", { time: formatTime(lastUpdatedAt.toISOString()) })}
             </time>
           ) : null}
+          {allPendingRequests.length > 0 ? (
+            <button
+              type="button"
+              className="pendingInboxButton"
+              aria-label={`${t("user.pendingRequests")}: ${allPendingRequests.length}`}
+              title={t("user.pendingRequests")}
+              onClick={openNextPendingRequest}
+            >
+              <AlertTriangle size={14} aria-hidden="true" />
+              <span>{t("user.pendingRequests")}</span>
+              <strong>{allPendingRequests.length}</strong>
+            </button>
+          ) : null}
           <LanguageSwitch />
-          <button type="button" className="toolbarButton" disabled={busy} title={t("user.openDbTitle")} onClick={onOpenDb}>
-            <Database size={15} /><span>{t("user.openDb")}</span>
+          <button type="button" className="toolbarButton" disabled={busy} aria-label={t("user.openDbTitle")} title={t("user.openDbTitle")} onClick={onOpenDb}>
+            <Database size={15} aria-hidden="true" /><span>{t("user.openDb")}</span>
           </button>
           <button type="button" className="iconOnly softButton" disabled={busy} aria-label={t("user.refreshTitle")} title={t("user.refreshTitle")} onClick={onRefresh}>
             <RefreshCw size={15} />
           </button>
-          <button type="button" className="secondary toolbarButton" onClick={onShowOperator}>
-            <Settings size={15} /><span>{t("user.operatorConsole")}</span>
+          <button type="button" className="secondary toolbarButton" aria-label={t("user.operatorConsole")} title={t("user.operatorConsole")} onClick={onShowOperator}>
+            <Settings size={15} aria-hidden="true" /><span>{t("user.operatorConsole")}</span>
           </button>
         </div>
       </header>
+
+      {notices}
 
       <div className="userWorkspace">
         <button
@@ -300,10 +333,16 @@ export function UserPage({
             <select value={selectedPid ?? ""} disabled={busy} onChange={(event) => {
               onSelectPid(event.currentTarget.value);
               setMobileSidebarOpen(false);
+              if (globalThis.matchMedia?.("(max-width: 820px)").matches) {
+                globalThis.setTimeout(() => workspaceRef.current?.focus(), 0);
+              }
             }}>
               {(snapshot?.processes.length ?? 0) === 0 ? <option value="">{t("user.noProcess")}</option> : null}
               {(snapshot?.processes ?? []).map((process) => (
-                <option key={process.pid} value={process.pid}>{taskDisplayLabel(process, taskLabels)} · {processStatusLabel(process.status, t)}</option>
+                <option key={process.pid} value={process.pid}>
+                  {taskDisplayLabel(process, taskLabels)} · {processStatusLabel(process.status, t)}
+                  {pendingRequestsByPid.has(process.pid) ? ` · ⚠ ${pendingRequestsByPid.get(process.pid)}` : ""}
+                </option>
               ))}
             </select>
           </label>
@@ -338,18 +377,20 @@ export function UserPage({
                 <label className="quanta sidebarQuanta">
                   <span>{t("user.quanta")}</span>
                   <input
-                    type="number"
-                    min={1}
-                    step={1}
+                    type="text"
+                    inputMode="numeric"
                     disabled={busy}
-                    value={maxQuanta ?? ""}
+                    value={taskSettings.maxQuantaInput}
+                    aria-invalid={!quantaValid || undefined}
+                    aria-errormessage={!quantaValid ? sidebarQuantaErrorId : undefined}
                     placeholder={t("scheduler.unlimitedPlaceholder")}
-                    title={t("scheduler.unlimitedHint")}
-                    onChange={(event) => onMaxQuantaChange(parseOptionalQuanta(event.currentTarget.value))}
+                    title={quantaValid ? t("scheduler.unlimitedHint") : t("scheduler.invalidQuanta")}
+                    onChange={(event) => onMaxQuantaChange(event.currentTarget.value)}
                   />
+                  {!quantaValid ? <small id={sidebarQuantaErrorId} className="inlineError" role="alert">{t("scheduler.invalidQuanta")}</small> : null}
                 </label>
                 <div className="sidebarRunControls">
-                  <button type="button" className="primary" disabled={busy || schedulerRunning || processRunning || processTerminal} onClick={onRun}><Play size={15} />{t("user.run")}</button>
+                  <button type="button" className="primary" disabled={busy || !quantaValid || schedulerRunning || processRunning || processTerminal} onClick={onRun}><Play size={15} />{t("user.run")}</button>
                   <button type="button" disabled={busy || !processRunning} onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
                   <button type="button" className="dangerGhost" disabled={busy || processTerminal} onClick={onStop}><Square size={13} />{t("user.stop")}</button>
                 </div>
@@ -362,7 +403,7 @@ export function UserPage({
                 </summary>
                 <div className="sidebarDisclosureBody">
                   <p>{t("user.imageToolsHint")}</p>
-                  <ImageSelect images={images} value={spawnImage} disabled={busy} onChange={onSpawnImageChange} />
+                  <ImageSelect images={images} value={taskSettings.image} disabled={busy} onChange={onSpawnImageChange} />
                   <button type="button" className="fullWidthButton" disabled={busy} onClick={onImportImage}>{t("image.import")}</button>
                   <div className="sidebarImageForm">
                     <input disabled={busy} aria-label={t("image.commitIdPlaceholder")} value={commitImageId} onChange={(event) => setCommitImageId(event.currentTarget.value)} placeholder={t("image.commitIdPlaceholder")} />
@@ -409,7 +450,7 @@ export function UserPage({
           </div>
         </aside>
 
-        <section className={`userMainPanel ${showTaskComposer ? "taskComposerMode" : ""}`} id="primary-workspace" aria-label={showTaskComposer ? t("user.startTask") : t("user.conversation")}>
+        <section ref={workspaceRef} className={`userMainPanel ${showTaskComposer ? "taskComposerMode" : ""}`} id="primary-workspace" tabIndex={-1} aria-label={showTaskComposer ? t("user.startTask") : t("user.conversation")}>
           {showTaskComposer ? (
             <div className="newTaskCanvas">
               <header className="newTaskHero">
@@ -456,86 +497,71 @@ export function UserPage({
                   </div>
                 </div>
 
-                <details className="newTaskSettings">
-                  <summary>
-                    <span className="settingsSummaryIcon"><ShieldCheck size={16} /></span>
+                <section className="taskSettingsLauncher" aria-label={t("user.taskSettings")}>
+                  <div className="taskSettingsLauncherCopy">
+                    <span className="settingsSummaryIcon" aria-hidden="true"><ShieldCheck size={17} /></span>
                     <span><strong>{t("user.taskSettings")}</strong><small>{t("user.taskSettingsHint")}</small></span>
-                    <ChevronDown size={16} className="disclosureChevron" />
-                  </summary>
-                  <div className="newTaskSettingsGrid">
-                    <div className="settingsSpan">
-                      <ImageSelect images={images} value={spawnImage} disabled={busy} onChange={onSpawnImageChange} />
-                    </div>
-                    <div className="settingsSpan">
-                      <LLMProfileSelect
-                        profiles={llmProfiles}
-                        value={spawnLlmProfile}
-                        label={t("llmProfile.spawnLabel")}
-                        disabled={busy}
-                        onChange={onSpawnLlmProfileChange}
-                        onCreate={onCreateLlmProfile}
-                        onUpdate={onUpdateLlmProfile}
-                        onDelete={onDeleteLlmProfile}
-                      />
-                    </div>
-                    <label className="fieldStack settingsSpan">
-                      <span>{t("user.initialCwd")}</span>
-                      <input
-                        value={spawnWorkingDirectory}
-                        disabled={busy}
-                        onChange={(event) => onSpawnWorkingDirectoryChange(event.currentTarget.value)}
-                        placeholder={t("user.initialCwdPlaceholder")}
-                      />
-                    </label>
-                    <label className="taskAuthorityField">
-                      <span>{t("taskAuthority.workspaceAccess")}</span>
-                      <select
-                        value={spawnWorkspaceAccess}
-                        disabled={busy}
-                        onChange={(event) => onSpawnWorkspaceAccessChange(event.currentTarget.value as WorkspaceAccess)}
-                      >
-                        <option value="none">{t("taskAuthority.none")}</option>
-                        <option value="read">{t("taskAuthority.read")}</option>
-                        <option value="edit">{t("taskAuthority.edit")}</option>
-                        <option value="manage">{t("taskAuthority.manage")}</option>
-                      </select>
-                    </label>
-                    <label className="taskAuthorityToggle settingsToggle">
-                      <input
-                        type="checkbox"
-                        checked={spawnContextMaintenance}
-                        disabled={busy}
-                        onChange={(event) => onSpawnContextMaintenanceChange(event.currentTarget.checked)}
-                      />
-                      <span>{t("taskAuthority.contextMaintenance")}</span>
-                    </label>
-                    <label className="taskAuthorityToggle settingsToggle">
-                      <input
-                        type="checkbox"
-                        checked={spawnAllowGitRequests}
-                        disabled={busy}
-                        onChange={(event) => onSpawnAllowGitRequestsChange(event.currentTarget.checked)}
-                      />
-                      <span>{t("taskAuthority.git")}</span>
-                    </label>
-                    <label className="taskAuthorityField">
-                      <span>{t("taskAuthority.commandAccess")}</span>
-                      <select
-                        value={spawnCommandAccess}
-                        disabled={busy}
-                        onChange={(event) => onSpawnCommandAccessChange(event.currentTarget.value as CommandAccess)}
-                      >
-                        <option value="none">{t("taskAuthority.commandNone")}</option>
-                        <option value="reviewed">{t("taskAuthority.commandReviewed")}</option>
-                      </select>
-                    </label>
-                    <p className="taskAuthorityHint settingsSpan">{t("taskAuthority.hint")}</p>
                   </div>
-                </details>
+                  <div className="taskSettingsSummary">
+                    <div className="taskSettingsPrimarySummary">
+                      <span className="taskSettingsSummaryItem">
+                        <small>{t("user.taskSettingsImageSummary")}</small>
+                        <strong title={taskSettings.image}>{taskSettings.image}</strong>
+                      </span>
+                      <span className="taskSettingsSummaryItem">
+                        <small>{t("user.taskSettingsProfileSummary")}</small>
+                        <strong title={taskSettings.llmProfile || t("llmProfile.defaultOption")}>
+                          {taskSettings.llmProfile || t("llmProfile.defaultOption")}
+                        </strong>
+                      </span>
+                      <span className="taskSettingsSummaryItem">
+                        <small>{t("user.taskSettingsWorkspaceSummary")}</small>
+                        <strong title={taskSettingsWorkspaceLabel}>{taskSettingsWorkspaceLabel}</strong>
+                      </span>
+                    </div>
+                    <div className="taskSettingsBadges" aria-label={t("user.taskSettingsPermissions")}>
+                      {taskSettings.allowGitRequests ? <span className="taskSettingsBadge">{t("user.taskSettingsGitBadge")}</span> : null}
+                      {taskSettings.commandAccess === "reviewed" ? <span className="taskSettingsBadge">{t("user.taskSettingsCommandBadge")}</span> : null}
+                      {taskSettings.contextMaintenance ? <span className="taskSettingsBadge">{t("user.taskSettingsContextBadge")}</span> : null}
+                      {!taskSettings.allowGitRequests && taskSettings.commandAccess === "none" && !taskSettings.contextMaintenance
+                        ? <span className="taskSettingsBadge muted">{t("user.taskSettingsNoExtraPermissions")}</span>
+                        : null}
+                    </div>
+                  </div>
+                  <button
+                    ref={taskSettingsButtonRef}
+                    type="button"
+                    className="softButton"
+                    aria-haspopup="dialog"
+                    aria-expanded={taskSettingsOpen}
+                    disabled={busy}
+                    onClick={() => setTaskSettingsOpen(true)}
+                  >
+                    <Settings size={15} aria-hidden="true" />{t("user.taskSettingsEdit")}
+                  </button>
+                </section>
+
+                {taskSettingsOpen ? (
+                  <UserTaskSettingsDialog
+                    value={taskSettings}
+                    images={images}
+                    llmProfiles={llmProfiles}
+                    busy={busy}
+                    onApply={onApplyTaskSettings}
+                    onClose={closeTaskSettings}
+                    onCreateLlmProfile={onCreateLlmProfile}
+                    onUpdateLlmProfile={onUpdateLlmProfile}
+                    onDeleteLlmProfile={onDeleteLlmProfile}
+                  />
+                ) : null}
 
                 <footer className="newTaskActions">
-                  <span>{t("user.startTaskHint")} {t("user.startShortcut")}</span>
-                  <button type="button" className="primary startTaskButton" disabled={busy || !spawnGoal.trim()} onClick={onSpawn}>
+                  <span id={newTaskStatusId} className={!quantaValid ? "actionHintError" : undefined}>
+                    {quantaValid
+                      ? `${t("user.startTaskHint")} ${t("user.startShortcut")}`
+                      : t("scheduler.invalidQuanta")}
+                  </span>
+                  <button type="button" className="primary startTaskButton" aria-describedby={newTaskStatusId} disabled={busy || !quantaValid || !spawnGoal.trim()} onClick={onSpawn}>
                     {busy ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : <Play size={16} />}
                     {busy ? t("user.working") : t("user.start")}
                   </button>
@@ -558,7 +584,7 @@ export function UserPage({
               </header>
 
               {pendingRequests.length > 0 ? (
-                <section className="userPendingRequests" aria-label={t("user.pendingRequests")}>
+                <section id="user-pending-requests" className="userPendingRequests" aria-label={t("user.pendingRequests")} tabIndex={-1}>
                   <div className="pendingRequestsHeading"><AlertTriangle size={15} /><strong>{t("user.pendingRequests")}</strong><span>{pendingRequests.length}</span></div>
                   {pendingRequests.map(({ request }) => (
                     <HumanRequestCard className="userRequestCard" key={request.request_id} request={request} onRespond={onRespond} />
@@ -614,18 +640,18 @@ export function UserPage({
                     onKeyDown={(event) => {
                       if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                         event.preventDefault();
-                        if (message.trim()) onSend("message");
+                        if (quantaValid && message.trim()) onSend("message");
                       }
                     }}
                   />
                   <span id="composer-hint">{t("user.sendHint")}</span>
                 </div>
-                <button type="button" className="primary sendButton" disabled={busy || !hasProcess || !message.trim()} onClick={() => onSend("message")}>
+                <button type="button" className="primary sendButton" disabled={busy || !quantaValid || !hasProcess || !message.trim()} onClick={() => onSend("message")}>
                   <Send size={15} />{t("user.send")}
                 </button>
                 <button
                   type="button"
-                  disabled={busy || !hasProcess || !message.trim()}
+                  disabled={busy || !quantaValid || !hasProcess || !message.trim()}
                   className="iconOnly warning"
                   aria-label={t("user.interrupt")}
                   title={t("user.interrupt")}
@@ -725,8 +751,8 @@ function ConversationBubble({ item }: { item: UserConversationItem }) {
     <article className={`conversationBubble ${item.role}`}>
       <span className="bubbleRole">{item.role === "assistant" ? t("user.agent") : t("user.you")}</span>
       {item.role === "assistant" ? (
-        <Suspense fallback={<p>{item.text || (item.protected ? t("user.protectedOutput") : t("user.empty"))}</p>}>
-          <MarkdownMessage text={item.text} fallback={item.protected ? t("user.protectedOutput") : t("user.empty")} />
+        <Suspense fallback={<p>{item.protected ? t("user.protectedOutput") : item.text || t("user.empty")}</p>}>
+          <MarkdownMessage text={item.protected ? "" : item.text} fallback={item.protected ? t("user.protectedOutput") : t("user.empty")} />
         </Suspense>
       ) : (
         <p>{item.text || t("user.empty")}</p>

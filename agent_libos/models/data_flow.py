@@ -351,7 +351,7 @@ class SinkTrustSpec:
         _require_text("trust_id", self.trust_id)
         _require_text("created_by", self.created_by)
         _require_text("created_at", self.created_at)
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError(f"unsupported sink trust schema_version: {self.schema_version}")
         if isinstance(self.generation, bool) or not isinstance(self.generation, int) or self.generation < 1:
             raise ValueError("sink trust generation must be a positive integer")
@@ -449,7 +449,7 @@ class DataReleaseBinding:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError(f"unsupported data release binding schema_version: {self.schema_version}")
         DataSink(self.sink, self.sink_identity_sha256)
         for name in ("trust_id", "operation"):

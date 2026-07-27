@@ -1,18 +1,19 @@
 ---
 name: agent-libos-workspace-editing
-description: Write, create, replace, or delete ordinary workspace text files and directories with explicit mutation and verification semantics. Use after resolving cwd, target, and baseline; not for binary/Object transfer, Git metadata, range edits, or shell commands.
+description: Write, create, replace, or delete bounded ordinary workspace text files and directories with explicit mutation and verification semantics. Use after resolving cwd, target, baseline, and a viable fresh-read verification route; not for binary/Object transfer, Git metadata, range edits, or shell commands.
 allowed-tools: write_text_file write_directory delete_file delete_directory
 ---
 # Edit the workspace
 
-Generic filesystem mutations are whole-target operations. Establish the current cwd and target with workspace navigation before the first mutation, and verify resulting state afterward with a fresh read. Tool inputs are cwd-relative; returned paths are workspace-root-relative identities.
+Generic filesystem mutations are whole-target operations. Establish the current cwd and target with workspace navigation before the first mutation, and verify resulting state afterward with a fresh read. Tool inputs must be cwd-relative; absolute paths and unknown input fields are rejected. Returned paths are workspace-root-relative identities. Path separators follow the Host platform, so a POSIX backslash is preserved as an ordinary filename character rather than rewritten as `/`.
 
 ## Tool guide
 
 ### `write_text_file`
 
-- Input: cwd-relative `path`, complete string `content`, optional `encoding`, and `overwrite` (default `true`).
+- Input: cwd-relative `path`, complete string `content`, optional `encoding`, `overwrite` (default `true`), and optional `expected_content_sha256`. Pass the full-content digest returned by a complete `read_text_file` to replace only that exact version, or pass `"missing"` to create only while the target is absent.
 - It writes the entire encoded file, not a patch or range. Missing parent directories are created automatically. With `overwrite=false`, an existing file fails instead of being replaced; use that setting for creation when unexpected existence matters.
+- Conditional writes require a compare-and-swap-capable filesystem provider. A legacy provider still supports ordinary writes, but a request with `expected_content_sha256` fails before mutation when that capability is unavailable.
 - Output: root-relative `path`, encoded `bytes_written`, and `created`. `created=false` means an existing file was replaced; it does not mean no change. The result does not echo content or encoding, so verify both separately.
 
 ### `write_directory`
@@ -36,7 +37,7 @@ Generic filesystem mutations are whole-target operations. Establish the current 
 ## Recommended workflow
 
 1. Activate workspace navigation. Record cwd, root-relative target identity, current kind, relevant content/tree, and the user-approved scope. Preserve requested pre-change evidence before writing.
-2. For a new file, prefer `write_text_file` with `overwrite=false`. For replacement, compare the complete intended content against the current file, then call it with the intended encoding and explicit overwrite choice. Do not pass a diff fragment as `content`.
+2. For a new file, prefer `write_text_file` with `overwrite=false`. For replacement, compare the complete intended content against the current file, then call it with the intended encoding and explicit overwrite choice. Do not pass a diff fragment as `content`. Before dispatch, confirm that the resulting file can fit a complete fresh `read_text_file` result under both its read bound and the global result-persistence bound; otherwise use a bounded Object/file-transfer workflow with its own verification rather than this generic text-edit path.
 3. For directories, call `write_directory` with explicit `parents` and `exist_ok`. Avoid silently accepting an unexpected existing path.
 4. Before `delete_file` or `delete_directory`, re-observe the exact target immediately before deletion. Keep `missing_ok=false` unless idempotent cleanup explicitly accepts prior absence. Keep `recursive=false` unless the complete subtree and deletion scope were reviewed.
 5. After the last mutation, use a separately activated read tool: re-read written text with the same encoding, list a created/deleted directory's parent, and verify type and canonical path. In a Git worktree, use Git status/diff through the Git Skills to detect unintended tracked changes.
@@ -48,7 +49,7 @@ Generic filesystem mutations are whole-target operations. Establish the current 
 - Workspace containment and generic `.git` protection are enforced. A recursive delete is also rejected when protected Git metadata appears below the target. Do not bypass this with a broader ancestor, shell command, symlink, or alternate path; use the owning Git primitive.
 - `delete_directory` can never delete the workspace root, including with `recursive=true`. The default local provider refuses a symlink/junction as the requested target or traversal route and never follows descendant links during recursive deletion; a recursive delete does remove descendant symlink/junction directory entries themselves. It also refuses read, overwrite, or file deletion of a regular file with multiple hard-link names. These are hard stops, not prompts to broaden the target or retry through Shell.
 - A failed side-effecting call is not proof that nothing changed. Local filesystem mutations are not transactionally rolled back, and recursive deletion can remove earlier children before failing on a later child. On timeout, provider error, unknown settlement, or post-effect classification failure, inspect the exact target and parent before deciding whether any retry is safe.
-- The complete content is subject to the global tool-argument size limit before dispatch. A preflight size rejection performs no write; use the appropriate Object/file-transfer boundary rather than silently splitting one intended whole-file replacement.
+- The complete content is subject to the global tool-argument size limit before dispatch. The write argument limit can be larger than the read and result-persistence limits, so argument acceptance alone does not prove that the mandatory exact readback will fit. Establish a viable verification route before mutation. A preflight size rejection performs no write; use the appropriate Object/file-transfer boundary rather than silently splitting one intended whole-file replacement.
 - On exists/not-found/wrong-kind errors, observe state and correct the plan. Never recover automatically by enabling overwrite, `parents`, recursion, or `missing_ok`; each changes the accepted mutation scope.
 - `bytes_written` proves the accepted encoded byte count, not that another actor did not modify the file afterward. An earlier read, listing, diff, or checkpoint becomes stale after any later mutation.
 

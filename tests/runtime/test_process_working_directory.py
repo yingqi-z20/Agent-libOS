@@ -8,6 +8,7 @@ from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import CommandResult, LocalFilesystemProvider, LocalResourceProviderSubstrate
+from tests.support.public_errors import assert_public_error_message
 
 
 class CountingFilesystemProvider(LocalFilesystemProvider):
@@ -43,6 +44,228 @@ class RecordingShellProvider:
 
 class TestProcessWorkingDirectory:
 
+    def test_working_directory_tools_reject_unknown_fields_before_state_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / 'known').mkdir()
+            provider = CountingFilesystemProvider(root)
+            substrate = LocalResourceProviderSubstrate(root)
+            substrate.filesystem = provider
+            runtime = Runtime.open('local', substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='reject unknown cwd fields')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    'known',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                read = runtime.tools.call(
+                    pid,
+                    'get_working_directory',
+                    {'unexpected': True},
+                )
+                changed = runtime.tools.call(
+                    pid,
+                    'set_working_directory',
+                    {'path': 'known', 'unexpected': True},
+                )
+
+                assert not read.ok
+                assert read.error == 'Invalid arguments for tool `get_working_directory`.'
+                assert not changed.ok
+                assert changed.error == 'Invalid arguments for tool `set_working_directory`.'
+                assert provider.state_calls == []
+                assert runtime.process.working_directory(pid) == '.'
+            finally:
+                runtime.close()
+
+    @pytest.mark.skipif(os.name != 'posix', reason='POSIX path identities required')
+    @pytest.mark.parametrize(
+        ('identity', 'legacy_retarget'),
+        [
+            (r'decoy\..\secret', 'secret'),
+            (' directory with boundary spaces ', 'directory with boundary spaces'),
+        ],
+    )
+    def test_set_working_directory_preserves_provider_canonical_identity(
+        self,
+        identity: str,
+        legacy_retarget: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / identity).mkdir()
+            (root / legacy_retarget).mkdir()
+            shell = RecordingShellProvider()
+            substrate = LocalResourceProviderSubstrate(root)
+            substrate.shell = shell
+            runtime = Runtime.open('local', substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='preserve canonical cwd')
+                expected_resource = runtime.filesystem.directory_resource_for_path(identity)
+                capability = runtime.filesystem.grant_directory(
+                    pid,
+                    identity,
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                runtime.shell.grant_policy(pid, 'always_allow', issued_by='test')
+
+                changed = runtime.tools.call(pid, 'set_working_directory', {'path': identity})
+                shell_result = runtime.tools.call(
+                    pid,
+                    'run_shell_command',
+                    {'argv': ['echo', 'cwd']},
+                )
+
+                assert changed.ok, changed.error
+                assert changed.payload['working_directory'] == identity
+                assert runtime.process.working_directory(pid) == identity
+                assert capability.resource == expected_resource
+                state_effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                    if effect.provider == 'filesystem' and effect.operation == 'state'
+                ]
+                assert len(state_effects) == 1
+                assert state_effects[0].target == expected_resource
+                assert shell_result.ok, shell_result.error
+                assert shell.calls == [(['echo', 'cwd'], identity)]
+            finally:
+                runtime.close()
+
+    @pytest.mark.skipif(os.name != 'posix', reason='POSIX path identities required')
+    @pytest.mark.parametrize('tool_name', ['spawn_child_process', 'fork_child_process'])
+    @pytest.mark.parametrize(
+        ('identity', 'legacy_retarget'),
+        [
+            (r'decoy\..\secret', 'secret'),
+            (' child cwd ', 'child cwd'),
+        ],
+    )
+    def test_explicit_child_working_directory_preserves_provider_canonical_identity(
+        self,
+        tool_name: str,
+        identity: str,
+        legacy_retarget: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / identity).mkdir()
+            (root / legacy_retarget).mkdir()
+            runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
+            try:
+                parent = runtime.process.spawn(image='review-agent:v0', goal='canonical child cwd')
+                runtime.capability.grant(
+                    parent,
+                    'process:spawn',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+                expected_resource = runtime.filesystem.directory_resource_for_path(identity)
+                capability = runtime.filesystem.grant_directory(
+                    parent,
+                    identity,
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                launched = runtime.tools.call(
+                    parent,
+                    tool_name,
+                    {'goal': 'preserve cwd identity', 'working_directory': identity},
+                )
+
+                assert launched.ok, launched.error
+                child = runtime.process.get(launched.payload['child_pid'])
+                assert child.working_directory == identity
+                assert capability.resource == expected_resource
+                state_effects = [
+                    effect
+                    for effect in runtime.store.list_external_effects(pid=parent)
+                    if effect.provider == 'filesystem' and effect.operation == 'state'
+                ]
+                assert len(state_effects) == 1
+                assert state_effects[0].target == expected_resource
+            finally:
+                runtime.close()
+
+    def test_set_working_directory_rejects_contained_absolute_path_before_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / 'known').mkdir()
+            provider = CountingFilesystemProvider(root)
+            substrate = LocalResourceProviderSubstrate(root)
+            substrate.filesystem = provider
+            runtime = Runtime.open('local', substrate=substrate)
+            try:
+                pid = runtime.process.spawn(image='review-agent:v0', goal='reject absolute cwd')
+                runtime.filesystem.grant_directory(
+                    pid,
+                    'known',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                changed = runtime.tools.call(
+                    pid,
+                    'set_working_directory',
+                    {'path': str(root / 'known')},
+                )
+
+                assert not changed.ok
+                assert (changed.error or '').startswith('validation_error: ValidationError')
+                assert provider.state_calls == []
+                assert runtime.store.list_external_effects(pid=pid) == []
+                assert runtime.process.working_directory(pid) == '.'
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize('tool_name', ['spawn_child_process', 'fork_child_process'])
+    def test_explicit_child_working_directory_rejects_contained_absolute_path(
+        self,
+        tool_name: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / 'child-cwd').mkdir()
+            provider = CountingFilesystemProvider(root)
+            substrate = LocalResourceProviderSubstrate(root)
+            substrate.filesystem = provider
+            runtime = Runtime.open('local', substrate=substrate)
+            try:
+                parent = runtime.process.spawn(image='review-agent:v0', goal='reject absolute child cwd')
+                runtime.capability.grant(
+                    parent,
+                    'process:spawn',
+                    [CapabilityRight.WRITE],
+                    issued_by='test',
+                )
+                runtime.filesystem.grant_directory(
+                    parent,
+                    'child-cwd',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+
+                launched = runtime.tools.call(
+                    parent,
+                    tool_name,
+                    {
+                        'goal': 'reject absolute child cwd',
+                        'working_directory': str(root / 'child-cwd'),
+                    },
+                )
+
+                assert not launched.ok
+                assert (launched.error or '').startswith('validation_error: ValidationError')
+                assert provider.state_calls == []
+                assert runtime.process.list_children(parent) == []
+            finally:
+                runtime.close()
+
     def test_set_working_directory_requires_filesystem_read_before_state_probe(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -57,8 +280,20 @@ class TestProcessWorkingDirectory:
                 known = runtime.tools.call(pid, 'set_working_directory', {'path': 'known'})
                 missing = runtime.tools.call(pid, 'set_working_directory', {'path': 'missing'})
 
-                assert not known.ok and 'lacks read' in (known.error or '')
-                assert not missing.ok and 'lacks read' in (missing.error or '')
+                assert not known.ok
+                assert_public_error_message(
+                    known.error,
+                    code='permission_denied',
+                    error_type='CapabilityDenied',
+                    forbidden=('lacks read', 'known'),
+                )
+                assert not missing.ok
+                assert_public_error_message(
+                    missing.error,
+                    code='permission_denied',
+                    error_type='CapabilityDenied',
+                    forbidden=('lacks read', 'missing'),
+                )
                 assert provider.state_calls == []
                 assert runtime.store.list_external_effects(pid=pid) == []
                 assert runtime.process.working_directory(pid) == '.'
@@ -87,10 +322,20 @@ class TestProcessWorkingDirectory:
                 inside_denied = runtime.tools.call(pid, 'set_working_directory', {'path': 'inside-link'})
                 outside_denied = runtime.tools.call(pid, 'set_working_directory', {'path': 'outside-link'})
 
-                assert not inside_denied.ok and 'filesystem:workspace:inside-link/*' in (inside_denied.error or '')
-                assert not outside_denied.ok and 'filesystem:workspace:outside-link/*' in (outside_denied.error or '')
-                assert 'private-target' not in (inside_denied.error or '')
-                assert str(outside_target) not in (outside_denied.error or '')
+                assert not inside_denied.ok
+                assert_public_error_message(
+                    inside_denied.error,
+                    code='permission_denied',
+                    error_type='CapabilityDenied',
+                    forbidden=('inside-link', 'private-target'),
+                )
+                assert not outside_denied.ok
+                assert_public_error_message(
+                    outside_denied.error,
+                    code='permission_denied',
+                    error_type='CapabilityDenied',
+                    forbidden=('outside-link', str(outside_target)),
+                )
                 assert provider.state_calls == []
 
                 runtime.filesystem.grant_directory(pid, 'inside-link', [CapabilityRight.READ], issued_by='test')
@@ -99,9 +344,19 @@ class TestProcessWorkingDirectory:
                 outside_authorized = runtime.tools.call(pid, 'set_working_directory', {'path': 'outside-link'})
 
                 assert not inside_authorized.ok
-                assert 'symlink' in (inside_authorized.error or '').lower()
+                assert_public_error_message(
+                    inside_authorized.error,
+                    code='permission_denied',
+                    error_type='CapabilityDenied',
+                    forbidden=('symlink', 'private-target'),
+                )
                 assert not outside_authorized.ok
-                assert 'escapes filesystem adapter root' in (outside_authorized.error or '')
+                assert_public_error_message(
+                    outside_authorized.error,
+                    code='permission_denied',
+                    error_type='CapabilityDenied',
+                    forbidden=('escapes filesystem adapter root', str(outside_target)),
+                )
                 assert provider.state_calls == ['inside-link', 'outside-link']
                 assert runtime.process.working_directory(pid) == '.'
                 effects = runtime.store.list_external_effects(pid=pid)
@@ -134,8 +389,12 @@ class TestProcessWorkingDirectory:
                     {'goal': 'denied child', 'image': 'missing-image:v0', 'working_directory': 'child-cwd'},
                 )
                 assert not denied_spawn.ok
-                assert 'process:spawn' in (denied_spawn.error or '')
-                assert 'not found' not in (denied_spawn.error or '').lower()
+                assert_public_error_message(
+                    denied_spawn.error,
+                    code='permission_denied',
+                    error_type='CapabilityDenied',
+                    forbidden=('process:spawn', 'not found'),
+                )
                 assert provider.state_calls == []
 
                 runtime.capability.grant(parent, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
@@ -145,8 +404,12 @@ class TestProcessWorkingDirectory:
                     {'goal': 'denied image', 'image': 'missing-image:v0', 'working_directory': 'child-cwd'},
                 )
                 assert not denied_image.ok
-                assert 'image:missing-image:v0' in (denied_image.error or '')
-                assert 'not found' not in (denied_image.error or '').lower()
+                assert_public_error_message(
+                    denied_image.error,
+                    code='permission_denied',
+                    error_type='CapabilityDenied',
+                    forbidden=('image:missing-image:v0', 'not found'),
+                )
                 assert provider.state_calls == []
             finally:
                 runtime.close()
@@ -211,8 +474,8 @@ class TestProcessWorkingDirectory:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / 'pkg' / 'pkg').mkdir(parents=True)
-            (root / 'pkg' / 'module.py').write_text("print('outer')\n", encoding='utf-8')
-            (root / 'pkg' / 'pkg' / 'module.py').write_text("print('nested')\n", encoding='utf-8')
+            (root / 'pkg' / 'module.py').write_bytes(b"print('outer')\n")
+            (root / 'pkg' / 'pkg' / 'module.py').write_bytes(b"print('nested')\n")
             runtime = Runtime.open('local', substrate=LocalResourceProviderSubstrate(root))
             try:
                 pid = runtime.process.spawn(image='review-agent:v0', goal='preserve cwd-relative path')

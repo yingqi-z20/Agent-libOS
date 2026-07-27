@@ -108,10 +108,59 @@ class ModuleContext:
     _tool_names: list[str] = field(default_factory=list, init=False, repr=False)
     _tool_name_set: set[str] = field(default_factory=set, init=False, repr=False)
     _registered_tools: list[BaseAgentTool] = field(default_factory=list, init=False, repr=False)
+    _registered_images: list[AgentImage] = field(default_factory=list, init=False, repr=False)
+    _registered_syscalls: dict[str, SyscallHandler] = field(default_factory=dict, init=False, repr=False)
+    _registered_provider_hooks: dict[str, list[ProviderHook]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _registered_startup_hooks: dict[str, StartupHook] = field(default_factory=dict, init=False, repr=False)
+    _registered_durable_object_release_finalizers: dict[
+        str,
+        tuple[Callable[..., Any], Callable[..., None]],
+    ] = field(default_factory=dict, init=False, repr=False)
+    _tools_buffer: list[BaseAgentTool] = field(init=False, repr=False)
+    _images_buffer: list[AgentImage] = field(init=False, repr=False)
+    _syscalls_buffer: dict[str, SyscallHandler] = field(init=False, repr=False)
+    _provider_hooks_buffer: dict[str, list[ProviderHook]] = field(init=False, repr=False)
+    _provider_hook_buckets: dict[str, list[ProviderHook]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _startup_hooks_buffer: dict[str, StartupHook] = field(init=False, repr=False)
+    _durable_object_release_finalizers_buffer: dict[
+        str,
+        tuple[Callable[..., Any], Callable[..., None]],
+    ] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         initial_tools = tuple(self.tools)
+        initial_images = tuple(self.images)
+        initial_syscalls = tuple(self.syscalls.items())
+        initial_provider_hooks = tuple(
+            (kind, tuple(hooks))
+            for kind, hooks in self.provider_hooks.items()
+        )
+        initial_startup_hooks = tuple(self.startup_hooks.items())
+        initial_durable_finalizers = tuple(
+            self.durable_object_release_finalizers.items()
+        )
         self.tools.clear()
+        self.images.clear()
+        self.syscalls.clear()
+        self.provider_hooks = defaultdict(list)
+        self.startup_hooks.clear()
+        self.durable_object_release_finalizers.clear()
+        self._tools_buffer = self.tools
+        self._images_buffer = self.images
+        self._syscalls_buffer = self.syscalls
+        self._provider_hooks_buffer = self.provider_hooks
+        self._startup_hooks_buffer = self.startup_hooks
+        self._durable_object_release_finalizers_buffer = (
+            self.durable_object_release_finalizers
+        )
         self._declared_tools = frozenset(self.manifest.provides.tools)
         self._declared_images = frozenset(self.manifest.provides.images)
         self._declared_syscalls = frozenset(self.manifest.provides.syscalls)
@@ -122,6 +171,21 @@ class ModuleContext:
         )
         for tool in initial_tools:
             self.register_tool(tool)
+        for image in initial_images:
+            self.register_image(image)
+        for name, handler in initial_syscalls:
+            self.register_syscall(name, handler)
+        for kind, hooks in initial_provider_hooks:
+            for hook in hooks:
+                self.register_provider_hook(kind, hook)
+        for name, hook in initial_startup_hooks:
+            self.add_startup_hook(hook, name=name)
+        for finalizer_id, (prepare, finalize) in initial_durable_finalizers:
+            self.bind_durable_object_release_finalizer(
+                finalizer_id,
+                prepare,
+                finalize,
+            )
 
     @property
     def module_id(self) -> str:
@@ -135,12 +199,26 @@ class ModuleContext:
     def registered_tool_names(self) -> tuple[str, ...]:
         """Return buffered tool names without regenerating their schemas."""
 
-        if len(self.tools) != len(self._registered_tools) or any(
-            current is not registered
-            for current, registered in zip(self.tools, self._registered_tools)
+        if (
+            self.tools is not self._tools_buffer
+            or len(self.tools) != len(self._registered_tools)
+            or any(
+                current is not registered
+                for current, registered in zip(
+                    self.tools,
+                    self._registered_tools,
+                )
+            )
         ):
             raise ValidationError("module tools must be added through register_tool")
         return tuple(self._tool_names)
+
+    @property
+    def registered_tools(self) -> tuple[tuple[str, BaseAgentTool], ...]:
+        """Return each buffered implementation with its admitted tool name."""
+
+        names = self.registered_tool_names
+        return tuple(zip(names, self._registered_tools))
 
     def register_tool(self, tool: BaseAgentTool) -> None:
         spec = tool.spec()
@@ -158,6 +236,7 @@ class ModuleContext:
         if any(existing.image_id == candidate.image_id for existing in self.images):
             raise ValidationError(f"module registered duplicate image: {candidate.image_id}")
         self.images.append(candidate)
+        self._registered_images.append(candidate)
 
     def register_syscall(self, name: str, handler: SyscallHandler) -> None:
         normalized = self._normalize_name(name, "syscall")
@@ -167,6 +246,7 @@ class ModuleContext:
         if not callable(handler):
             raise ValidationError(f"syscall handler is not callable: {normalized}")
         self.syscalls[normalized] = handler
+        self._registered_syscalls[normalized] = handler
 
     def register_provider_hook(self, kind: str, hook: ProviderHook) -> None:
         normalized = self._normalize_name(kind, "provider hook")
@@ -175,7 +255,10 @@ class ModuleContext:
             raise ValidationError(f"module registered duplicate provider hook: {normalized}")
         if not callable(hook):
             raise ValidationError(f"provider hook is not callable: {normalized}")
-        self.provider_hooks[normalized].append(hook)
+        bucket = self.provider_hooks[normalized]
+        bucket.append(hook)
+        self._provider_hook_buckets[normalized] = bucket
+        self._registered_provider_hooks[normalized] = [hook]
 
     def add_startup_hook(self, hook: StartupHook, *, name: str | None = None) -> None:
         hook_name = self._normalize_name(name or getattr(hook, "__name__", ""), "startup hook")
@@ -185,6 +268,7 @@ class ModuleContext:
         if not callable(hook):
             raise ValidationError(f"startup hook is not callable: {hook_name}")
         self.startup_hooks[hook_name] = hook
+        self._registered_startup_hooks[hook_name] = hook
 
     def bind_durable_object_release_finalizer(
         self,
@@ -214,8 +298,69 @@ class ModuleContext:
             prepare,
             finalize,
         )
+        self._registered_durable_object_release_finalizers[selected_id] = (
+            prepare,
+            finalize,
+        )
+
+    def validate_registration_buffers(self) -> None:
+        """Reject registration state that bypassed the declaration-aware API."""
+
+        _ = self.registered_tool_names
+        if (
+            self.images is not self._images_buffer
+            or len(self.images) != len(self._registered_images)
+            or any(
+                current is not registered
+                for current, registered in zip(
+                    self.images,
+                    self._registered_images,
+                )
+            )
+        ):
+            raise ValidationError("module images must be added through register_image")
+        if not self._identity_mapping_matches(
+            self.syscalls,
+            self._syscalls_buffer,
+            self._registered_syscalls,
+        ):
+            raise ValidationError("module syscalls must be added through register_syscall")
+        if (
+            self.provider_hooks is not self._provider_hooks_buffer
+            or set(self.provider_hooks) != set(self._registered_provider_hooks)
+        ):
+            raise ValidationError(
+                "module provider hooks must be added through register_provider_hook"
+            )
+        for kind, registered_hooks in self._registered_provider_hooks.items():
+            hooks = self.provider_hooks.get(kind)
+            if (
+                hooks is not self._provider_hook_buckets.get(kind)
+                or len(hooks) != len(registered_hooks)
+                or any(
+                    current is not registered
+                    for current, registered in zip(hooks, registered_hooks)
+                )
+            ):
+                raise ValidationError(
+                    "module provider hooks must be added through register_provider_hook"
+                )
+        if not self._identity_mapping_matches(
+            self.startup_hooks,
+            self._startup_hooks_buffer,
+            self._registered_startup_hooks,
+        ):
+            raise ValidationError(
+                "module startup hooks must be added through add_startup_hook"
+            )
+        if not self._finalizer_mapping_matches():
+            raise ValidationError(
+                "module durable object release finalizers must be added through "
+                "bind_durable_object_release_finalizer"
+            )
 
     def registered_summary(self) -> dict[str, Any]:
+        self.validate_registration_buffers()
         return {
             "tools": list(self.registered_tool_names),
             "images": [image.image_id for image in self.images],
@@ -226,6 +371,35 @@ class ModuleContext:
                 self.durable_object_release_finalizers
             ),
         }
+
+    @staticmethod
+    def _identity_mapping_matches(
+        current: dict[str, Any],
+        expected_buffer: dict[str, Any],
+        registered: dict[str, Any],
+    ) -> bool:
+        if current is not expected_buffer or set(current) != set(registered):
+            return False
+        return all(current[name] is value for name, value in registered.items())
+
+    def _finalizer_mapping_matches(self) -> bool:
+        current = self.durable_object_release_finalizers
+        registered = self._registered_durable_object_release_finalizers
+        if (
+            current is not self._durable_object_release_finalizers_buffer
+            or set(current) != set(registered)
+        ):
+            return False
+        for finalizer_id, expected_callbacks in registered.items():
+            callbacks = current[finalizer_id]
+            if (
+                not isinstance(callbacks, tuple)
+                or len(callbacks) != 2
+                or callbacks[0] is not expected_callbacks[0]
+                or callbacks[1] is not expected_callbacks[1]
+            ):
+                return False
+        return True
 
     def _require_declared(self, value: str, declared: Container[str], kind: str) -> None:
         if self.enforce_provides and value not in declared:

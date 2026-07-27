@@ -8,9 +8,11 @@ import os
 import socket
 import tempfile
 import threading
+import time
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from pytest import MonkeyPatch
 from agent_libos import Runtime
@@ -43,7 +45,166 @@ from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ProviderEffectNotStarted
 from agent_libos.utils.serde import dumps
 
+
+def test_jsonrpc_and_mcp_share_bounded_dns_resolver_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_libos.substrate.base as substrate_base
+    from agent_libos.primitives.jsonrpc import _bounded_jsonrpc_getaddrinfo
+    from agent_libos.substrate.local import _bounded_mcp_getaddrinfo
+
+    monkeypatch.setattr(
+        substrate_base,
+        "_PROVIDER_DNS_SLOTS",
+        threading.BoundedSemaphore(1),
+    )
+    resolver_started = threading.Event()
+    release_resolver = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def controlled_getaddrinfo(*_args: Any, **_kwargs: Any) -> list[Any]:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            selected_call = calls
+        if selected_call == 1:
+            resolver_started.set()
+            assert release_resolver.wait(2.0)
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", controlled_getaddrinfo)
+    first_errors: list[BaseException] = []
+
+    def resolve_jsonrpc() -> None:
+        try:
+            _bounded_jsonrpc_getaddrinfo(
+                "jsonrpc.example",
+                80,
+                deadline=time.monotonic() + 1.0,
+            )
+        except BaseException as error:
+            first_errors.append(error)
+
+    first = threading.Thread(target=resolve_jsonrpc)
+    first.start()
+    assert resolver_started.wait(1.0)
+    with pytest.raises(TimeoutError, match="resolver capacity"):
+        _bounded_mcp_getaddrinfo(
+            "mcp.example",
+            80,
+            deadline=time.monotonic() + 0.05,
+        )
+    assert calls == 1
+
+    release_resolver.set()
+    first.join(timeout=1.0)
+    assert not first.is_alive()
+    assert first_errors == []
+    assert _bounded_mcp_getaddrinfo(
+        "mcp.example",
+        80,
+        deadline=time.monotonic() + 1.0,
+    )
+    assert calls == 2
+
 class TestJsonRpcPrimitive:
+
+    def test_jsonrpc_dns_uses_endpoint_deadline_and_never_dispatches_after_timeout(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingJsonRpcProvider()
+        runtime.jsonrpc.provider = provider
+        release = threading.Event()
+        resolver_started = threading.Event()
+
+        def blocked_resolution(*_args: Any, **_kwargs: Any) -> list[Any]:
+            resolver_started.set()
+            release.wait(timeout=1.0)
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ]
+
+        monkeypatch.setattr(
+            "agent_libos.primitives.jsonrpc.socket.getaddrinfo",
+            blocked_resolution,
+        )
+        endpoint = replace(
+            _direct_jsonrpc_endpoint("dns-deadline"),
+            timeout_s=0.05,
+        )
+        protected = SimpleNamespace(
+            call=lambda _phase, function, *args, **kwargs: function(*args, **kwargs)
+        )
+        started = time.monotonic()
+        try:
+            with pytest.raises(TimeoutError, match="DNS resolution"):
+                runtime.jsonrpc._dispatch_transport(
+                    protected,
+                    endpoint,
+                    endpoint.methods[0],
+                    b"{}",
+                )
+            elapsed = time.monotonic() - started
+
+            assert resolver_started.is_set()
+            assert elapsed < 0.5
+            assert provider.calls == []
+        finally:
+            release.set()
+            runtime.close()
+
+    def test_jsonrpc_provider_receives_only_deadline_remaining_after_dns(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        class RemainingTimeoutProvider(_RecordingJsonRpcProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.timeouts: list[float] = []
+
+            def call(self, endpoint: Any, method: Any, request_body: bytes, **kwargs: Any) -> JsonRpcTransportResult:
+                self.timeouts.append(float(kwargs["timeout_s"]))
+                return super().call(endpoint, method, request_body, **kwargs)
+
+        runtime = Runtime.open("local")
+        provider = RemainingTimeoutProvider()
+        runtime.jsonrpc.provider = provider
+
+        def delayed_resolution(*_args: Any, **_kwargs: Any) -> list[Any]:
+            time.sleep(0.03)
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ]
+
+        monkeypatch.setattr(
+            "agent_libos.primitives.jsonrpc.socket.getaddrinfo",
+            delayed_resolution,
+        )
+        endpoint = replace(
+            _direct_jsonrpc_endpoint("dns-remaining"),
+            timeout_s=0.2,
+        )
+        protected = SimpleNamespace(
+            call=lambda _phase, function, *args, **kwargs: function(*args, **kwargs)
+        )
+        try:
+            result = runtime.jsonrpc._dispatch_transport(
+                protected,
+                endpoint,
+                endpoint.methods[0],
+                b"{}",
+            )
+
+            assert result.status_code == 200
+            assert len(provider.timeouts) == 1
+            assert 0 < provider.timeouts[0] < endpoint.timeout_s - 0.01
+        finally:
+            runtime.close()
 
     def test_async_call_returns_external_untrusted_ingress_context(self) -> None:
         with _jsonrpc_server() as server:
@@ -383,6 +544,61 @@ class TestJsonRpcPrimitive:
             for text in invalid_cases:
                 with pytest.raises(ValidationError):
                     runtime.jsonrpc.register_endpoint_from_yaml_text(text, actor='cli', require_capability=False)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("schema_version", 1.0),
+            ("schema_version", True),
+            ("max_request_bytes", 1.75),
+            ("max_request_bytes", True),
+            ("max_response_bytes", 1.75),
+            ("max_response_bytes", True),
+        ],
+    )
+    def test_manifest_integer_fields_reject_floats_and_booleans(
+        self,
+        field: str,
+        value: Any,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            manifest = _manifest_mapping(f"strict-integer-{field}")
+            manifest[field] = value
+
+            with pytest.raises(ValidationError, match=f"{field} must be an integer"):
+                runtime.jsonrpc.register_endpoint(
+                    manifest,
+                    actor="cli",
+                    require_capability=False,
+                )
+        finally:
+            runtime.close()
+
+    def test_manifest_integer_fields_accept_exact_positive_integers(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            manifest = _manifest_mapping("exact-integers")
+            manifest.update(
+                {
+                    "schema_version": 1,
+                    "max_request_bytes": 1_024,
+                    "max_response_bytes": 2_048,
+                }
+            )
+
+            runtime.jsonrpc.register_endpoint(
+                manifest,
+                actor="cli",
+                require_capability=False,
+            )
+
+            endpoint, _metadata = runtime.jsonrpc._load_endpoint("exact-integers")
+            assert endpoint.schema_version == 1
+            assert endpoint.max_request_bytes == 1_024
+            assert endpoint.max_response_bytes == 2_048
         finally:
             runtime.close()
 
@@ -1067,25 +1283,7 @@ class TestJsonRpcPrimitive:
 
     def test_http_jsonrpc_provider_connects_to_pinned_address(self, monkeypatch: MonkeyPatch) -> None:
         provider = HttpJsonRpcProvider()
-        endpoint = JsonRpcEndpointSpec(
-            schema_version=1,
-            endpoint_id='direct-pin',
-            url='https://api.example.test/rpc',
-            headers={},
-            methods=[
-                JsonRpcMethodSpec(
-                    method_id='echo',
-                    rpc_method='demo.echo',
-                    right='read',
-                    rollback_class='no_rollback_required',
-                    state_mutation=False,
-                    information_flow=True,
-                )
-            ],
-            timeout_s=1,
-            max_request_bytes=1024,
-            max_response_bytes=1024,
-        )
+        endpoint = _direct_jsonrpc_endpoint("direct-pin")
         called: list[tuple[str, int]] = []
 
         def fail_connect(address: tuple[str, int], *_args: Any, **_kwargs: Any) -> Any:
@@ -1105,6 +1303,552 @@ class TestJsonRpcPrimitive:
 
         assert not result.status_code
         assert called == [('93.184.216.34', 443)]
+
+    def test_http_jsonrpc_provider_failover_stops_after_request_dispatch(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = HttpJsonRpcProvider()
+        runtime.jsonrpc.provider = provider
+        addresses = ("93.184.216.34", "1.1.1.1")
+        attempts: list[str] = []
+        dispatches: list[bytes] = []
+
+        class SocketAfterConnect:
+            def __enter__(self) -> "SocketAfterConnect":
+                return self
+
+            def __exit__(self, *_exc: Any) -> None:
+                return None
+
+            def sendall(self, payload: bytes) -> None:
+                dispatches.append(payload)
+
+        class FailingResponse:
+            def __init__(self, _sock: Any) -> None:
+                pass
+
+            def begin(self) -> None:
+                raise OSError("response failed after request dispatch")
+
+        def open_pinned(address: str, *_args: Any, **_kwargs: Any) -> SocketAfterConnect:
+            attempts.append(address)
+            return SocketAfterConnect()
+
+        monkeypatch.setattr(provider, "_pinned_socket", open_pinned)
+        monkeypatch.setattr(
+            "agent_libos.substrate.local.http.client.HTTPResponse",
+            FailingResponse,
+        )
+        monkeypatch.setattr(
+            "agent_libos.primitives.jsonrpc.socket.getaddrinfo",
+            lambda *_args, **_kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))
+                for address in addresses
+            ],
+        )
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="do not replay a dispatched JSON-RPC request",
+            )
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    "post-send-failure",
+                    "https://safe.example.test/jsonrpc",
+                    with_header=False,
+                    state_mutation=True,
+                    rollback_class="irreversible",
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "jsonrpc:post-send-failure:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+            result = runtime.jsonrpc.call(
+                pid,
+                "post-send-failure",
+                "echo",
+                {"x": 1},
+            )
+
+            assert result.status.value == "transport_error"
+            assert attempts == [addresses[0]]
+            assert len(dispatches) == 1
+            effect = runtime.store.list_external_effects(pid=pid)[0]
+            assert effect.transaction_state == "unknown"
+            assert effect.state_mutation
+            assert effect.provider_metadata["outcome"] == "unknown_transport_failure"
+        finally:
+            runtime.close()
+
+    def test_http_jsonrpc_provider_failover_continues_before_request_dispatch(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        provider = HttpJsonRpcProvider()
+        endpoint = _direct_jsonrpc_endpoint("pre-send-failover")
+        addresses = ("93.184.216.34", "1.1.1.1")
+        attempts: list[str] = []
+        dispatches: list[bytes] = []
+
+        class ConnectedSocket:
+            def __enter__(self) -> "ConnectedSocket":
+                return self
+
+            def __exit__(self, *_exc: Any) -> None:
+                return None
+
+            def sendall(self, payload: bytes) -> None:
+                dispatches.append(payload)
+
+        class SuccessfulResponse:
+            status = 200
+
+            def __init__(self, _sock: Any) -> None:
+                pass
+
+            def begin(self) -> None:
+                return None
+
+            def read(self, _limit: int) -> bytes:
+                return b"{}"
+
+        def open_pinned(address: str, *_args: Any, **_kwargs: Any) -> ConnectedSocket:
+            attempts.append(address)
+            if address == addresses[0]:
+                raise OSError("connect failed before request dispatch")
+            return ConnectedSocket()
+
+        monkeypatch.setattr(provider, "_pinned_socket", open_pinned)
+        monkeypatch.setattr(
+            "agent_libos.substrate.local.http.client.HTTPResponse",
+            SuccessfulResponse,
+        )
+
+        result = provider.call(
+            endpoint,
+            endpoint.methods[0],
+            b"{}",
+            timeout_s=1,
+            max_response_bytes=1024,
+            resolved_addresses=addresses,
+        )
+
+        assert result.status_code == 200
+        assert attempts == list(addresses)
+        assert len(dispatches) == 1
+
+    def test_http_jsonrpc_provider_preserves_oversize_sentinel_for_primitive(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        provider = HttpJsonRpcProvider()
+        endpoint = replace(
+            _direct_jsonrpc_endpoint("oversize-sentinel"),
+            max_response_bytes=64,
+        )
+
+        class ConnectedSocket:
+            def __enter__(self) -> "ConnectedSocket":
+                return self
+
+            def __exit__(self, *_exc: Any) -> None:
+                return None
+
+            def sendall(self, _payload: bytes) -> None:
+                return None
+
+        class OversizeResponse:
+            status = 200
+
+            def __init__(self, _sock: Any) -> None:
+                pass
+
+            def begin(self) -> None:
+                return None
+
+            def read(self, limit: int) -> bytes:
+                return b"x" * limit
+
+        monkeypatch.setattr(
+            provider,
+            "_pinned_socket",
+            lambda *_args, **_kwargs: ConnectedSocket(),
+        )
+        monkeypatch.setattr(
+            "agent_libos.substrate.local.http.client.HTTPResponse",
+            OversizeResponse,
+        )
+
+        result = provider.call(
+            endpoint,
+            endpoint.methods[0],
+            b"{}",
+            timeout_s=1,
+            max_response_bytes=64,
+            resolved_addresses=("93.184.216.34",),
+        )
+
+        assert result.too_large
+        assert len(result.body) == 65
+        assert result.response_bytes == 64
+
+    def test_http_jsonrpc_provider_slow_connect_consumes_one_total_deadline(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        provider = HttpJsonRpcProvider()
+        endpoint = _direct_jsonrpc_endpoint("slow-connect-deadline")
+        attempts: list[tuple[str, float]] = []
+
+        def slow_connect(
+            address: str,
+            _port: int,
+            **kwargs: Any,
+        ) -> Any:
+            timeout_s = float(kwargs["timeout_s"])
+            attempts.append((address, timeout_s))
+            time.sleep(timeout_s)
+            raise TimeoutError("injected slow connect")
+
+        monkeypatch.setattr(provider, "_pinned_socket", slow_connect)
+        started = time.monotonic()
+        result = provider.call(
+            endpoint,
+            endpoint.methods[0],
+            b"{}",
+            timeout_s=0.05,
+            max_response_bytes=1024,
+            resolved_addresses=("93.184.216.34", "1.1.1.1"),
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.status_code is None
+        assert [address for address, _timeout in attempts] == ["93.184.216.34"]
+        assert 0.04 <= elapsed < 0.5
+        assert attempts[0][1] <= 0.05
+
+    def test_http_jsonrpc_provider_tls_handshake_uses_the_total_deadline(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        provider = HttpJsonRpcProvider()
+        endpoint = _direct_jsonrpc_endpoint("slow-tls-handshake")
+
+        class SlowHandshakeSocket(_DeadlineTestSocket):
+            def do_handshake(self) -> None:
+                assert self.closed.wait(timeout=1)
+                raise OSError("socket closed by deadline")
+
+        sock = SlowHandshakeSocket()
+        attempts: list[str] = []
+
+        def open_pinned(address: str, *_args: Any, **_kwargs: Any) -> Any:
+            attempts.append(address)
+            return sock
+
+        monkeypatch.setattr(provider, "_pinned_socket", open_pinned)
+        result = provider.call(
+            endpoint,
+            endpoint.methods[0],
+            b"{}",
+            timeout_s=0.05,
+            max_response_bytes=1024,
+            resolved_addresses=("93.184.216.34", "1.1.1.1"),
+        )
+
+        assert result.status_code is None
+        assert result.error == "TimeoutError: JSON-RPC pinned request timed out"
+        assert attempts == ["93.184.216.34"]
+        assert sock.dispatches == []
+        assert sock.shutdown_calls == 1
+        assert sock.close_calls >= 1
+        assert not _jsonrpc_deadline_threads()
+
+    def test_http_jsonrpc_provider_slow_header_times_out_without_replaying_non_idempotent_request(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        provider = HttpJsonRpcProvider()
+        method = replace(
+            _direct_jsonrpc_endpoint("unused").methods[0],
+            rollback_class="irreversible",
+            state_mutation=True,
+        )
+        endpoint = replace(
+            _direct_jsonrpc_endpoint("slow-header-deadline"),
+            methods=[method],
+        )
+        sock = _DeadlineTestSocket()
+        attempts: list[str] = []
+
+        class SlowHeaderResponse:
+            status = 200
+
+            def __init__(self, selected_socket: _DeadlineTestSocket) -> None:
+                self.sock = selected_socket
+
+            def begin(self) -> None:
+                assert self.sock.closed.wait(timeout=1)
+                raise OSError("socket closed by deadline")
+
+        def open_pinned(address: str, *_args: Any, **_kwargs: Any) -> Any:
+            attempts.append(address)
+            return sock
+
+        monkeypatch.setattr(provider, "_pinned_socket", open_pinned)
+        monkeypatch.setattr(
+            "agent_libos.substrate.local.http.client.HTTPResponse",
+            SlowHeaderResponse,
+        )
+        result = provider.call(
+            endpoint,
+            method,
+            b"{}",
+            timeout_s=0.05,
+            max_response_bytes=1024,
+            resolved_addresses=("93.184.216.34", "1.1.1.1"),
+        )
+
+        assert result.status_code is None
+        assert result.error == "TimeoutError: JSON-RPC pinned request timed out"
+        assert attempts == ["93.184.216.34"]
+        assert len(sock.dispatches) == 1
+        assert sock.shutdown_calls == 1
+        assert sock.close_calls >= 1
+        assert not _jsonrpc_deadline_threads()
+
+    def test_http_jsonrpc_provider_slow_body_uses_header_deadline_and_cleans_socket(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        provider = HttpJsonRpcProvider()
+        endpoint = _direct_jsonrpc_endpoint("slow-body-deadline")
+        sock = _DeadlineTestSocket()
+
+        class SlowBodyResponse:
+            status = 200
+
+            def __init__(self, selected_socket: _DeadlineTestSocket) -> None:
+                self.sock = selected_socket
+
+            def begin(self) -> None:
+                return None
+
+            def read(self, _limit: int) -> bytes:
+                assert self.sock.closed.wait(timeout=1)
+                raise OSError("socket closed by deadline")
+
+        monkeypatch.setattr(
+            provider,
+            "_pinned_socket",
+            lambda *_args, **_kwargs: sock,
+        )
+        monkeypatch.setattr(
+            "agent_libos.substrate.local.http.client.HTTPResponse",
+            SlowBodyResponse,
+        )
+        started = time.monotonic()
+        result = provider.call(
+            endpoint,
+            endpoint.methods[0],
+            b"{}",
+            timeout_s=0.05,
+            max_response_bytes=1024,
+            resolved_addresses=("93.184.216.34",),
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.status_code is None
+        assert result.error == "TimeoutError: JSON-RPC pinned request timed out"
+        assert 0.04 <= elapsed < 0.5
+        assert sock.shutdown_calls == 1
+        assert sock.close_calls >= 1
+        assert not _jsonrpc_deadline_threads()
+
+    def test_http_jsonrpc_provider_fails_closed_at_exact_deadline_before_dispatch(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        provider = HttpJsonRpcProvider()
+        endpoint = _direct_jsonrpc_endpoint("exact-deadline")
+        sock = _DeadlineTestSocket()
+        clock_values = iter((10.0, 10.0, 11.0, 11.0))
+        last_value = 11.0
+
+        def monotonic() -> float:
+            nonlocal last_value
+            last_value = next(clock_values, last_value)
+            return last_value
+
+        monkeypatch.setattr(
+            provider,
+            "_pinned_socket",
+            lambda *_args, **_kwargs: sock,
+        )
+        monkeypatch.setattr("agent_libos.substrate.local.time.monotonic", monotonic)
+        result = provider.call(
+            endpoint,
+            endpoint.methods[0],
+            b"{}",
+            timeout_s=1.0,
+            max_response_bytes=1024,
+            resolved_addresses=("93.184.216.34",),
+        )
+
+        assert result.status_code is None
+        assert result.error == "TimeoutError: JSON-RPC pinned request timed out"
+        assert result.elapsed_s == 1.0
+        assert sock.dispatches == []
+        assert sock.shutdown_calls == 1
+        assert sock.close_calls >= 1
+        assert not _jsonrpc_deadline_threads()
+
+    def test_http_jsonrpc_provider_cancels_and_joins_fast_request_watchdog(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        provider = HttpJsonRpcProvider()
+        endpoint = _direct_jsonrpc_endpoint("watchdog-cleanup")
+        sock = _DeadlineTestSocket()
+
+        class FastResponse:
+            status = 200
+
+            def __init__(self, _selected_socket: _DeadlineTestSocket) -> None:
+                pass
+
+            def begin(self) -> None:
+                return None
+
+            def read(self, _limit: int) -> bytes:
+                return b"{}"
+
+        monkeypatch.setattr(
+            provider,
+            "_pinned_socket",
+            lambda *_args, **_kwargs: sock,
+        )
+        monkeypatch.setattr(
+            "agent_libos.substrate.local.http.client.HTTPResponse",
+            FastResponse,
+        )
+        result = provider.call(
+            endpoint,
+            endpoint.methods[0],
+            b"{}",
+            timeout_s=1.0,
+            max_response_bytes=1024,
+            resolved_addresses=("93.184.216.34",),
+        )
+
+        assert result.status_code == 200
+        assert sock.shutdown_calls == 0
+        assert sock.close_calls == 1
+        assert not _jsonrpc_deadline_threads()
+
+    def test_jsonrpc_primitive_derives_oversize_and_accounting_from_body(
+        self,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _ForgedMetricsJsonRpcProvider(
+            oversized=True,
+            response_bytes=1,
+            too_large=False,
+        )
+        runtime.jsonrpc.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="enforce JSON-RPC body limit",
+            )
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    "actual-body-limit",
+                    "http://127.0.0.1:9/rpc",
+                    with_header=False,
+                    max_response_bytes="64",
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "jsonrpc:actual-body-limit:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+            result = runtime.jsonrpc.call(
+                pid,
+                "actual-body-limit",
+                "echo",
+                {"x": 1},
+            )
+
+            assert result.status.value == "response_too_large"
+            assert result.response_bytes == 64
+            assert provider.actual_response_bytes == 65
+            assert runtime.process.get(pid).resource_usage.jsonrpc_response_bytes == 64
+            effect = runtime.store.list_external_effects(pid=pid)[0]
+            assert effect.provider_metadata["response_bytes"] == 64
+        finally:
+            runtime.close()
+
+    def test_jsonrpc_primitive_ignores_forged_too_large_for_valid_body(
+        self,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _ForgedMetricsJsonRpcProvider(
+            oversized=False,
+            response_bytes=0,
+            too_large=True,
+        )
+        runtime.jsonrpc.provider = provider
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="account for actual JSON-RPC body",
+            )
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    "actual-body-accounting",
+                    "http://127.0.0.1:9/rpc",
+                    with_header=False,
+                    max_response_bytes="1024",
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "jsonrpc:actual-body-accounting:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+            result = runtime.jsonrpc.call(
+                pid,
+                "actual-body-accounting",
+                "echo",
+                {"x": 1},
+            )
+
+            assert result.ok
+            assert result.response_bytes == provider.actual_response_bytes
+            assert (
+                runtime.process.get(pid).resource_usage.jsonrpc_response_bytes
+                == provider.actual_response_bytes
+            )
+        finally:
+            runtime.close()
 
     def test_jsonrpc_params_are_sanitized_in_audit_and_external_effects(self) -> None:
         with _jsonrpc_server() as server:
@@ -1796,6 +2540,104 @@ class _FailingJsonRpcProvider(_RecordingJsonRpcProvider):
     def call(self, _endpoint: Any, _method: Any, request_body: bytes, **_kwargs: Any) -> JsonRpcTransportResult:
         self.calls.append(request_body)
         raise RuntimeError('transport-secret')
+
+
+class _ForgedMetricsJsonRpcProvider(_RecordingJsonRpcProvider):
+    def __init__(
+        self,
+        *,
+        oversized: bool,
+        response_bytes: int,
+        too_large: bool,
+    ) -> None:
+        super().__init__()
+        self.oversized = oversized
+        self.response_bytes = response_bytes
+        self.too_large = too_large
+        self.actual_response_bytes = 0
+
+    def call(
+        self,
+        _endpoint: Any,
+        _method: Any,
+        request_body: bytes,
+        **kwargs: Any,
+    ) -> JsonRpcTransportResult:
+        self.calls.append(request_body)
+        payload = json.loads(request_body.decode("utf-8"))
+        if self.oversized:
+            body = b"x" * (int(kwargs["max_response_bytes"]) + 1)
+        else:
+            body = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "result": {"ok": True},
+                }
+            ).encode("utf-8")
+        self.actual_response_bytes = len(body)
+        return JsonRpcTransportResult(
+            status_code=200,
+            body=body,
+            elapsed_s=0.01,
+            response_bytes=self.response_bytes,
+            too_large=self.too_large,
+        )
+
+
+def _direct_jsonrpc_endpoint(endpoint_id: str) -> JsonRpcEndpointSpec:
+    return JsonRpcEndpointSpec(
+        schema_version=1,
+        endpoint_id=endpoint_id,
+        url="https://api.example.test/rpc",
+        headers={},
+        methods=[
+            JsonRpcMethodSpec(
+                method_id="echo",
+                rpc_method="demo.echo",
+                right="read",
+                rollback_class="no_rollback_required",
+                state_mutation=False,
+                information_flow=True,
+            )
+        ],
+        timeout_s=1,
+        max_request_bytes=1_024,
+        max_response_bytes=1_024,
+    )
+
+
+class _DeadlineTestSocket:
+    def __init__(self) -> None:
+        self.closed = threading.Event()
+        self.dispatches: list[bytes] = []
+        self.shutdown_calls = 0
+        self.close_calls = 0
+
+    def __enter__(self) -> _DeadlineTestSocket:
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    def sendall(self, payload: bytes) -> None:
+        self.dispatches.append(payload)
+
+    def shutdown(self, _how: int) -> None:
+        self.shutdown_calls += 1
+        self.closed.set()
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.closed.set()
+
+
+def _jsonrpc_deadline_threads() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("agent-libos-jsonrpc-deadline-")
+    ]
 
 def _manifest_mapping(endpoint_id: str) -> dict[str, Any]:
     return {

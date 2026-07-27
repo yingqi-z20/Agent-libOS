@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
-import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
+
+import regex as bounded_regex
 
 from agent_libos.capability.effect_binding import (
     APPROVAL_BINDING_KEY,
@@ -11,6 +13,7 @@ from agent_libos.capability.effect_binding import (
     normalize_approval_binding,
 )
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY, AuthorityRuleCodec
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
     Capability,
     CapabilityDecision,
@@ -100,8 +103,14 @@ _ALLOWED_RULE_CONDITIONS = frozenset(
 class CapabilityEvaluator:
     """Side-effect-free capability constraint and precedence evaluator."""
 
-    def __init__(self, rule_codec: AuthorityRuleCodec | None = None) -> None:
+    def __init__(
+        self,
+        rule_codec: AuthorityRuleCodec | None = None,
+        *,
+        config: AgentLibOSConfig | None = None,
+    ) -> None:
         self.rule_codec = rule_codec or AuthorityRuleCodec()
+        self.config = config or DEFAULT_CONFIG
 
     def decide(
         self,
@@ -117,6 +126,7 @@ class CapabilityEvaluator:
         chains = issuer_chains or {}
         matched_ids = [cap.cap_id for cap in matches]
         failed_constraints: list[tuple[Capability, dict[str, Any]]] = []
+        decisions: list[tuple[Capability, CapabilityDecision]] = []
         for cap in matches:
             results = self.evaluate_constraints(cap, selected_context)
             decision = self._decide_match(
@@ -130,8 +140,32 @@ class CapabilityEvaluator:
                 issuer_chain=list(chains.get(cap.cap_id, ())),
             )
             if decision is not None:
-                return decision
-            failed_constraints.append((cap, results))
+                decisions.append((cap, decision))
+            else:
+                failed_constraints.append((cap, results))
+        denied = next(
+            (decision for _cap, decision in decisions if decision.effect == CapabilityEffect.DENY),
+            None,
+        )
+        if denied is not None:
+            return denied
+        approved_once = next(
+            (
+                decision
+                for cap, decision in decisions
+                if self._is_matched_one_shot_approval(cap, decision)
+            ),
+            None,
+        )
+        if approved_once is not None:
+            return approved_once
+        for effect in (CapabilityEffect.ASK, CapabilityEffect.ALLOW):
+            selected = next(
+                (decision for _cap, decision in decisions if decision.effect == effect),
+                None,
+            )
+            if selected is not None:
+                return selected
         if failed_constraints:
             cap, results = failed_constraints[0]
             return self._decision(
@@ -156,6 +190,20 @@ class CapabilityEvaluator:
             reason=f"{subject} lacks {requested_right} on {resource}",
             matched_capability_ids=matched_ids,
             context=selected_context,
+        )
+
+    @staticmethod
+    def _is_matched_one_shot_approval(
+        cap: Capability,
+        decision: CapabilityDecision,
+    ) -> bool:
+        binding_result = decision.constraint_results.get(APPROVAL_BINDING_KEY)
+        return (
+            decision.effect == CapabilityEffect.ALLOW
+            and cap.uses_remaining == 1
+            and decision.consume_capability_id == cap.cap_id
+            and isinstance(binding_result, dict)
+            and binding_result.get("ok") is True
         )
 
     def _decide_match(
@@ -453,7 +501,10 @@ class CapabilityEvaluator:
             or not all(isinstance(item, str) for item in conditions["argv"])
         ):
             malformed.append("argv")
-        if "match" in conditions and conditions["match"] not in {"exact", "prefix"}:
+        if "match" in conditions and (
+            "argv" not in conditions
+            or conditions["match"] not in {"exact", "prefix"}
+        ):
             malformed.append("match")
         if "regex_token" in conditions and not self._valid_regex(conditions["regex_token"]):
             malformed.append("regex_token")
@@ -493,6 +544,7 @@ class CapabilityEvaluator:
 
     def _authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
         conditions = dict(rule.conditions or {})
+        regex_unavailable = False
         if "operation" in conditions and str(context.get("operation")) != str(conditions["operation"]):
             return False
         if "authority_operation" in conditions and (
@@ -503,28 +555,73 @@ class CapabilityEvaluator:
             return False
         regex = conditions.get("regex_token")
         argv = context.get("argv")
-        if isinstance(regex, str) and (
-            not self._valid_regex(regex)
-            or not isinstance(argv, list)
-            or not any(re.fullmatch(regex, str(token)) for token in argv)
-        ):
-            return False
+        if isinstance(regex, str):
+            if not self._valid_regex(regex) or not isinstance(argv, list):
+                return False
+            regex_match = self._regex_matches_any_token(regex, argv)
+            if regex_match is False:
+                return False
+            regex_unavailable = regex_match is None
         if any(key in conditions and context.get(key) != conditions[key] for key in _DIRECT_RULE_CONDITIONS):
             return False
-        return self._timeout_conditions_match(conditions, context)
+        if not self._timeout_conditions_match(conditions, context):
+            return False
+        if regex_unavailable:
+            # A bounded regex timeout must never turn a deny/ask rule into an
+            # implicit allow. Auto-allow rules still require a positive match.
+            return rule.effect in {CapabilityEffect.DENY, CapabilityEffect.ASK}
+        return True
 
     def authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
         return self._authority_rule_matches(rule, context)
 
-    @staticmethod
-    def _valid_regex(value: Any) -> bool:
+    def _valid_regex(self, value: Any) -> bool:
         if not isinstance(value, str):
             return False
         try:
-            re.compile(value)
-        except re.error:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        if len(encoded) > self.config.capability.regex_pattern_max_bytes:
+            return False
+        try:
+            bounded_regex.compile(value)
+        except bounded_regex.error:
             return False
         return True
+
+    def _regex_matches_any_token(
+        self,
+        pattern: str,
+        argv: list[Any],
+    ) -> bool | None:
+        selected: list[str] = []
+        for token in argv:
+            if not isinstance(token, str):
+                return False
+            try:
+                encoded = token.encode("utf-8")
+            except UnicodeEncodeError:
+                return False
+            if len(encoded) > self.config.capability.regex_token_max_bytes:
+                return False
+            selected.append(token)
+
+        deadline = time.monotonic() + self.config.capability.regex_match_timeout_s
+        try:
+            for token in selected:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                if bounded_regex.fullmatch(
+                    pattern,
+                    token,
+                    timeout=remaining,
+                ) is not None:
+                    return True
+        except (TimeoutError, bounded_regex.error):
+            return None
+        return False
 
     def _timeout_conditions_match(self, conditions: dict[str, Any], context: dict[str, Any]) -> bool:
         if "timeout_s" in conditions:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import socket
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 from unittest.mock import patch
@@ -27,6 +28,29 @@ from benchmarks.practical_agent_workflows.models import (
 from benchmarks.practical_agent_workflows.catalog import build_modeled_scenarios
 from benchmarks.practical_agent_workflows.oracle import validate_modeled_scenario
 from benchmarks.practical_agent_workflows.validation import validate_practical_report
+
+
+_NATIVE_DNS_PATCH_LOCK = threading.RLock()
+_BENCHMARK_CONNECTOR_HOST = "connector.example.test"
+
+
+def _benchmark_getaddrinfo(
+    original: Any,
+    host: object,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    if host == _BENCHMARK_CONNECTOR_HOST:
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ]
+    return original(host, *args, **kwargs)
 
 
 class StatefulConnectorProvider:
@@ -116,7 +140,7 @@ def run_practical_evaluation(
     *,
     work_dir: str | Path | None = None,
 ) -> PracticalRunReport:
-    selected = list(scenarios or default_scenarios())
+    selected = default_scenarios() if scenarios is None else list(scenarios)
     results: list[PracticalScenarioResult] = []
     for scenario in selected:
         if scenario.evidence_level == EvidenceLevel.MODELED:
@@ -179,6 +203,24 @@ def _run_native_scenario(
     effect_ids: list[str] = []
     operation_ids: set[str] = set()
     tool_calls = 0
+    unsupported_outcomes = [
+        f"effects[{index}]={effect.expected_outcome!r}"
+        for index, effect in enumerate(scenario.effects)
+        if effect.expected_outcome != "committed"
+    ]
+    if unsupported_outcomes:
+        return PracticalScenarioResult(
+            scenario_id=scenario.scenario_id,
+            evidence_level=scenario.evidence_level,
+            ok=False,
+            semantic_effects=len(scenario.effects),
+            tool_calls=0,
+            operations=0,
+            errors=[
+                "native-live supports only expected_outcome='committed': "
+                + ", ".join(unsupported_outcomes)
+            ],
+        )
     owner = tempfile.TemporaryDirectory(dir=str(work_dir) if work_dir is not None else None)
     try:
         root = Path(owner.name)
@@ -210,58 +252,115 @@ def _run_native_scenario(
                     "metadata": {"benchmark_scenario_id": scenario.scenario_id},
                 },
             )
-            with patch(
-                "agent_libos.primitives.jsonrpc.socket.getaddrinfo",
-                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
-            ):
-                for index, action in enumerate(scenario.native_actions):
-                    expected_semantic_effect = scenario.effects[index]
-                    before = dict(provider.state[action.oracle_collection])
-                    prior_effects = {item.effect_id for item in runtime.store.list_external_effects(pid=pid)}
-                    result = runtime.tools.call(pid, action.tool, dict(action.arguments))
-                    tool_calls += 1
-                    if not result.ok:
-                        errors.append(f"tool {action.tool} failed: {result.error}")
-                        continue
-                    after = provider.state[action.oracle_collection]
-                    if action.oracle_key in before or action.oracle_key not in after:
-                        errors.append(f"state oracle failed for {action.oracle_collection}:{action.oracle_key}")
-                    new_effects = [
-                        item
-                        for item in runtime.store.list_external_effects(pid=pid)
-                        if item.effect_id not in prior_effects
-                    ]
-                    if len(new_effects) != 1:
-                        errors.append(f"expected one native external effect, found {len(new_effects)}")
-                        continue
-                    effect = new_effects[0]
-                    effect_ids.append(effect.effect_id)
-                    if effect.transaction_state != "committed":
-                        errors.append(f"effect {effect.effect_id} is {effect.transaction_state}, not committed")
-                    actual_semantic_effect = (
-                        str(effect.provider_receipt.get("semantic_effect_class") or ""),
-                        str(effect.provider_receipt.get("semantic_target") or ""),
+            with _NATIVE_DNS_PATCH_LOCK:
+                original_getaddrinfo = socket.getaddrinfo
+
+                def benchmark_getaddrinfo(
+                    host: object,
+                    *args: Any,
+                    **kwargs: Any,
+                ) -> Any:
+                    return _benchmark_getaddrinfo(
+                        original_getaddrinfo,
+                        host,
+                        *args,
+                        **kwargs,
                     )
-                    expected_semantic_pair = (
-                        expected_semantic_effect.effect_class,
-                        expected_semantic_effect.target,
-                    )
-                    if actual_semantic_effect != expected_semantic_pair:
-                        errors.append(
-                            "semantic effect mismatch: "
-                            f"expected {expected_semantic_pair[0]}:{expected_semantic_pair[1]}, "
-                            f"provider recorded {actual_semantic_effect[0]}:{actual_semantic_effect[1]}"
+
+                with patch(
+                    "agent_libos.primitives.jsonrpc.socket.getaddrinfo",
+                    side_effect=benchmark_getaddrinfo,
+                ):
+                    for index, action in enumerate(scenario.native_actions):
+                        expected_semantic_effect = scenario.effects[index]
+                        before = dict(provider.state[action.oracle_collection])
+                        prior_effects = {
+                            item.effect_id
+                            for item in runtime.store.list_external_effects(pid=pid)
+                        }
+                        tool_calls += 1
+                        result = runtime.tools.call(
+                            pid,
+                            action.tool,
+                            dict(action.arguments),
                         )
-                    resolved = runtime.explain.resolve("effect", effect.effect_id)
-                    effect_operations = resolved.get("operations", [])
-                    if not effect_operations:
-                        errors.append(f"effect {effect.effect_id} has no explicit operation link")
-                    operation_ids.update(str(item["operation_id"]) for item in effect_operations)
-                    call_resolved = runtime.explain.resolve("call", result.call_id)
-                    operation_ids.update(
-                        str(item["operation_id"])
-                        for item in call_resolved.get("operations", [])
-                    )
+                        if not result.ok:
+                            errors.append(f"tool {action.tool} failed: {result.error}")
+                            continue
+                        after = provider.state[action.oracle_collection]
+                        if action.oracle_key in before or action.oracle_key not in after:
+                            errors.append(
+                                "state oracle failed for "
+                                f"{action.oracle_collection}:{action.oracle_key}"
+                            )
+                        new_effects = [
+                            item
+                            for item in runtime.store.list_external_effects(pid=pid)
+                            if item.effect_id not in prior_effects
+                        ]
+                        if len(new_effects) != 1:
+                            errors.append(
+                                "expected one native external effect, "
+                                f"found {len(new_effects)}"
+                            )
+                            continue
+                        effect = new_effects[0]
+                        effect_ids.append(effect.effect_id)
+                        if (
+                            effect.transaction_state
+                            != expected_semantic_effect.expected_outcome
+                        ):
+                            errors.append(
+                                f"effect {effect.effect_id} is "
+                                f"{effect.transaction_state}, not "
+                                f"{expected_semantic_effect.expected_outcome}"
+                            )
+                        actual_semantic_effect = (
+                            str(
+                                effect.provider_receipt.get(
+                                    "semantic_effect_class"
+                                )
+                                or ""
+                            ),
+                            str(
+                                effect.provider_receipt.get("semantic_target")
+                                or ""
+                            ),
+                        )
+                        expected_semantic_pair = (
+                            expected_semantic_effect.effect_class,
+                            expected_semantic_effect.target,
+                        )
+                        if actual_semantic_effect != expected_semantic_pair:
+                            errors.append(
+                                "semantic effect mismatch: "
+                                f"expected {expected_semantic_pair[0]}:"
+                                f"{expected_semantic_pair[1]}, provider recorded "
+                                f"{actual_semantic_effect[0]}:"
+                                f"{actual_semantic_effect[1]}"
+                            )
+                        resolved = runtime.explain.resolve(
+                            "effect",
+                            effect.effect_id,
+                        )
+                        effect_operations = resolved.get("operations", [])
+                        if not effect_operations:
+                            errors.append(
+                                f"effect {effect.effect_id} has no explicit "
+                                "operation link"
+                            )
+                        operation_ids.update(
+                            str(item["operation_id"])
+                            for item in effect_operations
+                        )
+                        call_resolved = runtime.explain.resolve(
+                            "call",
+                            result.call_id,
+                        )
+                        operation_ids.update(
+                            str(item["operation_id"])
+                            for item in call_resolved.get("operations", [])
+                        )
             if len(effect_ids) != len(scenario.effects):
                 errors.append(
                     f"semantic/native effect mismatch: expected {len(scenario.effects)}, found {len(effect_ids)}"

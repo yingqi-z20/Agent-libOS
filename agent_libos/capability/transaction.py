@@ -74,8 +74,11 @@ class AuthorityTransaction:
                     used_by=self._actor,
                     reason=f"one-time {self._operation} authority reserved",
                 )
-                if reservation_id is not None:
-                    self._reservations[str(cap_id)] = reservation_id
+                if reservation_id is None:
+                    raise CapabilityDenied(
+                        f"{self._operation} authority reservation was not created"
+                    )
+                self._reservations[str(cap_id)] = reservation_id
             self._decisions = current
             return current
         except BaseException as exc:

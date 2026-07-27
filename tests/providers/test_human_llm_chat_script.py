@@ -47,6 +47,65 @@ class TestHumanLLMChatScript:
             finally:
                 runtime.close()
 
+    def test_chat_persistent_database_can_be_reused(self, tmp_path) -> None:
+        db = str(tmp_path / "chat.sqlite")
+
+        first = asyncio.run(
+            run_chat(
+                db=db,
+                responder=EchoResponder(),
+                max_turns=1,
+                auto_messages=["/exit"],
+                echo=False,
+            )
+        )
+        second = asyncio.run(
+            run_chat(
+                db=db,
+                responder=EchoResponder(),
+                max_turns=1,
+                auto_messages=["/exit"],
+                echo=False,
+            )
+        )
+
+        assert first["process_status"] == "exited"
+        assert second["process_status"] == "exited"
+        assert first["pid"] != second["pid"]
+
+    def test_model_responder_durable_error_excludes_provider_text(self, tmp_path) -> None:
+        responder = ModelResponder.__new__(ModelResponder)
+        responder.system_prompt = "System prompt"
+        responder.client = FailingTextLLMClient()
+        responder._runtime = None
+        responder._pid = None
+        db = str(tmp_path / "chat-error.sqlite")
+
+        with pytest.raises(RuntimeError, match="chat process did not exit"):
+            asyncio.run(
+                run_chat(
+                    db=db,
+                    responder=responder,
+                    max_turns=1,
+                    auto_messages=["hello"],
+                    echo=False,
+                )
+            )
+
+        runtime = Runtime.open(db)
+        try:
+            calls = [
+                call
+                for call in runtime.store.list_llm_calls()
+                if call.purpose == "script_human_chat_reply"
+            ]
+            assert len(calls) == 1
+            serialized = json.dumps(calls[0].__dict__, sort_keys=True)
+            assert "provider-secret-diagnostic" not in serialized
+            assert "llm_provider_error" in (calls[0].error or "")
+        finally:
+            runtime.close()
+
     def test_source_context_fallback_uses_latest_result_in_stable_root_order(self) -> None:
         messages = [
             {
@@ -91,3 +150,10 @@ class FakeTextLLMClient:
 
     def complete_with_metadata(self, messages, *, json_mode: bool) -> LLMCompletion:
         return LLMCompletion(content='model reply', tool_calls=[], raw={'id': 'fake_raw'}, api='chat', response_id='fake_resp', request_id='fake_req', model=self.model, usage={'prompt_tokens': 4, 'completion_tokens': 2, 'total_tokens': 6}, reasoning={'summary': 'fake text response'})
+
+
+class FailingTextLLMClient:
+    model = "failing-text-model"
+
+    def complete_with_metadata(self, messages, *, json_mode: bool) -> LLMCompletion:
+        raise RuntimeError("provider-secret-diagnostic")

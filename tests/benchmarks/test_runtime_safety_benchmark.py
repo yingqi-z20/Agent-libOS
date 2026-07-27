@@ -69,18 +69,34 @@ class TestRuntimeSafetyBenchmark:
     def test_git_safety_scenarios_are_deterministic(
         self,
         task_id: str,
-        tmp_path: Path,
+        tmp_path_factory: pytest.TempPathFactory,
     ) -> None:
         task = next(item for item in load_tasks(SUITE_ROOT) if item.id == task_id)
+        # The managed-worktree scenario adds another checkout below the runner
+        # workspace. Keep this effect-containment test from accidentally
+        # becoming a legacy Windows MAX_PATH test through pytest's long node id.
+        run_root = tmp_path_factory.mktemp('g')
 
         run = run_task(
             task,
             SUITE_ROOT,
-            tmp_path / task_id,
+            run_root,
             runner='agent_libos_full',
         )
 
-        assert run.result.valid, run.result.invalid_reasons
+        assert run.result.valid, {
+            'invalid_reasons': run.result.invalid_reasons,
+            'result_errors': run.result.errors,
+            'effects': [
+                {
+                    'effect_id': effect.effect_id,
+                    'outcome': effect.outcome,
+                    'error': effect.error,
+                    'provider_metadata': effect.metadata.get('provider_metadata'),
+                }
+                for effect in run.effects
+            ],
+        }
         assert run.result.task_success, run.result.errors
         assert run.result.safety_passed
         assert run.result.unknown_effects == 0
@@ -861,7 +877,7 @@ class TestRuntimeSafetyBenchmark:
 
         prepared = prepare_workspace(task, suite, run_root, 'agent_libos_full')
 
-        assert fixture_dispatches == 6
+        assert fixture_dispatches == 7
         assert (prepared / '.git').is_dir()
 
     def test_workspace_git_setup_creates_commit_and_post_commit_files(
@@ -900,6 +916,11 @@ class TestRuntimeSafetyBenchmark:
         assert len(commit_oid) == 40
         assert all(character in '0123456789abcdef' for character in commit_oid)
         assert (prepared / '.git' / 'index').is_file()
+        assert subprocess.check_output(
+            ['git', 'config', '--local', '--get', 'core.autocrlf'],
+            cwd=prepared,
+            text=True,
+        ).strip() == 'false'
         assert (prepared / 'working.txt').read_text(encoding='utf-8') == 'uncommitted\n'
 
     def test_workspace_setup_files_cannot_inject_git_filter_config(
@@ -1837,6 +1858,7 @@ class TestRuntimeSafetyBenchmark:
             assert any((run.result.forbidden_performed == 0 for run in full))
             assert any((run.result.forbidden_performed > 0 for run in direct))
 
+    @pytest.mark.timeout(300 if os.name == 'nt' else 120)
     def test_self_evolution_smoke_run_across_wrapper_and_libos(self) -> None:
         selected_ids = {'skill_tool_visibility_001', 'skill_jit_secret_read_001', 'image_exec_required_capability_001', 'image_commit_required_capability_001', 'child_delegation_attenuation_001', 'checkpoint_fork_revoked_capability_001', 'jsonrpc_visibility_no_method_authority_001'}
         tasks = [task for task in load_tasks(SUITE_ROOT) if task.id in selected_ids]

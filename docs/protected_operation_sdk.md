@@ -123,14 +123,22 @@ represented only by their hash. The handler has the signature
 record, and may repair only local state in the current RuntimeStore transaction.
 It must not call a provider or perform another non-transactional side effect.
 On startup, under the internal recovery lease, the SDK validates the stored
-metadata and reservation bindings, runs the handler, restores still-live
-reservations, and abandons the intent in one transaction. A missing handler,
-invalid or mismatched recovery metadata, or handler exception fails recovery;
-the transaction rolls back, the prepared intent and reservations remain, and
-Runtime startup does not continue to general provider reconciliation. Restore
-the compatible trusted handler or repair the trusted store state instead of
-replaying the provider call. A `prepared` SDK intent is never sent to a provider
-reconciler because no provider phase was dispatched.
+metadata and reservation bindings, runs the handler, restores the reservations,
+and abandons the intent in one transaction. Every linked reservation ID must be
+unique, present, still in `reserved` state, carry the exact JSON-integer count
+`1`, and be bound to the stored actor and contract reason. Prepare also appends
+an immutable `effect_reservation` operation-evidence link containing the exact
+effect, capability, count, contract, and actor. Recovery requires one
+unambiguous effect/operation link plus matching reservation and direct-effect
+links; the reservation row's `cap_id` and count must agree with both. A missing
+handler, missing or non-live reservation, duplicate link, missing/ambiguous or
+mismatched evidence, failed restoration, or handler exception fails recovery;
+the transaction rolls back, the prepared intent and any existing reservation
+rows remain unchanged, and Runtime startup does not continue to general
+provider reconciliation. A prepared row from an older development build that
+lacks the direct binding fails closed and requires trusted store repair or
+recreation; do not replay the provider call. A `prepared` SDK intent is never
+sent to a provider reconciler because no provider phase was dispatched.
 
 An invocation contains full canonical arguments and a separate safe
 observation. The SDK hashes canonical arguments for approval/idempotency
@@ -402,7 +410,11 @@ unknown evidence, and never invokes the sink again.
 ## Prepare, settle, and compensation hooks
 
 `prepare`, `restore_not_started`, `settle_success`, and `failure_settlement`
-may mutate only local transactional state. They must not call a provider.
+are synchronous hooks that may mutate only local transactional state. They
+must not call a provider. Returning an awaitable, generator, or async generator
+is rejected and the containing transaction fails closed rather than silently
+discarding deferred work; ordinary eager synchronous return values have no
+meaning.
 `failure_settlement(error, phase)` runs at most once, in its own transaction,
 only after dispatch may have crossed a provider boundary; it is not run for a
 first-phase `ProviderEffectNotStarted`. It lets a primitive preserve local

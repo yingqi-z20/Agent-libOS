@@ -58,6 +58,7 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
       path,
       content: newText,
       overwrite: false,
+      expected_content_sha256: "missing",
     });
     return { path: write.path ?? path, created: Boolean(write.created), edit: "create" };
   }
@@ -102,10 +103,20 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
   if (updated === content) {
     return { path: file.path ?? path, changed: false, edit, replacements };
   }
+  const expectedContentSha256 = file.content_sha256;
+  if (
+    typeof expectedContentSha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(expectedContentSha256)
+  ) {
+    throw new Error(
+      "filesystem.read_text did not return a complete content_sha256 version token",
+    );
+  }
   const write = await libos.syscall("filesystem.write_text", {
     path,
     content: updated,
     overwrite: true,
+    expected_content_sha256: expectedContentSha256,
   });
   return {
     path: write.path ?? path,

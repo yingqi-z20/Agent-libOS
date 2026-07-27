@@ -13,7 +13,9 @@ uv run python experiments/run_practical_evaluation.py \
 
 The command always writes the same JSON document to stdout. When `--output` is
 provided, it also creates parent directories and writes that document, followed
-by a newline, to the selected path.
+by a newline, to the selected path. Output is reserved before evaluation and
+atomically replaced only with a complete report. Failed reruns leave a
+non-favorable marker and retain the prior complete artifact beside it.
 
 ## Evidence levels
 
@@ -32,6 +34,18 @@ by a newline, to the selected path.
 The stateful mail, CRM, and calendar provider used by `native-live` scenarios is
 local deterministic evaluation infrastructure. It is not evidence of production
 connector interoperability.
+
+Native rows currently support only `expected_outcome: committed`; unsupported
+outcomes fail before a Tool call or external effect. `tool_calls` counts calls
+at the attempt boundary, including returned failures and raised exceptions.
+The deterministic DNS patch is serialized and intercepts only the fixed
+`connector.example.test` hostname; unrelated in-process lookups delegate to
+the original resolver.
+
+Modeled `task_family`, `variant`, and `attack_type` values must be actual
+non-whitespace strings before benign/attack relationships are evaluated. For
+programmatic selection, only `None` selects the default catalog; an explicit
+empty list, tuple, or iterator evaluates zero scenarios.
 
 ## Report schema v1
 

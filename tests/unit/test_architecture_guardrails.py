@@ -274,6 +274,30 @@ class TestArchitectureGuardrails:
                 for error in errors
             ), (relative, errors)
 
+    def test_jit_projection_sql_local_name_indirection_is_detected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        relative = "agent_libos/tools/sample.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(
+            tmp_path,
+            relative,
+            "SQL = 'DELETE FROM tools WHERE tool_id = ?'\n"
+            "def mutate(cursor, tool_id):\n"
+            "    statement = SQL\n"
+            "    cursor.execute(statement, (tool_id,))\n",
+        )
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any(
+            "runtime-storage-sql-bypass" in error
+            and "raw-jit-projection-sql:tools" in error
+            for error in errors
+        )
+
     @pytest.mark.parametrize(
         "relative",
         [

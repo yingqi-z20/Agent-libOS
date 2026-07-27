@@ -110,6 +110,9 @@ from agent_libos.models.exceptions import (
 from agent_libos.models.snapshot import SnapshotRows
 
 
+_THREAD_SYNC_TIMEOUT_S = 30.0
+
+
 STORE_BACKENDS = [
     "sqlite-memory",
     "sqlite-file",
@@ -353,12 +356,12 @@ class _RegistryDispatchBarrierProvider:
         self.mcp_call_tool_calls += 1
         return McpProviderCallResult(
             structured_content={"echo": dict(arguments)},
-            response_bytes=16,
+            response_bytes=512,
             duration_s=0.01,
             list_request_bytes=8,
-            list_response_bytes=8,
+            list_response_bytes=512,
             call_request_bytes=8,
-            call_response_bytes=8,
+            call_response_bytes=512,
             call_started=True,
         )
 
@@ -380,7 +383,7 @@ class _RegistryDispatchBarrierProvider:
                     },
                 )
             ],
-            response_bytes=16,
+            response_bytes=512,
             duration_s=0.01,
         )
 
@@ -818,7 +821,10 @@ def test_typed_provider_spec_integer_timeout_is_canonical_across_reopen(
             if adapter == "jsonrpc":
                 spec = replace(
                     _registry_contract_endpoint("canonical-timeout-jsonrpc"),
-                    timeout_s=1,
+                    # This contract exercises integer/float canonicalization,
+                    # not the provider deadline. Leave enough dispatch budget
+                    # for a loaded Windows runner.
+                    timeout_s=30,
                 )
                 assert type(spec.timeout_s) is int
                 runtime.jsonrpc.register_endpoint(
@@ -839,7 +845,7 @@ def test_typed_provider_spec_integer_timeout_is_canonical_across_reopen(
             else:
                 spec = replace(
                     _registry_contract_http_mcp_server("canonical-timeout-mcp"),
-                    timeout_s=1,
+                    timeout_s=30,
                 )
                 assert type(spec.timeout_s) is int
                 runtime.mcp.register_server(
@@ -878,7 +884,7 @@ def test_typed_provider_spec_integer_timeout_is_canonical_across_reopen(
             monkeypatch.setattr(
                 reopened.jsonrpc if adapter == "jsonrpc" else reopened.mcp,
                 "_validate_runtime_resolution",
-                lambda _spec: ("93.184.216.34",),
+                lambda _spec, **_kwargs: ("93.184.216.34",),
             )
             if adapter == "jsonrpc":
                 reopened.jsonrpc.provider = provider
@@ -1078,7 +1084,7 @@ def test_provider_approval_revalidates_registry_binding_before_first_dispatch(
             monkeypatch.setattr(
                 runtime.mcp,
                 "_validate_runtime_resolution",
-                lambda spec: resolution_calls.append(spec.http.url)
+                lambda spec, **_kwargs: resolution_calls.append(spec.http.url)
                 or ("93.184.216.34",),
             )
             invoke = lambda: runtime.mcp.call_tool(
@@ -1133,7 +1139,12 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
         provider = _RegistryDispatchBarrierProvider()
         runtime.jsonrpc.provider = provider
         pid = runtime.process.spawn(goal="registry phase linearization")
-        endpoint = _registry_contract_endpoint("inflight-registry-jsonrpc")
+        endpoint = replace(
+            _registry_contract_endpoint("inflight-registry-jsonrpc"),
+            # The synchronization barrier below may wait for 30 seconds on a
+            # loaded CI host; this contract test is not exercising deadlines.
+            timeout_s=60.0,
+        )
         runtime.jsonrpc.register_endpoint(
             endpoint,
             actor="test.host",
@@ -1168,7 +1179,7 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
 
         def mutate_registry() -> None:
             try:
-                assert release_mutation.wait(timeout=5)
+                assert release_mutation.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
                 mutation_attempted.set()
                 runtime.jsonrpc.register_endpoint(
                     replacement,
@@ -1195,7 +1206,9 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
                 phase_count += 1
                 if phase_count == 2:
                     release_mutation.set()
-                    assert mutation_attempted.wait(timeout=5)
+                    assert mutation_attempted.wait(
+                        timeout=_THREAD_SYNC_TIMEOUT_S
+                    )
                     assert not mutation_done.is_set()
 
         monkeypatch.setattr(
@@ -1217,7 +1230,7 @@ def test_provider_registry_mutation_serializes_after_inflight_phase(
             )
         finally:
             release_mutation.set()
-            worker.join(timeout=5)
+            worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
 
         assert not worker.is_alive()
         assert mutation_errors == []
@@ -1293,7 +1306,7 @@ def test_mcp_list_tools_revalidates_registry_binding_before_first_dispatch(
         monkeypatch.setattr(
             runtime.mcp,
             "_validate_runtime_resolution",
-            lambda spec: resolution_calls.append(spec.http.url)
+            lambda spec, **_kwargs: resolution_calls.append(spec.http.url)
             or ("93.184.216.34",),
         )
 
@@ -2316,7 +2329,7 @@ def test_active_exec_admission_rejects_tokenless_host_patch_before_write(
 
         def block_skills(*_args: object, **_kwargs: object) -> None:
             entered.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
 
         def run_exec() -> None:
             try:
@@ -2327,7 +2340,7 @@ def test_active_exec_admission_rejects_tokenless_host_patch_before_write(
         monkeypatch.setattr(runtime.image_boot, "_configure_skills", block_skills)
         worker = threading.Thread(target=run_exec)
         worker.start()
-        assert entered.wait(timeout=10)
+        assert entered.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
         before_row, before_counters = _raw_process_row_and_counters(runtime, pid)
 
         with pytest.raises(
@@ -2341,7 +2354,7 @@ def test_active_exec_admission_rejects_tokenless_host_patch_before_write(
         assert after_counters == before_counters
 
         release.set()
-        worker.join(timeout=10)
+        worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
         assert not worker.is_alive()
         assert errors == []
         committed = runtime.process.get(pid)
@@ -2532,7 +2545,7 @@ def test_exec_rollback_cas_preserves_trusted_control_winner_and_fences_runtime(
 
         def fail_after_control(*_args: object, **_kwargs: object) -> None:
             entered.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
             raise primary
 
         def run_exec() -> None:
@@ -2544,7 +2557,7 @@ def test_exec_rollback_cas_preserves_trusted_control_winner_and_fences_runtime(
         monkeypatch.setattr(runtime.image_boot, "_configure_skills", fail_after_control)
         worker = threading.Thread(target=run_exec)
         worker.start()
-        assert entered.wait(timeout=10)
+        assert entered.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
         admitted = runtime.process.get(pid)
         assert admitted.status == ProcessStatus.RUNNING
         assert admitted.execution_owner_id is not None
@@ -2574,7 +2587,7 @@ def test_exec_rollback_cas_preserves_trusted_control_winner_and_fences_runtime(
         assert runtime.store.get_object(reason_oid) is not None
 
         release.set()
-        worker.join(timeout=10)
+        worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
         assert not worker.is_alive()
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeRecoveryRequired)
@@ -2613,7 +2626,7 @@ def test_exec_rollback_preserves_resource_limit_takeover_winner(
 
         def fail_after_limit(*_args: object, **_kwargs: object) -> None:
             entered.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
             raise RuntimeError("injected late exec failure after resource limit")
 
         def run_exec() -> None:
@@ -2625,7 +2638,7 @@ def test_exec_rollback_preserves_resource_limit_takeover_winner(
         monkeypatch.setattr(runtime.image_boot, "_configure_skills", fail_after_limit)
         worker = threading.Thread(target=run_exec)
         worker.start()
-        assert entered.wait(timeout=10)
+        assert entered.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
 
         runtime.resources.kill_if_exceeded(pid, reason="resource ceiling reached")
         winner = runtime.process.get(pid)
@@ -2634,7 +2647,7 @@ def test_exec_rollback_preserves_resource_limit_takeover_winner(
         assert winner.outcome.code == "resource_limit_exceeded"
 
         release.set()
-        worker.join(timeout=10)
+        worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
         assert not worker.is_alive()
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeRecoveryRequired)
@@ -2663,7 +2676,7 @@ def test_exec_recovery_requires_startup_lease_before_reading_live_publication(
 
         def block_skills(*_args: object, **_kwargs: object) -> None:
             entered.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
 
         def run_exec() -> None:
             try:
@@ -2674,7 +2687,7 @@ def test_exec_recovery_requires_startup_lease_before_reading_live_publication(
         monkeypatch.setattr(runtime.image_boot, "_configure_skills", block_skills)
         worker = threading.Thread(target=run_exec)
         worker.start()
-        assert entered.wait(timeout=10)
+        assert entered.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
         publication = [
             item
             for item in runtime.store.list_runtime_publications(pid=pid)
@@ -2702,7 +2715,7 @@ def test_exec_recovery_requires_startup_lease_before_reading_live_publication(
         assert runtime.store.get_runtime_publication(publication["publication_id"]) == before
 
         release.set()
-        worker.join(timeout=10)
+        worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
         assert not worker.is_alive()
         assert errors == []
         committed = runtime.store.get_runtime_publication(publication["publication_id"])
@@ -4824,6 +4837,161 @@ def test_runtime_store_contract_data_flow_registry_decisions_and_file_labels(
 
 
 @pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_process_message_ack_is_unread_cas_and_preserves_envelope(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="message ack CAS")
+        posted = runtime.messages.post(
+            sender="test.host",
+            recipient_pid=pid,
+            channel="control",
+            correlation_id="job-1",
+            subject="preserve subject",
+            body="preserve body",
+            payload={"preserve": True},
+            metadata={"custom": "original"},
+        )
+        selected = runtime.store.get_process_message(posted.message_id)
+        assert selected is not None
+        expected_metadata = dict(selected.metadata)
+        concurrent_metadata = {**expected_metadata, "concurrent": "preserved"}
+        assert runtime.store.update_process_message_metadata(
+            posted.message_id,
+            recipient_pid=pid,
+            expected_metadata=expected_metadata,
+            metadata=concurrent_metadata,
+            updated_at="metadata-updated",
+        )
+
+        assert runtime.store.ack_process_message(
+            posted.message_id,
+            recipient_pid=pid,
+            acked_at="first-ack",
+            updated_at="first-ack-updated",
+        )
+        acked = runtime.store.get_process_message(posted.message_id)
+        assert acked is not None
+        assert acked.status == ProcessMessageStatus.ACKED
+        assert acked.acked_at == "first-ack"
+        assert acked.updated_at == "first-ack-updated"
+        assert acked.sender == "test.host"
+        assert acked.channel == "control"
+        assert acked.correlation_id == "job-1"
+        assert acked.subject == "preserve subject"
+        assert acked.body == "preserve body"
+        assert acked.payload == {"preserve": True}
+        assert acked.metadata == concurrent_metadata
+
+        assert not runtime.store.ack_process_message(
+            posted.message_id,
+            recipient_pid=pid,
+            acked_at="second-ack",
+            updated_at="second-ack-updated",
+        )
+        assert runtime.store.get_process_message(posted.message_id) == acked
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_checkpoint_rejects_non_json_native_payload_without_type_loss(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        pid = runtime.process.spawn(goal="strict checkpoint object payload")
+        handle = runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {"coordinates": (1, 2)},
+            name="tuple-payload",
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match="checkpoint snapshot contains non-JSON value tuple",
+        ):
+            runtime.checkpoint.create(
+                pid,
+                "must not stringify or coerce payload types",
+                actor=pid,
+            )
+
+        assert runtime.store.list_checkpoints(pid) == []
+        assert runtime.process.get(pid).checkpoint_head is None
+        stored = runtime.store.get_object(handle.oid)
+        assert stored is not None
+        assert stored.payload == {"coordinates": (1, 2)}
+        assert isinstance(stored.payload["coordinates"], tuple)
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_exec_snapshot_rows_and_payload_share_one_store_snapshot(
+    kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        pid = runtime.process.spawn(goal="atomic exec snapshot payload")
+        handle = runtime.memory.create_object(
+            pid,
+            ObjectType.ARTIFACT,
+            {"version": 1},
+            name="exec-snapshot-payload",
+            immutable=False,
+        )
+        object_rows_selected = threading.Event()
+        writer_started = threading.Event()
+        writer_finished = threading.Event()
+        writer_errors: list[BaseException] = []
+        snapshots = runtime.uow.snapshots
+        original_owned_rows = snapshots._owned_object_rows
+
+        def coordinated_owned_rows(selected_pid: str) -> list[dict[str, object]]:
+            rows = original_owned_rows(selected_pid)
+            object_rows_selected.set()
+            assert writer_started.wait(timeout=5)
+            # Snapshot capture owns the transaction here, so the payload
+            # update cannot commit between its row and cache reads.
+            writer_finished.wait(timeout=0.2)
+            return rows
+
+        monkeypatch.setattr(snapshots, "_owned_object_rows", coordinated_owned_rows)
+
+        def update_payload() -> None:
+            try:
+                assert object_rows_selected.wait(timeout=5)
+                writer_started.set()
+                runtime.memory.update_object(
+                    pid,
+                    handle,
+                    ObjectPatch(payload={"version": 2}),
+                )
+            except BaseException as exc:
+                writer_errors.append(exc)
+            finally:
+                writer_finished.set()
+
+        writer = threading.Thread(target=update_payload, daemon=True)
+        writer.start()
+        rows, payloads = snapshots.capture_process_exec_snapshot_rows(
+            pid,
+            process_namespace=runtime.memory.process_namespace(pid),
+        )
+        writer.join(timeout=5)
+
+        assert not writer.is_alive()
+        assert writer_errors == []
+        object_row = next(row for row in rows.objects if row["oid"] == handle.oid)
+        assert object_row["version"] == 1
+        assert payloads[handle.oid] == {"version": 1}
+        current = runtime.store.get_object(handle.oid)
+        assert current is not None
+        assert current.version == 2
+        assert current.payload == {"version": 2}
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
 def test_legacy_process_message_envelope_marker_remains_user_payload(
     kind: str,
     tmp_path: Path,
@@ -5615,42 +5783,7 @@ def test_prepared_recovery_handler_store_write_rolls_back_with_intent_and_reserv
             CapabilityRight.READ,
             consume=False,
         )
-        reservation_id = runtime.capability.reserve_decision_use(
-            decision,
-            used_by=pid,
-            reason=f"protected operation reserved authority for {contract_name}",
-        )
-        assert reservation_id is not None
-
         now = utc_now()
-        effect_id = f"effect-prepared-recovery-rollback-{uuid4().hex}"
-        runtime.store.insert_external_effect(
-            ExternalEffectRecord(
-                effect_id=effect_id,
-                record_id=None,
-                event_id=None,
-                pid=pid,
-                provider="test",
-                operation="prepared_recovery_rollback",
-                target=capability.resource,
-                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
-                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
-                state_mutation=True,
-                information_flow=False,
-                provider_metadata={
-                    "protected_operation": {
-                        "contract_name": contract_name,
-                        "actor": pid,
-                        "reservation_ids": [reservation_id],
-                        "prepared_recovery": "test_prepared_repair_rollback",
-                    }
-                },
-                created_at=now,
-                effect_state="pending",
-                transaction_state="prepared",
-                updated_at=now,
-            )
-        )
         repair_marker = HumanRequest(
             request_id=f"hreq-prepared-repair-{uuid4().hex}",
             pid=pid,
@@ -5679,6 +5812,52 @@ def test_prepared_recovery_handler_store_write_rolls_back_with_intent_and_reserv
             "test_prepared_repair_rollback",
             recover,
         )
+        contract = ProtectedOperationContract(
+            name=contract_name,
+            provider="test",
+            operation="prepared_recovery_rollback",
+            evidence_roles=("audit", "event", "effect"),
+            resource_policy=ResourcePolicy.NONE,
+            state_mutation=True,
+            prepared_recovery="test_prepared_repair_rollback",
+        )
+        runtime.protected_operations.register_contract(contract)
+
+        class Provider:
+            def classify_external_effect(self, _operation, _context, _result):
+                return ExternalEffectClassification(
+                    rollback_class=(
+                        ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+                    ),
+                    rollback_status=(
+                        ExternalEffectRollbackStatus.NOT_REQUIRED
+                    ),
+                    state_mutation=True,
+                    information_flow=False,
+                )
+
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
+            actor=pid,
+            target=capability.resource,
+            decisions=(decision,),
+            canonical_args={"item": "prepared repair"},
+            observation={"item_sha256": "safe"},
+        )
+        operation = runtime.protected_operations.start(
+            contract,
+            invocation,
+            provider=Provider(),
+        )
+        operation.__enter__()
+        effect_id = operation.effect_id
+        assert effect_id is not None
+        reservation_id = operation._reservation_ids[0]
+        scope = operation._operation_cm
+        assert scope is not None
+        interrupted = RuntimeError("simulated runtime crash")
+        scope.__exit__(type(interrupted), interrupted, interrupted.__traceback__)
+        operation._operation_cm = None
         monkeypatch.setattr(
             runtime.protected_operations,
             "_require_recovery_lease",

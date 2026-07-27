@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from jsonschema import Draft202012Validator
 from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
-from jsonschema import validate as jsonschema_validate
 
 from agent_libos.config import AgentLibOSConfig
 from agent_libos.memory.data_labels import propagate_object_labels
@@ -63,17 +63,23 @@ from agent_libos.tools.base import (
     ToolResult,
     attach_wait_data_flow_context,
     bounded_failure_model_projection,
+    exception_failure_provenance,
     model_safe_tool_error_message,
     tool_result_content_duplicates_data,
     wait_data_flow_context,
 )
+from agent_libos.tools.jit import JITSchemaDialectError, validate_jit_json_schema
 from agent_libos.tools.observability import ensure_json_size, sanitize_for_observability
 from agent_libos.tools.registry import ToolRegistry
-from agent_libos.tools.sandbox import SandboxBackend, SandboxExecutionResult
+from agent_libos.tools.sandbox import (
+    SandboxBackend,
+    SandboxExecutionResult,
+    sandbox_failure_metrics,
+)
 from agent_libos.utils.ids import new_id
 from agent_libos.utils.public_errors import (
-    provider_error_envelope,
-    public_exception_message,
+    internal_exception_observation,
+    public_error_envelope,
 )
 
 
@@ -86,6 +92,10 @@ _TOOL_CALLABLE_PROCESS_STATUSES = {
     ProcessStatus.RUNNABLE,
     ProcessStatus.RUNNING,
 }
+_DEFERRED_PROCESS_MESSAGE_ACK_METADATA_KEY = "_deferred_process_message_ack_ids"
+_PROCESS_MESSAGE_READ_TOOLS = frozenset(
+    {"read_process_messages", "receive_process_messages"}
+)
 
 
 class JITSyscallSession(Protocol):
@@ -119,9 +129,10 @@ class _InvocationOutput:
     result_was_omitted: bool = False
     ok: bool = True
     error: str | None = None
-    host_error: str | None = None
     policy_decision: str = "allow"
     structured_failure: bool = False
+    error_observation: dict[str, Any] | None = None
+    deferred_process_message_ack_ids: tuple[str, ...] = ()
 
 
 class ToolExecutionService:
@@ -281,12 +292,6 @@ class ToolExecutionService:
         except ProcessMessageWaitRequired as exc:
             self._record_wait(prepared, exc, started_at)
             raise
-        except ValueError as exc:
-            output = self._invocation_error_output(
-                prepared,
-                exc,
-                policy_decision="validation_error",
-            )
         except Exception as exc:
             output = self._invocation_error_output(
                 prepared,
@@ -371,7 +376,7 @@ class ToolExecutionService:
                 handle,
                 resource,
                 call_id,
-                str(exc),
+                exc,
                 policy_decision="resource_limit",
             )
         try:
@@ -386,14 +391,22 @@ class ToolExecutionService:
                 handle,
                 resource,
                 call_id,
-                str(exc),
+                exc,
                 policy_decision="validation_error",
             )
         self._events.emit(
             EventType.TOOL_CALLED,
             source=pid,
             target=resource,
-            payload={"call_id": call_id, "args": sanitize_for_observability(args)},
+            payload={
+                "call_id": call_id,
+                "args": sanitize_for_observability(
+                    args,
+                    preview_chars=(
+                        self._config.tools.tool_observability_preview_chars
+                    ),
+                ),
+            },
         )
         return _Invocation(pid, handle, call_id, resource, context_metadata)
 
@@ -449,17 +462,30 @@ class ToolExecutionService:
         handle: ToolHandle,
         resource: str,
         call_id: str,
-        error: str,
+        failure: BaseException,
         *,
         policy_decision: str,
     ) -> ToolCallResult:
+        error = (
+            "Tool call arguments exceed the configured Host size limit."
+            if policy_decision == "validation_error"
+            else "Tool call resource budget was exceeded before execution."
+        )
+        public_error = public_error_envelope(
+            failure,
+            code=policy_decision,
+        )
+        observed = internal_exception_observation(
+            failure,
+            correlation_id=public_error["correlation_id"],
+        )
         self._events.emit(
             EventType.TOOL_FAILED,
             source=resource,
             target=pid,
             payload={
                 "call_id": call_id,
-                "error": error,
+                "error": observed,
                 "policy_decision": policy_decision,
             },
         )
@@ -471,8 +497,9 @@ class ToolExecutionService:
                 "ok": False,
                 "tool": handle.name,
                 "policy_decision": policy_decision,
-                "error": error,
+                "error": observed,
             },
+            correlation_id=public_error["correlation_id"],
         )
         projection = self._failure_model_projection(
             code=(
@@ -486,7 +513,10 @@ class ToolExecutionService:
                 else "ResourceLimitExceeded"
             ),
             message=error,
-            details={"code": policy_decision},
+            details={
+                key: public_error[key]
+                for key in ("code", "error_type", "correlation_id")
+            },
         )
         return ToolCallResult(
             call_id=call_id,
@@ -508,6 +538,10 @@ class ToolExecutionService:
             tool_result = await implementation.ainvoke(
                 args,
                 self._context(invocation),
+            )
+            deferred_ack_ids = self._deferred_process_message_ack_ids(
+                invocation,
+                tool_result,
             )
             tool_metadata = self._merge_returned_context(dict(tool_result.metadata))
             tool_result.metadata = tool_metadata
@@ -537,12 +571,40 @@ class ToolExecutionService:
             return _InvocationOutput(
                 payload=payload,
                 result_payload=result_payload,
+                deferred_process_message_ack_ids=deferred_ack_ids,
             )
         if not self._registry.is_jit(invocation.handle.tool_id):
             raise NotFound(
                 f"tool implementation not loaded: {invocation.handle.tool_id}"
             )
         return await self._invoke_jit(invocation, args)
+
+    def _deferred_process_message_ack_ids(
+        self,
+        invocation: _Invocation,
+        result: ToolResult,
+    ) -> tuple[str, ...]:
+        raw = result.metadata.pop(
+            _DEFERRED_PROCESS_MESSAGE_ACK_METADATA_KEY,
+            None,
+        )
+        if raw is None:
+            return ()
+        if invocation.handle.name not in _PROCESS_MESSAGE_READ_TOOLS:
+            raise ValidationError(
+                "only built-in process message reads may defer mailbox acknowledgements"
+            )
+        if (
+            not isinstance(raw, list)
+            or not raw
+            or any(not isinstance(message_id, str) or not message_id for message_id in raw)
+            or len(set(raw)) != len(raw)
+            or len(raw) > self._config.tools.message_read_hard_limit
+        ):
+            raise ValidationError(
+                "deferred process message acknowledgement ids are malformed"
+            )
+        return tuple(raw)
 
     def _merge_returned_context(self, metadata: dict[str, Any]) -> dict[str, Any]:
         inbound = metadata.get("data_flow_context")
@@ -564,7 +626,10 @@ class ToolExecutionService:
         invocation: _Invocation,
         args: dict[str, Any],
     ) -> _InvocationOutput:
-        self.validate_jit_arguments(invocation.handle, args)
+        try:
+            self.validate_jit_arguments(invocation.handle, args)
+        except Exception as exc:
+            return self._input_validation_error_output(invocation, exc)
         session = self._jit_session_factory(invocation.pid)
         source = self._registry.jit_source(invocation.handle.tool_id)
         if source is None:
@@ -605,12 +670,62 @@ class ToolExecutionService:
             jit_session=session,
         )
 
+    def _input_validation_error_output(
+        self,
+        invocation: _Invocation,
+        error: Exception,
+    ) -> _InvocationOutput:
+        safe_message = "JIT tool arguments failed Host schema validation."
+        public_error = public_error_envelope(
+            error,
+            code=ToolErrorCode.VALIDATION_ERROR.value,
+        )
+        observation = internal_exception_observation(
+            error,
+            correlation_id=public_error["correlation_id"],
+        )
+        public_details: dict[str, Any] = {
+            "code": public_error["code"],
+            "error_type": "InputValidationError",
+            "correlation_id": public_error["correlation_id"],
+        }
+        durable_payload = {
+            "ok": False,
+            "error": {
+                "type": "InputValidationError",
+                "message": safe_message,
+                **public_details,
+            },
+            "internal_error": observation,
+            "policy_decision": "validation_error",
+        }
+        projection = self._failure_model_projection(
+            code=ToolErrorCode.VALIDATION_ERROR,
+            error_type="InputValidationError",
+            message=safe_message,
+            details=public_details,
+        )
+        return _InvocationOutput(
+            payload=projection,
+            result_payload=durable_payload,
+            ok=False,
+            error=self._projection_safe_message(
+                projection,
+                fallback=safe_message,
+            ),
+            policy_decision="validation_error",
+            error_observation=observation,
+        )
+
     def _structured_failure(
         self,
         invocation: _Invocation,
         tool_result: ToolResult,
         started_at: float,
     ) -> _InvocationOutput:
+        provenance = exception_failure_provenance(tool_result)
+        if provenance is not None:
+            return self._caught_exception_failure(invocation, tool_result, provenance)
         error = tool_result.error.message if tool_result.error else tool_result.content
         payload = tool_result.model_dump(mode="json")
         projection = tool_result.model_projection(
@@ -626,22 +741,100 @@ class ToolExecutionService:
             structured_failure=True,
         )
 
+    def _caught_exception_failure(
+        self,
+        invocation: _Invocation,
+        tool_result: ToolResult,
+        provenance: Any,
+    ) -> _InvocationOutput:
+        input_validation = provenance.phase == "input_validation"
+        if input_validation:
+            # Do not read the mutable ToolResult message after provenance was
+            # attached.  A nested caller could otherwise rewrite a genuine
+            # validation result before returning it from another tool.
+            error = f"Invalid arguments for tool `{invocation.handle.name}`."
+            error_type = "InputValidationError"
+        else:
+            error = provenance.message
+            error_type = provenance.error_type
+        public_details: dict[str, Any] = {
+            "code": provenance.code,
+            "error_type": error_type,
+            "correlation_id": provenance.correlation_id,
+        }
+        if input_validation:
+            # Read guidance from the immutable exception provenance, not the
+            # mutable ToolResult carrier. This keeps nested tools from forging
+            # model-facing validation advice while preserving safe recovery.
+            public_details.update(provenance.validation_details())
+        if tool_result.error is not None:
+            receipt = tool_result.error.details.get("checkpoint_fork_receipt")
+            if isinstance(receipt, dict):
+                public_details["checkpoint_fork_receipt"] = dict(receipt)
+        durable_payload = {
+            "ok": False,
+            "error": {
+                "type": error_type,
+                "message": error,
+                **public_details,
+                "details": dict(public_details),
+            },
+            "internal_error": provenance.observation(),
+            "policy_decision": "validation_error" if input_validation else "allow",
+        }
+        projection = bounded_failure_model_projection(
+            code=(
+                ToolErrorCode.VALIDATION_ERROR.value
+                if input_validation
+                else tool_result.error.code.value
+                if tool_result.error is not None
+                else ToolErrorCode.EXECUTION_ERROR.value
+            ),
+            error_type=error_type,
+            message=error,
+            retryable=(
+                bool(tool_result.error.retryable)
+                if tool_result.error is not None
+                else False
+            ),
+            details=public_details,
+            metadata={"data_flow_context": self._data_flow.current_context()},
+            limit_bytes=self._tool_result_persistence_limit(),
+        )
+        safe_error = self._projection_safe_message(projection, fallback=error)
+        return _InvocationOutput(
+            payload=projection,
+            result_payload=durable_payload,
+            ok=False,
+            error=safe_error,
+            policy_decision=("validation_error" if input_validation else "allow"),
+            error_observation=provenance.observation(),
+        )
+
     def _subprocess_limit_result(
         self,
         invocation: _Invocation,
         exc: SubprocessLimitExceeded,
     ) -> ToolCallResult:
-        self._handle_subprocess_limit(invocation, exc)
-        result_handle = self._persist_exception_tool_failure(
+        failure = self._handle_subprocess_limit(invocation, exc)
+        result_handle, public_error, observed = self._persist_exception_tool_failure(
             invocation,
-            error=exc,
+            error=failure,
             policy_decision="resource_limit",
+            code="resource_limit",
+        )
+        self._record_subprocess_failure(
+            invocation,
+            observed,
+            "resource_limit",
+            exc.metrics,
+            result_handle=result_handle,
         )
         projection = self._failure_model_projection(
             code=ToolErrorCode.EXECUTION_ERROR,
-            error_type=type(exc).__name__,
-            message=str(exc),
-            details={"code": "resource_limit"},
+            error_type=public_error["error_type"],
+            message=public_error["message"],
+            details=public_error,
         )
         return ToolCallResult(
             call_id=invocation.call_id,
@@ -649,7 +842,10 @@ class ToolExecutionService:
             result_handle=result_handle,
             payload=projection,
             ok=False,
-            error=self._projection_safe_message(projection, fallback=str(exc)),
+            error=self._projection_safe_message(
+                projection,
+                fallback=public_error["message"],
+            ),
         )
 
     def _subprocess_timeout_result(
@@ -657,19 +853,32 @@ class ToolExecutionService:
         invocation: _Invocation,
         exc: SubprocessTimeoutExpired,
     ) -> ToolCallResult:
-        error = self._handle_subprocess_timeout(invocation, exc)
-        result_handle = self._persist_exception_tool_failure(
+        failure = self._handle_subprocess_timeout(invocation, exc)
+        resource_limited = isinstance(failure, ResourceLimitExceeded)
+        policy_decision = "resource_limit" if resource_limited else "timeout"
+        result_handle, public_error, observed = self._persist_exception_tool_failure(
             invocation,
-            error=exc,
-            policy_decision="timeout",
-            message=error,
+            error=failure,
+            policy_decision=policy_decision,
+            code=policy_decision,
+        )
+        self._record_subprocess_failure(
+            invocation,
+            observed,
+            policy_decision,
+            exc.metrics,
+            result_handle=result_handle,
         )
         projection = self._failure_model_projection(
-            code=ToolErrorCode.TIMEOUT,
-            error_type=type(exc).__name__,
-            message=error,
-            retryable=True,
-            details={"code": "timeout"},
+            code=(
+                ToolErrorCode.EXECUTION_ERROR
+                if resource_limited
+                else ToolErrorCode.TIMEOUT
+            ),
+            error_type=public_error["error_type"],
+            message=public_error["message"],
+            retryable=not resource_limited,
+            details=public_error,
         )
         return ToolCallResult(
             call_id=invocation.call_id,
@@ -677,7 +886,10 @@ class ToolExecutionService:
             result_handle=result_handle,
             payload=projection,
             ok=False,
-            error=self._projection_safe_message(projection, fallback=error),
+            error=self._projection_safe_message(
+                projection,
+                fallback=public_error["message"],
+            ),
         )
 
     def _record_wait(
@@ -725,26 +937,29 @@ class ToolExecutionService:
         *,
         policy_decision: str,
     ) -> _InvocationOutput:
-        error = public_exception_message(exc)
-        public_error = provider_error_envelope(exc)
+        error_code = (
+            ToolErrorCode.VALIDATION_ERROR.value
+            if policy_decision == "validation_error"
+            else ToolErrorCode.EXECUTION_ERROR.value
+        )
+        public_error = public_error_envelope(exc, code=error_code)
+        error = public_error["message"]
+        observation = internal_exception_observation(
+            exc,
+            correlation_id=public_error["correlation_id"],
+        )
         error_payload: dict[str, Any] = {
-            "type": (
-                public_error["error_type"]
-                if public_error is not None
-                else type(exc).__name__
-            ),
+            "type": public_error["error_type"],
             "message": error,
+            **{
+                key: public_error[key]
+                for key in ("code", "error_type", "correlation_id")
+            },
         }
-        if public_error is not None:
-            error_payload.update(
-                {
-                    key: public_error[key]
-                    for key in ("code", "error_type", "correlation_id")
-                }
-            )
         durable_payload = {
             "ok": False,
             "error": error_payload,
+            "internal_error": observation,
             "policy_decision": policy_decision,
         }
         projection = bounded_failure_model_projection(
@@ -765,8 +980,8 @@ class ToolExecutionService:
             result_payload=durable_payload,
             ok=False,
             error=self._projection_safe_message(projection, fallback=error),
-            host_error=self._bounded_host_error(error),
             policy_decision=policy_decision,
+            error_observation=observation,
         )
 
     def _invocation_error_result(
@@ -797,14 +1012,19 @@ class ToolExecutionService:
             invocation,
             payload=output.result_payload,
         )
-        durable_error = output.result_payload.get("error")
-        evidence_message = (
-            durable_error.get("message")
-            if isinstance(durable_error, dict)
-            and isinstance(durable_error.get("message"), str)
-            else output.error or "Tool execution failed."
-        )
-        observed = self._error_observation(evidence_message)
+        observed = output.error_observation
+        if observed is None:
+            # Deliberate ToolResult failures are authored output rather than
+            # caught exceptions.  Their existing bounded observability
+            # projection remains the compatibility path.
+            durable_error = output.result_payload.get("error")
+            evidence_message = (
+                durable_error.get("message")
+                if isinstance(durable_error, dict)
+                and isinstance(durable_error.get("message"), str)
+                else output.error or "Tool execution failed."
+            )
+            observed = self._error_observation(evidence_message)
         event_payload: dict[str, Any] = {
             "call_id": invocation.call_id,
             "error": observed,
@@ -814,7 +1034,8 @@ class ToolExecutionService:
             event_payload["policy_decision"] = output.policy_decision
         if output.structured_failure:
             event_payload["tool_result"] = sanitize_for_observability(
-                output.result_payload
+                output.result_payload,
+                preview_chars=self._config.tools.tool_observability_preview_chars,
             )
         self._events.emit(
             EventType.TOOL_FAILED,
@@ -831,7 +1052,8 @@ class ToolExecutionService:
         }
         if output.structured_failure:
             decision["tool_result"] = sanitize_for_observability(
-                output.result_payload
+                output.result_payload,
+                preview_chars=self._config.tools.tool_observability_preview_chars,
             )
         self._audit.record(
             actor=invocation.pid,
@@ -839,6 +1061,11 @@ class ToolExecutionService:
             target=invocation.resource,
             output_refs=[result_handle.oid] if result_handle else [],
             decision=decision,
+            correlation_id=(
+                str(observed.get("correlation_id"))
+                if isinstance(observed.get("correlation_id"), str)
+                else None
+            ),
         )
         return ToolCallResult(
             call_id=invocation.call_id,
@@ -846,7 +1073,7 @@ class ToolExecutionService:
             result_handle=result_handle,
             payload=output.payload,
             ok=False,
-            error=output.host_error or output.error,
+            error=output.error,
         )
 
     def _bound_result(
@@ -893,12 +1120,17 @@ class ToolExecutionService:
             )
             return output
         except ValidationError as exc:
-            error = str(exc)
+            result_error = exc
         if self.has_side_effects(invocation.handle):
+            omission_reason = "Tool result exceeded the configured Host persistence limit."
             output.result_was_omitted = True
+            # A mailbox page may be consumed only when its exact durable body
+            # is committed. Never ACK a page whose model/result projection was
+            # replaced by the generic side-effect omission receipt.
+            output.deferred_process_message_ack_ids = ()
             output.payload = {
                 "result_omitted": True,
-                "reason": error,
+                "reason": omission_reason,
                 "tool_id": invocation.handle.tool_id,
                 "tool_name": invocation.handle.name,
             }
@@ -910,17 +1142,25 @@ class ToolExecutionService:
                 "artifacts": [],
                 "metadata": {
                     "result_omitted": True,
-                    "omission_reason": error,
+                    "omission_reason": omission_reason,
                 },
             }
             return output
+        public_error = public_error_envelope(
+            result_error,
+            code="result_validation_error",
+        )
+        observed = internal_exception_observation(
+            result_error,
+            correlation_id=public_error["correlation_id"],
+        )
         self._events.emit(
             EventType.TOOL_FAILED,
             source=invocation.resource,
             target=invocation.pid,
             payload={
                 "call_id": invocation.call_id,
-                "error": error,
+                "error": observed,
                 "policy_decision": "validation_error",
             },
         )
@@ -932,17 +1172,18 @@ class ToolExecutionService:
                 "ok": False,
                 "tool": invocation.handle.name,
                 "policy_decision": "validation_error",
-                "error": error,
+                "error": observed,
                 "result": self._oversize_result_observation(),
                 "tool_wall_seconds": self._elapsed(started_at),
             },
+            correlation_id=public_error["correlation_id"],
         )
         projection = bounded_failure_model_projection(
             code=ToolErrorCode.VALIDATION_ERROR.value,
-            error_type="ValidationError",
-            message=error,
+            error_type=public_error["error_type"],
+            message=public_error["message"],
             retryable=False,
-            details=None,
+            details=public_error,
             metadata={"data_flow_context": self._data_flow.current_context()},
             limit_bytes=limit,
         )
@@ -952,7 +1193,10 @@ class ToolExecutionService:
             result_handle=None,
             payload=projection,
             ok=False,
-            error=self._projection_safe_message(projection, fallback=error),
+            error=self._projection_safe_message(
+                projection,
+                fallback=public_error["message"],
+            ),
         )
 
     async def _persist_success(
@@ -962,34 +1206,42 @@ class ToolExecutionService:
         started_at: float,
     ) -> ToolCallResult:
         lifecycle_error: Exception | None = None
-        with self._memory.lifetime_scope(
-            actor=invocation.resource,
-            owner_kind=ObjectOwnerKind.PROCESS,
-            owner_id=invocation.pid,
-            reason="tool_result",
-        ) as result_scope:
-            flow = self._data_flow.current_context()
-            parent_oids, durable_source_refs = self._data_flow.provenance_sources(flow)
-            with self._result_process_mutation_scope(invocation, output):
-                result_handle = result_scope.create_object(
-                    pid=invocation.pid,
-                    object_type=ObjectType.TOOL_RESULT,
-                    payload=output.result_payload,
-                    metadata=self._tool_result_metadata(invocation.handle),
-                    provenance=Provenance(
-                        created_from_action=f"tool.{invocation.handle.name}",
-                        parent_oids=list(parent_oids),
-                        source_refs=list(durable_source_refs),
-                    ),
-                    immutable=True,
-                )
-            if output.jit_session is not None:
-                try:
-                    await output.jit_session.apply_deferred_lifecycle(result_handle)
-                except Exception as exc:
-                    lifecycle_error = exc
-            if lifecycle_error is None:
-                result_scope.commit()
+        persistence_transaction = (
+            self._processes.transaction(include_object_payloads=True)
+            if output.deferred_process_message_ack_ids
+            else nullcontext()
+        )
+        with persistence_transaction:
+            with self._memory.lifetime_scope(
+                actor=invocation.resource,
+                owner_kind=ObjectOwnerKind.PROCESS,
+                owner_id=invocation.pid,
+                reason="tool_result",
+            ) as result_scope:
+                if output.deferred_process_message_ack_ids:
+                    self._commit_process_message_ack(invocation, output)
+                flow = self._data_flow.current_context()
+                parent_oids, durable_source_refs = self._data_flow.provenance_sources(flow)
+                with self._result_process_mutation_scope(invocation, output):
+                    result_handle = result_scope.create_object(
+                        pid=invocation.pid,
+                        object_type=ObjectType.TOOL_RESULT,
+                        payload=output.result_payload,
+                        metadata=self._tool_result_metadata(invocation.handle),
+                        provenance=Provenance(
+                            created_from_action=f"tool.{invocation.handle.name}",
+                            parent_oids=list(parent_oids),
+                            source_refs=list(durable_source_refs),
+                        ),
+                        immutable=True,
+                    )
+                if output.jit_session is not None:
+                    try:
+                        await output.jit_session.apply_deferred_lifecycle(result_handle)
+                    except Exception as exc:
+                        lifecycle_error = exc
+                if lifecycle_error is None:
+                    result_scope.commit()
         if lifecycle_error is not None:
             return self._lifecycle_error_result(
                 invocation,
@@ -1027,6 +1279,46 @@ class ToolExecutionService:
             result_handle=result_handle,
             payload=output.payload,
             ok=True,
+        )
+
+    def _commit_process_message_ack(
+        self,
+        invocation: _Invocation,
+        output: _InvocationOutput,
+    ) -> None:
+        message_ids = list(output.deferred_process_message_ack_ids)
+        self._tool_context_host.messages.ack(invocation.pid, message_ids)
+        committed_messages: dict[str, Any] = {}
+        unresolved = []
+        for message_id in message_ids:
+            message = self._processes.get_process_message(message_id)
+            if (
+                message is None
+                or message.recipient_pid != invocation.pid
+                or message.status.value != "acked"
+            ):
+                unresolved.append(message_id)
+            else:
+                committed_messages[message_id] = message
+        if unresolved:
+            raise ProcessRevisionConflict(
+                "process messages changed before their ToolResult acknowledgement commit"
+            )
+        durable_result = output.result_payload.get("result")
+        if isinstance(durable_result, dict):
+            durable_messages = durable_result.get("messages")
+            if isinstance(durable_messages, list):
+                for item in durable_messages:
+                    if not isinstance(item, dict):
+                        continue
+                    message = committed_messages.get(str(item.get("message_id") or ""))
+                    if message is not None:
+                        item["status"] = message.status.value
+                        item["acked_at"] = message.acked_at
+        ensure_json_size(
+            output.result_payload,
+            self._tool_result_persistence_limit(),
+            "acknowledged process message ToolResult payload",
         )
 
     def _result_process_mutation_scope(
@@ -1121,13 +1413,12 @@ class ToolExecutionService:
         error: Exception,
         started_at: float,
     ) -> ToolCallResult:
-        outward_error = "JIT tool failed while applying deferred lifecycle."
-        result_handle = self._persist_exception_tool_failure(
+        result_handle, public_error, observed = self._persist_exception_tool_failure(
             invocation,
             error=error,
             policy_decision="lifecycle_error",
+            code="lifecycle_error",
         )
-        observed = self._error_observation(outward_error)
         self._events.emit(
             EventType.TOOL_FAILED,
             source=invocation.resource,
@@ -1151,15 +1442,13 @@ class ToolExecutionService:
                 "error": observed,
                 "tool_wall_seconds": self._elapsed(started_at),
             },
+            correlation_id=public_error["correlation_id"],
         )
         projection = self._failure_model_projection(
             code=ToolErrorCode.EXECUTION_ERROR,
-            error_type=type(error).__name__,
-            message=outward_error,
-            details={
-                "code": "lifecycle_error",
-                "policy_decision": "lifecycle_error",
-            },
+            error_type=public_error["error_type"],
+            message=public_error["message"],
+            details={**public_error, "policy_decision": "lifecycle_error"},
         )
         return ToolCallResult(
             call_id=invocation.call_id,
@@ -1169,7 +1458,7 @@ class ToolExecutionService:
             ok=False,
             error=self._projection_safe_message(
                 projection,
-                fallback=outward_error,
+                fallback=public_error["message"],
             ),
         )
 
@@ -1197,14 +1486,17 @@ class ToolExecutionService:
                 self._tool_result_persistence_limit(),
                 "tool failure result payload",
             )
-        except ValidationError as exc:
+        except ValidationError:
             flow_payload = flow.to_dict()
             carrier_payload = {
                 "tool_id": invocation.handle.tool_id,
                 "tool_name": invocation.handle.name,
                 "ok": False,
                 "failure_omitted": True,
-                "reason": str(exc),
+                "reason": (
+                    "Tool failure evidence exceeded the configured Host "
+                    "persistence limit."
+                ),
                 "metadata": {
                     "data_flow_context": {
                         "labels": flow_payload["labels"],
@@ -1257,36 +1549,31 @@ class ToolExecutionService:
         *,
         error: BaseException,
         policy_decision: str,
-        message: str | None = None,
-    ) -> ObjectHandle | None:
-        public_error = provider_error_envelope(error)
+        code: str,
+    ) -> tuple[ObjectHandle | None, dict[str, str], dict[str, Any]]:
+        public_error = public_error_envelope(error, code=code)
+        observation = internal_exception_observation(
+            error,
+            correlation_id=public_error["correlation_id"],
+        )
         error_payload: dict[str, Any] = {
-            "type": (
-                public_error["error_type"]
-                if public_error is not None
-                else type(error).__name__
-            ),
-            "message": (
-                public_error["message"]
-                if public_error is not None
-                else message if message is not None else str(error)
-            ),
+            "type": public_error["error_type"],
+            "message": public_error["message"],
+            **{
+                key: public_error[key]
+                for key in ("code", "error_type", "correlation_id")
+            },
         }
-        if public_error is not None:
-            error_payload.update(
-                {
-                    key: public_error[key]
-                    for key in ("code", "error_type", "correlation_id")
-                }
-            )
-        return self._persist_labeled_tool_failure(
+        handle = self._persist_labeled_tool_failure(
             invocation,
             payload={
                 "ok": False,
                 "error": error_payload,
+                "internal_error": observation,
                 "policy_decision": policy_decision,
             },
         )
+        return handle, public_error, observation
 
     async def _run_sandbox_source(
         self,
@@ -1318,7 +1605,20 @@ class ToolExecutionService:
             )
         if kwargs["limits"] is not None and "return_metrics" not in selected:
             raise ValidationError("sandbox backend must return subprocess metrics")
-        return await self._sandbox.arun_source(source_code, args, **selected)
+        try:
+            return await self._sandbox.arun_source(source_code, args, **selected)
+        except (SubprocessLimitExceeded, SubprocessTimeoutExpired):
+            raise
+        except Exception as exc:
+            metrics = sandbox_failure_metrics(exc)
+            if metrics is not None:
+                self._charge_subprocess_metrics(
+                    pid,
+                    metrics,
+                    source="tool.deno",
+                    context={"failure": type(exc).__name__},
+                )
+            raise
 
     def _jit_sandbox_timeout(self, handle: ToolHandle) -> float | None:
         spec = self._extensions.get_tool_spec(handle.tool_id)
@@ -1435,7 +1735,7 @@ class ToolExecutionService:
         self,
         invocation: _Invocation,
         exc: SubprocessLimitExceeded,
-    ) -> None:
+    ) -> BaseException:
         charge_error: ResourceLimitExceeded | None = None
         try:
             self._charge_subprocess_metrics(
@@ -1449,7 +1749,11 @@ class ToolExecutionService:
             )
         except ResourceLimitExceeded as resource_exc:
             charge_error = resource_exc
-        reason = str(charge_error or exc)
+        failure: BaseException = charge_error or exc
+        reason = public_error_envelope(
+            failure,
+            code="resource_limit",
+        )["message"]
         if self._resources is not None:
             self._resources.kill_if_exceeded(
                 invocation.pid,
@@ -1459,18 +1763,13 @@ class ToolExecutionService:
                     "metrics": self._metrics_json(exc.metrics),
                 },
             )
-        self._record_subprocess_failure(
-            invocation,
-            reason,
-            "resource_limit",
-            exc.metrics,
-        )
+        return failure
 
     def _handle_subprocess_timeout(
         self,
         invocation: _Invocation,
         exc: SubprocessTimeoutExpired,
-    ) -> str:
+    ) -> BaseException:
         charge_error: ResourceLimitExceeded | None = None
         try:
             self._charge_subprocess_metrics(
@@ -1484,7 +1783,11 @@ class ToolExecutionService:
             )
         except ResourceLimitExceeded as resource_exc:
             charge_error = resource_exc
-        reason = str(charge_error or exc)
+        failure: BaseException = charge_error or exc
+        reason = public_error_envelope(
+            failure,
+            code="timeout" if charge_error is None else "resource_limit",
+        )["message"]
         if charge_error is not None and self._resources is not None:
             self._resources.kill_if_exceeded(
                 invocation.pid,
@@ -1494,20 +1797,16 @@ class ToolExecutionService:
                     "metrics": self._metrics_json(exc.metrics),
                 },
             )
-        self._record_subprocess_failure(
-            invocation,
-            reason,
-            "timeout" if charge_error is None else "resource_limit",
-            exc.metrics,
-        )
-        return reason
+        return failure
 
     def _record_subprocess_failure(
         self,
         invocation: _Invocation,
-        reason: str,
+        observation: dict[str, Any],
         policy_decision: str,
         metrics: CommandMetrics,
+        *,
+        result_handle: ObjectHandle | None,
     ) -> None:
         self._events.emit(
             EventType.TOOL_FAILED,
@@ -1515,8 +1814,9 @@ class ToolExecutionService:
             target=invocation.pid,
             payload={
                 "call_id": invocation.call_id,
-                "error": reason,
+                "error": observation,
                 "policy_decision": policy_decision,
+                "result_oid": result_handle.oid if result_handle else None,
             },
         )
         self._audit.record(
@@ -1527,9 +1827,15 @@ class ToolExecutionService:
                 "ok": False,
                 "tool": invocation.handle.name,
                 "policy_decision": policy_decision,
-                "error": reason,
+                "error": observation,
                 "metrics": self._metrics_json(metrics),
             },
+            output_refs=[result_handle.oid] if result_handle else [],
+            correlation_id=(
+                str(observation.get("correlation_id"))
+                if isinstance(observation.get("correlation_id"), str)
+                else None
+            ),
         )
 
     def validate_jit_arguments(
@@ -1560,7 +1866,13 @@ class ToolExecutionService:
         schema_name: str,
     ) -> None:
         try:
-            jsonschema_validate(instance=value, schema=schema)
+            validate_jit_json_schema(schema)
+        except JITSchemaDialectError as exc:
+            raise ValueError(
+                f"JIT tool {handle.name!r} has invalid {schema_name}: {exc}"
+            ) from exc
+        try:
+            Draft202012Validator(schema).validate(value)
         except JsonSchemaValidationError as exc:
             path = ".".join(str(part) for part in exc.path)
             location = f" at {path}" if path else ""
@@ -1694,16 +2006,6 @@ class ToolExecutionService:
         # in that edge case as well.
         return safe_fallback
 
-    def _bounded_host_error(self, value: str) -> str:
-        """Keep direct-call diagnostics bounded; model dispatch redacts separately."""
-
-        limit = self._config.tools.tool_observability_preview_chars
-        if len(value) <= limit:
-            return value
-        if limit <= 3:
-            return value[:limit]
-        return f"{value[: limit - 3]}..."
-
     def _error_observation(self, text: str) -> dict[str, Any]:
         return sanitize_for_observability(
             text,
@@ -1770,6 +2072,28 @@ class ToolExecutionService:
             for candidate in descendants
         ):
             return "unknown"
+        structured_identities: set[str] = set()
+        if isinstance(result.payload, dict):
+            error_payload = result.payload.get("error")
+            if isinstance(error_payload, dict):
+                for key in ("code", "type"):
+                    value = error_payload.get(key)
+                    if isinstance(value, str):
+                        structured_identities.add(value.lower())
+                details = error_payload.get("details")
+                if isinstance(details, dict):
+                    for key in ("code", "error_type"):
+                        value = details.get(key)
+                        if isinstance(value, str):
+                            structured_identities.add(value.lower())
+        if structured_identities & {
+            "permission_denied",
+            "capabilitydenied",
+            "policydenied",
+            "resource_limit",
+            "resourcelimitexceeded",
+        }:
+            return "denied"
         error = str(result.error or "").lower()
         denial_markers = (
             "denied",

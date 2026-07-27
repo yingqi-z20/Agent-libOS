@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,6 +51,52 @@ def test_permitted_effects_policy_v2_distinguishes_unrestricted_and_deny_all() -
     assert upcast_permitted_effects_policy(
         {"schema_version": 2, "effects": []}
     ) == []
+    for invalid_version in (True, 2.0, "2"):
+        with pytest.raises(ValueError, match="schema_version"):
+            upcast_permitted_effects_policy(
+                {"schema_version": invalid_version, "effects": []}
+            )
+
+
+def test_persisted_effect_policy_provenance_requires_exact_schema_integer() -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(goal="strict effect policy provenance")
+        manifest = runtime.authority_manifests.get_for_process(pid)
+        assert manifest is not None
+        metadata = dict(manifest.metadata)
+        metadata["agent_libos_permitted_effects_policy_schema_version"] = 2.0
+        forged = replace(manifest, metadata=metadata, manifest_hash="")
+        forged_hash = runtime.authority_manifests._hash(forged)
+        runtime.store._execute(  # type: ignore[attr-defined]
+            "UPDATE authority_manifests SET metadata_json = ?, manifest_hash = ? WHERE manifest_id = ?",
+            (json.dumps(metadata, sort_keys=True), forged_hash, manifest.manifest_id),
+        )
+
+        with pytest.raises(ValidationError, match="hash mismatch"):
+            runtime.authority_manifests.get(manifest.manifest_id)
+    finally:
+        runtime.close()
+
+
+def test_persisted_effect_policy_envelope_rejects_float_schema_version() -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(goal="strict effect policy envelope")
+        manifest = runtime.authority_manifests.get_for_process(pid)
+        assert manifest is not None
+        runtime.store._execute(  # type: ignore[attr-defined]
+            "UPDATE authority_manifests SET permitted_effects_json = ? WHERE manifest_id = ?",
+            (
+                json.dumps({"schema_version": 2.0, "effects": None}),
+                manifest.manifest_id,
+            ),
+        )
+
+        with pytest.raises(ValidationError, match="schema_version"):
+            runtime.authority_manifests.get(manifest.manifest_id)
+    finally:
+        runtime.close()
 
 
 def test_explicit_empty_effect_ceiling_denies_all_while_omission_is_unrestricted() -> None:
@@ -506,10 +554,104 @@ def test_manifest_rejects_malformed_expiry_before_persisting(
         runtime.close()
 
 
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"expires_at": None},
+        {
+            "authorized_capabilities": [
+                {
+                    "resource": "object:null-expiry",
+                    "rights": [CapabilityRight.READ.value],
+                    "expires_at": None,
+                }
+            ]
+        },
+        {
+            "approval_policy": {
+                "requestable_capabilities": [
+                    {
+                        "resource": "object:null-requestable-expiry",
+                        "rights": [CapabilityRight.READ.value],
+                        "expires_at": None,
+                    }
+                ]
+            }
+        },
+    ],
+    ids=["manifest", "authorized-capability", "requestable-capability"],
+)
+def test_manifest_rejects_explicit_null_expiry_without_authority_state(
+    manifest: dict[str, object],
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        before_processes = runtime.store.list_processes()
+        before_manifests = runtime.store.list_authority_manifests()
+        before_capabilities = runtime.store.list_capabilities()
+        before_audit = runtime.store.list_audit()
+        before_events = runtime.store.list_events()
+
+        with pytest.raises(
+            ValidationError,
+            match="expires_at must be an ISO-8601 datetime string",
+        ):
+            runtime.authority_manifests.prepare_launch(
+                pid="pid_explicit_null_expiry",
+                image_id="base-agent:v0",
+                goal_ref=None,
+                supplied=manifest,
+            )
+
+        assert runtime.store.list_processes() == before_processes
+        assert runtime.store.list_authority_manifests() == before_manifests
+        assert runtime.store.list_capabilities() == before_capabilities
+        assert runtime.store.list_audit() == before_audit
+        assert runtime.store.list_events() == before_events
+    finally:
+        runtime.close()
+
+
+def test_manifest_expiry_omission_remains_valid() -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(
+            goal="expiry omission remains distinct from null",
+            authority_manifest={
+                "authorized_capabilities": [
+                    {
+                        "resource": "object:omitted-expiry",
+                        "rights": [CapabilityRight.READ.value],
+                    }
+                ],
+                "approval_policy": {
+                    "requestable_capabilities": [
+                        {
+                            "resource": "object:omitted-requestable-expiry",
+                            "rights": [CapabilityRight.READ.value],
+                        }
+                    ]
+                },
+            },
+        )
+
+        manifest = runtime.authority_manifests.get_for_process(pid)
+        assert manifest is not None
+        assert manifest.expires_at is None
+        assert "expires_at" not in manifest.authorized_capabilities[0]
+        assert (
+            "expires_at"
+            not in manifest.approval_policy["requestable_capabilities"][0]
+        )
+    finally:
+        runtime.close()
+
+
 def test_manifest_rejects_invalid_capability_use_leases_without_residue() -> None:
     runtime = Runtime.open("local")
     try:
         invalid_values: list[tuple[str, object]] = [
+            ("null", None),
             ("bool", True),
             ("zero", 0),
             ("negative", -1),
@@ -626,7 +768,14 @@ def test_child_manifest_budget_is_applied_before_process_reservation(
         assert runtime.tools.call(child, "get_working_directory", {}).ok
         denied = runtime.tools.call(child, "get_working_directory", {})
         assert not denied.ok
-        assert "max_tool_calls" in (denied.error or "")
+        assert denied.error == (
+            "Tool call resource budget was exceeded before execution."
+        )
+        assert denied.payload["error"]["details"]["code"] == "resource_limit"
+        assert (
+            denied.payload["error"]["details"]["error_type"]
+            == "ResourceLimitExceeded"
+        )
     finally:
         runtime.close()
 
@@ -1138,6 +1287,98 @@ def test_requestable_capability_rejects_fields_that_cannot_propagate(
         runtime.close()
 
 
+@pytest.mark.parametrize(
+    ("resource", "right"),
+    [
+        ("object:*", CapabilityRight.ADMIN.value),
+        ("jsonrpc:*", CapabilityRight.GRANT.value),
+        ("project:*", CapabilityRight.REVOKE.value),
+        ("filesystem:*", CapabilityRight.WRITE.value),
+        ("shell:*", CapabilityRight.EXECUTE.value),
+        ("opaque:*", CapabilityRight.DELETE.value),
+    ],
+    ids=["admin", "grant", "revoke", "write", "execute", "delete"],
+)
+def test_manifest_rejects_root_prefix_privileged_requestable_ceiling_without_side_effects(
+    resource: str,
+    right: str,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        before_processes = runtime.store.list_processes()
+        before_manifests = runtime.store.list_authority_manifests()
+        before_capabilities = runtime.store.list_capabilities()
+        before_requests = runtime.human.list()
+        before_events = runtime.store.list_events()
+        before_audit = runtime.store.list_audit()
+
+        with pytest.raises(ValidationError, match="root-prefix.*privileged"):
+            runtime.authority_manifests.prepare_launch(
+                pid="pid_invalid_root_prefix_requestable",
+                image_id="base-agent:v0",
+                goal_ref=None,
+                supplied={
+                    "approval_policy": {
+                        "requestable_capabilities": [
+                            {"resource": resource, "rights": [right]},
+                        ]
+                    }
+                },
+            )
+
+        assert runtime.store.list_processes() == before_processes
+        assert runtime.store.list_authority_manifests() == before_manifests
+        assert runtime.store.list_capabilities() == before_capabilities
+        assert runtime.human.list() == before_requests == []
+        assert runtime.store.list_events() == before_events
+        assert runtime.store.list_audit() == before_audit
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("resource", "right"),
+    [
+        ("object:*", CapabilityRight.READ.value),
+        ("object:report", CapabilityRight.WRITE.value),
+        ("shell:git", CapabilityRight.EXECUTE.value),
+    ],
+    ids=["root-read", "exact-write", "exact-shell-git"],
+)
+def test_manifest_preserves_safe_or_exact_requestable_ceilings(
+    resource: str,
+    right: str,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="preserve valid requestable authority ceiling",
+            authority_manifest={
+                "approval_policy": {
+                    "requestable_capabilities": [
+                        {"resource": resource, "rights": [right]},
+                    ]
+                }
+            },
+        )
+
+        manifest = runtime.authority_manifests.get_for_process(pid)
+        assert manifest is not None
+        assert manifest.approval_policy["requestable_capabilities"] == [
+            {
+                "resource": resource,
+                "rights": [right],
+                "constraints": {},
+                "delegable": False,
+                "revocable": True,
+            }
+        ]
+        assert runtime.human.list(pid=pid) == []
+    finally:
+        runtime.close()
+
+
 def test_requestable_capability_accepts_canonical_host_compatibility_values() -> None:
     runtime = Runtime.open("local")
     try:
@@ -1177,8 +1418,8 @@ def test_requestable_capability_accepts_canonical_host_compatibility_values() ->
 
 @pytest.mark.parametrize(
     "max_depth",
-    [True, -1, "1", 1.0, 1.5],
-    ids=["bool", "negative", "string", "integral-float", "fraction"],
+    [None, True, -1, "1", 1.0, 1.5],
+    ids=["null", "bool", "negative", "string", "integral-float", "fraction"],
 )
 def test_manifest_max_delegation_depth_requires_non_negative_json_integer(
     max_depth: object,
@@ -1241,6 +1482,61 @@ def test_manifest_capability_boolean_fields_compile_exact_values() -> None:
         )
         assert capability.delegable is True
         assert capability.revocable is False
+        assert (
+            capability.max_delegation_depth
+            == runtime.config.capability.default_delegation_depth
+        )
+    finally:
+        runtime.close()
+
+
+def test_root_compiler_rejects_a_derived_manifest_without_publishing_authority() -> None:
+    runtime = Runtime.open("local")
+    try:
+        resource = "object:derived-root-compile"
+        parent = runtime.process.spawn(
+            goal="parent manifest",
+            authority_manifest={
+                "authorized_capabilities": [
+                    {
+                        "resource": resource,
+                        "rights": [CapabilityRight.READ.value],
+                        "delegable": True,
+                        "max_delegation_depth": 1,
+                    }
+                ]
+            },
+        )
+        child_pid = "pid_reject_derived_root_compile"
+        child_manifest = runtime.authority_manifests.prepare_launch(
+            pid=child_pid,
+            image_id="base-agent:v0",
+            goal_ref=None,
+            parent_pid=parent,
+            supplied={
+                "authorized_capabilities": [
+                    {
+                        "resource": resource,
+                        "rights": [CapabilityRight.READ.value],
+                        "delegable": True,
+                    }
+                ]
+            },
+        )
+        assert child_manifest.parent_manifest_id is not None
+        before_capabilities = runtime.store.list_capabilities(subject=child_pid)
+        before_audit = runtime.store.list_audit()
+        before_events = runtime.store.list_events()
+
+        with pytest.raises(
+            ValidationError,
+            match="derived authority manifests cannot be compiled as root",
+        ):
+            runtime.authority_manifests.compile_root_capabilities(child_manifest)
+
+        assert runtime.store.list_capabilities(subject=child_pid) == before_capabilities
+        assert runtime.store.list_audit() == before_audit
+        assert runtime.store.list_events() == before_events
     finally:
         runtime.close()
 
@@ -1317,6 +1613,41 @@ def test_data_flow_policy_requires_lists_in_python_manifests() -> None:
                     }
                 },
             )
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0, "1"])
+def test_data_flow_policy_schema_version_requires_exact_integer_without_residue(
+    invalid_version: object,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        before_processes = runtime.store.list_processes()
+        before_manifests = runtime.store.list_authority_manifests()
+        before_capabilities = runtime.store.list_capabilities()
+        before_audit = runtime.store.list_audit()
+        before_events = runtime.store.list_events()
+
+        with pytest.raises(ValidationError, match="schema_version"):
+            runtime.authority_manifests.prepare_launch(
+                pid="pid_invalid_data_flow_schema",
+                image_id="base-agent:v0",
+                goal_ref=None,
+                supplied={
+                    "data_flow_policy": {
+                        "schema_version": invalid_version,
+                        "allowed_tenants": [],
+                        "allowed_principals": [],
+                    }
+                },
+            )
+
+        assert runtime.store.list_processes() == before_processes
+        assert runtime.store.list_authority_manifests() == before_manifests
+        assert runtime.store.list_capabilities() == before_capabilities
+        assert runtime.store.list_audit() == before_audit
+        assert runtime.store.list_events() == before_events
     finally:
         runtime.close()
 

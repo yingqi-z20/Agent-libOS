@@ -4,7 +4,8 @@ from dataclasses import field
 import math
 import re
 from typing import Annotated, Literal
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, unquote_plus, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BeforeValidator, ConfigDict, StrictFloat, StrictInt
 from pydantic.dataclasses import dataclass
@@ -19,6 +20,10 @@ from agent_libos.models.data_flow import (
 )
 
 _PYDANTIC_CONFIG = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+_TIMEZONE_KEY_PATTERN = re.compile(
+    r"[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*\Z"
+)
+_FIXED_TIMEZONE_FALLBACK_KEYS = frozenset({"Asia/Shanghai"})
 
 ShellPolicyLevel = Literal[
     "always_deny",
@@ -38,6 +43,134 @@ PromptCacheRetention = Annotated[
     Literal["in_memory", "24h"] | None,
     BeforeValidator(_normalize_prompt_cache_retention),
 ]
+
+_SENSITIVE_LLM_URL_QUERY_KEY_NAMES = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "auth",
+        "authorization",
+        "code",
+        "credential",
+        "credentials",
+        "key",
+        "pass",
+        "passwd",
+        "password",
+        "pwd",
+        "secret",
+        "sig",
+        "signature",
+        "token",
+    }
+)
+_SENSITIVE_LLM_URL_QUERY_KEY_SUFFIXES = (
+    "_api_key",
+    "_auth",
+    "_credential",
+    "_credentials",
+    "_key",
+    "_pass",
+    "_passwd",
+    "_password",
+    "_secret",
+    "_sig",
+    "_signature",
+    "_token",
+)
+_SENSITIVE_LLM_URL_QUERY_KEY_COMPACT_SUFFIXES = (
+    "apikey",
+    "credential",
+    "credentials",
+    "passwd",
+    "password",
+    "secret",
+    "signature",
+    "token",
+)
+
+
+def _is_sensitive_llm_url_query_key(raw_key: str) -> bool:
+    decoded = unquote_plus(raw_key).strip().casefold()
+    normalized = re.sub(r"[^a-z0-9]+", "_", decoded).strip("_")
+    return (
+        normalized in _SENSITIVE_LLM_URL_QUERY_KEY_NAMES
+        or normalized.endswith(_SENSITIVE_LLM_URL_QUERY_KEY_SUFFIXES)
+        or normalized.endswith(_SENSITIVE_LLM_URL_QUERY_KEY_COMPACT_SUFFIXES)
+    )
+
+
+def _llm_url_query_fields(query: str) -> tuple[str, ...]:
+    return tuple(field for field in re.split(r"[&;]", query) if field)
+
+
+def _split_llm_base_url(value: str, *, label: str) -> SplitResult:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty HTTP(S) URL")
+    if (
+        value != value.strip()
+        or "\\" in value
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise ValueError(f"{label} must be a valid HTTP(S) URL")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        parsed.port
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a valid HTTP(S) URL") from exc
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+    ):
+        raise ValueError(f"{label} must be an HTTP(S) URL")
+    return parsed
+
+
+def validate_llm_base_url(value: str, *, label: str = "LLM profile base_url") -> str:
+    """Validate an endpoint without permitting credentials in URL components."""
+
+    parsed = _split_llm_base_url(value, label=label)
+    if "@" in parsed.netloc:
+        raise ValueError(f"{label} must not include userinfo")
+    if "#" in value:
+        raise ValueError(f"{label} must not include a fragment")
+    for field in _llm_url_query_fields(parsed.query):
+        raw_key = field.partition("=")[0]
+        if _is_sensitive_llm_url_query_key(raw_key):
+            raise ValueError(f"{label} must not include sensitive query parameters")
+    return value
+
+
+def sanitize_llm_base_url_for_summary(value: object) -> str | None:
+    """Return a display-safe endpoint for profiles that bypassed validation."""
+
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = _split_llm_base_url(value, label="LLM profile base_url")
+    except ValueError:
+        return None
+    _userinfo, separator, hostinfo = parsed.netloc.rpartition("@")
+    netloc = hostinfo if separator else parsed.netloc
+    safe_query_fields = tuple(
+        field
+        for field in _llm_url_query_fields(parsed.query)
+        if not _is_sensitive_llm_url_query_key(field.partition("=")[0])
+    )
+    return urlunsplit(
+        SplitResult(
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            "&".join(safe_query_fields),
+            "",
+        )
+    )
 
 
 def _validate_runtime_page_bounds(
@@ -132,6 +265,8 @@ class RuntimeDefaults:
     payload_retention_hash_only_after_seconds: StrictInt | None = None
     payload_retention_page_size: StrictInt = 100
     payload_retention_page_hard_limit: StrictInt = 1_000
+    process_terminal_cleanup_recovery_page_size: StrictInt = 500
+    process_terminal_cleanup_recovery_page_hard_limit: StrictInt = 5_000
 
     def __post_init__(self) -> None:
         if self.publication_recovery_max_attempts <= 0:
@@ -181,6 +316,11 @@ class RuntimeDefaults:
             "operation_recovery",
             page_size=self.operation_recovery_page_size,
             hard_limit=self.operation_recovery_page_hard_limit,
+        )
+        _validate_runtime_page_bounds(
+            "process_terminal_cleanup_recovery",
+            page_size=self.process_terminal_cleanup_recovery_page_size,
+            hard_limit=self.process_terminal_cleanup_recovery_page_hard_limit,
         )
         for name in (
             "payload_retention_summary_after_seconds",
@@ -274,6 +414,9 @@ class CapabilityDefaults:
     max_constraints_bytes: int = 16_384
     list_limit: int = 100
     decision_explain_preview_chars: int = 2_000
+    regex_pattern_max_bytes: StrictInt = 1_024
+    regex_token_max_bytes: StrictInt = 4_096
+    regex_match_timeout_s: StrictFloat = 0.05
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -461,6 +604,9 @@ class ToolDefaults:
     clock_timezone: str = "UTC"
     max_sleep_seconds: float = 60.0
     sleep_timeout_grace_s: float = 5.0
+    human_response_payload_max_bytes: int = 131_072
+    human_response_max_depth: int = 32
+    human_response_max_nodes: int = 4_096
 
     @property
     def sleep_tool_timeout_s(self) -> float:
@@ -583,6 +729,8 @@ class GitDefaults:
     inherit_credential_helpers: bool = True
     inherit_ssh_agent: bool = True
     protect_git_metadata: bool = True
+    ref_list_limit: StrictInt = 200
+    pull_request_list_limit: StrictInt = 100
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -672,6 +820,12 @@ class ObjectMemoryDefaults:
     metadata_sensitivity: str = "normal"
     metadata_retention_policy: str = "default"
     process_namespace_prefix: str = "process"
+    query_scan_page_size: StrictInt = 128
+    query_scan_ceiling: StrictInt = 1_024
+    metadata_text_max_chars: StrictInt = 32_000
+    metadata_collection_max_items: StrictInt = 128
+    metadata_collection_item_max_chars: StrictInt = 2_048
+    metadata_max_bytes: StrictInt = 131_072
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -740,6 +894,9 @@ class SkillDefaults:
     max_actions: int = 128
     max_jit_tools: int = 32
     max_required_capabilities: int = 64
+    max_package_directories: StrictInt = 256
+    max_package_depth: StrictInt = 32
+    catalog_scan_limit: StrictInt = 1_000
 
     @property
     def manifest_max_bytes(self) -> int:
@@ -848,6 +1005,8 @@ def _validate_git_config(git: GitDefaults) -> None:
         "status_entry_hard_limit",
         "log_entry_limit",
         "log_entry_hard_limit",
+        "ref_list_limit",
+        "pull_request_list_limit",
         "output_max_bytes",
         "output_hard_limit_bytes",
         "patch_max_bytes",
@@ -876,6 +1035,18 @@ def _validate_git_config(git: GitDefaults) -> None:
         raise ValueError("git.allowed_remote_schemes may contain only https and ssh")
     if not git.protect_git_metadata:
         raise ValueError("git.protect_git_metadata must remain enabled")
+
+
+def _validate_capability_config(capability: CapabilityDefaults) -> None:
+    _positive("capability.default_delegation_depth", capability.default_delegation_depth)
+    _positive("capability.max_rights_per_capability", capability.max_rights_per_capability)
+    _nonnegative("capability.max_constraints_bytes", capability.max_constraints_bytes)
+    _positive("capability.list_limit", capability.list_limit)
+    _nonnegative(
+        "capability.decision_explain_preview_chars",
+        capability.decision_explain_preview_chars,
+    )
+    _positive("capability.regex_match_timeout_s", capability.regex_match_timeout_s)
 
 
 def _validate_shell_config(shell: ShellDefaults, tools: ToolDefaults) -> None:
@@ -954,6 +1125,40 @@ def _validate_llm_context_config(
         )
 
 
+def _validate_object_memory_config(memory: ObjectMemoryDefaults) -> None:
+    _require_non_empty("memory.object_schema_version", memory.object_schema_version)
+    _positive("memory.materialize_budget_tokens", memory.materialize_budget_tokens)
+    _positive("memory.query_limit", memory.query_limit)
+    for name in (
+        "query_scan_page_size",
+        "query_scan_ceiling",
+        "metadata_text_max_chars",
+        "metadata_collection_max_items",
+        "metadata_collection_item_max_chars",
+        "metadata_max_bytes",
+    ):
+        _positive(f"memory.{name}", getattr(memory, name))
+    _require_at_least(
+        "memory.query_scan_ceiling",
+        memory.query_scan_ceiling,
+        "memory.query_scan_page_size",
+        memory.query_scan_page_size,
+    )
+    _require_at_least(
+        "memory.query_scan_ceiling",
+        memory.query_scan_ceiling,
+        "memory.query_limit",
+        memory.query_limit,
+    )
+    for name in (
+        "context_policy",
+        "metadata_sensitivity",
+        "metadata_retention_policy",
+        "process_namespace_prefix",
+    ):
+        _require_non_empty(f"memory.{name}", getattr(memory, name))
+
+
 def _validate_runtime_config(runtime: RuntimeDefaults) -> None:
     for name in (
         "local_store_target",
@@ -996,12 +1201,12 @@ def _validate_runtime_config(runtime: RuntimeDefaults) -> None:
     _positive("runtime.launcher_max_quanta", runtime.launcher_max_quanta)
 
 
-def _validate_config(config: AgentLibOSConfig) -> None:
-    _validate_runtime_config(config.runtime)
-    data_flow = config.data_flow
+def _validate_data_flow_config(data_flow: DataFlowDefaults) -> None:
     if data_flow.default_trust_level is not SinkTrustLevel.UNTRUSTED:
         raise ValueError("data_flow.default_trust_level must remain untrusted")
-    if sensitivity_rank(data_flow.default_max_sensitivity) > sensitivity_rank(DataSensitivity.NORMAL):
+    if sensitivity_rank(data_flow.default_max_sensitivity) > sensitivity_rank(
+        DataSensitivity.NORMAL
+    ):
         raise ValueError("data_flow.default_max_sensitivity must not exceed normal")
     _require_non_empty("data_flow.registry_resource", data_flow.registry_resource)
     _positive("data_flow.registry_list_limit", data_flow.registry_list_limit)
@@ -1011,9 +1216,14 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     priorities: dict[tuple[str, int], str] = {}
     for index, rule in enumerate(data_flow.sink_rules):
         if not isinstance(rule, SinkTrustRule):
-            raise ValueError(f"data_flow.sink_rules[{index}] must be a SinkTrustRule")
+            raise ValueError(
+                f"data_flow.sink_rules[{index}] must be a SinkTrustRule"
+            )
         if rule.pattern in patterns:
-            raise ValueError(f"data_flow.sink_rules contains duplicate pattern: {rule.pattern}")
+            raise ValueError(
+                "data_flow.sink_rules contains duplicate pattern: "
+                f"{rule.pattern}"
+            )
         patterns.add(rule.pattern)
         base = rule.pattern[:-1] if rule.pattern.endswith("*") else rule.pattern
         priority = (base, len(base))
@@ -1025,6 +1235,10 @@ def _validate_config(config: AgentLibOSConfig) -> None:
             )
         priorities[priority] = rule.pattern
 
+
+def _validate_config(config: AgentLibOSConfig) -> None:
+    _validate_runtime_config(config.runtime)
+    _validate_data_flow_config(config.data_flow)
     gui = config.gui
     for name in (
         "event_buffer_limit",
@@ -1052,12 +1266,9 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         gui.object_task_wait_default_timeout_s,
     )
 
-    capability = config.capability
-    _positive("capability.default_delegation_depth", capability.default_delegation_depth)
-    _positive("capability.max_rights_per_capability", capability.max_rights_per_capability)
-    _nonnegative("capability.max_constraints_bytes", capability.max_constraints_bytes)
-    _positive("capability.list_limit", capability.list_limit)
-    _nonnegative("capability.decision_explain_preview_chars", capability.decision_explain_preview_chars)
+    _validate_capability_config(config.capability)
+    _positive("capability.regex_pattern_max_bytes", config.capability.regex_pattern_max_bytes)
+    _positive("capability.regex_token_max_bytes", config.capability.regex_token_max_bytes)
 
     scheduler = config.scheduler
     _positive_optional("scheduler.max_quanta", scheduler.max_quanta)
@@ -1139,6 +1350,9 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "message_filter_json_max_bytes",
         "message_wait_status_max_chars",
         "human_request_payload_max_bytes",
+        "human_response_payload_max_bytes",
+        "human_response_max_depth",
+        "human_response_max_nodes",
         "human_output_max_chars",
         "human_request_list_limit",
         "object_file_max_bytes",
@@ -1156,7 +1370,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         _positive(f"tools.{name}", getattr(tools, name))
     _require_non_empty("tools.default_text_encoding", tools.default_text_encoding)
     _require_non_empty("tools.deno_executable", tools.deno_executable)
-    _require_non_empty("tools.clock_timezone", tools.clock_timezone)
+    _require_timezone_key("tools.clock_timezone", tools.clock_timezone)
     _require_non_empty_items("tools.deno_jsr_allowlist", tools.deno_jsr_allowlist)
     _require_at_least("tools.filesystem_read_hard_limit_bytes", tools.filesystem_read_hard_limit_bytes, "tools.filesystem_read_max_bytes", tools.filesystem_read_max_bytes)
     _require_at_least("tools.directory_entry_hard_limit", tools.directory_entry_hard_limit, "tools.directory_entry_limit", tools.directory_entry_limit)
@@ -1252,12 +1466,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         _positive(f"image_commit.{name}", getattr(image_commit, name))
     _require_at_least("image_commit.artifact_hard_limit_bytes", image_commit.artifact_hard_limit_bytes, "image_commit.payload_capture_limit_bytes", image_commit.payload_capture_limit_bytes)
 
-    memory = config.memory
-    _require_non_empty("memory.object_schema_version", memory.object_schema_version)
-    _positive("memory.materialize_budget_tokens", memory.materialize_budget_tokens)
-    _positive("memory.query_limit", memory.query_limit)
-    for name in ("context_policy", "metadata_sensitivity", "metadata_retention_policy", "process_namespace_prefix"):
-        _require_non_empty(f"memory.{name}", getattr(memory, name))
+    _validate_object_memory_config(config.memory)
 
     object_tasks = config.object_tasks
     _positive("object_tasks.max_running_global", object_tasks.max_running_global)
@@ -1289,6 +1498,9 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "resource_read_max_bytes",
         "package_max_bytes",
         "max_package_files",
+        "max_package_directories",
+        "max_package_depth",
+        "catalog_scan_limit",
         "max_prompt_instruction_chars",
         "max_jit_source_chars",
         "discover_limit",
@@ -1361,7 +1573,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
         "chat_quanta_overhead",
     ):
         _positive(f"scripts.{name}", getattr(scripts, name))
-    _require_non_empty("scripts.clock_demo_timezone", scripts.clock_demo_timezone)
+    _require_timezone_key("scripts.clock_demo_timezone", scripts.clock_demo_timezone)
     _require_at_least("scripts.document_summary_max_read_bytes", scripts.document_summary_max_read_bytes, "scripts.document_summary_max_bytes", scripts.document_summary_max_bytes)
     _require_at_least("scripts.document_context_max_tokens", scripts.document_context_max_tokens, "scripts.document_context_min_tokens", scripts.document_context_min_tokens)
 
@@ -1380,6 +1592,10 @@ def _validate_llm_config(llm: LLMDefaults) -> None:
             raise ValueError(f"{prefix}.kind is not supported: {profile.kind}")
         if profile.base_url is not None:
             _require_non_empty(f"{prefix}.base_url", profile.base_url)
+            validate_llm_base_url(
+                profile.base_url,
+                label=f"{prefix}.base_url",
+            )
         if profile.model is not None:
             _require_non_empty(f"{prefix}.model", profile.model)
         _require_non_empty(f"{prefix}.api_key_env", profile.api_key_env)
@@ -1496,6 +1712,24 @@ def _require_number(name: str, value: object) -> None:
 def _require_non_empty(name: str, value: object) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+
+
+def _require_timezone_key(name: str, value: object) -> None:
+    _require_non_empty(name, value)
+    assert isinstance(value, str)
+    if (
+        value != value.strip()
+        or len(value) > 255
+        or _TIMEZONE_KEY_PATTERN.fullmatch(value) is None
+        or any(part in {".", ".."} for part in value.split("/"))
+    ):
+        raise ValueError(f"{name} must be a valid IANA timezone key")
+    if value.upper() == "UTC" or value in _FIXED_TIMEZONE_FALLBACK_KEYS:
+        return
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"{name} must be a known IANA timezone key") from exc
 
 
 def _optional_non_empty(name: str, value: object | None) -> None:

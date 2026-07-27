@@ -21,7 +21,8 @@ Decision loop:
 1. Orient. Read the goal and factual runtime context before choosing an action.
 2. Load on demand. If needed guidance or a domain tool is not visible, search
    Skills with two to four concrete domain/action terms. When a plausible
-   result appears, activate its exact id instead of repeating discovery.
+   result appears, activate its exact id with that row's package_sha256 as
+   expected_package_sha256 instead of repeating discovery.
 3. Decide. Choose the least risky sufficient action that advances the goal.
 4. Act. Respect the current tool visibility and authority boundaries.
 5. Verify. Re-check important claims against context or concrete evidence. If

@@ -2,16 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, ClassVar, Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError
+from jsonschema import Draft202012Validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError as PydanticValidationError,
+)
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.utils.openai_schema import openai_chat_tool_schema
@@ -26,13 +35,17 @@ from agent_libos.models.exceptions import (
 )
 from agent_libos.models import DataFlowContext, ToolSpec
 from agent_libos.ports.blocking_work import run_blocking_once
-from agent_libos.utils.public_errors import provider_error_envelope
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+)
 from agent_libos.utils.serde import dumps
 
 InputT = TypeVar("InputT", bound=BaseModel)
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _WAIT_DATA_FLOW_CONTEXT_ATTR = "_agent_libos_wait_data_flow_context"
+_EXCEPTION_FAILURE_MARKER = object()
 _DATA_FLOW_WAIT_EXCEPTIONS = (
     HumanApprovalRequired,
     ProcessWaitRequired,
@@ -62,6 +75,37 @@ _MODEL_ERROR_DYNAMIC_METADATA_KEYS = frozenset(
         "duration_ms",
         "materialization_id",
         "trace_id",
+    }
+)
+
+_RUNTIME_BOUNDED_ARGUMENT_FIELDS: dict[str, frozenset[str]] = {
+    "sleep": frozenset({"seconds"}),
+    "run_shell_command": frozenset(
+        {"timeout_s", "max_stdout_chars", "max_stderr_chars"}
+    ),
+    "read_text_file": frozenset({"max_bytes"}),
+    "read_file_bytes": frozenset({"max_bytes"}),
+    "read_directory": frozenset({"limit"}),
+    "read_memory_object": frozenset({"max_payload_chars"}),
+    "wait_object_task": frozenset({"timeout_s"}),
+    "git_status": frozenset({"limit"}),
+    "git_log": frozenset({"limit"}),
+    "git_diff": frozenset({"max_bytes"}),
+    "git_show": frozenset({"max_bytes"}),
+    "git_blame": frozenset({"max_bytes"}),
+    "git_list_refs": frozenset({"limit"}),
+    "git_list_pull_requests": frozenset({"limit"}),
+    "list_capabilities": frozenset({"limit"}),
+}
+_STATIC_CEILING_FALLBACK_TOOLS = frozenset(
+    {
+        "sleep",
+        "run_shell_command",
+        "read_text_file",
+        "read_file_bytes",
+        "read_directory",
+        "read_memory_object",
+        "wait_object_task",
     }
 )
 
@@ -133,6 +177,44 @@ class ToolError(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class ExceptionFailureProvenance:
+    """Text-free, process-local proof that BaseAgentTool caught an exception."""
+
+    phase: str
+    code: str
+    error_type: str
+    correlation_id: str
+    message: str
+    exception_text_bytes: int
+    exception_text_sha256: str
+    validation_error_count: int | None = None
+    validation_errors: tuple[tuple[str, str, str], ...] = ()
+
+    def observation(self) -> dict[str, Any]:
+        return {
+            "error_type": self.error_type,
+            "correlation_id": self.correlation_id,
+            "exception_text": {
+                "bytes": self.exception_text_bytes,
+                "sha256": self.exception_text_sha256,
+            },
+        }
+
+    def validation_details(self) -> dict[str, Any]:
+        """Return only schema-public, value-free input-validation guidance."""
+
+        details: dict[str, Any] = {}
+        if self.validation_error_count is not None:
+            details["validation_error_count"] = self.validation_error_count
+        if self.validation_errors:
+            details["errors"] = [
+                {"loc": [field], "type": error_type, "msg": message}
+                for field, error_type, message in self.validation_errors
+            ]
+        return details
+
+
 class ToolResult(BaseModel):
     ok: bool
     content: str = ""
@@ -143,6 +225,7 @@ class ToolResult(BaseModel):
     artifacts: list[ToolArtifact] = Field(default_factory=list)
     error: ToolError | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    _exception_failure: Any = PrivateAttr(default=None)
 
     @classmethod
     def success(
@@ -204,6 +287,113 @@ class ToolResult(BaseModel):
             metadata=self.metadata,
             limit_bytes=limit_bytes,
         )
+
+
+def _mark_exception_failure(
+    result: ToolResult,
+    error: BaseException,
+    *,
+    phase: str,
+    code: str,
+) -> ToolResult:
+    """Attach non-serializable provenance without retaining exception text."""
+
+    validation_error_count, validation_errors = _validation_error_summary(
+        error if phase == "input_validation" else None
+    )
+    envelope = public_error_envelope(error, code=code)
+    observation = internal_exception_observation(
+        error,
+        correlation_id=envelope["correlation_id"],
+    )
+    text_observation = observation["exception_text"]
+    result._exception_failure = (
+        _EXCEPTION_FAILURE_MARKER,
+        ExceptionFailureProvenance(
+            phase=phase,
+            code=envelope["code"],
+            error_type=envelope["error_type"],
+            correlation_id=envelope["correlation_id"],
+            message=envelope["message"],
+            exception_text_bytes=int(text_observation["bytes"]),
+            exception_text_sha256=str(text_observation["sha256"]),
+            validation_error_count=validation_error_count,
+            validation_errors=validation_errors,
+        ),
+    )
+    return result
+
+
+def _validation_error_summary(
+    error: BaseException | None,
+) -> tuple[int | None, tuple[tuple[str, str, str], ...]]:
+    """Project Pydantic failures to bounded field/type hints without values."""
+
+    if not isinstance(error, PydanticValidationError):
+        return None, ()
+    raw_errors = error.errors(
+        include_input=False,
+        include_context=False,
+        include_url=False,
+    )
+    projected: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw_errors:
+        location = item.get("loc")
+        if not isinstance(location, (list, tuple)) or not location:
+            continue
+        field = _bounded_identifier(location[0], fallback="field")
+        error_type = _bounded_identifier(
+            item.get("type"),
+            fallback="validation_error",
+        )
+        identity = (field, error_type)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        projected.append((field, error_type, _validation_error_hint(error_type)))
+        if len(projected) >= _MODEL_ERROR_DETAIL_LIMIT:
+            break
+    return len(raw_errors), tuple(projected)
+
+
+def _validation_error_hint(error_type: str) -> str:
+    normalized = error_type.casefold()
+    if "int" in normalized:
+        return "Use an unquoted JSON integer for this field."
+    if any(token in normalized for token in ("float", "decimal", "number")):
+        return "Use an unquoted JSON number for this field."
+    if "bool" in normalized:
+        return "Use true or false without quotes for this field."
+    if any(token in normalized for token in ("list", "array", "tuple")):
+        return "Use a JSON array for this field."
+    if any(token in normalized for token in ("dict", "mapping", "object", "model")):
+        return "Use a JSON object for this field."
+    if "string" in normalized:
+        return "Use a JSON string for this field."
+    if normalized == "missing":
+        return "Supply this required field using its declared tool schema."
+    if normalized == "extra_forbidden":
+        return "Remove this field because the tool schema does not declare it."
+    if any(token in normalized for token in ("literal", "enum")):
+        return "Use one of the values declared by the tool schema."
+    return "Use a value that matches this field's declared tool schema."
+
+
+def exception_failure_provenance(
+    result: ToolResult,
+) -> ExceptionFailureProvenance | None:
+    """Return provenance only when it carries this module's identity marker."""
+
+    selected = result._exception_failure
+    if (
+        isinstance(selected, tuple)
+        and len(selected) == 2
+        and selected[0] is _EXCEPTION_FAILURE_MARKER
+        and isinstance(selected[1], ExceptionFailureProvenance)
+    ):
+        return selected[1]
+    return None
 
 
 def tool_result_content_duplicates_data(content: Any, data: Any) -> bool:
@@ -425,6 +615,11 @@ def _project_stable_error_details(details: Mapping[str, Any]) -> dict[str, Any]:
             if receipt is not None:
                 projected[key] = receipt
             continue
+        if normalized == "checkpoint_restore_receipt":
+            receipt = _project_checkpoint_restore_receipt(details[raw_key])
+            if receipt is not None:
+                projected[key] = receipt
+            continue
         if normalized in {
             "errors",
             "message",
@@ -479,6 +674,13 @@ def _project_checkpoint_fork_failure_phases(
     value: Mapping[Any, Any],
 ) -> list[str]:
     phases: list[str] = []
+    projected_phases = value.get("failure_phases")
+    if isinstance(projected_phases, (list, tuple)):
+        for phase in projected_phases:
+            if isinstance(phase, str) and phase and phase not in phases:
+                phases.append(_bounded_identifier(phase, fallback="unknown"))
+            if len(phases) >= _MODEL_ERROR_DETAIL_LIMIT:
+                return phases
     failures = value.get("post_commit_failures")
     if isinstance(failures, (list, tuple)):
         for failure in failures:
@@ -516,6 +718,69 @@ def _project_checkpoint_fork_receipt(value: Any) -> dict[str, Any] | None:
     if phases:
         projected["failure_phases"] = phases
     return projected
+
+
+def _project_checkpoint_restore_receipt(value: Any) -> dict[str, Any] | None:
+    """Expose only stable retry-safety facts from a restore interruption."""
+
+    if not isinstance(value, Mapping):
+        return None
+    expected_keys = {
+        "checkpoint_id",
+        "publication_id",
+        "operation_id",
+        "state",
+        "phase",
+        "status",
+        "main_state_committed",
+        "reconciliation_pending",
+    }
+    if set(value) != expected_keys:
+        return None
+    projected: dict[str, Any] = {}
+    for key in (
+        "checkpoint_id",
+        "publication_id",
+        "operation_id",
+        "state",
+        "phase",
+        "status",
+    ):
+        selected = value.get(key)
+        if not isinstance(selected, str) or not selected:
+            return None
+        projected[key] = _bounded_identifier(selected, fallback="unknown")
+    if value.get("main_state_committed") is not None:
+        return None
+    if value.get("reconciliation_pending") is not True:
+        return None
+    if projected["status"] not in {
+        "restore_publication_pending",
+        "restore_recovery_required",
+    }:
+        return None
+    projected["main_state_committed"] = None
+    projected["reconciliation_pending"] = True
+    return projected
+
+
+def _safe_caught_exception_details(
+    details: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Retain only explicitly projected retry-safety facts from exceptions."""
+
+    safe: dict[str, Any] = {}
+    receipt = _project_checkpoint_fork_receipt(
+        details.get("checkpoint_fork_receipt")
+    )
+    if receipt is not None:
+        safe["checkpoint_fork_receipt"] = receipt
+    restore_receipt = _project_checkpoint_restore_receipt(
+        details.get("checkpoint_restore_receipt")
+    )
+    if restore_receipt is not None:
+        safe["checkpoint_restore_receipt"] = restore_receipt
+    return safe
 
 
 def _project_data_flow_context(
@@ -703,24 +968,58 @@ class BaseAgentTool(ABC, Generic[InputT]):
             },
         }
 
-    async def ainvoke(self, raw_args: Mapping[str, Any] | str | InputT, ctx: ToolContext) -> ToolResult:
-        started_at = time.perf_counter()
+    def _runtime_args_or_failure(
+        self,
+        raw_args: Mapping[str, Any] | str | InputT,
+        ctx: ToolContext,
+        *,
+        config: AgentLibOSConfig,
+        started_at: float,
+    ) -> InputT | ToolResult:
         try:
-            args = self.parse_args(self._raw_args_with_runtime_defaults(raw_args, ctx))
+            return self._parse_args_for_runtime(
+                self._raw_args_with_runtime_defaults(raw_args, ctx),
+                config=config,
+            )
         except PydanticValidationError as exc:
-            return ToolResult.failure(
+            caught_error = exc
+            validation_error_count, validation_errors = _validation_error_summary(exc)
+            details = {
+                "error_type": "InputValidationError",
+                "validation_error_count": validation_error_count,
+                "errors": [
+                    {"loc": [field], "type": error_type, "msg": message}
+                    for field, error_type, message in validation_errors
+                ],
+            }
+        except Exception as exc:
+            caught_error = exc
+            details = {"error_type": "InputValidationError"}
+        return _mark_exception_failure(
+            ToolResult.failure(
                 code=ToolErrorCode.VALIDATION_ERROR,
                 message=f"Invalid arguments for tool `{self.name}`.",
-                details=self._validation_failure_details(exc),
+                details=details,
                 metadata=self._base_metadata(ctx, started_at),
-            )
-        except Exception as exc:
-            return ToolResult.failure(
-                code=ToolErrorCode.VALIDATION_ERROR,
-                message=f"Failed to parse arguments for tool `{self.name}`.",
-                details={"error_type": type(exc).__name__},
-                metadata=self._base_metadata(ctx, started_at),
-            )
+            ),
+            caught_error,
+            phase="input_validation",
+            code=ToolErrorCode.VALIDATION_ERROR.value,
+        )
+
+    async def ainvoke(self, raw_args: Mapping[str, Any] | str | InputT, ctx: ToolContext) -> ToolResult:
+        started_at = time.perf_counter()
+        selected_config = _runtime_tool_config(ctx)
+        effective_policy = self.policy.model_dump()
+        _apply_runtime_policy_overrides(effective_policy, selected_config)
+        args = self._runtime_args_or_failure(
+            raw_args,
+            ctx,
+            config=selected_config,
+            started_at=started_at,
+        )
+        if isinstance(args, ToolResult):
+            return args
 
         try:
             runtime = ctx.runtime
@@ -753,11 +1052,12 @@ class BaseAgentTool(ABC, Generic[InputT]):
                     cancelled_context[:] = [returned_context]
                     return False, exc, returned_context
 
-            if self.policy.timeout_s is None or not self.enforce_timeout:
+            timeout_s = effective_policy.get("timeout_s")
+            if timeout_s is None or not self.enforce_timeout:
                 executed = await execute_with_flow()
             else:
                 executed = await asyncio.wait_for(
-                    execute_with_flow(), timeout=self.policy.timeout_s
+                    execute_with_flow(), timeout=float(timeout_s)
                 )
             if manager is None:
                 raw_result = executed
@@ -777,33 +1077,39 @@ class BaseAgentTool(ABC, Generic[InputT]):
                 )
             result.metadata.update(self._base_metadata(ctx, started_at))
             return result
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             if manager is not None and cancelled_context:
                 returned_context = cancelled_context[-1]
                 manager.observe_ingress(returned_context)
                 ctx.metadata["_agent_libos_returned_data_flow_context"] = (
                     returned_context.to_dict()
                 )
-            return ToolResult.failure(
+            return self._exception_failure_result(
+                exc,
+                ctx,
+                started_at,
                 code=ToolErrorCode.TIMEOUT,
-                message=f"Tool `{self.name}` timed out.",
-                retryable=True,
-                metadata=self._base_metadata(ctx, started_at),
+                # A timeout is an ambiguous outcome for a non-idempotent
+                # operation: cancellation can race with an external effect.
+                # Do not invite an automatic replay unless the tool contract
+                # explicitly says repeating the operation is safe.
+                retryable=self.policy.idempotent,
             )
         except PydanticValidationError as exc:
-            return ToolResult.failure(
+            return self._exception_failure_result(
+                exc,
+                ctx,
+                started_at,
                 code=ToolErrorCode.VALIDATION_ERROR,
-                message=f"Invalid output for tool `{self.name}`.",
-                details=self._validation_failure_details(exc),
-                metadata=self._base_metadata(ctx, started_at),
             )
         except ToolExecutionError as exc:
-            return ToolResult.failure(
+            return self._exception_failure_result(
+                exc,
+                ctx,
+                started_at,
                 code=exc.code,
-                message=str(exc),
                 retryable=exc.retryable,
-                details=exc.details,
-                metadata=self._base_metadata(ctx, started_at),
+                safe_details=_safe_caught_exception_details(exc.details),
             )
         except HumanApprovalRequired:
             raise
@@ -812,45 +1118,35 @@ class BaseAgentTool(ABC, Generic[InputT]):
         except ProcessMessageWaitRequired:
             raise
         except CapabilityDenied as exc:
-            return ToolResult.failure(
+            return self._exception_failure_result(
+                exc,
+                ctx,
+                started_at,
                 code=ToolErrorCode.PERMISSION_DENIED,
-                message=str(exc),
-                details={"error_type": type(exc).__name__},
-                metadata=self._base_metadata(ctx, started_at),
             )
         except NotFound as exc:
-            return ToolResult.failure(
+            return self._exception_failure_result(
+                exc,
+                ctx,
+                started_at,
                 code=ToolErrorCode.EXECUTION_ERROR,
-                message=str(exc),
-                details={"error_type": type(exc).__name__},
-                metadata=self._base_metadata(ctx, started_at),
             )
         except ProcessError as exc:
-            return ToolResult.failure(
+            return self._exception_failure_result(
+                exc,
+                ctx,
+                started_at,
                 code=ToolErrorCode.EXECUTION_ERROR,
-                message=str(exc),
-                details={"error_type": type(exc).__name__},
-                metadata=self._base_metadata(ctx, started_at),
             )
         except LibOSValidationError as exc:
-            return ToolResult.failure(
+            return self._exception_failure_result(
+                exc,
+                ctx,
+                started_at,
                 code=ToolErrorCode.VALIDATION_ERROR,
-                message=str(exc),
-                details={"error_type": type(exc).__name__},
-                metadata=self._base_metadata(ctx, started_at),
             )
         except Exception as exc:
             return self._unexpected_failure_result(exc, ctx, started_at)
-
-    @staticmethod
-    def _validation_failure_details(
-        exc: PydanticValidationError,
-    ) -> dict[str, Any]:
-        # Pydantic context may retain the original, non-serializable ValueError.
-        return {
-            "error_type": type(exc).__name__,
-            "errors": exc.errors(include_input=False, include_context=False),
-        }
 
     def _unexpected_failure_result(
         self,
@@ -858,25 +1154,40 @@ class BaseAgentTool(ABC, Generic[InputT]):
         ctx: ToolContext,
         started_at: float,
     ) -> ToolResult:
-        public_error = provider_error_envelope(exc)
-        if public_error is not None:
-            return ToolResult.failure(
-                code=ToolErrorCode.EXECUTION_ERROR,
-                message=public_error["message"],
-                details={
-                    key: public_error[key]
-                    for key in ("code", "error_type", "correlation_id")
-                },
-                metadata=self._base_metadata(ctx, started_at),
-            )
-        details: dict[str, Any] = {"error_type": type(exc).__name__}
-        if self.expose_internal_errors:
-            details["message"] = str(exc)
-        return ToolResult.failure(
+        return self._exception_failure_result(
+            exc,
+            ctx,
+            started_at,
             code=ToolErrorCode.EXECUTION_ERROR,
-            message=f"Tool `{self.name}` failed during execution.",
-            details=details,
+        )
+
+    def _exception_failure_result(
+        self,
+        exc: Exception,
+        ctx: ToolContext,
+        started_at: float,
+        *,
+        code: ToolErrorCode,
+        retryable: bool = False,
+        safe_details: Mapping[str, Any] | None = None,
+    ) -> ToolResult:
+        public_error = public_error_envelope(exc, code=code.value)
+        result = ToolResult.failure(
+            code=code,
+            message=public_error["message"],
+            retryable=retryable,
+            details={
+                key: public_error[key]
+                for key in ("code", "error_type", "correlation_id")
+            }
+            | dict(safe_details or {}),
             metadata=self._base_metadata(ctx, started_at),
+        )
+        return _mark_exception_failure(
+            result,
+            exc,
+            phase="execution",
+            code=code.value,
         )
 
     def invoke(self, raw_args: Mapping[str, Any] | str | InputT, ctx: ToolContext) -> ToolResult:
@@ -886,19 +1197,91 @@ class BaseAgentTool(ABC, Generic[InputT]):
             return asyncio.run(self.ainvoke(raw_args, ctx))
         raise RuntimeError("Cannot call invoke() inside a running event loop. Use `await ainvoke(...)`.")
 
-    def parse_args(self, raw_args: Mapping[str, Any] | str | InputT) -> InputT:
+    def _parse_args_for_runtime(
+        self,
+        raw_args: Mapping[str, Any] | str | InputT,
+        *,
+        config: AgentLibOSConfig,
+    ) -> InputT:
+        """Call old and new parser overrides once, based on their signatures."""
+
+        parser = self.parse_args
+        try:
+            signature = inspect.signature(parser)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"{self.__class__.__name__}.parse_args must expose an inspectable signature"
+            ) from exc
+        try:
+            signature.bind(raw_args, config=config)
+        except TypeError:
+            try:
+                signature.bind(raw_args)
+            except TypeError as exc:
+                raise TypeError(
+                    f"{self.__class__.__name__}.parse_args must accept raw_args and "
+                    "optionally a config keyword"
+                ) from exc
+            return parser(raw_args)
+        return parser(raw_args, config=config)
+
+    def parse_args(
+        self,
+        raw_args: Mapping[str, Any] | str | InputT,
+        *,
+        config: AgentLibOSConfig | None = None,
+    ) -> InputT:
+        selected_config = config or DEFAULT_CONFIG
         if isinstance(raw_args, self.args_schema):
-            return raw_args
-        if isinstance(raw_args, str):
-            return self.args_schema.model_validate_json(raw_args)
-        if isinstance(raw_args, Mapping):
-            return self.args_schema.model_validate(dict(raw_args))
-        raise TypeError(f"Tool arguments must be {self.args_schema.__name__}, dict, or JSON string.")
+            payload = raw_args.model_dump(mode="python", exclude_unset=True)
+        elif isinstance(raw_args, str):
+            try:
+                decoded = json.loads(raw_args)
+            except json.JSONDecodeError:
+                return self.args_schema.model_validate_json(raw_args, strict=True)
+            if not isinstance(decoded, dict):
+                return self.args_schema.model_validate_json(raw_args, strict=True)
+            payload = decoded
+        elif isinstance(raw_args, Mapping):
+            payload = dict(raw_args)
+        else:
+            raise TypeError(f"Tool arguments must be {self.args_schema.__name__}, dict, or JSON string.")
+
+        payload = _apply_runtime_arg_defaults(
+            self.name,
+            payload,
+            selected_config,
+        )
+
+        bounded_fields = _RUNTIME_BOUNDED_ARGUMENT_FIELDS.get(self.name)
+        if bounded_fields is not None:
+            Draft202012Validator(
+                self.spec(config=selected_config).input_schema
+            ).validate(payload)
+        try:
+            return self.args_schema.model_validate(payload, strict=True)
+        except PydanticValidationError as exc:
+            if (
+                self.name in _STATIC_CEILING_FALLBACK_TOOLS
+                and bounded_fields is not None
+                and exc.errors()
+                and all(
+                    error.get("type") == "less_than_equal"
+                    and bool(error.get("loc"))
+                    and str(error["loc"][0]) in bounded_fields
+                    for error in exc.errors()
+                )
+            ):
+                # The active JSON schema has already validated every field.
+                # Only import-time Pydantic ceilings may be bypassed here;
+                # primitives independently enforce the same Host limits.
+                return self.args_schema.model_construct(**payload)
+            raise
 
     def _raw_args_with_runtime_defaults(self, raw_args: Mapping[str, Any] | str | InputT, ctx: ToolContext) -> Mapping[str, Any] | str | InputT:
         if isinstance(raw_args, self.args_schema):
             return raw_args
-        config = getattr(ctx.runtime, "config", DEFAULT_CONFIG)
+        config = _runtime_tool_config(ctx)
         if isinstance(raw_args, str):
             try:
                 decoded = json.loads(raw_args)
@@ -913,7 +1296,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
 
     def _normalize_result(self, raw_result: Any) -> ToolResult:
         if isinstance(raw_result, ToolResult):
-            if raw_result.ok and self.output_schema is not None and raw_result.data is not None:
+            if raw_result.ok and self.output_schema is not None:
                 validated = self.output_schema.model_validate(raw_result.data)
                 raw_result.data = validated.model_dump()
                 raw_result.content = validated.model_dump_json()
@@ -1038,6 +1421,11 @@ def _apply_runtime_policy_overrides(policy: dict[str, Any], config: AgentLibOSCo
         policy["timeout_s"] = runtime.sleep_tool_timeout_s
 
 
+def _runtime_tool_config(ctx: ToolContext) -> AgentLibOSConfig:
+    selected = getattr(ctx.runtime, "config", None)
+    return selected if isinstance(selected, AgentLibOSConfig) else DEFAULT_CONFIG
+
+
 def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: AgentLibOSConfig) -> None:
     properties = schema.get("properties")
     if not isinstance(properties, dict):
@@ -1047,6 +1435,10 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
     runtime = config.runtime
 
     if _apply_checkpoint_schema_overrides(name, properties, config):
+        return
+    if _apply_git_schema_overrides(name, properties, config):
+        return
+    if _apply_registry_schema_overrides(name, properties, config):
         return
 
     if name in {"read_text_file", "read_file_bytes"}:
@@ -1080,12 +1472,6 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
             default=tools.memory_payload_chars,
             maximum=tools.memory_payload_hard_limit_chars,
         )
-    elif name == "list_memory_namespace":
-        _set_number_bounds(
-            properties,
-            "limit",
-            maximum=config.memory.query_limit,
-        )
     elif name in {"read_process_messages", "receive_process_messages"}:
         _set_number_bounds(properties, "limit", default=tools.message_read_limit, maximum=tools.message_read_hard_limit)
     elif name == "run_shell_command":
@@ -1110,18 +1496,6 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
         _set_property_default(properties, "channel", runtime.terminal_channel)
     elif name == "request_permission":
         _set_property_default(properties, "human", runtime.default_human)
-    elif name == "list_jsonrpc_endpoints":
-        _set_number_bounds(
-            properties,
-            "limit",
-            maximum=config.jsonrpc.list_limit,
-        )
-    elif name == "list_mcp_servers":
-        _set_number_bounds(
-            properties,
-            "limit",
-            maximum=config.mcp.list_limit,
-        )
 
 
 def _apply_checkpoint_schema_overrides(
@@ -1142,10 +1516,93 @@ def _apply_checkpoint_schema_overrides(
     return True
 
 
+def _apply_registry_schema_overrides(
+    name: str,
+    properties: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> bool:
+    limits = {
+        "list_memory_namespace": (None, config.memory.query_limit),
+        "list_jsonrpc_endpoints": (None, config.jsonrpc.list_limit),
+        "list_mcp_servers": (None, config.mcp.list_limit),
+        "list_capabilities": (
+            config.capability.list_limit,
+            config.capability.list_limit,
+        ),
+    }
+    selected = limits.get(name)
+    if selected is None:
+        return False
+    default, maximum = selected
+    _set_number_bounds(
+        properties,
+        "limit",
+        default=default,
+        maximum=maximum,
+    )
+    return True
+
+
+def _apply_git_schema_overrides(
+    name: str,
+    properties: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> bool:
+    git = config.git
+    if name == "git_status":
+        field, default, maximum = (
+            "limit",
+            git.status_entry_limit,
+            git.status_entry_hard_limit,
+        )
+    elif name == "git_log":
+        field, default, maximum = (
+            "limit",
+            git.log_entry_limit,
+            git.log_entry_hard_limit,
+        )
+    elif name in {"git_diff", "git_show"}:
+        field, default, maximum = (
+            "max_bytes",
+            git.patch_max_bytes,
+            git.patch_hard_limit_bytes,
+        )
+    elif name == "git_blame":
+        field, default, maximum = (
+            "max_bytes",
+            git.output_max_bytes,
+            git.output_hard_limit_bytes,
+        )
+    elif name == "git_list_refs":
+        field, default, maximum = (
+            "limit",
+            min(git.ref_list_limit, git.status_entry_hard_limit),
+            git.status_entry_hard_limit,
+        )
+    elif name == "git_list_pull_requests":
+        field, default, maximum = (
+            "limit",
+            min(git.pull_request_list_limit, git.status_entry_hard_limit),
+            git.status_entry_hard_limit,
+        )
+    else:
+        return False
+    _set_number_bounds(
+        properties,
+        field,
+        default=default,
+        maximum=maximum,
+    )
+    return True
+
+
 def _apply_runtime_arg_defaults(name: str, args: dict[str, Any], config: AgentLibOSConfig) -> dict[str, Any]:
     tools = config.tools
     shell = config.shell
     runtime = config.runtime
+
+    if _apply_git_arg_defaults(name, args, config):
+        return args
 
     if name in {"read_text_file", "read_file_bytes"}:
         args.setdefault("encoding", tools.default_text_encoding)
@@ -1189,7 +1646,38 @@ def _apply_runtime_arg_defaults(name: str, args: dict[str, Any], config: AgentLi
             "external_effect_limit",
             config.checkpoint.diff_preview_items,
         )
+    elif name == "list_capabilities":
+        args.setdefault("limit", config.capability.list_limit)
     return args
+
+
+def _apply_git_arg_defaults(
+    name: str,
+    args: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> bool:
+    git = config.git
+    defaults: dict[str, tuple[str, int]] = {
+        "git_status": ("limit", git.status_entry_limit),
+        "git_log": ("limit", git.log_entry_limit),
+        "git_diff": ("max_bytes", git.patch_max_bytes),
+        "git_show": ("max_bytes", git.patch_max_bytes),
+        "git_blame": ("max_bytes", git.output_max_bytes),
+        "git_list_refs": (
+            "limit",
+            min(git.ref_list_limit, git.status_entry_hard_limit),
+        ),
+        "git_list_pull_requests": (
+            "limit",
+            min(git.pull_request_list_limit, git.status_entry_hard_limit),
+        ),
+    }
+    selected = defaults.get(name)
+    if selected is None:
+        return False
+    field, value = selected
+    args.setdefault(field, value)
+    return True
 
 
 def _set_property_default(properties: dict[str, Any], field: str, value: Any) -> None:
@@ -1228,3 +1716,22 @@ def _set_number_bounds(
         prop["maximum"] = maximum
     if exclusive_minimum is not None:
         prop["exclusiveMinimum"] = exclusive_minimum
+
+    # Pydantic represents nullable numbers as ``anyOf: [number, null]`` and
+    # leaves the original numeric constraints on the number branch. Updating
+    # only the property wrapper would therefore preserve a stale import-time
+    # ceiling inside ``anyOf``. Keep both representations aligned because the
+    # wrapper constraint is useful to callers that inspect bounds directly.
+    variants = prop.get("anyOf")
+    if not isinstance(variants, list):
+        return
+    for variant in variants:
+        if not isinstance(variant, dict) or variant.get("type") not in {
+            "integer",
+            "number",
+        }:
+            continue
+        if maximum is not None:
+            variant["maximum"] = maximum
+        if exclusive_minimum is not None:
+            variant["exclusiveMinimum"] = exclusive_minimum

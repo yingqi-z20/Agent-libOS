@@ -15,7 +15,7 @@
       "checkpoint.restore": { "route": "POST /api/checkpoints/{checkpoint_id}/restore", "request_def": "checkpointRestorePayload" },
       "checkpoint.fork": { "route": "POST /api/checkpoints/{checkpoint_id}/fork", "request_def": "checkpointForkPayload" },
       "skill.register": { "route": "POST /api/skills/register", "request_def": "skillRegisterPayload" },
-      "skill.activate": { "route": "POST /api/skills/{skill_id}/activate", "request_def": "skillProcessMutationPayload" },
+      "skill.activate": { "route": "POST /api/skills/{skill_id}/activate", "request_def": "skillActivatePayload" },
       "skill.unload": { "route": "POST /api/skills/{skill_id}/unload", "request_def": "skillProcessMutationPayload" },
       "capability.grant": { "route": "POST /api/capabilities/grant", "request_def": "capabilityGrantPayload" },
       "capability.delegate": { "route": "POST /api/capabilities/delegate", "request_def": "capabilityDelegatePayload" },
@@ -37,6 +37,10 @@
       "type": "string",
       "minLength": 1,
       "pattern": "\\S"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "capabilityRights": {
       "oneOf": [
@@ -257,6 +261,17 @@
         {
           "required": ["pid"],
           "properties": { "pid": { "$ref": "#/$defs/nonEmptyString" } }
+        }
+      ]
+    },
+    "skillActivatePayload": {
+      "allOf": [
+        { "$ref": "#/$defs/skillProcessMutationPayload" },
+        {
+          "required": ["expected_package_sha256"],
+          "properties": {
+            "expected_package_sha256": { "$ref": "#/$defs/sha256" }
+          }
         }
       ]
     },

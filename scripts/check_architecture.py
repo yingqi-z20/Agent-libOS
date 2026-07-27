@@ -240,7 +240,93 @@ def _is_default_executor_dispatch(node: ast.Call) -> bool:
     return isinstance(executor, ast.Constant) and executor.value is None
 
 
-def _static_sql_text(node: ast.AST) -> str | None:
+def _nearest_function_scope(
+    node: ast.AST,
+    parents: Mapping[ast.AST, ast.AST],
+) -> FunctionNode | None:
+    current: ast.AST | None = node
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current
+        current = parents.get(current)
+    return None
+
+
+def _function_scope_chain(
+    scope: FunctionNode | None,
+    parents: Mapping[ast.AST, ast.AST],
+) -> tuple[FunctionNode | None, ...]:
+    chain: list[FunctionNode | None] = []
+    current = scope
+    while current is not None:
+        chain.append(current)
+        parent = parents.get(current)
+        current = (
+            _nearest_function_scope(parent, parents)
+            if parent is not None
+            else None
+        )
+    chain.append(None)
+    return tuple(chain)
+
+
+def _static_name_environment(
+    tree: ast.AST,
+    parents: Mapping[ast.AST, ast.AST],
+) -> tuple[
+    dict[tuple[FunctionNode | None, str], ast.AST | None],
+    set[tuple[FunctionNode | None, str]],
+]:
+    values: dict[tuple[FunctionNode | None, str], list[ast.AST]] = {}
+    definitions: set[tuple[FunctionNode | None, str]] = set()
+    for node in ast.walk(tree):
+        scope = _nearest_function_scope(node, parents)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for argument in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            ):
+                definitions.add((node, argument.arg))
+            if node.args.vararg is not None:
+                definitions.add((node, node.args.vararg.arg))
+            if node.args.kwarg is not None:
+                definitions.add((node, node.args.kwarg.arg))
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    key = (scope, target.id)
+                    definitions.add(key)
+                    values.setdefault(key, []).append(node.value)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            key = (scope, node.target.id)
+            definitions.add(key)
+            if node.value is not None:
+                values.setdefault(key, []).append(node.value)
+        elif isinstance(node, ast.arg):
+            definitions.add((scope, node.arg))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    definitions.add(
+                        (scope, alias.asname or alias.name.split(".", 1)[0])
+                    )
+    bindings = {
+        key: candidates[0] if len(candidates) == 1 else None
+        for key, candidates in values.items()
+    }
+    return bindings, definitions
+
+
+def _static_sql_text(
+    node: ast.AST,
+    *,
+    scope: FunctionNode | None = None,
+    bindings: Mapping[tuple[FunctionNode | None, str], ast.AST | None] | None = None,
+    definitions: set[tuple[FunctionNode | None, str]] | None = None,
+    parents: Mapping[ast.AST, ast.AST] | None = None,
+    seen: frozenset[tuple[FunctionNode | None, str]] = frozenset(),
+) -> str | None:
     """Return statically visible SQL text without evaluating source code."""
 
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -253,10 +339,48 @@ def _static_sql_text(node: ast.AST) -> str | None:
             for value in node.values
         )
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _static_sql_text(node.left)
-        right = _static_sql_text(node.right)
+        left = _static_sql_text(
+            node.left,
+            scope=scope,
+            bindings=bindings,
+            definitions=definitions,
+            parents=parents,
+            seen=seen,
+        )
+        right = _static_sql_text(
+            node.right,
+            scope=scope,
+            bindings=bindings,
+            definitions=definitions,
+            parents=parents,
+            seen=seen,
+        )
         if left is not None and right is not None:
             return left + right
+    if (
+        isinstance(node, ast.Name)
+        and bindings is not None
+        and definitions is not None
+        and parents is not None
+    ):
+        for candidate_scope in _function_scope_chain(scope, parents):
+            key = (candidate_scope, node.id)
+            if key in seen:
+                return None
+            if key in bindings:
+                value = bindings[key]
+                if value is None:
+                    return None
+                return _static_sql_text(
+                    value,
+                    scope=candidate_scope,
+                    bindings=bindings,
+                    definitions=definitions,
+                    parents=parents,
+                    seen=seen | {key},
+                )
+            if key in definitions:
+                return None
     return None
 
 
@@ -264,6 +388,10 @@ def _raw_jit_projection_mutation(
     node: ast.Call,
     *,
     relative: str,
+    scope: FunctionNode | None,
+    bindings: Mapping[tuple[FunctionNode | None, str], ast.AST | None],
+    definitions: set[tuple[FunctionNode | None, str]],
+    parents: Mapping[ast.AST, ast.AST],
 ) -> str | None:
     """Identify raw writes to the two transactionally derived JIT tables.
 
@@ -290,7 +418,13 @@ def _raw_jit_projection_mutation(
     )
     if sql_node is None:
         return None
-    sql = _static_sql_text(sql_node)
+    sql = _static_sql_text(
+        sql_node,
+        scope=scope,
+        bindings=bindings,
+        definitions=definitions,
+        parents=parents,
+    )
     if sql is None:
         return None
     match = _JIT_PROJECTION_MUTATION.search(sql)
@@ -607,6 +741,10 @@ def _scan_file(path: Path, root: Path) -> ArchitectureReport:
     owners = _qualified_owners(tree)
     runtime_aliases = _runtime_aliases(tree, parents, owners)
     component_aliases = _component_aliases(tree, parents, owners)
+    static_name_bindings, static_name_definitions = _static_name_environment(
+        tree,
+        parents,
+    )
     violations: list[Violation] = []
     functions: list[FunctionMetric] = []
 
@@ -1090,6 +1228,10 @@ def _scan_file(path: Path, root: Path) -> ArchitectureReport:
             projection_table = _raw_jit_projection_mutation(
                 node,
                 relative=relative,
+                scope=_nearest_function_scope(node, parents),
+                bindings=static_name_bindings,
+                definitions=static_name_definitions,
+                parents=parents,
             )
             if projection_table is not None:
                 violations.append(

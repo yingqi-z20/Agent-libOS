@@ -11,7 +11,17 @@ from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ValidationError
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.models import CapabilityRight, HumanRequestStatus, ProcessStatus
+from agent_libos.models import (
+    CapabilityEffect,
+    CapabilityRight,
+    HumanRequestStatus,
+    ProcessStatus,
+)
+from agent_libos.tools.base import ToolContext
+from agent_libos.tools.builtin.permission import (
+    RequestPermissionArgs,
+    RequestPermissionTool,
+)
 
 AUTHORITY_SKILL = 'agent-libos-authority-basics'
 
@@ -74,6 +84,94 @@ class TestPermissionPolicy:
         assert allowed.ok
         assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'allowed'
 
+    def test_ask_permission_policy_preserves_requestable_expiry(self) -> None:
+        resource = f"object:ask-expiry:{uuid4().hex}"
+        pid = self.runtime.process.spawn(
+            image="review-agent:v0",
+            goal="preserve ASK expiry",
+            authority_manifest={
+                "authorized_capabilities": [
+                    {
+                        "resource": "human:owner",
+                        "rights": [CapabilityRight.WRITE.value],
+                    }
+                ],
+                "approval_policy": {
+                    "requestable_capabilities": [
+                        {
+                            "resource": resource,
+                            "rights": [CapabilityRight.READ.value],
+                            "expires_at": "2030-01-01T00:00:00Z",
+                        }
+                    ]
+                },
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        )
+        request_id = self.runtime.human.request_permission(
+            pid,
+            "owner",
+            resource,
+            [CapabilityRight.READ.value],
+            "preserve the requestable lease",
+            blocking=False,
+        )
+
+        self.runtime.human.approve(
+            request_id,
+            {"approved": True, "policy": CapabilityManager.ASK_EACH_TIME},
+        )
+
+        policy_capability = next(
+            capability
+            for capability in self.runtime.capability.capabilities_for(pid)
+            if capability.resource == resource
+            and capability.effect == CapabilityEffect.ASK
+        )
+        assert policy_capability.expires_at == "2030-01-01T00:00:00+00:00"
+
+    def test_blank_human_resume_uses_canonical_runtime_default(self) -> None:
+        pid = self._spawn_review(goal="resume blank Human permission")
+        self._grant_human(pid)
+        resource = self.runtime.filesystem.resource_for(self._path())
+        args = RequestPermissionArgs(
+            resource=resource,
+            rights=[CapabilityRight.WRITE.value],
+            reason="resume with canonical default Human",
+            human="   ",
+        )
+        initial = RequestPermissionTool()
+        initial_context = ToolContext(
+            trace_id="trace-initial",
+            call_id="call-initial",
+            pid=pid,
+            runtime=self.runtime,
+        )
+
+        with pytest.raises(HumanResponseRequired) as raised:
+            initial.run(args, initial_context)
+
+        request = self.runtime.human.get(raised.value.request_id)
+        assert request.human == self.runtime.config.runtime.default_human
+        self.runtime.human.approve(
+            request.request_id,
+            {"approved": True, "policy": CapabilityManager.ASK_EACH_TIME},
+        )
+
+        resumed = RequestPermissionTool().run(
+            args,
+            ToolContext(
+                trace_id="trace-resume",
+                call_id="call-resume",
+                pid=pid,
+                runtime=self.runtime,
+                metadata={"human_resume_request_id": request.request_id},
+            ),
+        )
+
+        assert resumed.request_id == request.request_id
+        assert resumed.status == HumanRequestStatus.APPROVED.value
+
     def test_concurrent_terminal_drains_install_one_auto_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
         pid = self._spawn_review(goal='concurrent terminal policy')
         self._grant_human(pid)
@@ -127,7 +225,7 @@ class TestPermissionPolicy:
         assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         assert self.runtime.capability.permission_policy(pid, resource, CapabilityRight.WRITE) == CapabilityManager.ALWAYS_DENY
         assert not denied.ok
-        assert 'denied write' in (denied.error or '')
+        assert (denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert not (self.runtime.workspace_root / path).exists()
 
     def test_rejected_permission_request_cannot_install_allow_policy(self) -> None:
@@ -265,6 +363,69 @@ class TestPermissionPolicy:
         assert not request.ok
         assert self.runtime.human.pending() == []
 
+    @pytest.mark.parametrize(
+        'resource',
+        [
+            'shell:git:*',
+            'shell:git:status',
+            'shell:git/*',
+            'shell:Git',
+            'shell:git/',
+        ],
+        ids=[
+            'nested-prefix',
+            'nested-exact',
+            'subtree',
+            'case-variant',
+            'noncanonical-trailing-slash',
+        ],
+    )
+    def test_request_permission_rejects_noncanonical_git_shell_policy_without_human_side_effects(
+        self,
+        resource: str,
+    ) -> None:
+        pid = self.runtime.process.spawn(
+            image='review-agent:v0',
+            goal='reject noncanonical git shell policy',
+            authority_manifest={
+                'authorized_capabilities': [
+                    {
+                        'resource': 'human:owner',
+                        'rights': [CapabilityRight.WRITE.value],
+                    }
+                ],
+                'approval_policy': {
+                    'requestable_capabilities': [
+                        {
+                            'resource': resource,
+                            'rights': [CapabilityRight.EXECUTE.value],
+                        }
+                    ]
+                },
+            },
+        )
+        before_audit = self.runtime.store.list_audit()
+        before_events = self.runtime.store.list_events()
+        before_requests = self.runtime.human.list(pid=pid)
+
+        with pytest.raises(
+            ValidationError,
+            match='canonical exact resource shell:git',
+        ):
+            self.runtime.human.request_permission(
+                pid,
+                'owner',
+                resource,
+                [CapabilityRight.EXECUTE.value],
+                'inspect git state',
+                blocking=False,
+            )
+
+        assert self.runtime.human.list(pid=pid) == before_requests == []
+        assert self.runtime.store.list_audit() == before_audit
+        assert self.runtime.store.list_events() == before_events
+        assert self.runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+
     def test_request_permission_can_approve_workspace_write(self) -> None:
         pid = self._spawn_review(goal='request workspace write')
         self._grant_human(pid)
@@ -332,7 +493,7 @@ class TestPermissionPolicy:
         denied = self.runtime.tools.call(pid, 'request_permission', {'resource': resource, 'rights': ['write'], 'reason': 'write'})
 
         assert not denied.ok
-        assert 'lacks write on human:owner' in (denied.error or '')
+        assert (denied.error or '').startswith('permission_denied: CapabilityDenied')
         assert self.runtime.human.pending() == []
 
     def test_cancelled_human_request_cannot_be_approved_later(self) -> None:
@@ -572,7 +733,7 @@ class TestPermissionPolicy:
         result = self.runtime.tools.call(pid, 'write_text_file', {'path': path, 'content': 'new', 'overwrite': False})
         assert state_calls == 1
         assert not result.ok
-        assert 'already exists' in (result.error or '')
+        assert (result.error or '').startswith('execution_error: ToolExecutionError')
         assert target.read_text(encoding='utf-8') == 'existing'
 
     def test_missing_delete_consumes_one_time_grant(self) -> None:

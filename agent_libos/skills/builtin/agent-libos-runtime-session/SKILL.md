@@ -71,12 +71,12 @@ token counts, and actual preserved count. An unforced small context returns
 `compacted=false`, `reason="context_under_target"`, equal versions, and is a
 successful stop.
 
-Writeback uses a source-version compare-and-swap. A concurrent context change,
-invalid/empty child summary, killed child, or budget/authority failure detected
-before that write leaves the original context unchanged. Success advances
-context generation so the next quantum rematerializes. Compaction is not reopen
-persistence: ordinary Runtime reopen can lose runtime-local context payload
-history even though generation, labels, and evidence survive.
+Writeback uses a source-version compare-and-swap. Durable context generation is
+advanced before volatile Object writeback, so even a final version conflict can
+leave the original payload unchanged while advancing generation; the next
+quantum must rematerialize. Success also advances generation. Compaction is not
+reopen persistence: ordinary Runtime reopen can lose runtime-local context
+payload history even though generation, labels, and evidence survive.
 
 ### `process_exit`
 
@@ -84,7 +84,8 @@ Call alone after every write, wait, merge, requested Git/checkpoint action,
 verification, queued message, and required Human output is complete. Result
 input precedence is exact:
 
-1. `result_oid` reuses an existing readable Object and overrides everything.
+1. Nonempty `result_oid` reuses an existing readable Object and overrides everything;
+   an empty string is rejected before any terminal transition.
 2. Otherwise `payload` creates a structured final summary Object and overrides
    `message`.
 3. Otherwise `message` creates internal `{"message": ...}` Object data; it is
@@ -94,13 +95,25 @@ input precedence is exact:
    contract; never do so to discover whether an exit gate exists.
 
 `review_token` and `completion_evidence` are only for cumulative review. A
-one-phase success returns `status="exited"`; only that status confirms successful
-terminal completion. `status="completion_review_required"` is nonterminal.
+committed exit returns `status="exited"` and `terminal_committed=true`; only that
+status confirms terminal completion. `status="completion_review_required"` is
+nonterminal. If post-commit cleanup fails, the same exited result includes a
+safe structured `error.code="terminal_cleanup_required"`, the committed
+`result_oid`, cleanup state, and Host recovery instructions.
 
 Exit atomically records terminal state, result identity, evidence, and parent
-wake, then finalizes; it is irreversible. The result survives live-runtime
-process cleanup, while other child memory awaits its direct parent. Its payload
-is still not guaranteed recoverable after reopen.
+wake, then performs durable cleanup; the commit is irreversible even when that
+cleanup reports an error. The result survives live-runtime process cleanup,
+while other child memory awaits its direct parent. Its payload is still not
+guaranteed recoverable after reopen.
+
+Exit is rejected before terminal commit while any ordinary descendant remains
+nonterminal; settle it with the child-process Skill rather than leaving an
+independently runnable orphan. An already-published active ObjectTask runner is
+the deliberate exception because its lifecycle is Host-managed and its owner
+pin must survive creator exit; an unpublished runner is not exempt. Internal
+failed-exit handling terminates ordinary descendants bottom-up while preserving
+those Host-managed runners.
 
 ## Recommended workflow
 
@@ -121,19 +134,22 @@ is still not guaranteed recoverable after reopen.
 - Sleep error is unknown unless certified not-started; reconcile time/state.
 - Missing context/rights: stop; `force=true` creates neither.
 - A source-version conflict, rejected child output, or failure explicitly known
-  to occur before context writeback leaves the original context unchanged.
+  to occur before context writeback leaves the original payload unchanged, but
+  a final CAS conflict may already have advanced durable context generation.
   Other errors can occur after the context CAS but before job/result evidence
-  finishes, so settlement is unknown: re-read the context OID/version and the
-  compaction job before deciding what happened. Never loop or blindly replay;
-  make a later attempt only after readback proves no writeback committed and
-  the original cause is resolved.
+  finishes. Re-read context OID/version/generation and the compaction job; never
+  loop or replay until readback proves no writeback committed and the cause is
+  resolved. A changed generation ends the quantum for fresh rematerialization.
 - Pending compaction survives reopen: Runtime can reconstruct a missing child
   goal and resume; if a completed child's result payload vanished it may rerun
   that summary stage. If a crash happened after a pending row was claimed as
   `resuming`, Runtime fails the process closed rather than replay an operation
   with unknown settlement. Never forge `_resume_job` or spawn a replacement.
 - Exit validation/review: the process remains nonterminal. Use the newest review
-  and never claim exit without exact `status="exited"`.
+  and never claim exit without exact `status="exited"`. Any exited result with
+  `error.code="terminal_cleanup_required"` has already committed its outcome:
+  stop, preserve `result_oid`, do not call `process_exit` again, and leave the
+  idempotent `retry_terminal_cleanup` action to the Host.
 - Goal recovery after reopen: cumulative review first reads the live goal Object.
   If its runtime payload is gone, it can recover the exact initial goal only
   from retained full-I/O LLM evidence and only up to 32,000 characters. Disabled
@@ -170,15 +186,16 @@ probe that distinction with an empty terminal call. Use this state machine.
    appears, repeat read then the same result-bearing review call. Never submit
    the pre-ACK token.
 
-Review never inlines Human message bodies. It keeps every ACKed ID, a count and
-hash, plus an `acknowledged_human_message_reference` whose fixed and copied
-arguments describe the exact `read_process_messages` call. Copy those arguments,
-use `include_acked=true` and `ack=false`, and inspect `has_more`/`continuation`.
-That continuation has no cursor: if a durable-result bound splits the response,
-subtract returned IDs from the review's full ID list and issue the next exact-ID
-read; repeating identical filters would replay the first page. Empty
-`message_ids` means none. Refresh the review after any ACK. Message-count
-overflow fails closed and requires a Host-approved consolidated successor.
+Review never inlines Human message bodies. It keeps every ACKed ID, count, and
+hash, plus an `acknowledged_human_message_reference`. Execute each
+`batches[].arguments` exactly; every batch already fits the active ID-count and
+filter-JSON limits and uses `include_acked=true`, `ack=false`. Inspect
+`has_more`/`continuation`. There is no cursor: if a durable-result bound splits a
+batch, subtract returned IDs from that batch's `arguments.message_ids` and issue
+the next exact-ID read with only the remainder and its count. Repeating identical
+filters replays the first page. No batches means no ACKed messages. Refresh the
+review after any ACK. Message-count overflow fails closed and requires a
+Host-approved consolidated successor.
 
 A live goal likewise carries a hash and Object Memory reference, not an inline
 preview. Copy the reference's namespace/name arguments and read by name—never

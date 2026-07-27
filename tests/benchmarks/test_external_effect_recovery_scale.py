@@ -4,7 +4,9 @@ import contextlib
 import json
 import os
 import sqlite3
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -23,6 +25,7 @@ from benchmarks.external_effect_recovery import (
     run_recovery_scale_benchmark,
 )
 from benchmarks.external_effect_recovery import runner as recovery_runner
+from experiments import recovery_artifact_metadata as recovery_metadata_module
 from experiments.run_external_effect_recovery_scale import main
 from experiments.recovery_artifact_metadata import (
     build_recovery_artifact_metadata,
@@ -33,6 +36,65 @@ from experiments.recovery_artifact_metadata import (
 def test_ci_and_million_profiles_are_stable() -> None:
     assert BENCHMARK_PROFILES["ci"].total_records == 100_000
     assert BENCHMARK_PROFILES["million"].total_records == 1_000_000
+
+
+def test_recovery_benchmark_serializes_complete_global_patch_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def fake_locked(**kwargs: object) -> int:
+        selected = int(kwargs["total_records"])  # type: ignore[arg-type]
+        if selected == 1:
+            first_entered.set()
+            assert release_first.wait(2)
+        else:
+            second_entered.set()
+        return selected
+
+    monkeypatch.setattr(
+        recovery_runner,
+        "_run_recovery_scale_benchmark_locked",
+        fake_locked,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            run_recovery_scale_benchmark,
+            total_records=1,
+            pending_records=0,
+            page_size=1,
+        )
+        assert first_entered.wait(2)
+        second = executor.submit(
+            run_recovery_scale_benchmark,
+            total_records=2,
+            pending_records=0,
+            page_size=1,
+        )
+        assert not second_entered.wait(0.1)
+        release_first.set()
+        assert first.result(timeout=2) == 1
+        assert second.result(timeout=2) == 2
+
+
+def test_recovery_connect_trace_filter_matches_only_benchmark_database(
+    tmp_path: Path,
+) -> None:
+    database = (tmp_path / "benchmark.sqlite").resolve()
+
+    assert recovery_runner._connect_targets_database((database,), {}, database)
+    assert recovery_runner._connect_targets_database(
+        (f"{database.as_uri()}?mode=rw",),
+        {"uri": True},
+        database,
+    )
+    assert not recovery_runner._connect_targets_database(
+        (tmp_path / "unrelated.sqlite",),
+        {},
+        database,
+    )
 
 
 def test_scale_profiles_are_wired_into_ci_and_nightly_workflows() -> None:
@@ -510,18 +572,16 @@ def test_recovery_artifact_does_not_conflate_overrides_with_named_profile(
     classification: str,
     named_profile_evidence: bool,
 ) -> None:
-    run_id, started_at = new_recovery_run_identity()
+    identity = new_recovery_run_identity(source_paths=(Path(__file__),))
     defaults = {"total_records": 100, "pending_records": 10, "page_size": 500}
 
     metadata = build_recovery_artifact_metadata(
         benchmark_id="test-recovery",
-        run_id=run_id,
-        started_at=started_at,
+        identity=identity,
         selected_profile="ci",
         profile_defaults=defaults,
         explicit_overrides=explicit_overrides,
         effective_parameters={**defaults, "transaction_states": ["prepared"]},
-        source_paths=(Path(__file__),),
     )
 
     assert metadata["invocation"]["classification"] == classification
@@ -530,6 +590,40 @@ def test_recovery_artifact_does_not_conflate_overrides_with_named_profile(
         metadata["invocation"]["named_profile_evidence"]
         is named_profile_evidence
     )
+
+
+def test_recovery_source_snapshot_is_captured_before_workload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "benchmark.py"
+    source.write_text("version = 1\n", encoding="utf-8")
+    monkeypatch.setattr(recovery_metadata_module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(recovery_metadata_module, "__file__", str(source))
+    monkeypatch.setattr(
+        recovery_metadata_module,
+        "_git_provenance",
+        lambda: {"available": False},
+    )
+
+    identity = recovery_metadata_module.new_recovery_run_identity(
+        source_paths=(source,)
+    )
+    captured_sha256 = identity.source_entries[0].sha256
+    source.write_text("version = 2\n", encoding="utf-8")
+    metadata = recovery_metadata_module.build_recovery_artifact_metadata(
+        benchmark_id="snapshot-timing",
+        identity=identity,
+        selected_profile="ci",
+        profile_defaults={"total_records": 1},
+        explicit_overrides={},
+        effective_parameters={"total_records": 1},
+    )
+
+    assert metadata["provenance"]["benchmark_sources"] == [
+        {"path": "benchmark.py", "sha256": captured_sha256}
+    ]
+    assert captured_sha256 != recovery_metadata_module._sha256_file(source)
 
 
 @pytest.mark.parametrize(

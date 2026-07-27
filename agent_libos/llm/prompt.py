@@ -29,6 +29,9 @@ These tool calls are library/runtime wrapper calls, like libc or a language stan
 They are not kernel syscalls; the runtime may validate, attenuate, checkpoint, ask a human, sandbox, audit, or decompose them into lower-level libOS primitives.
 Use a native tool call for the final action. Ordinary assistant text has no side effect.
 The available library calls and their input schemas are supplied through the model tool schema for this turn.
+Match those JSON types exactly: integers, numbers, and booleans are unquoted
+JSON scalars (for example `{"limit":5}`, never `{"limit":"5"}`). If a call
+fails validation, correct the reported field/type instead of repeating unchanged arguments.
 Use object ids and process ids exactly as shown in context. Never invent a capability grant.
 If an action is risky or requires unavailable authority, use request_permission
 for an exact resource/right, use ask_human for missing intent, or choose a
@@ -386,9 +389,10 @@ def _process_message_directive(
         next_action = (
             "Resolve message handling before other work. If the immediately preceding "
             "discover_skills result identifies a Skill declaring read_process_messages "
-            "or receive_process_messages, activate that exact returned id. Otherwise, "
-            "your next action must be discover_skills with text `messages` and a bounded "
-            "limit. After activation, call a visible message-read tool."
+            "or receive_process_messages, activate that exact returned id with the same "
+            "row's package_sha256 as expected_package_sha256. Otherwise, "
+            "your next action must be discover_skills with text `messages` and an unquoted "
+            "JSON integer limit such as 5. After activation, call a visible message-read tool."
         )
     return (
         "Pending explicit process input (mandatory control action):\n"

@@ -16,8 +16,20 @@ Use one intentionally mutable owner from object-memory. It supplies identity, no
 Queues one call and returns `{task: ...}`. Pass `owner_oid`, or `owner_name` plus optional `namespace` (process scope by default). OID wins if both appear, so pass one.
 
 - `tool` must be visible in the creator's process tool table. Start validates the ObjectTask envelope but the runner validates target `args` asynchronously through ToolBroker. Start success proves admission, not execution or an external effect; malformed target args can make the queued task fail without executing the target.
-- Admission needs owner read/write/link, `process:spawn`, budget, and capacity. Finite owner grants can be consumed at commit.
-- Runner gets the exact tool and owner read/materialize only. Delegate minimal exact specs through `inherit_capabilities`; ambient and non-delegable authority does not follow.
+- Admission needs owner read/write/link, `process:spawn`, budget, and capacity.
+  Resolving `owner_name` additionally needs read on its namespace; `owner_oid`
+  avoids name discovery but not the owner Object rights. Finite owner/name
+  grants can be consumed at commit.
+- The runner's tool table is narrowed to the exact target tool, and creator-held
+  external authority follows only through explicit, delegable
+  `inherit_capabilities`. The runner is still a real child: it owns its
+  bootstrap goal/View and process namespace, receives self-scoped checkpoint
+  control, and an `image_package` boot can create fresh package-workspace
+  grants for that runner before the tool table is narrowed. ObjectTask then
+  adds exact owner read/materialize. Those are runner bootstrap/image/task
+  authorities, not inherited creator authority. The target call can exercise
+  authority that is actually present, so inspect a custom package image's boot
+  contract and delegate only minimal exact specs.
 - `notify_pid` defaults to creator and permits self, direct parent, or direct nonterminal child. Prefer `normal`; use `interrupt` only for needed preemption and a specific channel.
 - A notified `result_oid` grants nothing. `grant_result_to_notify=true` requests a handle for another recipient. Missing creator grant can fail/discard; label or delivery failure can leave `succeeded` without that handle. Inspect both records.
 - `owner_watch=true` sends selected `updated`/`linked` references to the runner. Watch channel/kind are separate from completion notification and grant no payload access.
@@ -26,17 +38,37 @@ Save `task_id` and `runner_pid`. Publish/claim/lease/heartbeat are Host-internal
 
 ### `get_object_task`
 
-Returns full state for one `task_id`. Creator can inspect; others need owner read, possibly finite. It can reconcile a dead runner and retry terminal notification in `none`/`failed`, so status reads may perform housekeeping.
+Returns full state for one `task_id`. Creator can inspect; others need owner
+read, possibly finite. It can reconcile a dead runner, retry a notification,
+or schedule a replay-safe message resume, so it is an effectful,
+non-idempotent reconciliation call rather than a pure read.
 
 ### `list_object_tasks`
 
-Lists visible tasks; filter with `owner_oid`, `include_terminal` (default true), and `limit` 0–1000. Filtering precedes limit; non-creators need owner read. Reconciliation/grant consumption can occur. No cursor or `has_more` exists, so a full page is incomplete evidence.
+Lists visible tasks; filter with `owner_oid`, `include_terminal` (default true),
+and `limit` 0–1000. Owner/status filtering precedes the bounded candidate
+lookup, but actor visibility filtering happens after that lookup; non-creators
+need owner read. Consequently, without an exact owner filter whose visibility
+is uniform, even an empty or underfilled response can omit older visible rows
+when newer invisible rows occupied the Host candidate window. Reconciliation/
+grant consumption can occur. Candidate refresh is effectful and non-idempotent,
+not a pure read. No cursor or `has_more` exists, and a response at
+the supplied limit is certainly incomplete evidence. Use retained exact task
+ids or obtain a complete Host-side query before making a global absence claim.
 
 ### `wait_object_task`
 
-Waits by ID. `timeout_s` is omitted or 0 through the configured maximum; omission may block, so prefer finite. Zero is nonblocking but can reconcile/retry notification.
+Waits by ID. `timeout_s` is omitted or 0 through the configured maximum;
+omission may block, so prefer finite. Zero is nonblocking but can
+reconcile/retry notification. A settled human dependency can schedule the
+original target again, so wait is effectful and non-idempotent.
 
-Timeout can return `queued`/`running` without failing or cancelling. Explicit waits expose a dependency in `wait`. Terminal state may precede notification settlement; poll again if delivery matters.
+Timeout can return `queued`/`running` without failing or cancelling. Explicit
+waits expose a dependency in `wait`. A waiting transition and its later
+terminal transition publish distinct messages. The task's single durable
+notification slot describes only the latest phase; earlier messages remain in
+the mailbox. Terminal state may precede notification settlement; poll again if
+delivery matters.
 
 ### `watch_object_task_owner`
 
@@ -68,10 +100,23 @@ Success publishes an immutable ToolResult owned by the task, linked as produced.
 - Explicit wait: satisfy only its recorded dependency, then wait. Stop if a non-replay-safe target is stranded.
 - `failed`: inspect `error` and follow the target Skill. A tool may fail after an external effect, so do authoritative read-only reconciliation before another call.
 - `cancelled`: report no rollback and inspect possible effects. After rejected cancellation, reconcile/wait; do not control the runner via unrelated tools.
-- Notification `failed`: get/wait may retry while recipient is valid. `undelivered_terminal` means that recipient ended. Either can coexist with target success; a message proves neither consumption nor result access.
+- Notification `failed`: get/wait may retry while recipient is valid.
+  `undelivered_terminal` means that recipient ended. On terminal reconciliation,
+  get/wait also repairs a legacy `delivered` slot that points to a waiting-phase
+  message. Either state can coexist with target success; a message proves
+  neither consumption nor result access.
 - Result grant: verify recipient handle. Fix missing authority before replacement; after label/delivery denial use an authorized handoff, never weaker labels.
-- Reopen: active tasks become `abandoned`; missing live results become `result_unavailable_after_reopen`. Args/delegations are not persisted, so review evidence before recreation.
-- Restore: scoped active tasks block restore; later history may become `superseded_by_restore`. Restore does not undo completed external effects.
+- Reopen: active tasks become `abandoned`; missing live results become
+  `result_unavailable_after_reopen`. Each transition attempts its own terminal
+  notification under the original Object source lineage. If reopen already
+  made that source payload unavailable, data-flow validation safely leaves the
+  notification `failed`; use exact get/list recovery evidence rather than
+  stripping labels or assuming a message. Args/delegations are not persisted,
+  so review evidence before recreation.
+- Restore: scoped active tasks block restore; later history may become
+  `superseded_by_restore`. That restore-generated terminal does not publish a
+  new ObjectTask notification; inspect the restore receipt and exact task
+  history. Restore does not undo completed external effects.
 
 Identity/status, notification/watch, result/error/wait are durable; args, delegation, and result-grant intent are live only. Creator exit does not cancel; active tasks pin owners.
 
@@ -79,7 +124,12 @@ Identity/status, notification/watch, result/error/wait are durable; args, delega
 
 Retain IDs, owner, creator/runner, tool, final status, and time. Success requires `status="succeeded"`; admission, runner exit, notification, or result alone is insufficient.
 
-If a result is expected, retain `result_oid` and prove the intended reader can read it. Separately retain notification recipient, `status`, `message_id`, and error. `delivered` proves message publication only, not consumption or Object access.
+If a result is expected, retain `result_oid` and prove the intended reader can
+read it. Separately retain notification recipient, `status`, `message_id`, and
+error, plus the referenced message's `phase` and task status. On a terminal
+task, the current delivered `message_id` must reference that terminal phase;
+an earlier waiting message is not terminal evidence. `delivered` proves message
+publication only, not consumption or Object access.
 
 For external effects, add target-Skill read-back. Task success proves tool return/result publication, not continuing external correctness.
 

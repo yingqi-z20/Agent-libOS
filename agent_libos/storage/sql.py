@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import threading
+import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
@@ -34,7 +37,8 @@ from agent_libos.process_execution import (
     trusted_process_control_mutation,
 )
 from agent_libos.utils.ids import new_id, utc_now
-from agent_libos.utils.skill_search import skill_search_terms
+from agent_libos.utils.public_errors import internal_exception_observation
+from agent_libos.utils.skill_search import skill_metadata_search_score
 from agent_libos.models import (
     AgentObject,
     AgentImage,
@@ -43,6 +47,7 @@ from agent_libos.models import (
     AuditRecord,
     Capability,
     CapabilityEffect,
+    CapabilityRight,
     CapabilityStatus,
     CapabilityUseReservationRecoverySummary,
     Checkpoint,
@@ -88,8 +93,13 @@ from agent_libos.models import (
     ObjectLink,
     ObjectMetadata,
     ObjectNamespace,
+    ObjectNamespaceCursor,
+    ObjectNamespacePage,
     ObjectOwnerKind,
     ObjectPayloadRecoverySummary,
+    ObjectRef,
+    ObjectRefCursor,
+    ObjectRefPage,
     PersistedObjectState,
     ObjectTask,
     ObjectTaskNotification,
@@ -451,6 +461,116 @@ def _persisted_bool(value: Any, label: str) -> bool:
     return value
 
 
+def _positive_capability_use_count(value: Any, *, label: str = "count") -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _capability_uses_remaining(
+    value: Any,
+    *,
+    status: CapabilityStatus,
+) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError("uses_remaining must be a non-negative integer")
+    if status == CapabilityStatus.ACTIVE and value < 1:
+        raise ValueError("active capability uses_remaining must be positive")
+    return value
+
+
+def _capability_boolean(value: Any, *, label: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{label} must be a boolean")
+    return value
+
+
+def _persisted_capability_boolean(value: Any, *, label: str) -> bool:
+    # Capability booleans are stored in INTEGER columns on every supported
+    # backend.  Accept only the two canonical encodings; bool()/truthiness
+    # would turn corrupt text or arbitrary non-zero values into authority.
+    if type(value) is not int or value not in {0, 1}:
+        raise ValueError(f"persisted capability {label} must be 0 or 1")
+    return value == 1
+
+
+def _capability_delegation_depth(
+    value: Any,
+    *,
+    label: str,
+    optional: bool = False,
+) -> int | None:
+    if value is None and optional:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _capability_authority_scalars(
+    cap: Capability,
+) -> tuple[bool, bool, int, int | None]:
+    delegable = _capability_boolean(cap.delegable, label="delegable")
+    revocable = _capability_boolean(cap.revocable, label="revocable")
+    delegation_depth = _capability_delegation_depth(
+        cap.delegation_depth,
+        label="delegation_depth",
+    )
+    max_delegation_depth = _capability_delegation_depth(
+        cap.max_delegation_depth,
+        label="max_delegation_depth",
+        optional=True,
+    )
+    assert delegation_depth is not None
+    if (
+        max_delegation_depth is not None
+        and max_delegation_depth < delegation_depth
+    ):
+        raise ValueError(
+            "max_delegation_depth cannot be less than delegation_depth"
+        )
+    return delegable, revocable, delegation_depth, max_delegation_depth
+
+
+def _capability_rights_for_write(value: Any) -> set[str]:
+    if type(value) is not set:
+        raise ValueError("capability rights must be a set")
+    return _validated_capability_rights(value)
+
+
+def _persisted_capability_rights(value: Any) -> set[str]:
+    if type(value) is not list:
+        raise ValueError("persisted capability rights must be a list")
+    rights = _validated_capability_rights(value)
+    if len(rights) != len(value):
+        raise ValueError("persisted capability rights must not contain duplicates")
+    return rights
+
+
+def _validated_capability_rights(value: Iterable[Any]) -> set[str]:
+    raw = list(value)
+    if not raw or any(type(item) is not str for item in raw):
+        raise ValueError("capability rights must contain non-empty string rights")
+    try:
+        return {CapabilityRight(item).value for item in raw}
+    except ValueError as exc:
+        raise ValueError(f"capability rights contain an unknown right: {exc}") from exc
+
+
+def _capability_json_object(value: Any, *, label: str) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise ValueError(f"capability {label} must be an object")
+    if any(type(key) is not str for key in value):
+        raise ValueError(f"capability {label} keys must be strings")
+    try:
+        json.dumps(value, ensure_ascii=True, sort_keys=True)
+    except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+        raise ValueError(f"capability {label} must be JSON-serializable") from exc
+    return dict(value)
+
+
 def _operation_runtime_publication_id(metadata: Mapping[str, Any]) -> str | None:
     value = metadata.get("runtime_publication_id")
     if value is None:
@@ -521,7 +641,76 @@ def _canonical_process_message_metadata(value: Any) -> dict[str, Any]:
 _MISSING_OBJECT_PAYLOAD = object()
 _MISSING_PAYLOAD_BEFORE_IMAGE = object()
 _LLM_CONTEXT_LABEL_SCHEMA_VERSION = 1
+_CONTINUOUS_RESOURCE_BUDGET_FIELDS = frozenset(
+    {
+        "max_runtime_seconds",
+        "max_subprocess_wall_seconds",
+        "max_subprocess_cpu_seconds",
+    }
+)
 _TOOL_ID_LOOKUP_BATCH_SIZE = 500
+# Keep dynamic PID predicates below SQLite's historical 999-bind ceiling.  The
+# changed-effect API itself is intentionally unbounded, so current rows are
+# fetched in deterministic pages rather than materializing changed IDs into a
+# second dynamic ``IN`` predicate.
+_EXTERNAL_EFFECT_CHANGE_QUERY_BATCH_SIZE = 500
+# A checkpoint task scope repeats each PID for creator and runner predicates;
+# 400 leaves room for statuses, boundary, cursor, and limit under SQLite's
+# historical 999-bind ceiling.
+_CHECKPOINT_OBJECT_TASK_SCOPE_BATCH_SIZE = 400
+
+
+def _dumps_strict_checkpoint_snapshot(snapshot: Any) -> str:
+    """Encode checkpoint state without coercing or stringifying payload types."""
+
+    pending: list[tuple[Any, bool]] = [(snapshot, False)]
+    active_containers: set[int] = set()
+    while pending:
+        value, leaving = pending.pop()
+        value_type = type(value)
+        if leaving:
+            active_containers.remove(id(value))
+            continue
+        if value is None or value_type in {str, bool, int}:
+            continue
+        if value_type is float:
+            if not math.isfinite(value):
+                raise ValidationError(
+                    "checkpoint snapshot contains a non-finite JSON number"
+                )
+            continue
+        if value_type not in {dict, list}:
+            raise ValidationError(
+                "checkpoint snapshot contains non-JSON value "
+                f"{value_type.__name__}"
+            )
+        identity = id(value)
+        if identity in active_containers:
+            raise ValidationError("checkpoint snapshot contains a container cycle")
+        active_containers.add(identity)
+        pending.append((value, True))
+        if value_type is dict:
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ValidationError(
+                        "checkpoint snapshot contains a non-string JSON object key"
+                    )
+                pending.append((item, False))
+        else:
+            pending.extend((item, False) for item in value)
+    try:
+        return json.dumps(
+            snapshot,
+            ensure_ascii=True,
+            sort_keys=True,
+            allow_nan=False,
+        )
+    except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+        raise ValidationError(
+            "checkpoint snapshot is not strict JSON-compatible"
+        ) from exc
+
+
 STORE_SCHEMA_VERSION = 3
 # Python cursor models compare strings by Unicode code point.  SQLite BINARY
 # and PostgreSQL "C" are the backend collations that preserve that ordering for
@@ -536,6 +725,7 @@ _V3_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
     "external_effects": frozenset({"created_at", "effect_id"}),
     "llm_calls": frozenset({"call_id", "created_at"}),
     "objects": frozenset({"created_at", "oid"}),
+    "object_namespaces": frozenset({"namespace", "parent_namespace"}),
     "object_tasks": frozenset({"created_at", "task_id"}),
     "operation_evidence": frozenset(
         {"created_at", "evidence_id", "link_id", "operation_id"}
@@ -550,6 +740,7 @@ _V3_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
         }
     ),
     "processes": frozenset({"created_at", "parent_pid", "pid"}),
+    "process_terminal_cleanups": frozenset({"created_at", "pid"}),
     "process_tool_bindings": frozenset({"pid", "tool_name"}),
     "resource_usage_reservations": frozenset(
         {"created_at", "reservation_id"}
@@ -574,6 +765,10 @@ _PROCESS_RESTORE_EPOCH_PID_BATCH_SIZE = 150
 _PROCESS_SEMANTIC_FIELDS = frozenset(
     {"status", "wait_state", "outcome", "state_generation"}
 )
+_PROCESS_TERMINAL_CLEANUP_PHASES = (
+    "terminal_notify",
+    "process_finalize",
+)
 
 
 def _validated_jit_rehydration_limit(
@@ -589,6 +784,50 @@ def _validated_jit_rehydration_limit(
             f"{limit} > {hard_limit}"
         )
     return limit
+
+
+def _validated_memory_scan_page_limit(
+    config: AgentLibOSConfig,
+    limit: int,
+    *,
+    label: str,
+) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValidationError(f"{label} limit must be a positive integer")
+    hard_limit = config.memory.query_scan_page_size
+    if limit > hard_limit:
+        raise ValidationError(
+            f"{label} limit exceeds configured hard cap: "
+            f"{limit} > {hard_limit}"
+        )
+    return limit
+
+
+def _checkpoint_object_task_query_scope(
+    scope_pids: Iterable[str],
+    owner_oids: Iterable[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    raw_pids = tuple(scope_pids)
+    raw_oids = tuple(owner_oids)
+    if any(
+        not isinstance(value, str) or not value
+        for value in (*raw_pids, *raw_oids)
+    ):
+        raise ValidationError(
+            "checkpoint task query scope values must be non-empty text"
+        )
+    selected_pids = tuple(dict.fromkeys(raw_pids))
+    selected_oids = tuple(dict.fromkeys(raw_oids))
+    if bool(selected_pids) == bool(selected_oids):
+        raise ValidationError(
+            "checkpoint task query requires exactly one non-empty scope kind"
+        )
+    if (
+        len(selected_pids or selected_oids)
+        > _CHECKPOINT_OBJECT_TASK_SCOPE_BATCH_SIZE
+    ):
+        raise ValidationError("checkpoint task query scope batch is invalid")
+    return selected_pids, selected_oids
 
 
 _V3_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
@@ -736,6 +975,10 @@ _V3_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         "working_directory llm_profile_id revision execution_generation "
         "execution_owner_id execution_lease_id created_at updated_at".split()
     ),
+    "process_terminal_cleanups": frozenset(
+        "pid terminal_status state completed_phases_json attempt_count owner_id "
+        "lease_id failed_phase last_error_json created_at updated_at".split()
+    ),
     "runtime_modules": frozenset(
         "module_id name version entrypoint manifest_path manifest_sha256 source_path "
         "source_sha256 status loaded_at registered_json error metadata_json updated_at".split()
@@ -829,6 +1072,7 @@ class SQLRuntimeStore:
             "object_namespaces",
             "object_links",
             "processes",
+            "process_terminal_cleanups",
             "authority_manifests",
             "process_resource_reservations",
             "process_tool_bindings",
@@ -889,9 +1133,13 @@ class SQLRuntimeStore:
         self._object_payloads: dict[str, Any] = {}
         self._transaction_depth = 0
         self._payload_transaction_frames: list[dict[str, Any]] = []
+        self._transaction_cursors: weakref.WeakSet[Any] = weakref.WeakSet()
         self._stale_operation_recovery_index_depth = 0
         self._stale_operation_recovery_index_active = False
         self._poisoned_reason: str | None = None
+        self._poisoned_failure_kind = "transaction rollback failure"
+        self._poisoned_failure_fingerprints: tuple[dict[str, Any], ...] = ()
+        self._uncertain_commit_confirmation_owner: int | None = None
         self._released_ownership_reason: str | None = None
         self._backend_ownership_release_observed = False
         self._admission_commit_guard: (
@@ -1274,6 +1522,8 @@ class SQLRuntimeStore:
     def claim_runtime_assembly(
         self,
         reservation: StoreAssemblyReservation,
+        *,
+        require_unbound_runtime: bool = False,
     ) -> Iterator[None]:
         """Activate one exact reservation for this startup worker thread."""
 
@@ -1289,6 +1539,11 @@ class SQLRuntimeStore:
                 )
             if self._runtime_assembly_claimant_thread_id is not None:
                 raise RuntimeError("runtime assembly reservation is already claimed")
+            if (
+                require_unbound_runtime
+                and self._admission_commit_guard is not None
+            ):
+                raise RuntimeError("admission commit guard is already bound")
             self._runtime_assembly_claimant_thread_id = claimant_thread_id
         try:
             yield
@@ -1647,9 +1902,39 @@ class SQLRuntimeStore:
         return nullcontext() if guard is None else guard()
 
     def close(self) -> None:
-        self.conn.close()
+        errors = self._close_transaction_cursors()
+        try:
+            self.conn.close()
+        except BaseException as exc:
+            errors.append(exc)
+        if not errors:
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        raise BaseExceptionGroup("SQL store cleanup failed", errors)
 
-    def _ensure_healthy(self) -> None:
+    def _track_transaction_cursor(self, cursor: Any) -> Any:
+        self._transaction_cursors.add(cursor)
+        return cursor
+
+    def _close_transaction_cursors(self) -> list[BaseException]:
+        cursors = tuple(getattr(self, "_transaction_cursors", ()))
+        transaction_cursors = getattr(self, "_transaction_cursors", None)
+        if transaction_cursors is not None:
+            transaction_cursors.clear()
+        errors: list[BaseException] = []
+        for cursor in cursors:
+            try:
+                cursor.close()
+            except BaseException as exc:
+                errors.append(exc)
+        return errors
+
+    def _ensure_healthy(
+        self,
+        *,
+        allow_uncertain_confirmation_read: bool = False,
+    ) -> None:
         released_ownership_reason = getattr(
             self,
             "_released_ownership_reason",
@@ -1662,18 +1947,102 @@ class SQLRuntimeStore:
             )
         poisoned_reason = getattr(self, "_poisoned_reason", None)
         if poisoned_reason is not None:
+            if (
+                allow_uncertain_confirmation_read
+                and poisoned_reason == "commit_outcome_uncertain"
+                and self._uncertain_commit_confirmation_owner
+                == threading.get_ident()
+            ):
+                return
+            failure_kind = getattr(
+                self,
+                "_poisoned_failure_kind",
+                "transaction rollback failure",
+            )
             raise ValidationError(
-                "runtime store is unusable after transaction rollback failure: "
+                f"runtime store is unusable after {failure_kind}: "
                 f"{poisoned_reason}"
             )
 
-    def _poison(self, reason: str) -> None:
+    def _poison(
+        self,
+        reason_code: str,
+        *,
+        failure_kind: str = "transaction rollback failure",
+        diagnostic_errors: Iterable[BaseException] = (),
+    ) -> None:
         if self._poisoned_reason is None:
-            self._poisoned_reason = reason
+            self._poisoned_reason = reason_code
+            self._poisoned_failure_kind = failure_kind
+            self._poisoned_failure_fingerprints = tuple(
+                internal_exception_observation(error)
+                for error in diagnostic_errors
+            )
+        if (
+            reason_code == "commit_outcome_uncertain"
+            and self._uncertain_commit_confirmation_owner
+            == threading.get_ident()
+        ):
+            return
+        self._close_poisoned_data_plane()
+
+    def _close_poisoned_data_plane(self) -> None:
+        self._close_transaction_cursors()
         try:
             self.conn.close()
         except Exception:
             pass
+
+    @contextmanager
+    def uncertain_commit_confirmation(self) -> Iterator[None]:
+        """Permit one same-thread typed readback after an ambiguous commit.
+
+        The window never permits a new transaction.  If exact confirmation is
+        not explicitly accepted before exit, the poisoned data plane is closed
+        and remains unusable.
+        """
+
+        owner = threading.get_ident()
+        with self._lock:
+            self._ensure_healthy()
+            if self._uncertain_commit_confirmation_owner is not None:
+                raise RuntimeError(
+                    "uncertain commit confirmation window is already active"
+                )
+            self._uncertain_commit_confirmation_owner = owner
+        try:
+            yield
+        finally:
+            with self._lock:
+                if self._uncertain_commit_confirmation_owner == owner:
+                    self._uncertain_commit_confirmation_owner = None
+                if self._poisoned_reason is not None:
+                    # No exact confirmation was accepted. Release concrete
+                    # backend ownership as well as closing the poisoned data
+                    # plane so a later Runtime can perform recovery.
+                    try:
+                        self.close()
+                    except Exception:
+                        pass
+
+    def accept_uncertain_commit_confirmation(self) -> bool:
+        """Re-enable this store only after the caller proved the commit state."""
+
+        with self._lock:
+            if self._uncertain_commit_confirmation_owner != threading.get_ident():
+                raise RuntimeError(
+                    "uncertain commit confirmation is not owned by this thread"
+                )
+            if self._poisoned_reason is None:
+                return False
+            if self._poisoned_reason != "commit_outcome_uncertain":
+                raise ValidationError(
+                    "only an uncertain outer commit can be confirmed"
+                )
+            self._poisoned_reason = None
+            self._poisoned_failure_kind = "transaction rollback failure"
+            self._poisoned_failure_fingerprints = ()
+            return True
 
     def _rollback_scope(
         self,
@@ -1682,6 +2051,7 @@ class SQLRuntimeStore:
         savepoint: str,
         payload_frame: dict[str, Any] | None,
         operation: str,
+        primary_error: BaseException | None = None,
     ) -> None:
         rollback_error: BaseException | None = None
         payload_error: BaseException | None = None
@@ -1693,24 +2063,38 @@ class SQLRuntimeStore:
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         except BaseException as exc:
             rollback_error = exc
-        try:
-            if payload_frame is not None:
-                self._restore_payload_frame(payload_frame)
-        except BaseException as exc:
-            payload_error = exc
+        # A before-image is safe to restore only after SQL definitely rolled
+        # back. In particular, RELEASE SAVEPOINT may have succeeded before a
+        # driver diagnostic; a failed ROLLBACK TO then leaves its SQL changes
+        # in the outer transaction. Restoring only the cache would manufacture
+        # a mixed state. Poison the store with the current cache instead.
+        if rollback_error is None:
+            try:
+                if payload_frame is not None:
+                    self._restore_payload_frame(payload_frame)
+            except BaseException as exc:
+                payload_error = exc
 
         if rollback_error is None and payload_error is None:
             return
-        failures: list[str] = []
-        if rollback_error is not None:
-            failures.append(f"SQL rollback failed: {rollback_error}")
-        if payload_error is not None:
-            failures.append(f"payload rollback failed: {payload_error}")
-        reason = f"{operation}; " + "; ".join(failures)
-        self._poison(reason)
+        reason_codes = {
+            "transaction body failed": "transaction_body_rollback_failed",
+            "transaction commit failed": "transaction_commit_rollback_failed",
+            "savepoint release failed": "savepoint_release_recovery_failed",
+        }
+        reason_code = reason_codes.get(operation, "transaction_recovery_failed")
+        self._poison(
+            reason_code,
+            diagnostic_errors=(
+                error
+                for error in (primary_error, rollback_error, payload_error)
+                if error is not None
+            ),
+        )
         raise ValidationError(
-            f"runtime store is unusable after transaction rollback failure: {reason}"
-        ) from (rollback_error or payload_error)
+            "runtime store is unusable after transaction rollback failure: "
+            f"{reason_code}"
+        ) from None
 
     def _journal_object_payload(self, oid: str) -> None:
         """Capture an OID's value at the start of the current transaction frame."""
@@ -1772,8 +2156,8 @@ class SQLRuntimeStore:
                 );
 
                 CREATE TABLE IF NOT EXISTS object_namespaces (
-                  namespace TEXT PRIMARY KEY,
-                  parent_namespace TEXT,
+                  namespace TEXT COLLATE BINARY PRIMARY KEY,
+                  parent_namespace TEXT COLLATE BINARY,
                   metadata_json TEXT NOT NULL,
                   created_by TEXT NOT NULL,
                   created_at TEXT NOT NULL,
@@ -1818,7 +2202,6 @@ class SQLRuntimeStore:
                   created_at TEXT COLLATE BINARY NOT NULL,
                   updated_at TEXT NOT NULL
                 );
-
                 CREATE TABLE IF NOT EXISTS authority_manifests (
                   manifest_id TEXT PRIMARY KEY,
                   pid TEXT NOT NULL UNIQUE,
@@ -2232,6 +2615,7 @@ class SQLRuntimeStore:
 
                 """
             )
+            self._create_process_terminal_cleanup_schema()
             self._create_process_tool_binding_schema()
             self._create_object_task_schema()
             self._create_runtime_publication_schema()
@@ -2239,6 +2623,45 @@ class SQLRuntimeStore:
             self._create_runtime_publication_indexes()
             self._create_runtime_module_schema()
             self._finish_schema_initialization()
+
+    def _create_process_terminal_cleanup_schema(self) -> None:
+        self._execute_script(
+            """
+            CREATE TABLE IF NOT EXISTS process_terminal_cleanups (
+              pid TEXT COLLATE BINARY PRIMARY KEY,
+              terminal_status TEXT NOT NULL CHECK (
+                terminal_status IN ('exited', 'failed', 'killed')
+              ),
+              state TEXT NOT NULL CHECK (
+                state IN ('pending', 'running', 'failed', 'completed')
+              ),
+              completed_phases_json TEXT NOT NULL DEFAULT '[]',
+              attempt_count BIGINT NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+              owner_id TEXT,
+              lease_id TEXT COLLATE BINARY,
+              failed_phase TEXT,
+              last_error_json TEXT,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              updated_at TEXT NOT NULL,
+              CHECK ((owner_id IS NULL) = (lease_id IS NULL)),
+              CHECK (
+                (state = 'running' AND lease_id IS NOT NULL)
+                OR (state != 'running' AND lease_id IS NULL)
+              ),
+              FOREIGN KEY(pid) REFERENCES processes(pid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_process_terminal_cleanup_recovery
+              ON process_terminal_cleanups(
+                state, created_at COLLATE BINARY, pid COLLATE BINARY
+              )
+              WHERE state != 'completed';
+            CREATE INDEX IF NOT EXISTS idx_process_terminal_cleanup_recovery_keyset
+              ON process_terminal_cleanups(
+                created_at COLLATE BINARY, pid COLLATE BINARY
+              )
+              WHERE state != 'completed';
+            """
+        )
 
     def _create_process_tool_binding_schema(self) -> None:
         self._execute_script(
@@ -2651,6 +3074,10 @@ class SQLRuntimeStore:
               ON object_namespaces(created_by, namespace);
             CREATE INDEX IF NOT EXISTS idx_object_namespaces_parent
               ON object_namespaces(parent_namespace, namespace);
+            CREATE INDEX IF NOT EXISTS idx_object_namespaces_parent_keyset
+              ON object_namespaces(
+                parent_namespace COLLATE BINARY, namespace COLLATE BINARY
+              );
 
             CREATE INDEX IF NOT EXISTS idx_object_tasks_recovery_status
               ON object_tasks(
@@ -2695,7 +3122,7 @@ class SQLRuntimeStore:
 
     def _query(self, sql: str, params: Iterable[Any] = ()) -> list[Any]:
         with self._lock:
-            self._ensure_healthy()
+            self._ensure_healthy(allow_uncertain_confirmation_read=True)
             self._ensure_store_scope_admitted()
             return list(self.conn.execute(sql, tuple(params)))
 
@@ -2706,18 +3133,15 @@ class SQLRuntimeStore:
         Object payloads live outside SQL. Every transaction frame lazily
         journals its first mutation of each OID so nested rollback restores the
         savepoint value and nested commit propagates the earliest before-image
-        to its parent. ``include_object_payloads=True`` remains compatible and
-        eagerly captures the currently cached payloads.
+        to its parent. ``include_object_payloads`` remains API-compatible, but
+        mutations always use the per-OID journal rather than copying the whole
+        runtime cache at transaction entry.
         """
 
         with self._lock:
             self._ensure_healthy()
             self._ensure_store_scope_admitted()
-            payload_frame = (
-                {oid: deepcopy(payload) for oid, payload in self._object_payloads.items()}
-                if include_object_payloads
-                else {}
-            )
+            payload_frame: dict[str, Any] = {}
             depth = self._transaction_depth
             savepoint = f"agent_libos_sp_{depth}"
             if depth == 0:
@@ -2727,13 +3151,19 @@ class SQLRuntimeStore:
             self._payload_transaction_frames.append(payload_frame)
             self._transaction_depth += 1
             try:
-                yield self.conn.cursor()
-            except BaseException:
+                yield self._track_transaction_cursor(self.conn.cursor())
+            except BaseException as exc:
+                # A nested finalization ambiguity already poisoned and closed
+                # the connection. Do not perform a second rollback attempt or
+                # restore an outer cache frame after that fail-closed point.
+                if self._poisoned_reason is not None:
+                    raise
                 self._rollback_scope(
                     depth=depth,
                     savepoint=savepoint,
                     payload_frame=payload_frame,
                     operation="transaction body failed",
+                    primary_error=exc,
                 )
                 raise
             else:
@@ -2744,17 +3174,37 @@ class SQLRuntimeStore:
                     else:
                         self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                         self._merge_payload_frame_into_parent(payload_frame)
-                except BaseException:
+                except BaseException as exc:
+                    if depth == 0 and self._transaction_active_after_commit_error() is not True:
+                        self._poison(
+                            "commit_outcome_uncertain",
+                            failure_kind="uncertain transaction commit",
+                            diagnostic_errors=(exc,),
+                        )
+                        raise ValidationError(
+                            "runtime store is unusable after uncertain transaction "
+                            "commit: commit_outcome_uncertain"
+                        ) from None
                     self._rollback_scope(
                         depth=depth,
                         savepoint=savepoint,
                         payload_frame=payload_frame,
                         operation="transaction commit failed" if depth == 0 else "savepoint release failed",
+                        primary_error=exc,
                     )
                     raise
             finally:
                 self._transaction_depth -= 1
                 self._payload_transaction_frames.pop()
+
+    def _transaction_active_after_commit_error(self) -> bool | None:
+        """Return whether a failed commit definitely left its transaction open."""
+
+        try:
+            state = getattr(self.conn, "in_transaction")
+        except BaseException:
+            return None
+        return state if isinstance(state, bool) else None
 
     @contextmanager
     def _join_or_begin_transaction(self):
@@ -2774,7 +3224,7 @@ class SQLRuntimeStore:
             self._ensure_healthy()
             self._ensure_store_scope_admitted()
             if self._transaction_depth:
-                yield self.conn.cursor()
+                yield self._track_transaction_cursor(self.conn.cursor())
             else:
                 with self.transaction() as cur:
                     yield cur
@@ -2894,22 +3344,24 @@ class SQLRuntimeStore:
             return True
 
     def get_object(self, oid: str) -> AgentObject | None:
-        rows = self._query(
-            "SELECT * FROM objects WHERE oid = ? AND lifecycle_state = ?",
-            (oid, ObjectLifecycleState.LIVE.value),
-        )
-        if not rows or not self.has_object_payload(oid, row=rows[0]):
-            return None
-        return self._row_to_object(rows[0])
+        with self.locked():
+            rows = self._query(
+                "SELECT * FROM objects WHERE oid = ? AND lifecycle_state = ?",
+                (oid, ObjectLifecycleState.LIVE.value),
+            )
+            if not rows or not self.has_object_payload(oid, row=rows[0]):
+                return None
+            return self._row_to_object(rows[0])
 
     def get_object_by_name(self, name: str, namespace: str) -> AgentObject | None:
-        rows = self._query(
-            "SELECT * FROM objects WHERE namespace = ? AND name = ? AND lifecycle_state = ?",
-            (namespace, name, ObjectLifecycleState.LIVE.value),
-        )
-        if not rows or not self.has_object_payload(str(rows[0]["oid"]), row=rows[0]):
-            return None
-        return self._row_to_object(rows[0])
+        with self.locked():
+            rows = self._query(
+                "SELECT * FROM objects WHERE namespace = ? AND name = ? AND lifecycle_state = ?",
+                (namespace, name, ObjectLifecycleState.LIVE.value),
+            )
+            if not rows or not self.has_object_payload(str(rows[0]["oid"]), row=rows[0]):
+                return None
+            return self._row_to_object(rows[0])
 
     def get_object_ref_by_name(self, name: str, namespace: str) -> dict[str, Any] | None:
         rows = self._query(
@@ -2930,25 +3382,122 @@ class SQLRuntimeStore:
         return any(row["oid"] != except_oid for row in rows)
 
     def list_objects(self, namespace: str | None = None) -> list[AgentObject]:
-        if namespace is None:
-            rows = self._query(
-                "SELECT * FROM objects WHERE lifecycle_state = ? ORDER BY updated_at DESC, created_at DESC, oid ASC",
-                (ObjectLifecycleState.LIVE.value,),
+        with self.locked():
+            if namespace is None:
+                rows = self._query(
+                    "SELECT * FROM objects WHERE lifecycle_state = ? ORDER BY updated_at DESC, created_at DESC, oid ASC",
+                    (ObjectLifecycleState.LIVE.value,),
+                )
+            else:
+                rows = self._query(
+                    """
+                    SELECT * FROM objects
+                     WHERE namespace = ? AND lifecycle_state = ?
+                     ORDER BY updated_at DESC, created_at DESC, oid ASC
+                    """,
+                    (namespace, ObjectLifecycleState.LIVE.value),
+                )
+            return [
+                self._row_to_object(row)
+                for row in rows
+                if self.has_object_payload(str(row["oid"]), row=row)
+            ]
+
+    def query_object_refs_page(
+        self,
+        namespace: str,
+        *,
+        after: ObjectRefCursor | None,
+        limit: int,
+    ) -> ObjectRefPage:
+        """Return a stable, hard-bounded page without touching Object payloads."""
+
+        if not isinstance(namespace, str) or not namespace or "\x00" in namespace:
+            raise ValidationError("Object reference namespace must not be empty")
+        selected_limit = _validated_memory_scan_page_limit(
+            self.config,
+            limit,
+            label="Object reference page",
+        )
+        clauses = ["namespace = ?", "lifecycle_state = ?"]
+        params: list[Any] = [namespace, ObjectLifecycleState.LIVE.value]
+        if after is not None:
+            if not isinstance(after, ObjectRefCursor):
+                raise ValidationError("Object reference page cursor has an invalid type")
+            clauses.append(
+                "(updated_at < ? "
+                "OR (updated_at = ? AND created_at < ?) "
+                "OR (updated_at = ? AND created_at = ? AND oid > ?))"
             )
-        else:
-            rows = self._query(
-                """
-                SELECT * FROM objects
-                 WHERE namespace = ? AND lifecycle_state = ?
-                 ORDER BY updated_at DESC, created_at DESC, oid ASC
-                """,
-                (namespace, ObjectLifecycleState.LIVE.value),
+            params.extend(
+                (
+                    after.updated_at,
+                    after.updated_at,
+                    after.created_at,
+                    after.updated_at,
+                    after.created_at,
+                    after.oid,
+                )
             )
-        return [
-            self._row_to_object(row)
-            for row in rows
-            if self.has_object_payload(str(row["oid"]), row=row)
-        ]
+        params.append(selected_limit + 1)
+        rows = self._query(
+            "SELECT oid, namespace, name, type, schema_version, metadata_json, "
+            "version, immutable, created_by, owner_kind, owner_id, created_at, "
+            "updated_at FROM objects "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY updated_at DESC, created_at DESC, oid ASC LIMIT ?",
+            params,
+        )
+        records = tuple(
+            self._row_to_object_ref(row) for row in rows[:selected_limit]
+        )
+        next_cursor = records[-1].cursor if len(rows) > selected_limit else None
+        return ObjectRefPage(records=records, next_cursor=next_cursor)
+
+    def query_child_namespaces_page(
+        self,
+        parent_namespace: str,
+        *,
+        after: ObjectNamespaceCursor | None,
+        limit: int,
+    ) -> ObjectNamespacePage:
+        """Return one stable, hard-bounded page of direct child namespaces."""
+
+        if (
+            not isinstance(parent_namespace, str)
+            or not parent_namespace
+            or "\x00" in parent_namespace
+        ):
+            raise ValidationError("parent Object namespace must not be empty")
+        selected_limit = _validated_memory_scan_page_limit(
+            self.config,
+            limit,
+            label="Object namespace page",
+        )
+        clauses = ["parent_namespace = ?"]
+        params: list[Any] = [parent_namespace]
+        if after is not None:
+            if not isinstance(after, ObjectNamespaceCursor):
+                raise ValidationError("Object namespace page cursor has an invalid type")
+            clauses.append("namespace COLLATE BINARY > ?")
+            params.append(after.namespace)
+        params.append(selected_limit + 1)
+        rows = self._query(
+            "SELECT namespace, parent_namespace, metadata_json, created_by, "
+            "created_at, updated_at FROM object_namespaces "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY namespace COLLATE BINARY LIMIT ?",
+            params,
+        )
+        records = tuple(
+            self._row_to_namespace(row) for row in rows[:selected_limit]
+        )
+        next_cursor = (
+            ObjectNamespaceCursor(records[-1].namespace)
+            if len(rows) > selected_limit
+            else None
+        )
+        return ObjectNamespacePage(records=records, next_cursor=next_cursor)
 
     def list_object_oids_created_by(self, created_by: str) -> list[str]:
         rows = self._query(
@@ -2958,15 +3507,16 @@ class SQLRuntimeStore:
         return [str(row["oid"]) for row in rows]
 
     def list_objects_created_by(self, created_by: str) -> list[AgentObject]:
-        rows = self._query(
-            "SELECT * FROM objects WHERE created_by = ? AND lifecycle_state = ? ORDER BY created_at, oid",
-            (created_by, ObjectLifecycleState.LIVE.value),
-        )
-        return [
-            self._row_to_object(row)
-            for row in rows
-            if self.has_object_payload(str(row["oid"]), row=row)
-        ]
+        with self.locked():
+            rows = self._query(
+                "SELECT * FROM objects WHERE created_by = ? AND lifecycle_state = ? ORDER BY created_at, oid",
+                (created_by, ObjectLifecycleState.LIVE.value),
+            )
+            return [
+                self._row_to_object(row)
+                for row in rows
+                if self.has_object_payload(str(row["oid"]), row=row)
+            ]
 
     def list_object_oids_owned_by(self, owner_kind: str | ObjectOwnerKind, owner_id: str) -> list[str]:
         rows = self._query(
@@ -2980,19 +3530,20 @@ class SQLRuntimeStore:
         return [str(row["oid"]) for row in rows]
 
     def list_objects_owned_by(self, owner_kind: str | ObjectOwnerKind, owner_id: str) -> list[AgentObject]:
-        rows = self._query(
-            """
-            SELECT * FROM objects
-             WHERE owner_kind = ? AND owner_id = ? AND lifecycle_state = ?
-             ORDER BY created_at, oid
-            """,
-            (str(owner_kind), owner_id, ObjectLifecycleState.LIVE.value),
-        )
-        return [
-            self._row_to_object(row)
-            for row in rows
-            if self.has_object_payload(str(row["oid"]), row=row)
-        ]
+        with self.locked():
+            rows = self._query(
+                """
+                SELECT * FROM objects
+                 WHERE owner_kind = ? AND owner_id = ? AND lifecycle_state = ?
+                 ORDER BY created_at, oid
+                """,
+                (str(owner_kind), owner_id, ObjectLifecycleState.LIVE.value),
+            )
+            return [
+                self._row_to_object(row)
+                for row in rows
+                if self.has_object_payload(str(row["oid"]), row=row)
+            ]
 
     def delete_object(
         self,
@@ -3121,12 +3672,58 @@ class SQLRuntimeStore:
                 process.tool_table,
                 process.model_tool_table,
             )
+            self._ensure_process_terminal_cleanup_intent(
+                cur,
+                pid=process.pid,
+                status=process.status,
+            )
             self.observe_process_concurrency(
                 process.pid,
                 revision=process.revision,
                 execution_generation=process.execution_generation,
                 state_generation=process.state_generation,
                 cursor=cur,
+            )
+
+    @staticmethod
+    def _ensure_process_terminal_cleanup_intent(
+        cursor: Any,
+        *,
+        pid: str,
+        status: ProcessStatus | str,
+    ) -> None:
+        selected = ProcessStatus(status)
+        if selected not in {
+            ProcessStatus.EXITED,
+            ProcessStatus.FAILED,
+            ProcessStatus.KILLED,
+        }:
+            return
+        now = utc_now()
+        cursor.execute(
+            """
+            INSERT INTO process_terminal_cleanups (
+                pid, terminal_status, state, completed_phases_json,
+                attempt_count, owner_id, lease_id, failed_phase,
+                last_error_json, created_at, updated_at
+            ) VALUES (?, ?, 'pending', '[]', 0, NULL, NULL, NULL, NULL, ?, ?)
+            ON CONFLICT(pid) DO NOTHING
+            """,
+            (pid, selected.value, now, now),
+        )
+
+    def ensure_process_terminal_cleanup_intent(
+        self,
+        pid: str,
+        status: ProcessStatus | str,
+    ) -> None:
+        """Create the lifecycle receipt when a typed bulk path publishes terminal state."""
+
+        with self.transaction() as cursor:
+            self._ensure_process_terminal_cleanup_intent(
+                cursor,
+                pid=pid,
+                status=status,
             )
 
     @staticmethod
@@ -3577,6 +4174,11 @@ class SQLRuntimeStore:
             )
             if updated.rowcount != 1:
                 raise ProcessRevisionConflict(f"process revision conflict for {process.pid}")
+            self._ensure_process_terminal_cleanup_intent(
+                cur,
+                pid=process.pid,
+                status=process.status,
+            )
             self._replace_process_tool_bindings(
                 cur,
                 process.pid,
@@ -6928,8 +7530,12 @@ class SQLRuntimeStore:
 
     def insert_authority_manifest(self, manifest: TaskAuthorityManifest) -> None:
         if (
-            manifest.permitted_effects_policy_schema_version
+            type(manifest.permitted_effects_policy_schema_version) is not int
+            or manifest.permitted_effects_policy_schema_version
             != PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION
+            or type(
+                manifest.metadata.get(PERMITTED_EFFECTS_POLICY_PROVENANCE_KEY)
+            ) is not int
             or manifest.metadata.get(PERMITTED_EFFECTS_POLICY_PROVENANCE_KEY)
             != PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION
         ):
@@ -7267,6 +7873,11 @@ class SQLRuntimeStore:
             )
             if updated.rowcount != 1:
                 return False
+            self._ensure_process_terminal_cleanup_intent(
+                cur,
+                pid=token.pid,
+                status=selected,
+            )
             rows = list(
                 cur.execute(
                     """
@@ -7321,6 +7932,255 @@ class SQLRuntimeStore:
                 cursor=cur,
             )
             return True
+
+    @staticmethod
+    def _process_terminal_cleanup_from_row(row: Any) -> dict[str, Any]:
+        completed = loads(row["completed_phases_json"], [])
+        error = loads(row["last_error_json"], None)
+        if (
+            not isinstance(completed, list)
+            or any(not isinstance(phase, str) for phase in completed)
+            or any(phase not in _PROCESS_TERMINAL_CLEANUP_PHASES for phase in completed)
+            or len(completed) != len(set(completed))
+            or completed
+            != [
+                phase
+                for phase in _PROCESS_TERMINAL_CLEANUP_PHASES
+                if phase in completed
+            ]
+        ):
+            raise ValidationError(
+                f"process terminal cleanup phases are invalid: {row['pid']}"
+            )
+        if error is not None and not isinstance(error, dict):
+            raise ValidationError(
+                f"process terminal cleanup error is invalid: {row['pid']}"
+            )
+        return {
+            "pid": str(row["pid"]),
+            "terminal_status": str(row["terminal_status"]),
+            "state": str(row["state"]),
+            "completed_phases": list(completed),
+            "attempt_count": int(row["attempt_count"]),
+            "owner_id": row["owner_id"],
+            "lease_id": row["lease_id"],
+            "failed_phase": row["failed_phase"],
+            "last_error": error,
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def get_process_terminal_cleanup(self, pid: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT * FROM process_terminal_cleanups WHERE pid = ?",
+            (pid,),
+        )
+        if not rows:
+            return None
+        return self._process_terminal_cleanup_from_row(rows[0])
+
+    def list_process_terminal_cleanups(
+        self,
+        *,
+        after: ProcessCursor | None,
+        limit: int,
+        include_completed: bool = False,
+    ) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValidationError(
+                "process terminal cleanup recovery limit must be a positive integer"
+            )
+        hard_limit = (
+            self.config.runtime.process_terminal_cleanup_recovery_page_hard_limit
+        )
+        if limit > hard_limit:
+            raise ValidationError(
+                "process terminal cleanup recovery limit exceeds configured hard cap: "
+                f"{limit} > {hard_limit}"
+            )
+        if after is not None and not isinstance(after, ProcessCursor):
+            raise ValidationError(
+                "process terminal cleanup recovery cursor has an invalid type"
+            )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if not include_completed:
+            clauses.append("state != ?")
+            params.append("completed")
+        if after is not None:
+            clauses.append("(created_at, pid) > (?, ?)")
+            params.extend((after.created_at, after.pid))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        sql = (
+            f"SELECT * FROM process_terminal_cleanups{where} "
+            "ORDER BY created_at COLLATE BINARY, pid COLLATE BINARY LIMIT ?"
+        )
+        return [
+            self._process_terminal_cleanup_from_row(row)
+            for row in self._query(sql, params)
+        ]
+
+    def claim_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        owner_id: str,
+        lease_id: str,
+        expected_lease_id: str | None,
+    ) -> dict[str, Any] | None:
+        if not owner_id or not lease_id:
+            raise ValidationError(
+                "process terminal cleanup owner and lease must be non-empty"
+            )
+        lease_clause = "lease_id IS NULL" if expected_lease_id is None else "lease_id = ?"
+        lease_params: tuple[Any, ...] = () if expected_lease_id is None else (expected_lease_id,)
+        with self.transaction() as cur:
+            updated = cur.execute(
+                f"""
+                UPDATE process_terminal_cleanups
+                   SET state = 'running', owner_id = ?, lease_id = ?,
+                       attempt_count = attempt_count + 1,
+                       failed_phase = NULL, last_error_json = NULL,
+                       updated_at = ?
+                 WHERE pid = ? AND state != 'completed' AND {lease_clause}
+                """,
+                (
+                    owner_id,
+                    lease_id,
+                    utc_now(),
+                    pid,
+                    *lease_params,
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            rows = list(
+                cur.execute(
+                    "SELECT * FROM process_terminal_cleanups WHERE pid = ?",
+                    (pid,),
+                )
+            )
+            return self._process_terminal_cleanup_from_row(rows[0])
+
+    def complete_process_terminal_cleanup_phase(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+        phase: str,
+    ) -> dict[str, Any] | None:
+        if phase not in _PROCESS_TERMINAL_CLEANUP_PHASES:
+            raise ValidationError(f"invalid process terminal cleanup phase: {phase}")
+        with self.transaction() as cur:
+            rows = list(
+                cur.execute(
+                    "SELECT * FROM process_terminal_cleanups WHERE pid = ?",
+                    (pid,),
+                )
+            )
+            if not rows:
+                return None
+            current = self._process_terminal_cleanup_from_row(rows[0])
+            if current["state"] != "running" or current["lease_id"] != lease_id:
+                return None
+            completed = list(current["completed_phases"])
+            if phase not in completed:
+                completed.append(phase)
+                completed = [
+                    candidate
+                    for candidate in _PROCESS_TERMINAL_CLEANUP_PHASES
+                    if candidate in completed
+                ]
+                updated = cur.execute(
+                    """
+                    UPDATE process_terminal_cleanups
+                       SET completed_phases_json = ?, updated_at = ?
+                     WHERE pid = ? AND state = 'running' AND lease_id = ?
+                    """,
+                    (dumps(completed), utc_now(), pid, lease_id),
+                )
+                if updated.rowcount != 1:
+                    return None
+            rows = list(
+                cur.execute(
+                    "SELECT * FROM process_terminal_cleanups WHERE pid = ?",
+                    (pid,),
+                )
+            )
+            return self._process_terminal_cleanup_from_row(rows[0])
+
+    def fail_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+        phase: str,
+        error: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if phase not in _PROCESS_TERMINAL_CLEANUP_PHASES:
+            raise ValidationError(f"invalid process terminal cleanup phase: {phase}")
+        with self.transaction() as cur:
+            updated = cur.execute(
+                """
+                UPDATE process_terminal_cleanups
+                   SET state = 'failed', owner_id = NULL, lease_id = NULL,
+                       failed_phase = ?, last_error_json = ?, updated_at = ?
+                 WHERE pid = ? AND state = 'running' AND lease_id = ?
+                """,
+                (phase, dumps(dict(error)), utc_now(), pid, lease_id),
+            )
+            if updated.rowcount != 1:
+                return None
+            rows = list(
+                cur.execute(
+                    "SELECT * FROM process_terminal_cleanups WHERE pid = ?",
+                    (pid,),
+                )
+            )
+            return self._process_terminal_cleanup_from_row(rows[0])
+
+    def finish_process_terminal_cleanup(
+        self,
+        pid: str,
+        *,
+        lease_id: str,
+    ) -> dict[str, Any] | None:
+        with self.transaction() as cur:
+            rows = list(
+                cur.execute(
+                    "SELECT * FROM process_terminal_cleanups WHERE pid = ?",
+                    (pid,),
+                )
+            )
+            if not rows:
+                return None
+            current = self._process_terminal_cleanup_from_row(rows[0])
+            if (
+                current["state"] != "running"
+                or current["lease_id"] != lease_id
+                or current["completed_phases"]
+                != list(_PROCESS_TERMINAL_CLEANUP_PHASES)
+            ):
+                return None
+            updated = cur.execute(
+                """
+                UPDATE process_terminal_cleanups
+                   SET state = 'completed', owner_id = NULL, lease_id = NULL,
+                       failed_phase = NULL, last_error_json = NULL, updated_at = ?
+                 WHERE pid = ? AND state = 'running' AND lease_id = ?
+                """,
+                (utc_now(), pid, lease_id),
+            )
+            if updated.rowcount != 1:
+                return None
+            rows = list(
+                cur.execute(
+                    "SELECT * FROM process_terminal_cleanups WHERE pid = ?",
+                    (pid,),
+                )
+            )
+            return self._process_terminal_cleanup_from_row(rows[0])
 
     def recover_stale_executions(
         self,
@@ -7907,6 +8767,11 @@ class SQLRuntimeStore:
                     loads(row.get("tool_table_json"), {}),
                     loads(row.get("model_tool_table_json"), {}),
                 )
+                self._ensure_process_terminal_cleanup_intent(
+                    cursor,
+                    pid=str(row["pid"]),
+                    status=str(row["status"]),
+                )
             else:
                 self._refresh_process_binding_jit_eligibility(
                     cursor,
@@ -7957,26 +8822,40 @@ class SQLRuntimeStore:
         return marker
 
     def object_payload(self, oid: str) -> Any:
-        self._ensure_healthy()
-        if oid in self._object_payloads:
-            return deepcopy(self._object_payloads[oid])
-        rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
-        if not rows:
-            raise KeyError(oid)
-        payload = self._decode_stored_object_payload(rows[0]["payload_json"])
-        if payload is _MISSING_OBJECT_PAYLOAD:
-            raise KeyError(oid)
-        self._set_cached_object_payload(oid, payload)
-        return deepcopy(payload)
+        with self.locked():
+            if oid in self._object_payloads:
+                return deepcopy(self._object_payloads[oid])
+            rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
+            if not rows:
+                raise KeyError(oid)
+            payload = self._decode_stored_object_payload(rows[0]["payload_json"])
+            if payload is _MISSING_OBJECT_PAYLOAD:
+                raise KeyError(oid)
+            self._set_cached_object_payload(oid, payload)
+            return deepcopy(payload)
 
     def set_object_payload(self, oid: str, payload: Any) -> None:
         self._ensure_healthy()
         with self.transaction(include_object_payloads=True) as cur:
-            self._set_cached_object_payload(oid, payload)
-            cur.execute(
-                "UPDATE objects SET payload_json = ? WHERE oid = ?",
-                (dumps(self.payload_marker(present=True)), oid),
+            updated = cur.execute(
+                "UPDATE objects SET payload_json = ? "
+                "WHERE oid = ? AND lifecycle_state = ?",
+                (
+                    dumps(self.payload_marker(present=True)),
+                    oid,
+                    ObjectLifecycleState.LIVE.value,
+                ),
             )
+            if updated.rowcount != 1:
+                raise ValidationError(
+                    "cannot set payload for a missing or released Object: "
+                    f"{oid}"
+                )
+            # Cache mutation follows the durable CAS.  The per-OID transaction
+            # journal restores this before-image after every known rollback;
+            # an ambiguous outer commit poisons the store before it can serve
+            # either SQL or cache state.
+            self._set_cached_object_payload(oid, payload)
 
     def rehydrate_object_payload_cache(
         self,
@@ -8004,24 +8883,24 @@ class SQLRuntimeStore:
             return tuple(sorted(staged))
 
     def forget_object_payload(self, oid: str) -> None:
-        self._ensure_healthy()
-        self._forget_cached_object_payload(oid)
+        with self.locked():
+            self._forget_cached_object_payload(oid)
 
     def has_object_payload(self, oid: str, *, row: Any | None = None) -> bool:
-        self._ensure_healthy()
-        if oid in self._object_payloads:
+        with self.locked():
+            if oid in self._object_payloads:
+                return True
+            selected_row = row
+            if selected_row is None:
+                rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
+                selected_row = rows[0] if rows else None
+            if selected_row is None:
+                return False
+            payload = self._decode_stored_object_payload(selected_row["payload_json"])
+            if payload is _MISSING_OBJECT_PAYLOAD:
+                return False
+            self._set_cached_object_payload(oid, payload)
             return True
-        selected_row = row
-        if selected_row is None:
-            rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
-            selected_row = rows[0] if rows else None
-        if selected_row is None:
-            return False
-        payload = self._decode_stored_object_payload(selected_row["payload_json"])
-        if payload is _MISSING_OBJECT_PAYLOAD:
-            return False
-        self._set_cached_object_payload(oid, payload)
-        return True
 
     def get_persisted_object_state(
         self,
@@ -8057,19 +8936,21 @@ class SQLRuntimeStore:
                 )
 
     def is_recovered_object_payload(self, oid: str) -> bool:
-        rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
-        if not rows:
-            return False
-        return _is_recovered_runtime_object_payload_marker(
-            rows[0]["payload_json"]
-        )
+        with self.locked():
+            rows = self._query("SELECT payload_json FROM objects WHERE oid = ?", (oid,))
+            if not rows:
+                return False
+            return _is_recovered_runtime_object_payload_marker(
+                rows[0]["payload_json"]
+            )
 
     def snapshot_object_payloads(self, oids: Iterable[str]) -> dict[str, Any]:
-        payloads: dict[str, Any] = {}
-        for oid in oids:
-            if self.has_object_payload(oid):
-                payloads[oid] = self.object_payload(oid)
-        return payloads
+        with self.locked():
+            payloads: dict[str, Any] = {}
+            for oid in oids:
+                if self.has_object_payload(oid):
+                    payloads[oid] = self.object_payload(oid)
+            return payloads
 
     def insert_event(self, event: Event) -> None:
         payload_json = dumps(event.payload)
@@ -8166,6 +9047,27 @@ class SQLRuntimeStore:
         return self._row_to_event(rows[0]) if rows else None
 
     def insert_capability(self, cap: Capability) -> None:
+        uses_remaining = _capability_uses_remaining(
+            cap.uses_remaining,
+            status=cap.status,
+        )
+        rights = _capability_rights_for_write(cap.rights)
+        constraints = _capability_json_object(
+            cap.constraints,
+            label="constraints",
+        )
+        metadata = _capability_json_object(
+            cap.metadata,
+            label="metadata",
+        )
+        if len(rights) > self.config.capability.max_rights_per_capability:
+            raise ValueError("capability rights exceed configured limit")
+        (
+            delegable,
+            revocable,
+            delegation_depth,
+            max_delegation_depth,
+        ) = _capability_authority_scalars(cap)
         self._execute(
             """
             INSERT INTO capabilities (
@@ -8180,27 +9082,26 @@ class SQLRuntimeStore:
                 cap.cap_id,
                 cap.subject,
                 cap.resource,
-                dumps(cap.rights),
-                dumps(cap.constraints),
+                dumps(rights),
+                dumps(constraints),
                 cap.issued_by,
                 cap.issued_at,
                 cap.expires_at,
-                int(cap.delegable),
-                int(cap.revocable),
+                int(delegable),
+                int(revocable),
                 cap.effect.value,
                 cap.issuer_cap_id,
                 cap.parent_cap_id,
-                cap.delegation_depth,
-                cap.max_delegation_depth,
-                cap.uses_remaining,
+                delegation_depth,
+                max_delegation_depth,
+                uses_remaining,
                 cap.status.value,
-                dumps(cap.metadata),
+                dumps(metadata),
             ),
         )
 
     def consume_capability_uses(self, cap_id: str, count: int = 1) -> Capability | None:
-        if count < 1:
-            raise ValueError("count must be >= 1")
+        count = _positive_capability_use_count(count)
         with self._join_or_begin_transaction() as cur:
             updated = cur.execute(
                 """
@@ -8239,8 +9140,7 @@ class SQLRuntimeStore:
         reason: str,
         created_at: str,
     ) -> Capability | None:
-        if count < 1:
-            raise ValueError("count must be >= 1")
+        count = _positive_capability_use_count(count)
         with self.transaction() as cur:
             updated = cur.execute(
                 """
@@ -8304,7 +9204,13 @@ class SQLRuntimeStore:
                 return None
             reservation = reservations[0]
             cap_id = str(reservation["cap_id"])
-            count = int(reservation["count"])
+            try:
+                count = _positive_capability_use_count(
+                    reservation["count"],
+                    label="persisted capability reservation count",
+                )
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
             restored = cur.execute(
                 """
                 UPDATE capabilities
@@ -8352,9 +9258,40 @@ class SQLRuntimeStore:
             "SELECT * FROM capability_use_reservations WHERE reservation_id = ?",
             (reservation_id,),
         )
-        return dict(rows[0]) if rows else None
+        if not rows:
+            return None
+        selected = dict(rows[0])
+        try:
+            _positive_capability_use_count(
+                selected["count"],
+                label="persisted capability reservation count",
+            )
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        return selected
 
     def update_capability(self, cap: Capability) -> None:
+        uses_remaining = _capability_uses_remaining(
+            cap.uses_remaining,
+            status=cap.status,
+        )
+        rights = _capability_rights_for_write(cap.rights)
+        constraints = _capability_json_object(
+            cap.constraints,
+            label="constraints",
+        )
+        metadata = _capability_json_object(
+            cap.metadata,
+            label="metadata",
+        )
+        if len(rights) > self.config.capability.max_rights_per_capability:
+            raise ValueError("capability rights exceed configured limit")
+        (
+            delegable,
+            revocable,
+            delegation_depth,
+            max_delegation_depth,
+        ) = _capability_authority_scalars(cap)
         sql = """
             UPDATE capabilities
                SET subject = ?, resource = ?, rights_json = ?, constraints_json = ?,
@@ -8367,21 +9304,21 @@ class SQLRuntimeStore:
         params = (
             cap.subject,
             cap.resource,
-            dumps(cap.rights),
-            dumps(cap.constraints),
+            dumps(rights),
+            dumps(constraints),
             cap.issued_by,
             cap.issued_at,
             cap.expires_at,
-            int(cap.delegable),
-            int(cap.revocable),
+            int(delegable),
+            int(revocable),
             cap.effect.value,
             cap.issuer_cap_id,
             cap.parent_cap_id,
-            cap.delegation_depth,
-            cap.max_delegation_depth,
-            cap.uses_remaining,
+            delegation_depth,
+            max_delegation_depth,
+            uses_remaining,
             cap.status.value,
-            dumps(cap.metadata),
+            dumps(metadata),
             cap.cap_id,
         )
         if cap.status == CapabilityStatus.ACTIVE:
@@ -8447,14 +9384,85 @@ class SQLRuntimeStore:
         rows = self._query("SELECT * FROM capabilities WHERE cap_id = ?", (cap_id,))
         return self._row_to_capability(rows[0]) if rows else None
 
-    def list_capabilities(self, subject: str | None = None) -> list[Capability]:
-        if subject is None:
-            rows = self._query("SELECT * FROM capabilities ORDER BY subject ASC, issued_at ASC, cap_id ASC")
-        else:
-            rows = self._query(
-                "SELECT * FROM capabilities WHERE subject = ? ORDER BY issued_at ASC, cap_id ASC",
-                (subject,),
+    def list_capabilities(
+        self,
+        subject: str | None = None,
+        *,
+        limit: int | None = None,
+    ) -> list[Capability]:
+        if limit is not None and (
+            type(limit) is not int
+            or limit <= 0
+            or limit > self.config.capability.list_limit
+        ):
+            raise ValidationError(
+                "capability list limit must be a positive integer no greater than "
+                f"capability.list_limit={self.config.capability.list_limit}"
             )
+        params: list[Any] = []
+        if subject is None:
+            sql = "SELECT * FROM capabilities ORDER BY subject ASC, issued_at ASC, cap_id ASC"
+        else:
+            sql = (
+                "SELECT * FROM capabilities WHERE subject = ? "
+                "ORDER BY issued_at ASC, cap_id ASC"
+            )
+            params.append(subject)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._query(sql, params)
+        return [self._row_to_capability(row) for row in rows]
+
+    def query_capabilities(
+        self,
+        subject: str | None = None,
+        *,
+        active_only: bool,
+        after_cap_id: str | None,
+        limit: int,
+    ) -> list[Capability]:
+        """Return one stable, hard-bounded capability page ordered by ID."""
+
+        if subject is not None and (type(subject) is not str or not subject):
+            raise ValidationError(
+                "capability page subject must be a non-empty string when set"
+            )
+        if type(active_only) is not bool:
+            raise ValidationError("capability page active_only must be boolean")
+        if after_cap_id is not None and (
+            type(after_cap_id) is not str or not after_cap_id
+        ):
+            raise ValidationError(
+                "capability page cursor must be a non-empty string when set"
+            )
+        if (
+            type(limit) is not int
+            or limit <= 0
+            or limit > self.config.capability.list_limit
+        ):
+            raise ValidationError(
+                "capability page limit must be a positive integer no greater than "
+                f"capability.list_limit={self.config.capability.list_limit}"
+            )
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if subject is not None:
+            clauses.append("subject = ?")
+            params.append(subject)
+        if active_only:
+            clauses.append("status = ?")
+            params.append(CapabilityStatus.ACTIVE.value)
+        if after_cap_id is not None:
+            clauses.append("cap_id > ?")
+            params.append(after_cap_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self._query(
+            f"SELECT * FROM capabilities{where} ORDER BY cap_id ASC LIMIT ?",
+            params,
+        )
         return [self._row_to_capability(row) for row in rows]
 
     def register_sink_trust(self, spec: SinkTrustSpec, *, replace: bool = False) -> SinkTrustSpec:
@@ -8922,6 +9930,7 @@ class SQLRuntimeStore:
         target: str | None = None,
         match_any: bool = False,
         include_gui_presentation: bool = True,
+        before_record_id: str | None = None,
     ) -> list[AuditRecord]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -8937,6 +9946,16 @@ class SQLRuntimeStore:
         if selectors:
             joiner = " OR " if match_any and len(selectors) > 1 else " AND "
             clauses.append(f"({joiner.join(selectors)})")
+        if before_record_id is not None:
+            cursor_rows = self._query(
+                "SELECT timestamp, record_id FROM audit_records WHERE record_id = ?",
+                (before_record_id,),
+            )
+            if not cursor_rows:
+                return []
+            cursor = cursor_rows[0]
+            clauses.append("(timestamp, record_id) < (?, ?)")
+            params.extend((cursor["timestamp"], cursor["record_id"]))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         order = "ORDER BY timestamp, record_id"
         if limit is None:
@@ -9195,12 +10214,12 @@ class SQLRuntimeStore:
                     self._execute(f"DROP TABLE IF EXISTS {table}")
                 except BaseException as cleanup_error:
                     self._poison(
-                        "stale operation recovery setup and cleanup failed: "
-                        f"{cleanup_error}"
+                        "stale_operation_recovery_setup_cleanup_failed",
+                        diagnostic_errors=(cleanup_error,),
                     )
                     setup_error.add_note(
-                        "stale operation recovery cleanup also failed: "
-                        f"{cleanup_error}"
+                        "stale operation recovery cleanup also failed; "
+                        "diagnostic fingerprint retained internally"
                     )
                 raise
             body_error: BaseException | None = None
@@ -9218,18 +10237,18 @@ class SQLRuntimeStore:
                     self._execute(f"DROP TABLE IF EXISTS {table}")
                 except BaseException as cleanup_error:
                     self._poison(
-                        "stale operation recovery cleanup failed: "
-                        f"{cleanup_error}"
+                        "stale_operation_recovery_cleanup_failed",
+                        diagnostic_errors=(cleanup_error,),
                     )
                     if body_error is not None:
                         body_error.add_note(
-                            "stale operation recovery cleanup also failed: "
-                            f"{cleanup_error}"
+                            "stale operation recovery cleanup also failed; "
+                            "diagnostic fingerprint retained internally"
                         )
                     else:
                         raise ValidationError(
                             "stale operation recovery cleanup failed; store is unusable"
-                        ) from cleanup_error
+                        ) from None
 
     def _populate_stale_operation_recovery_index(self, table: str) -> None:
         self._execute(
@@ -9728,39 +10747,102 @@ class SQLRuntimeStore:
         *,
         pids: Iterable[str] | None = None,
     ) -> list[ExternalEffectRecord]:
-        """Pin changed effect ids, then read one consistent current-row batch."""
+        """Read current rows for every effect changed after one ledger sequence.
 
-        with self.transaction() as cur:
-            id_rows = list(
-                cur.execute(
-                    """
-                    SELECT DISTINCT effect_id
-                      FROM external_effect_transitions
-                     WHERE seq > ?
-                     ORDER BY effect_id
-                    """,
-                    (int(effect_ledger_seq),),
-                )
+        The transition ledger may contain many entries for the same effect and
+        may be arbitrarily newer than an old checkpoint.  Keep the identity
+        join inside SQL so neither those duplicates nor all changed effect IDs
+        become Python data or one unbounded bind list.  A transaction pins all
+        PID batches and keyset pages to one consistent current-row snapshot.
+        """
+
+        if type(effect_ledger_seq) is not int or effect_ledger_seq < 0:
+            raise ValidationError(
+                "external effect ledger sequence must be a non-negative integer"
             )
-            effect_ids = [str(row["effect_id"]) for row in id_rows]
-            if not effect_ids:
-                return []
-            clauses = [f"effect_id IN ({', '.join('?' for _ in effect_ids)})"]
-            params: list[Any] = list(effect_ids)
-            if pids is not None:
-                selected_pids = list(dict.fromkeys(str(pid) for pid in pids))
-                if not selected_pids:
+        with self.transaction() as cur:
+            if pids is None:
+                rows = self._query_external_effect_changes(
+                    cur,
+                    effect_ledger_seq=effect_ledger_seq,
+                    pid_batch=None,
+                )
+            else:
+                rows = []
+                found_pid = False
+                for pid_batch in self._external_effect_pid_batches(pids):
+                    found_pid = True
+                    rows.extend(
+                        self._query_external_effect_changes(
+                            cur,
+                            effect_ledger_seq=effect_ledger_seq,
+                            pid_batch=pid_batch,
+                        )
+                    )
+                if not found_pid:
                     return []
-                clauses.append(f"pid IN ({', '.join('?' for _ in selected_pids)})")
-                params.extend(selected_pids)
-            rows = list(
+        rows.sort(key=lambda row: (str(row["created_at"]), str(row["effect_id"])))
+        return [self._row_to_external_effect(row) for row in rows]
+
+    @staticmethod
+    def _external_effect_pid_batches(
+        pids: Iterable[str],
+    ) -> Iterator[tuple[str, ...]]:
+        seen: set[str] = set()
+        batch: list[str] = []
+        for pid in pids:
+            if not isinstance(pid, str) or not pid:
+                raise ValidationError("external effect PID filters must be non-empty text")
+            if pid in seen:
+                continue
+            seen.add(pid)
+            batch.append(pid)
+            if len(batch) == _EXTERNAL_EFFECT_CHANGE_QUERY_BATCH_SIZE:
+                yield tuple(batch)
+                batch.clear()
+        if batch:
+            yield tuple(batch)
+
+    def _query_external_effect_changes(
+        self,
+        cur: Any,
+        *,
+        effect_ledger_seq: int,
+        pid_batch: tuple[str, ...] | None,
+    ) -> list[Any]:
+        rows: list[Any] = []
+        after: tuple[str, str] | None = None
+        while True:
+            clauses = [
+                "EXISTS ("
+                "SELECT 1 FROM external_effect_transitions AS effect_change "
+                "WHERE effect_change.effect_id = effect.effect_id "
+                "AND effect_change.seq > ?"
+                ")"
+            ]
+            params: list[Any] = [effect_ledger_seq]
+            if pid_batch is not None:
+                clauses.append(
+                    f"effect.pid IN ({', '.join('?' for _ in pid_batch)})"
+                )
+                params.extend(pid_batch)
+            if after is not None:
+                clauses.append("(effect.created_at, effect.effect_id) > (?, ?)")
+                params.extend(after)
+            params.append(_EXTERNAL_EFFECT_CHANGE_QUERY_BATCH_SIZE)
+            page = list(
                 cur.execute(
-                    f"SELECT * FROM external_effects WHERE {' AND '.join(clauses)} "
-                    "ORDER BY created_at, effect_id",
+                    "SELECT effect.* FROM external_effects AS effect "
+                    f"WHERE {' AND '.join(clauses)} "
+                    "ORDER BY effect.created_at, effect.effect_id LIMIT ?",
                     params,
                 )
             )
-            return [self._row_to_external_effect(row) for row in rows]
+            rows.extend(page)
+            if len(page) < _EXTERNAL_EFFECT_CHANGE_QUERY_BATCH_SIZE:
+                return rows
+            last = page[-1]
+            after = (str(last["created_at"]), str(last["effect_id"]))
 
     def _append_external_effect_transition(
         self,
@@ -10627,6 +11709,33 @@ class SQLRuntimeStore:
             ),
         )
 
+    def ack_process_message(
+        self,
+        message_id: str,
+        *,
+        recipient_pid: str,
+        acked_at: str,
+        updated_at: str,
+    ) -> bool:
+        """CAS an unread message to ACKED without overwriting its envelope."""
+
+        cursor = self._execute(
+            """
+            UPDATE process_messages
+               SET status = ?, acked_at = ?, updated_at = ?
+             WHERE message_id = ? AND recipient_pid = ? AND status = ?
+            """,
+            (
+                ProcessMessageStatus.ACKED.value,
+                acked_at,
+                updated_at,
+                message_id,
+                recipient_pid,
+                ProcessMessageStatus.UNREAD.value,
+            ),
+        )
+        return cursor.rowcount == 1
+
     def update_process_message_metadata(
         self,
         message_id: str,
@@ -10708,6 +11817,54 @@ class SQLRuntimeStore:
             params.append(max(0, int(limit)))
         rows = self._query(f"SELECT * FROM process_messages{where} ORDER BY created_at, message_id{limit_sql}", params)
         return [self._row_to_process_message(row) for row in rows]
+
+    def count_process_messages(
+        self,
+        recipient_pid: str | None = None,
+        *,
+        status: ProcessMessageStatus | str | None = None,
+        kind: ProcessMessageKind | str | None = None,
+        sender: str | None = None,
+        channel: str | None = None,
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+        message_ids: list[str] | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if message_ids is not None and not message_ids:
+            return 0
+        if recipient_pid is not None:
+            clauses.append("recipient_pid = ?")
+            params.append(recipient_pid)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(ProcessMessageStatus(status).value)
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(ProcessMessageKind(kind).value)
+        if sender is not None:
+            clauses.append("sender = ?")
+            params.append(sender)
+        if channel is not None:
+            clauses.append("channel = ?")
+            params.append(channel)
+        if correlation_id is not None:
+            clauses.append("correlation_id = ?")
+            params.append(correlation_id)
+        if reply_to is not None:
+            clauses.append("reply_to = ?")
+            params.append(reply_to)
+        if message_ids is not None:
+            placeholders = ", ".join("?" for _ in message_ids)
+            clauses.append(f"message_id IN ({placeholders})")
+            params.extend(message_ids)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._query(
+            f"SELECT COUNT(*) AS message_count FROM process_messages{where}",
+            params,
+        )
+        return int(rows[0]["message_count"] if rows else 0)
 
     def get_process_activity_summaries(
         self,
@@ -10898,6 +12055,74 @@ class SQLRuntimeStore:
             params.append(max(0, int(limit)))
         rows = self._query(f"SELECT * FROM object_tasks{where} ORDER BY updated_at DESC, created_at DESC, task_id ASC{limit_sql}", params)
         return [self._row_to_object_task(row) for row in rows]
+
+    def query_checkpoint_object_tasks(
+        self,
+        *,
+        statuses: Iterable[str | ObjectTaskStatus],
+        checkpoint_created_at: str,
+        terminal_after: bool,
+        scope_pids: Iterable[str] = (),
+        owner_oids: Iterable[str] = (),
+        after: ObjectTaskRecoveryCursor | None,
+        limit: int | None = None,
+    ) -> ObjectTaskRecoveryPage:
+        """Return a bounded task page already narrowed to checkpoint scope."""
+
+        selected_statuses = tuple(
+            dict.fromkeys(ObjectTaskStatus(status).value for status in statuses)
+        )
+        if not selected_statuses:
+            raise ValidationError("checkpoint task query requires statuses")
+        if not isinstance(checkpoint_created_at, str) or not checkpoint_created_at:
+            raise ValidationError("checkpoint task query requires a timestamp")
+        if type(terminal_after) is not bool:
+            raise ValidationError("checkpoint task boundary direction must be boolean")
+        if after is not None and not isinstance(after, ObjectTaskRecoveryCursor):
+            raise ValidationError("checkpoint task cursor has an invalid type")
+        selected_pids, selected_oids = _checkpoint_object_task_query_scope(
+            scope_pids,
+            owner_oids,
+        )
+        selected_scope = selected_pids or selected_oids
+        selected_limit = self._object_task_recovery_limit(
+            self.config.runtime.object_task_recovery_page_size
+            if limit is None
+            else limit
+        )
+        clauses = [
+            f"status IN ({', '.join('?' for _ in selected_statuses)})",
+            f"COALESCE(completed_at, updated_at) {'>' if terminal_after else '<='} ?",
+        ]
+        params: list[Any] = [*selected_statuses, checkpoint_created_at]
+        scope_placeholders = ", ".join("?" for _ in selected_scope)
+        if selected_pids:
+            clauses.append(
+                f"(creator_pid IN ({scope_placeholders}) "
+                f"OR runner_pid IN ({scope_placeholders}))"
+            )
+            params.extend((*selected_pids, *selected_pids))
+        else:
+            clauses.append(f"owner_oid IN ({scope_placeholders})")
+            params.extend(selected_oids)
+        if after is not None:
+            clauses.append("(created_at, task_id) > (?, ?)")
+            params.extend((after.created_at, after.task_id))
+        params.append(selected_limit + 1)
+        rows = self._query(
+            "SELECT * FROM object_tasks "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at, task_id LIMIT ?",
+            params,
+        )
+        records = tuple(
+            self._row_to_object_task(row) for row in rows[:selected_limit]
+        )
+        next_cursor = None
+        if len(rows) > selected_limit:
+            last = records[-1]
+            next_cursor = ObjectTaskRecoveryCursor(last.created_at, last.task_id)
+        return ObjectTaskRecoveryPage(records=records, next_cursor=next_cursor)
 
     def query_object_task_recovery(
         self,
@@ -11350,59 +12575,54 @@ class SQLRuntimeStore:
         return self._dict_to_skill_package(loads(row["package_json"], {})), self._skill_row_metadata(row)
 
     def list_skills(self, text: str | None = None, limit: int | None = None) -> list[tuple[SkillPackage, dict[str, Any]]]:
-        params: list[Any] = []
-        sql = "SELECT * FROM skills"
-        exact_query: str | None = None
-        terms: tuple[str, ...] = ()
-        if text:
-            exact_query = text.strip().casefold()
-            terms = skill_search_terms(text)
-            predicates: list[str] = []
-            for term in terms:
-                needle = f"%{term}%"
-                predicates.append(
-                    "(lower(skill_id) LIKE ? OR lower(name) LIKE ? "
-                    "OR lower(json_extract(package_json, '$.description')) LIKE ?)"
+        query = str(text or "").strip()
+        if not query:
+            params: list[Any] = []
+            sql = "SELECT * FROM skills ORDER BY name, skill_id"
+            if limit is not None:
+                sql += " LIMIT ?"
+                params.append(limit)
+            return [
+                (
+                    self._dict_to_skill_package(loads(row["package_json"], {})),
+                    self._skill_row_metadata(row),
                 )
-                params.extend([needle, needle, needle])
-            if predicates:
-                sql += " WHERE " + " AND ".join(predicates)
-        if exact_query:
-            order: list[str] = [
-                "CASE WHEN lower(skill_id) = ? OR lower(name) = ? "
-                "THEN 1 ELSE 0 END DESC"
+                for row in self._query(sql, params)
             ]
-            params.extend([exact_query, exact_query])
-            phrase = f"%{' '.join(terms)}%"
-            order.append(
-                "CASE WHEN lower(skill_id) LIKE ? OR lower(name) LIKE ? "
-                "OR lower(json_extract(package_json, '$.description')) LIKE ? "
-                "THEN 1000 ELSE 0 END DESC"
+
+        # SQLite lower()/LIKE is ASCII-oriented and can miss Unicode casefold
+        # matches before the shared scorer sees them.  Read a stable catalog,
+        # score with the source-independent Python semantics, then apply limit.
+        scan_limit = self.config.skills.catalog_scan_limit
+        rows = self._query(
+            "SELECT * FROM skills ORDER BY name, skill_id LIMIT ?",
+            (scan_limit + 1,),
+        )
+        if len(rows) > scan_limit:
+            raise ValidationError(
+                "Skill catalog exceeds catalog_scan_limit="
+                f"{scan_limit}; refusing incomplete metadata search"
             )
-            params.extend([phrase, phrase, phrase])
-            relevance_parts: list[str] = []
-            for term in terms:
-                needle = f"%{term}%"
-                relevance_parts.append(
-                    "(CASE WHEN lower(skill_id) LIKE ? THEN 12 ELSE 0 END + "
-                    "CASE WHEN lower(name) LIKE ? THEN 10 ELSE 0 END + "
-                    "CASE WHEN lower(json_extract(package_json, '$.description')) "
-                    "LIKE ? THEN 4 ELSE 0 END)"
-                )
-                params.extend([needle, needle, needle])
-            if relevance_parts:
-                order.append(f"({' + '.join(relevance_parts)}) DESC")
-            order.extend(["name", "skill_id"])
-            sql += " ORDER BY " + ", ".join(order)
-        else:
-            sql += " ORDER BY name, skill_id"
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(limit)
-        return [
-            (self._dict_to_skill_package(loads(row["package_json"], {})), self._skill_row_metadata(row))
-            for row in self._query(sql, params)
-        ]
+        scored: list[tuple[int, SkillPackage, dict[str, Any]]] = []
+        for row in rows:
+            package = self._dict_to_skill_package(loads(row["package_json"], {}))
+            score = skill_metadata_search_score(
+                skill_id=package.skill_id,
+                name=package.name,
+                description=package.description,
+                text=query,
+            )
+            if score is not None:
+                scored.append((score, package, self._skill_row_metadata(row)))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                item[1].name,
+                item[1].skill_id,
+            )
+        )
+        selected = scored if limit is None else scored[:limit]
+        return [(package, metadata) for _, package, metadata in selected]
 
     def insert_skill_trust(
         self,
@@ -11869,6 +13089,7 @@ class SQLRuntimeStore:
         return [self._runtime_module_row(row) for row in self._query(sql, params)]
 
     def insert_checkpoint(self, checkpoint: Checkpoint, snapshot: dict[str, Any]) -> None:
+        snapshot_json = _dumps_strict_checkpoint_snapshot(snapshot)
         self._execute(
             """
             INSERT INTO checkpoints (
@@ -11880,7 +13101,7 @@ class SQLRuntimeStore:
                 checkpoint.checkpoint_id,
                 checkpoint.pid,
                 checkpoint.reason,
-                dumps(snapshot),
+                snapshot_json,
                 checkpoint.created_at,
                 checkpoint.created_by,
                 checkpoint.snapshot_version,
@@ -12410,6 +13631,26 @@ class SQLRuntimeStore:
                 deleted_at=row["deleted_at"],
             )
 
+    def _row_to_object_ref(self, row: Any) -> ObjectRef:
+        with _persisted_model_decode(f"object reference {row['oid']}"):
+            return ObjectRef(
+                oid=row["oid"],
+                namespace=row["namespace"],
+                name=row["name"],
+                type=ObjectType(row["type"]),
+                schema_version=row["schema_version"],
+                metadata=ObjectMetadata.from_persisted(
+                    loads(row["metadata_json"], {})
+                ),
+                version=int(row["version"]),
+                immutable=bool(row["immutable"]),
+                created_by=row["created_by"],
+                owner_kind=ObjectOwnerKind(row["owner_kind"]),
+                owner_id=row["owner_id"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+
     def _row_to_namespace(self, row: Any) -> ObjectNamespace:
         return ObjectNamespace(
             namespace=row["namespace"],
@@ -12535,9 +13776,31 @@ class SQLRuntimeStore:
         return ResourceReservation(
             parent_pid=row["parent_pid"],
             child_pid=row["child_pid"],
-            reserved={key: float(value) for key, value in loads(row["reservation_json"], {}).items()},
+            reserved={
+                key: self._decode_resource_reservation_number(key, value)
+                for key, value in loads(row["reservation_json"], {}).items()
+            },
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _decode_resource_reservation_number(
+        budget_field: str,
+        value: Any,
+    ) -> int | float:
+        if budget_field in _CONTINUOUS_RESOURCE_BUDGET_FIELDS:
+            return float(value)
+        if isinstance(value, bool):
+            raise ValidationError(
+                f"persisted discrete resource reservation is invalid: {budget_field}"
+            )
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        raise ValidationError(
+            f"persisted discrete resource reservation is invalid: {budget_field}"
         )
 
     def _row_to_event(self, row: Any) -> Event:
@@ -12557,33 +13820,83 @@ class SQLRuntimeStore:
     def _row_to_capability(self, row: Any) -> Capability:
         with _persisted_model_decode(f"capability {row['cap_id']}"):
             keys = set(row.keys())
+            status = (
+                CapabilityStatus(row["status"])
+                if "status" in keys
+                else (
+                    CapabilityStatus.REVOKED
+                    if _persisted_capability_boolean(
+                        row["revoked"],
+                        label="revoked",
+                    )
+                    else CapabilityStatus.ACTIVE
+                )
+            )
+            uses_remaining = _capability_uses_remaining(
+                row["uses_remaining"] if "uses_remaining" in keys else None,
+                status=status,
+            )
+            delegable = _persisted_capability_boolean(
+                row["delegable"],
+                label="delegable",
+            )
+            revocable = _persisted_capability_boolean(
+                row["revocable"],
+                label="revocable",
+            )
+            delegation_depth = _capability_delegation_depth(
+                row["delegation_depth"] if "delegation_depth" in keys else 0,
+                label="delegation_depth",
+            )
+            max_delegation_depth = _capability_delegation_depth(
+                (
+                    row["max_delegation_depth"]
+                    if "max_delegation_depth" in keys
+                    else None
+                ),
+                label="max_delegation_depth",
+                optional=True,
+            )
+            assert delegation_depth is not None
+            if (
+                max_delegation_depth is not None
+                and max_delegation_depth < delegation_depth
+            ):
+                raise ValueError(
+                    "max_delegation_depth cannot be less than delegation_depth"
+                )
+            rights = _persisted_capability_rights(
+                loads(row["rights_json"], [])
+            )
+            if len(rights) > self.config.capability.max_rights_per_capability:
+                raise ValueError("persisted capability rights exceed configured limit")
+            constraints = _capability_json_object(
+                loads(row["constraints_json"], {}),
+                label="constraints",
+            )
+            metadata = _capability_json_object(
+                loads(row["metadata_json"], {}) if "metadata_json" in keys else {},
+                label="metadata",
+            )
             return Capability(
                 cap_id=row["cap_id"],
                 subject=row["subject"],
                 resource=row["resource"],
-                rights=set(loads(row["rights_json"], [])),
-                constraints=loads(row["constraints_json"], {}),
+                rights=rights,
+                constraints=constraints,
                 issued_by=row["issued_by"],
                 issued_at=row["issued_at"],
                 expires_at=row["expires_at"],
-                delegable=bool(row["delegable"]),
-                revocable=bool(row["revocable"]),
+                delegable=delegable,
+                revocable=revocable,
                 effect=CapabilityEffect(row["effect"]) if "effect" in keys else CapabilityEffect.ALLOW,
                 issuer_cap_id=row["issuer_cap_id"] if "issuer_cap_id" in keys else None,
                 parent_cap_id=row["parent_cap_id"] if "parent_cap_id" in keys else None,
-                delegation_depth=int(row["delegation_depth"]) if "delegation_depth" in keys else 0,
-                max_delegation_depth=(
-                    int(row["max_delegation_depth"])
-                    if "max_delegation_depth" in keys and row["max_delegation_depth"] is not None
-                    else None
-                ),
-                uses_remaining=row["uses_remaining"] if "uses_remaining" in keys else None,
-                status=(
-                    CapabilityStatus(row["status"])
-                    if "status" in keys
-                    else (CapabilityStatus.REVOKED if bool(row["revoked"]) else CapabilityStatus.ACTIVE)
-                ),
-                metadata=loads(row["metadata_json"], {}) if "metadata_json" in keys else {},
+                delegation_depth=delegation_depth,
+                max_delegation_depth=max_delegation_depth,
+                uses_remaining=uses_remaining,
+                status=status,
+                metadata=metadata,
             )
 
     def _row_to_audit(self, row: Any) -> AuditRecord:

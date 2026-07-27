@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -75,6 +75,11 @@ from agent_libos.runtime.snapshots import (
 from agent_libos.storage import StoreAssemblyReadiness, UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads, to_jsonable
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+    public_error_envelope_for_type,
+)
 
 
 @dataclass
@@ -90,7 +95,7 @@ class _CheckpointForkPublication:
     root_pid: str
     restored_image_ids: list[str]
     publication_state: dict[str, Any]
-    post_commit_failures: list[dict[str, str]]
+    post_commit_failures: list[dict[str, Any]]
 
 
 class CheckpointManager:
@@ -296,8 +301,18 @@ class CheckpointManager:
         metadata: dict[str, Any] | None,
     ) -> str:
         selected_actor = actor or pid
+        authority_decision: CapabilityDecision | None = None
         if require_capability:
-            self._require_process_right(selected_actor, pid, CapabilityRight.WRITE)
+            # Authorization is advisory until the shared store transaction is
+            # held.  AuthorityTransaction reauthorizes and reserves any
+            # finite use in the same UoW as the checkpoint publication, so a
+            # snapshot/evidence failure cannot consume a one-shot grant.
+            authority_decision = self._require_process_right(
+                selected_actor,
+                pid,
+                CapabilityRight.WRITE,
+                consume=False,
+            )
         checkpoint_id = new_id("ckpt")
         created_at = utc_now()
         # Snapshot discovery spans process, object, capability, message, image,
@@ -305,7 +320,16 @@ class CheckpointManager:
         # checkpoint/head write behind one store transaction so a concurrent
         # mutation cannot produce a row from one instant and a payload from
         # another.
-        with self.snapshots.capture_scope():
+        with ExitStack() as publication_scope:
+            if self.capabilities is not None and authority_decision is not None:
+                publication_scope.enter_context(
+                    self.capabilities.authority_transaction(
+                        [authority_decision],
+                        actor=selected_actor,
+                        operation="checkpoint create",
+                    )
+                )
+            publication_scope.enter_context(self.snapshots.capture_scope())
             snapshot = self._build_snapshot(
                 checkpoint_id=checkpoint_id,
                 pid=pid,
@@ -420,7 +444,11 @@ class CheckpointManager:
         actor: str | None = None,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+        checkpoint, snapshot = self._load_checkpoint_for_read(
+            checkpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
         if require_capability and actor is not None:
             with self._checkpoint_or_process_read_scope(actor, checkpoint):
                 return self.inspect(checkpoint_id, actor=actor, require_capability=False)
@@ -461,7 +489,11 @@ class CheckpointManager:
         actor: str | None = None,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+        checkpoint, snapshot = self._load_checkpoint_for_read(
+            checkpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
         if require_capability and actor is not None:
             with self._checkpoint_or_process_read_scope(actor, checkpoint):
                 return self.diff(checkpoint_id, actor=actor, require_capability=False)
@@ -512,6 +544,16 @@ class CheckpointManager:
         *,
         require_capability: bool = True,
     ) -> dict[str, Any]:
+        if require_capability:
+            # Establish target authority before any repository lookup. The
+            # later publication transaction reauthorizes and settles the same
+            # decision together with the restore writes.
+            self._require_checkpoint_right(
+                actor,
+                checkpoint_id,
+                CapabilityRight.ADMIN,
+                consume=False,
+            )
         with self._restore_single_flight():
             return self._restore_once(
                 actor,
@@ -917,14 +959,98 @@ class CheckpointManager:
         return self.restore(pid, checkpoint_id, require_capability=False)
 
     def preflight_checkpoint(self, checkpoint_id: str) -> None:
-        """Reject incompatible immutable artifacts before operation evidence."""
+        """Reject an incompatible immutable artifact for a trusted caller."""
 
         self._preflight_artifact.set(None)
-        checkpoint, snapshot, typed = self._read_checkpoint_artifact(
-            checkpoint_id
+        self._cache_preflight_artifact(
+            checkpoint_id,
+            self._read_checkpoint_artifact(checkpoint_id),
         )
-        self._preflight_artifact.set(
-            (checkpoint_id, checkpoint, snapshot, typed)
+
+    def preflight_checkpoint_read(
+        self,
+        checkpoint_id: str,
+        *,
+        actor: str | None,
+        require_capability: bool = True,
+    ) -> None:
+        """Authorize a diagnostic checkpoint reference before decoding it."""
+
+        self._preflight_artifact.set(None)
+        self._cache_preflight_artifact(
+            checkpoint_id,
+            self._read_checkpoint_artifact_for_read(
+                checkpoint_id,
+                actor=actor,
+                require_capability=require_capability,
+            ),
+        )
+
+    def preflight_checkpoint_inspect(
+        self,
+        checkpoint_id: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+    ) -> None:
+        self.preflight_checkpoint_read(
+            checkpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
+
+    def preflight_checkpoint_diff(
+        self,
+        checkpoint_id: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+    ) -> None:
+        self.preflight_checkpoint_read(
+            checkpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
+
+    def preflight_checkpoint_replay(
+        self,
+        checkpoint_id: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+    ) -> None:
+        self.preflight_checkpoint_read(
+            checkpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
+
+    def preflight_checkpoint_restore(
+        self,
+        actor: str,
+        checkpoint_id: str,
+        *,
+        require_capability: bool = True,
+    ) -> None:
+        self._preflight_checkpoint_exact_right(
+            actor,
+            checkpoint_id,
+            CapabilityRight.ADMIN,
+            require_capability=require_capability,
+        )
+
+    def preflight_checkpoint_fork(
+        self,
+        actor: str,
+        checkpoint_id: str,
+        *,
+        require_capability: bool = True,
+    ) -> None:
+        self._preflight_checkpoint_exact_right(
+            actor,
+            checkpoint_id,
+            CapabilityRight.EXECUTE,
+            require_capability=require_capability,
         )
 
     def load_checkpoint_artifact(
@@ -935,6 +1061,21 @@ class CheckpointManager:
 
         return self._load_checkpoint(checkpoint_id)
 
+    def load_checkpoint_artifact_for_read(
+        self,
+        checkpoint_id: str,
+        *,
+        actor: str | None,
+        require_capability: bool = True,
+    ) -> tuple[Checkpoint, dict[str, Any]]:
+        """Load an internal artifact without exposing existence before read authority."""
+
+        return self._load_checkpoint_for_read(
+            checkpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
+
     def fork_from_checkpoint(
         self,
         actor: str,
@@ -943,6 +1084,16 @@ class CheckpointManager:
         parent_pid: str | None = None,
         require_capability: bool = True,
     ) -> dict[str, Any]:
+        if require_capability:
+            # A missing and an existing unauthorized checkpoint must fail at
+            # the same authority boundary. The fork transaction reauthorizes
+            # this non-consuming decision before publication.
+            self._require_checkpoint_right(
+                actor,
+                checkpoint_id,
+                CapabilityRight.EXECUTE,
+                consume=False,
+            )
         # Reject same-thread nesting before taking the registry lock. This
         # preserves the global registry -> store lock order while ensuring a
         # savepoint can never be mistaken for a durable fork commit.
@@ -1319,7 +1470,7 @@ class CheckpointManager:
         self,
         publication: _CheckpointForkPublication,
         *,
-        recovery_failures: list[dict[str, str]],
+        recovery_failures: list[dict[str, Any]],
     ) -> dict[str, Any]:
         secured = self._secure_checkpoint_fork_subtree(
             remapped=publication.remapped,
@@ -1457,11 +1608,18 @@ class CheckpointManager:
             )
 
     @staticmethod
-    def _fork_failure(*, phase: str, exc: BaseException) -> dict[str, str]:
+    def _fork_failure(*, phase: str, exc: BaseException) -> dict[str, Any]:
+        envelope = public_error_envelope(
+            exc,
+            code="checkpoint_fork_post_commit_failed",
+        )
         return {
             "phase": phase,
-            "error_type": type(exc).__name__,
-            "message": str(exc),
+            **envelope,
+            "internal_error": internal_exception_observation(
+                exc,
+                correlation_id=envelope["correlation_id"],
+            ),
         }
 
     def _fork_committed_receipt(
@@ -1470,7 +1628,7 @@ class CheckpointManager:
         checkpoint: Checkpoint,
         root_pid: str,
         remapped: dict[str, Any],
-        post_commit_failures: Iterable[Mapping[str, str]],
+        post_commit_failures: Iterable[Mapping[str, Any]],
     ) -> dict[str, Any]:
         failures = [dict(item) for item in post_commit_failures]
         return {
@@ -1495,6 +1653,14 @@ class CheckpointManager:
         interruption: BaseException,
         diagnostic_error: BaseException,
     ) -> dict[str, Any]:
+        interruption_error = public_error_envelope(
+            interruption,
+            code="checkpoint_fork_commit_interrupted",
+        )
+        diagnostic = public_error_envelope(
+            diagnostic_error,
+            code="checkpoint_fork_commit_confirmation_failed",
+        )
         return {
             "checkpoint_id": checkpoint.checkpoint_id,
             "source_pid": checkpoint.pid,
@@ -1508,10 +1674,22 @@ class CheckpointManager:
             "post_commit_failures": [],
             "outcome_diagnostic": {
                 "phase": "fork_commit_confirmation",
-                "interruption_error_type": type(interruption).__name__,
-                "interruption": str(interruption),
-                "diagnostic_error_type": type(diagnostic_error).__name__,
-                "diagnostic_error": str(diagnostic_error),
+                "interruption_error_type": interruption_error["error_type"],
+                "interruption": interruption_error["message"],
+                "interruption_code": interruption_error["code"],
+                "interruption_correlation_id": interruption_error["correlation_id"],
+                "interruption_internal_error": internal_exception_observation(
+                    interruption,
+                    correlation_id=interruption_error["correlation_id"],
+                ),
+                "diagnostic_error_type": diagnostic["error_type"],
+                "diagnostic_error": diagnostic["message"],
+                "diagnostic_code": diagnostic["code"],
+                "diagnostic_correlation_id": diagnostic["correlation_id"],
+                "diagnostic_internal_error": internal_exception_observation(
+                    diagnostic_error,
+                    correlation_id=diagnostic["correlation_id"],
+                ),
                 "prepared_runtime_assets_retained": True,
             },
         }
@@ -1522,7 +1700,7 @@ class CheckpointManager:
         checkpoint: Checkpoint,
         root_pid: str,
         remapped: dict[str, Any],
-        post_commit_failures: Iterable[Mapping[str, str]],
+        post_commit_failures: Iterable[Mapping[str, Any]],
         subtree_quarantined: bool,
     ) -> dict[str, Any]:
         failures = [dict(item) for item in post_commit_failures]
@@ -1552,7 +1730,7 @@ class CheckpointManager:
         self,
         *,
         remapped: Mapping[str, Any],
-        failures: list[dict[str, str]],
+        failures: list[dict[str, Any]],
     ) -> str | None:
         """Confirm absence or durably terminalize a whole ambiguous subtree."""
 
@@ -1643,14 +1821,24 @@ class CheckpointManager:
             )
             diagnostic["operation_recovery_signal_recorded"] = True
         except BaseException as exc:
-            diagnostic["operation_recovery_signal_error_type"] = type(exc).__name__
-            diagnostic["operation_recovery_signal_error"] = str(exc)
+            self._append_diagnostic_error(
+                diagnostic,
+                "operation_recovery_signal",
+                exc,
+                code="checkpoint_fork_operation_recovery_signal_failed",
+            )
         callback = self._recovery_required_callback
         if callback is None:
-            diagnostic["lifecycle_fence_error_type"] = "RuntimeError"
-            diagnostic["lifecycle_fence_error"] = (
-                "checkpoint fork recovery fence is unavailable"
+            envelope = public_error_envelope_for_type(
+                "RuntimeError",
+                code="checkpoint_fork_recovery_fence_unavailable",
             )
+            diagnostic["lifecycle_fence_error_type"] = envelope["error_type"]
+            diagnostic["lifecycle_fence_error"] = envelope["message"]
+            diagnostic["lifecycle_fence_error_code"] = envelope["code"]
+            diagnostic["lifecycle_fence_error_correlation_id"] = envelope[
+                "correlation_id"
+            ]
         else:
             try:
                 callback(
@@ -1661,8 +1849,12 @@ class CheckpointManager:
                 )
                 diagnostic["lifecycle_fenced"] = True
             except BaseException as exc:
-                diagnostic["lifecycle_fence_error_type"] = type(exc).__name__
-                diagnostic["lifecycle_fence_error"] = str(exc)
+                self._append_diagnostic_error(
+                    diagnostic,
+                    "lifecycle_fence",
+                    exc,
+                    code="checkpoint_fork_recovery_fence_failed",
+                )
         receipt["outcome_diagnostic"] = diagnostic
 
     def _record_checkpoint_fork_recovery(
@@ -1683,9 +1875,31 @@ class CheckpointManager:
             )
             diagnostic["recovery_signal_record_id"] = record.record_id
         except BaseException as exc:
-            diagnostic["recovery_signal_error_type"] = type(exc).__name__
-            diagnostic["recovery_signal_error"] = str(exc)
+            self._append_diagnostic_error(
+                diagnostic,
+                "recovery_signal",
+                exc,
+                code="checkpoint_fork_recovery_signal_failed",
+            )
         receipt["outcome_diagnostic"] = diagnostic
+
+    @staticmethod
+    def _append_diagnostic_error(
+        diagnostic: MutableMapping[str, Any],
+        prefix: str,
+        error: BaseException,
+        *,
+        code: str,
+    ) -> None:
+        envelope = public_error_envelope(error, code=code)
+        diagnostic[f"{prefix}_error_type"] = envelope["error_type"]
+        diagnostic[f"{prefix}_error"] = envelope["message"]
+        diagnostic[f"{prefix}_error_code"] = envelope["code"]
+        diagnostic[f"{prefix}_error_correlation_id"] = envelope["correlation_id"]
+        diagnostic[f"{prefix}_internal_error"] = internal_exception_observation(
+            error,
+            correlation_id=envelope["correlation_id"],
+        )
 
     def _attach_fork_receipt(
         self,
@@ -1730,7 +1944,11 @@ class CheckpointManager:
         actor: str | None = None,
         require_capability: bool = True,
     ) -> dict[str, Any]:
-        checkpoint, snapshot = self._load_checkpoint(checkpoint_id)
+        checkpoint, snapshot = self._load_checkpoint_for_read(
+            checkpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
         if require_capability and actor is not None:
             with self._checkpoint_or_process_read_scope(actor, checkpoint):
                 return self.replay_to_event(
@@ -1858,14 +2076,14 @@ class CheckpointManager:
         capability_rows = [
             row
             for row in captured_rows.capabilities
-            if not str(row.get("resource", "")).startswith(
+            if not row["resource"].startswith(
                 self.CHECKPOINT_RESOURCE_PREFIX
             )
         ]
         capability_ids_by_subject: dict[str, list[str]] = {selected_pid: [] for selected_pid in subtree_pids}
         for capability_row in capability_rows:
-            capability_ids_by_subject.setdefault(str(capability_row["subject"]), []).append(
-                str(capability_row["cap_id"])
+            capability_ids_by_subject.setdefault(capability_row["subject"], []).append(
+                capability_row["cap_id"]
             )
         # capabilities_json is a denormalized process index. Derive it from the
         # capability rows captured by this same transaction so a capability
@@ -2134,7 +2352,7 @@ class CheckpointManager:
         snapshot: dict[str, Any],
         stale_tool_ids: set[str],
         scoped_pids: set[str],
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         phases = [
             ("image_reconciliation", lambda: self._restore_images(snapshot)),
             ("jit_source_reconciliation", lambda: self._restore_jit_sources(snapshot)),
@@ -2143,7 +2361,7 @@ class CheckpointManager:
                 lambda: self._prune_stale_ephemeral_jit_tools(stale_tool_ids, scoped_pids=scoped_pids),
             ),
         ]
-        failures: list[dict[str, str]] = []
+        failures: list[dict[str, Any]] = []
         for phase, operation in phases:
             try:
                 operation()
@@ -2164,7 +2382,7 @@ class CheckpointManager:
         actor: str,
         checkpoint: Checkpoint,
         release_finalizer_objects: list[Any],
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         try:
             self._run_object_release_finalizers_for_objects(
                 release_finalizer_objects,
@@ -2182,7 +2400,7 @@ class CheckpointManager:
             ]
         return []
 
-    def _restore_status(self, failures: list[dict[str, str]]) -> str:
+    def _restore_status(self, failures: list[dict[str, Any]]) -> str:
         return "restored_with_warnings" if failures else "restored"
 
     def _restore_post_commit_failure(
@@ -2193,11 +2411,18 @@ class CheckpointManager:
         phase: str,
         exc: Exception,
         record_failure: bool = True,
-    ) -> dict[str, str]:
-        failure = {
+    ) -> dict[str, Any]:
+        envelope = public_error_envelope(
+            exc,
+            code="checkpoint_restore_post_commit_failed",
+        )
+        failure: dict[str, Any] = {
             "phase": phase,
-            "error_type": type(exc).__name__,
-            "message": str(exc),
+            **envelope,
+            "internal_error": internal_exception_observation(
+                exc,
+                correlation_id=envelope["correlation_id"],
+            ),
         }
         if not record_failure:
             return failure
@@ -2216,8 +2441,12 @@ class CheckpointManager:
             # The committed restore must remain observable to the caller even
             # when its append-only audit sink is unavailable. Preserve that
             # secondary failure in-band rather than hiding the committed state.
-            failure["audit_error_type"] = type(audit_exc).__name__
-            failure["audit_error"] = str(audit_exc)
+            self._append_diagnostic_error(
+                failure,
+                "audit",
+                audit_exc,
+                code="checkpoint_restore_failure_audit_failed",
+            )
         return failure
 
     def _fork_post_commit_failure(
@@ -2229,11 +2458,18 @@ class CheckpointManager:
         phase: str,
         exc: Exception,
         record_failure: bool = True,
-    ) -> dict[str, str]:
-        failure = {
+    ) -> dict[str, Any]:
+        envelope = public_error_envelope(
+            exc,
+            code="checkpoint_fork_post_commit_failed",
+        )
+        failure: dict[str, Any] = {
             "phase": phase,
-            "error_type": type(exc).__name__,
-            "message": str(exc),
+            **envelope,
+            "internal_error": internal_exception_observation(
+                exc,
+                correlation_id=envelope["correlation_id"],
+            ),
         }
         if not record_failure:
             return failure
@@ -2250,8 +2486,12 @@ class CheckpointManager:
                 },
             )
         except Exception as audit_exc:
-            failure["audit_error_type"] = type(audit_exc).__name__
-            failure["audit_error"] = str(audit_exc)
+            self._append_diagnostic_error(
+                failure,
+                "audit",
+                audit_exc,
+                code="checkpoint_fork_failure_audit_failed",
+            )
         return failure
 
     def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None, root_pid: str) -> dict[str, Any]:
@@ -2289,7 +2529,7 @@ class CheckpointManager:
             self._remap_capability_row(row, identities)
             for row in rows.get("capabilities", [])
             if row["subject"] in identities.pids
-            and not str(row["resource"]).startswith(
+            and not row["resource"].startswith(
                 self.CHECKPOINT_RESOURCE_PREFIX
             )
         ]
@@ -2383,7 +2623,7 @@ class CheckpointManager:
         ]
         rows["capabilities"] = self._fork_capability_rows(source_rows)
         source_capability_rows = {
-            str(row["cap_id"]): dict(row)
+            row["cap_id"]: dict(row)
             for row in rows.get("capabilities", [])
         }
         capability_map = {
@@ -2425,15 +2665,15 @@ class CheckpointManager:
         return non_clonable
 
     def _capability_references_any_object(self, row: dict[str, Any], object_oids: set[str]) -> bool:
-        resource = str(row.get("resource") or "")
+        resource = row["resource"]
         return resource.startswith("object:") and resource.split(":", 1)[1] in object_oids
 
     def _fork_capability_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         kept: list[dict[str, Any]] = []
         for row in rows:
-            if str(row.get("resource", "")).startswith(self.CHECKPOINT_RESOURCE_PREFIX):
+            if row["resource"].startswith(self.CHECKPOINT_RESOURCE_PREFIX):
                 continue
-            current = self._authority.get_capability(str(row.get("cap_id")))
+            current = self._authority.get_capability(row["cap_id"])
             if current is None or not current.active:
                 continue
             if self.capabilities.is_expired(current):
@@ -2484,9 +2724,9 @@ class CheckpointManager:
         )
 
     def _filter_restored_capability_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
-        if str(row.get("resource", "")).startswith(self.CHECKPOINT_RESOURCE_PREFIX):
+        if row["resource"].startswith(self.CHECKPOINT_RESOURCE_PREFIX):
             return None
-        current = self._authority.get_capability(str(row.get("cap_id")))
+        current = self._authority.get_capability(row["cap_id"])
         if current is not None:
             if not current.active or self._capability_is_expired(current):
                 return None
@@ -2517,28 +2757,24 @@ class CheckpointManager:
 
     def _capability_from_row(self, row: dict[str, Any]) -> Capability:
         return Capability(
-            cap_id=str(row["cap_id"]),
-            subject=str(row["subject"]),
-            resource=str(row["resource"]),
-            rights=set(loads(row.get("rights_json"), [])),
-            constraints=loads(row.get("constraints_json"), {}),
-            issued_by=str(row.get("issued_by") or "checkpoint.restore"),
-            issued_at=str(row.get("issued_at") or utc_now()),
-            expires_at=row.get("expires_at"),
-            delegable=bool(row.get("delegable")),
-            revocable=bool(row.get("revocable", True)),
-            effect=CapabilityEffect(str(row.get("effect") or CapabilityEffect.ALLOW.value)),
-            issuer_cap_id=row.get("issuer_cap_id"),
-            parent_cap_id=row.get("parent_cap_id"),
-            delegation_depth=int(row.get("delegation_depth") or 0),
-            max_delegation_depth=(
-                int(row["max_delegation_depth"])
-                if row.get("max_delegation_depth") is not None
-                else None
-            ),
-            uses_remaining=row.get("uses_remaining"),
-            status=CapabilityStatus(str(row.get("status") or CapabilityStatus.ACTIVE.value)),
-            metadata=loads(row.get("metadata_json"), {}),
+            cap_id=row["cap_id"],
+            subject=row["subject"],
+            resource=row["resource"],
+            rights=set(loads(row["rights_json"])),
+            constraints=loads(row["constraints_json"]),
+            issued_by=row["issued_by"],
+            issued_at=row["issued_at"],
+            expires_at=row["expires_at"],
+            delegable=row["delegable"],
+            revocable=row["revocable"],
+            effect=CapabilityEffect(row["effect"]),
+            issuer_cap_id=row["issuer_cap_id"],
+            parent_cap_id=row["parent_cap_id"],
+            delegation_depth=row["delegation_depth"],
+            max_delegation_depth=row["max_delegation_depth"],
+            uses_remaining=row["uses_remaining"],
+            status=CapabilityStatus(row["status"]),
+            metadata=loads(row["metadata_json"]),
         )
 
     def _insert_fork_rows(
@@ -2675,23 +2911,23 @@ class CheckpointManager:
     ) -> list[dict[str, Any]]:
         specs: list[dict[str, Any]] = []
         for row in rows:
-            resource = str(row.get("resource") or "")
+            resource = row["resource"]
             if (
-                str(row.get("subject")) != target_pid
-                or str(row.get("status")) != CapabilityStatus.ACTIVE.value
-                or str(row.get("effect")) != CapabilityEffect.ALLOW.value
+                row["subject"] != target_pid
+                or row["status"] != CapabilityStatus.ACTIVE.value
+                or row["effect"] != CapabilityEffect.ALLOW.value
                 or resource.startswith(("object:", "object_namespace:", "checkpoint:"))
             ):
                 continue
             spec: dict[str, Any] = {
                 "resource": resource,
-                "rights": loads(row.get("rights_json"), []),
-                "constraints": loads(row.get("constraints_json"), {}),
-                "delegable": bool(row.get("delegable")),
-                "revocable": bool(row.get("revocable", True)),
+                "rights": loads(row["rights_json"]),
+                "constraints": loads(row["constraints_json"]),
+                "delegable": row["delegable"],
+                "revocable": row["revocable"],
             }
             for key in ("expires_at", "uses_remaining", "max_delegation_depth"):
-                if row.get(key) is not None:
+                if row[key] is not None:
                     spec[key] = row[key]
             specs.append(spec)
         return specs
@@ -2739,14 +2975,14 @@ class CheckpointManager:
 
         source_rows = list(remapped.get("source_capability_rows", {}).values())
         current_source_rows = {
-            str(row["cap_id"]): row
+            row["cap_id"]: row
             for row in self._fork_capability_rows(source_rows)
         }
         source_ids = remapped.get("source_capability_ids", {})
         kept_rows: list[dict[str, Any]] = []
         for remapped_row in remapped["rows"].get("capabilities", []):
-            source_id = source_ids.get(str(remapped_row["cap_id"]))
-            current = current_source_rows.get(str(source_id)) if source_id is not None else None
+            source_id = source_ids.get(remapped_row["cap_id"])
+            current = current_source_rows.get(source_id) if source_id is not None else None
             if current is None:
                 continue
             item = dict(remapped_row)
@@ -2754,7 +2990,7 @@ class CheckpointManager:
                 item[key] = current[key]
             kept_rows.append(item)
         remapped["rows"]["capabilities"] = kept_rows
-        kept_ids = {str(row["cap_id"]) for row in kept_rows}
+        kept_ids = {row["cap_id"] for row in kept_rows}
         for process_row in remapped["rows"].get("processes", []):
             process_row["capabilities_json"] = dumps(
                 [
@@ -2808,11 +3044,112 @@ class CheckpointManager:
         self,
         checkpoint_id: str,
     ) -> tuple[Checkpoint, dict[str, Any], ProcessSnapshot]:
+        cached = self._take_preflight_artifact(checkpoint_id)
+        if cached is not None:
+            return cached
+        return self._read_checkpoint_artifact(checkpoint_id)
+
+    def _load_checkpoint_for_read(
+        self,
+        checkpoint_id: str,
+        *,
+        actor: str | None,
+        require_capability: bool,
+    ) -> tuple[Checkpoint, dict[str, Any]]:
+        cached = self._take_preflight_artifact(checkpoint_id)
+        if cached is not None:
+            return cached[0], cached[1]
+        checkpoint, snapshot, _typed = self._read_checkpoint_artifact_for_read(
+            checkpoint_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
+        return checkpoint, snapshot
+
+    def _take_preflight_artifact(
+        self,
+        checkpoint_id: str,
+    ) -> tuple[Checkpoint, dict[str, Any], ProcessSnapshot] | None:
         cached = self._preflight_artifact.get()
         self._preflight_artifact.set(None)
-        if cached is not None and cached[0] == checkpoint_id:
-            return cached[1], cached[2], cached[3]
-        return self._read_checkpoint_artifact(checkpoint_id)
+        if cached is None or cached[0] != checkpoint_id:
+            return None
+        return cached[1], cached[2], cached[3]
+
+    def _cache_preflight_artifact(
+        self,
+        checkpoint_id: str,
+        artifact: tuple[Checkpoint, dict[str, Any], ProcessSnapshot],
+    ) -> None:
+        checkpoint, snapshot, typed = artifact
+        self._preflight_artifact.set(
+            (checkpoint_id, checkpoint, snapshot, typed)
+        )
+
+    def _preflight_checkpoint_exact_right(
+        self,
+        actor: str,
+        checkpoint_id: str,
+        right: CapabilityRight,
+        *,
+        require_capability: bool,
+    ) -> None:
+        self._preflight_artifact.set(None)
+        if require_capability:
+            self._require_checkpoint_right(
+                actor,
+                checkpoint_id,
+                right,
+                consume=False,
+            )
+        self._cache_preflight_artifact(
+            checkpoint_id,
+            self._read_checkpoint_artifact(checkpoint_id),
+        )
+
+    def _read_checkpoint_artifact_for_read(
+        self,
+        checkpoint_id: str,
+        *,
+        actor: str | None,
+        require_capability: bool,
+    ) -> tuple[Checkpoint, dict[str, Any], ProcessSnapshot]:
+        if (
+            not require_capability
+            or actor is None
+            or self.capabilities is None
+        ):
+            return self._read_checkpoint_artifact(checkpoint_id)
+
+        checkpoint_decision = self.capabilities.authorize(
+            actor,
+            self.checkpoint_resource(checkpoint_id),
+            CapabilityRight.READ,
+        )
+        if checkpoint_decision.allowed:
+            return self._read_checkpoint_artifact(checkpoint_id)
+
+        # Process-read authority is a supported fallback, but resolving its
+        # resource requires the checkpoint owner. Read only the bounded durable
+        # row first and collapse a missing row into the same denial as an
+        # existing unauthorized row. Snapshot canonicalization happens only
+        # after one of the two read scopes is established.
+        found = self._snapshot_rows.get_checkpoint_snapshot(checkpoint_id)
+        if found is None:
+            raise CapabilityDenied(
+                f"{actor} lacks read on requested checkpoint"
+            )
+        checkpoint, stored_snapshot = found
+        process_decision = self.capabilities.authorize(
+            actor,
+            self.process_resource(checkpoint.pid),
+            CapabilityRight.READ,
+        )
+        if not process_decision.allowed:
+            raise CapabilityDenied(
+                f"{actor} lacks read on requested checkpoint"
+            )
+        return self._decode_checkpoint_artifact(checkpoint, stored_snapshot)
 
     def _read_checkpoint_artifact(
         self,
@@ -2822,6 +3159,13 @@ class CheckpointManager:
         if found is None:
             raise NotFound(f"checkpoint not found: {checkpoint_id}")
         checkpoint, stored_snapshot = found
+        return self._decode_checkpoint_artifact(checkpoint, stored_snapshot)
+
+    def _decode_checkpoint_artifact(
+        self,
+        checkpoint: Checkpoint,
+        stored_snapshot: Any,
+    ) -> tuple[Checkpoint, dict[str, Any], ProcessSnapshot]:
         typed, validated = self.snapshots.canonicalize(
             stored_snapshot.to_mapping()
         )
@@ -2839,10 +3183,22 @@ class CheckpointManager:
             "metadata": checkpoint.metadata or {},
         }
 
-    def _require_process_right(self, actor: str, pid: str, right: CapabilityRight) -> None:
+    def _require_process_right(
+        self,
+        actor: str,
+        pid: str,
+        right: CapabilityRight,
+        *,
+        consume: bool = True,
+    ) -> CapabilityDecision | None:
         if self.capabilities is None:
-            return
-        self.capabilities.require(actor, self.process_resource(pid), right)
+            return None
+        return self.capabilities.require(
+            actor,
+            self.process_resource(pid),
+            right,
+            consume=consume,
+        )
 
     def _require_checkpoint_right(
         self,
@@ -3112,13 +3468,27 @@ class CheckpointManager:
     def _snapshot_image_ids_to_restore(self, snapshot: dict[str, Any], *, overwrite_existing: bool) -> list[str]:
         image_ids: list[str] = []
         for image_id, data in snapshot.get("images", {}).items():
-            if image_id in self._images:
+            existing = self._registered_image(image_id)
+            quarantined = existing is not None and image_id not in self._images
+            if existing is not None:
                 if not overwrite_existing:
+                    if quarantined:
+                        raise ValidationError(
+                            "checkpoint image conflicts with a quarantined durable "
+                            f"registry row: {image_id}"
+                        )
                     continue
-                if to_jsonable(self._images[image_id]) == data:
+                if not quarantined and to_jsonable(existing) == data:
                     continue
             image_ids.append(str(image_id))
         return image_ids
+
+    def _registered_image(self, image_id: str) -> AgentImage | None:
+        registry = self._image_registry
+        lookup = getattr(registry, "registered_image", None)
+        if callable(lookup):
+            return lookup(image_id)
+        return self._images.get(image_id)
 
     def _validate_snapshot_restore_assets(self, snapshot: dict[str, Any]) -> None:
         registry = self._image_registry
@@ -3308,7 +3678,7 @@ class CheckpointManager:
             resource = registry.resource_for(image_id) if registry is not None else f"image:{image_id}"
             required_right = (
                 CapabilityRight.ADMIN
-                if overwrite_existing and image_id in self._images
+                if overwrite_existing and self._registered_image(image_id) is not None
                 else CapabilityRight.WRITE
             )
             decisions.append(
@@ -3329,52 +3699,89 @@ class CheckpointManager:
         # cache and durable rows as one batch so any failed write restores the
         # complete pre-reconciliation cache, not a partially updated prefix.
         with atomic_scope:
-            restored_artifact_ids: set[str] | None = set() if not overwrite_existing else None
-            for image_id, data in images.items():
-                if not overwrite_existing and image_id in self._images:
-                    continue
-                image = AgentImage(**data)
-                self._images[image_id] = image
-                self._extensions.upsert_image(
-                    image,
-                    registered_by="checkpoint.restore",
-                    source=f"checkpoint:{snapshot.get('checkpoint_id')}",
-                    created_at=utc_now(),
-                )
-                if restored_artifact_ids is not None:
-                    artifact_id = str(image.boot.get("artifact_id") or "")
-                    if artifact_id:
-                        restored_artifact_ids.add(artifact_id)
-            for artifact_id, data in snapshot.get("image_artifacts", {}).items():
-                if restored_artifact_ids is not None and artifact_id not in restored_artifact_ids:
-                    continue
-                existing = self._extensions.get_image_artifact(artifact_id)
-                if existing is not None:
-                    artifact, metadata = existing
-                    expected_artifact = data.get("artifact", {})
-                    expected_metadata = data.get("metadata", {})
-                    if (
-                        artifact != expected_artifact
-                        or str(metadata.get("kind") or "")
-                        != str(data.get("kind", "checkpoint_commit"))
-                        or str(metadata.get("sha256") or "")
-                        != str(data.get("sha256", ""))
-                        or metadata.get("metadata", {}) != expected_metadata
-                    ):
+            restored_artifact_ids = self._restore_image_rows(
+                images,
+                checkpoint_id=snapshot.get("checkpoint_id"),
+                overwrite_existing=overwrite_existing,
+            )
+            self._restore_image_artifact_rows(
+                snapshot.get("image_artifacts", {}),
+                restored_artifact_ids=restored_artifact_ids,
+            )
+
+    def _restore_image_rows(
+        self,
+        images: Mapping[str, Any],
+        *,
+        checkpoint_id: Any,
+        overwrite_existing: bool,
+    ) -> set[str] | None:
+        restored_artifact_ids: set[str] | None = (
+            set() if not overwrite_existing else None
+        )
+        for image_id, data in images.items():
+            existing = self._registered_image(image_id)
+            quarantined = existing is not None and image_id not in self._images
+            if existing is not None:
+                if not overwrite_existing:
+                    if quarantined:
                         raise ValidationError(
-                            "checkpoint image artifact conflicts with durable row: "
-                            f"{artifact_id}"
+                            "checkpoint image conflicts with a quarantined durable "
+                            f"registry row: {image_id}"
                         )
                     continue
-                self._extensions.insert_image_artifact(
-                    artifact_id=artifact_id,
-                    kind=str(data.get("kind", "checkpoint_commit")),
-                    artifact=data.get("artifact", {}),
-                    sha256=str(data.get("sha256", "")),
-                    created_by="checkpoint.restore",
-                    created_at=utc_now(),
-                    metadata=data.get("metadata", {}),
-                )
+                if not quarantined and to_jsonable(existing) == data:
+                    continue
+            image = AgentImage(**data)
+            self._images[image_id] = image
+            self._extensions.upsert_image(
+                image,
+                registered_by="checkpoint.restore",
+                source=f"checkpoint:{checkpoint_id}",
+                created_at=utc_now(),
+            )
+            if restored_artifact_ids is not None:
+                artifact_id = str(image.boot.get("artifact_id") or "")
+                if artifact_id:
+                    restored_artifact_ids.add(artifact_id)
+        return restored_artifact_ids
+
+    def _restore_image_artifact_rows(
+        self,
+        image_artifacts: Mapping[str, Any],
+        *,
+        restored_artifact_ids: set[str] | None,
+    ) -> None:
+        for artifact_id, data in image_artifacts.items():
+            if restored_artifact_ids is not None and artifact_id not in restored_artifact_ids:
+                continue
+            existing = self._extensions.get_image_artifact(artifact_id)
+            if existing is not None:
+                artifact, metadata = existing
+                expected_artifact = data.get("artifact", {})
+                expected_metadata = data.get("metadata", {})
+                if (
+                    artifact != expected_artifact
+                    or str(metadata.get("kind") or "")
+                    != str(data.get("kind", "checkpoint_commit"))
+                    or str(metadata.get("sha256") or "")
+                    != str(data.get("sha256", ""))
+                    or metadata.get("metadata", {}) != expected_metadata
+                ):
+                    raise ValidationError(
+                        "checkpoint image artifact conflicts with durable row: "
+                        f"{artifact_id}"
+                    )
+                continue
+            self._extensions.insert_image_artifact(
+                artifact_id=artifact_id,
+                kind=str(data.get("kind", "checkpoint_commit")),
+                artifact=data.get("artifact", {}),
+                sha256=str(data.get("sha256", "")),
+                created_by="checkpoint.restore",
+                created_at=utc_now(),
+                metadata=data.get("metadata", {}),
+            )
 
     def _object_payload_snapshot(self, object_oids: list[str]) -> dict[str, Any]:
         payloads: dict[str, Any] = {}
@@ -4032,7 +4439,7 @@ class CheckpointManager:
         item = SnapshotRemapper.remap_row(row, identities)
         object_map = identities.objects
         namespace_map = identities.namespaces
-        resource = str(item["resource"])
+        resource = item["resource"]
         if resource.startswith("object:"):
             oid = resource.split(":", 1)[1]
             item["resource"] = f"object:{object_map.get(oid, oid)}"

@@ -135,16 +135,25 @@ Git authority is independent of tool visibility and legacy Shell grants:
 | value of `git.repository_resource` (default `git:workspace`) | `read`, `diff`, `write`, `delete`, and `admin` for the fixed repository |
 | `git_remote:workspace:<remote>` | `read` for fetch/pull input, `write` for push, and `delete`/`admin` for deletion or force-with-lease |
 | `git_pr:workspace:<pr-id>` | `read`, `write`, `approve`, and `delete` for one simulated PR; wildcard read is used for listing |
+| `object_namespace:<process-namespace>` | `write` when `git_create_patch` stores a new immutable patch Object in the caller's process namespace |
+| `object:<patch-oid>` | `read` when `git_apply_patch` resolves and verifies an existing patch Object |
 
 Remote capability constraints may bind `git_remote`, `git_url_fingerprint`,
 `git_allowed_refs`, `git_expected_state_token`, and `git_old_oid`. These are
-matched against Host-derived operation context, not model assertions.
+matched against primitive-built operation context, not raw model assertions.
+The primitive validates and canonicalizes the remote, exact ref, expected state
+token, and old OID inputs before placing them in that context;
+`git_url_fingerprint` comes from the Host-observed registered remote
+configuration.
 
-An operation that may read or rewrite checkout files also requires the
-corresponding `filesystem:workspace:<path>` rights. Exact path operations check
-each path. When a safe preflight cannot enumerate the affected set, the
-operation requires read/write/delete authority for the selected worktree
-subtree. Git metadata is never authorized through filesystem capabilities.
+Read-only Git inspection does not require filesystem capability, even when the
+provider observes checkout bytes; repository Git authority, Task Authority, and
+data-flow policy govern those reads. Filesystem capability is an additional
+boundary for Git mutations that read, write, or delete checkout files. Exact
+path mutations check each path. When a safe preflight cannot enumerate the
+affected set, the mutation requires the applicable read/write/delete authority
+for the selected worktree subtree. Git metadata is never authorized through
+filesystem capabilities.
 
 Some writes contain a separately protected Git read phase and therefore need
 repository `read` in addition to their mutation right: commit preflight, clean
@@ -158,7 +167,7 @@ The following actions require `delete` and `admin` authority plus a mandatory
 one-use Human approval bound to the exact parameters, old state token, and
 relevant old OID:
 
-- reset, clean, amend, every restore, and ref-rewriting integration;
+- reset, clean, amend, every restore, rebase, and every integration abort;
 - branch/tag/stash/worktree/ref deletion, branch rename, and forced branch create;
 - stash pop, stash including untracked files, forced switch/tag, and fetch
   prune;
@@ -173,11 +182,13 @@ authority so file/tree type changes remain authorized. A staged-only restore
 (`worktree=false`) requires no filesystem authority. A source-specific,
 worktree-only restore is unsupported; select `staged` as well.
 
-Ordinary commit, non-destructive merge, fast-forward pull, and non-forced push
-follow the selected capability effect (`allow`, `ask`, or `deny`). A mandatory
-approval cannot be satisfied by a broad unbound allow. Capability decisions,
-finite-use reservations, approval binding, the pending effect, event, audit,
-and operation evidence use the protected-operation lifecycle.
+Ordinary commit, `git_integrate` merge/cherry-pick/revert, non-rebase pull,
+and non-forced push follow the selected capability effect (`allow`, `ask`, or
+`deny`). Rebase and every `git_integrate` abort instead use the mandatory
+destructive controls above. A mandatory approval cannot be satisfied by a broad
+unbound allow. Capability decisions, finite-use reservations, approval binding,
+the pending effect, event, audit, and operation evidence use the
+protected-operation lifecycle.
 
 Git provider effects must also pass the process Task Authority Manifest. The
 relevant effect classes are `git.read`, `git.mutate`, `git.fetch`, `git.push`,
@@ -192,17 +203,19 @@ the runtime data-flow boundary:
 | Effect class | Data-flow direction | Additional behavior |
 | --- | --- | --- |
 | `git.read` | ingress | observed repository/file/ref labels are attached to returned data and carrier state |
-| `git.mutate` | bidirectional | source/carrier labels must clear the repository and affected-file Sinks; returned observations carry resulting labels |
-| `git.fetch` | bidirectional | remote ingress and local repository mutation are checked together |
-| `git.push` | egress | source/carrier labels must clear the exact configured remote/ref Sink |
-| `git.pull_request` | bidirectional | PR and repository Sinks are both checked for create/merge operations |
+| `git.mutate` | bidirectional | source/carrier labels must clear the configured repository Sink; affected paths/refs are bound in canonical payload and state evidence, not created as independent Sinks |
+| `git.fetch` | bidirectional | remote input contributes ingress while the local mutation clears the configured repository Sink |
+| `git.push` | egress | source/carrier labels must clear the exact configured `git_remote:workspace:<remote>` Sink; the destination ref is canonically bound to that operation |
+| `git.pull_request` | bidirectional | the exact PR resource is the primary Sink; create and merge additionally clear the configured repository Sink |
 
-The primitive aggregates source and carrier labels, binds stable repository,
-worktree, path/ref, PR, and remote Sink identities, and revalidates source and
+The primitive aggregates source and carrier labels, uses stable repository, PR,
+and remote resource identities as Sinks, and canonically binds worktree,
+path/ref, and state details to the operation payload. Those payload bindings do
+not create additional per-path or per-ref Sinks. It revalidates source and
 target state immediately before dispatch. Host Sink trust or an exact
-conditional release is therefore still required when labels exceed a Sink's
-clearance; a matching Git capability and manifest effect ceiling alone do not
-authorize the flow.
+conditional release is therefore still required when labels exceed an actual
+Sink's clearance; a matching Git capability and manifest effect ceiling alone
+do not authorize the flow.
 
 ## External-effect classification
 
@@ -341,13 +354,18 @@ every Runtime-mediated mutation. It is bound after final policy revalidation
 and before the first Host effect, so renamed or deleted content, ref-only
 outputs, long histories, and post-effect settlement failures cannot lose their
 lineage. If the complete patch exceeds `git.patch_max_bytes` or the Object hard
-limit, the call fails without creating an Object.
+limit, the call fails without creating an Object. Creating it requires Git
+`diff` plus `write` on the caller's process Object namespace; successful
+creation grants the caller a handle for the new immutable Object under the
+ordinary Object Memory contract.
 
 `git_apply_patch` accepts only an existing patch Object created by this
 primitive. It validates the artifact hash and schema, checks the expected state,
 runs `git apply --check` as a preview, determines affected/deleted paths, then
 applies through the typed mutation boundary. The source Object's labels flow to
-the result and affected file bindings.
+the result and affected file bindings. Resolving the artifact requires
+`ObjectRight.READ` on that exact `object:<patch-oid>` independently of the Git
+and filesystem rights required for application.
 
 `git_clean` builds a bounded, hashed reconciliation manifest from `git
 ls-files` observations and also hashes Git's dry-run preview before approval,

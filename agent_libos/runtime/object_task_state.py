@@ -14,7 +14,7 @@ from agent_libos.models import (
     ProcessExecutionToken,
     ProcessStatus,
 )
-from agent_libos.models.exceptions import NotFound
+from agent_libos.models.exceptions import NotFound, ProcessTerminalCleanupRequired
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.process_execution import (
     trusted_process_control_mutation,
@@ -118,13 +118,15 @@ class ObjectTaskStateService:
             task = self._require(task_id)
             if task.status in OBJECT_TASK_TERMINAL_STATUSES:
                 return task
-            updated = replace(
-                task,
-                status=ObjectTaskStatus.SUCCEEDED,
-                result_oid=result_oid,
-                error=None,
-                updated_at=now,
-                completed_at=now,
+            updated = self._notifications.begin_phase(
+                replace(
+                    task,
+                    status=ObjectTaskStatus.SUCCEEDED,
+                    result_oid=result_oid,
+                    error=None,
+                    updated_at=now,
+                    completed_at=now,
+                )
             )
             self._records.update_object_task(updated)
             self._events.emit(
@@ -158,12 +160,14 @@ class ObjectTaskStateService:
             task = self._require(task_id)
             if task.status in OBJECT_TASK_TERMINAL_STATUSES:
                 return task
-            updated = replace(
-                task,
-                status=ObjectTaskStatus.FAILED,
-                error=error,
-                updated_at=now,
-                completed_at=now,
+            updated = self._notifications.begin_phase(
+                replace(
+                    task,
+                    status=ObjectTaskStatus.FAILED,
+                    error=error,
+                    updated_at=now,
+                    completed_at=now,
+                )
             )
             self._records.update_object_task(updated)
             self._events.emit(
@@ -202,12 +206,14 @@ class ObjectTaskStateService:
             task = self._require(task_id)
             if task.status in OBJECT_TASK_TERMINAL_STATUSES:
                 return task
-            updated = replace(
-                task,
-                status=status,
-                wait=wait,
-                error=message,
-                updated_at=now,
+            updated = self._notifications.begin_phase(
+                replace(
+                    task,
+                    status=status,
+                    wait=wait,
+                    error=message,
+                    updated_at=now,
+                )
             )
             self._records.update_object_task(updated)
         self._events.emit(
@@ -242,12 +248,14 @@ class ObjectTaskStateService:
             latest = self._records.get_object_task(task.task_id) or task
             if latest.status in OBJECT_TASK_TERMINAL_STATUSES:
                 return latest
-            updated = replace(
-                latest,
-                status=ObjectTaskStatus.CANCELLED,
-                error=reason,
-                updated_at=now,
-                completed_at=now,
+            updated = self._notifications.begin_phase(
+                replace(
+                    latest,
+                    status=ObjectTaskStatus.CANCELLED,
+                    error=reason,
+                    updated_at=now,
+                    completed_at=now,
+                )
             )
             self._records.update_object_task(updated)
             if updated.runner_pid is not None:
@@ -330,6 +338,22 @@ class ObjectTaskStateService:
                         outcome=KilledProcessOutcome(code="object_task_cancelled"),
                         status_message=reason,
                     )
+                try:
+                    self._process.retry_terminal_cleanup(runner_pid)
+                except ProcessTerminalCleanupRequired:
+                    # Runtime shutdown closes ordinary admission before it
+                    # drains ObjectTasks.  Commit the cancellation and let the
+                    # durable cleanup intent be reclaimed on reopen.
+                    return
+                return
+            if process is not None:
+                cleanup = self._process.terminal_cleanup_state(runner_pid)
+                if cleanup["state"] != "completed":
+                    # The runner outcome and cleanup diagnostic commit with
+                    # the enclosing ObjectTask cancellation.  Let that primary
+                    # cancellation settle; the durable cleanup row remains
+                    # observable and retryable after lifecycle admission closes.
+                    return
 
     @staticmethod
     def _runner_takeover_scope(process: Any) -> AbstractContextManager[Any]:

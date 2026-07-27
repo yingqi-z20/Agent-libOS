@@ -8,16 +8,28 @@ export function reconcileSelectedPid(
   if (preserveExisting && current && snapshot.processes.some((process) => process.pid === current)) {
     return current;
   }
+  const pendingHumanPids = new Set(
+    snapshot.human_requests
+      .filter((request) => request.status === "pending")
+      .map((request) => request.pid)
+  );
+  const pendingHumanProcess = snapshot.processes.find(
+    (process) => pendingHumanPids.has(process.pid)
+      && !process.terminal
+      && !["exited", "failed", "killed"].includes(process.status)
+  );
   const activeProcess = snapshot.processes.find(
     (process) => !process.terminal && !["exited", "failed", "killed"].includes(process.status)
   );
-  return activeProcess?.pid ?? snapshot.processes[0]?.pid ?? null;
+  return pendingHumanProcess?.pid ?? activeProcess?.pid ?? snapshot.processes[0]?.pid ?? null;
 }
 
 export function upsertRuntimeProcess(
   snapshot: RuntimeSnapshot,
   process: RuntimeProcess
 ): RuntimeSnapshot {
+  const existing = snapshot.processes.find((item) => item.pid === process.pid);
+  if (existing && existing.state_generation > process.state_generation) return snapshot;
   return {
     ...snapshot,
     processes: [process, ...snapshot.processes.filter((item) => item.pid !== process.pid)]

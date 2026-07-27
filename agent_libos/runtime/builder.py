@@ -93,6 +93,11 @@ from agent_libos.substrate import (
 )
 from agent_libos.tools.broker import ToolBroker
 from agent_libos.utils.ids import new_id
+from agent_libos.utils.public_errors import (
+    internal_exception_observation,
+    public_error_envelope,
+    public_error_envelope_for_type,
+)
 
 if TYPE_CHECKING:
     from agent_libos.llm.client import LLMClient
@@ -239,7 +244,7 @@ class _CompletedCleanupCancellation(BaseException):
     def __init__(
         self,
         cancellations: list[BaseException],
-        cleanup_errors: list[dict[str, str]],
+        cleanup_errors: list[dict[str, Any]],
         cleanup_exception: BaseException | None = None,
     ) -> None:
         super().__init__("caller cancelled while failed assembly cleanup drained")
@@ -279,7 +284,7 @@ class RuntimeAssemblyCleanupRequired(RuntimeError):
         *,
         partial_runtime: Runtime | None,
         store: RuntimeStore,
-        cleanup_errors: list[dict[str, str]],
+        cleanup_errors: list[dict[str, Any]],
         cleanup_completed: bool = False,
         cleanup_kind: RuntimeAssemblyCleanupKind = (
             RuntimeAssemblyCleanupKind.FAILED_ASSEMBLY
@@ -303,7 +308,7 @@ class RuntimeAssemblyCleanupRequired(RuntimeError):
     @property
     def cleanup_errors(self) -> tuple[dict[str, str], ...]:
         with self._lock:
-            return tuple(dict(item) for item in self._cleanup_errors)
+            return tuple(self._public_cleanup_error(item) for item in self._cleanup_errors)
 
     @property
     def cleanup_completed(self) -> bool:
@@ -625,7 +630,7 @@ class RuntimeAssemblyCleanupRequired(RuntimeError):
             return None
         return RuntimeError(
             "runtime assembly completed after cancellation but normal shutdown "
-            f"remains incomplete: {shutdown_result!r}"
+            "remains incomplete"
         )
 
     def _claim_owned_store(
@@ -676,7 +681,7 @@ class RuntimeAssemblyCleanupRequired(RuntimeError):
             if self._cleanup_completed:
                 self._released = True
 
-    def _replace_cleanup_errors(self, errors: list[dict[str, str]]) -> None:
+    def _replace_cleanup_errors(self, errors: list[dict[str, Any]]) -> None:
         with self._lock:
             self._cleanup_errors = [dict(item) for item in errors]
 
@@ -898,11 +903,43 @@ class RuntimeAssemblyCleanupRequired(RuntimeError):
         return None
 
     @staticmethod
-    def _error_record(component: str, error: BaseException) -> dict[str, str]:
+    def _error_record(component: str, error: BaseException) -> dict[str, Any]:
+        envelope = public_error_envelope(
+            error,
+            code="runtime_cleanup_failed",
+        )
         return {
             "component": component,
-            "error_type": type(error).__name__,
-            "error": str(error),
+            **envelope,
+            "internal_observation": internal_exception_observation(
+                error,
+                correlation_id=envelope["correlation_id"],
+            ),
+        }
+
+    @staticmethod
+    def _deferred_error_record(component: str) -> dict[str, str]:
+        return {
+            "component": component,
+            **public_error_envelope_for_type(
+                "ComponentStopDeferred",
+                code="runtime_cleanup_deferred",
+            ),
+        }
+
+    @staticmethod
+    def _public_cleanup_error(value: dict[str, Any]) -> dict[str, str]:
+        allowed = {
+            "component",
+            "code",
+            "error_type",
+            "correlation_id",
+            "message",
+        }
+        return {
+            key: item
+            for key, item in value.items()
+            if key in allowed and isinstance(item, str)
         }
 
 
@@ -1013,7 +1050,40 @@ class RuntimeBuilder(Generic[RuntimeT]):
         llm_client: LLMClient | None,
         owned_store_close_reservation: Any | None,
     ) -> RuntimeT:
-        host = self._allocate_host()
+        assembly_reservation = self._new_runtime_assembly_reservation()
+        # A builder-owned Store has not been published and cannot have a
+        # competing Runtime. Allocate first so an allocation-hook failure is
+        # still the primary error and ordinary owned-store cleanup can run.
+        # Caller-owned Stores must instead be fenced before allocation: a
+        # rejected second Runtime must not construct a dependency graph.
+        if owned_store_close_reservation is not None:
+            host = self._allocate_host()
+            readiness_error = self._runtime_assembly_reservation_error(
+                store,
+                assembly_reservation,
+            )
+            if readiness_error is not None:
+                raise readiness_error
+        else:
+            readiness_error = self._runtime_assembly_reservation_error(
+                store,
+                assembly_reservation,
+            )
+            if readiness_error is not None:
+                raise readiness_error
+            try:
+                host = self._allocate_host()
+            except BaseException as allocation_error:
+                release_error = _release_runtime_assembly_reservation_error(
+                    store,
+                    assembly_reservation,
+                )
+                if release_error is not None:
+                    raise BaseExceptionGroup(
+                        "runtime allocation and assembly reservation release failed",
+                        [allocation_error, release_error],
+                    ) from allocation_error
+                raise
         self.assemble_existing(
             host,
             store,
@@ -1024,6 +1094,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             trusted_modules=self.trusted_modules,
             trusted_module_sha256=self.trusted_module_sha256,
             owned_store_close_reservation=owned_store_close_reservation,
+            _assembly_reservation=assembly_reservation,
         )
         return host
 
@@ -1276,7 +1347,10 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 raise RuntimeError(
                     "runtime store does not support atomic assembly claims"
                 )
-            with claim(assembly_reservation):
+            with claim(
+                assembly_reservation,
+                require_unbound_runtime=True,
+            ):
                 self._assemble_host(
                     host,
                     store,
@@ -1362,20 +1436,36 @@ class RuntimeBuilder(Generic[RuntimeT]):
         trusted_modules: list[str] | tuple[str, ...] | None,
         trusted_module_sha256: list[str] | tuple[str, ...] | None,
         owned_store_close_reservation: Any | None = None,
+        _assembly_reservation: StoreAssemblyReservation | None = None,
     ) -> None:
         cls._require_sync_assembly_context()
-        try:
-            cls._assemble_host(
-                host,
+        # Match the async entry point: reserve the Store before allocating or
+        # mutating any dependency graph.  A rejected second Runtime must not
+        # rebind Store configuration or assume cleanup ownership of a
+        # substrate still used by the live Runtime.
+        assembly_reservation = (
+            _assembly_reservation or cls._new_runtime_assembly_reservation()
+        )
+        if _assembly_reservation is None:
+            readiness_error = cls._runtime_assembly_reservation_error(
                 store,
-                substrate=substrate,
-                config=config,
-                llm_client=llm_client,
-                startup_module_manifests=startup_module_manifests,
-                trusted_modules=trusted_modules,
-                trusted_module_sha256=trusted_module_sha256,
+                assembly_reservation,
             )
-        except BaseException as original:
+            if readiness_error is not None:
+                raise readiness_error
+        captured = cls._capture_existing_runtime_assembly(
+            host,
+            store,
+            assembly_reservation,
+            substrate=substrate,
+            config=config,
+            llm_client=llm_client,
+            startup_module_manifests=startup_module_manifests,
+            trusted_modules=trusted_modules,
+            trusted_module_sha256=trusted_module_sha256,
+        )
+        original = captured.error
+        if original is not None:
             cls._attach_partial_runtime(original, host)
             reservation_failures = cls._owned_store_close_reservation_failures(
                 host,
@@ -1422,7 +1512,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 cleanup_completed=bool(reservation_failures) and not cleanup_errors,
                 secondary_failures=reservation_failures,
             )
-            raise
+            raise original
 
     @classmethod
     def _capture_existing_runtime_assembly(
@@ -1445,7 +1535,10 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 raise RuntimeError(
                     "runtime store does not support atomic assembly claims"
                 )
-            with claim(assembly_reservation):
+            with claim(
+                assembly_reservation,
+                require_unbound_runtime=True,
+            ):
                 cls._assemble_host(
                     host,
                     store,
@@ -1741,7 +1834,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
     async def _drain_async_failed_assembly(
         cls,
         host: Runtime,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         """Finish cleanup even when the async open caller is cancelled."""
 
         cleanup_task = asyncio.create_task(cls._acleanup_failed_assembly(host))
@@ -2320,7 +2413,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
     @staticmethod
     def _raise_assembly_cleanup_errors(
         original: BaseException,
-        cleanup_errors: list[dict[str, str]],
+        cleanup_errors: list[dict[str, Any]],
         *,
         host: Runtime,
         store: RuntimeStore,
@@ -2411,7 +2504,11 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 lambda: host.lifecycle.current_mutation_admission_is_stale()
             ),
         )
-        host.audit = AuditManager(host.uow.evidence, host.operations)
+        host.audit = AuditManager(
+            host.uow.evidence,
+            host.operations,
+            query_limit=host.config.gui.snapshot_audit_limit,
+        )
         host.events = EventBus(host.uow.evidence, host.operations)
         host.lifecycle = RuntimeLifecycle(
             store=host.store,
@@ -2570,6 +2667,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             blocking_work=host.blocking_work,
             config=host.config,
             transitions=host.process_transitions,
+            process_terminal_cleanup=host.process.retry_terminal_cleanup,
         )
         host.data_flow.bind_human(host.human)
         with host.lifecycle.recovery_lease():
@@ -2704,8 +2802,13 @@ class RuntimeBuilder(Generic[RuntimeT]):
             require_recovery_lease=host.lifecycle.require_recovery_lease,
             autostart=False,
         )
+        host.process.bind_host_managed_runner_checker(
+            host.object_tasks.is_runner_pid
+        )
         host.memory.bind_object_pin_checker(
-            lambda owner_oid: host.object_tasks.has_active_for_owner(owner_oid)
+            lambda owner_oid: host.object_tasks.has_published_active_for_owner(
+                owner_oid
+            )
         )
         host.memory.bind_object_change_notifier(
             lambda owner_oid, change, actor_pid: host.object_tasks.notify_owner_changed(
@@ -2743,6 +2846,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             blocking_work=host.blocking_work,
             owner_id=host.instance_id,
             transitions=host.process_transitions,
+            terminal_cleanup=host.process.retry_terminal_cleanup,
         )
         cls._configure_checkpoint(host)
         host.skills = SkillManager(
@@ -2821,72 +2925,73 @@ class RuntimeBuilder(Generic[RuntimeT]):
     ) -> tuple[BaseException | None, bool]:
         """Commit one ACK and classify an ambiguous failure without replay."""
 
-        try:
-            with host.lifecycle.open_on_next_commit():
-                # The acknowledgement CAS must join this exact outer
-                # transaction. A false CAS raises before its sole commit can
-                # consume the lifecycle OPEN scope.
-                with host.uow.transaction():
-                    host.checkpoint._ack_startup_payload_delivery(attempt)
-        except BaseException as acknowledgement_error:
+        with host.store.uncertain_commit_confirmation():
             try:
-                attempt_state = (
-                    host.checkpoint._get_startup_payload_delivery_attempt_state(
-                        attempt
+                with host.lifecycle.open_on_next_commit():
+                    # The acknowledgement CAS must join this exact outer
+                    # transaction. A false CAS raises before its sole commit can
+                    # consume the lifecycle OPEN scope.
+                    with host.uow.transaction():
+                        host.checkpoint._ack_startup_payload_delivery(attempt)
+            except BaseException as acknowledgement_error:
+                try:
+                    attempt_state = (
+                        host.checkpoint._get_startup_payload_delivery_attempt_state(
+                            attempt
+                        )
                     )
-                )
-            except BaseException as confirmation_error:
-                return (
-                    BaseExceptionGroup(
-                        "checkpoint payload acknowledgement failed and its "
-                        "exact durable state could not be confirmed",
-                        [acknowledgement_error, confirmation_error],
-                    ),
-                    False,
-                )
-
-            if attempt_state is CheckpointPayloadDeliveryAttemptState.PREPARING:
-                # The acknowledgement did not commit. The compensation path
-                # may safely reopen this exact token.
-                return acknowledgement_error, True
-            if attempt_state is not CheckpointPayloadDeliveryAttemptState.ACKED:
-                state_error = RuntimeError(
-                    "checkpoint payload acknowledgement exact-state "
-                    "confirmation was not compensable: "
-                    f"{attempt_state!r}"
-                )
-                return (
-                    BaseExceptionGroup(
-                        "checkpoint payload acknowledgement failed closed after "
-                        "an inconclusive durable-state confirmation",
-                        [acknowledgement_error, state_error],
-                    ),
-                    False,
-                )
-
-            # The commit completed even though the backend raised afterwards.
-            # Preserve the hydrated payload cache and repair only the in-memory
-            # lifecycle projection.
-            try:
-                if host.lifecycle.state == "starting":
-                    with host.lifecycle.in_memory_open_scope():
-                        pass
-                elif host.lifecycle.state != "open":
-                    raise RuntimeError(
-                        "durably acknowledged checkpoint payload delivery has "
-                        "an invalid runtime lifecycle state: "
-                        f"{host.lifecycle.state}"
+                except BaseException as confirmation_error:
+                    return (
+                        BaseExceptionGroup(
+                            "checkpoint payload acknowledgement failed and its "
+                            "exact durable state could not be confirmed",
+                            [acknowledgement_error, confirmation_error],
+                        ),
+                        False,
                     )
-            except BaseException as lifecycle_error:
-                return (
-                    BaseExceptionGroup(
-                        "checkpoint payload acknowledgement committed but "
-                        "lifecycle OPEN could not be confirmed",
-                        [acknowledgement_error, lifecycle_error],
-                    ),
-                    False,
-                )
-            return None, False
+
+                if attempt_state is CheckpointPayloadDeliveryAttemptState.PREPARING:
+                    # The acknowledgement did not commit. The compensation path
+                    # may safely reopen this exact token.
+                    return acknowledgement_error, True
+                if attempt_state is not CheckpointPayloadDeliveryAttemptState.ACKED:
+                    state_error = RuntimeError(
+                        "checkpoint payload acknowledgement exact-state "
+                        "confirmation was not compensable: "
+                        f"{attempt_state!r}"
+                    )
+                    return (
+                        BaseExceptionGroup(
+                            "checkpoint payload acknowledgement failed closed after "
+                            "an inconclusive durable-state confirmation",
+                            [acknowledgement_error, state_error],
+                        ),
+                        False,
+                    )
+
+                # The commit completed even though the backend raised afterwards.
+                # Exact readback makes the retained data plane safe to reuse.
+                host.store.accept_uncertain_commit_confirmation()
+                try:
+                    if host.lifecycle.state == "starting":
+                        with host.lifecycle.in_memory_open_scope():
+                            pass
+                    elif host.lifecycle.state != "open":
+                        raise RuntimeError(
+                            "durably acknowledged checkpoint payload delivery has "
+                            "an invalid runtime lifecycle state: "
+                            f"{host.lifecycle.state}"
+                        )
+                except BaseException as lifecycle_error:
+                    return (
+                        BaseExceptionGroup(
+                            "checkpoint payload acknowledgement committed but "
+                            "lifecycle OPEN could not be confirmed",
+                            [acknowledgement_error, lifecycle_error],
+                        ),
+                        False,
+                    )
+                return None, False
         return None, False
 
     @classmethod
@@ -3041,6 +3146,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 ),
             )
             host.recovered_object_tasks = host.object_tasks.recover()
+            host.recovered_terminal_cleanups = host.process.recover_terminal_cleanups()
 
     @staticmethod
     def _record_stale_execution_recovery(host: Runtime, pid: str) -> None:
@@ -3230,14 +3336,14 @@ class RuntimeBuilder(Generic[RuntimeT]):
         )
 
     @staticmethod
-    def _cleanup_failed_assembly(host: Runtime) -> list[dict[str, str]]:
+    def _cleanup_failed_assembly(host: Runtime) -> list[dict[str, Any]]:
         """Synchronously drain a partial graph after failed assembly."""
 
         lifecycle = getattr(host, "lifecycle", None)
         if lifecycle is not None:
             RuntimeBuilder._bind_partial_cleanup_components(host, lifecycle)
             return lifecycle.cleanup_failed_assembly()
-        errors: list[dict[str, str]] = []
+        errors: list[dict[str, Any]] = []
         caught: list[BaseException] = []
         for name in ("blocking_work", "substrate"):
             try:
@@ -3246,11 +3352,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 )
                 if not stopped:
                     errors.append(
-                        {
-                            "component": name,
-                            "error_type": "ComponentStopDeferred",
-                            "error": "returned false",
-                        }
+                        RuntimeAssemblyCleanupRequired._deferred_error_record(name)
                     )
             except BaseException as exc:
                 RuntimeBuilder._append_cleanup_error(errors, name, exc)
@@ -3259,14 +3361,14 @@ class RuntimeBuilder(Generic[RuntimeT]):
         return errors
 
     @staticmethod
-    async def _acleanup_failed_assembly(host: Runtime) -> list[dict[str, str]]:
+    async def _acleanup_failed_assembly(host: Runtime) -> list[dict[str, Any]]:
         """Drain a partial graph on the async assembly caller's loop."""
 
         lifecycle = getattr(host, "lifecycle", None)
         if lifecycle is not None:
             RuntimeBuilder._bind_partial_cleanup_components(host, lifecycle)
             return await lifecycle.acleanup_failed_assembly()
-        errors: list[dict[str, str]] = []
+        errors: list[dict[str, Any]] = []
         caught: list[BaseException] = []
         for name in ("blocking_work", "substrate"):
             try:
@@ -3275,11 +3377,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 )
                 if not stopped:
                     errors.append(
-                        {
-                            "component": name,
-                            "error_type": "ComponentStopDeferred",
-                            "error": "returned false",
-                        }
+                        RuntimeAssemblyCleanupRequired._deferred_error_record(name)
                     )
             except BaseException as exc:
                 RuntimeBuilder._append_cleanup_error(errors, name, exc)
@@ -3289,17 +3387,11 @@ class RuntimeBuilder(Generic[RuntimeT]):
 
     @staticmethod
     def _append_cleanup_error(
-        errors: list[dict[str, str]],
+        errors: list[dict[str, Any]],
         component: str,
         exc: BaseException,
     ) -> None:
-        errors.append(
-            {
-                "component": component,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
-        )
+        errors.append(RuntimeAssemblyCleanupRequired._error_record(component, exc))
 
     @staticmethod
     def _bind_partial_cleanup_components(

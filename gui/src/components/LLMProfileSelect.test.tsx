@@ -1,8 +1,14 @@
+// @vitest-environment jsdom
+
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { LLMProfileSummary } from "../api/types";
 import { I18nProvider } from "../i18n";
 import { LLMProfileSelect, parseProfileNumber } from "./LLMProfileSelect";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe("LLMProfileSelect", () => {
   it("renders profile choices and warns when the selected env var is missing", () => {
@@ -49,6 +55,63 @@ describe("LLMProfileSelect", () => {
     expect(html).toMatch(/Reuse Responses chain|复用 Responses 调用链/);
     expect(html).toContain("kimi-k2.7-code");
     expect(html).toContain("disabled=\"\"");
+    expect(html).toContain('aria-pressed="true"');
+    expect(html.match(/required=""/g)).toHaveLength(3);
+  });
+
+  it("delegates profile management without mounting an internal dialog when onManage is provided", async () => {
+    const onManage = vi.fn();
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(() => {
+      root.render(
+        <I18nProvider initialLanguage="en">
+          <LLMProfileSelect
+            profiles={[profile("default", "config", false, true)]}
+            value="default"
+            onManage={onManage}
+            onChange={() => undefined}
+            onCreate={async () => true}
+            onUpdate={async () => true}
+            onDelete={async () => true}
+          />
+        </I18nProvider>
+      );
+    });
+
+    const manageButton = container.querySelector<HTMLButtonElement>('button[title="Manage"]');
+    expect(manageButton).not.toBeNull();
+    await act(() => manageButton?.click());
+
+    expect(onManage).toHaveBeenCalledOnce();
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    await act(() => root.unmount());
+  });
+
+  it("opens the built-in manager when no external management callback is provided", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(() => {
+      root.render(
+        <I18nProvider initialLanguage="en">
+          <LLMProfileSelect
+            profiles={[profile("default", "config", false, true)]}
+            value="default"
+            onChange={() => undefined}
+            onCreate={async () => true}
+            onUpdate={async () => true}
+            onDelete={async () => true}
+          />
+        </I18nProvider>
+      );
+    });
+
+    const manageButton = container.querySelector<HTMLButtonElement>('button[title="Manage"]');
+    await act(() => manageButton?.click());
+
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(container.textContent).toContain("Model profiles");
+    await act(() => root.unmount());
   });
 
   it("rejects invalid numeric profile values without truncating them", () => {

@@ -45,6 +45,7 @@ class ProcessMessagePort(Protocol):
         kind: ProcessMessageKind | str,
         phase: str,
         source: str = "runtime",
+        instruction: str | None = None,
     ) -> dict[str, Any] | None:
         ...
 

@@ -1,21 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, AlertTriangle, ChevronDown, CirclePlus, PanelRight, Send, Settings } from "lucide-react";
 import { LibOSClient } from "./api/client";
-import { runtimeSnapshotFromSseData } from "./api/types";
-import type { GuiConnection, HumanRequest, HumanResponseInput, RuntimeProcess, RuntimeSnapshot, StreamConnectionStatus } from "./api/types";
+import { assertSchedulerStatus, runtimeSnapshotFromSseData } from "./api/types";
+import type { GuiConnection, HumanRequest, HumanResponseInput, RuntimeProcess, RuntimeSnapshot, SchedulerStatus, StreamConnectionStatus } from "./api/types";
 import { AppNotices, LoadingScreen } from "./components/AppNotices";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DetailTabs } from "./components/DetailTabs";
 import { ImageSelect } from "./components/ImageSelect";
-import { HumanRequestCard } from "./components/HumanRequestCard";
+import { HumanRequestCard, type HumanResponseOutcome } from "./components/HumanRequestCard";
 import { LLMProfileSelect } from "./components/LLMProfileSelect";
 import { ProcessTree } from "./components/ProcessTree";
 import { Timeline } from "./components/Timeline";
 import { TopBar } from "./components/TopBar";
 import { processStatusLabel, processStatusTone, UserPage } from "./components/UserPage";
-import { previewImageManifest } from "./imagePreview";
+import type { TaskLaunchSettings } from "./components/UserTaskSettingsDialog";
 import { useI18n } from "./i18n";
-import type { OptionalQuanta } from "./quanta";
+import { parseQuantaDraft } from "./quanta";
 import { processFromMutationResult, reconcileSelectedPid, upsertRuntimeProcess } from "./selection";
 import { runOrResumeProcess } from "./runControl";
 import type { LLMProfileInput } from "./api/types";
@@ -29,6 +29,7 @@ import {
   taskLabelsForStorage,
   taskLabelsFromStorage
 } from "./taskPresentation";
+import { SnapshotEpoch } from "./snapshotEpoch";
 
 type PendingConfirm = ConfirmationRequest;
 const TASK_LABELS_STORAGE_KEY = "agent-libos.gui.task-labels";
@@ -41,7 +42,7 @@ export function App() {
   const [client, setClient] = useState<LibOSClient | null>(null);
   const [snapshot, setSnapshot] = useState<RuntimeSnapshot | null>(null);
   const [selectedPid, setSelectedPid] = useState<string | null>(readStoredSelectedPid);
-  const [maxQuanta, setMaxQuanta] = useState<OptionalQuanta>(null);
+  const [maxQuantaInput, setMaxQuantaInput] = useState("");
   const [spawnGoal, setSpawnGoal] = useState("");
   const [spawnImage, setSpawnImage] = useState("coding-agent:v0");
   const [spawnLlmProfile, setSpawnLlmProfile] = useState("");
@@ -59,6 +60,7 @@ export function App() {
   const [execGoalDrafts, setExecGoalDrafts] = useState<Record<string, string>>({});
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
   const [initializing, setInitializing] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [activeAction, setActiveAction] = useState<string | null>(null);
@@ -66,16 +68,56 @@ export function App() {
   const [lastUpdatedAt, setLastUpdatedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [explainLookup, setExplainLookup] = useState<{ pid: string; kind: string; id: string; nonce: number } | null>(null);
+  const [connectionEpoch, setConnectionEpoch] = useState(0);
+  const [streamEpoch, setStreamEpoch] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
+  const requestAbortRef = useRef<AbortController | null>(null);
   const activeClientRef = useRef<LibOSClient | null>(null);
   const initializationInFlightRef = useRef<Promise<void> | null>(null);
   const refreshInFlightRef = useRef<Promise<boolean> | null>(null);
   const actionGuardRef = useRef(false);
   const confirmGuardRef = useRef(false);
+  const snapshotEpochRef = useRef(new SnapshotEpoch());
+  const ambiguousHumanRequestsRef = useRef(new Set<string>());
+  const quantaDraft = useMemo(() => parseQuantaDraft(maxQuantaInput), [maxQuantaInput]);
+  const maxQuanta = quantaDraft.value;
+  const taskLaunchSettings = useMemo<TaskLaunchSettings>(() => ({
+    image: spawnImage,
+    llmProfile: spawnLlmProfile,
+    maxQuantaInput,
+    workingDirectory: spawnWorkingDirectory,
+    workspaceAccess: spawnWorkspaceAccess,
+    allowGitRequests: spawnAllowGitRequests,
+    commandAccess: spawnCommandAccess,
+    contextMaintenance: spawnContextMaintenance
+  }), [
+    maxQuantaInput,
+    spawnAllowGitRequests,
+    spawnCommandAccess,
+    spawnContextMaintenance,
+    spawnImage,
+    spawnLlmProfile,
+    spawnWorkingDirectory,
+    spawnWorkspaceAccess
+  ]);
+
+  function applyTaskLaunchSettings(next: TaskLaunchSettings) {
+    setSpawnImage(next.image);
+    setSpawnLlmProfile(next.llmProfile);
+    setMaxQuantaInput(next.maxQuantaInput);
+    setSpawnWorkingDirectory(next.workingDirectory);
+    setSpawnWorkspaceAccess(next.workspaceAccess);
+    setSpawnAllowGitRequests(next.allowGitRequests);
+    setSpawnCommandAccess(next.commandAccess);
+    setSpawnContextMaintenance(next.contextMaintenance);
+  }
 
   useEffect(() => {
     void initialize();
-    return () => abortRef.current?.abort();
+    return () => {
+      abortRef.current?.abort();
+      requestAbortRef.current?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -96,6 +138,28 @@ export function App() {
   }, [selectedPid]);
 
   useEffect(() => {
+    if (pendingConfirm) setConfirmError(null);
+  }, [pendingConfirm]);
+
+  useEffect(() => {
+    if (initializing) return;
+    const shell = document.querySelector<HTMLElement>(view === "user" ? ".userAppShell" : ".appShell");
+    const header = shell?.querySelector<HTMLElement>(view === "user" ? ".userTopBar" : ".topBar");
+    if (!shell || !header) return;
+    const updateHeaderInset = () => {
+      shell.style.setProperty("--app-header-height", `${Math.ceil(header.getBoundingClientRect().height)}px`);
+    };
+    updateHeaderInset();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateHeaderInset);
+    observer?.observe(header);
+    globalThis.addEventListener("resize", updateHeaderInset);
+    return () => {
+      observer?.disconnect();
+      globalThis.removeEventListener("resize", updateHeaderInset);
+    };
+  }, [initializing, view]);
+
+  useEffect(() => {
     if (!client) return;
     const streamClient = client;
     abortRef.current?.abort();
@@ -106,6 +170,7 @@ export function App() {
       if (message.event === "snapshot") {
         try {
           const next = runtimeSnapshotFromSseData(message.data);
+          snapshotEpochRef.current.acceptStreamSnapshot();
           setSnapshot(next);
           setSelectedPid((current) => reconcileSelectedPid(next, current));
           setLastUpdatedAt(new Date());
@@ -116,6 +181,15 @@ export function App() {
       if (message.event === "snapshot_truncated" || message.event === "event.invalidated") {
         void refresh();
       }
+      if (message.event === "scheduler.status") {
+        try {
+          assertSchedulerStatus(message.data);
+          mergeSchedulerStatus(message.data);
+          setLastUpdatedAt(new Date());
+        } catch (reason) {
+          setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+        }
+      }
     }, controller.signal, "0", (status) => {
       if (activeClientRef.current === streamClient) setStreamStatus(status);
     }).catch((reason) => {
@@ -124,7 +198,7 @@ export function App() {
       }
     });
     return () => controller.abort();
-  }, [client]);
+  }, [client, streamEpoch]);
 
   const selectedProcess = useMemo(
     () => snapshot?.processes.find((process) => process.pid === selectedPid) ?? null,
@@ -167,13 +241,18 @@ export function App() {
         ?? (import.meta.env.DEV ? developmentConnection(import.meta.env, true) : null);
       if (!conn) throw new Error(t("app.preloadMissing"));
       const nextClient = new LibOSClient(conn);
-      const nextSnapshot = await nextClient.snapshot();
+      requestAbortRef.current?.abort();
+      const requestController = new AbortController();
+      requestAbortRef.current = requestController;
+      const nextSnapshot = await nextClient.snapshot({ signal: requestController.signal, timeoutMs: 15_000 });
       activeClientRef.current = nextClient;
+      snapshotEpochRef.current.acceptAuthoritativeSnapshot();
       setConnection(conn);
       setClient(nextClient);
+      setConnectionEpoch((current) => current + 1);
       setSnapshot(nextSnapshot);
       setSelectedPid((current) => reconcileSelectedPid(nextSnapshot, current));
-      setMaxQuanta(nextSnapshot.scheduler.default_max_quanta ?? null);
+      setMaxQuantaInput(nextSnapshot.scheduler.default_max_quanta?.toString() ?? "");
       setLastUpdatedAt(new Date());
     } catch (reason) {
       setError(describeError(reason, t("app.confirmationRequiredSuffix")));
@@ -186,19 +265,21 @@ export function App() {
     if (!client) return Promise.resolve(false);
     if (refreshInFlightRef.current) return refreshInFlightRef.current;
     const requestClient = client;
+    const requestEpoch = snapshotEpochRef.current.beginHttpRequest();
     setRefreshing(true);
     let request: Promise<boolean>;
-    request = requestClient.snapshot().then((next) => {
+    request = requestClient.snapshot({ signal: requestAbortRef.current?.signal, timeoutMs: 15_000 }).then((next) => {
       if (activeClientRef.current !== requestClient) return false;
+      if (!snapshotEpochRef.current.acceptHttpResponse(requestEpoch)) return true;
       setSnapshot(next);
       setSelectedPid((current) => reconcileSelectedPid(next, current));
       setLastUpdatedAt(new Date());
       return true;
     }).catch((reason) => {
-      if (activeClientRef.current === requestClient) {
+      if (activeClientRef.current === requestClient && snapshotEpochRef.current.isCurrent(requestEpoch)) {
         setError(describeError(reason, t("app.confirmationRequiredSuffix")));
       }
-      return false;
+      return !snapshotEpochRef.current.isCurrent(requestEpoch);
     }).finally(() => {
       if (refreshInFlightRef.current === request) {
         setRefreshing(false);
@@ -213,16 +294,21 @@ export function App() {
     if (!next) return;
     if (connection && sameConnection(connection, next)) return;
     const nextClient = new LibOSClient(next);
-    const nextSnapshot = await nextClient.snapshot();
+    requestAbortRef.current?.abort();
+    const requestController = new AbortController();
+    requestAbortRef.current = requestController;
+    const nextSnapshot = await nextClient.snapshot({ signal: requestController.signal, timeoutMs: 15_000 });
     abortRef.current?.abort();
     activeClientRef.current = nextClient;
+    snapshotEpochRef.current.acceptAuthoritativeSnapshot();
     refreshInFlightRef.current = null;
     setRefreshing(false);
     setConnection(next);
     setClient(nextClient);
+    setConnectionEpoch((current) => current + 1);
     setSnapshot(nextSnapshot);
     setSelectedPid(reconcileSelectedPid(nextSnapshot, null, { preserveExisting: false }));
-    setMaxQuanta(nextSnapshot.scheduler.default_max_quanta ?? null);
+    setMaxQuantaInput(nextSnapshot.scheduler.default_max_quanta?.toString() ?? "");
     setLastUpdatedAt(new Date());
     setError(null);
   }
@@ -267,7 +353,7 @@ export function App() {
   }
 
   async function spawnProcess() {
-    if (!client) return;
+    if (!client || !requireValidQuanta()) return;
     let spawnedPid: string | null = null;
     let submittedLabel = "";
     let spawnedProcess: RuntimeProcess | null = null;
@@ -293,6 +379,7 @@ export function App() {
     const pid = spawnedPid as string | null;
     if (!pid) return;
     if (spawnedProcess) {
+      snapshotEpochRef.current.acceptAuthoritativeSnapshot();
       setSnapshot((current) => current ? upsertRuntimeProcess(current, spawnedProcess!) : current);
     }
     setTaskLabels((current) => ({ ...current, [pid]: submittedLabel }));
@@ -302,7 +389,7 @@ export function App() {
   }
 
   async function send(kind: "message" | "interrupt"): Promise<boolean> {
-    if (!client || !selectedProcess || !message.trim()) return false;
+    if (!client || !selectedProcess || !message.trim() || !requireValidQuanta()) return false;
     const pid = selectedProcess.pid;
     return safe(async () => {
       const result = await client.sendMessage(pid, message.trim(), kind, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
@@ -312,10 +399,10 @@ export function App() {
   }
 
   async function runSelectedProcess(): Promise<boolean> {
-    if (!client || !selectedProcess) return false;
+    if (!client || !selectedProcess || !requireValidQuanta()) return false;
     const pid = selectedProcess.pid;
     return safe(async () => {
-      await runOrResumeProcess(client, selectedProcess, maxQuanta);
+      mergeProcessResult(await runOrResumeProcess(client, selectedProcess, maxQuanta));
     }, "process.run", false);
   }
 
@@ -334,25 +421,79 @@ export function App() {
   }
 
   function mergeProcessResult(result: unknown): RuntimeProcess | null {
+    mergeSchedulerResult(result);
     const process = processFromMutationResult(result);
-    if (process) setSnapshot((current) => current ? upsertRuntimeProcess(current, process) : current);
+    if (process) {
+      snapshotEpochRef.current.acceptAuthoritativeSnapshot();
+      setSnapshot((current) => current ? upsertRuntimeProcess(current, process) : current);
+    }
     return process;
   }
 
-  async function respond(request: HumanRequest, response: HumanResponseInput): Promise<boolean> {
-    if (!client) return false;
+  function mergeSchedulerResult(result: unknown): SchedulerStatus | null {
+    const candidate = result && typeof result === "object" && !Array.isArray(result) && "scheduler" in result
+      ? (result as { scheduler?: unknown }).scheduler
+      : result;
+    try {
+      assertSchedulerStatus(candidate);
+      mergeSchedulerStatus(candidate);
+      return candidate;
+    } catch {
+      return null;
+    }
+  }
+
+  function mergeSchedulerStatus(status: SchedulerStatus) {
+    setSnapshot((current) => current ? { ...current, scheduler: status } : current);
+  }
+
+  function requireValidQuanta(): boolean {
+    if (quantaDraft.valid) return true;
+    setError(t("scheduler.invalidQuanta"));
+    return false;
+  }
+
+  async function respond(request: HumanRequest, response: HumanResponseInput): Promise<HumanResponseOutcome> {
+    if (!client || !requireValidQuanta()) return "retryable";
     // A message/interrupt request with auto-run may remain in flight while the
     // scheduler is waiting for this exact Human decision. Do not route Human
     // responses through the global action guard or the GUI deadlocks: the
     // pending run waits for approval while approval is discarded as "busy".
     // HumanRequestCard owns per-request duplicate-submission protection.
+    if (ambiguousHumanRequestsRef.current.has(request.request_id)) {
+      const pending = await readbackHumanRequest(request.request_id);
+      if (pending === null) return "ambiguous";
+      ambiguousHumanRequestsRef.current.delete(request.request_id);
+      if (!pending) return "settled";
+    }
     try {
       setError(null);
-      await client.respondHumanRequest(request.request_id, response, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
-      return true;
+      const result = await client.respondHumanRequest(request.request_id, response, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
+      mergeProcessResult(result);
+      return "accepted";
     } catch (reason) {
       setError(describeError(reason, t("app.confirmationRequiredSuffix")));
-      return false;
+      const pending = await readbackHumanRequest(request.request_id);
+      if (pending === false) return "settled";
+      if (pending === true) return "retryable";
+      ambiguousHumanRequestsRef.current.add(request.request_id);
+      return "ambiguous";
+    }
+  }
+
+  async function readbackHumanRequest(requestId: string): Promise<boolean | null> {
+    const requestClient = client;
+    if (!requestClient) return null;
+    try {
+      const next = await requestClient.snapshot({ signal: requestAbortRef.current?.signal, timeoutMs: 10_000 });
+      if (activeClientRef.current !== requestClient) return null;
+      snapshotEpochRef.current.acceptAuthoritativeSnapshot();
+      setSnapshot(next);
+      setSelectedPid((current) => reconcileSelectedPid(next, current));
+      setLastUpdatedAt(new Date());
+      return next.human_requests.some((item) => item.request_id === requestId && item.status === "pending");
+    } catch {
+      return null;
     }
   }
 
@@ -387,7 +528,7 @@ export function App() {
   }
 
   function confirmExec() {
-    if (!client || !selectedProcess) return;
+    if (!client || !selectedProcess || !requireValidQuanta()) return;
     const pid = selectedProcess.pid;
     setPendingConfirm({
       title: t("app.exec.title"),
@@ -422,18 +563,13 @@ export function App() {
     try {
       const imagePackage = await window.libosApi?.chooseImagePackage();
       if (!imagePackage) return;
-      const preview = previewImageManifest(imagePackage.manifest);
       setPendingConfirm({
         title: t("image.register.title"),
         message: t("image.register.message"),
         details: {
           source: imagePackage.name,
-          image_id: preview.image_id,
-          name: preview.name,
-          version: preview.version,
-          default_tools_count: preview.default_tools_count,
-          required_capabilities_count: preview.required_capabilities_count,
-          required_modules_count: preview.required_modules_count,
+          manifest_sha256: imagePackage.manifest_sha256,
+          manifest_bytes: new Blob([imagePackage.manifest]).size,
           files: Object.keys(imagePackage.files).length,
           bytes: new Blob([JSON.stringify(imagePackage.files)]).size,
           replace
@@ -489,11 +625,12 @@ export function App() {
     confirmGuardRef.current = true;
     setConfirmBusy(true);
     setError(null);
+    setConfirmError(null);
     try {
       if (refreshInFlightRef.current) await refreshInFlightRef.current;
       await pendingConfirm.action();
     } catch (reason) {
-      setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+      setConfirmError(describeError(reason, t("app.confirmationRequiredSuffix")));
     } finally {
       confirmGuardRef.current = false;
       setConfirmBusy(false);
@@ -518,10 +655,17 @@ export function App() {
     } catch {
       // Persistence is optional in restricted renderer environments.
     }
+    globalThis.setTimeout(() => document.getElementById("primary-workspace")?.focus(), 0);
   }
 
   async function refreshAndClearError() {
-    if (await refresh()) setError(null);
+    if (await refresh()) {
+      setError(null);
+      // An HTTP-level SSE failure ends the stream loop. A snapshot refresh can
+      // prove the backend is healthy, but it must also restart the subscription
+      // or the renderer remains silently stale after reporting success.
+      if (streamStatus === "failed") setStreamEpoch((current) => current + 1);
+    }
   }
 
   if (initializing && !snapshot) {
@@ -532,12 +676,14 @@ export function App() {
   // that passive synchronization visible without disabling message, approval,
   // pause, or interrupt controls that are needed to steer the running process.
   const interactionBusy = Boolean(activeAction);
-  const appBusy = interactionBusy || refreshing;
   const selectedStatusTone = selectedProcess
     ? processStatusTone(selectedProcess.status)
     : "idle";
   const selectedTaskLabel = selectedProcess
     ? taskDisplayLabel(selectedProcess, taskLabels)
+    : null;
+  const selectedProcessMetadata = selectedProcess
+    ? `${shortProcessId(selectedProcess.pid)} · ${selectedProcess.image_id} · ${selectedProcess.llm_profile_id} · ${t("operator.cwd")} ${selectedProcess.working_directory}`
     : null;
   const selectedProcessTerminal = Boolean(
     selectedProcess?.terminal || (selectedProcess && ["exited", "failed", "killed"].includes(selectedProcess.status))
@@ -545,50 +691,81 @@ export function App() {
   const selectedPendingRequests = (snapshot?.human_requests ?? []).filter(
     (request) => request.status === "pending" && request.pid === selectedProcess?.pid
   );
+  const allPendingRequests = (snapshot?.human_requests ?? []).filter((request) => request.status === "pending");
+
+  function openOperatorPendingRequest() {
+    const next = allPendingRequests[0];
+    if (!next) return;
+    setSelectedPid(next.pid);
+    globalThis.setTimeout(() => {
+      const region = document.getElementById("operator-pending-requests");
+      region?.focus({ preventScroll: true });
+      region?.scrollIntoView({ block: "nearest", behavior: globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+    }, 0);
+  }
+
+  function openOperatorSpawn() {
+    setSpawnPanelOpen(true);
+    globalThis.setTimeout(() => {
+      const disclosure = document.querySelector<HTMLElement>(".spawnBox");
+      disclosure?.querySelector<HTMLElement>("summary")?.focus({ preventScroll: true });
+      disclosure?.scrollIntoView({
+        block: "start",
+        behavior: globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
+      });
+    }, 0);
+  }
+
+  function explainOperatorEvidence(kind: string, id: string) {
+    if (!selectedProcess) return;
+    setExplainLookup({ pid: selectedProcess.pid, kind, id, nonce: Date.now() });
+    globalThis.setTimeout(() => {
+      const panel = document.querySelector<HTMLElement>(".rightPane .tabPanel");
+      panel?.focus({ preventScroll: true });
+      panel?.scrollIntoView({
+        block: "start",
+        behavior: globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
+      });
+    }, 0);
+  }
+
+  const notices = (
+    <AppNotices
+      key="runtime-notices"
+      error={error}
+      snapshot={snapshot}
+      streamStatus={streamStatus}
+      refreshing={refreshing}
+      showSnapshotDiagnostics={view === "operator"}
+      onDismissError={() => setError(null)}
+      onRetry={() => client ? void refreshAndClearError() : void initialize()}
+    />
+  );
 
   return (
     <div
       className={view === "user" ? "userAppShell" : "appShell"}
-      aria-busy={appBusy || undefined}
+      data-refreshing={refreshing || undefined}
     >
-      <AppNotices
-        error={error}
-        snapshot={snapshot}
-        streamStatus={streamStatus}
-        refreshing={refreshing}
-        onDismissError={() => setError(null)}
-        onRetry={() => client ? void refreshAndClearError() : void initialize()}
-      />
       {view === "user" ? (
         <UserPage
-          key={selectedPid ?? "no-process"}
+          notices={notices}
           connection={connection}
           snapshot={snapshot}
           selectedPid={selectedPid}
           selectedProcess={selectedProcess}
           taskLabels={taskLabels}
-          maxQuanta={maxQuanta}
+          taskSettings={taskLaunchSettings}
+          quantaValid={quantaDraft.valid}
           spawnGoal={spawnGoal}
-          spawnImage={spawnImage}
-          spawnLlmProfile={spawnLlmProfile}
-          spawnWorkingDirectory={spawnWorkingDirectory}
-          spawnWorkspaceAccess={spawnWorkspaceAccess}
-          spawnAllowGitRequests={spawnAllowGitRequests}
-          spawnCommandAccess={spawnCommandAccess}
-          spawnContextMaintenance={spawnContextMaintenance}
           message={message}
           images={snapshot?.images ?? []}
           llmProfiles={snapshot?.llm_profiles ?? []}
           onSelectPid={setSelectedPid}
-          onMaxQuantaChange={setMaxQuanta}
+          onMaxQuantaChange={setMaxQuantaInput}
           onSpawnGoalChange={setSpawnGoal}
           onSpawnImageChange={setSpawnImage}
-          onSpawnLlmProfileChange={setSpawnLlmProfile}
-          onSpawnWorkingDirectoryChange={setSpawnWorkingDirectory}
-          onSpawnWorkspaceAccessChange={setSpawnWorkspaceAccess}
-          onSpawnAllowGitRequestsChange={setSpawnAllowGitRequests}
-          onSpawnCommandAccessChange={setSpawnCommandAccess}
-          onSpawnContextMaintenanceChange={setSpawnContextMaintenance}
+          onApplyTaskSettings={applyTaskLaunchSettings}
           onMessageChange={setMessage}
           onSpawn={() => void spawnProcess()}
           onImportImage={() => void chooseAndConfirmImageImport(false)}
@@ -611,26 +788,31 @@ export function App() {
         />
       ) : (
         <>
+          <a className="skipLink" href="#primary-workspace">{t("user.skipToWorkspace")}</a>
           <TopBar
             db={connection?.db ?? t("app.defaultDb")}
             scheduler={snapshot?.scheduler ?? null}
-            maxQuanta={maxQuanta}
+            maxQuantaInput={maxQuantaInput}
+            quantaValid={quantaDraft.valid}
             selectedPid={selectedProcess && !selectedProcessTerminal ? selectedProcess.pid : null}
-            onMaxQuantaChange={setMaxQuanta}
+            onMaxQuantaChange={setMaxQuantaInput}
             onOpenDb={() => void openDatabase()}
-            onSpawn={() => setSpawnPanelOpen(true)}
+            onSpawn={openOperatorSpawn}
             onRun={() => void runSelectedProcess()}
-            onStep={() => selectedProcess && client && void safe(() => client.step(selectedProcess.pid).then(() => undefined))}
-            onPause={() => client && void safe(() => client.pauseScheduler().then(() => undefined), "scheduler.pause", false)}
-            onAutoRunChange={(value) => client && void safe(() => client.setAutoRun(value).then(() => undefined), "scheduler.auto", false)}
+            onStep={() => selectedProcess && client && quantaDraft.valid && void safe(async () => { mergeProcessResult(await client.step(selectedProcess.pid)); }, "process.step", false)}
+            onPause={() => client && void safe(async () => { mergeSchedulerStatus(await client.pauseScheduler()); }, "scheduler.pause", false)}
+            onAutoRunChange={(value) => client && void safe(async () => { mergeSchedulerStatus(await client.setAutoRun(value)); }, "scheduler.auto", false)}
             onRefresh={() => void refreshAndClearError()}
+            pendingHumanCount={allPendingRequests.length}
+            onOpenPending={openOperatorPendingRequest}
             onShowUser={() => setView("user")}
             busy={interactionBusy}
             streamStatus={streamStatus}
             lastUpdatedAt={lastUpdatedAt}
           />
+          {notices}
 
-          <main className="workspace">
+          <main className="workspace" id="primary-workspace" tabIndex={-1}>
             <section className="leftPane operatorPane" aria-label={t("operator.processes.title")}>
               <header className="paneHeader operatorPaneHeader">
                 <div className="paneTitle">
@@ -718,7 +900,7 @@ export function App() {
                     <textarea value={spawnGoal} disabled={interactionBusy} onChange={(event) => setSpawnGoal(event.currentTarget.value)} />
                   </label>
                   <p className="taskAuthorityHint">{t("taskAuthority.hint")}</p>
-                  <button type="button" className="primary launchProcessButton" disabled={interactionBusy || !spawnGoal.trim()} onClick={() => void spawnProcess()}>
+                  <button type="button" className="primary launchProcessButton" disabled={interactionBusy || !quantaDraft.valid || !spawnGoal.trim()} onClick={() => void spawnProcess()}>
                     <CirclePlus size={15} />{t("operator.launchProcess")}
                   </button>
                 </div>
@@ -727,6 +909,7 @@ export function App() {
                 processes={snapshot?.processes ?? []}
                 selectedPid={selectedPid}
                 taskLabels={taskLabels}
+                humanRequests={snapshot?.human_requests ?? []}
                 disabled={interactionBusy}
                 onSelect={setSelectedPid}
               />
@@ -736,8 +919,8 @@ export function App() {
               <header className="paneHeader activityPaneHeader">
                 <div className="paneTitle">
                   <span className="eyebrow"><Activity size={12} />{t("operator.activity")}</span>
-                  <h1 title={selectedProcess?.pid}>{selectedTaskLabel ?? t("operator.noProcessSelected")}</h1>
-                  {selectedProcess ? <p>{shortProcessId(selectedProcess.pid)} · {selectedProcess.image_id} · {selectedProcess.llm_profile_id} · {t("operator.cwd")} {selectedProcess.working_directory}</p> : <p>{t("operator.activityHint")}</p>}
+                  <h1 title={selectedTaskLabel ?? selectedProcess?.pid}>{selectedTaskLabel ?? t("operator.noProcessSelected")}</h1>
+                  {selectedProcessMetadata ? <p title={selectedProcessMetadata}>{selectedProcessMetadata}</p> : <p>{t("operator.activityHint")}</p>}
                 </div>
                 <div className="paneHeaderMeta">
                   {selectedProcess?.interrupt_count ? <span className="interruptBanner"><AlertTriangle size={15} />{t("operator.interruptPending")}</span> : null}
@@ -745,7 +928,7 @@ export function App() {
                 </div>
               </header>
 
-              {selectedPendingRequests.length ? <section className="humanRequests" aria-label={t("user.pendingRequests")}>
+              {selectedPendingRequests.length ? <section id="operator-pending-requests" className="humanRequests" aria-label={t("user.pendingRequests")} tabIndex={-1}>
                 <div className="pendingRequestsHeading"><AlertTriangle size={15} /><strong>{t("user.pendingRequests")}</strong><span>{selectedPendingRequests.length}</span></div>
                 {selectedPendingRequests.map((request) => (
                   <HumanRequestCard key={request.request_id} request={request} onRespond={respond} />
@@ -759,7 +942,7 @@ export function App() {
                 llmCalls={snapshot?.llm_calls ?? []}
                 events={snapshot?.events ?? []}
                 audit={snapshot?.audit ?? []}
-                onExplainEvidence={(kind, id) => selectedProcess && setExplainLookup({ pid: selectedProcess.pid, kind, id, nonce: Date.now() })}
+                onExplainEvidence={explainOperatorEvidence}
               />
 
               <div className="composer">
@@ -773,15 +956,15 @@ export function App() {
                     onKeyDown={(event) => {
                       if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                         event.preventDefault();
-                        if (message.trim()) void send("message");
+                        if (quantaDraft.valid && message.trim()) void send("message");
                       }
                     }}
                     placeholder={t("operator.messagePlaceholder")}
                   />
                   <span>{t("user.sendHint")}</span>
                 </div>
-                <button type="button" className="primary" disabled={interactionBusy || !selectedProcess || selectedProcessTerminal || !message.trim()} onClick={() => void send("message")}><Send size={15} />{t("operator.message")}</button>
-                <button type="button" disabled={interactionBusy || !selectedProcess || selectedProcessTerminal || !message.trim()} className="iconOnly warning" aria-label={t("operator.interrupt")} title={t("operator.interrupt")} onClick={() => void send("interrupt")}><AlertTriangle size={15} /></button>
+                <button type="button" className="primary" disabled={interactionBusy || !quantaDraft.valid || !selectedProcess || selectedProcessTerminal || !message.trim()} onClick={() => void send("message")}><Send size={15} />{t("operator.message")}</button>
+                <button type="button" disabled={interactionBusy || !quantaDraft.valid || !selectedProcess || selectedProcessTerminal || !message.trim()} className="iconOnly warning" aria-label={t("operator.interrupt")} title={t("operator.interrupt")} onClick={() => void send("interrupt")}><AlertTriangle size={15} /></button>
               </div>
             </section>
 
@@ -790,7 +973,7 @@ export function App() {
                 <div className="paneTitle">
                   <span className="eyebrow"><PanelRight size={12} />{t("operator.inspector")}</span>
                   <h2>{t("operator.inspector")}</h2>
-                  <p title={selectedProcess?.pid}>{selectedTaskLabel ?? t("operator.noSelectionHint")}</p>
+                  <p title={selectedTaskLabel ?? selectedProcess?.pid}>{selectedTaskLabel ?? t("operator.noSelectionHint")}</p>
                 </div>
               </header>
               <details className="quickActions operatorDisclosure">
@@ -805,7 +988,7 @@ export function App() {
                     <div className="inlineAction">
                       <input
                         value={cwd}
-                        disabled={interactionBusy}
+                        disabled={interactionBusy || !selectedProcess}
                         aria-label={t("operator.newCwdPlaceholder")}
                         placeholder={t("operator.newCwdPlaceholder")}
                         onChange={(event) => setCwd(event.currentTarget.value)}
@@ -818,7 +1001,7 @@ export function App() {
                   </section>
                   <section className="processActionGroup">
                     <span className="actionGroupLabel">{t("operator.exec")}</span>
-                    <ImageSelect images={snapshot?.images ?? []} value={execImage} label={t("operator.exec")} disabled={interactionBusy} onChange={setExecImage} />
+                    <ImageSelect images={snapshot?.images ?? []} value={execImage} label={t("operator.exec")} disabled={interactionBusy || !selectedProcess} onChange={setExecImage} />
                     <LLMProfileSelect
                       profiles={snapshot?.llm_profiles ?? []}
                       value={execLlmProfile}
@@ -829,8 +1012,8 @@ export function App() {
                       onUpdate={updateLlmProfile}
                       onDelete={deleteLlmProfile}
                     />
-                    <input value={execGoal} disabled={interactionBusy} onChange={(event) => setExecGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} placeholder={t("operator.execGoalPlaceholder")} />
-                    <button type="button" disabled={interactionBusy || !selectedProcess} className="warning fullWidthButton" onClick={confirmExec}>{t("operator.exec")}</button>
+                    <input value={execGoal} disabled={interactionBusy || !selectedProcess} onChange={(event) => setExecGoal(event.currentTarget.value)} aria-label={t("operator.spawnGoal")} placeholder={t("operator.execGoalPlaceholder")} />
+                    <button type="button" disabled={interactionBusy || !quantaDraft.valid || !selectedProcess} className="warning fullWidthButton" onClick={confirmExec}>{t("operator.exec")}</button>
                   </section>
                   <section className="processActionGroup">
                     <span className="actionGroupLabel">{t("operator.lifecycle")}</span>
@@ -865,22 +1048,24 @@ export function App() {
                   if (!client) throw new Error(t("app.clientUnavailable"));
                   return client.inspectImage(imageId);
                 }}
-                onListOperations={(pid, cursor) => {
+                onListOperations={(pid, cursor, signal) => {
                   if (!client) throw new Error(t("app.clientUnavailable"));
-                  return client.listOperations(pid, 100, cursor);
+                  return client.listOperations(pid, 100, cursor, { signal, timeoutMs: 15_000 });
                 }}
-                onExplainOperation={(operationId, cursor) => {
+                onExplainOperation={(operationId, cursor, signal) => {
                   if (!client) throw new Error(t("app.clientUnavailable"));
-                  return client.explainOperation(operationId, 200, cursor);
+                  return client.explainOperation(operationId, 200, cursor, { signal, timeoutMs: 15_000 });
                 }}
-                onResolveOperation={(kind, id) => {
+                onResolveOperation={(kind, id, signal) => {
                   if (!client) throw new Error(t("app.clientUnavailable"));
-                  return client.resolveOperation(kind, id);
+                  return client.resolveOperation(kind, id, { signal, timeoutMs: 15_000 });
                 }}
                 explainLookup={selectedExplainLookup}
+                connectionEpoch={connectionEpoch}
                 client={client}
                 runAction={safe}
                 confirmAction={queueConfirmation}
+                busy={interactionBusy}
               />
             </section>
           </main>
@@ -893,7 +1078,11 @@ export function App() {
           message={pendingConfirm.message}
           details={pendingConfirm.details}
           busy={confirmBusy}
-          onCancel={() => setPendingConfirm(null)}
+          error={confirmError}
+          onCancel={() => {
+            setPendingConfirm(null);
+            setConfirmError(null);
+          }}
           onConfirm={() => void confirmPendingAction()}
         />
       ) : null}
