@@ -53,6 +53,7 @@ class Command:
     argv: list[str]
     env: dict[str, str] | None = None
     enforce_timeout: bool = True
+    invariant_test_paths: tuple[str, ...] | None = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -90,6 +91,18 @@ def main(argv: list[str] | None = None) -> int:
         help="report the N slowest pytest durations; use 0 to report all durations",
     )
     parser.add_argument(
+        "--shard-count",
+        type=_positive_integer,
+        default=1,
+        help="split one Python lane into this many deterministic file-weighted shards",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=_nonnegative_integer,
+        default=0,
+        help="zero-based shard to execute when --shard-count is greater than one",
+    )
+    parser.add_argument(
         "-n",
         "--workers",
         type=_worker_count,
@@ -123,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
                 status = _validate_invariant_receipt(
                     receipt_path,
                     lane=None if args.lane == "all" else args.lane,
+                    selected_test_paths=command.invariant_test_paths,
                 )
                 if status != 0:
                     return status
@@ -145,13 +159,62 @@ def _commands_for(args: argparse.Namespace) -> list[Command]:
                 env=_pytest_env(args),
             )
         ]
+    selected_paths = _sharded_lane_paths(
+        LANE_PATHS[args.lane],
+        shard_count=args.shard_count,
+        shard_index=args.shard_index,
+    )
+    shard_suffix = (
+        ""
+        if args.shard_count == 1
+        else f" shard {args.shard_index + 1}/{args.shard_count}"
+    )
     return [
         Command(
-            f"pytest {args.lane}{_worker_suffix(args)}",
-            _pytest_args(LANE_PATHS[args.lane], args),
+            f"pytest {args.lane}{shard_suffix}{_worker_suffix(args)}",
+            _pytest_args(selected_paths, args),
             env=_pytest_env(args),
+            invariant_test_paths=(
+                selected_paths if args.shard_count > 1 else None
+            ),
         )
     ]
+
+
+def _sharded_lane_paths(
+    paths: tuple[str, ...],
+    *,
+    shard_count: int,
+    shard_index: int,
+) -> tuple[str, ...]:
+    if shard_count == 1:
+        return paths
+    files = sorted(
+        {
+            candidate.relative_to(ROOT).as_posix()
+            for raw_path in paths
+            for candidate in (
+                sorted((ROOT / raw_path).rglob("test_*.py"))
+                if (ROOT / raw_path).is_dir()
+                else (ROOT / raw_path,)
+            )
+            if candidate.is_file()
+        }
+    )
+    if shard_count > len(files):
+        raise ValueError(
+            f"shard count {shard_count} exceeds the {len(files)} selected test files"
+        )
+    buckets: list[list[str]] = [[] for _ in range(shard_count)]
+    weights = [0 for _ in range(shard_count)]
+    weighted_files = sorted(
+        ((ROOT / path).stat().st_size, path) for path in files
+    )
+    for size, path in reversed(weighted_files):
+        selected = min(range(shard_count), key=lambda index: (weights[index], index))
+        buckets[selected].append(path)
+        weights[selected] += size
+    return tuple(sorted(buckets[shard_index]))
 
 
 def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
@@ -184,6 +247,21 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("pytest-xdist is required for --workers; run `uv sync --all-groups` first")
     if args.lane == "gui" and args.keep_agent_outputs:
         parser.error("--keep-agent-outputs only applies to pytest lanes")
+    if args.shard_index >= args.shard_count:
+        parser.error("--shard-index must be less than --shard-count")
+    if args.lane in {"gui", "all"} and (
+        args.shard_count != 1 or args.shard_index != 0
+    ):
+        parser.error("test sharding applies only to an individual Python lane")
+    if args.shard_count > 1:
+        try:
+            _sharded_lane_paths(
+                LANE_PATHS[args.lane],
+                shard_count=args.shard_count,
+                shard_index=args.shard_index,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
 
 
 def _resolve_defaults(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -265,7 +343,12 @@ def _with_invariant_receipt(command: Command, path: Path) -> Command:
     return replace(command, argv=argv, env=env)
 
 
-def _validate_invariant_receipt(path: Path, *, lane: str | None) -> int:
+def _validate_invariant_receipt(
+    path: Path,
+    *,
+    lane: str | None,
+    selected_test_paths: tuple[str, ...] | None = None,
+) -> int:
     from scripts import check_test_invariants as checker
 
     try:
@@ -280,6 +363,7 @@ def _validate_invariant_receipt(path: Path, *, lane: str | None) -> int:
         executed,
         errors,
         lane=lane,
+        selected_test_paths=selected_test_paths,
     )
     if errors:
         for error in errors:
@@ -452,6 +536,13 @@ def _nonnegative_integer(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
     if selected < 0:
         raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return selected
+
+
+def _positive_integer(value: str) -> int:
+    selected = _nonnegative_integer(value)
+    if selected < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
     return selected
 
 

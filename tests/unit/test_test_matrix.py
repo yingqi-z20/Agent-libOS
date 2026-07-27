@@ -22,6 +22,8 @@ def _args(**overrides: object) -> argparse.Namespace:
         "dist": "loadfile",
         "max_lane_seconds": test_matrix.DEFAULT_MAX_LANE_SECONDS,
         "durations": None,
+        "shard_count": 1,
+        "shard_index": 0,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -95,6 +97,34 @@ class TestTestMatrix:
         command = test_matrix._pytest_args(("tests/security",), _args(durations=25))
 
         assert command[4:6] == ["--durations", "25"]
+
+    def test_runtime_shards_are_complete_disjoint_and_weight_balanced(self) -> None:
+        first = test_matrix._commands_for(
+            _args(lane="runtime", shard_count=2, shard_index=0)
+        )[0]
+        second = test_matrix._commands_for(
+            _args(lane="runtime", shard_count=2, shard_index=1)
+        )[0]
+        first_paths = set(first.invariant_test_paths or ())
+        second_paths = set(second.invariant_test_paths or ())
+        expected = {
+            path.relative_to(test_matrix.ROOT).as_posix()
+            for path in (test_matrix.ROOT / "tests/runtime").glob("test_*.py")
+        }
+
+        assert first.name == "pytest runtime shard 1/2"
+        assert second.name == "pytest runtime shard 2/2"
+        assert first_paths
+        assert second_paths
+        assert first_paths.isdisjoint(second_paths)
+        assert first_paths | second_paths == expected
+        weights = [
+            sum((test_matrix.ROOT / path).stat().st_size for path in paths)
+            for paths in (first_paths, second_paths)
+        ]
+        assert max(weights) - min(weights) <= max(
+            (test_matrix.ROOT / path).stat().st_size for path in expected
+        )
 
     def test_runtime_lane_defaults_to_bounded_parallel_worksteal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         parser = argparse.ArgumentParser()
@@ -212,6 +242,12 @@ class TestTestMatrix:
         for value in ("-1", "1.5", "not-a-number"):
             with pytest.raises(argparse.ArgumentTypeError):
                 test_matrix._nonnegative_integer(value)
+
+    def test_shard_count_requires_a_positive_integer(self) -> None:
+        assert test_matrix._positive_integer("2") == 2
+        for value in ("0", "-1", "1.5", "not-a-number"):
+            with pytest.raises(argparse.ArgumentTypeError):
+                test_matrix._positive_integer(value)
 
     def test_individual_lane_timeout_terminates_the_command(self) -> None:
         started = time.monotonic()
@@ -357,4 +393,18 @@ pathlib.Path(sys.argv[2]).write_text(str(child.pid), encoding="utf-8")
             test_matrix._validate_args(
                 parser,
                 _args(lane="gui", keep_agent_outputs=True),
+            )
+
+    def test_sharding_rejects_invalid_index_and_aggregate_lanes(self) -> None:
+        parser = argparse.ArgumentParser()
+
+        with pytest.raises(SystemExit):
+            test_matrix._validate_args(
+                parser,
+                _args(shard_count=2, shard_index=2),
+            )
+        with pytest.raises(SystemExit):
+            test_matrix._validate_args(
+                parser,
+                _args(lane="all", shard_count=2, shard_index=0),
             )

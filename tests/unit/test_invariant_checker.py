@@ -232,6 +232,33 @@ benchmark_attack_classes:
 
         assert errors == []
 
+    def test_sharded_execution_checks_only_selected_test_files(self) -> None:
+        first = "tests/runtime/test_first.py::test_first"
+        second = "tests/runtime/test_second.py::test_second"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "sharded-invariant",
+                    "title": "Sharded invariant",
+                    "lane": "runtime",
+                    "node_ids": [first, second],
+                    "required_platform_nodes": {"linux": [first, second]},
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids={first},
+            errors=errors,
+            lane="runtime",
+            platform="linux",
+            selected_test_paths=("tests/runtime/test_first.py",),
+        )
+
+        assert errors == []
+
     def test_platform_scoped_invariant_is_not_required_on_other_platform(
         self,
     ) -> None:

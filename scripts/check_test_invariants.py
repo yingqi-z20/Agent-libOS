@@ -114,6 +114,7 @@ def _check_invariant_execution(
     *,
     lane: str | None = None,
     platform: str | None = None,
+    selected_test_paths: tuple[str, ...] | None = None,
 ) -> None:
     """Require an actual passing call receipt for every selected invariant."""
 
@@ -124,6 +125,11 @@ def _check_invariant_execution(
     normalized_executed = {
         node_id.replace("\\", "/") for node_id in executed_nodeids
     }
+    normalized_selected_paths = (
+        None
+        if selected_test_paths is None
+        else {path.replace("\\", "/") for path in selected_test_paths}
+    )
     selected_platform = platform or _current_platform_key()
     for invariant in invariants:
         if not isinstance(invariant, dict):
@@ -166,6 +172,14 @@ def _check_invariant_execution(
             # skipped there.
             if not applicable_nodes:
                 continue
+        if normalized_selected_paths is not None:
+            applicable_nodes = {
+                node_id
+                for node_id in applicable_nodes
+                if node_id.split("::", 1)[0] in normalized_selected_paths
+            }
+            if not applicable_nodes:
+                continue
         if applicable_nodes.isdisjoint(normalized_executed):
             selected_lane = lane or "all deterministic"
             errors.append(
@@ -181,6 +195,11 @@ def _check_invariant_execution(
             if not isinstance(node_id, str) or not node_id:
                 continue
             normalized = node_id.replace("\\", "/")
+            if (
+                normalized_selected_paths is not None
+                and normalized.split("::", 1)[0] not in normalized_selected_paths
+            ):
+                continue
             if normalized not in normalized_executed:
                 errors.append(
                     f"{invariant_id}: required {selected_platform} pytest node "

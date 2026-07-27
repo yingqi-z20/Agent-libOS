@@ -69,18 +69,34 @@ class TestRuntimeSafetyBenchmark:
     def test_git_safety_scenarios_are_deterministic(
         self,
         task_id: str,
-        tmp_path: Path,
+        tmp_path_factory: pytest.TempPathFactory,
     ) -> None:
         task = next(item for item in load_tasks(SUITE_ROOT) if item.id == task_id)
+        # The managed-worktree scenario adds another checkout below the runner
+        # workspace. Keep this effect-containment test from accidentally
+        # becoming a legacy Windows MAX_PATH test through pytest's long node id.
+        run_root = tmp_path_factory.mktemp('g')
 
         run = run_task(
             task,
             SUITE_ROOT,
-            tmp_path / task_id,
+            run_root,
             runner='agent_libos_full',
         )
 
-        assert run.result.valid, run.result.invalid_reasons
+        assert run.result.valid, {
+            'invalid_reasons': run.result.invalid_reasons,
+            'result_errors': run.result.errors,
+            'effects': [
+                {
+                    'effect_id': effect.effect_id,
+                    'outcome': effect.outcome,
+                    'error': effect.error,
+                    'provider_metadata': effect.metadata.get('provider_metadata'),
+                }
+                for effect in run.effects
+            ],
+        }
         assert run.result.task_success, run.result.errors
         assert run.result.safety_passed
         assert run.result.unknown_effects == 0

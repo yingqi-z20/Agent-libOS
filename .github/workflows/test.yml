@@ -390,9 +390,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: ["unit", "runtime", "security", "self-evolution", "providers", "benchmark"]
+        include:
+          - name: unit
+            lane: unit
+            shard_args: ""
+          - name: runtime 1/2
+            lane: runtime
+            shard_args: --shard-count 2 --shard-index 0
+          - name: runtime 2/2
+            lane: runtime
+            shard_args: --shard-count 2 --shard-index 1
+          - name: security
+            lane: security
+            shard_args: ""
+          - name: self-evolution
+            lane: self-evolution
+            shard_args: ""
+          - name: providers
+            lane: providers
+            shard_args: ""
+          - name: benchmark
+            lane: benchmark
+            shard_args: ""
 
-    name: windows (${{ matrix.lane }})
+    name: windows (${{ matrix.name }})
 
     steps:
       - name: Check out repository
@@ -423,6 +444,7 @@ jobs:
         timeout-minutes: 25
         run: >-
           uv run python scripts/test_matrix.py --lane ${{ matrix.lane }}
+          ${{ matrix.shard_args }}
           --durations 25 --max-lane-seconds 1400
 
   deterministic-release:

@@ -928,17 +928,30 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     assert windows_job["runs-on"] == "windows-latest"
     assert windows_job["needs"] == "static"
     assert windows_job["timeout-minutes"] == 30
-    assert windows_job["name"] == "windows (${{ matrix.lane }})"
+    assert windows_job["name"] == "windows (${{ matrix.name }})"
     assert windows_job["strategy"] == {
         "fail-fast": False,
         "matrix": {
-            "lane": [
-                "unit",
-                "runtime",
-                "security",
-                "self-evolution",
-                "providers",
-                "benchmark",
+            "include": [
+                {"name": "unit", "lane": "unit", "shard_args": ""},
+                {
+                    "name": "runtime 1/2",
+                    "lane": "runtime",
+                    "shard_args": "--shard-count 2 --shard-index 0",
+                },
+                {
+                    "name": "runtime 2/2",
+                    "lane": "runtime",
+                    "shard_args": "--shard-count 2 --shard-index 1",
+                },
+                {"name": "security", "lane": "security", "shard_args": ""},
+                {
+                    "name": "self-evolution",
+                    "lane": "self-evolution",
+                    "shard_args": "",
+                },
+                {"name": "providers", "lane": "providers", "shard_args": ""},
+                {"name": "benchmark", "lane": "benchmark", "shard_args": ""},
             ]
         },
     }
@@ -1079,6 +1092,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
             "Run deterministic Python lane",
             (
                 "scripts/test_matrix.py --lane ${{ matrix.lane }}",
+                "${{ matrix.shard_args }}",
                 "--max-lane-seconds 1400",
             ),
         ),
