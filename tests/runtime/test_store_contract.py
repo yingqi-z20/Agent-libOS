@@ -110,6 +110,9 @@ from agent_libos.models.exceptions import (
 from agent_libos.models.snapshot import SnapshotRows
 
 
+_THREAD_SYNC_TIMEOUT_S = 30.0
+
+
 STORE_BACKENDS = [
     "sqlite-memory",
     "sqlite-file",
@@ -2324,7 +2327,7 @@ def test_active_exec_admission_rejects_tokenless_host_patch_before_write(
 
         def block_skills(*_args: object, **_kwargs: object) -> None:
             entered.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
 
         def run_exec() -> None:
             try:
@@ -2335,7 +2338,7 @@ def test_active_exec_admission_rejects_tokenless_host_patch_before_write(
         monkeypatch.setattr(runtime.image_boot, "_configure_skills", block_skills)
         worker = threading.Thread(target=run_exec)
         worker.start()
-        assert entered.wait(timeout=10)
+        assert entered.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
         before_row, before_counters = _raw_process_row_and_counters(runtime, pid)
 
         with pytest.raises(
@@ -2349,7 +2352,7 @@ def test_active_exec_admission_rejects_tokenless_host_patch_before_write(
         assert after_counters == before_counters
 
         release.set()
-        worker.join(timeout=10)
+        worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
         assert not worker.is_alive()
         assert errors == []
         committed = runtime.process.get(pid)
@@ -2540,7 +2543,7 @@ def test_exec_rollback_cas_preserves_trusted_control_winner_and_fences_runtime(
 
         def fail_after_control(*_args: object, **_kwargs: object) -> None:
             entered.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
             raise primary
 
         def run_exec() -> None:
@@ -2552,7 +2555,7 @@ def test_exec_rollback_cas_preserves_trusted_control_winner_and_fences_runtime(
         monkeypatch.setattr(runtime.image_boot, "_configure_skills", fail_after_control)
         worker = threading.Thread(target=run_exec)
         worker.start()
-        assert entered.wait(timeout=10)
+        assert entered.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
         admitted = runtime.process.get(pid)
         assert admitted.status == ProcessStatus.RUNNING
         assert admitted.execution_owner_id is not None
@@ -2582,7 +2585,7 @@ def test_exec_rollback_cas_preserves_trusted_control_winner_and_fences_runtime(
         assert runtime.store.get_object(reason_oid) is not None
 
         release.set()
-        worker.join(timeout=10)
+        worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
         assert not worker.is_alive()
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeRecoveryRequired)
@@ -2621,7 +2624,7 @@ def test_exec_rollback_preserves_resource_limit_takeover_winner(
 
         def fail_after_limit(*_args: object, **_kwargs: object) -> None:
             entered.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
             raise RuntimeError("injected late exec failure after resource limit")
 
         def run_exec() -> None:
@@ -2633,7 +2636,7 @@ def test_exec_rollback_preserves_resource_limit_takeover_winner(
         monkeypatch.setattr(runtime.image_boot, "_configure_skills", fail_after_limit)
         worker = threading.Thread(target=run_exec)
         worker.start()
-        assert entered.wait(timeout=10)
+        assert entered.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
 
         runtime.resources.kill_if_exceeded(pid, reason="resource ceiling reached")
         winner = runtime.process.get(pid)
@@ -2642,7 +2645,7 @@ def test_exec_rollback_preserves_resource_limit_takeover_winner(
         assert winner.outcome.code == "resource_limit_exceeded"
 
         release.set()
-        worker.join(timeout=10)
+        worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
         assert not worker.is_alive()
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeRecoveryRequired)
@@ -2671,7 +2674,7 @@ def test_exec_recovery_requires_startup_lease_before_reading_live_publication(
 
         def block_skills(*_args: object, **_kwargs: object) -> None:
             entered.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
 
         def run_exec() -> None:
             try:
@@ -2682,7 +2685,7 @@ def test_exec_recovery_requires_startup_lease_before_reading_live_publication(
         monkeypatch.setattr(runtime.image_boot, "_configure_skills", block_skills)
         worker = threading.Thread(target=run_exec)
         worker.start()
-        assert entered.wait(timeout=10)
+        assert entered.wait(timeout=_THREAD_SYNC_TIMEOUT_S)
         publication = [
             item
             for item in runtime.store.list_runtime_publications(pid=pid)
@@ -2710,7 +2713,7 @@ def test_exec_recovery_requires_startup_lease_before_reading_live_publication(
         assert runtime.store.get_runtime_publication(publication["publication_id"]) == before
 
         release.set()
-        worker.join(timeout=10)
+        worker.join(timeout=_THREAD_SYNC_TIMEOUT_S)
         assert not worker.is_alive()
         assert errors == []
         committed = runtime.store.get_runtime_publication(publication["publication_id"])

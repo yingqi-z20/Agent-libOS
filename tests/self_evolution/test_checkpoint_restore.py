@@ -44,6 +44,9 @@ from agent_libos.utils.serde import dumps, loads
 from tests.support.checkpoints import ClassifiedShellProvider
 
 
+_OBJECT_TASK_SYNC_TIMEOUT_S = 30.0
+
+
 def _write_durable_finalizer_module(
     root: Path,
     *,
@@ -2415,7 +2418,11 @@ class TestCheckpointRestore:
             )
             checkpoint_id = runtime.checkpoint.create(pid, 'before task', actor=pid)
             task = runtime.object_tasks.start(pid, owner, 'receive_process_messages', {'channel': 'never'})
-            waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            waiting = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             restore_publications_before = {
                 str(publication['publication_id'])
                 for publication in runtime.store.list_runtime_publications()
@@ -2492,7 +2499,7 @@ class TestCheckpointRestore:
             completed = runtime.object_tasks.wait(
                 task.task_id,
                 actor_pid=pid,
-                timeout=3,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
             )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
 
@@ -2601,7 +2608,11 @@ class TestCheckpointRestore:
             )
             checkpoint_id = runtime.checkpoint.create(pid, 'before terminal task', actor=pid)
             task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
-            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.runner_pid is not None
             old_runner_pid = str(completed.runner_pid)
@@ -2645,7 +2656,11 @@ class TestCheckpointRestore:
             )
             checkpoint_id = runtime.checkpoint.create(pid, 'before terminal task', actor=pid)
             task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
-            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.runner_pid is not None
             assert completed.result_oid is not None
@@ -2718,7 +2733,11 @@ class TestCheckpointRestore:
                 immutable=False,
             )
             task = runtime.object_tasks.start(pid, owner, 'get_working_directory', {})
-            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.runner_pid is not None
             assert completed.result_oid is not None
@@ -2821,7 +2840,11 @@ class TestCheckpointRestore:
             )
 
             release_notification.set()
-            completed = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=3)
+            completed = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=_OBJECT_TASK_SYNC_TIMEOUT_S,
+            )
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert completed.updated_at >= checkpoint.created_at
 

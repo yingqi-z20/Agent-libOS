@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 import threading
 import time
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -31,6 +34,7 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessStatus,
     RelationType,
+    ToolHandle,
 )
 from agent_libos.models.exceptions import CapabilityDenied, ProcessError, ProcessMessageWaitRequired, ValidationError
 from agent_libos.process_execution import bind_process_execution
@@ -3081,7 +3085,10 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
-    def test_object_task_cancel_updates_task_and_runner_process(self) -> None:
+    def test_object_task_cancel_updates_task_and_runner_process(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         runtime = Runtime.open("local")
         try:
             pid = runtime.process.spawn(image="base-agent:v0", goal="cancel task")
@@ -3092,12 +3099,66 @@ class TestObjectTasks:
                 pid,
                 owner,
                 "sleep",
-                {"seconds": 1.0},
+                {"seconds": 30.0},
                 inherit_capabilities=_inherit_clock_sleep(),
             )
 
-            cancelled = runtime.object_tasks.cancel(task.task_id, actor_pid=pid, reason="no longer needed")
+            deadline = time.monotonic() + 30.0
+            running = runtime.store.get_object_task(task.task_id)
+            while (
+                running is not None
+                and running.status != ObjectTaskStatus.RUNNING
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+                running = runtime.store.get_object_task(task.task_id)
+            assert running is not None
+            assert running.status == ObjectTaskStatus.RUNNING
 
+            transaction_depth = threading.local()
+            original_transaction = runtime.object_tasks._records.transaction
+
+            @contextlib.contextmanager
+            def observe_transaction(
+                *args: Any,
+                **kwargs: Any,
+            ) -> Iterator[Any]:
+                with original_transaction(*args, **kwargs) as cursor:
+                    depth = int(getattr(transaction_depth, "value", 0))
+                    transaction_depth.value = depth + 1
+                    try:
+                        yield cursor
+                    finally:
+                        transaction_depth.value = depth
+
+            classified_tools: list[ToolHandle | str] = []
+            original_classification = (
+                runtime.object_tasks._tools.is_sync_side_effect_tool
+            )
+
+            def observe_classification(tool: ToolHandle | str) -> bool:
+                assert int(getattr(transaction_depth, "value", 0)) == 0
+                classified_tools.append(tool)
+                return original_classification(tool)
+
+            monkeypatch.setattr(
+                runtime.object_tasks._records,
+                "transaction",
+                observe_transaction,
+            )
+            monkeypatch.setattr(
+                runtime.object_tasks._tools,
+                "is_sync_side_effect_tool",
+                observe_classification,
+            )
+
+            cancelled = runtime.object_tasks.cancel(
+                task.task_id,
+                actor_pid=pid,
+                reason="no longer needed",
+            )
+
+            assert classified_tools == [task.tool_id]
             assert cancelled.status == ObjectTaskStatus.CANCELLED
             assert runtime.process.get(str(cancelled.runner_pid)).status == ProcessStatus.KILLED
         finally:

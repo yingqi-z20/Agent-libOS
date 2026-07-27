@@ -639,11 +639,14 @@ class ToolBroker:
         return self.registry.process_has_tool(pid, handle)
 
     def is_sync_side_effect_tool(self, tool: ToolHandle | str) -> bool:
-        handle = self.resolve(tool)
-        implementation = self.registry.implementation(handle.tool_id)
-        if implementation is None:
-            return False
-        return isinstance(implementation, SyncAgentTool) and bool(implementation.spec().policy.get("side_effects"))
+        with self._registry_lifecycle_lock():
+            handle = self._resolve_locked(tool)
+            implementation = self.registry.implementation(handle.tool_id)
+            if implementation is None:
+                return False
+            return isinstance(implementation, SyncAgentTool) and bool(
+                implementation.spec().policy.get("side_effects")
+            )
 
     def propose(
         self,

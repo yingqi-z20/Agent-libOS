@@ -2133,6 +2133,7 @@
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_disabled_does_not_notify_runner",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_owner_watch_terminal_task_is_not_notified",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_pins_owner_object_after_creator_exit_until_task_completes",
+        "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_cancel_updates_task_and_runner_process",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_refuses_to_cancel_running_sync_side_effect_tool",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_object_task_reconciles_external_runner_kill",
         "tests/runtime/test_object_tasks.py::TestObjectTasks::test_runtime_reopen_marks_terminal_result_unavailable_when_payload_was_runtime_only",

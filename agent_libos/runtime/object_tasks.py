@@ -802,33 +802,50 @@ class ObjectTaskManager:
     def cancel(self, task_id: str, *, actor_pid: str, reason: str | None = None) -> ObjectTask:
         selected_reason = self._messages.validate_body(str(reason or "cancelled"))
         self._refresh_task_from_runner(self._get(task_id))
-        with self._lock, self._records.transaction():
+        # Tool execution resolves under the registry lifecycle lock and then
+        # reads the Store. Never invert that order by resolving a tool while a
+        # Store transaction is held: cancellation can otherwise deadlock the
+        # worker at registry -> Store versus Store -> registry. The task lock
+        # keeps its status/tool binding stable across classification and the
+        # following transaction.
+        with self._lock:
             task = self._get(task_id)
-            decision = self._require_task_mutable(actor_pid, task)
-            if task.status == ObjectTaskStatus.RUNNING and self._tools.is_sync_side_effect_tool(task.tool):
-                raise ValidationError(
-                    f"running synchronous side-effect object task cannot be safely cancelled: {task_id}"
+            running_sync_side_effect = (
+                task.status == ObjectTaskStatus.RUNNING
+                and self._tools.is_sync_side_effect_tool(
+                    task.tool_id or task.tool
                 )
-            with self._capabilities.authority_transaction(
-                [decision],
-                actor=actor_pid,
-                operation="object task cancellation",
-            ):
-                cancelled = (
-                    task
-                    if task.status in _TERMINAL_STATUSES
-                    else self._state.mark_cancelled(
-                        task,
-                        actor=actor_pid,
-                        reason=selected_reason,
+            )
+            with self._records.transaction():
+                task = self._get(task_id)
+                decision = self._require_task_mutable(actor_pid, task)
+                if (
+                    task.status == ObjectTaskStatus.RUNNING
+                    and running_sync_side_effect
+                ):
+                    raise ValidationError(
+                        f"running synchronous side-effect object task cannot be safely cancelled: {task_id}"
                     )
-                )
-            if task.status in _TERMINAL_STATUSES:
-                return cancelled
-            future = self._futures.get(task_id)
-            if future is not None:
-                future.cancel()
-            self._cleanup_task_state_locked(cancelled.task_id)
+                with self._capabilities.authority_transaction(
+                    [decision],
+                    actor=actor_pid,
+                    operation="object task cancellation",
+                ):
+                    cancelled = (
+                        task
+                        if task.status in _TERMINAL_STATUSES
+                        else self._state.mark_cancelled(
+                            task,
+                            actor=actor_pid,
+                            reason=selected_reason,
+                        )
+                    )
+                if task.status in _TERMINAL_STATUSES:
+                    return cancelled
+                future = self._futures.get(task_id)
+                if future is not None:
+                    future.cancel()
+                self._cleanup_task_state_locked(cancelled.task_id)
         return cancelled
 
     def wait(self, task_id: str, *, actor_pid: str | None = None, timeout: float | None = None) -> ObjectTask:
