@@ -950,7 +950,21 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
                     "lane": "self-evolution",
                     "shard_args": "",
                 },
-                {"name": "providers", "lane": "providers", "shard_args": ""},
+                {
+                    "name": "providers 1/3",
+                    "lane": "providers",
+                    "shard_args": "--shard-count 3 --shard-index 0",
+                },
+                {
+                    "name": "providers 2/3",
+                    "lane": "providers",
+                    "shard_args": "--shard-count 3 --shard-index 1",
+                },
+                {
+                    "name": "providers 3/3",
+                    "lane": "providers",
+                    "shard_args": "--shard-count 3 --shard-index 2",
+                },
                 {"name": "benchmark", "lane": "benchmark", "shard_args": ""},
             ]
         },

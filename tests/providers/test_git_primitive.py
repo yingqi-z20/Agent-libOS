@@ -58,6 +58,12 @@ from agent_libos.substrate import (
 
 _T = TypeVar("_T")
 
+# Git for Windows performs the same repository-identity and lineage checks with
+# substantially higher process and filesystem latency. Keep the platform's
+# already-established 300-second ceiling consistent across this module; the
+# provider lane retains its independent hard deadline.
+pytestmark = pytest.mark.timeout(300 if os.name == "nt" else 120)
+
 
 class _LegacyGitProvider:
     """1.0.0-shape adapter with no subprocess supervision extensions."""
@@ -2838,7 +2844,6 @@ def test_staged_only_restore_needs_no_filesystem_authority(
         runtime.close()
 
 
-@pytest.mark.timeout(300 if os.name == "nt" else 120)
 def test_local_branch_switch_stash_integrate_restore_reset_and_clean(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
@@ -3841,7 +3846,6 @@ def test_post_dispatch_git_failure_is_retained_as_unknown(
         runtime.close()
 
 
-@pytest.mark.timeout(300 if os.name == "nt" else 120)
 def test_non_fast_forward_push_and_exact_force_with_lease(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     remote = tmp_path / "remote.git"
@@ -4042,7 +4046,6 @@ def test_pull_defaults_to_the_capability_scoped_current_branch(tmp_path: Path) -
         runtime.close()
 
 
-@pytest.mark.timeout(300 if os.name == "nt" else 120)
 def test_repository_content_high_water_covers_all_patch_scopes_and_renames(
     tmp_path: Path,
 ) -> None:

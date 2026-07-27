@@ -98,29 +98,46 @@ class TestTestMatrix:
 
         assert command[4:6] == ["--durations", "25"]
 
-    def test_runtime_shards_are_complete_disjoint_and_weight_balanced(self) -> None:
-        first = test_matrix._commands_for(
-            _args(lane="runtime", shard_count=2, shard_index=0)
-        )[0]
-        second = test_matrix._commands_for(
-            _args(lane="runtime", shard_count=2, shard_index=1)
-        )[0]
-        first_paths = set(first.invariant_test_paths or ())
-        second_paths = set(second.invariant_test_paths or ())
+    @pytest.mark.parametrize(
+        ("lane", "shard_count"),
+        [("runtime", 2), ("providers", 3)],
+    )
+    def test_lane_shards_are_complete_disjoint_and_weight_balanced(
+        self,
+        lane: str,
+        shard_count: int,
+    ) -> None:
+        commands = [
+            test_matrix._commands_for(
+                _args(
+                    lane=lane,
+                    shard_count=shard_count,
+                    shard_index=shard_index,
+                )
+            )[0]
+            for shard_index in range(shard_count)
+        ]
+        shard_paths = [
+            set(command.invariant_test_paths or ()) for command in commands
+        ]
         expected = {
             path.relative_to(test_matrix.ROOT).as_posix()
-            for path in (test_matrix.ROOT / "tests/runtime").glob("test_*.py")
+            for path in (
+                test_matrix.ROOT / test_matrix.LANE_PATHS[lane][0]
+            ).glob("test_*.py")
         }
 
-        assert first.name == "pytest runtime shard 1/2"
-        assert second.name == "pytest runtime shard 2/2"
-        assert first_paths
-        assert second_paths
-        assert first_paths.isdisjoint(second_paths)
-        assert first_paths | second_paths == expected
+        assert [command.name for command in commands] == [
+            f"pytest {lane} shard {index + 1}/{shard_count}"
+            for index in range(shard_count)
+        ]
+        assert all(shard_paths)
+        combined = set().union(*shard_paths)
+        assert sum(len(paths) for paths in shard_paths) == len(combined)
+        assert combined == expected
         weights = [
             sum((test_matrix.ROOT / path).stat().st_size for path in paths)
-            for paths in (first_paths, second_paths)
+            for paths in shard_paths
         ]
         assert max(weights) - min(weights) <= max(
             (test_matrix.ROOT / path).stat().st_size for path in expected
