@@ -134,6 +134,13 @@ class TestLLMPromptModes:
             assert capture.seen[0]["llm_transcript_output_key"].startswith("llmcall_")
             assert capture.seen[0]["llm_tool_call_id"] == "provider-tool-call-7"
             assert capture.seen[0]["llm_tool_name"] == "capture_tool_identity"
+            assert capture.seen[0]["llm_tool_raw_arguments_sha256"] == hashlib.sha256(
+                json.dumps(
+                    {"value": "one"},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
         finally:
             runtime.close()
 
@@ -198,8 +205,71 @@ class TestLLMPromptModes:
                 second["llm_transcript_output_key"]
                 == first["llm_transcript_output_key"]
             )
+            assert (
+                second["llm_tool_raw_arguments_sha256"]
+                == first["llm_tool_raw_arguments_sha256"]
+                == hashlib.sha256(
+                    json.dumps(
+                        {"value": "resume"},
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
             assert "human_resume_request_id" not in first
             assert second["human_resume_request_id"] == waiting["request_id"]
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_call_raw_argument_hashes_follow_call_indices(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, parallel_tool_calls=True),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            capture = _CaptureToolIdentity()
+            runtime.tools.register_tool(capture, registered_by="test", ephemeral=True)
+            runtime.register_image(
+                AgentImage(
+                    image_id="parallel-tool-call-identity:v0",
+                    name="parallel-tool-call-identity",
+                    system_prompt="Capture both provider tool-call identities.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=[capture.name],
+                ),
+                actor="test",
+            )
+            runtime.llm.client = ScriptedTranscriptClient(
+                [[
+                    _tool_call("parallel-call-a", capture.name, {"value": "a"}),
+                    _tool_call("parallel-call-b", capture.name, {"value": "b"}),
+                ]]
+            )
+            pid = runtime.process.spawn(
+                image="parallel-tool-call-identity:v0",
+                goal="capture both calls",
+            )
+
+            result = runtime.run_process_once(pid)
+
+            assert result["ok"] and result["executed_count"] == 2
+            assert [item["llm_tool_call_id"] for item in capture.seen] == [
+                "parallel-call-a",
+                "parallel-call-b",
+            ]
+            assert [
+                item["llm_tool_raw_arguments_sha256"] for item in capture.seen
+            ] == [
+                hashlib.sha256(
+                    json.dumps(
+                        {"value": value},
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                for value in ("a", "b")
+            ]
         finally:
             runtime.close()
 

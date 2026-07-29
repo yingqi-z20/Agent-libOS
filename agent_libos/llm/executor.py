@@ -2021,8 +2021,14 @@ class LLMProcessExecutor:
         response_id: str | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
+        raw_arguments_sha256: str | None = None,
         pending_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._validate_pending_raw_arguments_hash(
+            action,
+            tool_call_id=tool_call_id,
+            raw_arguments_sha256=raw_arguments_sha256,
+        )
         resume_token = self._persist_pending_action(
             pid,
             wait_type="human",
@@ -2212,8 +2218,14 @@ class LLMProcessExecutor:
         response_id: str | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
+        raw_arguments_sha256: str | None = None,
         pending_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._validate_pending_raw_arguments_hash(
+            action,
+            tool_call_id=tool_call_id,
+            raw_arguments_sha256=raw_arguments_sha256,
+        )
         resume_token = self._persist_pending_action(
             pid,
             wait_type="child",
@@ -2264,8 +2276,14 @@ class LLMProcessExecutor:
         response_id: str | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
+        raw_arguments_sha256: str | None = None,
         pending_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._validate_pending_raw_arguments_hash(
+            action,
+            tool_call_id=tool_call_id,
+            raw_arguments_sha256=raw_arguments_sha256,
+        )
         resume_token = self._persist_pending_action(
             pid,
             wait_type="message",
@@ -2702,13 +2720,24 @@ class LLMProcessExecutor:
     def _pending_resume_token(pending: dict[str, Any]) -> str:
         return pending_resume_token(pending)
 
-    @staticmethod
-    def _pending_tool_call_context(pending: dict[str, Any]) -> dict[str, str | None]:
-        return {
+    @classmethod
+    def _pending_tool_call_context(cls, pending: dict[str, Any]) -> dict[str, str | None]:
+        context: dict[str, str | None] = {
             "response_id": str(pending["response_id"]) if pending.get("response_id") else None,
             "tool_call_id": str(pending["tool_call_id"]) if pending.get("tool_call_id") else None,
             "tool_name": str(pending["tool_name"]) if pending.get("tool_name") else None,
         }
+        # The durable pending action is the exact, already-canonicalized object
+        # selected from the provider tool call.  Recompute the pre-Pydantic
+        # argument hash from that action on every resume instead of persisting a
+        # second mutable copy of the hash.
+        action = pending.get("action")
+        context["raw_arguments_sha256"] = (
+            cls._canonical_action_arguments_sha256(action)
+            if context["tool_call_id"] and isinstance(action, Mapping)
+            else None
+        )
+        return context
 
     @staticmethod
     def _host_auto_wait_metadata() -> dict[str, Any]:
@@ -2854,7 +2883,45 @@ class LLMProcessExecutor:
         )
 
     @staticmethod
-    def _completion_tool_call_context(completion: Any, *, index: int) -> dict[str, str | None]:
+    def _canonical_action_arguments_sha256(action: Mapping[str, Any]) -> str:
+        """Hash the canonical raw argument object before tool schema parsing."""
+
+        arguments = {
+            str(key): value
+            for key, value in action.items()
+            if key != "action"
+        }
+        return hashlib.sha256(dumps(arguments).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _validate_pending_raw_arguments_hash(
+        cls,
+        action: Mapping[str, Any],
+        *,
+        tool_call_id: str | None,
+        raw_arguments_sha256: str | None,
+    ) -> None:
+        if not tool_call_id:
+            if raw_arguments_sha256 is not None:
+                raise ValueError(
+                    "host-generated action cannot carry a provider raw-arguments hash"
+                )
+            return
+        expected = cls._canonical_action_arguments_sha256(action)
+        if not isinstance(raw_arguments_sha256, str) or not hmac.compare_digest(
+            raw_arguments_sha256,
+            expected,
+        ):
+            raise ValueError(
+                "provider tool-call raw arguments changed before pending persistence"
+            )
+
+    def _completion_tool_call_context(
+        self,
+        completion: Any,
+        *,
+        index: int,
+    ) -> dict[str, str | None]:
         response_id = str(
             getattr(completion, "_agent_libos_transcript_output_key", None)
             or getattr(completion, "response_id", "")
@@ -2862,18 +2929,46 @@ class LLMProcessExecutor:
         ) or None
         tool_calls = list(getattr(completion, "tool_calls", []) or [])
         if not tool_calls:
-            return {"response_id": response_id, "tool_call_id": None, "tool_name": None}
+            return {
+                "response_id": response_id,
+                "tool_call_id": None,
+                "tool_name": None,
+                "raw_arguments_sha256": None,
+            }
         try:
             tool_call = tool_calls[index]
         except IndexError:
-            return {"response_id": response_id, "tool_call_id": None, "tool_name": None}
+            return {
+                "response_id": response_id,
+                "tool_call_id": None,
+                "tool_name": None,
+                "raw_arguments_sha256": None,
+            }
         if not isinstance(tool_call, dict):
-            return {"response_id": response_id, "tool_call_id": None, "tool_name": None}
+            return {
+                "response_id": response_id,
+                "tool_call_id": None,
+                "tool_name": None,
+                "raw_arguments_sha256": None,
+            }
+        action = tool_call_to_action(
+            tool_call,
+            max_argument_bytes=(
+                self.config.tools.tool_call_args_hard_limit_bytes
+            ),
+        )
         call_id = str(
             tool_call.get("call_id") or tool_call.get("id") or ""
         ).strip() or None
         tool_name = str(tool_call.get("name") or "").strip() or None
-        return {"response_id": response_id, "tool_call_id": call_id, "tool_name": tool_name}
+        return {
+            "response_id": response_id,
+            "tool_call_id": call_id,
+            "tool_name": tool_name,
+            "raw_arguments_sha256": self._canonical_action_arguments_sha256(
+                action
+            ),
+        }
 
     @staticmethod
     def _tool_context_identity_metadata(
@@ -2886,6 +2981,7 @@ class LLMProcessExecutor:
             ("response_id", "llm_transcript_output_key"),
             ("tool_call_id", "llm_tool_call_id"),
             ("tool_name", "llm_tool_name"),
+            ("raw_arguments_sha256", "llm_tool_raw_arguments_sha256"),
         ):
             value = context.get(source)
             if isinstance(value, str) and value:
@@ -2913,7 +3009,12 @@ class LLMProcessExecutor:
             or getattr(completion, "response_id", "")
             or ""
         ) or None
-        return {"response_id": response_id, "tool_call_id": None, "tool_name": None}
+        return {
+            "response_id": response_id,
+            "tool_call_id": None,
+            "tool_name": None,
+            "raw_arguments_sha256": None,
+        }
 
     @staticmethod
     def _image_only_expected_tool_outputs(
@@ -3001,8 +3102,10 @@ class LLMProcessExecutor:
         response_id: str | None,
         tool_call_id: str | None,
         tool_name: str | None,
+        raw_arguments_sha256: str | None = None,
         synthetic: bool = False,
     ) -> None:
+        del raw_arguments_sha256
         if not response_id or not tool_call_id or not self.config.llm.persist_full_io:
             return
         call = self._processes.get_latest_llm_call(pid=pid, purpose="action_selection")

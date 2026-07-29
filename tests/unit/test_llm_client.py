@@ -712,6 +712,11 @@ class TestLLMClient:
         assert 'prompt_cache_retention' not in completions.payloads[2]
         assert 'safety_identifier' not in completions.payloads[3]
         assert completion.provider_request_options == {
+            'requested_model': 'compat-model',
+            'max_completion_tokens': 16_384,
+            'generation_token_limit_parameter': 'max_completion_tokens',
+            'timeout_s': 60.0,
+            'enable_thinking': None,
             'prompt_cache_key_sent': False,
             'prompt_cache_retention': None,
             'prompt_cache_options_sent': False,
@@ -1200,6 +1205,175 @@ class TestLLMClient:
             api='responses',
         )
         assert retry is None
+
+    def test_explicitly_enabled_thinking_incompatibility_fails_closed(
+        self,
+        monkeypatch,
+    ) -> None:
+        completed = SimpleNamespace(
+            id='chatcmpl_unused',
+            model='compat-model',
+            choices=[
+                SimpleNamespace(
+                    finish_reason='stop',
+                    message=SimpleNamespace(content='unused', tool_calls=[]),
+                )
+            ],
+        )
+        completions = FakeChatCompletions(
+            [Exception('unknown parameter enable_thinking'), completed]
+        )
+        client = LLMClient(
+            base_url='https://example.com/compatible/v1',
+            model='compat-model',
+            api_key='key',
+            api_mode='chat',
+            allow_custom_base_url=True,
+            enable_thinking=True,
+        )
+        client._async_client = FakeAsyncOpenAI(chat=FakeChat(completions))
+        monkeypatch.setattr(
+            llm_client_module,
+            '_is_openai_sdk_error',
+            lambda _exc: True,
+        )
+
+        with pytest.raises(LLMError):
+            asyncio.run(
+                client.acomplete(
+                    [{'role': 'user', 'content': 'answer'}],
+                    json_mode=False,
+                )
+            )
+
+        assert len(completions.payloads) == 1
+        assert completions.payloads[0]['extra_body'] == {
+            'enable_thinking': True
+        }
+
+    def test_chat_token_name_fallback_preserves_fixed_value_and_thinking_telemetry(
+        self,
+        monkeypatch,
+    ) -> None:
+        completed = SimpleNamespace(
+            id='chatcmpl_compat_tokens',
+            model='compat-model',
+            choices=[
+                SimpleNamespace(
+                    finish_reason='stop',
+                    message=SimpleNamespace(content='ok', tool_calls=[]),
+                )
+            ],
+        )
+        completions = FakeChatCompletions(
+            [Exception('unknown parameter max_completion_tokens'), completed]
+        )
+        client = LLMClient(
+            base_url='https://example.com/compatible/v1',
+            model='compat-model',
+            api_key='key',
+            api_mode='chat',
+            allow_custom_base_url=True,
+            timeout=240.0,
+            enable_thinking=True,
+        )
+        client._async_client = FakeAsyncOpenAI(chat=FakeChat(completions))
+        monkeypatch.setattr(
+            llm_client_module,
+            '_is_openai_sdk_error',
+            lambda _exc: True,
+        )
+
+        completion = asyncio.run(
+            client.acomplete_with_metadata(
+                [{'role': 'user', 'content': 'answer'}],
+                max_tokens=65_536,
+                json_mode=False,
+            )
+        )
+
+        assert len(completions.payloads) == 2
+        assert completions.payloads[0]['max_completion_tokens'] == 65_536
+        assert completions.payloads[1]['max_tokens'] == 65_536
+        assert completions.payloads[1]['extra_body'] == {
+            'enable_thinking': True
+        }
+        assert completion.provider_request_options[
+            'generation_token_limit_parameter'
+        ] == 'max_tokens'
+        assert completion.provider_request_options['requested_model'] == 'compat-model'
+        assert completion.provider_request_options['max_completion_tokens'] == 65_536
+        assert completion.provider_request_options['timeout_s'] == 240.0
+        assert completion.provider_request_options['enable_thinking'] is True
+        assert completion.compatibility_removed_options == [
+            'max_completion_tokens'
+        ]
+
+    def test_requested_and_response_models_are_distinct_metadata(self) -> None:
+        provider_response = SimpleNamespace(
+            id='chatcmpl_routed',
+            model='provider-routed-backend',
+            choices=[
+                SimpleNamespace(
+                    finish_reason='stop',
+                    message=SimpleNamespace(content='ok', tool_calls=[]),
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(
+            chat=FakeChat(FakeChatCompletions(provider_response))
+        )
+        client = LLMClient(
+            model='qwen3.7-max',
+            api_key='key',
+            api_mode='chat',
+        )
+        client._async_client = fake
+
+        completion = asyncio.run(
+            client.acomplete_with_metadata(
+                [{'role': 'user', 'content': 'answer'}],
+                json_mode=False,
+            )
+        )
+
+        assert completion.provider_request_options['requested_model'] == 'qwen3.7-max'
+        assert completion.model == 'provider-routed-backend'
+
+    def test_required_max_completion_tokens_rejects_parameter_name_fallback(
+        self,
+        monkeypatch,
+    ) -> None:
+        completions = FakeChatCompletions(
+            [Exception('unknown parameter max_completion_tokens')]
+        )
+        client = LLMClient(
+            base_url='https://example.com/formal-evaluation/v1',
+            model='formal-model',
+            api_key='key',
+            api_mode='chat',
+            allow_custom_base_url=True,
+            require_max_completion_tokens=True,
+        )
+        client._async_client = FakeAsyncOpenAI(chat=FakeChat(completions))
+        monkeypatch.setattr(
+            llm_client_module,
+            '_is_openai_sdk_error',
+            lambda _exc: True,
+        )
+
+        with pytest.raises(LLMError):
+            asyncio.run(
+                client.acomplete_with_metadata(
+                    [{'role': 'user', 'content': 'answer'}],
+                    max_tokens=65_536,
+                    json_mode=False,
+                )
+            )
+
+        assert len(completions.payloads) == 1
+        assert completions.payloads[0]['max_completion_tokens'] == 65_536
+        assert 'max_tokens' not in completions.payloads[0]
 
     def test_new_prompt_cache_options_incompatibility_can_downgrade(self) -> None:
         client = LLMClient(model='gpt-test', api_key='key', api_mode='responses')

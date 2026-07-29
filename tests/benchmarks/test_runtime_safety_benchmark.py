@@ -2507,6 +2507,8 @@ class TestRuntimeSafetyBenchmark:
         assert summary['runner_failures'] == 0
         assert summary['invalid_runs'] == 1
         metadata = json.loads((output / 'metadata.json').read_text(encoding='utf-8'))
+        assert metadata['historical_results_allowed'] is False
+        assert metadata['historical_inputs'] == []
         provenance = metadata['provenance']
         assert provenance['schema_version'] == 1
         assert isinstance(provenance['git']['dirty'], bool)
@@ -2544,6 +2546,26 @@ class TestRuntimeSafetyBenchmark:
         )
 
         assert [entry['path'] for entry in task_entries] == ['tasks/selected.yaml']
+
+    def test_fixture_provenance_ignores_interpreter_and_os_cache_files(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        fixture = tmp_path / 'fixture'
+        fixture.mkdir()
+        source = fixture / 'app.py'
+        source.write_text('VALUE = 1\n', encoding='utf-8')
+        expected = run_benchmark_module._hash_path(fixture)
+
+        cache = fixture / '__pycache__'
+        cache.mkdir()
+        (cache / 'app.cpython-311.pyc').write_bytes(b'runtime cache')
+        (fixture / 'loose.pyc').write_bytes(b'loose runtime cache')
+        (fixture / '.DS_Store').write_bytes(b'finder metadata')
+
+        assert run_benchmark_module._hash_path(fixture) == expected
+        source.write_text('VALUE = 2\n', encoding='utf-8')
+        assert run_benchmark_module._hash_path(fixture) != expected
 
     def test_workload_provenance_hashes_loaded_yaml_not_same_id_yml(
         self,
@@ -2633,14 +2655,16 @@ class TestRuntimeSafetyBenchmark:
         write_metrics(output)
         assert (output / 'metrics.json').exists()
         assert (output / 'metrics.csv').exists()
-        monkeypatch.setattr(run_benchmark_module, '_build_provenance', lambda *args, **kwargs: {})
+        old_metadata_bytes = (output / 'metadata.json').read_bytes()
+        old_results_bytes = (output / 'results.jsonl').read_bytes()
+        old_effects_bytes = (output / 'effects.jsonl').read_bytes()
 
-        def interrupt(*args: object, **kwargs: object) -> list[TaskRun]:
-            raise RuntimeError('injected interruption')
+        def must_not_run(*args: object, **kwargs: object) -> list[TaskRun]:
+            raise AssertionError('pre-existing output must fail before execution')
 
-        monkeypatch.setattr(run_benchmark_module, 'run_suite', interrupt)
+        monkeypatch.setattr(run_benchmark_module, 'run_suite', must_not_run)
 
-        with pytest.raises(RuntimeError, match='injected interruption'):
+        with pytest.raises(SystemExit, match='must not already exist'):
             run_benchmark_module.main(
                 [
                     '--suite',
@@ -2654,20 +2678,13 @@ class TestRuntimeSafetyBenchmark:
                 ]
             )
 
-        new_metadata = json.loads(
-            (output / 'metadata.json').read_text(encoding='utf-8')
-        )
-        metrics = collect_metrics(output)
-        reasons = '\n'.join(metrics['invalid_reasons'])
-
-        assert new_metadata['run_id'] != old_metadata['run_id']
-        assert new_metadata['completion_state'] == 'in_progress'
-        assert not (output / 'summary.json').exists()
-        assert not (output / 'metrics.json').exists()
-        assert not (output / 'metrics.csv').exists()
-        assert metrics['valid'] is False
-        assert "requires completion_state='complete'" in reasons
-        assert 'run_id' in reasons and 'expected' in reasons
+        assert json.loads((output / 'metadata.json').read_text(encoding='utf-8')) == old_metadata
+        assert (output / 'metadata.json').read_bytes() == old_metadata_bytes
+        assert (output / 'results.jsonl').read_bytes() == old_results_bytes
+        assert (output / 'effects.jsonl').read_bytes() == old_effects_bytes
+        assert (output / 'summary.json').exists()
+        assert (output / 'metrics.json').exists()
+        assert (output / 'metrics.csv').exists()
 
     def test_benchmark_git_provenance_rejects_active_repository_filter(
         self,

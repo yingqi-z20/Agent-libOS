@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import replace
 from types import MethodType
 from typing import Any, Mapping, Sequence
@@ -9,7 +10,24 @@ from agent_libos.models import (
     Capability,
     CapabilityDecision,
     CapabilityEffect,
+    DataFlowOutcome,
+    DataIntegrity,
+    integrity_rank,
 )
+
+
+BENCHMARK_ONLY_ADMISSION_ABLATIONS: dict[str, dict[str, str | bool]] = {
+    "no_task_ceiling": {
+        "benchmark_only": True,
+        "removed_gate": "task_authority_provider_effect_ceiling",
+        "isolation": "per_runtime_instance_method_override",
+    },
+    "no_sink_clearance": {
+        "benchmark_only": True,
+        "removed_gate": "data_flow_sink_sensitivity_identity_clearance",
+        "isolation": "per_runtime_instance_method_override",
+    },
+}
 
 
 class BenchmarkNoPrimitiveApprovalEvaluator(CapabilityEvaluator):
@@ -75,6 +93,110 @@ def install_agent_libos_ablation(runtime: Any, runner: str) -> None:
         _install_no_git_approval(runtime)
     elif runner == "no_fork_attenuation":
         _install_no_fork_attenuation(runtime)
+    elif runner == "no_task_ceiling":
+        _install_no_task_ceiling(runtime)
+    elif runner == "no_sink_clearance":
+        _install_no_sink_clearance(runtime)
+
+
+def benchmark_only_ablation_metadata(runner: str) -> dict[str, str | bool] | None:
+    """Return a detached, machine-readable label for unsafe benchmark bypasses."""
+
+    selected = BENCHMARK_ONLY_ADMISSION_ABLATIONS.get(runner)
+    return dict(selected) if selected is not None else None
+
+
+def _install_no_task_ceiling(runtime: Any) -> None:
+    """Remove only Task Authority's provider effect-class ceiling.
+
+    Capability checks, Sink clearance, resource accounting, provider contracts,
+    and effect evidence remain unchanged.  Replacing a bound method on the
+    freshly constructed benchmark instance makes this intervention impossible
+    to select through production configuration.
+    """
+
+    def assert_effect_without_task_ceiling(
+        authority_manifests: Any,
+        pid: str,
+        effect_class: str,
+    ) -> None:
+        del effect_class
+        manifest = authority_manifests.get_for_process(pid)
+        if manifest is not None:
+            # Preserve production hash/provenance validation in ``get`` and
+            # expiry enforcement in ``_require_live``.  Only the final
+            # permitted-effect pattern comparison is omitted.
+            authority_manifests._require_live(manifest)  # noqa: SLF001
+
+    runtime.authority_manifests.assert_effect = MethodType(
+        assert_effect_without_task_ceiling,
+        runtime.authority_manifests,
+    )
+
+
+def _install_no_sink_clearance(runtime: Any) -> None:
+    """Remove only Sink sensitivity/identity clearance on this Runtime.
+
+    The surrounding ``authorize_egress`` path still validates source snapshots,
+    target versions, registry generations, minimum integrity, conditional
+    one-shot release, and ordinary authority.  It also records an explicit
+    counterfactual clearance error when the benchmark bypass changes an allow
+    decision.  This is a private instance override, not a Runtime option or
+    Host API.
+    """
+
+    original_clearance_error = runtime.data_flow._clearance_error  # noqa: SLF001
+    original_record_decision = runtime.data_flow._record_decision  # noqa: SLF001
+    counterfactual_error: ContextVar[str | None] = ContextVar(
+        f"benchmark_sink_clearance_error_{id(runtime.data_flow)}",
+        default=None,
+    )
+
+    def clearance_without_sink_gate(
+        data_flow: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> str | None:
+        del data_flow
+        error = original_clearance_error(*args, **kwargs)
+        counterfactual_error.set(error)
+        if error is None:
+            return None
+        labels = args[1] if len(args) >= 2 else kwargs.get("labels")
+        minimum_integrity = DataIntegrity(
+            kwargs.get("minimum_integrity", DataIntegrity.UNTRUSTED)
+        )
+        if labels is not None and integrity_rank(labels.integrity) < integrity_rank(
+            minimum_integrity
+        ):
+            # Integrity is an operation-contract floor, not the Sink
+            # sensitivity/identity predicate under test.
+            return error
+        return None
+
+    def record_decision_with_bypass_evidence(
+        data_flow: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        del data_flow
+        bypassed = counterfactual_error.get()
+        counterfactual_error.set(None)
+        if kwargs.get("outcome") is DataFlowOutcome.ALLOW and bypassed is not None:
+            kwargs["reason"] = (
+                "BENCHMARK-ONLY bypassed Sink sensitivity/identity clearance: "
+                f"{bypassed}"
+            )
+        return original_record_decision(*args, **kwargs)
+
+    runtime.data_flow._clearance_error = MethodType(  # noqa: SLF001
+        clearance_without_sink_gate,
+        runtime.data_flow,
+    )
+    runtime.data_flow._record_decision = MethodType(  # noqa: SLF001
+        record_decision_with_bypass_evidence,
+        runtime.data_flow,
+    )
 
 
 def _install_no_fork_attenuation(runtime: Any) -> None:
@@ -234,7 +356,9 @@ def sandbox_only_denial_reason(action: Mapping[str, Any]) -> str | None:
 
 
 __all__ = [
+    "BENCHMARK_ONLY_ADMISSION_ABLATIONS",
     "BenchmarkNoPrimitiveApprovalEvaluator",
+    "benchmark_only_ablation_metadata",
     "install_agent_libos_ablation",
     "sandbox_only_denial_reason",
 ]

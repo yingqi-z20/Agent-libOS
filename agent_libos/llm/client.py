@@ -108,6 +108,7 @@ class LLMClient:
     inherit_ambient_openai_sdk_config: bool = True
     allow_custom_base_url: bool = False
     defaults: LLMDefaults = field(default_factory=lambda: DEFAULT_CONFIG.llm, repr=False)
+    require_max_completion_tokens: bool = False
     _client: Any | None = field(default=None, init=False, repr=False)
     _async_client: Any | None = field(default=None, init=False, repr=False)
 
@@ -768,9 +769,19 @@ class LLMClient:
         retry = dict(payload)
 
         if "enable_thinking" in message and "extra_body" in retry:
+            # An explicitly enabled thinking mode is part of the caller's
+            # requested evaluation semantics.  Silently dropping it would
+            # turn a successful compatibility retry into a different model
+            # configuration, so fail closed instead.  The legacy downgrade
+            # remains available only when thinking was not explicitly enabled.
+            configured, enabled = self._enable_thinking_setting()
+            if configured and enabled:
+                return None
             retry.pop("extra_body", None)
             return retry
         if "max_completion_tokens" in message and "max_completion_tokens" in retry:
+            if self.require_max_completion_tokens:
+                return None
             retry["max_tokens"] = retry.pop("max_completion_tokens")
             return retry
         if "max_tokens" in message and "max_tokens" in retry:
@@ -893,7 +904,8 @@ class LLMClient:
             usage=_usage_from_response(response),
             reasoning=_reasoning_from_response(response),
             provider_request_options=_provider_request_option_observation(
-                provider_call.request
+                provider_call.request,
+                timeout_s=self.timeout,
             ),
             compatibility_removed_options=sorted(
                 set(additional_removed).union(
@@ -973,7 +985,8 @@ class LLMClient:
             usage=_usage_from_response(completion),
             reasoning=_reasoning_from_chat_message(message),
             provider_request_options=_provider_request_option_observation(
-                provider_call.request
+                provider_call.request,
+                timeout_s=self.timeout,
             ),
             compatibility_removed_options=sorted(
                 set(additional_removed).union(
@@ -1436,10 +1449,50 @@ def _messages_have_unrepresentable_tool_output(messages: list[dict[str, Any]]) -
 
 def _provider_request_option_observation(
     request: dict[str, Any],
+    *,
+    timeout_s: float | None,
 ) -> dict[str, Any]:
     """Return non-secret facts about the request that actually succeeded."""
 
+    token_parameter = next(
+        (
+            name
+            for name in (
+                "max_completion_tokens",
+                "max_tokens",
+                "max_output_tokens",
+            )
+            if name in request
+        ),
+        None,
+    )
+    extra_body = request.get("extra_body")
+    enable_thinking = (
+        extra_body.get("enable_thinking")
+        if isinstance(extra_body, dict)
+        else None
+    )
+
     return {
+        # Bind the telemetry to the exact model label on the request that
+        # succeeded.  This is intentionally distinct from ``LLMCompletion``'s
+        # provider-authored response model, which may be an alias or a routed
+        # backend identifier.
+        "requested_model": (
+            request.get("model")
+            if isinstance(request.get("model"), str) and request.get("model")
+            else None
+        ),
+        # ``max_completion_tokens`` is the normalized evaluation quantity.
+        # ``generation_token_limit_parameter`` records which provider API
+        # spelling actually succeeded (Chat, legacy-compatible Chat, or
+        # Responses) without retaining any secret request data.
+        "max_completion_tokens": (
+            request.get(token_parameter) if token_parameter is not None else None
+        ),
+        "generation_token_limit_parameter": token_parameter,
+        "timeout_s": timeout_s,
+        "enable_thinking": enable_thinking,
         "prompt_cache_key_sent": "prompt_cache_key" in request,
         "prompt_cache_retention": request.get("prompt_cache_retention"),
         "prompt_cache_options_sent": "prompt_cache_options" in request,

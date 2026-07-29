@@ -42,6 +42,9 @@ _MAX_PROVENANCE_FILE_BYTES = 256 * 1024 * 1024
 _MAX_PROVENANCE_TREE_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_PROVENANCE_FILES = 100_000
 _PROVENANCE_CHUNK_BYTES = 1024 * 1024
+_TRANSIENT_PROVENANCE_DIRECTORIES = frozenset({"__pycache__"})
+_TRANSIENT_PROVENANCE_FILES = frozenset({".DS_Store"})
+_TRANSIENT_PROVENANCE_SUFFIXES = frozenset({".pyc", ".pyo"})
 
 
 @dataclass
@@ -128,12 +131,21 @@ def main(argv: list[str] | None = None) -> None:
                 + ", ".join(unsupported_runners)
             )
     output = Path(args.output)
+    try:
+        output.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise SystemExit(
+            "benchmark output directory must not already exist; use a fresh "
+            f"artifact path: {output}"
+        ) from exc
     run_id = f"run_{uuid.uuid4().hex}"
     with output_run_lease(output, run_id) as ownership_token:
         metadata: dict[str, Any] = {
             "output_schema_version": 2,
             "run_id": run_id,
             "completion_state": "in_progress",
+            "historical_results_allowed": False,
+            "historical_inputs": [],
             "suite": str(suite),
             "tasks": [task.id for task in tasks],
             "runners": runners,
@@ -148,7 +160,6 @@ def main(argv: list[str] | None = None) -> None:
             ),
         }
         _write_json_atomic(output / "metadata.json", metadata)
-        _clear_stale_derived_outputs(output)
         runs = run_suite(
             tasks,
             suite,
@@ -507,6 +518,19 @@ def _hash_path(path: Path) -> str:
                         raise RuntimeError(
                             "benchmark provenance exceeds the source entry limit"
                         )
+                    if (
+                        entry.name in _TRANSIENT_PROVENANCE_DIRECTORIES
+                        and entry.is_dir(follow_symlinks=False)
+                    ):
+                        continue
+                    if (
+                        entry.is_file(follow_symlinks=False)
+                        and (
+                            entry.name in _TRANSIENT_PROVENANCE_FILES
+                            or Path(entry.name).suffix in _TRANSIENT_PROVENANCE_SUFFIXES
+                        )
+                    ):
+                        continue
                     selected = Path(entry.path)
                     info = entry.stat(follow_symlinks=False)
                     if stat.S_ISDIR(info.st_mode):
@@ -609,11 +633,6 @@ def _write_json_atomic(path: Path, value: Any) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
-
-
-def _clear_stale_derived_outputs(output: Path) -> None:
-    for name in ("summary.json", "metrics.json", "metrics.csv"):
-        (output / name).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

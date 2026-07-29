@@ -225,10 +225,11 @@ persistence.
 - `metrics.csv`: stable CSV metrics columns.
 
 `summary.json` and `metrics.json` carry the same `run_id` as the completion
-manifest; `metrics.json` also declares `output_schema_version: 2`. Starting a
-new run in an existing output directory removes stale summary/metric files
-after installing the new `in_progress` manifest, so a prior favorable summary
-is not left beside an interrupted new run.
+manifest; `metrics.json` also declares `output_schema_version: 2`. The output
+directory must not already exist. A rerun therefore uses a new artifact path
+and never appends to, overwrites, or cleans a prior run. Preserve an interrupted
+attempt as excluded evidence and use another never-existing path for the next
+whole-run attempt.
 
 Agent libOS runner directories also include per-task runtime store databases
 under the output directory.
@@ -384,19 +385,19 @@ SHA-256 digests under `metadata.artifacts`, and only then atomically changes
 the state to `complete`. Metrics are valid only when the state is complete,
 every row has the manifest run id, both artifacts match their declared counts
 and hashes, every declared pair has exactly one result, and no result appears
-outside that matrix. Reusing an output directory therefore cannot combine a
-new interrupted run's metadata with an older run's results, and an interrupted
-write, truncated copy, or missing runner cannot be reported as a favorable
-partial sample.
+outside that matrix. The CLI additionally rejects every pre-existing output
+path, so a new attempt cannot combine its metadata with an older attempt's
+results. An interrupted write, truncated copy, or missing runner cannot be
+reported as a favorable partial sample.
 
 The output directory is protected by an exclusive
 `.runtime-safety-output.lock` acquired before the in-progress manifest is
 written. A concurrent benchmark process targeting the same directory fails
 closed instead of interleaving artifacts; different output directories can run
 concurrently. Normal context exit removes only the lock whose ownership token
-still matches. A process crash can leave that lock behind, so an operator must
-inspect the directory and confirm that no writer remains before removing a
-stale lock. Sequential reuse is safe under the artifact binding above.
+still matches. A process crash can leave that lock behind; preserve the whole
+directory as an excluded attempt and use a never-existing output path for the
+next CLI run.
 
 `write_run_outputs(...)` also supports direct programmatic/test callers. If no
 metadata file exists, that helper generates a run id and writes a

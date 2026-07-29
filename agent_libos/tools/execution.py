@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import math
 import threading
@@ -81,6 +82,7 @@ from agent_libos.utils.public_errors import (
     internal_exception_observation,
     public_error_envelope,
 )
+from agent_libos.utils.serde import dumps
 
 
 _TERMINAL_PROCESS_STATUSES = {
@@ -96,6 +98,63 @@ _DEFERRED_PROCESS_MESSAGE_ACK_METADATA_KEY = "_deferred_process_message_ack_ids"
 _PROCESS_MESSAGE_READ_TOOLS = frozenset(
     {"read_process_messages", "receive_process_messages"}
 )
+_PROVIDER_TOOL_OPERATION_IDENTITY_SCHEMA_VERSION = 1
+
+
+def _provider_tool_operation_metadata(
+    context_metadata: dict[str, Any] | None,
+    *,
+    selected_name: str,
+) -> dict[str, Any]:
+    """Persist a payload-free provider/native identity on one tool operation.
+
+    The LLM executor captures these four values before tool schema parsing and
+    passes them through trusted ``ToolContext`` metadata.  A tool can fail
+    before its wrapper runs, so the durable operation is the only common
+    evidence boundary shared by validation failures and wrapper outcomes.
+    Partial or inconsistent identity metadata is ignored so observability
+    cannot change ordinary tool semantics.  Evidence consumers that require
+    native provider identity fail closed when the envelope is absent.
+    """
+
+    metadata = context_metadata or {}
+    # Host-authored/fallback JSON actions may carry only the surrounding LLM
+    # response key.  They are not provider-native tool calls and therefore do
+    # not receive this identity envelope.
+    if not metadata.get("llm_tool_call_id"):
+        return {}
+    response_id = metadata.get("llm_transcript_output_key")
+    provider_tool_call_id = metadata.get("llm_tool_call_id")
+    tool_name = metadata.get("llm_tool_name")
+    raw_arguments_sha256 = metadata.get("llm_tool_raw_arguments_sha256")
+    if any(
+        not isinstance(value, str) or not value
+        for value in (
+            response_id,
+            provider_tool_call_id,
+            tool_name,
+            raw_arguments_sha256,
+        )
+    ):
+        return {}
+    if tool_name != selected_name:
+        return {}
+    if (
+        len(raw_arguments_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in raw_arguments_sha256)
+    ):
+        return {}
+    identity = {
+        "schema_version": _PROVIDER_TOOL_OPERATION_IDENTITY_SCHEMA_VERSION,
+        "llm_response_id": response_id,
+        "provider_tool_call_id": provider_tool_call_id,
+        "function": tool_name,
+        "raw_arguments_sha256": raw_arguments_sha256,
+    }
+    identity["identity_sha256"] = hashlib.sha256(
+        dumps(identity).encode("utf-8")
+    ).hexdigest()
+    return {"provider_tool_identity": identity}
 
 
 class JITSyscallSession(Protocol):
@@ -249,6 +308,10 @@ class ToolExecutionService:
             actor=pid,
             pid=pid,
             expected_roles=("invocation", "audit", "event"),
+            metadata=_provider_tool_operation_metadata(
+                context_metadata,
+                selected_name=selected_name,
+            ),
             operation_id=resume_id,
             parent_operation_id=parent_id,
             auto_finish=False,

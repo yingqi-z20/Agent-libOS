@@ -41,6 +41,7 @@ from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.utils.serde import loads, to_jsonable
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 from benchmarks.runtime_safety.ablations import (
+    benchmark_only_ablation_metadata,
     install_agent_libos_ablation,
     sandbox_only_denial_reason,
 )
@@ -104,13 +105,30 @@ RUNNER_INTERVENTIONS = {
         "Agent libOS runtime where each benchmark child receives an unattenuated copy of every "
         "active parent capability instead of authority derived from the requested child specs."
     ),
+    "no_task_ceiling": (
+        "BENCHMARK-ONLY per-Runtime intervention removing Task Authority provider-dispatch "
+        "effect-class ceiling checks; Capability, data-flow Sink clearance, provider contracts, "
+        "manifest hash/expiry, and evidence remain active."
+    ),
+    "no_sink_clearance": (
+        "BENCHMARK-ONLY per-Runtime intervention removing data-flow Sink sensitivity/identity "
+        "clearance only; source snapshot, target-version, minimum-integrity, conditional-release, "
+        "ordinary Capability, provider-contract, and evidence checks remain active."
+    ),
 }
+BENCHMARK_ONLY_EXPERIMENT_RUNNERS = frozenset(
+    {
+        "no_task_ceiling",
+        "no_sink_clearance",
+    }
+)
 AGENT_LIBOS_RUNNERS = {
     "agent_libos_full",
     "no_primitive_approval",
     "no_audit_linkage",
     "no_namespace_isolation",
     "no_fork_attenuation",
+    *BENCHMARK_ONLY_EXPERIMENT_RUNNERS,
 }
 _TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 _BENCHMARK_ACTION_KEYS = {
@@ -340,11 +358,44 @@ def run_task(
 ) -> TaskRun:
     if max_quanta is not None and max_quanta <= 0:
         raise ValueError("max_quanta must be a positive integer")
+    _validate_benchmark_only_experiment_runner(task, runner, llm_mode=llm_mode)
     if runner in AGENT_LIBOS_RUNNERS:
         return _run_agent_libos_task(task, suite_root, output_dir, runner=runner, llm_mode=llm_mode, max_quanta=max_quanta)
     if llm_mode == "real":
         raise ValueError("real LLM mode is only supported for Agent libOS runners")
     return _run_wrapper_task(task, suite_root, output_dir, runner=runner)
+
+
+def _validate_benchmark_only_experiment_runner(
+    task: BenchmarkTask,
+    runner: str,
+    *,
+    llm_mode: str,
+) -> None:
+    if runner not in BENCHMARK_ONLY_EXPERIMENT_RUNNERS:
+        return
+    if llm_mode != "mock":
+        raise ValueError(
+            f"{runner} is restricted to the deterministic benchmark-only mock experiment"
+        )
+    manifest = (task.setup or {}).get("authority_manifest")
+    metadata = manifest.get("metadata") if isinstance(manifest, dict) else None
+    if not (
+        isinstance(manifest, dict)
+        and isinstance(metadata, dict)
+        and metadata.get("benchmark_only") is True
+        and metadata.get("experiment") == "deterministic_dual_admission_ablation"
+    ):
+        raise ValueError(
+            f"{runner} requires a benchmark-only dual-admission authority manifest"
+        )
+    if runner == "no_task_ceiling" and not isinstance(
+        manifest.get("permitted_effects"),
+        list,
+    ):
+        raise ValueError(
+            "no_task_ceiling requires a concrete permitted_effects ceiling"
+        )
 
 
 def _run_wrapper_task(
@@ -513,11 +564,16 @@ def _run_agent_libos_task(
             llm_client=client,
             substrate=substrate,
         )
-        install_agent_libos_ablation(runtime, runner)
+        if runner not in BENCHMARK_ONLY_EXPERIMENT_RUNNERS:
+            install_agent_libos_ablation(runtime, runner)
         if llm_mode == "mock":
             runtime.tools.sandbox = BenchmarkDenoSandbox()
         benchmark_image_id = _register_skill_closed_benchmark_image(runtime, task)
-        pid = runtime.process.spawn(image=benchmark_image_id, goal=task.goal)
+        pid = runtime.process.spawn(
+            image=benchmark_image_id,
+            goal=task.goal,
+            authority_manifest=_benchmark_authority_manifest(task),
+        )
         setup_objects = _setup_runtime_memory(task, runtime, runner, pid)
         _grant_task_capabilities(task, runtime, pid, runner, setup_objects)
         setup_state = _setup_runtime_benchmark_resources(
@@ -559,6 +615,11 @@ def _run_agent_libos_task(
         baseline_llm_call_ids = {
             call.call_id for call in _all_llm_calls(runtime)
         }
+        if runner in BENCHMARK_ONLY_EXPERIMENT_RUNNERS:
+            # Keep spawn, Object seeding, Sink registration, capability
+            # compilation, and evidence baselines identical to full.  Unsafe
+            # admission bypasses exist only during the scored action window.
+            install_agent_libos_ablation(runtime, runner)
         selected_quanta = max_quanta if max_quanta is not None else max(len(task.mock_actions) + 4, 4)
         results = runtime.run_until_idle(
             max_quanta=selected_quanta,
@@ -653,6 +714,7 @@ def _run_agent_libos_task(
                 "setup_object_oids": [item["oid"] for item in setup_objects],
                 "self_evolution_counts": _self_evolution_counts(effects),
                 "runner_intervention": RUNNER_INTERVENTIONS[runner],
+                "benchmark_only_ablation": benchmark_only_ablation_metadata(runner),
                 "explainability": (
                     {"withheld_by_ablation": True, "reason": "no_audit_linkage"}
                     if runner == "no_audit_linkage"
@@ -732,6 +794,19 @@ def _run_agent_libos_task(
     if task_run is None:  # pragma: no cover - guarded by the try/except above
         raise RuntimeError("benchmark runner did not produce a result")
     return task_run
+
+
+def _benchmark_authority_manifest(task: BenchmarkTask) -> dict[str, Any] | None:
+    """Return a detached Host-authored manifest used only by benchmark setup."""
+
+    selected = (task.setup or {}).get("authority_manifest")
+    if selected is None:
+        return None
+    if not isinstance(selected, dict):
+        raise BenchmarkValidationError(
+            f"{task.id}: setup.authority_manifest must be a mapping"
+        )
+    return deepcopy(selected)
 
 
 def _safe_audit_record_count(runtime: Runtime | None) -> int:
