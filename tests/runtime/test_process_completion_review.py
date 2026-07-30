@@ -396,6 +396,55 @@ def test_exit_review_does_not_hint_a_goal_prohibited_tool(tmp_path: Path) -> Non
         runtime.close()
 
 
+def test_exit_review_does_not_treat_inline_shell_argv_as_typed_tool(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(tmp_path / "completion-review-inline-command.sqlite")
+    try:
+        for command_literal in (
+            "`git status --short`",
+            "```\ngit status --short\n```",
+        ):
+            pid = runtime.process.spawn(
+                image="coding-agent:v0",
+                goal=(
+                    f"Run the approved argv-only command {command_literal} and "
+                    "report its output. Use live command execution rather than "
+                    "the typed Git inspection interface."
+                ),
+            )
+
+            review, _review_result_oid = _start_review(runtime, pid)
+
+            assert "git_status" not in {
+                item["tool"]
+                for item in review["explicit_unobserved_tool_hints"]
+            }
+    finally:
+        runtime.close()
+
+
+def test_exit_review_keeps_exact_inline_tool_identifier_hint(tmp_path: Path) -> None:
+    runtime = Runtime.open(tmp_path / "completion-review-inline-tool.sqlite")
+    try:
+        for tool_literal in ("`git_status`", "```\ngit_status()\n```"):
+            pid = runtime.process.spawn(
+                image="coding-agent:v0",
+                goal=(
+                    f"Call {tool_literal} to inspect the repository and then finish."
+                ),
+            )
+
+            review, _review_result_oid = _start_review(runtime, pid)
+
+            assert "git_status" in {
+                item["tool"]
+                for item in review["explicit_unobserved_tool_hints"]
+            }
+    finally:
+        runtime.close()
+
+
 def test_exit_review_rejects_stale_token_after_human_followup(tmp_path: Path) -> None:
     runtime = Runtime.open(tmp_path / "completion-review-message.sqlite")
     try:

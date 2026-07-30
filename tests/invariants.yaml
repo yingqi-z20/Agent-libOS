@@ -4010,6 +4010,8 @@
         "tests/runtime/test_process_completion_review.py::test_coding_exit_review_is_nonterminal_published_and_audited",
         "tests/runtime/test_process_completion_review.py::test_exit_review_does_not_make_process_exit_a_self_dependency",
         "tests/runtime/test_process_completion_review.py::test_exit_review_requires_explicit_human_facing_output_before_exit",
+        "tests/runtime/test_process_completion_review.py::test_exit_review_does_not_treat_inline_shell_argv_as_typed_tool",
+        "tests/runtime/test_process_completion_review.py::test_exit_review_keeps_exact_inline_tool_identifier_hint",
         "tests/runtime/test_process_completion_review.py::test_final_exit_linearizes_against_concurrent_human_followup",
         "tests/runtime/test_process_completion_review.py::test_exit_review_rejects_stale_token_after_human_followup",
         "tests/runtime/test_process_completion_review.py::test_final_exit_rejects_missing_sources_and_unobserved_tool_claims",

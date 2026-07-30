@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 from collections.abc import Iterable
 from typing import Any, Literal
 
@@ -65,6 +66,8 @@ _COMPLETION_TOOL_PHRASES = {
     ),
 }
 _COMPLETION_CONTROL_TOOLS = frozenset({"process_exit"})
+_COMPLETION_FENCED_CODE = re.compile(r"```(.*?)```", re.DOTALL)
+_COMPLETION_INLINE_CODE = re.compile(r"`([^`\n]*)`")
 
 
 class CompletionAcceptanceCheck(BaseModel):
@@ -1234,18 +1237,22 @@ def _explicit_unobserved_tool_hints(
     goal_payload: Any,
     observed_tools: list[str],
 ) -> list[dict[str, str]]:
-    searchable = json.dumps(
+    serialized_goal = json.dumps(
         goal_payload,
         ensure_ascii=False,
         sort_keys=True,
         default=str,
-    ).lower().replace("\\n", " ").replace("_", " ")
+    ).lower().replace("\\n", " ")
     observed = set(observed_tools)
     catalog = get_builtin_skill_catalog()
     hints: list[dict[str, str]] = []
     for tool_name in sorted(process.tool_table):
         if tool_name in observed or tool_name in _COMPLETION_CONTROL_TOOLS:
             continue
+        searchable = _completion_hint_searchable_text(
+            serialized_goal,
+            tool_name=tool_name,
+        )
         phrases = (
             tool_name.lower().replace("_", " ").replace(".", " "),
             *_COMPLETION_TOOL_PHRASES.get(tool_name, ()),
@@ -1280,6 +1287,37 @@ def _explicit_unobserved_tool_hints(
             }
         )
     return hints
+
+
+def _completion_hint_searchable_text(
+    serialized_goal: str,
+    *,
+    tool_name: str,
+) -> str:
+    """Mask command/code literals without hiding an exact Tool identifier.
+
+    Completion hints are a conservative evidence aid, not a natural-language
+    command parser. A shell argv such as ``git status --short`` must not make
+    the cumulative review require the adjacent typed ``git_status`` Tool.
+    Exact model-facing identifiers remain eligible even when written as inline
+    code, for example ``git_status`` or ``git_status()``.
+    """
+
+    canonical_tool = tool_name.lower()
+
+    def replace_code_literal(match: re.Match[str]) -> str:
+        code = match.group(1).strip()
+        reference = code[:-2].strip() if code.endswith("()") else code
+        return f" {code} " if reference == canonical_tool else " "
+
+    without_fences = _COMPLETION_FENCED_CODE.sub(
+        replace_code_literal,
+        serialized_goal,
+    )
+    return _COMPLETION_INLINE_CODE.sub(
+        replace_code_literal,
+        without_fences,
+    ).replace("_", " ")
 
 
 def _has_positive_tool_mention(searchable: str, phrase: str) -> bool:

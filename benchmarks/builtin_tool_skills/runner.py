@@ -564,6 +564,7 @@ def _run_once(
         actions = _action_sequence(results)
         observations = _action_observations(results)
         discovery_trace = _discovery_trace(observations)
+        exit_review_trace = _exit_review_trace(observations)
         activated_skills = [
             str(action.get("skill_id") or "")
             for action in actions
@@ -662,6 +663,7 @@ def _run_once(
             "correct_route": correct_route,
             "actions": [str(action.get("action") or "") for action in actions],
             "discovery_trace": discovery_trace,
+            "exit_review_trace": exit_review_trace,
             "invalid_tool_calls": invalid_tool_calls,
             "llm_calls": len(calls),
             "models": sorted(
@@ -881,6 +883,66 @@ def _discovery_trace(
                 "next_step": payload.get("next_step")
                 if isinstance(payload, dict)
                 else None,
+            }
+        )
+    return trace
+
+
+def _exit_review_trace(
+    observations: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Retain bounded completion diagnostics without prompts or result payloads."""
+
+    max_trace_entries = 16
+    max_list_entries = 16
+    max_text_chars = 256
+
+    def bounded_text(value: str) -> str:
+        if len(value) <= max_text_chars:
+            return value
+        return value[: max_text_chars - 3] + "..."
+
+    trace: list[dict[str, Any]] = []
+    for observation in observations:
+        if len(trace) >= max_trace_entries:
+            break
+        action = observation.get("action")
+        result = observation.get("result")
+        if not isinstance(action, dict) or action.get("action") != "process_exit":
+            continue
+        payload = result.get("payload") if isinstance(result, dict) else None
+        review = (
+            payload.get("completion_review")
+            if isinstance(payload, dict)
+            else None
+        )
+        trace.append(
+            {
+                "ok": result.get("ok") if isinstance(result, dict) else None,
+                "result_status": (
+                    payload.get("status") if isinstance(payload, dict) else None
+                ),
+                "has_review_token": bool(action.get("review_token")),
+                "has_completion_evidence": action.get("completion_evidence")
+                is not None,
+                "validation_errors": [
+                    bounded_text(value)
+                    for value in review.get("validation_errors", [])[
+                        :max_list_entries
+                    ]
+                    if isinstance(value, str)
+                ]
+                if isinstance(review, dict)
+                else [],
+                "explicit_unobserved_tools": [
+                    bounded_text(item["tool"])
+                    for item in review.get("explicit_unobserved_tool_hints", [])[
+                        :max_list_entries
+                    ]
+                    if isinstance(item, dict) and isinstance(item.get("tool"), str)
+                ]
+                if isinstance(review, dict)
+                else [],
             }
         )
     return trace

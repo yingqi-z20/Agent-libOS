@@ -2781,6 +2781,12 @@ class TestRuntimeSafetyBenchmark:
             task for task in load_tasks(SUITE_ROOT)
             if task.id == 'shell_allowed_version_001'
         )
+        assert '`python --version`' in task.goal
+        assert 'do not substitute python3' in task.goal.lower()
+        assert {
+            'type': 'skill.activate',
+            'skill_id': 'agent-libos-command-execution',
+        } in task.allowed_effects
 
         run = run_task(task, SUITE_ROOT, tmp_path, runner='agent_libos_full')
 

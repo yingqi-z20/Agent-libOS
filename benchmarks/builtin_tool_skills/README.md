@@ -27,6 +27,8 @@ The JSON report records per-run and aggregate:
   oracles (exact file bytes, Git status state, shell argv/exit/output,
   checkpoint readback, or MCP registry metadata shape);
 - invalid model tool calls, measured from runtime action-repair evidence;
+- a bounded exit-review trace containing only review status, token/evidence
+  presence, validation errors, and exact unobserved Tool names;
 - initial, authorized-full, and cumulative tool-schema bytes;
 - compact catalog metadata bytes and cumulative serialized prompt bytes;
 - a clearly labeled `bytes / 4` schema-token estimate and provider-reported
@@ -68,6 +70,10 @@ it, a successfully published schema-v2 report exits 0 even when one or more
 runs fail those correctness checks. CI and release gates must therefore pass
 `--require-all-correct`; provider/setup exceptions and publication failures
 still terminate nonzero independently of the flag.
+
+The exit-review trace deliberately omits review tokens, prompts, completion
+evidence payloads, goal text, provider responses, and raw Tool results. It is
+diagnostic evidence for a failed terminal sequence, not a copy of model I/O.
 
 The output path is reserved before paid work begins and the completed JSON is
 published with an atomic replace. A failed rerun leaves a small non-favorable

@@ -429,6 +429,59 @@ def test_read_only_task_oracles_validate_structured_results_without_network(
     assert outcome["passed"] is True
 
 
+def test_exit_review_trace_is_bounded_and_omits_raw_completion_content() -> None:
+    long_error = "e" * 300
+    long_tool = "t" * 300
+    observations = [
+        {
+            "action": {
+                "action": "process_exit",
+                "review_token": "secret-review-token",
+                "completion_evidence": "{\"goal_oid\":\"sensitive\"}",
+                "payload": {"private": "result"},
+            },
+            "result": {
+                "ok": True,
+                "payload": {
+                    "status": "completion_review_required",
+                    "completion_review": {
+                        "review_token": "secret-review-token",
+                        "validation_errors": [
+                            "missing required tool",
+                            long_error,
+                            *[f"extra-{index}" for index in range(20)],
+                        ],
+                        "explicit_unobserved_tool_hints": [
+                            {"tool": "git_status", "reason": "sensitive goal"},
+                            {"tool": long_tool},
+                            *[{"tool": f"tool_{index}"} for index in range(20)],
+                        ],
+                        "goal": {"fallback": "sensitive goal"},
+                    },
+                },
+            },
+        }
+    ] * 20
+
+    trace = evaluation_runner._exit_review_trace(observations)
+
+    assert len(trace) == 16
+    assert trace[0]["ok"] is True
+    assert trace[0]["result_status"] == "completion_review_required"
+    assert trace[0]["has_review_token"] is True
+    assert trace[0]["has_completion_evidence"] is True
+    assert len(trace[0]["validation_errors"]) == 16
+    assert len(trace[0]["explicit_unobserved_tools"]) == 16
+    assert trace[0]["validation_errors"][0] == "missing required tool"
+    assert trace[0]["validation_errors"][1] == "e" * 253 + "..."
+    assert trace[0]["explicit_unobserved_tools"][0] == "git_status"
+    assert trace[0]["explicit_unobserved_tools"][1] == "t" * 253 + "..."
+    assert max(len(value) for value in trace[0]["validation_errors"]) == 256
+    assert max(len(value) for value in trace[0]["explicit_unobserved_tools"]) == 256
+    assert "secret-review-token" not in json.dumps(trace)
+    assert "sensitive" not in json.dumps(trace)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
