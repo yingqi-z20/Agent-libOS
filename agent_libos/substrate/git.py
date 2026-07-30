@@ -279,7 +279,7 @@ def _is_within(path: Path, root: Path) -> bool:
 def _is_link_or_reparse(metadata: os.stat_result) -> bool:
     reparse_attribute = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
     return stat.S_ISLNK(metadata.st_mode) or bool(
-        int(getattr(metadata, "st_file_attributes", 0)) & reparse_attribute
+        int(getattr(metadata, "st_file_attributes", 0) or 0) & reparse_attribute
     )
 
 
@@ -2877,7 +2877,12 @@ class LocalGitProvider:
 
         resources = contextlib.ExitStack()
         try:
-            common_guard = resources.enter_context(open_secure_directory(common_dir))
+            common_guard = resources.enter_context(
+                open_secure_directory(
+                    common_dir,
+                    allow_child_mutation=True,
+                )
+            )
             lock_directory = common_dir / "agent-libos"
             try:
                 if os.name == "nt":

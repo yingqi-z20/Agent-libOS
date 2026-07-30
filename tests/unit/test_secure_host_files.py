@@ -203,6 +203,25 @@ def test_windows_directory_open_contract_guards_each_enumerated_parent(
     )
 
 
+def test_windows_mutable_directory_guard_allows_writes_without_delete_sharing(
+    tmp_path: Path,
+) -> None:
+    api = _FakeWindowsAPI()
+
+    with open_secure_directory(
+        tmp_path,
+        allow_child_mutation=True,
+        platform="nt",
+        windows_api=api,
+    ):
+        pass
+
+    contract = api.directory_contracts[-1]
+    assert contract == windows_open_contract(directory=True, ancestor=True)
+    assert contract.share_mode == 0x00000001 | 0x00000002
+    assert contract.share_mode & 0x00000004 == 0
+
+
 @pytest.mark.parametrize(
     "child_name",
     ["../outside.txt", "subdir/child.txt", "/tmp/outside.txt", ".", "..", "", "bad\0name"],
@@ -413,3 +432,28 @@ def test_real_windows_guarded_readwrite_child_allows_peer_lockers_but_not_replac
 
     os.replace(target, parked)
     os.replace(parked, target)
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="requires real Win32 child-mutation and replacement semantics",
+)
+def test_real_windows_mutable_directory_guard_allows_child_replace_but_not_self_replace(
+    tmp_path: Path,
+) -> None:
+    guarded = tmp_path / "guarded"
+    parked = tmp_path / "parked"
+    guarded.mkdir()
+
+    with open_secure_directory(guarded, allow_child_mutation=True):
+        child = guarded / "child.txt"
+        replacement = guarded / "replacement.txt"
+        child.write_text("old\n", encoding="utf-8")
+        replacement.write_text("new\n", encoding="utf-8")
+        os.replace(replacement, child)
+        assert child.read_text(encoding="utf-8") == "new\n"
+        with pytest.raises(OSError):
+            os.replace(guarded, parked)
+
+    os.replace(guarded, parked)
+    os.replace(parked, guarded)

@@ -111,7 +111,7 @@ def windows_readwrite_create_contract() -> WindowsOpenContract:
 
 
 def snapshot_from_stat(value: os.stat_result) -> StablePathSnapshot:
-    attributes = int(getattr(value, "st_file_attributes", 0))
+    attributes = int(getattr(value, "st_file_attributes", 0) or 0)
     return StablePathSnapshot(
         device=int(value.st_dev),
         inode=int(value.st_ino),
@@ -569,9 +569,17 @@ def open_secure_directory(
     *,
     parent: SecureDirectoryGuard | None = None,
     relative_name: str | None = None,
+    allow_child_mutation: bool = False,
     platform: str | None = None,
     windows_api: Any | None = None,
 ) -> SecureDirectoryGuard:
+    """Open a stable directory guard without following path indirection.
+
+    Win32 callers that must mutate children while the directory identity stays
+    pinned may opt into write sharing. Delete sharing remains disabled, so the
+    guarded directory itself still cannot be renamed or replaced.
+    """
+
     selected = Path(path)
     _validate_child_path(selected, parent=parent, relative_name=relative_name)
     selected_platform = (
@@ -591,7 +599,10 @@ def open_secure_directory(
         try:
             native_handle = api.open_directory(
                 selected,
-                windows_open_contract(directory=True),
+                windows_open_contract(
+                    directory=True,
+                    ancestor=allow_child_mutation,
+                ),
             )
             _require_stable_directory_snapshot(api.snapshot(native_handle))
         except BaseException:

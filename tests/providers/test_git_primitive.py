@@ -155,6 +155,19 @@ def _git(root: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
     return result.stdout
 
 
+def _rewrite_gitfile(path: Path, content: str) -> None:
+    """Rewrite an existing linked-worktree marker without replacing it.
+
+    Git for Windows marks these ``.git`` files hidden, which makes the
+    create-or-truncate open used by ``Path.write_text`` fail with access denied.
+    """
+
+    with path.open("r+", encoding="utf-8", newline="") as handle:
+        handle.seek(0)
+        handle.write(content)
+        handle.truncate()
+
+
 def _init_repository(root: Path) -> None:
     root.mkdir()
     _git(root, "init", "-q")
@@ -373,6 +386,26 @@ def test_provider_defers_hook_isolation_until_a_git_call(
     with pytest.raises(GitError) as exc_info:
         provider.repository_layout()
     assert exc_info.value.code == GitErrorCode.COMMAND_FAILED.value
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 directory sharing")
+def test_provider_repository_lock_allows_git_index_replacement_on_windows(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    (root / "lock-safe.txt").write_text("safe\n", encoding="utf-8")
+
+    with provider.repository_lock(worktree=root):
+        result = provider.run(
+            ["add", "--", "lock-safe.txt"],
+            worktree=root,
+            read_only=False,
+        )
+
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert _git(root, "diff", "--cached", "--name-only", "-z") == b"lock-safe.txt\0"
 
 
 def test_provider_repository_lock_thread_waiter_honors_timeout(
@@ -1074,7 +1107,7 @@ def test_provider_rejects_gitfile_metadata_ancestor_symlink(
         alias.symlink_to(git_dir.parent, target_is_directory=True)
     except OSError:
         pytest.skip("symlinks are unavailable on this platform")
-    gitfile.write_text(f"gitdir: {alias / git_dir.name}\n", encoding="utf-8")
+    _rewrite_gitfile(gitfile, f"gitdir: {alias / git_dir.name}\n")
 
     with pytest.raises(GitError) as exc_info:
         provider.repository_layout(worktree=worktree)
@@ -1119,9 +1152,9 @@ def test_provider_accepts_relative_linked_worktree_metadata_paths(
         .removeprefix("gitdir: ")
         .strip()
     )
-    gitfile.write_text(
+    _rewrite_gitfile(
+        gitfile,
         f"gitdir: {os.path.relpath(git_dir, worktree)}\n",
-        encoding="utf-8",
     )
     (git_dir / "gitdir").write_text(
         f"{os.path.relpath(gitfile, git_dir)}\n",
@@ -1165,9 +1198,9 @@ def test_list_worktrees_rejects_linked_gitfile_reusing_primary_metadata(
     managed_root.mkdir(parents=True)
     worktree = managed_root / "wt_primary_alias"
     _git(root, "worktree", "add", "--detach", str(worktree), "HEAD")
-    (worktree / ".git").write_text(
+    _rewrite_gitfile(
+        worktree / ".git",
         f"gitdir: {root / '.git'}\n",
-        encoding="utf-8",
     )
     runtime = _open_runtime(root)
     try:
@@ -1208,9 +1241,9 @@ def test_list_worktrees_rejects_linked_gitfile_aliasing_another_worktree(
         .removeprefix("gitdir: ")
         .strip()
     )
-    (alias / ".git").write_text(
+    _rewrite_gitfile(
+        alias / ".git",
         f"gitdir: {first_git_dir}\n",
-        encoding="utf-8",
     )
     runtime = _open_runtime(root)
     try:
@@ -3925,7 +3958,7 @@ def test_list_worktrees_rejects_managed_gitfile_with_symlinked_ancestor(
         alias.symlink_to(git_dir.parent, target_is_directory=True)
     except OSError:
         pytest.skip("symlinks are unavailable on this platform")
-    gitfile.write_text(f"gitdir: {alias / git_dir.name}\n", encoding="utf-8")
+    _rewrite_gitfile(gitfile, f"gitdir: {alias / git_dir.name}\n")
     runtime = _open_runtime(root)
     try:
         pid = runtime.process.spawn(
