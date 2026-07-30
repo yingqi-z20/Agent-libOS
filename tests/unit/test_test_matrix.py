@@ -77,6 +77,9 @@ class TestTestMatrix:
         assert wrapped.env == {
             "AGENT_LIBOS_INVARIANT_EXECUTION_RECEIPT": str(receipt)
         }
+        assert wrapped.invariant_marker_expression == (
+            "not postgres and not real_llm and not mcp"
+        )
         assert command.env is None
 
     def test_pytest_environment_combines_real_llm_and_output_retention(self) -> None:

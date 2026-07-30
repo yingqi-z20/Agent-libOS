@@ -54,6 +54,7 @@ class Command:
     env: dict[str, str] | None = None
     enforce_timeout: bool = True
     invariant_test_paths: tuple[str, ...] | None = None
+    invariant_marker_expression: str | None = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -137,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
                     receipt_path,
                     lane=None if args.lane == "all" else args.lane,
                     selected_test_paths=command.invariant_test_paths,
+                    marker_expression=command.invariant_marker_expression,
                 )
                 if status != 0:
                     return status
@@ -157,6 +159,7 @@ def _commands_for(args: argparse.Namespace) -> list[Command]:
                 f"pytest all deterministic lanes{_worker_suffix(args)}",
                 _pytest_args(("tests",), args),
                 env=_pytest_env(args),
+                invariant_marker_expression=_pytest_marker_expression(args),
             )
         ]
     selected_paths = _sharded_lane_paths(
@@ -177,6 +180,7 @@ def _commands_for(args: argparse.Namespace) -> list[Command]:
             invariant_test_paths=(
                 selected_paths if args.shard_count > 1 else None
             ),
+            invariant_marker_expression=_pytest_marker_expression(args),
         )
     ]
 
@@ -223,21 +227,25 @@ def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
         command.extend(["-n", args.workers, "--dist", args.dist])
     if args.durations is not None:
         command.extend(["--durations", str(args.durations)])
-    marker_filters: list[str] = ["not postgres"]
     if args.skip_real_deno:
         command.append("--skip-real-deno")
-        marker_filters.append("not real_deno")
     if args.run_real_llm:
         command.append("--run-real-llm")
-    else:
-        marker_filters.append("not real_llm")
     if getattr(args, "run_mcp", False):
         command.append("--run-mcp")
-    else:
-        marker_filters.append("not mcp")
-    if marker_filters:
-        command.extend(["-m", " and ".join(marker_filters)])
+    command.extend(["-m", _pytest_marker_expression(args)])
     return command
+
+
+def _pytest_marker_expression(args: argparse.Namespace) -> str:
+    marker_filters: list[str] = ["not postgres"]
+    if args.skip_real_deno:
+        marker_filters.append("not real_deno")
+    if not args.run_real_llm:
+        marker_filters.append("not real_llm")
+    if not getattr(args, "run_mcp", False):
+        marker_filters.append("not mcp")
+    return " and ".join(marker_filters)
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -348,12 +356,26 @@ def _validate_invariant_receipt(
     *,
     lane: str | None,
     selected_test_paths: tuple[str, ...] | None = None,
+    marker_expression: str | None = None,
 ) -> int:
     from scripts import check_test_invariants as checker
 
     try:
         executed = checker.load_execution_receipt(path)
         manifest = checker._load_manifest(checker.MANIFEST)
+        # A file assigned to this shard may contain only nodes excluded by the
+        # active marker expression (for example an MCP-only integration file
+        # in the default deterministic providers lane).  Collect the exact
+        # marker-selected nodes so those files do not create false evidence
+        # failures while selected skips still fail closed.
+        selected_nodeids = (
+            None
+            if selected_test_paths is None
+            else checker._collect_pytest_nodeids(
+                marker_expression,
+                test_paths=selected_test_paths,
+            )
+        )
     except (OSError, ValueError) as exc:
         print(f"invariant execution evidence failed: {exc}", file=sys.stderr)
         return 1
@@ -364,6 +386,7 @@ def _validate_invariant_receipt(
         errors,
         lane=lane,
         selected_test_paths=selected_test_paths,
+        selected_nodeids=selected_nodeids,
     )
     if errors:
         for error in errors:

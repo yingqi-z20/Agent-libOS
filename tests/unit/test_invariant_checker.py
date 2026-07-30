@@ -200,6 +200,7 @@ benchmark_attack_classes:
             errors=errors,
             lane="security",
             platform="linux",
+            selected_nodeids={node},
         )
 
         assert errors == [
@@ -255,6 +256,33 @@ benchmark_attack_classes:
             lane="runtime",
             platform="linux",
             selected_test_paths=("tests/runtime/test_first.py",),
+        )
+
+        assert errors == []
+
+    def test_sharded_execution_ignores_marker_deselected_nodes(self) -> None:
+        deterministic = "tests/providers/test_default.py::test_default"
+        mcp_only = "tests/providers/test_mcp_sdk.py::test_sdk"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "mixed-marker-invariant",
+                    "title": "Mixed marker invariant",
+                    "lane": "providers",
+                    "node_ids": [deterministic, mcp_only],
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids=set(),
+            errors=errors,
+            lane="providers",
+            platform="windows",
+            selected_test_paths=("tests/providers/test_mcp_sdk.py",),
+            selected_nodeids=set(),
         )
 
         assert errors == []

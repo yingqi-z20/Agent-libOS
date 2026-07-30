@@ -84,11 +84,15 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     return data
 
 
-def _collect_pytest_nodeids(marker_expression: str | None = None) -> set[str]:
+def _collect_pytest_nodeids(
+    marker_expression: str | None = None,
+    *,
+    test_paths: tuple[str, ...] = ("tests",),
+) -> set[str]:
     command = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
     if marker_expression:
         command.extend(["-m", marker_expression])
-    command.append("tests")
+    command.extend(test_paths)
     result = subprocess.run(
         command,
         cwd=ROOT,
@@ -115,6 +119,7 @@ def _check_invariant_execution(
     lane: str | None = None,
     platform: str | None = None,
     selected_test_paths: tuple[str, ...] | None = None,
+    selected_nodeids: set[str] | None = None,
 ) -> None:
     """Require an actual passing call receipt for every selected invariant."""
 
@@ -129,6 +134,11 @@ def _check_invariant_execution(
         None
         if selected_test_paths is None
         else {path.replace("\\", "/") for path in selected_test_paths}
+    )
+    normalized_selected_nodeids = (
+        None
+        if selected_nodeids is None
+        else {node_id.replace("\\", "/") for node_id in selected_nodeids}
     )
     selected_platform = platform or _current_platform_key()
     for invariant in invariants:
@@ -180,6 +190,10 @@ def _check_invariant_execution(
             }
             if not applicable_nodes:
                 continue
+        if normalized_selected_nodeids is not None:
+            applicable_nodes &= normalized_selected_nodeids
+            if not applicable_nodes:
+                continue
         if applicable_nodes.isdisjoint(normalized_executed):
             selected_lane = lane or "all deterministic"
             errors.append(
@@ -198,6 +212,11 @@ def _check_invariant_execution(
             if (
                 normalized_selected_paths is not None
                 and normalized.split("::", 1)[0] not in normalized_selected_paths
+            ):
+                continue
+            if (
+                normalized_selected_nodeids is not None
+                and normalized not in normalized_selected_nodeids
             ):
                 continue
             if normalized not in normalized_executed:
