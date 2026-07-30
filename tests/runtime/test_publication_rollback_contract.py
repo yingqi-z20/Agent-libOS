@@ -669,10 +669,12 @@ def test_launch_rollback_transition_failure_fences_partial_package_until_reopen(
                 assert publication["state"] == "applying"
                 assert publication["phase"] != "compensating"
             else:
-                # Model an ambiguous write acknowledgement: the durable CAS
-                # committed before its caller observed a storage exception.
-                assert publication["state"] == "rollback_pending"
-                assert publication["phase"] == "compensating"
+                # The rollback CAS and launch-goal redaction share one outer
+                # transaction. A storage exception before that boundary
+                # acknowledges commit must therefore restore the earlier
+                # recoverable state rather than publish rollback_pending.
+                assert publication["state"] == "applying"
+                assert publication["phase"] != "compensating"
             assert runtime.lifecycle.state == "close_failed"
             assert runtime.lifecycle.shutdown_reason == (
                 f"runtime.recovery_required:{publication_id}"
@@ -1254,10 +1256,10 @@ def test_committed_launch_propagates_secondary_transition_interrupt(
         runtime.close()
 
 
-def test_rolled_back_launch_propagates_complete_transition_aggregate(
+def test_rollback_outer_transaction_propagates_complete_transition_aggregate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A concurrently resolved rollback cannot discard either failure."""
+    """A nested terminal write cannot escape an interrupted outer rollback."""
 
     runtime = Runtime.open("local")
     primary_error = RuntimeError("injected launch body before concurrent rollback")
@@ -1325,18 +1327,18 @@ def test_rolled_back_launch_propagates_complete_transition_aggregate(
             for item in runtime.store.list_runtime_publications()
             if item["kind"] == "process_launch"
         ][-1]
-        assert publication["state"] == "rolled_back"
-        assert publication["phase"] == "concurrent_compensated"
-        assert runtime.store.get_process(str(publication["pid"])) is None
+        assert publication["state"] == "applying"
+        assert publication["phase"] != "concurrent_compensated"
+        assert runtime.store.get_process(str(publication["pid"])) is not None
         operation = runtime.store.get_operation(
             str(publication["plan"]["operation_id"])
         )
         assert operation is not None
-        assert operation.state.value == "terminal"
-        assert operation.outcome.value == "failed"
-        assert runtime.lifecycle.state == "open"
+        assert operation.state.value == "running"
+        assert operation.outcome.value == "pending"
+        assert runtime.lifecycle.state == "close_failed"
     finally:
-        runtime.close()
+        _release_fenced_runtime_or_close(runtime)
 
 
 @pytest.mark.parametrize(

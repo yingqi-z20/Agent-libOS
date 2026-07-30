@@ -86,7 +86,13 @@ class SendProcessMessageOutput(BaseModel):
 
 
 class ReadProcessMessagesArgs(BaseModel):
-    include_acked: bool = Field(default=False, description="Include already acknowledged messages.")
+    include_acked: bool = Field(
+        default=False,
+        description=(
+            "Select unread and already acknowledged messages; "
+            "restore-superseded history is never mailbox-visible."
+        ),
+    )
     kind: str | None = Field(default=None, description="Optional kind filter: normal or interrupt.")
     sender: str | None = Field(default=None, description="Optional sender filter.")
     channel: str | None = Field(default=None, description="Optional channel filter.")
@@ -237,7 +243,8 @@ class ReceiveProcessMessagesArgs(ReadProcessMessagesArgs):
     block: bool = Field(
         default=True,
         description=(
-            "Suspend until a matching unread message arrives; false returns ready=false immediately when none match."
+            "Suspend until a message matching the include_acked policy is available; "
+            "false returns ready=false immediately when none match."
         ),
     )
 
@@ -245,7 +252,9 @@ class ReceiveProcessMessagesArgs(ReadProcessMessagesArgs):
 class ReceiveProcessMessagesTool(SyncAgentTool[ReceiveProcessMessagesArgs]):
     name = "receive_process_messages"
     description = (
-        "Receive unread process messages using optional selective filters. "
+        "Receive process messages using optional selective filters; unread messages are "
+        "selected by default, while include_acked=true permits exactly unread and acknowledged "
+        "matches, never restore-superseded history. "
         "Unlike read_process_messages, block=true suspends in WAITING_EVENT until a match; "
         "block=false returns immediately. Large matching windows may be split to fit the durable result budget; "
         "when has_more is true, use the returned continuation with the same filters."

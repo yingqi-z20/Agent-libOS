@@ -121,8 +121,17 @@ _HOST_AUTO_WAIT_METADATA = {
 }
 
 _FULL_SNAPSHOT_RESPONSE_CHAIN_DISABLED_REASON = "full_snapshot_executor_replay"
+_IMAGE_ONLY_FROZEN_ANCHOR_KEY = "image_only_request_anchor"
+_IMAGE_ONLY_FROZEN_ANCHOR_SCHEMA_VERSION = 1
+_IMAGE_ONLY_REQUEST_KEY = "image_only_request"
+_IMAGE_ONLY_REQUEST_PURPOSE_PREFIX = "image_only_request"
+_IMAGE_ONLY_ERROR_PURPOSE = "image_only_error"
+_IMAGE_ONLY_REQUEST_SCHEMA_VERSION = 1
 _IMAGE_ONLY_TRANSCRIPT_KEY = "image_only_transcript"
-_IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION = 1
+_IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION = 2
+_IMAGE_ONLY_EMPTY_HEAD_VALIDATION_KEY = "image_only_empty_head_validation"
+_IMAGE_ONLY_EMPTY_HEAD_VALIDATION_PURPOSE_PREFIX = "image_only_empty_validation"
+_IMAGE_ONLY_EMPTY_HEAD_VALIDATION_SCHEMA_VERSION = 1
 _IMAGE_ONLY_TOOL_OUTPUT_SCHEMA_VERSION = 1
 
 
@@ -344,8 +353,11 @@ class LLMProcessExecutor:
             )
         )
 
-    @staticmethod
-    def _image_only_transcript_anchor(image: Any, process: Any) -> dict[str, str]:
+    def _image_only_transcript_anchor(
+        self,
+        image: Any,
+        process: Any,
+    ) -> dict[str, str]:
         system_prompt = str(getattr(image, "system_prompt", "") or "")
         return {
             "image_id": str(image.image_id),
@@ -353,7 +365,64 @@ class LLMProcessExecutor:
             "system_prompt_sha256": hashlib.sha256(
                 system_prompt.encode("utf-8")
             ).hexdigest(),
+            # Checkpoint restore deliberately advances this durable generation
+            # without deleting append-only LLM evidence. Binding it into the
+            # anchor prevents post-checkpoint transcript rows from leaking
+            # into the restored process timeline, while an ordinary Runtime
+            # reopen keeps the same generation and resumes normally.
+            "llm_context_generation": self._processes.get_llm_context_generation(
+                process.pid
+            ),
         }
+
+    @staticmethod
+    def _image_only_request_purpose(anchor: Mapping[str, str]) -> str:
+        fingerprint = hashlib.sha256(
+            dumps(to_jsonable(dict(anchor))).encode("utf-8")
+        ).hexdigest()[:24]
+        return f"{_IMAGE_ONLY_REQUEST_PURPOSE_PREFIX}:{fingerprint}"
+
+    @staticmethod
+    def _image_only_empty_head_validation_purpose(transcript_call_id: str) -> str:
+        return (
+            f"{_IMAGE_ONLY_EMPTY_HEAD_VALIDATION_PURPOSE_PREFIX}:"
+            f"{transcript_call_id}"
+        )
+
+    @classmethod
+    def _frozen_image_only_anchor(
+        cls,
+        state: _LLMCallState,
+        *,
+        image: Any,
+    ) -> dict[str, str]:
+        frozen = state.request_options.get(_IMAGE_ONLY_FROZEN_ANCHOR_KEY)
+        if not isinstance(frozen, dict):
+            raise ValidationError("image_only request anchor was not frozen")
+        if frozen.get("schema_version") != _IMAGE_ONLY_FROZEN_ANCHOR_SCHEMA_VERSION:
+            raise ValidationError("image_only frozen request anchor has an unsupported schema")
+        expected_static = {
+            "image_id": str(image.image_id),
+            "goal_oid": str(state.process.goal_oid or ""),
+            "system_prompt_sha256": hashlib.sha256(
+                str(getattr(image, "system_prompt", "") or "").encode("utf-8")
+            ).hexdigest(),
+        }
+        anchor: dict[str, str] = {}
+        for key, expected in expected_static.items():
+            value = frozen.get(key)
+            if value != expected:
+                raise ValidationError(f"image_only frozen request anchor changed {key}")
+            anchor[key] = expected
+        generation = frozen.get("llm_context_generation")
+        if not isinstance(generation, str) or not generation:
+            raise ValidationError(
+                "image_only frozen request anchor is missing llm_context_generation"
+            )
+        anchor["llm_context_generation"] = generation
+        if frozen.get("purpose") != cls._image_only_request_purpose(anchor):
+            raise ValidationError("image_only frozen request anchor purpose changed")
+        return anchor
 
     @classmethod
     def _image_only_marker_for_anchor(
@@ -372,6 +441,27 @@ class LLMProcessExecutor:
                 raise ValidationError(f"image_only transcript head is missing {key}")
             if value != expected:
                 return None
+        return marker
+
+    @classmethod
+    def _image_only_request_marker_for_anchor(
+        cls,
+        call: LLMCallRecord,
+        anchor: Mapping[str, str],
+    ) -> dict[str, Any] | None:
+        marker = call.request_options.get(_IMAGE_ONLY_REQUEST_KEY)
+        if not isinstance(marker, dict):
+            return None
+        if marker.get("schema_version") != _IMAGE_ONLY_REQUEST_SCHEMA_VERSION:
+            raise ValidationError("image_only request anchor has an unsupported schema")
+        for key, expected in anchor.items():
+            value = marker.get(key)
+            if not isinstance(value, str):
+                raise ValidationError(f"image_only request anchor is missing {key}")
+            if value != expected:
+                return None
+        if marker.get("purpose") != cls._image_only_request_purpose(anchor):
+            raise ValidationError("image_only request anchor purpose changed")
         return marker
 
     def _image_only_goal_content(
@@ -462,20 +552,114 @@ class LLMProcessExecutor:
         image: Any,
         anchor: Mapping[str, str],
     ) -> tuple[LLMCallRecord | None, dict[str, Any] | None]:
-        latest = self._processes.get_latest_llm_call(
+        latest = self._processes.get_latest_successful_llm_call(
             pid=pid,
             purpose="action_selection",
         )
         if latest is None:
             return None, None
         marker = self._image_only_marker_for_anchor(latest, anchor)
-        if marker is not None or latest.image_id != image.image_id:
+        if marker is not None:
+            self._assert_image_only_transcript_complete(
+                pid=pid,
+                image=image,
+                latest=latest,
+                marker=marker,
+            )
             return latest, marker
-        if latest.request_options.get(_IMAGE_ONLY_TRANSCRIPT_KEY) is None:
+        if latest.image_id != image.image_id:
+            return latest, None
+        raw_marker = latest.request_options.get(_IMAGE_ONLY_TRANSCRIPT_KEY)
+        if raw_marker is None:
             raise ValidationError(
                 "image_only legacy prompt history cannot be resumed transparently"
             )
+        if not isinstance(raw_marker, dict):
+            raise ValidationError("image_only transcript head marker is invalid")
+        # A valid head for another goal, prompt, or restore generation is an
+        # anchor boundary. Do not resurrect an older transcript merely because
+        # its other fields happen to match the current process again.
         return latest, None
+
+    def _latest_image_only_request(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        anchor: Mapping[str, str],
+    ) -> tuple[LLMCallRecord | None, dict[str, Any] | None]:
+        request = self._processes.get_latest_llm_call(
+            pid=pid,
+            purpose=self._image_only_request_purpose(anchor),
+        )
+        if request is None or request.status != "error":
+            return None, None
+        raw_marker = request.request_options.get(_IMAGE_ONLY_REQUEST_KEY)
+        if raw_marker is None:
+            return None, None
+        marker = self._image_only_request_marker_for_anchor(request, anchor)
+        if marker is not None:
+            return request, marker
+        if request.image_id == image.image_id and not isinstance(raw_marker, dict):
+            raise ValidationError("image_only request anchor marker is invalid")
+        return None, None
+
+    def _assert_image_only_transcript_complete(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        latest: LLMCallRecord,
+        marker: Mapping[str, Any],
+    ) -> None:
+        messages = self._image_only_canonical_messages(image, latest, marker)
+        manifest, assistant_calls, seen_call_ids = self._image_only_replay_manifest(
+            latest,
+            marker,
+        )
+        self._append_image_only_assistant_message(messages, latest, assistant_calls)
+        if not manifest:
+            validation = self._processes.get_latest_llm_call(
+                pid=pid,
+                purpose=self._image_only_empty_head_validation_purpose(
+                    latest.call_id
+                ),
+            )
+            validation_marker = (
+                validation.request_options.get(
+                    _IMAGE_ONLY_EMPTY_HEAD_VALIDATION_KEY
+                )
+                if validation is not None
+                else None
+            )
+            if (
+                validation is None
+                or validation.status != "ok"
+                or not isinstance(validation_marker, dict)
+                or validation_marker.get("schema_version")
+                != _IMAGE_ONLY_EMPTY_HEAD_VALIDATION_SCHEMA_VERSION
+                or validation_marker.get("transcript_call_id") != latest.call_id
+            ):
+                raise ValidationError(
+                    "image_only empty transcript head was not action-validated"
+                )
+        output_key = marker.get("output_key")
+        if not isinstance(output_key, str) or not output_key:
+            raise ValidationError("image_only transcript head is missing its output key")
+        output_rows = self._processes.list_llm_tool_outputs(
+            pid=pid,
+            response_id=output_key,
+        )
+        outputs_by_call_id = {
+            str(row.get("call_id") or ""): row for row in output_rows
+        }
+        if set(outputs_by_call_id) != seen_call_ids:
+            raise ValidationError("image_only transcript tool outputs are incomplete")
+        for item in manifest:
+            row = outputs_by_call_id[item["call_id"]]
+            if str(row.get("tool_name") or "") != item["name"]:
+                raise ValidationError("image_only transcript tool output is not paired")
+            self._decode_image_only_tool_output(row.get("output_text"))
 
     def _new_image_only_transcript(
         self,
@@ -501,6 +685,50 @@ class LLMProcessExecutor:
             ],
             goal_flow,
             [goal_oid] if goal_oid else [],
+        )
+
+    def _retry_image_only_request(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        process: Any,
+        context: MaterializedContext,
+        request: LLMCallRecord,
+        marker: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], DataFlowContext, list[str]]:
+        if request.status != "error" or not isinstance(request.messages, list):
+            raise ValidationError("image_only retry request is incomplete")
+        canonical_count = marker.get("canonical_message_count")
+        # An error request may contain a snapshot assembled from an earlier
+        # successful transcript. It is evidence of an attempted request, not
+        # a completed transcript head, so only the original two-message goal
+        # request is safe to recover from this row.
+        if canonical_count != 2 or len(request.messages) < 2:
+            raise ValidationError(
+                "image_only complete transcript head is unavailable for retry"
+            )
+        selected = request.messages[:2]
+        if any(not isinstance(message, dict) for message in selected):
+            raise ValidationError("image_only retry request contains an invalid message")
+        messages = [dict(message) for message in selected]
+        if messages[0] != {"role": "system", "content": build_system_prompt(image)}:
+            raise ValidationError("image_only retry request system prompt changed unexpectedly")
+        if messages[1].get("role") != "user" or not isinstance(
+            messages[1].get("content"), str
+        ):
+            raise ValidationError("image_only retry request goal message is invalid")
+        goal_oid = str(process.goal_oid or "") or None
+        flow_contexts, input_oids = self._image_only_replay_sources(
+            pid=pid,
+            goal_oid=goal_oid,
+            materialized_oids=set(context.object_refs),
+            marker=marker,
+        )
+        return (
+            messages,
+            DataFlowContext.aggregate(flow_contexts),
+            list(dict.fromkeys(input_oids)),
         )
 
     @staticmethod
@@ -735,14 +963,28 @@ class LLMProcessExecutor:
         image: Any,
         process: Any,
         context: MaterializedContext,
+        anchor: Mapping[str, str],
     ) -> tuple[list[dict[str, Any]], DataFlowContext, list[str]]:
-        anchor = self._image_only_transcript_anchor(image, process)
         latest, marker = self._latest_image_only_transcript(
             pid=pid,
             image=image,
             anchor=anchor,
         )
         if latest is None or marker is None:
+            request, request_marker = self._latest_image_only_request(
+                pid=pid,
+                image=image,
+                anchor=anchor,
+            )
+            if request is not None and request_marker is not None:
+                return self._retry_image_only_request(
+                    pid=pid,
+                    image=image,
+                    process=process,
+                    context=context,
+                    request=request,
+                    marker=request_marker,
+                )
             return self._new_image_only_transcript(
                 pid=pid,
                 image=image,
@@ -815,17 +1057,24 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
         skills: list[dict[str, Any]],
         available_skills: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], DataFlowContext, str | None]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        DataFlowContext,
+        str | None,
+        dict[str, str] | None,
+    ]:
         if image.prompt_mode == PROMPT_MODE_IMAGE_ONLY:
             if not self.config.llm.persist_full_io:
                 raise _ImageOnlyFullIORequired(
                     "image_only requires llm.persist_full_io=true for durable transcript replay"
                 )
+            anchor = self._image_only_transcript_anchor(image, process)
             messages, flow_context, input_refs = self._image_only_messages_and_flow(
                 pid=pid,
                 image=image,
                 process=process,
                 context=context,
+                anchor=anchor,
             )
             self._audit.record(
                 actor=pid,
@@ -839,7 +1088,7 @@ class LLMProcessExecutor:
                     "event_projection": {"model_visible": False},
                 },
             )
-            return messages, flow_context, None
+            return messages, flow_context, None, anchor
         # The live goal is already part of the authoritative materialized
         # context in the ordinary case.  Replaying the retained copy as well
         # duplicates a potentially large, volatile block on every later
@@ -858,6 +1107,25 @@ class LLMProcessExecutor:
                 image=image,
             )
         )
+        if (
+            process.goal_oid is not None
+            and not goal_is_materialized
+            and original_goal_context is None
+            # An explicit MemoryView may deliberately omit the goal while the
+            # exact live Object remains available to the Runtime.  That is a
+            # visibility choice, not lost first-quantum state.  Fail closed
+            # only when the payload itself is unavailable and there is no
+            # retained prompt evidence to recover from.
+            and self._objects.get_object(process.goal_oid) is None
+            and self._processes.get_latest_llm_call(
+                pid=pid,
+                purpose="action_selection",
+            )
+            is None
+        ):
+            raise ValidationError(
+                "process goal payload is unavailable before the first LLM quantum"
+            )
         flow_context = self._data_flow.context_from_materialization(pid, context)
         if original_goal_context is not None:
             flow_context = self._include_retained_goal_labels(
@@ -911,6 +1179,7 @@ class LLMProcessExecutor:
             messages,
             flow_context,
             event_projection.represented_through_event_id,
+            None,
         )
 
     def run_once(self, pid: str) -> dict[str, Any]:
@@ -1044,7 +1313,12 @@ class LLMProcessExecutor:
             return prepared_context
         context = prepared_context
         try:
-            messages, flow_context, represented_through_event_id = (
+            (
+                messages,
+                flow_context,
+                represented_through_event_id,
+                image_only_anchor,
+            ) = (
                 self._assemble_llm_request(
                     pid=pid,
                     image=image,
@@ -1082,6 +1356,7 @@ class LLMProcessExecutor:
                 messages,
                 openai_tools,
                 response_scope_fingerprint=response_scope_fingerprint,
+                image_only_anchor=image_only_anchor,
             )
             # Cursor advancement is an acknowledgement that the projected
             # batch reached a successfully recorded provider completion.  A
@@ -1324,12 +1599,6 @@ class LLMProcessExecutor:
                 error=RuntimeError(reason),
                 include_error=False,
             )
-        self._audit.record(
-            actor=pid,
-            action="llm.context_pressure_detected",
-            target=f"process:{pid}",
-            decision=common,
-        )
         marker_failure = self._record_storage_context_attempt(
             pid,
             action=action,
@@ -1338,12 +1607,6 @@ class LLMProcessExecutor:
         )
         if marker_failure is not None:
             return marker_failure
-        self._audit.record(
-            actor=pid,
-            action="llm.context_pressure_auto_attempted",
-            target=f"process:{pid}",
-            decision=common,
-        )
         try:
             result = await self._dispatch_auto_context_action(
                 pid,
@@ -1433,11 +1696,57 @@ class LLMProcessExecutor:
         common: dict[str, Any],
     ) -> dict[str, Any] | None:
         try:
-            self._persist_completed_context_management_marker(
-                pid,
-                action=action,
-                metadata={**pending_context, "outcome": "attempted"},
+            # The read-only check in LLMContextMemory is only a planning
+            # predicate. Revalidate and consume the maintenance authority at
+            # the first durable attempt boundary. Keeping the finite-use
+            # claim, marker, and attempt evidence in one transaction means a
+            # pre-dispatch persistence failure rolls all of them back. Once
+            # this transaction commits, the attempt owns that use even when
+            # provider/tool outcome is later unknown; replay must reconcile
+            # the existing attempt instead of restoring authority.
+            with self._capabilities.store.transaction():
+                self._capabilities.require(
+                    pid,
+                    LLM_CONTEXT_MAINTENANCE_RESOURCE,
+                    CapabilityRight.EXECUTE,
+                    used_by=pid,
+                    reason="storage context auto-compaction attempt",
+                )
+                self._persist_completed_context_management_marker(
+                    pid,
+                    action=action,
+                    metadata={**pending_context, "outcome": "attempted"},
+                )
+                self._audit.record(
+                    actor=pid,
+                    action="llm.context_pressure_detected",
+                    target=f"process:{pid}",
+                    decision=common,
+                )
+                self._audit.record(
+                    actor=pid,
+                    action="llm.context_pressure_auto_attempted",
+                    target=f"process:{pid}",
+                    decision=common,
+                )
+        except CapabilityDenied:
+            # Revocation/exhaustion that wins before the attempt transaction
+            # is a clean authorization race, not a compaction failure. End
+            # this quantum without dispatch; the next materialization sees
+            # the current authority state and will not retrigger maintenance.
+            self._audit.record(
+                actor=pid,
+                action="llm.context_pressure_maintenance_not_authorized",
+                target=f"process:{pid}",
+                decision={**common, "maintenance_authorized": False},
             )
+            return {
+                "ok": True,
+                "context_compacted": False,
+                "context_storage_pressure": True,
+                "context_maintenance_not_authorized": True,
+                "context_generation": common.get("context_generation"),
+            }
         except Exception as exc:
             return self._fail_storage_context_attempt(
                 pid,
@@ -2991,6 +3300,37 @@ class LLMProcessExecutor:
             tool_name=tool_name,
             output=dumps(envelope),
         )
+        try:
+            output_rows = self._processes.list_llm_tool_outputs(
+                pid=pid,
+                response_id=response_id,
+            )
+        except Exception as exc:
+            # The output upsert above is the correctness boundary. A read used
+            # only to decide whether retention cleanup may run cannot turn a
+            # successfully executed tool into a failed/replayed quantum.
+            try:
+                self._audit.record(
+                    actor=pid,
+                    action="llm.image_only_request_anchor_supersede_failed",
+                    target=f"llm_call:{call.call_id if call is not None else response_id}",
+                    decision={
+                        "error_type": type(exc).__name__,
+                        "phase": "paired_output_query",
+                    },
+                )
+            except Exception:
+                pass
+            return True
+        if {str(row.get("call_id") or "") for row in output_rows} == set(expected):
+            self._try_supersede_image_only_request_anchor(
+                pid=pid,
+                image_id=call.image_id if call is not None else None,
+                transcript_call_id=(
+                    call.call_id if call is not None else response_id
+                ),
+                request_options=call.request_options if call is not None else {},
+            )
         return True
 
     def _persist_response_tool_output(
@@ -3005,7 +3345,7 @@ class LLMProcessExecutor:
     ) -> None:
         if not response_id or not tool_call_id or not self.config.llm.persist_full_io:
             return
-        call = self._processes.get_latest_llm_call(pid=pid, purpose="action_selection")
+        call = self._processes.get_llm_call(response_id)
         if self._persist_image_only_tool_output(
             pid=pid,
             call=call,
@@ -3016,6 +3356,10 @@ class LLMProcessExecutor:
             synthetic=synthetic,
         ):
             return
+        call = self._processes.get_latest_llm_call(
+            pid=pid,
+            purpose="action_selection",
+        )
         if (
             call is None
             or call.api != "responses"
@@ -3346,6 +3690,7 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
         max_attempts: int | None = None,
         response_scope_fingerprint: str | None = None,
+        image_only_anchor: Mapping[str, str] | None = None,
         _prepared_request: dict[str, Any] | None = None,
     ) -> tuple[Any, list[dict[str, Any]], bool, bool]:
         attempt_messages = list(
@@ -3370,6 +3715,7 @@ class LLMProcessExecutor:
                     attempt=attempt_number,
                     max_attempts=selected_max_attempts,
                     response_scope_fingerprint=response_scope_fingerprint,
+                    image_only_anchor=image_only_anchor,
                     _prepared_request=prepared_request,
                 )
             except _LLMReleaseApprovalRequired as exc:
@@ -3416,6 +3762,10 @@ class LLMProcessExecutor:
                         self._validate_dispatchable_action(pid, action)
                 if parallel_tool_calls and len(actions) > 1:
                     self._preflight_parallel_tool_batch(pid, actions)
+                self._supersede_validated_image_only_empty_head(
+                    pid=pid,
+                    completion=completion,
+                )
                 return completion, actions, parallel_tool_calls, auto_wait_used
             except ValueError as exc:
                 last_error = exc
@@ -3464,6 +3814,61 @@ class LLMProcessExecutor:
     def _validate_dispatchable_action(self, pid: str, action: dict[str, Any]) -> None:
         self.actions.validate(pid, action)
 
+    def _supersede_validated_image_only_empty_head(
+        self,
+        *,
+        pid: str,
+        completion: Any,
+    ) -> None:
+        if list(getattr(completion, "tool_calls", []) or []):
+            return
+        output_key = str(
+            getattr(completion, "_agent_libos_transcript_output_key", "") or ""
+        )
+        if not output_key:
+            return
+        call = self._processes.get_llm_call(output_key)
+        if call is None:
+            return
+        transcript = call.request_options.get(_IMAGE_ONLY_TRANSCRIPT_KEY)
+        if not isinstance(transcript, dict) or transcript.get("tool_calls") != []:
+            return
+        # A provider completion is not a usable transcript head until its
+        # model action has passed normalization and dispatch validation.  In
+        # particular, an empty/invalid completion that enters repair must not
+        # discard the only durable first-request retry anchor.
+        now = utc_now()
+        self._processes.insert_llm_call(
+            LLMCallRecord(
+                call_id=new_id("llmvalidation"),
+                pid=pid,
+                image_id=call.image_id,
+                purpose=self._image_only_empty_head_validation_purpose(call.call_id),
+                status="ok",
+                messages=[],
+                tools=[],
+                request_options={
+                    _IMAGE_ONLY_EMPTY_HEAD_VALIDATION_KEY: {
+                        "schema_version": (
+                            _IMAGE_ONLY_EMPTY_HEAD_VALIDATION_SCHEMA_VERSION
+                        ),
+                        "transcript_call_id": call.call_id,
+                    }
+                },
+                response_content="",
+                tool_calls=[],
+                observability={"kind": "image_only_empty_head_validation"},
+                created_at=now,
+                completed_at=now,
+            )
+        )
+        self._try_supersede_image_only_request_anchor(
+            pid=pid,
+            image_id=call.image_id,
+            transcript_call_id=call.call_id,
+            request_options=call.request_options,
+        )
+
     def _tool_call_previews(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         previews: list[dict[str, Any]] = []
         for ordinal, tool_call in enumerate(tool_calls):
@@ -3511,6 +3916,7 @@ class LLMProcessExecutor:
         attempt: int,
         max_attempts: int,
         response_scope_fingerprint: str | None = None,
+        image_only_anchor: Mapping[str, str] | None = None,
         _force_stateless: bool = False,
         _chain_scope_retry: int = 0,
         _prepared_request: dict[str, Any] | None = None,
@@ -3522,6 +3928,7 @@ class LLMProcessExecutor:
             attempt=attempt,
             max_attempts=max_attempts,
             prepared_request=_prepared_request,
+            image_only_anchor=image_only_anchor,
         )
         try:
             if _prepared_request is None:
@@ -3556,6 +3963,7 @@ class LLMProcessExecutor:
                 attempt=attempt,
                 max_attempts=max_attempts,
                 response_scope_fingerprint=response_scope_fingerprint,
+                image_only_anchor=image_only_anchor,
                 _force_stateless=True,
                 _chain_scope_retry=_chain_scope_retry + 1,
             )
@@ -3573,12 +3981,26 @@ class LLMProcessExecutor:
         attempt: int,
         max_attempts: int,
         prepared_request: dict[str, Any] | None,
+        image_only_anchor: Mapping[str, str] | None,
     ) -> _LLMCallState:
         process = self._process.get(pid)
         if prepared_request is None:
             profile_id = (
                 process.llm_profile_id or self.config.llm.default_profile_id
             )
+            request_options: dict[str, Any] = {
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "purpose": "action_selection",
+                "llm_profile_id": profile_id,
+            }
+            if image_only_anchor is not None:
+                frozen_anchor = dict(image_only_anchor)
+                request_options[_IMAGE_ONLY_FROZEN_ANCHOR_KEY] = {
+                    "schema_version": _IMAGE_ONLY_FROZEN_ANCHOR_SCHEMA_VERSION,
+                    **frozen_anchor,
+                    "purpose": self._image_only_request_purpose(frozen_anchor),
+                }
             return _LLMCallState(
                 pid=pid,
                 process=process,
@@ -3587,12 +4009,7 @@ class LLMProcessExecutor:
                 profile_id=profile_id,
                 attempt=attempt,
                 max_attempts=max_attempts,
-                request_options={
-                    "attempt": attempt,
-                    "max_attempts": max_attempts,
-                    "purpose": "action_selection",
-                    "llm_profile_id": profile_id,
-                },
+                request_options=request_options,
                 request_messages=messages,
                 tools=tools,
                 flow_context=self._data_flow.current_context(),
@@ -3682,6 +4099,7 @@ class LLMProcessExecutor:
             previous_output_count=len(previous_outputs),
         )
         await self._apply_context_management(state, image=image)
+        self._prepare_image_only_request_record(state, image=image)
         state.egress_payload = {
             "messages": state.request_messages,
             "tools": state.tools,
@@ -4510,6 +4928,63 @@ class LLMProcessExecutor:
         state.canonical_args = dict(
             prepared_request.get("canonical_args") or {}
         )
+        self._rebind_resumed_image_only_generation(state)
+
+    def _rebind_resumed_image_only_generation(self, state: _LLMCallState) -> None:
+        image = self._images.get(state.process.image_id)
+        if image is None or image.prompt_mode != PROMPT_MODE_IMAGE_ONLY:
+            return
+        anchor = self._frozen_image_only_anchor(state, image=image)
+        prepared_generation = state.request_options.get("llm_context_generation")
+        if prepared_generation != anchor["llm_context_generation"]:
+            raise ValidationError(
+                "image_only resumed request generation does not match its frozen anchor"
+            )
+        current_generation = self._processes.get_llm_context_generation(state.pid)
+        if current_generation == prepared_generation:
+            return
+
+        rebound_anchor = {
+            **anchor,
+            "llm_context_generation": current_generation,
+        }
+        rebound_purpose = self._image_only_request_purpose(rebound_anchor)
+        state.request_options["llm_context_generation"] = current_generation
+        state.request_options[_IMAGE_ONLY_FROZEN_ANCHOR_KEY] = {
+            "schema_version": _IMAGE_ONLY_FROZEN_ANCHOR_SCHEMA_VERSION,
+            **rebound_anchor,
+            "purpose": rebound_purpose,
+        }
+        request_marker = state.request_options.get(_IMAGE_ONLY_REQUEST_KEY)
+        if request_marker is not None:
+            if not isinstance(request_marker, dict):
+                raise ValidationError("image_only resumed request anchor marker is invalid")
+            if request_marker.get("schema_version") != _IMAGE_ONLY_REQUEST_SCHEMA_VERSION:
+                raise ValidationError(
+                    "image_only resumed request anchor has an unsupported schema"
+                )
+            for key, expected in anchor.items():
+                if request_marker.get(key) != expected:
+                    raise ValidationError(
+                        f"image_only resumed request anchor changed {key}"
+                    )
+            if request_marker.get("purpose") != self._image_only_request_purpose(anchor):
+                raise ValidationError("image_only resumed request anchor purpose changed")
+            state.request_options[_IMAGE_ONLY_REQUEST_KEY] = {
+                **request_marker,
+                **rebound_anchor,
+                "purpose": rebound_purpose,
+            }
+        self._audit.record(
+            actor=state.pid,
+            action="llm.image_only_release_generation_rebound",
+            target=f"llm_call:{state.call_id}",
+            decision={
+                "previous_generation": prepared_generation,
+                "current_generation": current_generation,
+                "request_payload_changed": False,
+            },
+        )
 
     async def _invoke_prepared_llm_request(self, state: _LLMCallState) -> Any:
         assert state.resolved is not None and state.sink is not None
@@ -4737,12 +5212,28 @@ class LLMProcessExecutor:
                 "public_error": public_error,
                 "internal_error": internal_error,
             }
+        image = self._images.get(state.process.image_id)
+        request_marker = state.request_options.get(_IMAGE_ONLY_REQUEST_KEY)
+        request_purpose = (
+            str(request_marker.get("purpose") or "")
+            if isinstance(request_marker, dict)
+            else ""
+        )
+        purpose = "action_selection"
+        if image is not None and image.prompt_mode == PROMPT_MODE_IMAGE_ONLY:
+            purpose = (
+                request_purpose
+                if request_purpose.startswith(
+                    f"{_IMAGE_ONLY_REQUEST_PURPOSE_PREFIX}:"
+                )
+                else _IMAGE_ONLY_ERROR_PURPOSE
+            )
         self._processes.insert_llm_call(
             LLMCallRecord(
                 call_id=state.call_id,
                 pid=state.pid,
                 image_id=state.process.image_id,
-                purpose="action_selection",
+                purpose=purpose,
                 status="error",
                 messages=observable["messages"],
                 tools=observable["tools"],
@@ -4805,31 +5296,30 @@ class LLMProcessExecutor:
             raw_response=getattr(completion, "raw", None),
             config=self.config,
         )
-        self._processes.insert_llm_call(
-            LLMCallRecord(
-                call_id=state.call_id,
-                pid=state.pid,
-                image_id=state.process.image_id,
-                purpose="action_selection",
-                status="ok",
-                api=getattr(completion, "api", None),
-                model=getattr(completion, "model", None),
-                request_id=getattr(completion, "request_id", None),
-                response_id=getattr(completion, "response_id", None),
-                messages=observable["messages"],
-                tools=observable["tools"],
-                request_options=state.request_options,
-                response_content=observable["response_content"],
-                tool_calls=observable["tool_calls"],
-                reasoning=observable["reasoning"],
-                usage=usage,
-                raw_response=observable["raw_response"],
-                observability=observable["observability"],
-                error=observable["error"],
-                created_at=state.created_at,
-                completed_at=utc_now(),
-            )
+        success_record = LLMCallRecord(
+            call_id=state.call_id,
+            pid=state.pid,
+            image_id=state.process.image_id,
+            purpose="action_selection",
+            status="ok",
+            api=getattr(completion, "api", None),
+            model=getattr(completion, "model", None),
+            request_id=getattr(completion, "request_id", None),
+            response_id=getattr(completion, "response_id", None),
+            messages=observable["messages"],
+            tools=observable["tools"],
+            request_options=state.request_options,
+            response_content=observable["response_content"],
+            tool_calls=observable["tool_calls"],
+            reasoning=observable["reasoning"],
+            usage=usage,
+            raw_response=observable["raw_response"],
+            observability=observable["observability"],
+            error=observable["error"],
+            created_at=state.created_at,
+            completed_at=utc_now(),
         )
+        self._processes.insert_llm_call(success_record)
         self._operations.link_evidence(
             "llm_call",
             state.call_id,
@@ -4856,6 +5346,90 @@ class LLMProcessExecutor:
             state.fallback_json_actions,
             str(state.request_options["llm_profile_id"]),
         )
+
+    def _supersede_image_only_request_anchor(
+        self,
+        *,
+        pid: str,
+        image_id: str | None,
+        transcript_call_id: str,
+        request_options: Mapping[str, Any],
+    ) -> None:
+        frozen = request_options.get(_IMAGE_ONLY_FROZEN_ANCHOR_KEY)
+        if not isinstance(frozen, dict):
+            return
+        purpose = str(frozen.get("purpose") or "")
+        if not purpose.startswith(f"{_IMAGE_ONLY_REQUEST_PURPOSE_PREFIX}:"):
+            raise ValidationError("image_only frozen request anchor purpose changed")
+        request = self._processes.get_latest_llm_call(
+            pid=pid,
+            purpose=purpose,
+        )
+        if (
+            request is None
+            or request.status != "error"
+            or not isinstance(
+                request.request_options.get(_IMAGE_ONLY_REQUEST_KEY),
+                dict,
+            )
+        ):
+            return
+        now = utc_now()
+        self._processes.insert_llm_call(
+            LLMCallRecord(
+                call_id=new_id("llmanchor"),
+                pid=pid,
+                image_id=image_id,
+                purpose=purpose,
+                status="ok",
+                messages=[],
+                tools=[],
+                request_options={
+                    "image_only_request_superseded": {
+                        "schema_version": 1,
+                        "request_call_id": request.call_id,
+                        "transcript_call_id": transcript_call_id,
+                    }
+                },
+                response_content="",
+                tool_calls=[],
+                observability={"kind": "image_only_request_superseded"},
+                created_at=now,
+                completed_at=now,
+            )
+        )
+
+    def _try_supersede_image_only_request_anchor(
+        self,
+        *,
+        pid: str,
+        image_id: str | None,
+        transcript_call_id: str,
+        request_options: Mapping[str, Any],
+    ) -> bool:
+        try:
+            self._supersede_image_only_request_anchor(
+                pid=pid,
+                image_id=image_id,
+                transcript_call_id=transcript_call_id,
+                request_options=request_options,
+            )
+        except Exception as exc:
+            # The complete transcript remains canonical and the older request
+            # anchor remains protected. Tombstone failure therefore delays
+            # retention only; it must not roll back a correct tool output or
+            # turn an already-terminal tool action into a second exit.
+            try:
+                self._audit.record(
+                    actor=pid,
+                    action="llm.image_only_request_anchor_supersede_failed",
+                    target=f"llm_call:{transcript_call_id}",
+                    decision={"error_type": type(exc).__name__},
+                )
+            except Exception:
+                pass
+            return False
+        return True
 
     @staticmethod
     def _normalize_image_only_completion_tool_calls(
@@ -4885,7 +5459,7 @@ class LLMProcessExecutor:
         anchor: Mapping[str, str],
     ) -> set[str]:
         input_oids: set[str] = set()
-        previous = self._processes.get_latest_llm_call(
+        previous = self._processes.get_latest_successful_llm_call(
             pid=state.pid,
             purpose="action_selection",
         )
@@ -4924,6 +5498,54 @@ class LLMProcessExecutor:
             raise ValidationError("image_only action-repair request is malformed")
         return canonical_message_count - 1
 
+    def _prepare_image_only_request_record(
+        self,
+        state: _LLMCallState,
+        *,
+        image: Any,
+    ) -> None:
+        if image.prompt_mode != PROMPT_MODE_IMAGE_ONLY:
+            return
+        if not self.config.llm.persist_full_io:
+            raise ValidationError(
+                "image_only requires llm.persist_full_io=true for durable request retry"
+            )
+        anchor = self._frozen_image_only_anchor(state, image=image)
+        prepared_generation = state.request_options.get("llm_context_generation")
+        if prepared_generation != anchor["llm_context_generation"]:
+            raise ValidationError(
+                "image_only request generation changed during request preparation"
+            )
+        purpose = self._image_only_request_purpose(anchor)
+        canonical_message_count = self._image_only_canonical_message_count(state)
+        if canonical_message_count != 2:
+            # Once a complete transcript exists, that successful head and its
+            # paired output rows—not a failed request snapshot—remain the
+            # canonical recovery source.
+            return
+        previous_request, previous_marker = self._latest_image_only_request(
+            pid=state.pid,
+            image=image,
+            anchor=anchor,
+        )
+        if previous_request is not None and previous_marker is not None:
+            # Keep a single durable goal retry anchor per transcript anchor.
+            # Later transient rows use the separate request purpose so they
+            # cannot hide a successful transcript head, but need not duplicate
+            # the same retained goal payload.
+            return
+        input_oids = {ref.oid for ref in state.flow_context.source_refs}
+        if state.process.goal_oid:
+            input_oids.add(str(state.process.goal_oid))
+        state.request_options[_IMAGE_ONLY_REQUEST_KEY] = {
+            "schema_version": _IMAGE_ONLY_REQUEST_SCHEMA_VERSION,
+            **anchor,
+            "purpose": purpose,
+            "canonical_message_count": canonical_message_count,
+            "labels": state.flow_context.labels.to_dict(),
+            "input_oids": sorted(input_oids),
+        }
+
     def _prepare_image_only_transcript_record(
         self,
         state: _LLMCallState,
@@ -4937,10 +5559,13 @@ class LLMProcessExecutor:
                 "image_only requires llm.persist_full_io=true for durable transcript replay"
             )
         self._normalize_image_only_completion_tool_calls(state, completion)
-        anchor = self._image_only_transcript_anchor(image, state.process)
+        anchor = self._frozen_image_only_anchor(state, image=image)
         input_oids = {ref.oid for ref in state.flow_context.source_refs}
         input_oids.update(
-            self._previous_image_only_input_oids(state=state, anchor=anchor)
+            self._previous_image_only_input_oids(
+                state=state,
+                anchor=anchor,
+            )
         )
         if state.process.goal_oid:
             input_oids.add(str(state.process.goal_oid))

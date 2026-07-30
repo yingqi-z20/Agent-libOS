@@ -50,6 +50,12 @@ are never automatically deleted. Listing uses the configured managed-root
 identity rather than following a later symlink replacement, so an external
 checkout cannot become visible by redirecting that root.
 
+Preparing a create may materialize the managed-root directories and add the
+`info/exclude` entry before `git worktree add` succeeds. Those repository-local
+metadata effects are therefore part of failure reconciliation even when no
+managed worktree is ultimately listed; callers must not remove them through
+ordinary filesystem tools.
+
 ## Public Runtime and tool surface
 
 Every method below has a synchronous form on `Runtime.git` and an asynchronous
@@ -110,6 +116,12 @@ dispatch. Drift returns `stale_state`; success returns the post-operation
 observation token in `GitOperationResult.after`. It is a deterministic digest,
 not a freshly generated nonce, so a verified no-op or a remote-only mutation
 whose local inputs are unchanged may return the same hex value.
+
+Only an initial state-token comparison that fails before the first
+state-changing provider effect certifies that the invocation did not mutate
+Git. A later `stale_state` can follow an earlier phase or a successful Host
+command and is a possibly dispatched outcome: inspect and reconcile before any
+retry rather than classifying it from the error code alone.
 
 Repository reads as well as mutations acquire the same bounded cross-process
 repository lock, so either kind of operation can fail with `repository_busy`.
@@ -307,6 +319,11 @@ Host defaults cannot broaden the approved effect.
 Typed pull supplies a Host-generated exact refspec and updates only the selected
 branch's matching remote-tracking ref, including when repository configuration
 contains a wildcard fetch refspec.
+`git_list_remotes` exposes those validated fetch refspec strings alongside the
+redacted URL placeholders and hashes, so callers can determine whether a
+specific pushed branch maps to a locally observable remote-tracking ref. The
+values are read-only configuration observations and cannot be supplied back as
+transport input.
 Local `file:` remotes are disabled by default and exist only as an explicit
 Host configuration option for controlled deployments and deterministic tests.
 

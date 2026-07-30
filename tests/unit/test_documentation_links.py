@@ -1,31 +1,108 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+from functools import lru_cache
+from io import StringIO
 import re
 from pathlib import Path
 import subprocess
 import sys
 from urllib.parse import unquote, urlsplit
 
+from agent_libos.api.cli import _parse_cli_args
+
 
 ROOT = Path(__file__).resolve().parents[2]
-_DOCUMENT_PATTERNS = (
-    "*.md",
-    "docs/**/*.md",
-    "benchmarks/**/*.md",
-    "skills/**/*.md",
-    "images/**/*.md",
-    "modules/**/*.md",
-)
-DOCUMENTS = sorted(
-    {
-        path
-        for pattern in _DOCUMENT_PATTERNS
-        for path in ROOT.glob(pattern)
-        if path.is_file()
-    }
-)
+
+
+def _repository_markdown_documents() -> tuple[Path, ...]:
+    completed = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            "*.md",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    documents = []
+    for relative in completed.stdout.split("\0"):
+        if not relative or Path(relative).suffix.lower() != ".md":
+            continue
+        path = ROOT / relative
+        if not path.is_file():
+            raise AssertionError(f"repository Markdown document is missing: {relative}")
+        documents.append(path)
+    return tuple(sorted(documents))
+
+
+DOCUMENTS = _repository_markdown_documents()
 _LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 _HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+
+_IMPORTANT_COMMAND_SECTIONS = {
+    "explain": "Explainable Operations",
+    "workflow": "Workflow Run",
+    "object-task": "Object Tasks",
+    "checkpoint": "Checkpoint Commands",
+    "skills": "Skill Commands",
+    "capabilities": "Capability Commands",
+    "images": "Image Commands",
+    "jsonrpc": "JSON-RPC Commands",
+    "mcp": "MCP Commands",
+    "modules": "Runtime Module Commands",
+}
+
+_IMPORTANT_LEAF_PARAMETERS = {
+    ("workflow", "run"): (
+        "Workflow Run",
+        ("--args-json", "--image", "--goal"),
+    ),
+    ("object-task", "start"): (
+        "Object Tasks",
+        ("--pid", "--owner-oid", "--wait"),
+    ),
+    ("exec",): (
+        "Process Builtins",
+        ("--pid", "--preserve-capabilities", "--run"),
+    ),
+    ("skills", "activate"): (
+        "Skill Commands",
+        ("--expected-package-sha256",),
+    ),
+    ("capabilities", "grant"): (
+        "Capability Commands",
+        ("--rights",),
+    ),
+    ("images", "commit"): (
+        "Image Commands",
+        ("--name",),
+    ),
+    ("jsonrpc", "call"): (
+        "JSON-RPC Commands",
+        ("--params-json",),
+    ),
+    ("mcp", "call"): (
+        "MCP Commands",
+        ("--arguments-json",),
+    ),
+}
+
+_ACTOR_SCOPED_GROUPS = (
+    "checkpoint",
+    "skills",
+    "capabilities",
+    "images",
+    "jsonrpc",
+    "mcp",
+)
 
 
 def _without_code(text: str) -> str:
@@ -59,6 +136,38 @@ def _anchors(path: Path) -> set[str]:
     return anchors
 
 
+@lru_cache(maxsize=None)
+def _cli_help(command: tuple[str, ...]) -> str:
+    stdout = StringIO()
+    with redirect_stdout(stdout):
+        try:
+            _parse_cli_args([*command, "--help"])
+        except SystemExit as exc:
+            if exc.code != 0:
+                raise AssertionError(
+                    f"CLI help failed for {' '.join(command)} with {exc.code}"
+                ) from exc
+        else:
+            raise AssertionError(f"CLI help did not exit for {' '.join(command)}")
+    return stdout.getvalue()
+
+
+def _markdown_section(text: str, heading: str) -> str:
+    match = re.search(
+        rf"^## {re.escape(heading)}\s*$\n(?P<body>.*?)(?=^## |\Z)",
+        text,
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    assert match is not None, f"docs/cli.md is missing the {heading!r} section"
+    return match.group("body")
+
+
+def _nested_commands(help_text: str) -> tuple[str, ...]:
+    match = re.search(r"\{(?P<commands>[a-z0-9,-]+)\}", help_text)
+    assert match is not None, "CLI group help does not expose a subcommand list"
+    return tuple(match.group("commands").split(","))
+
+
 def test_local_documentation_links_and_anchors_resolve() -> None:
     failures: list[str] = []
     for document in DOCUMENTS:
@@ -80,6 +189,24 @@ def test_local_documentation_links_and_anchors_resolve() -> None:
                     )
 
     assert not failures, "\n" + "\n".join(failures)
+
+
+def test_document_inventory_covers_tracked_and_untracked_markdown_files() -> None:
+    relative_documents = {path.relative_to(ROOT) for path in DOCUMENTS}
+    builtin_skills = {
+        path
+        for path in relative_documents
+        if path.parts[:3] == ("agent_libos", "skills", "builtin")
+        and path.name == "SKILL.md"
+    }
+    experiment_documents = {
+        path for path in relative_documents if path.parts[0] == "experiments"
+    }
+
+    assert builtin_skills
+    assert experiment_documents
+    assert Path("docs/events.md") in relative_documents
+    assert Path("benchmarks/runtime_safety/README.md") in relative_documents
 
 
 def test_cli_reference_tracks_every_top_level_command() -> None:
@@ -108,3 +235,60 @@ def test_cli_reference_tracks_every_top_level_command() -> None:
     ]
 
     assert documented == actual
+
+
+def test_cli_reference_tracks_important_nested_commands() -> None:
+    cli_reference = (ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
+    failures: list[str] = []
+
+    for group, heading in _IMPORTANT_COMMAND_SECTIONS.items():
+        section = _markdown_section(cli_reference, heading)
+        for command in _nested_commands(_cli_help((group,))):
+            if not re.search(
+                rf"(?<![\w-]){re.escape(command)}(?![\w-])",
+                section,
+            ):
+                failures.append(f"{group} {command} is absent from {heading!r}")
+
+    assert not failures, "\n" + "\n".join(failures)
+
+
+def test_cli_reference_tracks_important_leaf_parameters() -> None:
+    cli_reference = (ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
+    failures: list[str] = []
+
+    for command, (heading, parameters) in _IMPORTANT_LEAF_PARAMETERS.items():
+        help_text = _cli_help(command)
+        section = _markdown_section(cli_reference, heading)
+        for parameter in parameters:
+            if parameter not in help_text:
+                failures.append(
+                    f"agent-libos {' '.join(command)} help is missing {parameter}"
+                )
+            if parameter not in section:
+                failures.append(
+                    f"{heading!r} does not document {' '.join(command)} {parameter}"
+                )
+
+    assert not failures, "\n" + "\n".join(failures)
+
+
+def test_cli_reference_tracks_actor_scoped_command_groups() -> None:
+    cli_reference = (ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
+    actor_contract = re.search(
+        r"`--actor-pid` is a command-group option.*?(?=\n\n)",
+        cli_reference,
+        flags=re.DOTALL,
+    )
+    assert actor_contract is not None
+
+    failures: list[str] = []
+    for group in _ACTOR_SCOPED_GROUPS:
+        if "--actor-pid" not in _cli_help((group,)):
+            failures.append(f"agent-libos {group} help is missing --actor-pid")
+        if f"`{group}`" not in actor_contract.group(0):
+            failures.append(
+                f"docs/cli.md actor-scope contract does not name {group}"
+            )
+
+    assert not failures, "\n" + "\n".join(failures)

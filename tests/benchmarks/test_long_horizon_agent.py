@@ -113,6 +113,11 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
     runtime = Runtime.open(database, substrate=substrate)
     try:
         pid = runtime.process.spawn(image="coding-agent:v0", goal=GOAL)
+        initial_process = runtime.process.get(pid)
+        assert initial_process.goal_oid is not None
+        initial_goal = runtime.store.get_object(initial_process.goal_oid)
+        assert initial_goal is not None
+        assert initial_goal.payload == {"text": GOAL}
         _grant_authority(runtime, pid)
         runtime.skills.activate_skill(
             pid,
@@ -153,6 +158,12 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
 
     reopened = Runtime.open(database, substrate=substrate)
     try:
+        rehydrated_process = reopened.process.get(pid)
+        assert rehydrated_process.goal_oid == initial_goal.oid
+        rehydrated_goal = reopened.store.get_object(rehydrated_process.goal_oid)
+        assert rehydrated_goal == initial_goal
+        assert rehydrated_goal.payload == {"text": GOAL}
+
         def dispatch(action: dict[str, Any]) -> dict[str, Any]:
             result = reopened.llm.dispatch(pid, action)
             results.append({"ok": True, "action": action, "result": result})
@@ -211,9 +222,11 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
         )
         review_result = dispatch({"action": "process_exit"})
         review = review_result["payload"]["completion_review"]
-        assert review["goal"]["source"] == "persisted_initial_llm_context"
+        assert review["goal"]["source"] == "object_memory"
+        assert review["goal"]["oid"] == initial_goal.oid
+        assert review["goal"]["version"] == initial_goal.version
         assert "payload" not in review["goal"]
-        assert "exactly 100.00" in str(review["goal"]["fallback"])
+        assert "fallback" not in review["goal"]
         dispatch(
             {
                 "action": "human_output",

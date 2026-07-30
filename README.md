@@ -145,8 +145,8 @@ The implementation currently includes:
 
 Start here, then read the deeper references as needed:
 
-- [docs/release_status.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/release_status.md): current-version readiness,
-  validation outcomes, and remaining environment boundaries.
+- [docs/release_status.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/release_status.md): current-version candidate scope,
+  validation contract, and remaining environment boundaries (not a CI receipt).
 - [docs/python_api.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/python_api.md): public Python imports, Runtime
   lifecycle, manager properties, sync/async usage, exceptions, and
   compatibility boundaries.
@@ -156,6 +156,8 @@ Start here, then read the deeper references as needed:
   trust boundaries, guarantees, non-goals, and severity calibration.
 - [docs/runtime_model.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/runtime_model.md): process lifecycle, scheduler,
   cwd, human queue, IPC, fork/spawn/exec, and waits.
+- [docs/events.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/events.md): closed Runtime event catalog, envelope,
+  producer/payload contracts, ordering, idempotency, and consumer guidance.
 - [docs/explainable_operations.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/explainable_operations.md): operation
   trees, evidence completeness, Context Manifests, redaction, CLI, and GUI/API
   queries.
@@ -188,7 +190,8 @@ Start here, then read the deeper references as needed:
 - [docs/checkpoints.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/checkpoints.md): scoped snapshots, restore, fork,
   replay diagnostics, retained runtime history, and external-effect reporting.
 - [docs/storage.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/storage.md): transaction rollback/poison semantics,
-  Object payload durability, schema recovery, and active-runtime leases.
+  Object payload durability, schema recovery, active-runtime leases, and the
+  backup/restore runbook.
 - [docs/evidence_payload_retention.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/evidence_payload_retention.md):
   explicit, auditable LLM/external-effect payload retention tiers and safety
   exclusions.
@@ -247,7 +250,9 @@ infer current commands, interfaces, security guarantees, or release evidence:
 
 ## Quick Start
 
-Prerequisites are Python 3.11–3.14 and [uv](https://docs.astral.sh/uv/). The
+Prerequisites are Python 3.11–3.14 and [uv](https://docs.astral.sh/uv/). CI
+currently pins uv `0.11.32`; use that version when reproducing a CI or release
+receipt exactly. The
 typed Git provider and full test matrix require system Git 2.26 or newer. GUI
 development requires Node `>=22.12.0` and npm 8 or newer; CI uses
 Node 24. Deno is optional unless running real TypeScript/JIT coverage.
@@ -257,6 +262,12 @@ Install dependencies:
 ```bash
 uv sync --frozen --all-groups
 ```
+
+Dependency groups and optional extras are separate in uv: `--all-groups` does
+not install the `mcp`, `postgres`, or `pty` extras. Add the relevant
+`--extra <name>` when exercising that integration. In particular, a complete
+Windows test checkout needs `uv sync --frozen --all-groups --extra pty` for
+native ConPTY coverage.
 
 ### Distribution artifacts
 
@@ -279,9 +290,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.0.0-py3-none-any.whl dist/agent_libos-1.0.0.tar.gz
+  dist/agent_libos-1.0.1-py3-none-any.whl dist/agent_libos-1.0.1.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.0.0-py3-none-any.whl
+  dist/agent_libos-1.0.1-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -295,7 +306,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.0.0-py3-none-any.whl
+  --no-deps dist/agent_libos-1.0.1-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -308,7 +319,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.0.0.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.0.1.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -363,11 +374,14 @@ test session; use `--keep-agent-outputs` when debugging generated files.
 Run the deterministic local demo:
 
 ```bash
-uv run agent-libos demo
+uv run agent-libos --db local demo
 ```
 
 The demo overwrites `agent_outputs/demo_patch_preview.txt` below the Runtime
 workspace. Preserve or move an existing file at that path before running it.
+The explicit `--db local` keeps Runtime records in memory. The project-root
+`config.yaml` still loads its configured PTY Runtime Module; if `--db` is
+omitted, that config also selects the persistent `.agent_libos.sqlite` store.
 
 Run the Electron GUI in development mode:
 
@@ -439,23 +453,48 @@ and Explain evidence; it never falls back to a modeled success.
 
 ## Persistent Runtime
 
-Use `--db` to keep runtime state in a persistent store. A filesystem path uses
-SQLite and remains the default local option. The `spawn` command prints the new
-pid; substitute it for `<pid>` below. Running a quantum invokes the configured
-real LLM, consumes provider tokens, and requires the model/API environment
-described in the next section. Image requirement declarations do not grant
-authority, so grant the exact README read capability before running this goal:
+Use `--db` to keep runtime metadata and authority in a persistent store. A
+filesystem path selects SQLite. Ordinary Object payloads are deliberately
+runtime-only. One narrow recovery path makes the common CLI workflow usable
+across invocations: with the default `llm.persist_full_io: true`, a committed
+root `spawn` publication retains a bounded, identity- and hash-bound copy of
+that process's initial goal. Startup validates the same active root process and
+unchanged goal id, Object identity/version, live state, and runtime-memory
+marker for the immutable initial GOAL created by `ProcessManager` before
+rehydrating only that payload. Mutable goal handles are never recoverable by
+this path. The envelope is separately bound to the initial image in the spawn
+publication, so a later exec may change the current image without invalidating
+an otherwise unchanged goal. All other Object payloads remain volatile. The
+`spawn` command prints the pid to substitute for `<pid>`. `run` invokes the
+configured real LLM, consumes provider tokens, and requires the model/API
+environment described in the next section:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite init
 uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Summarize README.md"
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:workspace:README.md --rights read
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> human:owner --rights write
 uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 uv run agent-libos --db .agent_libos.sqlite processes
 uv run agent-libos --db .agent_libos.sqlite resources <pid>
 uv run agent-libos --db .agent_libos.sqlite audit
 uv run agent-libos --db .agent_libos.sqlite workflow run get_working_directory
 ```
+
+The Host-issued README and Human-output grants satisfy and narrow the image's
+declarative requirements; the image declarations did not issue them. Setting
+`llm.persist_full_io: false` writes only content-free identity, hash, and size
+metadata, so the initial goal cannot be recovered by a later CLI invocation.
+Under that opt-out, keep spawn and execution in one embedded/GUI Runtime
+lifetime, or use
+a bootstrap spawn followed by same-invocation `exec --no-preserve-memory
+--preserve-capabilities --run`. Terminal process cleanup redacts a reversible
+initial-goal envelope to its hash-only form; failed launch rollback and startup
+compensation do the same before committing a non-committable publication state.
+`human:owner` corresponds to the checked-in `runtime.default_human: owner`;
+substitute the configured Human resource when that setting changes.
+For a simpler one-process launch, use `scripts/run_coding_agent.py`, an embedded
+`Runtime`, or the GUI server.
 
 PostgreSQL is opt-in. Install the extra dependency and either pass a DSN with
 `--db` or configure `runtime.store_backend: postgres` together with
@@ -474,13 +513,16 @@ checkpoints, and registered tools/images/skills are durable store records.
 Ordinary Object Memory payloads remain runtime-only; current writes store a
 runtime-memory marker in the object table, and marker rows whose payload cache
 cannot be reconstructed are released fail-closed on reopen instead of being
-treated as real payloads. An accepted legacy row from an older development
-build may still contain full JSON payload data; migrate or recreate such a
-store before claiming marker-only historical retention. See
+treated as real payloads. The validated active root-spawn initial-goal recovery
+described above rehydrates its exact matching marker before that sweep; it does
+not make the object table a payload store. An accepted legacy row from an older
+development build may still contain full JSON payload data; migrate or recreate
+such a store before claiming marker-only historical retention. See
 [docs/storage.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/storage.md#transaction-model).
-Persistent stores take an active-runtime lease: SQLite uses a secure sidecar
-`flock` where available or an exclusive database lock as fallback, and
-PostgreSQL uses a session advisory lock. Two writable `Runtime` instances
+Persistent stores take an active-runtime lease: SQLite always holds an
+exclusive lock on the database actually opened and adds secure sidecar/identity
+`flock` leases where available; PostgreSQL uses a session advisory lock. Two
+writable `Runtime` instances
 cannot concurrently open the same store. Closing the first runtime releases the
 lease and permits a later reopen.
 
@@ -489,9 +531,12 @@ path. On the hardened POSIX path, a no-follow path-sidecar `flock` is paired
 with an owner-only identity lease keyed by the validated database
 `(st_dev, st_ino)`. The database, lease, identity-lease, journal, WAL, and SHM
 files must be regular, current-user-owned, single-link files and are tightened
-to `0600`; this rejects hard-link aliases and path/lockfile replacement. Where
-that mechanism is unavailable, SQLite uses its kernel-managed exclusive
-database lock without claiming the POSIX path/inode guarantees. PostgreSQL
+to `0600`; this rejects ordinary hard-link aliases and path/lockfile replacement
+races. The exclusive database lock retains the one-writer boundary when POSIX
+identity hardening is unavailable or a same-UID administrator races connect,
+but the standard driver cannot prove that such a raced connection names the
+originally selected inode. Keep the parent owner-only and never rename/replace
+a live database path; see the documented Host trust boundary below. PostgreSQL
 advisory keys are scoped to the current database and schema. Store transactions
 also fail closed: an ordinary statement/savepoint failure rolls back while the
 transaction is still active. If commit or savepoint release has an uncertain
@@ -592,8 +637,10 @@ support an env file. PowerShell users can set the same inherited variables with
 The client uses the OpenAI Python SDK. It uses the Responses API for
 OpenAI-hosted models by default and falls back to Chat Completions for custom
 OpenAI-compatible `base_url` providers. Custom OpenAI-compatible endpoints
-require `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1`; official OpenAI endpoints do
-not. Set `OPENAI_API_MODE=responses` or `OPENAI_API_MODE=chat` to force a mode.
+require either the selected profile's `allow_custom_base_url: true` setting or
+the Host-wide `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1` opt-in; the two examples
+above demonstrate those alternatives. Official OpenAI endpoints need neither.
+Set `OPENAI_API_MODE=responses` or `OPENAI_API_MODE=chat` to force a mode.
 
 Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`,
 `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific
@@ -638,10 +685,21 @@ uv run agent-libos --db .agent_libos.sqlite run --interactive --pid <pid> --max-
 Manually control process cwd and lifecycle:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite cd <pid> src
-uv run agent-libos --db .agent_libos.sqlite exec review-agent:v0 "Review README.md" --pid <pid> --run
-uv run agent-libos --db .agent_libos.sqlite exit <pid> --payload '{"done":true}'
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> 'filesystem:workspace:agent_libos/*' --rights read
+uv run agent-libos --db .agent_libos.sqlite cd <pid> agent_libos
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> image:review-agent:v0 --rights read
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> human:owner --rights write
+uv run agent-libos --db .agent_libos.sqlite exec review-agent:v0 "Review runtime/runtime.py" \
+  --pid <pid> --no-preserve-memory --preserve-capabilities --run --max-quanta 10
 ```
+
+`cd` requires read authority for the selected directory. Changing images also
+requires read authority for the target image. Exec drops external capabilities
+by default, so this example opts in to preserving the Host-issued reviewed
+directory, target-image, and Human grants. Those grants satisfy and narrow the
+review image's declarations; the declarations themselves do not grant final
+output authority. Use `exit <pid> --payload '{"done":true}'` only for a process that is
+still non-terminal.
 
 Commit a checkpoint into a new checkpoint-derived image:
 
@@ -708,6 +766,14 @@ uv run python scripts/run_coding_agent.py --workspace /path/to/repo --goal "Impl
 The launcher loads `.env` from this Agent libOS checkout before mounting the
 target workspace. It does not automatically read the target workspace's `.env`;
 pass `--env-file /path/to/env` when a run needs a different credential file.
+Unless `--no-run` is supplied, it immediately calls the configured real LLM
+with a default ceiling of 40 quanta. Its default `edit` preset grants the agent
+read and write authority across the mounted workspace, uses the configured
+`allowlist_auto_else_ask` Shell policy, and writes to a workspace-keyed
+persistent database outside the model-visible workspace. Use `--ephemeral-db`
+for an in-memory store, choose `--permission-preset read-only` when writes are
+not required, and add `--strict` when a failed or killed process must make the
+launcher exit non-zero.
 
 On Windows PowerShell:
 

@@ -25,7 +25,7 @@ The call validates and registers the image/artifact. It does not exec, rebuild c
 
 Check the complete output: `image_id`, `name`, `version`, `source_path`, `replaced`, `default_tools`, `package_jit_tools`, `boot_kind`, `artifact_id`, `package_sha256`, and both requirement counts. A package hash is content identity only; a manifest signature field is metadata unless separately authenticated.
 
-Reading needs filesystem authority; a new ID needs exact `image:<image_id>` write, and replacement needs exact admin. Replacement changes future resolution. A process already bearing that ID may resolve new prompt/policy while retaining its bound tools. Prefer a fresh ID and explicit exec.
+Reading needs filesystem authority; a new ID needs exact `image:<image_id>` write, and replacement needs exact admin. A durable but unbootable/quarantined row still counts as an existing ID: `replace=false` cannot overwrite it with write authority, and deliberate replacement requires `replace=true` plus exact admin. Replacement changes future resolution. A process already bearing that ID may resolve new prompt/policy while retaining its bound tools. Prefer a fresh ID and explicit exec.
 
 ### `commit_checkpoint_to_image`
 
@@ -33,7 +33,7 @@ Use a checkpoint previously inspected with the checkpoint Skill; this Skill cann
 
 The call publishes a checkpoint-derived artifact and registry entry. It does not restore/resume the checkpoint, change the caller, create a process, exec this process, or test boot.
 
-The root-process artifact captures reconstructable Object roots/payloads, namespaces/internal Object authority, visible static/JIT state and source, loaded Skills, cwd string, and module/capability requirements. It does not clone children, files/shell, provider registrations/sessions, MCP/JSON-RPC state, UI state, budgets/usage, or external effects. Source-row metadata may remain, but boot does not replay its lease, status, waits, mailbox/history, event cursor, or outcomes. Package files separately when boot needs them.
+The root-process artifact captures reconstructable Object roots/payloads, namespaces/internal Object authority, static tool names/bindings, process-local JIT state/source, loaded Skills, cwd string, and module/capability requirements. Static implementation code is not embedded: boot resolves each non-JIT name against the current Host `ToolBroker`, so a same-name implementation may drift or disappear. Required Module hashes mitigate this for module-supplied tools but do not pin every Host/built-in tool. It does not clone children, files/shell, provider registrations/sessions, MCP/JSON-RPC state, UI state, budgets/usage, or external effects. Source-row metadata may remain, but boot does not replay its lease, status, waits, mailbox/history, event cursor, or outcomes. Package files separately when boot needs them.
 
 Boot remaps internal Object/namespace capabilities. External capabilities become requirements only. Hash-pinned modules fail closed if absent/mismatched; global Skill trust and provider registries are not packaged. Before boot, the Host must also confirm that every captured Object's data-flow labels, including tenant boundaries, are admissible for the target process; boot rejects incompatible metadata rather than relabeling it.
 

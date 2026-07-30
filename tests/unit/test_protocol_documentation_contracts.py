@@ -129,6 +129,30 @@ def test_jit_skill_keeps_strict_expected_and_interruption_contracts() -> None:
     assert "do not revalidate the interrupted candidate" in skill
 
 
+def test_skill_compatibility_is_opaque_metadata_not_a_runtime_gate() -> None:
+    documentation = _words(_read("docs/skills.md"))
+
+    assert "validated only as a non-empty string" in documentation
+    assert "does not parse Semantic Versioning" in documentation
+    assert "reject registration or activation" in documentation
+    assert "Host or package-release workflow is responsible" in documentation
+    assert "not a Runtime-enforced version gate" in documentation
+
+
+def test_swe_skill_docs_keep_native_child_boundary_and_dependency_contracts() -> None:
+    documentation = _words(_read("docs/skills.md"))
+    skill = _words(_read("skills/swe-agent/SKILL.md"))
+
+    for text in (documentation, skill):
+        assert "does not re-enter" in text
+        assert "not an operating-system sandbox" in text
+        assert "container, WASM, VM, service" in text
+        assert "safe PATH" in text
+
+    assert "Skill activation validates the JIT package" in documentation
+    assert "activating this Skill does not prove" in skill
+
+
 def test_remote_skills_keep_deadline_pagination_and_phase_local_contracts() -> None:
     jsonrpc = _words(
         _read("agent_libos/skills/builtin/agent-libos-jsonrpc/SKILL.md")
@@ -140,8 +164,21 @@ def test_remote_skills_keep_deadline_pagination_and_phase_local_contracts() -> N
     assert "no phase gets a fresh timeout" in jsonrpc
     assert "v1 live `tools/list` is deliberately unpaginated" in mcp
     assert "continuation cursors are neither exposed nor followed" in mcp
+    assert "a non-empty MCP `nextCursor` is rejected as an incomplete catalog" in _words(
+        _read("docs/mcp.md")
+    )
     assert "one absolute deadline across the live exchange" in mcp
     assert "certificate is phase-local" in mcp
+
+
+def test_remote_manifest_docs_keep_explicit_null_rollback_default() -> None:
+    for path in ("docs/jsonrpc.md", "docs/mcp.md"):
+        documentation = _words(_read(path))
+        assert (
+            "An omitted `rollback_status` and an explicit YAML/JSON `null` "
+            "have the same meaning"
+        ) in documentation
+        assert "A supplied non-null `rollback_status` is preserved" in documentation
 
 
 def test_image_and_checkpoint_skills_keep_recovery_boundaries() -> None:
@@ -159,3 +196,18 @@ def test_image_and_checkpoint_skills_keep_recovery_boundaries() -> None:
     assert "mutates the global image registry" in checkpoints
     assert "Release finalizers may themselves create external effects" in checkpoints
     assert "`checkpoint_restore_receipt`" in checkpoints
+
+
+def test_checkpoint_image_docs_keep_direct_and_skill_projection_distinct() -> None:
+    documentation = _words(_read("docs/checkpoints.md"))
+
+    assert (
+        "Without `metadata.tool_projection: skills`, a custom or committed Image "
+        "that includes the wrapper in `default_tools` projects it directly"
+    ) in documentation
+    assert "Skill activation is not required" in documentation
+    assert (
+        "With the `skills` projection, the Image must bind the complete immutable "
+        "`agent-libos-agent-images` tool set"
+    ) in documentation
+    assert "every call still enforces the same checkpoint/image authority" in documentation

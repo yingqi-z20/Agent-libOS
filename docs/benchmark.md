@@ -136,10 +136,25 @@ counterfactual baseline collection. Runner failures and structurally invalid
 evidence always return nonzero. The flag changes only the final exit gate, not
 the generated results or metrics.
 
-`run_benchmark.py` returns 0 for a structurally valid exploratory run, 1 for a
-runner failure, invalid evidence, or a failed `--require-all-passed` gate, and
-2 for command-line parsing errors. An unexpected execution exception also
-terminates nonzero and leaves `metadata.json` marked `in_progress`.
+`run_benchmark.py` returns 0 for a structurally valid exploratory run. It
+returns 1 for semantic preflight failures (for example, no selected tasks, an
+unknown runner, or an invalid real-LLM runner/task selection), a runner
+failure, invalid evidence, or a failed `--require-all-passed` gate. `argparse`
+syntax and type errors return 2. An uncaught execution exception also
+terminates nonzero, but the artifact left behind depends on when it occurred:
+
+- output-lease acquisition and provenance collection happen before the new
+  `metadata.json` is installed, so failure there may leave no manifest for the
+  attempted run;
+- after the initial manifest is written, failure during runner execution or
+  result publication normally leaves `completion_state: in_progress`;
+- the output writer changes the manifest to `complete` after binding the
+  result/effect JSONL files and summary, before metrics are collected. A later
+  metrics-write failure can therefore leave a complete result/effect manifest
+  with missing, partial, or otherwise invalid metrics; a fresh
+  `collect_metrics.py` invocation still validates the bound inputs before
+  accepting them.
+
 `collect_metrics.py` returns 0 for a valid complete artifact and 2 for an
 invalid, incomplete, or structurally malformed artifact.
 

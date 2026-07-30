@@ -20,6 +20,7 @@ from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
     EventType,
+    HostResumeProcessWait,
     ObjectHandle,
     ObjectMetadata,
     ObjectOwnerKind,
@@ -34,9 +35,16 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessStatus,
     RelationType,
+    ToolProcessWait,
     ToolHandle,
 )
-from agent_libos.models.exceptions import CapabilityDenied, ProcessError, ProcessMessageWaitRequired, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    ProcessError,
+    ProcessMessageWaitRequired,
+    ProcessWaitRequired,
+    ValidationError,
+)
 from agent_libos.process_execution import bind_process_execution
 from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import LocalResourceProviderSubstrate
@@ -1488,6 +1496,190 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_mark_running_cannot_clear_condition_owned_runner_wait(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="preserve ObjectTask runner wait owner",
+            )
+            _grant_process_spawn(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                _owner(runtime, pid),
+                "receive_process_messages",
+                {"channel": "never"},
+            )
+            waiting_task = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            assert waiting_task.status == ObjectTaskStatus.WAITING_MESSAGE
+            runner_pid = str(waiting_task.runner_pid)
+            waiting_runner = runtime.process.get(runner_pid)
+            before_event_ids = {event.event_id for event in runtime.events.list()}
+            before_audit_ids = {record.record_id for record in runtime.audit.trace()}
+
+            with pytest.raises(ProcessError, match="before its wait owner releases"):
+                runtime.object_tasks._state.mark_running(waiting_task)
+
+            assert runtime.process.get(runner_pid) == waiting_runner
+            assert runtime.object_tasks.get(waiting_task.task_id).status == (
+                ObjectTaskStatus.WAITING_MESSAGE
+            )
+            assert {event.event_id for event in runtime.events.list()} == before_event_ids
+            assert {record.record_id for record in runtime.audit.trace()} == before_audit_ids
+        finally:
+            runtime.close()
+
+    def test_mark_running_cannot_bypass_runner_host_resume_gate(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="preserve ObjectTask Host resume gate",
+            )
+            _grant_process_spawn(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                _owner(runtime, pid),
+                "receive_process_messages",
+                {"channel": "never"},
+            )
+            waiting_task = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            runner_pid = str(waiting_task.runner_pid)
+            waiting_runner = runtime.process.get(runner_pid)
+            gated_runner = runtime.process_transitions.transition(
+                runner_pid,
+                ProcessStatus.PAUSED,
+                expected_revision=waiting_runner.revision,
+                expected_status=waiting_runner.status,
+                expected_state_generation=waiting_runner.state_generation,
+                wait_state=HostResumeProcessWait(
+                    reason_oid="obj_object_task_manual_recovery"
+                ),
+            )
+
+            with pytest.raises(ProcessError, match="before its wait owner releases"):
+                runtime.object_tasks._state.mark_running(waiting_task)
+
+            assert runtime.process.get(runner_pid) == gated_runner
+            assert runtime.object_tasks.get(waiting_task.task_id).status == (
+                ObjectTaskStatus.WAITING_MESSAGE
+            )
+        finally:
+            runtime.close()
+
+    def test_mark_running_rejects_a_foreign_execution_lease_atomically(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="reject a foreign ObjectTask runner lease",
+            )
+            _grant_process_spawn(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                _owner(runtime, pid),
+                "receive_process_messages",
+                {"channel": "never"},
+            )
+            waiting_task = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            runner_pid = str(waiting_task.runner_pid)
+            waiting_runner = runtime.process.get(runner_pid)
+            runtime.process_transitions.wake(
+                runtime.process_transitions.wait_token(waiting_runner),
+                control=False,
+                reason="test prepares foreign runner claim",
+            )
+            foreign_token = runtime.store.claim_execution(
+                runner_pid,
+                owner_id="foreign-object-task-runner",
+            )
+            assert foreign_token is not None
+            foreign_running = runtime.process.get(runner_pid)
+            before_event_ids = {event.event_id for event in runtime.events.list()}
+            before_audit_ids = {record.record_id for record in runtime.audit.trace()}
+
+            with pytest.raises(ProcessError, match="before its wait owner releases"):
+                runtime.object_tasks._state.mark_running(waiting_task)
+
+            assert runtime.process.get(runner_pid) == foreign_running
+            assert runtime.object_tasks.get(task.task_id).status == (
+                ObjectTaskStatus.WAITING_MESSAGE
+            )
+            assert {event.event_id for event in runtime.events.list()} == before_event_ids
+            assert {record.record_id for record in runtime.audit.trace()} == before_audit_ids
+
+            assert runtime.store.complete_execution(
+                foreign_token,
+                status=ProcessStatus.RUNNABLE,
+            )
+            runtime.object_tasks.cancel(task.task_id, actor_pid=pid)
+        finally:
+            runtime.close()
+
+    def test_mark_running_rejects_mismatched_task_source_state_atomically(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="reject a forged ObjectTask source state",
+            )
+            _grant_process_spawn(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                _owner(runtime, pid),
+                "receive_process_messages",
+                {"channel": "never"},
+            )
+            waiting_task = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            runner_pid = str(waiting_task.runner_pid)
+            waiting_runner = runtime.process.get(runner_pid)
+            runnable = runtime.process_transitions.wake(
+                runtime.process_transitions.wait_token(waiting_runner),
+                control=False,
+                reason="test prepares mismatched Tool wait",
+            )
+            forged_wait = runtime.process_transitions.transition(
+                runner_pid,
+                ProcessStatus.WAITING_TOOL,
+                expected_revision=runnable.revision,
+                expected_status=runnable.status,
+                expected_state_generation=runnable.state_generation,
+                wait_state=ToolProcessWait(operation_id=task.task_id),
+            )
+
+            with pytest.raises(ProcessError, match="before its wait owner releases"):
+                runtime.object_tasks._state.mark_running(waiting_task)
+
+            assert runtime.process.get(runner_pid) == forged_wait
+            assert runtime.object_tasks.get(task.task_id).status == (
+                ObjectTaskStatus.WAITING_MESSAGE
+            )
+
+            runtime.process_transitions.wake(
+                runtime.process_transitions.wait_token(forged_wait),
+                control=False,
+                reason="test cleanup releases forged Tool wait",
+            )
+            runtime.object_tasks.cancel(task.task_id, actor_pid=pid)
+        finally:
+            runtime.close()
+
     def test_object_task_completion_survives_one_time_owner_handle(self) -> None:
         runtime = Runtime.open("local")
         try:
@@ -2652,6 +2844,14 @@ class TestObjectTasks:
             child_pid = runtime.spawn_child_process(runner_pid, "child waited by object task")
             runtime.tools.configure_process_tools(runner_pid, ["wait_child_process"], assigned_by="test")
             runtime.object_tasks._pending_args[task.task_id] = {"child_pid": child_pid}
+            message_waiting_runner = runtime.process.get(runner_pid)
+            runtime.process_transitions.wake(
+                runtime.process_transitions.wait_token(message_waiting_runner),
+                control=False,
+                reason="test changes the ObjectTask fixture to a child-owned wait",
+            )
+            with pytest.raises(ProcessWaitRequired):
+                runtime.process.wait(runner_pid, child_pid)
             runtime.store.update_object_task(
                 replace(
                     waiting,
@@ -3384,10 +3584,17 @@ class TestObjectTasks:
                 runner_pid: str,
                 status: ProcessStatus,
                 message: str | None = None,
+                *,
+                task_id: str | None = None,
             ) -> None:
                 transition_started.set()
                 assert release_transition.wait(timeout=2)
-                original_set_runner_status(runner_pid, status, message)
+                original_set_runner_status(
+                    runner_pid,
+                    status,
+                    message,
+                    task_id=task_id,
+                )
 
             monkeypatch.setattr(state, "set_runner_status", delayed_set_runner_status)
             task = runtime.object_tasks.start(

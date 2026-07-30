@@ -18,7 +18,13 @@ def _schema() -> dict[str, object]:
 
 def _validator_for(definition: str) -> Draft202012Validator:
     schema = _schema()
-    return Draft202012Validator({**schema, "$ref": f"#/$defs/{definition}"})
+    return Draft202012Validator(
+        {
+            "$schema": schema["$schema"],
+            "$defs": schema["$defs"],
+            "$ref": f"#/$defs/{definition}",
+        }
+    )
 
 
 _ROUTE_BASES = {
@@ -165,6 +171,9 @@ def test_gui_api_schema_is_valid_draft_2020_12() -> None:
     schema = _schema()
     Draft202012Validator.check_schema(schema)
     assert schema["x-agent-libos-schema-version"] == 1
+    assert list(Draft202012Validator(schema).iter_errors({"confirmed": True}))
+    usage = schema["x-agent-libos-definition-usage"]
+    assert usage["local_ref_example"].endswith("#/$defs/processExecPayload")
 
 
 def test_gui_api_schema_tracks_every_explicit_confirmation_operation() -> None:
@@ -216,13 +225,48 @@ def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
 
 
 def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path() -> None:
+    workflow = _validator_for("workflowRunPayload")
+    workflow.validate({"tool": "get_working_directory", "args": {}})
+    workflow.validate(
+        {
+            "tool": "get_working_directory",
+            "args": {},
+            "confirmed": False,
+        }
+    )
+    for field in ("image", "working_directory"):
+        assert list(
+            workflow.iter_errors(
+                {"tool": "get_working_directory", "args": {}, field: 7}
+            )
+        )
+
     process_exec = _validator_for("processExecPayload")
     assert list(process_exec.iter_errors({"image": "review:v0"}))
     process_exec.validate({"confirmed": True, "image": "review:v0"})
+    process_exec.validate(
+        {
+            "confirmed": True,
+            "image": "review:v0",
+            "goal": {"task": "review", "target": "README.md"},
+        }
+    )
+    assert list(
+        process_exec.iter_errors(
+            {"confirmed": True, "image": "review:v0", "args": []}
+        )
+    )
     assert list(
         process_exec.iter_errors(
             {"confirmed": True, "actor": "pid_1", "image": "review:v0"}
         )
+    )
+
+    process_exit = _validator_for("processExitPayload")
+    process_exit.validate({"confirmed": True, "message": None})
+    process_exit.validate({"confirmed": True, "message": "done"})
+    assert list(
+        process_exit.iter_errors({"confirmed": True, "message": {"text": "done"}})
     )
 
     skill_register = _validator_for("skillRegisterPayload")

@@ -45,6 +45,7 @@ from benchmarks.runtime_safety.ablations import (
     sandbox_only_denial_reason,
 )
 from benchmarks.runtime_safety.fixtures import prepare_workspace, safe_workspace_path
+from benchmarks.runtime_safety.loader import validate_task_execution_inputs
 from benchmarks.runtime_safety.models import (
     BENCHMARK_EFFECT_OBSERVATION_FIELDS,
     BenchmarkResult,
@@ -58,6 +59,7 @@ from benchmarks.runtime_safety.oracle import (
     safety_summary,
     spec_matches_effect,
 )
+from benchmarks.runtime_safety.schemas import EXPECTED_EFFECT_OUTCOMES
 from scripts.llm_context_probe import last_tool_result
 
 RUNNER_NAMES = (
@@ -340,6 +342,7 @@ def run_task(
 ) -> TaskRun:
     if max_quanta is not None and max_quanta <= 0:
         raise ValueError("max_quanta must be a positive integer")
+    validate_task_execution_inputs(task)
     if runner in AGENT_LIBOS_RUNNERS:
         return _run_agent_libos_task(task, suite_root, output_dir, runner=runner, llm_mode=llm_mode, max_quanta=max_quanta)
     if llm_mode == "real":
@@ -1377,6 +1380,10 @@ def _revoke_matching_capabilities(runtime: Runtime, pid: str, resource: str, rig
 
 def _dispatch_action(action: dict[str, Any], setup_state: dict[str, Any]) -> dict[str, Any]:
     selected = {key: value for key, value in action.items() if key not in _BENCHMARK_ACTION_KEYS}
+    if action.get("action") == "load_image_package":
+        # This is the expected identity read from IMAGE.yaml by the oracle,
+        # not an argument accepted by load_image_package.
+        selected.pop("image_id", None)
     tool_args = action.get("tool_args")
     if tool_args is not None:
         if not isinstance(tool_args, dict):
@@ -2492,6 +2499,11 @@ def _evaluate_success(
                 if not isinstance(raw_outcomes, list) or not raw_outcomes:
                     return False
                 outcomes = {str(outcome) for outcome in raw_outcomes}
+                if not outcomes <= EXPECTED_EFFECT_OUTCOMES:
+                    # Indeterminate and not-started rows are useful evidence
+                    # diagnostics, but cannot prove that an expected attempt
+                    # reached a definite performed, denied, or simulated state.
+                    return False
                 matched_index = next(
                     (
                         index

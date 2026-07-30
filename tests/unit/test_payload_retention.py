@@ -764,7 +764,7 @@ def test_live_responses_chain_and_process_exit_fallback_are_runtime_dependencies
             tool_calls=[],
             request_options={
                 "image_only_transcript": {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "output_key": "call-transparent-head",
                 }
             },

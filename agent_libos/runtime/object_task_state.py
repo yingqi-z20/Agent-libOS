@@ -13,8 +13,13 @@ from agent_libos.models import (
     ObjectTaskStatus,
     ProcessExecutionToken,
     ProcessStatus,
+    ToolProcessWait,
 )
-from agent_libos.models.exceptions import NotFound, ProcessTerminalCleanupRequired
+from agent_libos.models.exceptions import (
+    NotFound,
+    ProcessError,
+    ProcessTerminalCleanupRequired,
+)
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.process_execution import (
     trusted_process_control_mutation,
@@ -70,10 +75,24 @@ class ObjectTaskStateService:
 
     def mark_running(self, task: ObjectTask) -> ObjectTask:
         now = utc_now()
-        with self._lock:
-            latest = self._records.get_object_task(task.task_id) or task
+        with self._lock, self._records.transaction():
+            # Running admission is decided from the durable task row while it
+            # still records the source state.  Do not trust the caller's task
+            # snapshot and do not rewrite the task before validating its exact
+            # runner/process ownership.
+            latest = self._require(task.task_id)
             if latest.status in OBJECT_TASK_TERMINAL_STATUSES:
                 return latest
+            if latest.runner_pid is not None:
+                # The runner transition and task rewrite commit in one storage
+                # transaction.  A losing cancellation or failed admission
+                # therefore cannot leave either side partially advanced.
+                self.set_runner_status(
+                    str(latest.runner_pid),
+                    ProcessStatus.RUNNING,
+                    "object task running",
+                    task_id=latest.task_id,
+                )
             updated = replace(
                 latest,
                 status=ObjectTaskStatus.RUNNING,
@@ -81,14 +100,6 @@ class ObjectTaskStateService:
                 updated_at=now,
             )
             self._records.update_object_task(updated)
-            if updated.runner_pid is not None:
-                # The task and runner transition share the scheduler lock so a
-                # winning cancellation cannot be overwritten by stale RUNNING.
-                self.set_runner_status(
-                    str(updated.runner_pid),
-                    ProcessStatus.RUNNING,
-                    "object task running",
-                )
         self._events.emit(
             EventType.OBJECT_TASK_RUNNING,
             source=updated.creator_pid,
@@ -281,6 +292,8 @@ class ObjectTaskStateService:
         runner_pid: str,
         status: ProcessStatus,
         message: str | None = None,
+        *,
+        task_id: str | None = None,
     ) -> None:
         with self._records.locked():
             process = self._records.get_process(runner_pid)
@@ -289,6 +302,54 @@ class ObjectTaskStateService:
                 or process.status in self._process.TERMINAL_STATUSES
             ):
                 return
+            if status == ProcessStatus.RUNNING:
+                task = (
+                    self._records.get_object_task(task_id)
+                    if task_id is not None
+                    else None
+                )
+                if (
+                    task is None
+                    or task.runner_pid is None
+                    or str(task.runner_pid) != runner_pid
+                ):
+                    raise ProcessError(
+                        "object task running transition requires its exact runner: "
+                        f"task={task_id or '<missing>'} runner={runner_pid}"
+                    )
+                execution_unclaimed = (
+                    process.execution_owner_id is None
+                    and process.execution_lease_id is None
+                )
+                owns_initial_wait = (
+                    task.status == ObjectTaskStatus.QUEUED
+                    and process.status == ProcessStatus.WAITING_TOOL
+                    and process.wait_state
+                    == ToolProcessWait(operation_id=task.task_id)
+                    and execution_unclaimed
+                )
+                owns_resumed_runner = (
+                    task.status
+                    in {
+                        ObjectTaskStatus.WAITING_HUMAN,
+                        ObjectTaskStatus.WAITING_PROCESS,
+                        ObjectTaskStatus.WAITING_MESSAGE,
+                    }
+                    and process.status == ProcessStatus.RUNNABLE
+                    and process.wait_state is None
+                    and execution_unclaimed
+                )
+                if not owns_initial_wait and not owns_resumed_runner:
+                    wait_kind = (
+                        process.wait_state.kind
+                        if process.wait_state is not None
+                        else "none"
+                    )
+                    raise ProcessError(
+                        "object task cannot mark runner running before its wait owner "
+                        f"releases the process: task={task.task_id} runner={runner_pid} "
+                        f"status={process.status.value} wait={wait_kind}"
+                    )
             self._process.transitions.transition(
                 runner_pid,
                 status,

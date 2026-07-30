@@ -120,6 +120,33 @@ limits bound harness calls, not physical provider requests: retry and fallback
 behavior inside one `LLMClient` call is governed by the recorded effective LLM
 configuration.
 
+The run command checks the observed-token budget only between trajectories. If
+the budget is reached before the planned case list is exhausted, it publishes
+the valid completed prefix with `metadata.status` and `manifest.status` set to
+`partial_budget_exhausted`. This is a retained diagnostic artifact, not a
+complete evaluation. `--fail-on-invalid` gates invalid rows only; it does not
+gate plan completeness, so a partial artifact whose completed rows are valid
+can still make `run` exit 0. There is no run-side completeness flag: follow a
+release or CI run with strict verification.
+
+The command/status contract is:
+
+| Command and result | Exit status |
+| --- | --- |
+| `run --dry-run` | 0; prints the plan and writes no run artifact. |
+| `run`, complete plan, no uncaught infrastructure error | 0 by default, even if rows are invalid. |
+| `run --fail-on-invalid`, one or more completed rows invalid | Nonzero after publishing the final artifacts. |
+| `run`, token stop with a valid completed prefix | 0, including with `--fail-on-invalid`; artifact status is `partial_budget_exhausted`. |
+| `verify`, any always-on schema, hash, trace, provenance, redaction, or consistency check fails | Nonzero. |
+| `verify` without strict flags | May return 0 for a valid partial prefix or intentionally selected single-arm diagnostic artifact. |
+| `verify --require-complete` | Additionally requires `status: complete`, the full planned-case count, and paired semantic cases. |
+| `verify --require-all-valid` | Additionally requires zero invalid rows and paired semantic cases, but does not by itself require a complete plan. |
+| `verify --require-complete --require-all-valid` | 0 only for the complete, valid paired gate used below. |
+
+Argument parsing errors return 2; uncaught setup/provider/publication errors are
+nonzero and may leave only an `in_progress` prefix, which is not a verifiable
+completed artifact.
+
 Real runs take OpenAI configuration from the explicit `--env-file` path. If an
 ambient `OPENAI_*` value is absent from that file or differs from it, the run
 fails before creating artifacts or constructing a provider client; an identical
@@ -138,15 +165,19 @@ Each run contains:
 - `metadata.json`: status, exact versions/configuration, a non-secret effective
   LLM-config digest, Git and lock provenance, and deterministic fingerprints of
   both this harness and the editable root `agent_libos` package (including
-  package data and excluding bytecode caches);
+  package data and excluding bytecode caches). Current metadata requires
+  `schema_version: 1`, `query_evidence_schema_version: 1`, and
+  `tool_outcome_evidence_schema_version: 1`;
 - `results.jsonl`: one direction-explicit row per trajectory;
 - `metrics.json`: utility, targeted ASR, safe-and-useful, direct injection
   solvability, invalid rate, successful/failed/unexecuted and repeated failed
   calls, query retries, paired arm disagreements, and token/time totals;
+  current metrics use `schema_version: 1`;
 - `traces/*.json`: full AgentDojo injection and model/tool evidence;
 - `runtimes/*/query-*/runtime.sqlite`: native Agent libOS evidence for every
   ambient query invocation, including AgentDojo empty-output retries;
-- `manifest.json`: row/trace counts and artifact hashes.
+- `manifest.json`: row/trace counts and artifact hashes; current manifests use
+  `schema_version: 1`.
 
 `agent-libos-dojo verify` recomputes metrics and hashes, checks row/trace and
 paired-surface consistency (including realized provider API and compatibility

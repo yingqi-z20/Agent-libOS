@@ -13,9 +13,11 @@ from agent_libos.utils.secure_host_files import (
     WindowsOpenContract,
     open_secure_directory,
     open_secure_file,
+    open_secure_readwrite_child,
     snapshot_from_stat,
     stable_identity_available,
     windows_open_contract,
+    windows_readwrite_create_contract,
 )
 
 
@@ -33,6 +35,15 @@ class _FakeWindowsAPI:
     ) -> tuple[int, int]:
         self.file_contracts.append(contract)
         descriptor = os.open(path, os.O_RDONLY)
+        return descriptor, descriptor
+
+    def open_readwrite_file_descriptor(
+        self,
+        path: Path,
+        contract: WindowsOpenContract,
+    ) -> tuple[int, int]:
+        self.file_contracts.append(contract)
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         return descriptor, descriptor
 
     def open_directory(
@@ -103,6 +114,65 @@ def test_zero_file_index_requires_a_held_win32_replacement_lock() -> None:
     assert stable_identity_available(
         replace(snapshot, replacement_locked=True)
     )
+
+
+def test_windows_guarded_readwrite_create_contract_is_mutable_and_no_delete(
+    tmp_path: Path,
+) -> None:
+    api = _FakeWindowsAPI()
+    selected = tmp_path / "repository.lock"
+
+    with open_secure_directory(
+        tmp_path,
+        platform="nt",
+        windows_api=api,
+    ) as directory:
+        secure_file = open_secure_readwrite_child(
+            selected,
+            parent=directory,
+            relative_name=selected.name,
+            platform="nt",
+            windows_api=api,
+        )
+        try:
+            os.write(secure_file.descriptor, b"\0")
+            os.lseek(secure_file.descriptor, 0, os.SEEK_SET)
+            assert os.read(secure_file.descriptor, 1) == b"\0"
+        finally:
+            secure_file.close()
+
+    contract = api.file_contracts[-1]
+    assert contract == windows_readwrite_create_contract()
+    assert contract.desired_access & 0x80000000
+    assert contract.desired_access & 0x40000000
+    assert contract.share_mode == 0x00000001 | 0x00000002
+    assert contract.share_mode & 0x00000004 == 0
+    assert contract.creation_disposition == 4
+    assert contract.flags_and_attributes & 0x00200000
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd semantics")
+def test_posix_guarded_readwrite_create_stays_in_renamed_parent(
+    tmp_path: Path,
+) -> None:
+    guarded = tmp_path / "guarded"
+    guarded.mkdir()
+    renamed = tmp_path / "renamed"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    with open_secure_directory(guarded) as directory:
+        guarded.rename(renamed)
+        guarded.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(OSError):
+            open_secure_readwrite_child(
+                guarded / "repository.lock",
+                parent=directory,
+                relative_name="repository.lock",
+            )
+
+    assert (renamed / "repository.lock").is_file()
+    assert not (outside / "repository.lock").exists()
 
 
 def test_windows_directory_open_contract_guards_each_enumerated_parent(
@@ -308,6 +378,38 @@ def test_real_windows_file_guard_blocks_write_and_replacement_until_close(
                 os.replace(target, parked)
     finally:
         secure_file.release_path_guards()
+
+    os.replace(target, parked)
+    os.replace(parked, target)
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="requires real Win32 read-write sharing and replacement semantics",
+)
+def test_real_windows_guarded_readwrite_child_allows_peer_lockers_but_not_replace(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "repository.lock"
+    parked = tmp_path / "parked.lock"
+
+    with open_secure_directory(tmp_path) as directory:
+        first = open_secure_readwrite_child(
+            target,
+            parent=directory,
+            relative_name=target.name,
+        )
+        try:
+            second = open_secure_readwrite_child(
+                target,
+                parent=directory,
+                relative_name=target.name,
+            )
+            second.close()
+            with pytest.raises(OSError):
+                os.replace(target, parked)
+        finally:
+            first.close()
 
     os.replace(target, parked)
     os.replace(parked, target)

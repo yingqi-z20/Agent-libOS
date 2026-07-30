@@ -6,16 +6,97 @@
     "input_schema": {
       "type": "object",
       "properties": {
-        "path": {"type": "string", "default": "."},
+        "path": {"type": "string", "minLength": 1, "default": "."},
         "kind": {"type": "string", "enum": ["file", "directory"], "default": "file"},
         "limit": {"type": "integer", "minimum": 1, "maximum": 1024, "default": 200},
         "start_line": {"type": "integer", "minimum": 1, "default": 1},
         "window": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
-        "max_bytes": {"type": "integer", "minimum": 1, "default": 65536}
-      }
+        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536}
+      },
+      "additionalProperties": false
     },
-    "output_schema": {"type": "object"},
-    "tests": [],
+    "output_schema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {"const": "directory"},
+            "path": {"type": "string"},
+            "count": {"type": "integer", "minimum": 0},
+            "truncated": {"type": "boolean"},
+            "entries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type": "string"},
+                  "path": {"type": "string"},
+                  "kind": {"type": "string"},
+                  "size_bytes": {"type": ["integer", "null"], "minimum": 0}
+                },
+                "required": ["name", "path", "kind", "size_bytes"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["kind", "path", "count", "truncated", "entries"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {"const": "file"},
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+            "total_lines": {"type": "integer", "minimum": 1},
+            "truncated_by_bytes": {"type": "boolean"},
+            "lines_above": {"type": "integer", "minimum": 0},
+            "lines_below": {"type": "integer", "minimum": 0},
+            "content": {"type": "string"}
+          },
+          "required": [
+            "kind",
+            "path",
+            "start_line",
+            "end_line",
+            "total_lines",
+            "truncated_by_bytes",
+            "lines_above",
+            "lines_below",
+            "content"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "tests": [
+      {
+        "args": {"path": "document.txt", "start_line": 2, "window": 1, "max_bytes": 64},
+        "syscalls": [
+          {
+            "name": "filesystem.read_text",
+            "args": {"path": "document.txt", "max_bytes": 64},
+            "result": {
+              "path": "document.txt",
+              "content": "alpha\nbeta\n",
+              "truncated": false
+            }
+          }
+        ],
+        "expected": {
+          "kind": "file",
+          "path": "document.txt",
+          "start_line": 2,
+          "end_line": 2,
+          "total_lines": 3,
+          "truncated_by_bytes": false,
+          "lines_above": 1,
+          "lines_below": 1,
+          "content": "     2  beta"
+        }
+      }
+    ],
     "metadata": {"aci_role": "file_viewer"}
   },
   {
@@ -25,15 +106,115 @@
     "input_schema": {
       "type": "object",
       "properties": {
-        "pattern": {"type": "string"},
-        "path": {"type": "string", "default": "."},
+        "pattern": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1, "default": "."},
         "literal": {"type": "boolean", "default": true},
         "max_results": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
         "timeout_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 10, "default": 10}
-      }
+      },
+      "required": ["pattern"],
+      "additionalProperties": false
     },
-    "output_schema": {"type": "object"},
-    "tests": [],
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "returncode": {"type": "integer"},
+        "files": {"type": "array", "items": {"type": "string"}},
+        "matches": {"type": "array", "items": {"type": "string"}},
+        "omitted_matches": {"type": ["integer", "null"], "minimum": 0},
+        "observed_omitted_matches": {"type": "integer", "minimum": 0},
+        "matches_incomplete": {"type": "boolean"},
+        "stdout_truncated": {"type": "boolean"},
+        "stderr_truncated": {"type": "boolean"},
+        "output_incomplete": {"type": "boolean"},
+        "stderr": {"type": "string"},
+        "message": {"type": "string"}
+      },
+      "required": [
+        "argv",
+        "returncode",
+        "files",
+        "matches",
+        "omitted_matches",
+        "observed_omitted_matches",
+        "matches_incomplete",
+        "stdout_truncated",
+        "stderr_truncated",
+        "output_incomplete",
+        "stderr",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "tests": [
+      {
+        "args": {"pattern": "needle", "path": "src", "max_results": 2},
+        "syscalls": [
+          {
+            "name": "shell.run",
+            "args": {
+              "argv": ["rg", "-n", "--null", "--with-filename", "--hidden", "--glob", "!.git/*", "-F", "--", "needle", "src"],
+              "timeout_s": 10
+            },
+            "result": {
+              "returncode": 0,
+              "stdout": "src/a.py\u00001:needle\nsrc/b.py\u00002:needle\nsrc/c.py\u00003:needle\n",
+              "stderr": "",
+              "stdout_truncated": false,
+              "stderr_truncated": false
+            }
+          }
+        ],
+        "expected": {
+          "argv": ["rg", "-n", "--null", "--with-filename", "--hidden", "--glob", "!.git/*", "-F", "--", "needle", "src"],
+          "returncode": 0,
+          "files": ["src/a.py", "src/b.py"],
+          "matches": ["src/a.py:1:needle", "src/b.py:2:needle"],
+          "omitted_matches": 1,
+          "observed_omitted_matches": 1,
+          "matches_incomplete": false,
+          "stdout_truncated": false,
+          "stderr_truncated": false,
+          "output_incomplete": false,
+          "stderr": "",
+          "message": ""
+        }
+      },
+      {
+        "args": {"pattern": "needle", "path": "src/single:file.py"},
+        "syscalls": [
+          {
+            "name": "shell.run",
+            "args": {
+              "argv": ["rg", "-n", "--null", "--with-filename", "--hidden", "--glob", "!.git/*", "-F", "--", "needle", "src/single:file.py"],
+              "timeout_s": 10
+            },
+            "result": {
+              "returncode": 0,
+              "stdout": "src/single:file.py\u00001:needle\n",
+              "stderr": "",
+              "stdout_truncated": false,
+              "stderr_truncated": false
+            }
+          }
+        ],
+        "expected": {
+          "argv": ["rg", "-n", "--null", "--with-filename", "--hidden", "--glob", "!.git/*", "-F", "--", "needle", "src/single:file.py"],
+          "returncode": 0,
+          "files": ["src/single:file.py"],
+          "matches": ["src/single:file.py:1:needle"],
+          "omitted_matches": 0,
+          "observed_omitted_matches": 0,
+          "matches_incomplete": false,
+          "stdout_truncated": false,
+          "stderr_truncated": false,
+          "output_incomplete": false,
+          "stderr": "",
+          "message": ""
+        }
+      }
+    ],
     "timeout_s": 15,
     "metadata": {"aci_role": "repository_search"}
   },
@@ -44,16 +225,88 @@
     "input_schema": {
       "type": "object",
       "properties": {
-        "path": {"type": "string"},
-        "old_text": {"type": "string"},
+        "path": {"type": "string", "minLength": 1},
+        "old_text": {"type": "string", "minLength": 1},
         "new_text": {"type": "string"},
         "start_line": {"type": "integer", "minimum": 1},
         "end_line": {"type": "integer", "minimum": 1},
         "occurrence": {"type": "integer", "minimum": 1, "default": 1},
         "create_if_missing": {"type": "boolean", "default": false}
-      }
+      },
+      "required": ["path", "new_text"],
+      "oneOf": [
+        {
+          "required": ["old_text"],
+          "not": {
+            "anyOf": [
+              {"required": ["start_line"]},
+              {"required": ["end_line"]},
+              {"properties": {"create_if_missing": {"const": true}}, "required": ["create_if_missing"]}
+            ]
+          }
+        },
+        {
+          "required": ["start_line", "end_line"],
+          "not": {
+            "anyOf": [
+              {"required": ["old_text"]},
+              {"required": ["occurrence"]},
+              {"properties": {"create_if_missing": {"const": true}}, "required": ["create_if_missing"]}
+            ]
+          }
+        },
+        {
+          "properties": {"create_if_missing": {"const": true}},
+          "required": ["create_if_missing"],
+          "not": {
+            "anyOf": [
+              {"required": ["old_text"]},
+              {"required": ["start_line"]},
+              {"required": ["end_line"]},
+              {"required": ["occurrence"]}
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
     },
-    "output_schema": {"type": "object"},
+    "output_schema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string"},
+            "created": {"type": "boolean"},
+            "edit": {"const": "create"}
+          },
+          "required": ["path", "created", "edit"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string"},
+            "changed": {"const": false},
+            "edit": {"type": "string", "enum": ["replace_text", "replace_lines"]},
+            "replacements": {"type": "integer", "minimum": 0}
+          },
+          "required": ["path", "changed", "edit", "replacements"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string"},
+            "changed": {"const": true},
+            "edit": {"type": "string", "enum": ["replace_text", "replace_lines"]},
+            "replacements": {"type": "integer", "minimum": 1},
+            "bytes_written": {"type": "integer", "minimum": 0}
+          },
+          "required": ["path", "changed", "edit", "replacements", "bytes_written"],
+          "additionalProperties": false
+        }
+      ]
+    },
     "tests": [
       {
         "args": {
@@ -135,13 +388,63 @@
       "properties": {
         "argv": {
           "type": "array",
-          "items": {"type": "string"}
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1
         },
         "timeout_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 55, "default": 55}
-      }
+      },
+      "required": ["argv"],
+      "additionalProperties": false
     },
-    "output_schema": {"type": "object"},
-    "tests": [],
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "returncode": {"type": "integer"},
+        "stdout": {"type": "string"},
+        "stderr": {"type": "string"},
+        "stdout_truncated": {"type": "boolean"},
+        "stderr_truncated": {"type": "boolean"},
+        "message": {"type": "string"}
+      },
+      "required": [
+        "argv",
+        "returncode",
+        "stdout",
+        "stderr",
+        "stdout_truncated",
+        "stderr_truncated",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "tests": [
+      {
+        "args": {"argv": ["pytest", "-q"]},
+        "syscalls": [
+          {
+            "name": "shell.run",
+            "args": {"argv": ["pytest", "-q"], "timeout_s": 55},
+            "result": {
+              "returncode": 0,
+              "stdout": "",
+              "stderr": "",
+              "stdout_truncated": false,
+              "stderr_truncated": false
+            }
+          }
+        ],
+        "expected": {
+          "argv": ["pytest", "-q"],
+          "returncode": 0,
+          "stdout": "",
+          "stderr": "",
+          "stdout_truncated": false,
+          "stderr_truncated": false,
+          "message": "Your command ran successfully and did not produce any output."
+        }
+      }
+    ],
     "timeout_s": 60,
     "metadata": {"aci_role": "command_runner"}
   },
@@ -152,7 +455,7 @@
     "input_schema": {
       "type": "object",
       "properties": {
-        "summary": {"type": "string"},
+        "summary": {"type": "string", "minLength": 1},
         "tests": {
           "type": "array",
           "items": {"type": "string"}
@@ -161,11 +464,76 @@
           "type": "array",
           "items": {"type": "string"}
         },
-        "status": {"type": "string", "default": "resolved"}
-      }
+        "status": {"type": "string", "minLength": 1, "default": "resolved"}
+      },
+      "required": ["summary", "tests", "residual_risks"],
+      "additionalProperties": false
     },
-    "output_schema": {"type": "object"},
-    "tests": [],
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "prepared": {"const": true},
+        "payload": {
+          "type": "object",
+          "properties": {
+            "status": {"type": "string"},
+            "summary": {"type": "string"},
+            "tests": {"type": "array", "items": {"type": "string"}},
+            "residual_risks": {"type": "array", "items": {"type": "string"}}
+          },
+          "required": ["status", "summary", "tests", "residual_risks"],
+          "additionalProperties": false
+        },
+        "next_action": {"const": "process_exit"},
+        "process_exit_args": {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "object",
+              "properties": {
+                "status": {"type": "string"},
+                "summary": {"type": "string"},
+                "tests": {"type": "array", "items": {"type": "string"}},
+                "residual_risks": {"type": "array", "items": {"type": "string"}}
+              },
+              "required": ["status", "summary", "tests", "residual_risks"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["payload"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["prepared", "payload", "next_action", "process_exit_args"],
+      "additionalProperties": false
+    },
+    "tests": [
+      {
+        "args": {
+          "summary": "fixed the issue",
+          "tests": ["focused tests passed"],
+          "residual_risks": []
+        },
+        "expected": {
+          "prepared": true,
+          "payload": {
+            "status": "resolved",
+            "summary": "fixed the issue",
+            "tests": ["focused tests passed"],
+            "residual_risks": []
+          },
+          "next_action": "process_exit",
+          "process_exit_args": {
+            "payload": {
+              "status": "resolved",
+              "summary": "fixed the issue",
+              "tests": ["focused tests passed"],
+              "residual_risks": []
+            }
+          }
+        }
+      }
+    ],
     "metadata": {"aci_role": "submit"}
   }
 ]

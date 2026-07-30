@@ -435,7 +435,6 @@ class CapabilityManager:
         actor: str | None,
     ) -> Capability:
         parent_cap = self._find_delegation_parent(parent, selected)
-        self._validate_delegation_parent(parent_cap, selected)
         child_max_depth = self._delegated_max_delegation_depth(parent_cap, selected)
         cap = self._insert_capability(
             subject=child,
@@ -465,9 +464,7 @@ class CapabilityManager:
 
     def validate_delegation(self, parent: str, spec: CapabilitySpec | dict[str, Any]) -> Capability:
         selected = self._coerce_spec(spec)
-        parent_cap = self._find_delegation_parent(parent, selected)
-        self._validate_delegation_parent(parent_cap, selected)
-        return parent_cap
+        return self._find_delegation_parent(parent, selected)
 
     def inherit(
         self,
@@ -547,7 +544,10 @@ class CapabilityManager:
             return False
         if not selected.rights.issubset(parent_rights):
             return False
-        if any(selected.constraints.get(key) != value for key, value in parent_constraints.items()):
+        if self._constraint_attenuation_error(
+            parent_constraints,
+            selected.constraints,
+        ) is not None:
             return False
         if parent_expires_at is not None and (
             selected.expires_at is None or selected.expires_at > parent_expires_at
@@ -603,8 +603,7 @@ class CapabilityManager:
                         f"{transition_kind} authority exceeds transition ceiling: "
                         f"{selected.resource} rights={sorted(selected.rights)}"
                     )
-                parent_cap = self._find_delegation_parent(source_subject, selected)
-                self._validate_delegation_parent(parent_cap, selected)
+                self._find_delegation_parent(source_subject, selected)
             for selected in selected_specs:
                 derived.append(
                     self._delegate_selected(
@@ -1684,8 +1683,21 @@ class CapabilityManager:
         ]
         if not candidates:
             raise CapabilityDenied(f"{parent} cannot delegate {sorted(spec.rights)} on {spec.resource}")
-        candidates.sort(key=lambda cap: (len(cap.resource), cap.issued_at), reverse=True)
-        return candidates[0]
+        candidates.sort(
+            key=lambda cap: (len(cap.resource), cap.issued_at, cap.cap_id),
+            reverse=True,
+        )
+        first_error: CapabilityDenied | None = None
+        for candidate in candidates:
+            try:
+                self._validate_delegation_parent(candidate, spec)
+            except CapabilityDenied as exc:
+                if first_error is None:
+                    first_error = exc
+                continue
+            return candidate
+        assert first_error is not None
+        raise first_error
 
     def _find_transfer_parent(self, actor: str, spec: CapabilitySpec) -> Capability:
         self._require_no_restrictive_parent_boundary(actor, spec, action="grant")
@@ -1915,6 +1927,7 @@ class CapabilityManager:
                 self.rule_codec.to_json(rule)
                 for rule in rules
             ]
+        self._validate_constraints(constraints)
         return CapabilitySpec(
             resource=resource,
             rights=self._normalize_rights(raw_rights),
@@ -2281,16 +2294,37 @@ class CapabilityManager:
         return self.evaluator.argv_condition_matches(conditions, context)
 
     def _require_constraint_attenuation(self, parent_cap: Capability, spec: CapabilitySpec) -> None:
-        for key, value in parent_cap.constraints.items():
-            if spec.constraints.get(key) != value:
-                raise CapabilityDenied(f"delegated capability cannot drop parent constraint: {key}")
-        for key, value in spec.constraints.items():
-            if key in parent_cap.constraints:
+        error = self._constraint_attenuation_error(
+            parent_cap.constraints,
+            spec.constraints,
+        )
+        if error is not None:
+            raise CapabilityDenied(error)
+
+    def _constraint_attenuation_error(
+        self,
+        parent_constraints: dict[str, Any],
+        delegated_constraints: dict[str, Any],
+    ) -> str | None:
+        for key, value in parent_constraints.items():
+            if delegated_constraints.get(key) != value:
+                return f"delegated capability cannot drop parent constraint: {key}"
+        for key in delegated_constraints:
+            if key in parent_constraints:
                 continue
             if key not in self._KNOWN_CONSTRAINT_KEYS:
-                raise CapabilityDenied(f"delegated capability uses unknown constraint: {key}")
-            if key == self.config.shell.policy_capability_key:
-                raise CapabilityDenied(f"delegated constraint is not covered by parent: {key}")
+                return f"delegated capability uses unknown constraint: {key}"
+            # These constraints select an authority effect rather than merely
+            # narrowing the operation context. Adding either one can turn an
+            # otherwise inapplicable parent capability into explicit authority
+            # (for example, an allow rule for a shell command that the bare
+            # command-family capability cannot authorize).
+            if key in {
+                AUTHORITY_RULES_KEY,
+                self.config.shell.policy_capability_key,
+            }:
+                return f"delegated constraint is not covered by parent: {key}"
+        return None
 
     def _context_dict(self, context: OperationContext | dict[str, Any] | None) -> dict[str, Any]:
         return self.evaluator.context_dict(context)

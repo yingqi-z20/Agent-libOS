@@ -12,7 +12,11 @@ from typing import Any, ClassVar, Mapping
 
 from agent_libos.config import AgentLibOSConfig
 from agent_libos.models.exceptions import UnsupportedStoreVersion, ValidationError
-from agent_libos.storage.sql import SQLRuntimeStore, _V3_KEYSET_TEXT_COLUMNS
+from agent_libos.storage.sql import (
+    SQLRuntimeStore,
+    _V3_KEYSET_TEXT_COLUMNS,
+    _V3_REQUIRED_COLUMNS,
+)
 from agent_libos.utils.ids import utc_now
 
 try:  # pragma: no cover - Windows fallback is exercised only on non-POSIX hosts.
@@ -63,7 +67,12 @@ class SQLiteStore(SQLRuntimeStore):
         self._lease_handle: Any | None = None
         self._sqlite_connection_closed = False
         self._database_identity: tuple[int, int] | None = None
-        use_database_lease = False
+        # Every persistent connection also holds SQLite's own database lock.
+        # The POSIX path/inode sidecars bind the selected pathname, while this
+        # lock independently preserves the single-owner invariant for the file
+        # SQLite actually opened if a same-UID Host administrator retargets the
+        # pathname during sqlite3_connect().
+        use_exclusive_database_lease = selected_path != ":memory:"
         if selected_path == ":memory:" and not initialize_schema:
             raise ValidationError(
                 "offline migration requires an existing initialized Agent libOS store"
@@ -130,17 +139,15 @@ class SQLiteStore(SQLRuntimeStore):
                 connection_target = connection_path
             if fcntl is not None and hasattr(os, "O_NOFOLLOW"):
                 self._lease_handle = self._acquire_runtime_lease(canonical_path)
-            else:
-                # SQLite's kernel-managed EXCLUSIVE lock is crash-recoverable,
-                # unlike a create-once fallback lockfile that can survive its
-                # owner indefinitely.  This is also the Windows path.
-                use_database_lease = True
+            # SQLite's kernel-managed EXCLUSIVE lock is crash-recoverable and
+            # complements the POSIX path/inode leases. Where those sidecars are
+            # unavailable, including Windows, it is the sole runtime lease.
         conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(
                 connection_target,
                 check_same_thread=False,
-                timeout=0.0 if use_database_lease else 5.0,
+                timeout=0.0 if use_exclusive_database_lease else 5.0,
                 uri=connection_uri,
             )
             # Make the live handle visible to the state-aware cleanup path even
@@ -150,7 +157,7 @@ class SQLiteStore(SQLRuntimeStore):
                 self._require_database_lease_identity(Path(connection_path))
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
-            if use_database_lease:
+            if use_exclusive_database_lease:
                 self._acquire_exclusive_sqlite_lease(conn, Path(connection_path))
             self._init_store(
                 selected_path,
@@ -235,7 +242,11 @@ class SQLiteStore(SQLRuntimeStore):
 
         conn: sqlite3.Connection | None = None
         try:
-            conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+            conn = sqlite3.connect(
+                f"{db_path.as_uri()}?mode=ro",
+                timeout=0.0,
+                uri=True,
+            )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA schema_version").fetchone()
             return self._require_supported_store_version_for(conn)
@@ -269,6 +280,34 @@ class SQLiteStore(SQLRuntimeStore):
             "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
         )
         return {str(row["name"]) for row in rows}
+
+    @classmethod
+    def _require_v3_schema_shape(cls, conn: Any) -> None:
+        """Require every manifest relation to have SQLite type ``table``."""
+
+        required_tables = sorted(_V3_REQUIRED_COLUMNS)
+        placeholders = ", ".join("?" for _ in required_tables)
+        rows = conn.execute(
+            "SELECT name, type FROM sqlite_master "
+            f"WHERE name IN ({placeholders})",
+            required_tables,
+        )
+        relation_types = {
+            str(row["name"]): str(row["type"]).lower()
+            for row in rows
+        }
+        invalid_relations = {
+            table: relation_types.get(table, "missing")
+            for table in required_tables
+            if relation_types.get(table) != "table"
+        }
+        if invalid_relations:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v3 "
+                "manifest relation types: "
+                f"{invalid_relations}; expected type 'table'"
+            )
+        super()._require_v3_schema_shape(conn)
 
     @classmethod
     def _probe_text_column_collations(

@@ -235,6 +235,229 @@ class TestImageRegistration:
         finally:
             runtime.close()
 
+    def test_successful_registration_publishes_cache_only_after_late_audit_commit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+        image_id = 'commit-visible-image:v0'
+        outcomes: list[object] = []
+        try:
+            real_record = runtime.audit.record
+
+            def block_register_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') == 'image.register' and kwargs.get('target') == f'image:{image_id}':
+                    audit_entered.set()
+                    if not release_audit.wait(timeout=5):
+                        raise RuntimeError('timed out waiting to release image registration audit')
+                return real_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', block_register_audit)
+
+            def register() -> None:
+                try:
+                    outcomes.append(
+                        runtime.image_registry.register(
+                            AgentImage(image_id=image_id, name='commit-visible-image'),
+                            actor='test',
+                        )
+                    )
+                except BaseException as exc:
+                    outcomes.append(exc)
+
+            thread = threading.Thread(target=register, daemon=True)
+            thread.start()
+            assert audit_entered.wait(timeout=5)
+
+            assert image_id not in runtime.images
+            assert runtime.llm._images.get(image_id) is None
+            with pytest.raises(NotFound):
+                runtime.launch.require_image(image_id)
+            with pytest.raises(KeyError):
+                runtime.get_image(image_id)
+
+            release_audit.set()
+            thread.join(timeout=10)
+
+            assert not thread.is_alive()
+            assert len(outcomes) == 1
+            assert not isinstance(outcomes[0], BaseException), outcomes[0]
+            assert runtime.get_image(image_id).name == 'commit-visible-image'
+            assert runtime.store.get_image(image_id) is not None
+            assert [
+                event for event in runtime.events.list()
+                if event.target == f'image:{image_id}'
+            ]
+            assert [
+                record for record in runtime.audit.trace()
+                if record.target == f'image:{image_id}'
+            ]
+        finally:
+            release_audit.set()
+            runtime.close()
+
+    def test_failed_new_registration_is_never_visible_to_concurrent_cache_readers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+        image_id = 'failed-unpublished-image:v0'
+        outcomes: list[BaseException] = []
+        try:
+            real_record = runtime.audit.record
+
+            def fail_register_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') == 'image.register' and kwargs.get('target') == f'image:{image_id}':
+                    audit_entered.set()
+                    if not release_audit.wait(timeout=5):
+                        raise RuntimeError('timed out waiting to fail image registration audit')
+                    raise RuntimeError('injected late image register audit failure')
+                return real_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_register_audit)
+
+            def register() -> None:
+                try:
+                    runtime.image_registry.register(
+                        AgentImage(image_id=image_id, name='failed-unpublished-image'),
+                        actor='test',
+                    )
+                except BaseException as exc:
+                    outcomes.append(exc)
+
+            thread = threading.Thread(target=register, daemon=True)
+            thread.start()
+            assert audit_entered.wait(timeout=5)
+
+            assert image_id not in runtime.images
+            assert runtime.llm._images.get(image_id) is None
+            with pytest.raises(NotFound):
+                runtime.launch.require_image(image_id)
+            with pytest.raises(KeyError):
+                runtime.get_image(image_id)
+
+            release_audit.set()
+            thread.join(timeout=10)
+
+            assert not thread.is_alive()
+            assert len(outcomes) == 1
+            assert isinstance(outcomes[0], RuntimeError)
+            assert str(outcomes[0]) == 'injected late image register audit failure'
+            assert image_id not in runtime.images
+            assert runtime.store.get_image(image_id) is None
+            assert not [
+                event for event in runtime.events.list()
+                if event.target == f'image:{image_id}'
+            ]
+            assert not [
+                record for record in runtime.audit.trace()
+                if record.target == f'image:{image_id}'
+            ]
+        finally:
+            release_audit.set()
+            runtime.close()
+
+    def test_failed_replacement_keeps_old_image_visible_to_concurrent_cache_readers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+        image_id = 'failed-unpublished-replacement:v0'
+        outcomes: list[BaseException] = []
+        try:
+            original = AgentImage(
+                image_id=image_id,
+                name='failed-unpublished-replacement',
+                version='v1',
+                default_tools=['human_output'],
+            )
+            runtime.image_registry.register(original, actor='test')
+            before_events = list(runtime.events.list())
+            before_audit = list(runtime.audit.trace())
+            real_record = runtime.audit.record
+
+            def fail_replace_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') == 'image.replace' and kwargs.get('target') == f'image:{image_id}':
+                    audit_entered.set()
+                    if not release_audit.wait(timeout=5):
+                        raise RuntimeError('timed out waiting to fail image replacement audit')
+                    raise RuntimeError('injected late image replace audit failure')
+                return real_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_replace_audit)
+
+            def replace_image() -> None:
+                try:
+                    runtime.image_registry.register(
+                        AgentImage(
+                            image_id=image_id,
+                            name='failed-unpublished-replacement',
+                            version='v2',
+                            default_tools=['process_exit'],
+                        ),
+                        actor='test',
+                        replace=True,
+                    )
+                except BaseException as exc:
+                    outcomes.append(exc)
+
+            thread = threading.Thread(target=replace_image, daemon=True)
+            thread.start()
+            assert audit_entered.wait(timeout=5)
+
+            assert runtime.get_image(image_id) == original
+            assert runtime.launch.require_image(image_id) == original
+            assert runtime.llm._images.get(image_id) == original
+
+            release_audit.set()
+            thread.join(timeout=10)
+
+            assert not thread.is_alive()
+            assert len(outcomes) == 1
+            assert isinstance(outcomes[0], RuntimeError)
+            assert str(outcomes[0]) == 'injected late image replace audit failure'
+            assert runtime.get_image(image_id) == original
+            persisted = runtime.store.get_image(image_id)
+            assert persisted is not None and persisted[0] == original
+            assert runtime.events.list() == before_events
+            assert runtime.audit.trace() == before_audit
+        finally:
+            release_audit.set()
+            runtime.close()
+
+    def test_registration_rejects_a_caller_owned_outer_store_transaction(self) -> None:
+        runtime = Runtime.open('local')
+        image_id = 'nested-store-image:v0'
+        try:
+            with runtime.uow.transaction():
+                with pytest.raises(
+                    ValidationError,
+                    match='cannot join an existing store transaction',
+                ):
+                    runtime.image_registry.register(
+                        AgentImage(image_id=image_id, name='nested-store-image'),
+                        actor='test',
+                    )
+
+            assert image_id not in runtime.images
+            assert runtime.store.get_image(image_id) is None
+            assert not [
+                event for event in runtime.events.list()
+                if event.target == f'image:{image_id}'
+            ]
+            assert not [
+                record for record in runtime.audit.trace()
+                if record.target == f'image:{image_id}'
+            ]
+        finally:
+            runtime.close()
+
     def test_register_image_primitive_validates_tools_and_emits_audit(self) -> None:
         runtime = Runtime.open('local')
         try:

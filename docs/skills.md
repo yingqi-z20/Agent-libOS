@@ -36,7 +36,7 @@ skills/review-helper/
 name: review-helper
 description: Focused code-review workflow helpers.
 license: Apache-2.0
-compatibility: agent-libos>=0.1.0
+compatibility: agent-libos==1.0.1
 allowed-tools: read_text_file read_directory
 metadata:
   agent-libos.version: v0
@@ -52,10 +52,18 @@ Prefer small, evidence-backed findings with file and line references.
 
 Supported frontmatter fields are `name`, `description`, `license`,
 `compatibility`, `allowed-tools`, and `metadata`. The `name` must be 1–64
-characters, start with a lowercase letter or digit, contain only lowercase
-letters, digits, and hyphens, and match the package directory name. A configured
+characters, consist of one or more non-empty lowercase-alphanumeric segments
+separated by single hyphens, and match the package directory name. Leading,
+trailing, or repeated hyphens are invalid. A configured
 `skills.name_max_chars` below 64 imposes the lower limit.
 `metadata` values must be strings.
+`compatibility` is optional and, when present, is validated only as a non-empty
+string. The Runtime treats it as opaque publisher metadata: it stores and
+projects the value and includes it in the package hash, but does not parse
+Semantic Versioning, compare it with the running Agent libOS version, or reject
+registration or activation because an expression does not match. The Host or
+package-release workflow is responsible for interpreting and verifying this
+declaration before approving a package hash.
 Per the Agent Skills specification, `allowed-tools` is a space-separated YAML
 string. Agent libOS still accepts the historical YAML-list spelling for
 registered third-party packages, but generated and repository-shipped packages
@@ -208,7 +216,9 @@ state and audit evidence, but the model receives the same activation result
 shape as for every other Skill.
 
 `references/agent-libos/jit-tools.json` declares TypeScript JIT tools. Each
-entry references a `scripts/*.ts` source file:
+entry references a `scripts/*.ts` source file. Its `name` follows the OpenAI
+tool-name syntax `[A-Za-z0-9_-]{1,64}` (hyphens and underscores are both
+valid, but dots and slashes are not):
 
 ```json
 [
@@ -267,10 +277,22 @@ silently become advisory metadata:
 }
 ```
 
-JIT test entries use `args`, optional `expected`, and an ordered `syscalls`
-array. Each syscall fixture supplies `name`, optional exact `args`, optional
-`ok`/`error`, and either `result` or `payload`; unexpected, out-of-order, or
-unconsumed expected syscalls fail validation.
+Every JIT test entry must contain `expected`; omitting it rejects the test
+before executing candidate source. `args` is optional and defaults to `{}`.
+`syscalls` is also optional and defaults to an empty ordered list. Each syscall
+fixture names the expected syscall; when `args` is present it is compared
+exactly. Unexpected, out-of-order, or unconsumed expected syscalls fail
+validation.
+
+For a successful fixture (`ok` omitted or true), the injected return value is
+`result` when that key is present, otherwise `payload`, otherwise JSON `null`.
+Thus `result` deliberately wins if legacy metadata contains both keys. An
+`ok: false` fixture instead injects the same text-free `syscall_error` boundary
+seen by live JIT code; `result` and `payload` are not returned, and any legacy
+`error` text is deliberately ignored so package-authored diagnostics cannot be
+exposed to candidate code. These precedence and default rules preserve
+compatibility with already registered package snapshots; new packages should
+use `result` and omit the legacy aliases.
 
 ## Sources And Trust
 
@@ -350,10 +372,13 @@ Static `skills validate` accepts a Host filesystem path and therefore rejects
 `--actor-pid`; use actor-mode `skills register` when package reads must cross
 the process workspace filesystem boundary.
 
-Capability requirements:
+Capability requirements (resource strings below name their default values;
+Hosts can replace the wildcard registry/trust roots through the referenced
+configuration keys):
 
 - Discovering applicable built-in Skills requires no Skill Capability;
-  discovering registered Skills as a process requires `skill:*` `read`.
+  discovering registered Skills as a process requires `read` on
+  `skills.registry_resource` (default `skill:*`).
 - Inspecting a registered Skill as a process requires `skill:<name>` `read`.
 - Registering or replacing a Skill requires `skill:<name>` `write`.
 - Activating or unloading a registered Skill requires `skill:<name>` `execute`.
@@ -361,8 +386,8 @@ Capability requirements:
   no Skill Capability because it only changes prompt and schema visibility.
 - Activating or unloading a Skill for a different process also requires
   `process:<pid>` `admin`.
-- Trusting or untrusting global Skill package hashes requires
-  `skill_trust:*` `admin`.
+- Trusting or untrusting global Skill package hashes requires `admin` on
+  `skills.trust_resource` (default `skill_trust:*`).
 
 The host catalog shown to admin callers uses the configured and de-duplicated
 workspace/global roots described above; it does not add a second implicit root
@@ -378,11 +403,14 @@ mutation. Business rows, event/audit evidence, and finite-use settlement share
 that transaction. A failure before commit therefore restores the exact
 reservation token; an explicit revoke still wins over late cleanup.
 
-Process-mediated `discover` and `inspect` are read-only catalog operations.
-They reserve the selected finite read decision before constructing the result,
-restore it if result construction fails, and commit it after a successful
-read; they do not create a business mutation or event/audit publication and do
-not use the mutation `AuthorityTransaction` path.
+Process-mediated `discover` and `inspect` do not mutate the Skill catalog and
+do not publish Skill lifecycle events or Skill-operation audit rows. They do,
+however, use and durably settle authority. They reserve the selected finite
+`read` decision before constructing the result, restore it if result
+construction fails, and commit it after a successful read. Committing a
+limited-use Capability writes the normal capability-use audit evidence and can
+emit `CAPABILITY_REVOKED` when that use exhausts the grant. These reads do not
+use the mutation `AuthorityTransaction` path.
 
 `activate_skill` is atomic across the process tool table, loaded Skill metadata,
 process-local JIT rows, executable handles, and name aliases. The runtime
@@ -441,11 +469,20 @@ are rejected before a result set can become unbounded.
 
 The workspace includes `skills/swe-agent`, named and registerable as
 `swe-agent`. It reproduces the useful SWE-Agent Agent Computer Interface shape
-inside Agent libOS:
+inside Agent libOS. The shipped package pins `compatibility` to
+`agent-libos==1.0.1`: its JIT manifest uses extension fields from this release,
+so older parsers must not be promised compatibility merely because the
+frontmatter itself can be read. This exact pin is a publisher/Host-facing
+declaration, not a Runtime-enforced version gate.
 
 - `swe_view` for directory listings and bounded file windows,
-- `swe_grep` for concise repository search through `rg`; `max_results` bounds
-  both its returned match lines and its file list,
+- `swe_grep` for concise repository search through `rg`; it requests a
+  NUL-delimited filename on every match, so its `files` list is reliable for a
+  single-file search and paths containing colons, while `max_results` bounds
+  both its returned match lines and its file list. Calling it also requires the
+  Host Shell provider to resolve `rg` from its safe PATH and authorize it under
+  Shell Capability and policy; Skill activation validates the JIT package but
+  does not prove that this external executable is installed or callable,
 - `swe_edit` for exact-text, line-range, or create-if-missing edits,
 - `swe_run` for test and diagnostic commands,
 - `swe_submit` for preparing a structured final payload that must then be
@@ -479,6 +516,16 @@ command's exit status; the absent suffix must not be treated as evidence that
 a diagnostic or match did not occur.
 `swe_grep` propagates the shell capture's truncation flags. If stdout was
 truncated, `matches_incomplete` is true, `omitted_matches` is null because the
-total is unknowable, and `observed_omitted_matches` counts only captured matches
-excluded by `max_results`; `output_incomplete` also covers truncated stderr.
-The Skill does not grant filesystem or shell authority.
+total is unknowable, and an incomplete NUL-framed tail is excluded from both
+`matches` and `files`. `observed_omitted_matches` counts only complete captured
+matches excluded by `max_results`; `output_incomplete` also covers truncated
+stderr or malformed/incomplete stdout framing.
+The Skill does not grant filesystem or shell authority. `swe_view` and
+`swe_edit` use typed filesystem primitives, but `swe_run` and `swe_grep`
+authorize the outer native-process launch through Shell Capability, policy,
+data-flow, cwd/environment checks, and resource controls. Once an authorized
+native child runs, its direct filesystem, network, child-process, or other I/O
+does not re-enter the corresponding typed libOS primitives; Shell is not an
+operating-system sandbox. A Host that runs untrusted native code must supply a
+stronger container, WASM, VM, service-provider, or comparable isolation
+boundary.

@@ -17,7 +17,7 @@ from benchmarks.runtime_safety.ablations import (
     sandbox_only_denial_reason,
 )
 from benchmarks.runtime_safety.loader import load_tasks
-from benchmarks.runtime_safety.models import BenchmarkTask
+from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationError
 from benchmarks.runtime_safety.runners import (
     PlannedActionClient,
     _safe_audit_record_count,
@@ -349,7 +349,7 @@ def test_sandbox_only_denies_shell_instead_of_aliasing_direct_wrapper(
     )
 
 
-def test_sandbox_only_records_denial_for_unmodeled_action(tmp_path: Path) -> None:
+def test_runner_rejects_unmodeled_action_before_baseline_execution(tmp_path: Path) -> None:
     task = BenchmarkTask(
         id="sandbox_unknown_action",
         title="Sandbox unknown action",
@@ -366,22 +366,13 @@ def test_sandbox_only_records_denial_for_unmodeled_action(tmp_path: Path) -> Non
         ],
     )
 
-    run = run_task(
-        task,
-        SUITE_ROOT,
-        tmp_path,
-        runner="sandbox_only",
-    )
-
-    assert run.result.metadata["sandbox_denied_actions"] == [
-        {
-            "action": "unknown_provider_tool",
-            "reason": (
-                "sandbox-only baseline blocks action category: "
-                "unknown_provider_tool"
-            ),
-        }
-    ]
+    with pytest.raises(BenchmarkValidationError, match="action must be one of"):
+        run_task(
+            task,
+            SUITE_ROOT,
+            tmp_path,
+            runner="sandbox_only",
+        )
 
 
 def test_no_fork_attenuation_clones_unrequested_parent_capability(

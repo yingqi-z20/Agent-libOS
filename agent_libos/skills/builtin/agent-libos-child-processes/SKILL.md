@@ -88,7 +88,8 @@ Object payloads and external effects have separate lifetimes and guarantees.
   Filters (`kind`, sender, channel, correlation, reply, exact IDs) are ANDed.
   Defaults are `include_acked=false`, `ack=true`, so an ordinary read changes
   state by acknowledging returned unread messages. Ack is not deletion;
-  `include_acked=true` can retrieve them again. Check `acked_message_ids`,
+  `include_acked=true` selects exactly unread plus ACKed messages and can retrieve
+  them again; checkpoint-restore-superseded history is never selected. Check `acked_message_ids`,
   `has_more`, `omitted_count`, and `continuation`. Continuation has no cursor: it
   only says to reuse the filters. That advances only when each returned unread
   page is acknowledged and therefore excluded, normally with `ack=true` and

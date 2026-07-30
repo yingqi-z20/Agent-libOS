@@ -13,6 +13,9 @@ from agent_libos.evidence.payload_retention import (
     PayloadRetentionStore,
     PayloadRetentionTier,
 )
+from agent_libos.evidence.initial_goal_recovery import (
+    redact_initial_goal_recovery_receipt_projection,
+)
 from agent_libos.models import (
     AgentObject,
     AgentImage,
@@ -333,6 +336,7 @@ class ProcessRepository(_RepositoryFacade):
             "list_llm_calls",
             "get_llm_call",
             "get_latest_llm_call",
+            "get_latest_successful_llm_call",
             "upsert_llm_tool_output",
             "list_llm_tool_outputs",
             "get_llm_context_generation",
@@ -985,6 +989,24 @@ class ObjectRepository(_RepositoryFacade):
             require_recovery_lease=require_recovery_lease,
         )
 
+    def rehydrate_root_spawn_goal_payload(
+        self,
+        oid: str,
+        payload: Any,
+        *,
+        expected_version: int,
+        expected_identity_sha256: str,
+        require_recovery_lease: Callable[[], None],
+    ) -> bool:
+        require_recovery_lease()
+        return self._object_recovery_backend.rehydrate_root_spawn_goal_payload(
+            oid,
+            payload,
+            expected_version=expected_version,
+            expected_identity_sha256=expected_identity_sha256,
+            require_recovery_lease=require_recovery_lease,
+        )
+
     def payload_marker(
         self,
         *,
@@ -1443,6 +1465,35 @@ class RuntimePublicationRepository(_RepositoryFacade):
             )
         ]
 
+    def get_committed_root_spawn_publication(
+        self,
+        pid: str,
+    ) -> RuntimePublicationRecord | None:
+        record = self._publication_backend.get_committed_root_spawn_publication(pid)
+        return self._validated_recovery_record(record) if record is not None else None
+
+    def redact_root_spawn_initial_goal(
+        self,
+        publication_id: str,
+        *,
+        pid: str,
+        goal_oid: str,
+        expected_payload_sha256: str,
+        expected_states: Iterable[RuntimePublicationState | str] = ("committed",),
+    ) -> bool:
+        return _transactional_backend_cas_result(
+            self._publication_backend,
+            self.transaction,
+            lambda: self._publication_backend.redact_root_spawn_initial_goal(
+                publication_id,
+                pid=pid,
+                goal_oid=goal_oid,
+                expected_payload_sha256=expected_payload_sha256,
+                expected_states=expected_states,
+            ),
+            operation="redact root spawn initial goal",
+        )
+
     @staticmethod
     def _validated_record(
         record: Mapping[str, Any],
@@ -1464,7 +1515,23 @@ class RuntimePublicationRepository(_RepositoryFacade):
                 f"publication {validated['publication_id']!r} for "
                 f"request {expected_publication_id!r}"
             )
+        validated["receipt"] = redact_initial_goal_recovery_receipt_projection(
+            validated["receipt"]
+        )
         return validated
+
+    @staticmethod
+    def _validated_recovery_record(
+        record: Mapping[str, Any],
+    ) -> RuntimePublicationRecord:
+        """Validate the Host-only recovery projection without exposing it generally."""
+
+        try:
+            return validate_runtime_publication_record(record)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"invalid runtime publication recovery record: {exc}"
+            ) from exc
 
     @staticmethod
     def _require_insert_binding(

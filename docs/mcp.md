@@ -51,6 +51,13 @@ http:
       prefix: "Bearer "
 ```
 
+These blocks show the complete manifest structure, but they are not a live
+demo service. `api.example.test` is a reserved documentation host,
+`demo_mcp_server` is a placeholder module, and the environment variable name
+must be mapped to a credential supplied by the Host. Save an adapted manifest
+to a real file (the CLI section calls that user-created path `server.yaml`)
+before running the registration commands.
+
 `stdio.env` maps child process environment variable names to host environment
 variable names. The runtime does not inherit the full host environment. On
 Windows, it additionally forwards `SYSTEMROOT` and `WINDIR`, when present,
@@ -64,11 +71,12 @@ directory or reads ambient `PATH`/`PATHEXT`.
 The accepted v1 shape is closed: unknown server, transport, tool, or header
 fields are rejected instead of being silently ignored. `metadata` and JSON
 Schema contents remain application-defined mappings. Field types are strict:
-mapping/array/string fields must use that exact YAML/JSON shape, explicit
-wrong-type or `null` values are not treated as defaults, and every `stdio.args`
-entry must be a string. In particular, `args: "-m"` is rejected rather than
-split into characters, and malformed `input_schema` values cannot silently
-become `{}` and disable validation or live-schema pinning.
+mapping/array/string fields must use that exact YAML/JSON shape and every
+`stdio.args` entry must be a string. Explicit `null` is accepted only where
+documented (`stdio.cwd` and `rollback_status`); it is not a default for other
+fields. In particular, `args: "-m"` is rejected rather than split into
+characters, and malformed `input_schema` values cannot silently become `{}`
+and disable validation or live-schema pinning.
 
 | Mapping | Required fields | Optional fields and defaults |
 | --- | --- | --- |
@@ -80,10 +88,11 @@ become `{}` and disable validation or live-schema pinning.
 
 `transport` is `stdio` or `streamable_http`; the inactive transport block is
 forbidden. `right` is `read`, `write`, or `execute`. `rollback_class` accepts
-`irreversible`, `rollbackable`, `no_rollback_required`, or `unknown`, while an
-explicit `rollback_status` accepts `not_supported`, `not_applied`,
-`not_required`, or `unknown`. If `rollback_status` is omitted, the default MCP
-provider maps it as follows:
+`irreversible`, `rollbackable`, `no_rollback_required`, or `unknown`, while a
+non-null `rollback_status` accepts `not_supported`, `not_applied`,
+`not_required`, or `unknown`. An omitted `rollback_status` and an explicit
+YAML/JSON `null` have the same meaning: the default MCP provider maps them as
+follows:
 
 | `rollback_class` | Effective omitted `rollback_status` |
 | --- | --- |
@@ -92,10 +101,11 @@ provider maps it as follows:
 | `no_rollback_required` | `not_required` |
 | `unknown` | `unknown` |
 
-An explicitly supplied `rollback_status` is preserved instead of applying this
-default mapping. The durable manifest retains omission as `null`, while
-registry inspection/tool listing and the default provider's effect
-classification expose the effective mapped value shown above.
+A supplied non-null `rollback_status` is preserved instead of applying this
+default mapping. The durable manifest retains an omitted or explicit-null
+status as `null`, while registry inspection/tool listing and the default
+provider's effect classification expose the effective mapped value shown
+above.
 
 A tool cannot combine `no_rollback_required` with `state_mutation: true`. A
 non-empty `input_schema` must be valid JSON Schema and is pinned exactly against
@@ -362,6 +372,8 @@ tree and applies all of these bounds:
   `max_response_bytes`;
 - a live `tools/list` response contains at most `config.mcp.list_limit` tools
   (100 with `DEFAULT_CONFIG`), with unique non-empty names;
+- a non-empty MCP `nextCursor` is rejected as an incomplete catalog; v1 does
+  not return or follow continuation cursors;
 - the canonical JSON encoding of the complete returned tool list, or of a call's
   `content` plus `structured_content`, cannot exceed `max_response_bytes`; and
 - provider byte receipts cannot exceed `max_response_bytes` or under-report
@@ -383,6 +395,11 @@ as sanitized `transport_error` with an error type such as `McpStdioFrameTooLarge
 `McpStdioStdoutTooLarge`, `McpHttpResponseTooLarge`, or
 `McpHttpSseFrameTooLarge`. A live `list_tools(refresh=true)` failure is instead
 raised as a sanitized provider exception and never returns a partial list.
+The atomic validate-and-call path reports a non-empty `nextCursor` as
+`LiveToolValidationError` with `call_started: false` and does not invoke the
+selected tool. Because an incomplete catalog has no exact complete-response
+receipt, resource settlement charges the list stage's bounded
+`max_response_bytes` ceiling.
 Neither outcome makes a consequential call safe to replay.
 
 ### stdio Resource Limits And Provider Compatibility
@@ -504,6 +521,11 @@ uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mc
 uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
 uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
 ```
+
+`server.yaml` is the user-created, adapted manifest described above; it is not
+shipped at the repository root. The placeholder server/module and reserved
+HTTP hostname in the manifest examples will not make these commands a live
+remote demo.
 
 `mcp list` accepts `--text` and `--limit`; `mcp tools --refresh` performs the
 live provider operation described above. Registering with `--replace` requires

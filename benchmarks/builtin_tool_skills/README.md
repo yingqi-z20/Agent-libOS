@@ -37,6 +37,14 @@ The JSON report records per-run and aggregate:
 The estimate is for comparisons only; provider tokenization remains the source
 of truth for billed prompt usage.
 
+The report contract is `schema_version: 2`. With no `--scenario` selector, the
+CLI evaluates all five held-out scenarios with the fixed three repetitions and
+two arms: 15 pairs and 30 runs. Repeating `--scenario` selects a subset but does
+not change the three repetitions. The separate 26-case activation catalog is a
+pytest-only routing check; it is not included in this JSON report. The current
+treatment authority ceiling contains 99 unique catalog-owned tools; this is an
+inventory fact for this source version, not a stable schema field.
+
 The fresh-state read oracles fail closed on incomplete evidence. Git must
 return exactly the one untracked `tracked-intent.txt` fixture with normalized
 status fields, `truncated: false`, and a 64-hex state token. MCP must return
@@ -55,7 +63,11 @@ Run it only with explicit real-LLM credentials and confirmation:
 `--require-all-correct` fails unless every treatment and baseline run returns a
 successful probe result, passes its observable-state oracle, chooses the
 correct route, and exits. Merely dispatching the expected tool and then calling
-`process_exit` is not sufficient.
+`process_exit` is not sufficient. The flag is not enabled by default: without
+it, a successfully published schema-v2 report exits 0 even when one or more
+runs fail those correctness checks. CI and release gates must therefore pass
+`--require-all-correct`; provider/setup exceptions and publication failures
+still terminate nonzero independently of the flag.
 
 The output path is reserved before paid work begins and the completed JSON is
 published with an atomic replace. A failed rerun leaves a small non-favorable

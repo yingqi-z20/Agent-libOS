@@ -19,7 +19,7 @@ from agent_libos.models import ExternalEffectRecoveryQuery
 from agent_libos.runtime import RuntimeBuilder
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage.postgres import PostgresStore
-from agent_libos.storage.sql import SQLRuntimeStore
+from agent_libos.storage.sql import SQLRuntimeStore, _V3_REQUIRED_COLUMNS
 from benchmarks.external_effect_recovery import (
     BENCHMARK_PROFILES,
     run_recovery_scale_benchmark,
@@ -309,6 +309,41 @@ def test_runtime_assembly_select_allowlist_is_exact() -> None:
     )
 
 
+def test_startup_v3_manifest_schema_probe_allowlist_is_exact() -> None:
+    manifest_tables = sorted(_V3_REQUIRED_COLUMNS)
+
+    def manifest_probe(tables: list[str]) -> str:
+        names = ", ".join(f"'{name}'" for name in tables)
+        return (
+            "SELECT name, type FROM sqlite_master "
+            f"WHERE name IN ({names})"
+        )
+
+    exact_probe = manifest_probe(manifest_tables)
+    assert (
+        recovery_runner._startup_statement_kind(exact_probe)
+        == "v3_manifest_schema_probe"
+    )
+
+    near_or_arbitrary_probes = (
+        manifest_probe(
+            [name for name in manifest_tables if name != "external_effects"]
+        ),
+        manifest_probe(["external_effects"]),
+        manifest_probe([*manifest_tables, "not_a_manifest_table"]),
+        manifest_probe(list(reversed(manifest_tables))),
+        manifest_probe([name.upper() for name in manifest_tables]),
+        exact_probe.replace("SELECT name, type", "SELECT name, type, sql"),
+        "SELECT name, type FROM sqlite_master WHERE name = 'external_effects'",
+        "SELECT * FROM sqlite_master WHERE sql LIKE '%external_effects%'",
+        "SELECT * FROM external_effects",
+    )
+    assert all(
+        recovery_runner._startup_statement_kind(probe) is None
+        for probe in near_or_arbitrary_probes
+    )
+
+
 def test_scale_benchmark_rejects_pre_finish_direct_cursor_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -402,21 +437,25 @@ def test_scale_benchmark_rejects_extra_reviewed_effect_reads(
         )
 
 
-def test_scale_benchmark_traces_handler_connections_opened_during_recovery(
+def test_scale_benchmark_second_handler_connection_is_locked_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if os.name == "nt":
-        pytest.skip("Windows SQLite runtime ownership uses an exclusive connection lease")
+    direct_connect = sqlite3.connect
     original = RuntimeBuilder._recover_runtime_state
+    observed_lock_codes: list[int] = []
 
     def recover_with_second_connection(host: Runtime) -> None:
         original(host)
         database_path = str(
             host.store.conn.execute("PRAGMA database_list").fetchone()[2]
         )
-        connection = sqlite3.connect(database_path)
+        connection = direct_connect(database_path, timeout=0.0)
         try:
-            connection.execute("SELECT * FROM external_effects").fetchone()
+            with pytest.raises(sqlite3.OperationalError) as error:
+                connection.execute("SELECT * FROM external_effects").fetchone()
+            error_code = getattr(error.value, "sqlite_errorcode", None)
+            assert error_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            observed_lock_codes.append(error_code)
         finally:
             connection.close()
 
@@ -425,15 +464,14 @@ def test_scale_benchmark_traces_handler_connections_opened_during_recovery(
         "_recover_runtime_state",
         staticmethod(recover_with_second_connection),
     )
-    with pytest.raises(
-        AssertionError,
-        match="statement default-deny rejected",
-    ):
-        run_recovery_scale_benchmark(
-            total_records=10,
-            pending_records=1,
-            page_size=1,
-        )
+    result = run_recovery_scale_benchmark(
+        total_records=10,
+        pending_records=1,
+        page_size=1,
+    )
+
+    assert observed_lock_codes
+    assert result.handler_recovered_records == 1
 
 
 @pytest.mark.parametrize(

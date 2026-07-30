@@ -472,14 +472,16 @@ real Deno installation skip with a clear message when `deno` is missing; use
 ## Documentation Consistency
 
 - README is the current project entrypoint and documentation index.
-- `docs/release_status.md` describes only the current version's readiness,
-  validation outcomes, and remaining environment boundaries;
+- `docs/release_status.md` describes the current version's candidate scope,
+  validation contract, and remaining environment boundaries; it is not a CI
+  receipt or a claim of observed validation outcomes;
   `docs/prelaunch_hardening_report.md` is historical evidence only.
 - `agent_libos_design_doc.md` is a historical design archive.
 - `docs/invariants.md` is the invariant-to-test map.
 - `docs/paper_thesis.md` carries the fixed paper title, thesis, contributions,
   and non-goals.
 - `docs/architecture.md`, `docs/threat_model.md`, `docs/runtime_model.md`,
+  `docs/events.md`,
   `docs/python_api.md`, `docs/capabilities.md`,
   `docs/task_authority_manifest.md`, `docs/data_flow.md`,
   `docs/object_memory.md`, `docs/tools_and_jit.md`, `docs/skills.md`,

@@ -8,6 +8,12 @@ allowed-tools: create_checkpoint list_checkpoints inspect_checkpoint diff_checkp
 Checkpoints preserve reconstructable Agent libOS state for one process subtree.
 They are not filesystem or Git snapshots, remote transactions, or provider undo.
 
+Checkpoint-committed images embed process-local JIT source, but static tools are
+captured by name/binding only and resolve again against the current Host
+`ToolBroker` at boot. Hash-pinned required Modules mitigate drift for their
+module-supplied tools; they do not freeze every built-in or Host static-tool
+implementation. Never claim code-identical replay from the image artifact alone.
+
 ## Mental model
 
 A checkpoint captures its process subtree, cwd/state, owned Objects/namespaces,

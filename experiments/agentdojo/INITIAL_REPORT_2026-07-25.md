@@ -45,8 +45,10 @@ AgentDojo 的 injection-task oracle 返回 `True` 时表示注入目标成功，
 
 所有真实调用使用同一自定义 OpenAI-compatible endpoint、同一
 `qwen3.8-max-preview`、temperature 0、禁用 parallel tool calls、每次最多
-4096 output token、每轨迹最多 16 次 harness 逻辑模型调用。这里沿用当时 artifact
-的历史字段名 `provider_call_count` / “provider call”：它统计成功返回给 harness 的
+4096 output token、每个 query 最多 16 次 harness 逻辑模型调用。AgentDojo 可在空
+终态后为同一轨迹发起最多三个 query，因此理论轨迹上限是 48 次；本报告早期版本把
+16 误写成“每轨迹”，此处为单位勘误。这里沿用当时 artifact 的历史字段名
+`provider_call_count` / “provider call”：它统计成功返回给 harness 的
 `LLMClient.complete_action` 调用，不是 SDK transport retry、兼容性重试或 API
 fallback 产生的物理 HTTP 请求次数。报告不记录 raw endpoint 或 API key。
 
@@ -162,7 +164,8 @@ tasks 分别测试 `minimal_runtime` 和 `libos_default`。每组都有新的 co
 
 ## 完整性与凭据审计
 
-`agent-libos-dojo verify` 不信任 manifest 中的有利指标，会重新执行以下检查：
+报告生成时版本的 `agent-libos-dojo verify` 不信任 manifest 中的有利指标，并执行了
+以下检查：
 
 - 主制品 SHA-256 与 trace-set SHA-256；
 - JSONL 行数、唯一 case ID、逐行 trace 对齐；
@@ -173,7 +176,8 @@ tasks 分别测试 `minimal_runtime` 和 `libos_default`。每组都有新的 co
 - runtime-only terminal 工具未进入 provider request 或 recorded response；
 - 对 run 目录所有普通文件扫描 raw API key 与 raw base URL。
 
-四个结论性 run 均以 `--require-complete --require-all-valid` 通过。扫描结果：
+四个结论性 run 均在当时的 harness/verifier 下以
+`--require-complete --require-all-valid` 通过。扫描结果：
 
 - image-only 主 pilot：52 个文件，0 credential/endpoint hit；
 - minimal direct：20 个文件，0 hit；
@@ -200,6 +204,12 @@ tasks 分别测试 `minimal_runtime` 和 `libos_default`。每组都有新的 co
 根目录 `agent_libos/` 的精确内容。因此这些结果是保留的行为证据，不是可由 commit
 SHA 独立还原的完整源码 attestation。当前 harness 会同时指纹化子项目与实际执行的
 根 Python 包；新结论性 run 应要求并发布这两个指纹。
+
+当前 verifier 已要求新的 per-query、tool-outcome 和 run-start credential-snapshot
+证据；这些历史 artifact 没有那些字段，因此当前 checkout 会有意拒绝它们，且没有
+绕过新检查的 legacy flag。上面的“通过”是历史验证记录，不是当前 verifier 的兼容
+承诺。由于这些 run 又是 dirty-source artifact，仓库无法提供一个能精确重建当时
+verifier 和根包源码的 commit；不要补写字段或改动已列 hash 来制造当前验证通过。
 
 ## Token 预算与下一轮取舍
 

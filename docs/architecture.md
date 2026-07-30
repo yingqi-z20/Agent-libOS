@@ -34,6 +34,7 @@ Agent personality / application
      - operation/explain manager
      - protected-operation SDK and evidence retention
      - audit manager
+     - UnitOfWork and typed repository facades
   -> protected provider boundaries
      - LLM provider service/client
      - Resource Provider Substrate
@@ -220,25 +221,30 @@ classifier failure cannot prove non-execution, so authority stays consumed and
 the primitive records or retains a conservative `unknown` effect. This makes a
 failed return value distinct from a proven absence of external effects.
 
-The PTY Runtime Module applies this pending-to-finalized protocol to spawn,
-write, resize, and close. Cleanup after a spawned session fails to publish its
+The PTY Runtime Module applies this pending-to-finalized protocol to every
+protected PTY operation, including spawn, read, continuous ingest, write,
+resize, and close. Cleanup after a spawned session fails to publish its
 Object is containment, not evidence that spawn never occurred; classifier
 absence or failure after a PTY operation finalizes an `unknown` fallback, while
 post-provider sink failure leaves the pending row visible.
 
 ## Composition Root And Internal Dependencies
 
-`agent_libos.runtime.builder.RuntimeBuilder` is the composition root. It opens
-the store, constructs all acyclic dependencies in dependency order, and uses
+`agent_libos.runtime.builder.RuntimeBuilder` is the composition root. It either
+opens a builder-owned store (`open`/`aopen`) or accepts a caller-owned store
+(`from_store`/`afrom_store`), constructs all acyclic dependencies in dependency
+order, and uses
 named late bindings only for explicit construction cycles: Data Flow/Human,
 Resource/Process and Object Task notifications, lifecycle participants, and
 the checkpoint module-catalog/image-registry pair. Protected-operation recovery
 and Process/Image Boot use their named recovery/hook registries for the same
 reason. The builder then loads trusted extensions and cleans up a partially
-assembled host on failure. Async hosts must use `await Runtime.aopen()`; failed
-assembly cleanup runs on that caller loop and is shielded until teardown has
-drained. Sync open refuses an active event loop before it opens storage. Both
-sync and async builders allocate the host through `Runtime.allocate_unassembled`
+assembled host on failure. Async hosts opening a builder-owned target use
+`await Runtime.aopen()`; hosts supplying a caller-owned store use
+`await RuntimeBuilder.afrom_store(...)`. Failed assembly cleanup runs on that
+caller loop and is shielded until teardown has drained. Sync open refuses an
+active event loop before it opens storage. Both sync and async builders allocate the host through
+`Runtime.allocate_unassembled`
 and then run the same explicit assembly pipeline; they never wrap an already
 live graph in a subclass constructor. A Runtime subclass that overrides
 `__init__` must therefore override `allocate_unassembled` and initialize its
@@ -350,11 +356,15 @@ bindings is itself ratcheted so new late bindings cannot accumulate unnoticed.
 
 The assembled graph includes:
 
-- `RuntimeStore` persists mutable state plus append-only evidence through a backend
-  abstraction. SQLite is the default backend; PostgreSQL is available through
-  an optional extra. Both SQL backends share the same `SQLRuntimeStore`
-  repository contract while backend classes own connection setup and dialect
-  behavior.
+- `RuntimeStore` is the concrete backend boundary. `UnitOfWork` supplies the
+  shared transaction boundary and typed process, Object, authority, resource,
+  publication, snapshot, evidence, extension, module-publication, retention,
+  and protected-effect repositories injected into subsystem services. Direct
+  raw-store use is reserved for Host lifecycle/storage ownership and small
+  compatibility surfaces rather than being the normal subsystem dependency.
+  SQLite is the default backend; PostgreSQL is available through an optional
+  extra, and each backend owns connection setup and dialect behavior behind the
+  same UnitOfWork backend contract.
 - `RuntimeModuleRegistry` loads the internal core module and configured trusted
   startup modules before processes, tools, or LLM execution can run. Hook code
   receives an explicit `ModuleHookServices` snapshot and journaled registration
@@ -371,6 +381,9 @@ The assembled graph includes:
   decisions. Registry writes require configured `data_flow_sink_registry:*`
   admin authority and are never projected as model tools.
 - `ObjectMemoryManager` provides typed memory and namespace resolution.
+- `EventBus` validates and appends the closed `EventType` catalog. Its event
+  insert and active operation-evidence link are atomic, while wider
+  state/event/audit coupling remains the responsibility of the owning manager.
 - `HumanObjectManager` owns questions, approvals, terminal queue processing,
   and human output.
 - `FilesystemAdapter`, `GitPrimitive`, `ShellAdapter`, `ClockPrimitive`,
@@ -395,11 +408,21 @@ The assembled graph includes:
   transactional transitions that enforce the same typed-state contract. Row
   `revision`, wait `state_generation`, and exact scheduler
   execution-generation/owner/lease tokens separately fence stale updates,
-  repeated-wait ABA wakeups, and detached quantum writes.
+  repeated-wait ABA wakeups, and detached quantum writes. Registration by a
+  different condition domain, retargeting an already active condition, and
+  generic pause/resume while a condition or Host-resume gate owns the process
+  fail closed.
 - `ImageBootService` owns image preflight, process-exec admission leases,
   phased boot publications, exact rollback snapshots, compensation, and
   startup reconciliation.
-- `SimpleScheduler` runs runnable processes and wakes waiting work.
+- `SimpleScheduler` claims only `runnable` processes and advances
+  scheduler-owned quanta. It does not interpret or clear typed waits. Child,
+  message, Human, and ObjectTask managers own the durable condition they
+  created; syscall cleanup likewise owns only the exact interrupted wait it
+  recorded. Those owners release a matching revision/state generation through
+  `ProcessTransitionService`, with token-based owners failing closed on stale
+  wake tokens. Direct Host workflows and Host-managed ObjectTask runners can
+  also advance a process without making it scheduler work.
 - `ObjectTaskManager` coordinates execution while dedicated state and
   notification services own durable transitions and wake/message publication.
 - `CheckpointManager` coordinates restore/fork transactions over typed snapshot
@@ -417,6 +440,9 @@ The assembled graph includes:
 
 The default substrate is `LocalResourceProviderSubstrate`, rooted at the current
 workspace unless another substrate is injected.
+
+The durable event envelope, current 45-value event catalog, ordering model, and
+transaction/causality limits are documented in [Runtime Events](events.md).
 
 The internal core module registers the built-in tool set and default images
 through the same module registration path exposed to trusted external modules.
@@ -498,8 +524,8 @@ workflow), the actual write still enters the filesystem primitive, which checks:
 - filesystem capability, Task Authority effect ceiling, and permission policy,
 - human approval if policy requires it,
 - overwrite and content preview metadata,
-- resource and finite-authority reservations plus a pending external-effect
-  intent,
+- resource preflight/accounting, a finite-authority reservation, and a pending
+  external-effect intent,
 - source, target, payload, and policy revalidation immediately before dispatch,
 - provider classification and label/resource/authority settlement,
 - event emission,
@@ -574,7 +600,8 @@ including:
 - explainable operations, evidence links, and context manifests,
 - durable LLM pending-action generations, `image_only` native transcript tool
   outputs, compatible Responses-continuation rows, and context generations,
-- provider-decided finalized external effects and conservative pending intents,
+- provider- or trusted-runtime-classified finalized external effects and
+  conservative pending intents,
   their append-only transition history, and record-level payload-retention
   tier/digest provenance,
 - events and audit records,
@@ -613,10 +640,20 @@ memory, while current SQL object writes store only a runtime-memory marker.
 Accepted legacy rows from older development builds may still contain full JSON
 payloads and must be migrated or recreated before claiming marker-only
 historical retention. Marker rows whose live payload cache cannot be
-reconstructed are released fail-closed on reopen; see
+reconstructed are released fail-closed on reopen. The one current exception is
+an internal, integrity-bound recovery envelope for the immutable initial GOAL of a
+committed, live root spawn when `llm.persist_full_io=true`: startup validates
+the process and Object identity plus payload digest before rehydration, generic
+publication reads redact the payload, and terminal cleanup reduces the envelope
+to hashes. It does not apply to child/fork/ObjectTask or ordinary Object payloads,
+or to a replacement goal supplied by exec; an exec that preserves the original
+root goal remains eligible. `persist_full_io=false` stores no reversible goal
+content. See
 [Runtime Storage](storage.md#transaction-model).
 Persistent stores take an active-runtime lease so two writable Runtime
-instances cannot concurrently open the same database. File-backed SQLite
+instances cannot concurrently open the same file-backed SQLite target or the
+same PostgreSQL `(current_database(), current_schema())` target. Separate
+PostgreSQL schemas have distinct lease identities. File-backed SQLite
 canonicalizes the database path for both the connection and lease. On the
 tested POSIX path, `O_NOFOLLOW` plus `fchmod` enables file-type/symlink checks
 and owner-only (`0600`) tightening for the database and sidecars; current-user
@@ -624,13 +661,17 @@ ownership is also required where `getuid` is available. Separately, `fcntl`
 plus `O_NOFOLLOW` enables both the hardened no-follow path-sidecar `flock` and
 an owner-only private identity lease keyed by the validated database
 `(st_dev, st_ino)`. Database, lease, identity-lease, and SQLite sidecar files
-must be regular, current-user-owned, single-link files on that path. The
-database path is rechecked against the opened identity before use, so a hard
-link is rejected and a path/lockfile replacement, rename plus symlink retarget,
-or alternate path to the already leased inode cannot admit a second Runtime.
-Where that lease mechanism is unavailable, SQLite's kernel-managed exclusive
-database lock is the fallback, without claiming the unavailable POSIX
-path/inode and mode/ownership hardening. PostgreSQL derives its advisory-lock
+must be regular, current-user-owned, single-link files on that path. Pre/post
+path-identity checks and those leases reject ordinary aliases and replacement
+races; the live connection also holds SQLite's exclusive lock on the actual
+database it opened, preserving one active writer if a same-UID filesystem
+administrator races the pathname at connect time. The standard SQLite driver
+cannot prove that such a raced connection still names the originally selected
+inode, so writable database directories are inside the Host trust boundary and
+must not be renamed/replaced while the Runtime is alive. Where the POSIX lease
+mechanism is unavailable, the exclusive database lock remains the single-writer
+boundary without claiming unavailable path/inode or mode/ownership hardening.
+PostgreSQL derives its advisory-lock
 key from the current database and schema. A clean close releases the lease and
 permits a later reopen. Checkpoint and image artifact payloads are explicit
 durable snapshot exceptions.
@@ -703,7 +744,7 @@ agent_libos/
   sdk/             public protected-operation lifecycle and provider-facing contracts
   skills/          Skill schema, strict loader, trust registry, and SkillManager
   substrate/       provider interfaces and local host-backed implementations
-  storage/         runtime store backends and installed storage-migration entrypoints
+  storage/         UnitOfWork, typed repositories, store backends, and migrations
   tools/           tool base classes, ToolBroker, sandbox, and built-in tools
   utils/           shared validation, YAML loading, and helper utilities
 benchmarks/        runtime-safety, practical, Skill-projection, long-horizon, and

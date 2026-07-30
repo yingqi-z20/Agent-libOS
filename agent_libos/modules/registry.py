@@ -273,8 +273,9 @@ class RuntimeModuleRegistry:
             return
         failed_hook: tuple[str, str] | None = None
         try:
-            with self._module_publications.transaction(
-                include_object_payloads=True
+            with (
+                self._image_registry.atomic_image_registrations(()),
+                self._module_publications.transaction(include_object_payloads=True),
             ):
                 for module_id, hook_name, hook in list(self._provider_hooks):
                     failed_hook = (module_id, hook_name)
@@ -323,8 +324,9 @@ class RuntimeModuleRegistry:
         journal = RegistrationJournal(source.manifest.module_id)
         self._registration_journals[source.manifest.module_id] = journal
         try:
-            with self._module_publications.transaction(
-                include_object_payloads=True
+            with (
+                self._image_registry.atomic_image_registrations(()),
+                self._module_publications.transaction(include_object_payloads=True),
             ):
                 result = entrypoint(ctx)
                 if inspect.isawaitable(result):
@@ -426,7 +428,11 @@ class RuntimeModuleRegistry:
             return
         if module_id in self._loaded_modules:
             raise ValidationError(f"startup module already loaded: {module_id}")
-        journal.rollback()
+        with (
+            self._image_registry.atomic_image_registrations(()),
+            self._module_publications.transaction(include_object_payloads=True),
+        ):
+            journal.rollback()
         self._registration_journals.pop(module_id, None)
 
     def _require_module_id_available(self, module_id: str, source_sha256: str) -> None:
@@ -645,8 +651,9 @@ class RuntimeModuleRegistry:
         ctx = self._applied_contexts.get(module_id)
         journal = self._registration_journals.get(module_id)
         try:
-            with self._module_publications.transaction(
-                include_object_payloads=True
+            with (
+                self._image_registry.atomic_image_registrations(()),
+                self._module_publications.transaction(include_object_payloads=True),
             ):
                 if journal is not None:
                     journal.rollback()
@@ -691,7 +698,10 @@ class RuntimeModuleRegistry:
             rollback_exc,
             code="module_rollback_recovery_failed",
         )
-        with self._module_publications.transaction(include_object_payloads=True):
+        with (
+            self._image_registry.atomic_image_registrations(()),
+            self._module_publications.transaction(include_object_payloads=True),
+        ):
             for row in self._extensions.list_tools():
                 if row.get("registered_by") == actor:
                     self._extensions.delete_tool(
@@ -703,6 +713,12 @@ class RuntimeModuleRegistry:
                     image.image_id in created_image_ids
                     and metadata.get("registered_by") == actor
                 ):
+                    current = self._images.get(image.image_id)
+                    if current == image:
+                        self._image_registry.stage_image_removal(
+                            image.image_id,
+                            expected=image,
+                        )
                     self._extensions.delete_image(
                         image.image_id,
                         registered_by=actor,
@@ -768,7 +784,10 @@ class RuntimeModuleRegistry:
 
     def _unregister_image(self, image: Any, *, actor: str) -> None:
         if self._images.get(image.image_id) == image:
-            self._images.pop(image.image_id, None)
+            self._image_registry.stage_image_removal(
+                image.image_id,
+                expected=image,
+            )
         stored = self._extensions.get_image(image.image_id)
         registered_by = stored[1].get("registered_by") if stored is not None else None
         if registered_by == actor:
@@ -778,7 +797,10 @@ class RuntimeModuleRegistry:
         """Undo cache-only module replay without touching its durable row."""
 
         if self._images.get(image.image_id) == image:
-            self._images.pop(image.image_id, None)
+            self._image_registry.stage_image_removal(
+                image.image_id,
+                expected=image,
+            )
 
     def _unregister_context_provider_hook(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from types import SimpleNamespace
@@ -157,6 +158,47 @@ def test_candidate_test_requires_expected_without_executing_source(
     assert not validation.ok
     assert validation.errors == ["JIT test 1 must include expected"]
     assert calls == 0
+
+
+def test_candidate_test_omitted_args_and_syscalls_use_empty_defaults(
+    monkeypatch: Any,
+) -> None:
+    sandbox = _sandbox(monkeypatch, {})
+    observed_args: list[dict[str, Any]] = []
+
+    def run_source(_source: str, args: dict[str, Any], **_kwargs: Any) -> Any:
+        observed_args.append(args)
+        return {}
+
+    monkeypatch.setattr(sandbox, "run_source", run_source)
+
+    validation = sandbox.run_tests(SOURCE, [{"expected": {}}])
+
+    assert validation.ok, validation.errors
+    assert observed_args == [{}]
+
+
+def test_successful_syscall_fixture_preserves_result_payload_null_precedence() -> None:
+    sandbox = DenoTypescriptSandbox(deno_executable="deno")
+    handler, assert_consumed = sandbox._test_syscall_handler(
+        {
+            "syscalls": [
+                {
+                    "name": "first",
+                    "result": {"selected": "result"},
+                    "payload": {"selected": "payload"},
+                },
+                {"name": "second", "payload": {"selected": "payload"}},
+                {"name": "third"},
+            ]
+        },
+        1,
+    )
+
+    assert asyncio.run(handler("first", {})) == {"selected": "result"}
+    assert asyncio.run(handler("second", {})) == {"selected": "payload"}
+    assert asyncio.run(handler("third", {})) is None
+    assert_consumed()
 
 
 def test_candidate_expected_comparison_is_json_type_sensitive(

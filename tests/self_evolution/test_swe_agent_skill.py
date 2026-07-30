@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ProcessStatus
@@ -24,6 +26,11 @@ class TestSWEAgentSkill:
 
         assert allowed_tools_line.startswith('allowed-tools: read_directory ')
         assert ' process_exit' in allowed_tools_line
+
+    def test_shipped_skill_pins_current_jit_extension_compatibility(self) -> None:
+        skill_md = PACKAGE_ROOT.joinpath('SKILL.md').read_text(encoding='utf-8')
+
+        assert 'compatibility: agent-libos==1.0.1\n' in skill_md
 
     def test_command_wrappers_reserve_outer_sandbox_cleanup_windows(self) -> None:
         specs = {
@@ -55,6 +62,65 @@ class TestSWEAgentSkill:
             'maximum': 55,
             'default': 55,
         }
+
+    def test_jit_manifest_has_closed_executable_contracts_and_self_tests(self) -> None:
+        specs = {
+            item['name']: item
+            for item in json.loads(
+                PACKAGE_ROOT.joinpath(
+                    'references/agent-libos/jit-tools.json'
+                ).read_text(encoding='utf-8')
+            )
+        }
+
+        assert set(specs) == {
+            'swe_view',
+            'swe_grep',
+            'swe_edit',
+            'swe_run',
+            'swe_submit',
+        }
+        for name, spec in specs.items():
+            assert spec['input_schema']['additionalProperties'] is False
+            assert spec['output_schema'] != {'type': 'object'}
+            assert spec['tests'], (
+                f'{name} must ship at least one behavioral self-test'
+            )
+            input_validator = Draft202012Validator(spec['input_schema'])
+            output_validator = Draft202012Validator(spec['output_schema'])
+            for case in spec['tests']:
+                assert 'expected' in case
+                input_validator.validate(case.get('args', {}))
+                output_validator.validate(case['expected'])
+                with pytest.raises(JsonSchemaValidationError):
+                    input_validator.validate(
+                        {**case.get('args', {}), 'unexpected': True}
+                    )
+                with pytest.raises(JsonSchemaValidationError):
+                    output_validator.validate(
+                        {**case['expected'], 'unexpected': True}
+                    )
+
+        with pytest.raises(JsonSchemaValidationError):
+            Draft202012Validator(specs['swe_grep']['input_schema']).validate({})
+        with pytest.raises(JsonSchemaValidationError):
+            Draft202012Validator(specs['swe_run']['input_schema']).validate(
+                {'argv': []}
+            )
+        with pytest.raises(JsonSchemaValidationError):
+            Draft202012Validator(specs['swe_submit']['input_schema']).validate(
+                {'summary': 'done', 'tests': []}
+            )
+        with pytest.raises(JsonSchemaValidationError):
+            Draft202012Validator(specs['swe_edit']['input_schema']).validate(
+                {
+                    'path': 'document.txt',
+                    'new_text': 'replacement',
+                    'old_text': 'old',
+                    'start_line': 1,
+                    'end_line': 1,
+                }
+            )
 
     @pytest.mark.parametrize(
         ('source', 'expected_error'),
@@ -236,6 +302,8 @@ class TestSWEAgentSkill:
                     'argv': [
                         'rg',
                         '-n',
+                        '--null',
+                        '--with-filename',
                         '--hidden',
                         '--glob',
                         '!.git/*',
@@ -248,7 +316,7 @@ class TestSWEAgentSkill:
                 },
                 {
                     'returncode': 0,
-                    'stdout': 'src/tool.py:4:needle\n',
+                    'stdout': 'src/tool.py\x004:needle\n',
                     'stderr': '',
                     'stdout_truncated': False,
                     'stderr_truncated': False,
@@ -257,6 +325,8 @@ class TestSWEAgentSkill:
                     'argv': [
                         'rg',
                         '-n',
+                        '--null',
+                        '--with-filename',
                         '--hidden',
                         '--glob',
                         '!.git/*',
@@ -323,6 +393,8 @@ class TestSWEAgentSkill:
         argv = [
             'rg',
             '-n',
+            '--null',
+            '--with-filename',
             '--hidden',
             '--glob',
             '!.git/*',
@@ -348,9 +420,9 @@ class TestSWEAgentSkill:
                             'result': {
                                 'returncode': 0,
                                 'stdout': (
-                                    'src/a.py:1:needle\n'
-                                    'src/b.py:2:needle\n'
-                                    'src/c.py:3:needle'
+                                    'src/a.py\x001:needle\n'
+                                    'src/b.py\x002:needle\n'
+                                    'src/c.py\x003:needle\n'
                                 ),
                                 'stderr': '',
                                 'stdout_truncated': True,
@@ -376,6 +448,104 @@ class TestSWEAgentSkill:
                         'message': '',
                     },
                 }
+            ],
+        )
+
+        assert validation.ok, validation.errors
+
+    @pytest.mark.real_deno
+    def test_swe_grep_nul_framing_preserves_single_colon_path_and_drops_partial_tail(
+        self,
+    ) -> None:
+        source = PACKAGE_ROOT.joinpath('scripts/swe_grep.ts').read_text(
+            encoding='utf-8'
+        )
+        sandbox = DenoTypescriptSandbox(deno_executable='deno')
+        argv = [
+            'rg',
+            '-n',
+            '--null',
+            '--with-filename',
+            '--hidden',
+            '--glob',
+            '!.git/*',
+            '-F',
+            '--',
+            'needle',
+            'src/single:file.py',
+        ]
+        base = {
+            'argv': argv,
+            'returncode': 0,
+            'stderr_truncated': False,
+            'stderr': '',
+            'message': '',
+        }
+
+        validation = sandbox.run_tests(
+            source,
+            [
+                {
+                    'args': {
+                        'pattern': 'needle',
+                        'path': 'src/single:file.py',
+                    },
+                    'syscalls': [
+                        {
+                            'name': 'shell.run',
+                            'args': {'argv': argv, 'timeout_s': 10},
+                            'result': {
+                                'returncode': 0,
+                                'stdout': 'src/single:file.py\x001:needle\n',
+                                'stderr': '',
+                                'stdout_truncated': False,
+                                'stderr_truncated': False,
+                            },
+                        }
+                    ],
+                    'expected': {
+                        **base,
+                        'files': ['src/single:file.py'],
+                        'matches': ['src/single:file.py:1:needle'],
+                        'omitted_matches': 0,
+                        'observed_omitted_matches': 0,
+                        'matches_incomplete': False,
+                        'stdout_truncated': False,
+                        'output_incomplete': False,
+                    },
+                },
+                {
+                    'args': {
+                        'pattern': 'needle',
+                        'path': 'src/single:file.py',
+                    },
+                    'syscalls': [
+                        {
+                            'name': 'shell.run',
+                            'args': {'argv': argv, 'timeout_s': 10},
+                            'result': {
+                                'returncode': 0,
+                                'stdout': (
+                                    'src/single:file.py\x001:needle\n'
+                                    'src/partial:file.py'
+                                ),
+                                'stderr': '',
+                                'stdout_truncated': True,
+                                'stderr_truncated': False,
+                            },
+                        }
+                    ],
+                    'expected': {
+                        **base,
+                        'files': ['src/single:file.py'],
+                        'matches': ['src/single:file.py:1:needle'],
+                        'omitted_matches': None,
+                        'observed_omitted_matches': 0,
+                        'matches_incomplete': True,
+                        'stdout_truncated': True,
+                        'output_incomplete': True,
+                    },
+                },
             ],
         )
 

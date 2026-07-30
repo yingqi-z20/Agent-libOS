@@ -181,6 +181,7 @@ class Runtime:
     recovered_exec_publications: list[str]
     recovered_runtime_publications: list[str]
     recovered_checkpoint_restore_publications: list[str]
+    recovered_root_spawn_initial_goal_payloads: tuple[str, ...]
     recovered_stale_operations: StaleOperationRecoverySummary
     recovered_stale_executions: StaleExecutionRecoverySummary
     recovered_terminal_cleanups: dict[str, Any]

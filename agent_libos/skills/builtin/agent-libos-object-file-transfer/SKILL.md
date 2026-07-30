@@ -7,7 +7,10 @@ allowed-tools: create_object_from_file write_object_to_file
 
 Both input paths are relative to the caller's working directory and must remain inside the workspace. Returned paths are canonical workspace-relative evidence; if cwd is not the workspace root, do not reuse one as though it were cwd-relative.
 
-Imported payloads survive prompt/compaction changes only in the live Runtime; ordinary payloads vanish on reopen unless explicitly captured. Exported files are workspace effects that restore does not undo.
+Imported payloads survive prompt/compaction changes only in the live Runtime;
+these ordinary non-root-goal payloads vanish on reopen unless explicitly
+captured. The Host's narrow committed-root initial-GOAL recovery path does not
+apply. Exported files are workspace effects that restore does not undo.
 
 ## Tool guide
 
@@ -79,7 +82,9 @@ A round trip can preserve stored Unicode text while changing encoded bytes. It c
   only after deciding that the new snapshot is the intended export. The failed
   stale-snapshot attempt does not create or replace the destination.
 - Authority/approval/label denial: correct authority or destination; never reroute to evade policy.
-- Runtime reopen: recover imported content from the authoritative file or a checkpoint/image that captured it; do not infer vanished payload from durable OID metadata.
+- Runtime reopen: recover this ordinary imported content from the authoritative
+  file or a checkpoint/image that captured it; do not infer vanished payload
+  from durable OID metadata.
 
 There is no wait, resume, rollback, or cross-boundary transaction tool here. If inspection cannot distinguish whether a non-idempotent transfer occurred, stop with an explicit unknown-state blocker.
 

@@ -755,6 +755,7 @@ class TestJsonRpcPrimitive:
             pytest.param('rollbackable', None, 'not_applied', id='rollbackable-default'),
             pytest.param('no_rollback_required', None, 'not_required', id='not-required-default'),
             pytest.param('unknown', None, 'unknown', id='unknown-default'),
+            pytest.param('rollbackable', 'null', 'not_applied', id='explicit-null-default'),
             pytest.param('rollbackable', 'unknown', 'unknown', id='explicit-override'),
         ],
     )

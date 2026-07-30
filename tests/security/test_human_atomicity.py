@@ -10,17 +10,28 @@ from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig
 from agent_libos.models import (
     CapabilityRight,
+    ChildProcessWait,
     DataFlowContext,
     DataLabels,
     DataSensitivity,
     EventType,
+    ExternalEffectRollbackStatus,
+    HostResumeProcessWait,
+    HumanProcessWait,
     HumanRequestStatus,
+    MessageProcessWait,
+    PausedProcessWait,
     ProcessSignal,
     ProcessStatus,
     SinkTrustLevel,
     SinkTrustRule,
+    ToolProcessWait,
 )
-from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    ProcessError,
+    ValidationError,
+)
 
 
 def _reservation_rows(runtime: Runtime) -> list[dict[str, object]]:
@@ -141,7 +152,7 @@ def test_human_request_reservation_settlement_failure_rolls_back_composite_unit(
 
 @pytest.mark.parametrize(
     "signal",
-    [ProcessSignal.PAUSE, ProcessSignal.CANCEL, ProcessSignal.TERMINATE],
+    [ProcessSignal.CANCEL, ProcessSignal.TERMINATE],
 )
 @pytest.mark.parametrize("failed_sink", ["event", "audit"])
 def test_human_interrupt_evidence_failure_rolls_back_state_cancellation_and_evidence(
@@ -223,6 +234,130 @@ def test_human_interrupt_commits_state_cancellation_and_evidence_together() -> N
         assert any(
             record.action == "human.interrupt"
             for record in runtime.audit.trace(target=f"process:{pid}")
+        )
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [ProcessSignal.PAUSE, ProcessSignal.RESUME],
+    ids=("pause", "resume"),
+)
+@pytest.mark.parametrize(
+    ("status", "wait_state"),
+    (
+        (
+            ProcessStatus.WAITING_EVENT,
+            MessageProcessWait(filters={"channel": "control"}),
+        ),
+        (
+            ProcessStatus.WAITING_EVENT,
+            ChildProcessWait(child_pid="pid_owned_child"),
+        ),
+        (
+            ProcessStatus.WAITING_HUMAN,
+            HumanProcessWait(request_ids=("hreq_owned",)),
+        ),
+        (
+            ProcessStatus.WAITING_TOOL,
+            ToolProcessWait(operation_id="op_owned"),
+        ),
+    ),
+    ids=("event", "child", "human", "tool"),
+)
+def test_human_pause_or_resume_cannot_clear_condition_owned_typed_wait(
+    status: ProcessStatus,
+    wait_state: object,
+    signal: ProcessSignal,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="preserve condition-owned typed wait",
+        )
+        runnable = runtime.process.get(pid)
+        waiting = runtime.process_transitions.transition(
+            pid,
+            status,
+            expected_revision=runnable.revision,
+            expected_status=ProcessStatus.RUNNABLE,
+            expected_state_generation=runnable.state_generation,
+            wait_state=wait_state,  # type: ignore[arg-type]
+        )
+        before_event_ids = {event.event_id for event in runtime.events.list()}
+        before_audit_ids = {record.record_id for record in runtime.audit.trace()}
+
+        with pytest.raises(
+            ProcessError,
+            match=rf"cannot {signal.value} waiting process",
+        ):
+            runtime.human.interrupt(
+                pid,
+                signal,
+                {"reason": "must not bypass the condition owner"},
+            )
+
+        unchanged = runtime.process.get(pid)
+        assert unchanged.status == waiting.status
+        assert unchanged.wait_state == waiting.wait_state
+        assert unchanged.state_generation == waiting.state_generation
+        assert unchanged.revision == waiting.revision
+        assert unchanged.status_message == waiting.status_message
+        assert {event.event_id for event in runtime.events.list()} == before_event_ids
+        assert {record.record_id for record in runtime.audit.trace()} == before_audit_ids
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "initial_status",
+    [ProcessStatus.PAUSED, ProcessStatus.SUSPENDED],
+    ids=("paused", "suspended"),
+)
+def test_human_resume_keeps_legitimate_paused_and_suspended_paths(
+    initial_status: ProcessStatus,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="resume trusted control state",
+        )
+        if initial_status == ProcessStatus.PAUSED:
+            runtime.human.interrupt(
+                pid,
+                ProcessSignal.PAUSE,
+                {"reason": "trusted pause"},
+            )
+        else:
+            runnable = runtime.process.get(pid)
+            runtime.process_transitions.transition(
+                pid,
+                ProcessStatus.SUSPENDED,
+                expected_revision=runnable.revision,
+                expected_status=ProcessStatus.RUNNABLE,
+                expected_state_generation=runnable.state_generation,
+            )
+        before = runtime.process.get(pid)
+        assert before.status == initial_status
+        if initial_status == ProcessStatus.PAUSED:
+            assert isinstance(before.wait_state, PausedProcessWait)
+        else:
+            assert before.wait_state is None
+
+        event_id = runtime.human.interrupt(pid, ProcessSignal.RESUME)
+
+        resumed = runtime.process.get(pid)
+        assert resumed.status == ProcessStatus.RUNNABLE
+        assert resumed.wait_state is None
+        assert resumed.state_generation == before.state_generation + 1
+        assert any(
+            event.event_id == event_id
+            and event.type == EventType.PROCESS_SIGNAL
+            and event.payload["signal"] == ProcessSignal.RESUME.value
+            for event in runtime.events.list(target=pid)
         )
     finally:
         runtime.close()
@@ -505,12 +640,31 @@ def test_output_delivery_tail_preserves_concurrent_request_metadata(
         runtime.close()
 
 
-def test_ambiguous_provider_marker_failure_uses_minimal_retry_fence(
+@pytest.mark.parametrize(
+    "force_minimal_retry_fence",
+    [False, True],
+    ids=("primary", "minimal-retry-fence"),
+)
+def test_ambiguous_provider_outcome_requires_explicit_host_resume(
     monkeypatch: pytest.MonkeyPatch,
+    force_minimal_retry_fence: bool,
 ) -> None:
     runtime = Runtime.open("local")
     try:
-        pid = runtime.process.spawn(image="base-agent:v0", goal="fence ambiguous Human I/O")
+        parent = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="manage ambiguous Human I/O child",
+        )
+        runtime.capability.grant(
+            parent,
+            "process:spawn",
+            [CapabilityRight.WRITE],
+            issued_by="test",
+        )
+        pid = runtime.spawn_child_process(
+            parent,
+            "fence ambiguous Human I/O",
+        )
         request_id = runtime.human.query(
             pid,
             "owner",
@@ -539,18 +693,127 @@ def test_ambiguous_provider_marker_failure_uses_minimal_retry_fence(
                 raise RuntimeError("transient marker persistence failure")
             original_update(request)
 
-        monkeypatch.setattr(runtime.human.requests, "update", fail_first_unknown_marker)
+        if force_minimal_retry_fence:
+            monkeypatch.setattr(
+                runtime.human.requests,
+                "update",
+                fail_first_unknown_marker,
+            )
 
         with pytest.raises(RuntimeError, match="ambiguous provider failure"):
             runtime.human.process_next_terminal()
 
         persisted = runtime.human.get(request_id)
-        assert failed_marker is True
+        assert failed_marker is force_minimal_retry_fence
         assert persisted.status == HumanRequestStatus.CANCELLED
         assert persisted.decision is not None
+        assert persisted.decision["provider_outcome"] == "unknown"
         assert persisted.decision["automatic_retry_disabled"] is True
-        assert persisted.decision["process_reconciliation_required"] is False
-        assert runtime.process.get(pid).status == ProcessStatus.PAUSED
+        assert persisted.decision["manual_recovery_required"] is True
+        if force_minimal_retry_fence:
+            assert persisted.decision["process_reconciliation_required"] is False
+        paused = runtime.process.get(pid)
+        assert paused.status == ProcessStatus.PAUSED
+        assert isinstance(paused.wait_state, HostResumeProcessWait)
+        reason = runtime.store.get_object(paused.wait_state.reason_oid)
+        assert reason is not None
+        assert reason.oid == paused.goal_oid
+        effects = [
+            effect
+            for effect in runtime.store.list_external_effects(pid=pid)
+            if effect.provider == "human"
+        ]
+        assert len(effects) == 1
+        assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
+        if not force_minimal_retry_fence:
+            assert any(
+                event.type == EventType.HUMAN_RESPONSE
+                and event.payload.get("request_id") == request_id
+                and event.payload.get("provider_outcome") == "unknown"
+                for event in runtime.events.list(target=pid)
+            )
+            assert any(
+                record.action == "human.request.provider_outcome_unknown"
+                and record.target == f"human_request:{request_id}"
+                for record in runtime.audit.trace()
+            )
+
+        with pytest.raises(ProcessError, match="requires explicit Host resume"):
+            runtime.process.signal_child(parent, pid, ProcessSignal.RESUME)
+
+        still_paused = runtime.process.get(pid)
+        assert still_paused.status == ProcessStatus.PAUSED
+        assert still_paused.wait_state == paused.wait_state
+        runtime.process.resume(pid)
+        assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert runtime.human.process_next_terminal() is None
+        assert provider_calls == 1
+    finally:
+        runtime.close()
+
+
+def test_ambiguous_provider_host_gate_preempts_remaining_human_waits() -> None:
+    runtime = Runtime.open("local")
+    try:
+        parent = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="manage child with multiple Human waits",
+        )
+        runtime.capability.grant(
+            parent,
+            "process:spawn",
+            [CapabilityRight.WRITE],
+            issued_by="test",
+        )
+        pid = runtime.spawn_child_process(
+            parent,
+            "preserve manual recovery across remaining Human waits",
+        )
+        unknown_request_id = runtime.human.query(
+            pid,
+            "owner",
+            {"type": "question", "question": "Ambiguous first request"},
+            blocking=True,
+        )
+        remaining_request_id = runtime.human.query(
+            pid,
+            "owner",
+            {"type": "question", "question": "Still pending second request"},
+            blocking=True,
+        )
+        provider_calls = 0
+
+        def fail_provider(_prompt: str) -> str:
+            nonlocal provider_calls
+            provider_calls += 1
+            raise RuntimeError("ambiguous first request outcome")
+
+        runtime.substrate.human.input_reader = fail_provider
+        with pytest.raises(RuntimeError, match="ambiguous first request outcome"):
+            runtime.human.process_next_terminal()
+
+        unknown_request = runtime.human.get(unknown_request_id)
+        remaining_request = runtime.human.get(remaining_request_id)
+        paused = runtime.process.get(pid)
+        assert unknown_request.status == HumanRequestStatus.CANCELLED
+        assert unknown_request.decision is not None
+        assert unknown_request.decision["provider_outcome"] == "unknown"
+        assert remaining_request.status == HumanRequestStatus.PENDING
+        assert paused.status == ProcessStatus.PAUSED
+        assert isinstance(paused.wait_state, HostResumeProcessWait)
+
+        runtime.human.approve(
+            remaining_request_id,
+            {"approved": True, "answer": "handled separately"},
+        )
+        after_remaining_decision = runtime.process.get(pid)
+        assert after_remaining_decision.status == ProcessStatus.PAUSED
+        assert after_remaining_decision.wait_state == paused.wait_state
+        with pytest.raises(ProcessError, match="requires explicit Host resume"):
+            runtime.process.signal_child(parent, pid, ProcessSignal.RESUME)
+
+        runtime.process.resume(pid)
+        assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         assert runtime.human.process_next_terminal() is None
         assert provider_calls == 1
     finally:

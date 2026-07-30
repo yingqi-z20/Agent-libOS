@@ -20,6 +20,7 @@ from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import sqlite as sqlite_storage
 from agent_libos.storage.repositories import CheckpointRestorePublicationWriter
+from agent_libos.storage.sql import _V3_REQUIRED_COLUMNS
 from agent_libos.storage.sqlite import SQLiteStore
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import dumps
@@ -40,6 +41,12 @@ _PUBLICATION_DOMAIN_SELECT = " ".join(
 )
 _SQL_TEXT_LITERAL_RE = re.compile(r"'(?:''|[^'])*'")
 _SQL_INTEGER_LITERAL_RE = re.compile(r"(?<![A-Z0-9_?])-?\d+(?![A-Z0-9_?])")
+_SQLITE_V3_MANIFEST_TABLES = tuple(sorted(_V3_REQUIRED_COLUMNS))
+_SQLITE_V3_MANIFEST_SCHEMA_PROBE_SHAPE = (
+    "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
+    + ", ".join("?" for _ in _SQLITE_V3_MANIFEST_TABLES)
+    + ")"
+)
 _OPERATION_RECONCILIATION_SELECT_RE = re.compile(
     r"SELECT \* FROM RUNTIME_PUBLICATIONS /\* OPERATION-RECONCILIATION \*/"
     r" WHERE KIND = \? AND STATE = \? AND OPERATION_RECONCILED = \?"
@@ -1816,7 +1823,17 @@ def _is_publication_statement(sql: str) -> bool:
 def _publication_statement_shape(sql: str) -> str | None:
     if not _is_publication_statement(sql):
         return None
-    uncommented = _strip_sql_comments(str(sql))
+    raw_sql = str(sql)
+    raw_normalized = " ".join(raw_sql.upper().split()).rstrip(";")
+    raw_normalized_literals = _normalize_publication_select(raw_normalized)
+    if raw_normalized_literals == _SQLITE_V3_MANIFEST_SCHEMA_PROBE_SHAPE:
+        manifest_tables = tuple(
+            literal[1:-1].replace("''", "'")
+            for literal in _SQL_TEXT_LITERAL_RE.findall(raw_sql)
+        )
+        if manifest_tables == _SQLITE_V3_MANIFEST_TABLES:
+            return "v3_manifest_schema_probe"
+    uncommented = _strip_sql_comments(raw_sql)
     normalized = " ".join(uncommented.upper().split()).rstrip(";")
     normalized_literals = _normalize_publication_select(normalized)
     if re.fullmatch(
@@ -2332,6 +2349,7 @@ def _assert_publication_trace_contract(
             "schema_probe": 2,
             "payload_attempt_schema_probe": 2,
             "keyset_collation_schema_probe": 2,
+            "v3_manifest_schema_probe": 2,
             "schema_table": 1,
             "schema_payload_attempt_table": 1,
             "domain_validation": 1,

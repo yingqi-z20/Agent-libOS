@@ -46,6 +46,15 @@ the retained events. Clients must fetch `GET /api/snapshot` when they receive
 that invalidation; the bundled renderer does so. This makes a replay gap
 explicit instead of silently leaving the UI on stale state.
 
+SSE frames are also bounded by `gui.sse_payload_max_bytes`. If a bounded
+`snapshot` frame is still too large, the server replaces it with
+`snapshot_truncated`; if any other frame is too large, it replaces it with
+`event.invalidated`. Both replacements carry `invalidated: true`, identify the
+original event, and require a fresh `GET /api/snapshot` rather than applying the
+replacement as a delta. The bundled renderer refreshes on either event. Cursor
+invalidation additionally carries `reason: sse_cursor_not_replayable` and the
+available/reset cursor metadata.
+
 Append-event de-duplication is bounded by the GUI event-buffer configuration.
 Append-only events and audit records use their durable ids. Message and LLM-call
 notifications also key de-duplication by durable row id, but that identity key
@@ -140,6 +149,20 @@ Run the Python server directly:
 uv run agent-libos-gui-server --db .agent_libos.sqlite --port 0
 ```
 
+The server options are:
+
+| Option | Behavior |
+| --- | --- |
+| `--config <path>` | Load a YAML overlay; otherwise use the project-root `config.yaml` when present. |
+| `--db <target>` | Select the SQLite path, `local`, or configured PostgreSQL target; omission uses the runtime configuration default. |
+| `--port <n>` | Bind the fixed loopback host on this port; `0` asks the OS for an available port and is the default. |
+| `--token <value>` | Use an explicit bearer token; omission generates a random token. Treat an explicit value and the startup JSON as Host credentials. |
+| `--llm-profiles-file <path>` | Select the user GUI LLM-profile JSON file; omission uses the documented user-level default. |
+| `--no-auto-run` | Start with automatic scheduler runs disabled and the scheduler paused. |
+| `--max-quanta <n>` | Set a positive default scheduler quantum budget; omission uses `runtime.run_until_idle_max_quanta`. |
+
+There is no public-bind option: the server rejects non-loopback hosts.
+
 The GUI server accepts the same runtime store targets as the CLI. SQLite paths
 are the default local store; PostgreSQL DSNs require installing the `postgres`
 extra and are redacted in startup and health payloads. Persistent stores use an
@@ -147,9 +170,12 @@ active-runtime lease, so a GUI server and a writable CLI Runtime cannot open
 the same SQLite target or PostgreSQL database/schema concurrently. On the
 hardened POSIX path, SQLite pairs its canonical target and no-follow sidecar
 `flock` with an owner-only `(st_dev, st_ino)` identity lease; the database and
-sidecars must be regular, current-user-owned, single-link files, so hard-link
-aliases and path/lockfile replacement fail closed. Other platforms use a kernel
-exclusive database lock without claiming those POSIX identity guarantees.
+sidecars must be regular, current-user-owned, single-link files, rejecting
+ordinary hard-link aliases and path/lockfile replacement races. Every platform
+also holds an exclusive lock on the actual database connection. That preserves
+one writer without POSIX identity guarantees and during a same-UID connect-time
+retarget, but such filesystem administration remains inside the Host trust
+boundary; do not rename or replace a live database path.
 PostgreSQL uses a stable database/schema advisory key. See
 [Runtime Storage](storage.md#active-runtime-leases).
 
@@ -491,7 +517,7 @@ Either kind of lookahead becomes a `source_limited` lower-bound entry in
 Event and audit rows persist a derived `gui_snapshot_visible` flag. Snapshot
 queries filter that indexed flag before applying `LIMIT`, preventing internal
 GUI-presentation evidence from displacing causal runtime rows. The flag is
-required by the 0.3 schema; missing or malformed persisted visibility state is
+required by store schema v3; missing or malformed persisted visibility state is
 rejected rather than repaired during open. Bounded event/audit page endpoints
 can still include presentation evidence when requested.
 The process window orders non-terminal processes before the most recently
@@ -535,6 +561,13 @@ present its own confirmation UX. `LibOSClient.runWorkflow` accepts an explicit
 confirmation before invoking any high-risk runtime operation, regardless of
 renderer state.
 
+The Object Tasks panel also presents review dialogs before start and cancel,
+but those dialogs are renderer UX rather than the server's `confirmed: true`
+boundary. The Object Task endpoints do not consume a `confirmed` field; process,
+Object, Tool, Capability, and Human-approval checks in the runtime remain their
+authorization boundary. Clients must not infer server confirmation from the
+presence of that dialog.
+
 JSON-RPC endpoint and MCP server registration through the GUI accept manifest
 text only. The renderer cannot ask the Python GUI server to read an arbitrary
 host file path; file/path based registration remains a CLI/admin workflow.
@@ -542,14 +575,24 @@ host file path; file/path based registration remains a CLI/admin workflow.
 Image package registration follows the same rule. Electron may read a package
 directory selected by the user and pass bounded package file payloads to the
 local GUI server, but the preload result omits the selected host path and the
-server rejects host file paths. The selector rejects
-symbolic and multiply-linked files, more than 512 files, more than 512 directories,
-directory depth above 32, and more than 16 MiB of raw file data; it separately
-caps the selected manifest at 1 MiB. Runtime image limits then apply as a second
-boundary, including the configured manifest, per-file, total-byte, and file-count
-limits (defaults: 256 KiB, 1 MiB, 16 MiB, and 512 respectively). The default GUI
-request body limit is sized to carry that raw package limit after base64 and
-JSON wrapping. Registering or
+server rejects host file paths. The Electron selector rejects a symbolic root,
+symbolic or multiply-linked files, non-file/non-directory entries, `.git`
+segments, more than 512 files, more than 512 directories, more than 1,024 total
+directory entries, more than 524,288 bytes of entry names, directory depth above
+32, and more than 16 MiB of raw file data. It separately caps the selected
+manifest at 1 MiB.
+
+Those directory-walk checks belong to Electron and do not apply to an API
+client that already has a file map. The Python server accepts only a non-empty
+`files` object whose values are text or `{ "base64": "..." }`; malformed base64
+is a `400`. The Runtime then normalizes each supplied relative path, rejects
+absolute/traversing/duplicate paths and `.git` segments, requires `IMAGE.yaml`,
+and applies the file-map limits. Their defaults are a 1 MiB manifest hard limit,
+1 MiB per file, 16 MiB total, and 512 files. The softer 256 KiB
+`package_manifest_max_bytes` limit applies when the Runtime itself reads a Host
+or process-workspace package; the preloaded GUI file-map path uses
+`package_manifest_hard_limit_bytes`. The default GUI request-body limit is sized
+to carry the raw package limit after base64 and JSON wrapping. Registering or
 committing an image changes image visibility and baked internal runtime state
 only; it does not grant the target image's declared capabilities. Package
 workspace grants apply only to the private materialized copy declared by the
@@ -574,6 +617,16 @@ process/scheduler shape consumed during bootstrap, the JSON error envelope, and
 payloads for every operation that the server gates with explicit confirmation.
 Other snapshot collection item schemas and renderer routes remain same-build
 implementation details. It is JSON Schema, not a complete OpenAPI document.
+
+The schema file is a registry, not a single instance schema: its document root
+deliberately rejects every instance. A validator must select a named entry point
+with a fragment such as
+`./gui_api_schema.json#/$defs/processExecPayload` or
+`./gui_api_schema.json#/$defs/snapshotResponse`. In particular,
+`workflowRunPayload` can validate field types but cannot determine whether a
+resolved Tool has side effects; `confirmed` is therefore an optional boolean in
+that definition. The server still requires it to equal `true` whenever runtime
+risk classification says the workflow is high risk.
 
 `tests/unit/test_gui_api_schema.py` parses that schema, validates representative
 payloads, and compares its high-risk operation map with the server's
@@ -612,6 +665,10 @@ Important endpoints:
   `gui.snapshot_event_limit`) and `before=<event_id>` for older pages. It selects
   the bounded newest/cursor window in storage and returns that page in
   chronological order; it is not an unbounded full-log endpoint.
+  The audit route likewise accepts `limit=<n>` (default and maximum
+  `gui.snapshot_audit_limit`) and `before=<record_id>`. To page backward without
+  gaps, use the oldest `record_id` in the current page as the next `before`
+  cursor; cursors are opaque and excluded from the returned page.
 - `GET /api/processes/{pid}/rating` and
   `POST /api/processes/{pid}/rating` for the selected process's 1-5 human
   score and optional comment.
@@ -670,6 +727,12 @@ Mutation endpoints validate required ids, image names, and paths as non-empty
 JSON strings. Malformed enum values such as an unknown process signal, missing
 required fields, non-object request bodies, and incorrectly typed booleans
 return `400` without invoking the runtime mutation.
+For process spawn and workflow run, optional `image` and `working_directory`
+fields must be omitted or supplied as non-empty JSON strings; explicit `null`
+is not treated as omission. Process exec defaults an omitted `args` to `{}` but
+rejects any supplied non-object value. Process exit accepts `message` only as a
+JSON string or `null`. These type failures also return `400` before the runtime
+mutation or workflow launch.
 
 The process detail pane includes an Explain tab. It renders an outcome and
 evidence-completeness summary, an explicit causal tree, and a filterable

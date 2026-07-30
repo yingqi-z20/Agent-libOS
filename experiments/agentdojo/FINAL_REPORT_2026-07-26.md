@@ -189,20 +189,34 @@ token。
 
 ## 完整性、严格验证与来源
 
-八个选定 artifact 都用以下命令通过：
+八个选定 artifact 都在各自 metadata 记录的 harness commit 上用 strict verifier
+通过；这是报告生成时的验证记录，不是当前 checkout 对旧 schema 的兼容承诺。
+workspace 五个 artifact 使用
+`38493ee11454fbe5d3831a81ff90f2730187b583`，其余三个使用
+`69317eb8d06188bf9f10c77bba0125110747b6e1`。要复核保存的本地副本，应在独立
+worktree 中检出表中对应 commit，并使用该 commit 的 frozen AgentDojo 环境：
 
 ```bash
+git worktree add --detach <verification-worktree> <artifact-git-full-sha>
+cd <verification-worktree>/experiments/agentdojo
+uv sync --frozen
 uv run --frozen agent-libos-dojo verify \
-  --output <artifact> \
-  --env-file ../../.env \
+  --output <absolute-artifact-path> \
+  --env-file <absolute-env-file> \
   --require-complete \
   --require-all-valid
 ```
 
-verifier 对每个 artifact 重新检查主制品与 trace-set hash、行数、逐行 trace 对齐、
+当时的 verifier 对每个 artifact 重新检查主制品与 trace-set hash、行数、逐行 trace 对齐、
 指标重算、token 总数、完整配对、injection hash、工具名与 normalized chat schema、
 provider API、compatibility fallback、消息角色和 hidden terminal provider 隔离。
 合计扫描 4,356 个普通文件，raw API key 与 raw endpoint 命中均为 0。
+
+当前 verifier 在这些提交之后增加了精确 schema-v1、逻辑调用上限、per-query、
+tool-outcome 和 run-start credential-snapshot 绑定。旧 artifact 没有全部新证据，因此
+用当前 checkout 验证会按设计失败；当前 CLI 没有放宽这些检查的 legacy flag。不要
+给旧 artifact 补字段或重写 manifest/hash。若需要当前验证结果，应按当前 harness
+生成新的真实模型 run，并作为新证据发布，而不是把它解释成历史响应的复现。
 
 从 catalog 独立重建四套全量笛卡尔积后，结果为：预期 2,162、实际 2,162、唯一
 2,162、重复 0、缺失 0、意外项 0、缺失 trace 0。旧的未完成 workspace 与所有
@@ -271,7 +285,8 @@ locator；没有本地副本的读者无法仅凭 hash 取回真实模型响应�
 - invariant checker：90 个 invariant 对 4,313 个 pytest node，全部通过。
 - protected-operation 静态覆盖检查：通过。
 - 隔离 AgentDojo harness：17/17 通过。
-- 8 个结论性 artifact 由修复后 strict verifier 并行复核：全部退出码 0；
+- 8 个结论性 artifact 由其各自 Git 列所绑定版本的 strict verifier 并行复核：
+  全部退出码 0；
   artifact/trace hash、row validity、完整配对与 credential/endpoint 扫描全部通过。
 
 ## 评测取舍与下一轮

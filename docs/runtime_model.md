@@ -22,11 +22,19 @@ chain. Waiting/resume behavior remains part of the enclosing logical operation.
 The current lifecycle includes:
 
 - `created`: process row exists but has not started running.
-- `runnable`: scheduler may run the process.
-- `running`: a quantum is currently executing.
+- `runnable`: eligible for an execution claim. The scheduler may claim it, and
+  a Host direct-workflow entrypoint may claim a newly published process.
+- `running`: a Runtime-owned execution path is advancing the process. This can
+  be a scheduler quantum, a claimed direct workflow, process-exec admission and
+  publication, or a Host-managed ObjectTask runner. Scheduler, direct-workflow,
+  and process-exec admission use an exact execution owner/lease tuple; an
+  ObjectTask runner is managed by the ObjectTask service without a scheduler
+  lease and is excluded from LLM scheduling.
 - `waiting_human`: the process is blocked on a human question or approval.
-- `waiting_event`: the process is blocked on a child, message, or event.
-- `waiting_tool`: reserved waiting state for tool-level blocking.
+- `waiting_event`: the process has exactly a `ChildProcessWait` or
+  `MessageProcessWait`; it is not an untyped arbitrary-event subscription.
+- `waiting_tool`: an ObjectTask runner has a `ToolProcessWait` whose
+  `operation_id` is the owning durable ObjectTask id.
 - `paused`: the process is not selected for normal execution.
 - `suspended`: compatibility status accepted by resume/state readers; current
   production transitions use `paused` and do not create new suspended rows.
@@ -41,9 +49,17 @@ The durable process state is a typed product, not a free-form status message.
 tagged `wait_state`; terminal statuses carry a matching tagged `outcome`; other
 statuses carry neither. `ProcessTransitionService` is the semantic write
 boundary for those three fields. It increments `state_generation` on every
-transition, and a waiter captures both that generation and the exact wait
-payload in a `ProcessStateToken`. A stale wake therefore cannot wake a later,
+transition. Child/message and syscall-cleanup wake paths capture both that
+generation and the exact wait payload in a `ProcessStateToken`; Human decisions
+use the exact observed revision/status/generation and request-id wait in their
+transaction. A stale owner therefore cannot wake or rewrite a later,
 structurally identical wait after a wait/runnable/wait ABA cycle.
+Registering a new child, message, Human, or Tool condition wait is also
+owner-preserving: it may start from an unblocked state; an active child, message,
+or Tool wait can only be renewed with an exactly equal value, while Human
+request-id sets may only add or remove ids monotonically. Exact
+revision/generation CAS fences each update. No condition owner can replace
+another domain's active wait or a paused/Host-resume gate.
 
 `revision` is the optimistic compare-and-swap fence for persisted process-row
 updates. Scheduler execution has a separate
@@ -56,6 +72,58 @@ These counters have different jobs: `revision` rejects stale row updates,
 `state_generation` rejects stale semantic wakeups, and the execution tuple
 rejects stale quantum ownership.
 
+### Principal lifecycle transitions
+
+The following matrix describes the principal production orchestration contract,
+not every internal publication or recovery staging row. It is not permission to
+call a repository transition directly: each actor still has to satisfy its
+listed authority, ownership, publication, and compare-and-swap preconditions.
+`ProcessTransitionService` validates the status/wait/outcome product and
+state-generation fence; specialized execution, exec, and restore repository
+operations perform the same validation at their atomic boundary.
+
+| From | To | Owning actor | Required precondition | Durable evidence at the successful boundary |
+| --- | --- | --- | --- | --- |
+| `created` | `runnable` | `ProcessManager` launch/direct-fork publication | Image boot and launch authority succeeded; exact `created` revision | Process row, committed launch/fork publication, `PROCESS_CREATED` or `PROCESS_FORKED`, and audit |
+| `created` | `waiting_tool` | `ProcessManager` for `ObjectTaskManager` | Newly created ObjectTask runner; `ToolProcessWait.operation_id` names that task | Child creation evidence; the task insert is followed by `OBJECT_TASK_STARTED` evidence |
+| `created` | `failed` | startup or publication recovery | Orphaned/failed launch is identified under the recovery lease | Typed failed outcome plus recovery audit; orphan recovery uses idempotent `PROCESS_EXITED` evidence |
+| `runnable` | `running` | scheduler or direct-workflow admission | Exact runnable CAS; no existing execution owner/lease | Rotated execution generation, owner id, lease id, and concurrency high-water; scheduler quanta additionally audit `scheduler.run_quantum` |
+| `runnable` or token-owned `running` | `running` | `ImageBootService` process-exec admission | Host path has the exact runnable concurrency tuple, or worker path presents the exact active execution token; no typed wait | The complete execution tuple rotates and the durable process-exec publication begins in the same transaction; the old worker token is invalid immediately |
+| `waiting_tool` or `runnable` | `running` | `ObjectTaskStateService` | The durable task is still `queued` and owns the exact `ToolProcessWait`, or it is still in the matching Human/child/message wait status after that owner woke the runner to `runnable`; task id and runner pid match, the runner has no wait on the runnable path, and neither path has an execution owner/lease | Runner admission and the task rewrite commit atomically, followed by `OBJECT_TASK_RUNNING` and audit; this Host-managed runner has no scheduler execution tuple |
+| `running` | `runnable` | execution owner or successful exec publication | Exact current execution token, or exact exec admission publication | Token is cleared/rotated and state generation advances; no generic process-state event is promised |
+| active nonterminal | `waiting_event` | child wait or message manager | Exact revision/generation, no foreign-owned wait or pause gate, and a `ChildProcessWait` or `MessageProcessWait`; the empty mailbox check and message-wait registration are atomic | Typed wait row; child/message domain audit and message events where that operation defines them |
+| active nonterminal | `waiting_human` | `HumanObjectManager` | At least one durable blocking Human request, exact process revision/generation, and no foreign-owned wait or pause gate | Human request, typed request-id wait, `HUMAN_QUERY`, operation link, and audit in the owning transaction |
+| matching typed wait | `runnable`, same-domain wait, or `paused` | child/message condition owner, Human decision owner, or syscall-owned cleanup | Child/message and syscall cleanup use an exact `ProcessStateToken`; Human uses the exact observed revision/status/generation and acts only on its own request-id wait | Updated process generation plus the owning domain's documented evidence; there is no standalone generic wake event |
+| `waiting_human` | `paused` | `HumanObjectManager` | Rejected release/general request, or an unknown provider outcome; the latter and executor finalization of a rejected exact conditional LLM release require the Host-only wait kind | Typed ordinary-pause or Host-resume state and Human response/diagnostic evidence |
+| `paused` or compatibility `suspended` | `runnable` | trusted Host resume | Signal is applicable; a Host-resume marker may be cleared only by the Host path | `PROCESS_SIGNAL` and audit with the state transition |
+| eligible nonterminal without a condition-owned wait | `paused` | trusted Host/Human control or startup stale-execution recovery | Exact observed state; a live execution lease requires a scoped takeover | Typed pause state and signal/recovery audit/event |
+| eligible nonterminal | `killed` | trusted signal, resource enforcement, or ObjectTask cancellation | Exact observed state; a live execution lease requires a scoped takeover | Typed killed outcome and terminal-cleanup intent; signal/resource evidence identifies the cause |
+| eligible nonterminal | `exited` or `failed` | process exit, workflow/ObjectTask owner, scheduler failure, or recovery | Exact revision/generation and a matching typed outcome | Terminal row and cleanup intent; ordinary process exit emits `PROCESS_EXITED`, while specialized failures retain their own audit/event contract |
+| captured process state | reconciled restored state | `CheckpointManager` | Recovery/publication lease, exact plan anchor, scoped quiescence, and restore CAS | Checkpoint-restore publication, `ROLLBACK`, audit, operation evidence, and fresh revision/execution/state-generation fences |
+
+“Active nonterminal” above is deliberately narrower than “any source status”:
+the public manager validates the operation-specific source status. Terminal
+statuses have no ordinary outgoing transition. Checkpoint restore is the
+explicit reconstruction exception and never lowers concurrency high-water
+marks. A restored `running` snapshot is made `runnable`; restored waits are
+reconciled against live Human, child, message, and ObjectTask facts before they
+remain blocked.
+
+Checkpoint fork has a separate durable publication protocol rather than using
+the ordinary `created` → `runnable` launch row above. Each new non-terminal
+process row is first inserted as a `created` quarantine row with
+`checkpoint_fork_pending_payload`, no wait/outcome, revision `0`, state
+generation `0`, execution generation `0`, and no execution owner/lease. After
+the captured Object payloads are rehydrated, publication atomically changes
+those rows to their exact remapped target states while requiring every fresh
+counter and quarantine marker to remain unchanged. Captured terminal rows stay
+terminal. See [Checkpoints](checkpoints.md#fork-from-checkpoint) for the recovery
+and failure boundary.
+
+See [Runtime Events](events.md) for event-envelope and ordering semantics. A
+process transition is not, by itself, a promise that a generic event exists;
+only the owning lifecycle operation's documented evidence commits with it.
+
 ## Images And Tool Tables
 
 An `AgentImage` defines the default process prompt, tool table, default Skills,
@@ -64,18 +132,21 @@ declared required startup modules, an optional default LLM profile, and
 optional boot metadata. Fresh images boot from their manifest.
 Checkpoint-commit images boot from an immutable internal runtime artifact
 derived from one checkpoint root process. Image-package images boot from an
-immutable directory-package artifact created from `IMAGE.yaml`, `prompt.md`,
-optional `tools/`, optional `resources/`, and optional `workspace/`.
+immutable directory-package artifact created from `IMAGE.yaml`, the prompt file
+named by that manifest (commonly `prompt.md`), optional `tools/`, optional
+`resources/`, and optional `workspace/`.
 
-Image registration and replacement keep the in-memory image cache, durable
-manifest, event/audit records, and any newly inserted package or checkpoint
-artifact in one transaction. A failure after artifact insertion therefore
-restores the previous image (for replacement) or removes the new image and
-artifact (for registration/commit); a caller never observes a manifest whose
-registration result was reported as failed. A registry-wide reentrant lock
-covers the cache/store critical section, and `replace=false` is revalidated
-inside it. Two concurrent registrations for one id cannot both win, and one
-caller's rollback cannot delete another caller's committed cache entry.
+Image registration and replacement commit the durable manifest, event/audit
+records, and any newly inserted package or checkpoint artifact in one
+transaction. Shared-cache publication is staged and occurs under the same
+registry lifecycle/registration locks only after that outer durable transaction
+commits. A failure after artifact insertion therefore keeps the previous cache
+entry (for replacement) or keeps the new id absent, while the transaction
+restores/removes its durable rows; a caller never observes a manifest whose
+registration result was reported as failed. `replace=false` is revalidated
+inside the locked transaction. Two concurrent registrations for one id cannot
+both win, and one caller's rollback cannot delete another caller's committed
+cache entry.
 
 The registry owns deep snapshots of image definitions. Mutating the caller's
 registration object, a returned registration result, or an object returned by
@@ -92,23 +163,75 @@ structured goal is canonical JSON). Later quanta send the cumulative native
 model projection, not the Runtime result envelope. Object Memory, Capability,
 Skill, fallback-action, pressure-notice, and Agent libOS explanatory text are
 never injected. This is the default for custom images and image packages.
-`minimal_runtime` adds a short factual runtime note and state sections.
-`libos_default` preserves the native Agent libOS planner envelope and optional
-fallback JSON instructions used by built-in images.
+`minimal_runtime` omits the full `BASE_SYSTEM_PROMPT`/action-planner envelope,
+but it is not otherwise transparent: it still adds the complete cumulative
+completion contract, factual runtime/state sections, activated Skill bodies and
+recovered-goal context, and optional Host-enabled fallback JSON guidance.
+Unactivated Skill metadata is not injected; the model obtains it through
+`discover_skills`.
+`libos_default` additionally preserves the native Agent libOS planner envelope
+used by built-in images. Only `image_only` is byte-transparent.
 
-The transparent transcript is reconstructed from the latest complete durable
-LLM call plus its call-id-paired tool outputs, including after Runtime reopen;
-the Responses API receives explicit historical `function_call` and
-`function_call_output` input items and does not rely on `previous_response_id`.
-Repair prompts are request-local. A stopped parallel batch records explicit
-non-effect cancellation outputs for calls that were not dispatched. An Image,
-goal, or exact system-prompt change starts a new transcript anchor. Because a
-lossless head is required to avoid replaying an external effect,
-`image_only` fails before provider dispatch when `llm.persist_full_io` is
-false. Payload retention protects the active head while allowing superseded
-heads to age normally. This is a breaking replacement of the former
-Object-Memory-snapshot behavior: existing Images selecting `image_only` adopt
-these semantics after upgrade; there is no legacy compatibility mode.
+The transparent transcript is reconstructed from the latest complete,
+successful `action_selection` call for the exact `(image_id, goal_oid, system
+prompt hash, durable LLM-context generation)` anchor plus its call-id-paired
+tool outputs, including after an ordinary Runtime reopen. The Responses API
+receives explicit historical `function_call` and `function_call_output` input
+items and does not rely on `previous_response_id`. Image-only provider errors
+use a separate purpose and therefore do not shadow the last complete transcript
+head; legacy same-purpose error rows are likewise ignored by the
+latest-successful-head lookup. Repair prompts are request-local. A stopped
+parallel batch records explicit non-effect cancellation outputs for calls that
+were not dispatched. For a nonempty tool-call manifest, every exact call-id/name
+output must be paired before the row is replayable. A provider success with no
+tool calls is not a usable head until normalization and dispatch validation
+writes its separate validation marker. A crash or exhausted repair before that
+marker leaves the row unusable and preserves any first-request retry anchor
+rather than treating provider success alone as a completed action.
+
+An Image, goal, exact system prompt, or durable LLM-context-generation change
+starts a new transcript anchor. Ordinary reopen preserves that generation;
+checkpoint restore advances it, so a reopened restored process cannot replay
+tool results produced after the checkpoint. If the first provider attempt for
+an anchor fails, its exact two-message system/goal request and out-of-band flow
+metadata form a separate durable retry anchor. The first successful transcript
+that is action-validated, with every nonempty tool call paired, becomes
+canonical first; the Runtime then attempts to append a content-free
+same-purpose tombstone, after which the failed request can age through payload
+retention. A tombstone failure does not discard the successful transcript or
+paired tool outputs: it is audited and leaves the old request anchor
+conservatively protected. The same protection remains if the Host terminalizes
+the process before any successful transcript exists; this release does not
+promise automatic terminal redaction for that LLM-call row.
+
+Because a lossless head or retry request is required to avoid silently changing
+or replaying an external effect, `image_only` fails before provider dispatch
+when `llm.persist_full_io` is false. Payload retention protects the active head
+and retry anchor while allowing superseded rows to age normally. This is a
+breaking replacement of the former Object-Memory-snapshot behavior: existing
+Images selecting `image_only` adopt these semantics after upgrade; there is no
+legacy compatibility mode.
+
+A persistent Runtime reopen has one separate, narrow initial-goal recovery path.
+A committed root `ProcessManager.spawn` publication records a size-bounded,
+integrity-bound JSON recovery envelope for its immutable initial GOAL when
+`llm.persist_full_io=true`. During
+startup, before the general missing-payload sweep, the Host validates the root
+process identity and creation time, current goal id, Object identity and version,
+and payload digest before rehydrating that exact live nonterminal goal into the
+volatile cache. An exec that preserves the original root goal remains eligible
+even if it changes Image; a replacement goal supplied by exec does not. Ordinary
+publication reads expose only a hash-only projection.
+`persist_full_io=false` writes only that hash-only projection; forks, child
+spawns, ObjectTask owner payloads, and ordinary Objects do not gain this recovery
+path. Terminal root cleanup redacts any still-full envelope. This exception does
+not make SQL Object rows general payload storage. A failed launch enters
+`rollback_pending` (and later a terminal non-committable publication state) in
+the same outer transaction that reduces any full envelope to hashes. Startup
+recovery claims an interrupted launch under the same rule. If that redaction
+fails, the transaction leaves the earlier recoverable publication state and
+full envelope together behind a recovery fence; it never commits a
+non-committable launch state with reversible goal content.
 
 Capability, approval, IFC, resource, audit, and guarded external-effect checks
 remain outside the prompt and apply normally. The transcript ledger retains
@@ -131,8 +254,12 @@ When explicitly enabled, the context helper uses the active Runtime's
 `llm_context.recent_event_limit`; these are not import-time constants. New
 context Objects carry the active schema version, and an existing context Object
 with a different schema fails closed before reuse. Event capture consumes the
-same configured, store-bounded window whose cursor the executor advances. The
-rendered append-only context records one initial Capability snapshot and then
+same configured, store-bounded window. In Runtime-owned prompt modes, the
+executor advances the process event cursor only after the provider successfully
+returns for a request that actually carried that event projection. `image_only`
+does not project or advance this cursor, and preflight, conditional-release, or
+provider failure leaves it unchanged. The rendered append-only context records
+one initial Capability snapshot and then
 keyed Capability/tool deltas. Repetitive bookkeeping events are projected as
 bounded counts and aggregate usage. Compaction resets captured signatures so
 the next quantum appends a fresh baseline before later deltas.
@@ -246,7 +373,10 @@ process-local JIT tools to both tables. Discovery uses the same bounded
 metadata-term matching, relevance ordering, and `next_step` contract for every
 visible package source. An explicitly configured custom Image may list
 `default_skills`; that is a boot-time activation list, and any failed activation
-fails spawn/exec rather than starting a partial Image.
+fails spawn/exec rather than starting a partial Image. This is Host-authored
+Image assembly, so it does not require a separate Skill `execute` grant on the
+new process; package integrity, trust, loadability, tool-binding, and primitive
+authority checks are not bypassed.
 
 The current built-in image contracts are:
 
@@ -357,6 +487,16 @@ Host-only pause marker. Direct-child model signals cannot resume through that
 marker; an explicit Host resume begins a fresh turn rather than replaying or
 silently regenerating the rejected request.
 
+Checkpoint restore gives every restored process a fresh durable LLM-context
+generation. For a full-I/O `image_only` conditional release, the exact persisted
+approved messages, tools, Sink/flow binding, and resume token remain the request;
+immediately before dispatch the executor may rebind only the frozen transcript
+anchor and request marker from the captured generation to the restored one and
+audits that the request payload did not change. This prevents a post-restore
+successful head from being filed under the pre-restore epoch. It does not relax
+profile, Sink, trust, flow, or single-claim checks. The redacted full-I/O opt-out
+still fails closed after restore because its exact request is unavailable.
+
 LLM-selected blocking actions use durable wait generations. Each row has a
 unique `resume_token` plus the causal LLM and Tool operation ids; one executor
 CASes `pending -> resuming` before crossing
@@ -413,20 +553,27 @@ filesystem paths and shell subprocess cwd resolve from that process cwd. The
 runtime host process does not `chdir` into launched workspaces.
 
 Changing a process cwd requires `read` on the selected filesystem directory.
-An explicit cwd supplied to spawn, fork, or PTY creation is checked through the
-same filesystem directory primitive after the higher-level spawn/image or
-shell authority gates. The directory `state()` observation therefore runs
-under a structured filesystem intent rather than acting as an unauthorized
-existence oracle. Finite directory-read authority is consumed only after an
-observation; an ambiguous provider failure leaves unknown effect evidence.
+An explicit cwd supplied to child spawn, direct fork, or PTY creation—and every
+explicit `chdir`—is validated through the filesystem directory primitive after
+the applicable spawn/image or shell authority gates. When those creation calls
+omit cwd, they reuse the stored parent/current cwd identity without a new
+directory observation. An explicit directory `state()` observation
+therefore runs under a structured filesystem intent rather than acting as an
+unauthorized existence oracle. Finite directory-read authority is consumed
+only after an observation; an ambiguous provider failure leaves unknown effect
+evidence. Root `ProcessManager.spawn(working_directory=...)` is a trusted Host
+construction surface: it normalizes and stores the workspace-relative identity
+but does not itself perform a provider existence/read observation.
 
 The CLI command:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite cd <pid> src
+uv run agent-libos --db .agent_libos.sqlite cd <pid> <workspace-relative-dir>
 ```
 
-updates one process working directory and leaves other processes unchanged.
+After the Host grants that process directory-read authority for the selected
+path, this updates one process working directory and leaves other processes
+unchanged.
 
 ## Object-Bound PTY Sessions
 
@@ -611,9 +758,12 @@ exact tiers and eligibility rules.
 
 ## Scheduler
 
-The scheduler is thread-backed. Its normal executor starts one worker task per
-runnable process up to `config.scheduler.max_workers`, and each task advances only that process
-until it blocks, exits, fails, or the shared quantum budget is exhausted. Public
+The scheduler is thread-backed. It enumerates and claims only `runnable` rows.
+Its normal executor starts one worker task per claimed process up to
+`config.scheduler.max_workers`, and each task advances only that process until
+it blocks, exits, fails, or the shared quantum budget is exhausted. It never
+claims a `running` or waiting row, including a direct-workflow process or an
+ObjectTask runner. Public
 async APIs remain available for event-loop hosts, but they are wrappers around
 the same scheduler and do not mean process quanta are serialized on one asyncio
 loop.
@@ -658,7 +808,8 @@ quantum limit and no bounded-run drain deadline. In all cases, a run:
 1. runs runnable processes,
 2. processes pending human terminal messages when work is blocked on human I/O,
 3. delivers process-message notices at tool boundaries,
-4. wakes resumed processes,
+4. observes processes that condition-owning managers have returned to
+   `runnable`,
 5. stops when no runnable or human-resumable work remains, or when the quantum
    budget is exhausted.
 
@@ -691,6 +842,15 @@ single-step invocations for one `Runtime` instance, so two host calls cannot
 re-enter the same runnable process concurrently. Individual process claims are
 also status-checked at the store boundary before a quantum changes a process
 from `runnable` to `running`.
+
+The scheduler does not convert typed waits to `runnable`. Child completion,
+message posting, Human decisions, ObjectTask notification/resume, and
+syscall-owned cleanup each use their own exact owner fence. Child/message and
+syscall cleanup use generation tokens; Human/ObjectTask services use exact CAS
+and durable service ownership. The scheduler only sees the resulting runnable
+row on a later enumeration. The bounded “unblock
+quantum” pool likewise runs a different runnable PID; it does not wake or claim
+the blocked PID.
 
 Single-step APIs remain available for tests and debugging:
 
@@ -767,18 +927,21 @@ available and continues cleanup. Success returns `ok: true`,
 instead returns `recovery_required: true` and requires the explicit handoff
 described below.
 
-Persistent stores also take an active-runtime lease: SQLite uses a secure
-path-sidecar `flock` where available and, on that hardened POSIX path, a second
-owner-only identity lease keyed by the validated database `(st_dev, st_ino)`.
+Persistent stores also take an active-runtime lease: SQLite holds an exclusive
+lock on the database actually opened and, on the hardened POSIX path, adds a
+secure path-sidecar `flock` plus an owner-only identity lease keyed by the
+validated database `(st_dev, st_ino)`.
 The database and lease files must be regular, current-user-owned, single-link
-files; the canonical database path is rechecked against the opened identity
-before use. This rejects database hard links and prevents a replaced lock path,
-a rename plus symlink retarget, or a different path to the same leased inode
-from admitting another Runtime. Platforms without that mechanism fall back to
-an exclusive SQLite database lock without claiming POSIX path/inode hardening.
+files; the canonical database path is checked before and after open. This
+rejects ordinary hard-link aliases and replacement races, while the connection
+lock preserves the one-writer boundary for the database actually opened.
+Because the standard driver cannot expose that database descriptor, same-UID
+path administration remains a Host trust boundary; a live database path and
+parent must not be renamed or replaced. Platforms without the sidecar/identity
+mechanism retain the exclusive lock without claiming POSIX path/inode hardening.
 PostgreSQL uses a database/schema-scoped session advisory lock. Another
-writable Runtime cannot open the same database until the active Runtime closes
-and releases the lease.
+writable Runtime cannot open the same database/schema target until the active
+Runtime closes and releases the lease.
 
 SQL transactions nest through savepoints. An outer commit error triggers SQL
 and Object-payload rollback only when the driver proves that the transaction is
@@ -978,14 +1141,25 @@ Human records; effect and audit metadata remain content-free as described below.
 
 If a primitive or human tool blocks on human approval, the process enters
 `waiting_human`. Human requests are terminally decided once: only pending
-requests can be approved or rejected. The runtime can process human terminal
-messages, update the request, wake the process, and resume the original
-operation. Rejection returns a normal failure to the process instead of crashing
-the runtime, except `request_permission` rejection returns a structured
-`rejected` decision after installing the selected non-allow policy
-(`always_deny` or `ask_each_time`).
-Terminal queue selection claims the oldest pending request in one serialized
-critical section, but blocking provider input/output runs outside that lock.
+requests can be approved or rejected. The runtime processes a terminal message
+and updates that request, but the resulting process transition depends on the
+request kind and outcome. Approval may release the matching Human wait;
+`request_permission` rejection installs the selected non-allow policy
+(`always_deny` or `ask_each_time`) and resumes with a structured `rejected`
+decision. An ordinary question/general-request rejection or a rejected
+data-release request instead records the normal operation failure and pauses the
+process in `PausedProcessWait` until an explicitly permitted resume; either the
+Host or a direct parent with the required relationship/authority may clear that
+ordinary pause. An ambiguous provider outcome installs the stronger
+`HostResumeProcessWait`: neither an ordinary parent resume signal nor a later
+Human decision may clear it, and the original provider call is not replayed.
+Executor finalization of a rejected exact conditional LLM release likewise
+uses the Host-only wait kind.
+Terminal queue selection normally claims the oldest pending request in one
+serialized critical section. A metadata-only `data_release_approval` is a
+prerequisite for delivering its protected parent request and is therefore
+selected ahead of older ordinary requests. Blocking provider input/output runs
+outside the lock.
 Concurrent drains therefore cannot deliver one output twice or install two
 automatic permission policies from the same pending request, while process
 exit/cancel can still cancel the claim without waiting for user input. A late
@@ -1003,8 +1177,11 @@ are not coerced from numbers, objects, or missing fields.
 Automatic terminal policy belongs to one host run invocation. It is stored in
 an immutable `ContextVar`, copied into scheduler workers, and captured by a JIT
 syscall session, so concurrent runs cannot overwrite one another's human,
-auto-policy, or answer. Resolving one of several blocking requests leaves the
-process in `waiting_human` until no blocking request remains. After process
+auto-policy, or answer. Resolving one of several blocking requests normally
+leaves the process in `waiting_human` until no blocking request remains. An
+ambiguous provider outcome is the exception: its Host-resume gate preempts the
+remaining Human-request wait set so those requests cannot make the process
+runnable. After process
 exit, failure, kill, or terminal cancellation, a post-commit cleanup phase
 attempts to cancel all still-pending requests as part of the durable
 `terminal_notify` phase. A failure leaves the process-terminal cleanup intent
@@ -1026,7 +1203,12 @@ Each process has a durable message queue. Messages include:
 
 Processes can send messages to themselves, their parent, or direct children.
 Receivers use `read_process_messages` for non-blocking reads or
-`receive_process_messages` to block until matching unread messages arrive.
+`receive_process_messages` to block until matching messages arrive. Unread-only
+selection is the default. `include_acked=True` expands the mailbox-visible
+status set to exactly `unread` plus `acked`; an acknowledged match is returned
+immediately and therefore also satisfies a blocking receive without registering
+a wait. History marked `superseded_by_restore` is excluded from returned pages,
+full matching counts, and blocking readiness even when `include_acked=True`.
 Filters can match kind, sender, channel, correlation id, reply target, and exact
 message ids. An explicit empty message-id filter matches no messages; it never
 means "all messages." Read limits bound both returned messages and
@@ -1041,7 +1223,11 @@ Recipient terminal-state recheck, message insertion, event/audit evidence, and
 matching waiter wakeup commit in the same store transaction. An evidence sink
 failure therefore leaves neither an orphan unread message nor a false wakeup.
 
-Interrupt messages preempt before non-message tool calls until read. Normal
+Interrupt messages preempt other work until they are acknowledged. The narrow
+guidance exceptions are restricted `discover_skills` queries for message/mailbox
+help and activation of a Skill that exposes the required message tools, so a
+process can reach a reader without bypassing the mailbox gate. A read with
+`ack=false` leaves the interrupt unread and therefore still preempting. Normal
 messages notify after a tool call and do not block the current action.
 
 ObjectTask completion and waiting notices use the same queue. By default they
@@ -1058,9 +1244,12 @@ object ids, not Object Memory read authority. The same ObjectTask resume hook
 also observes ordinary process messages delivered to a waiting runner, and
 child-process termination can resume a runner blocked in `wait_child_process`.
 ObjectTask runner processes are host-managed and skipped by the LLM scheduler;
-auto-resume is limited to tools with explicitly safe replay semantics, currently
-`receive_process_messages` for message waits and `wait_child_process` for child
-process waits.
+message/child condition replay auto-resume is limited to tools with explicitly
+safe semantics, currently `receive_process_messages` for message waits and
+`wait_child_process` for child-process waits. Human-blocked ObjectTasks resume
+through their durable request id after approval or a permission-policy
+rejection; that continuation does not blindly replay a provider call whose
+outcome may already be unknown.
 
 CLI examples:
 
@@ -1130,9 +1319,15 @@ Signals can pause, resume, cancel, or terminate direct children.
 rejected as a signal because it has no durable state transition. Send a durable
 process message with kind `interrupt` through the message CLI/tool/API when a
 recipient needs a preemption notice.
-Pause/resume and terminal signal state, child-budget release, signal evidence,
-and a matching parent wake are one store transaction. Cancel/terminate then
-run Human/ObjectTask terminal notification and Object/host finalization as
+Generic child `pause`/`resume` is also rejected while the target has an active
+child/message, Human, or Tool condition-owned wait (`waiting_event`,
+`waiting_human`, or `waiting_tool`); only that domain may release its condition.
+`cancel` and `terminate` remain terminal control operations and may terminalize
+such a waiting child.
+Every successful signal commits its target state and signal evidence in one
+store transaction. For terminal `cancel`/`terminate`, child-budget release and
+a matching parent wake join that transaction. Cancel/terminate then run
+Human/ObjectTask terminal notification and Object/host finalization as
 independent post-commit phases: failure in one does not skip the other or make
 the durable terminal transition retryable. A process paused after rejection of
 an exact conditional LLM release also carries a Host-only resume marker:

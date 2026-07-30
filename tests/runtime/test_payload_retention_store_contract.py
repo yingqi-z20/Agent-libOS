@@ -217,7 +217,7 @@ def test_image_only_retention_protects_only_the_active_transcript_head(
     with _retention_store(backend) as store:
         marker = {
             "image_only_transcript": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "output_key": "transcript-output",
             }
         }
@@ -231,8 +231,22 @@ def test_image_only_retention_protects_only_the_active_transcript_head(
             purpose="action_selection",
             request_options=marker,
         )
+        newer_error = replace(
+            _llm_call("transparent-error", "2026-01-01T00:00:02+00:00"),
+            purpose="image_only_error",
+            status="error",
+            error="temporary provider failure",
+        )
+        legacy_same_purpose_error = replace(
+            _llm_call("transparent-legacy-error", "2026-01-01T00:00:03+00:00"),
+            purpose="action_selection",
+            status="error",
+            error="legacy temporary provider failure",
+        )
         store.insert_llm_call(older)
         store.insert_llm_call(head)
+        store.insert_llm_call(newer_error)
+        store.insert_llm_call(legacy_same_purpose_error)
 
         page = store.scan_llm_call_payloads_for_retention(
             older_than="2026-02-01T00:00:00+00:00",
@@ -259,6 +273,88 @@ def test_image_only_retention_protects_only_the_active_transcript_head(
         assert not store.update_llm_call_payload_retention(
             head_summary,
             expected_payload_sha256=llm_call_payload_sha256(head),
+            expected_tier=PayloadRetentionTier.FULL,
+        )
+
+
+@pytest.mark.parametrize("backend", STORE_BACKENDS)
+def test_image_only_request_anchor_is_protected_until_success_tombstone(
+    backend: str,
+) -> None:
+    with _retention_store(backend) as store:
+        purpose = "image_only_request:anchor-fingerprint"
+        request = replace(
+            _llm_call("transparent-request", "2026-01-01T00:00:00+00:00"),
+            purpose=purpose,
+            status="error",
+            messages=[
+                {"role": "system", "content": "Exact prompt."},
+                {"role": "user", "content": "Durable retry goal."},
+            ],
+            request_options={
+                "image_only_request": {
+                    "schema_version": 1,
+                    "image_id": "transparent-request:v0",
+                    "goal_oid": "obj_goal",
+                    "system_prompt_sha256": "a" * 64,
+                    "llm_context_generation": "generation-1",
+                    "purpose": purpose,
+                    "canonical_message_count": 2,
+                    "labels": {},
+                    "input_oids": ["obj_goal"],
+                }
+            },
+            error="temporary provider failure",
+        )
+        store.insert_llm_call(request)
+
+        active_page = store.scan_llm_call_payloads_for_retention(
+            older_than="2026-02-01T00:00:00+00:00",
+            after=None,
+            limit=10,
+        )
+
+        assert active_page.latest_llm_call_ids == frozenset({request.call_id})
+        with pytest.raises(ValueError, match="runtime-dependent"):
+            retain_llm_call_payload(
+                request,
+                PayloadRetentionTier.SUMMARY,
+                provider_chain_head=True,
+            )
+
+        tombstone = replace(
+            _llm_call("transparent-request-done", "2026-01-01T00:00:01+00:00"),
+            purpose=purpose,
+            messages=[],
+            tools=[],
+            request_options={
+                "image_only_request_superseded": {
+                    "schema_version": 1,
+                    "request_call_id": request.call_id,
+                    "transcript_call_id": "transparent-head",
+                }
+            },
+            response_content="",
+            tool_calls=[],
+            reasoning=None,
+            raw_response=None,
+        )
+        store.insert_llm_call(tombstone)
+        superseded_page = store.scan_llm_call_payloads_for_retention(
+            older_than="2026-02-01T00:00:00+00:00",
+            after=None,
+            limit=10,
+        )
+
+        assert superseded_page.latest_llm_call_ids == frozenset({tombstone.call_id})
+        retained = retain_llm_call_payload(
+            request,
+            PayloadRetentionTier.SUMMARY,
+            provider_chain_head=False,
+        )
+        assert store.update_llm_call_payload_retention(
+            retained,
+            expected_payload_sha256=llm_call_payload_sha256(request),
             expected_tier=PayloadRetentionTier.FULL,
         )
 

@@ -14,6 +14,14 @@ from typing import Any, Iterable, NoReturn
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.evidence.initial_goal_recovery import (
+    INITIAL_GOAL_RECOVERY_KEY,
+    InitialGoalRecoveryEnvelope,
+    build_initial_goal_recovery_envelope,
+    decode_initial_goal_recovery_envelope,
+    initial_goal_object_identity,
+    initial_goal_object_identity_sha256,
+)
 from agent_libos.memory.data_labels import metadata_from_labels, propagate_object_labels
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models.exceptions import (
@@ -76,6 +84,7 @@ from agent_libos.process_execution import (
     trusted_terminal_process_mutation,
 )
 from agent_libos.storage import UnitOfWork
+from agent_libos.utils.serde import to_jsonable
 
 
 class _SanitizedFinalizationInterruption(BaseException):
@@ -276,6 +285,8 @@ class ProcessManager:
                 publication_id,
                 pid,
                 goal,
+                image_id=selected_image,
+                record_initial_goal_recovery=True,
             )
             # A process starts with a mutable goal-rooted view; later results append to it.
             view = self.memory.create_view(pid, [goal_handle], mode=ViewMode.MUTABLE)
@@ -1376,18 +1387,7 @@ class ProcessManager:
                 "process interrupt signals are not state transitions; "
                 "send a durable interrupt process message instead"
             )
-        if sig == ProcessSignal.PAUSE and proc.status in {
-            ProcessStatus.WAITING_EVENT,
-            ProcessStatus.WAITING_TOOL,
-            ProcessStatus.WAITING_HUMAN,
-        }:
-            raise ProcessError(f"cannot pause waiting process: {proc.pid} status={proc.status.value}")
-        if sig == ProcessSignal.RESUME and proc.status in {
-            ProcessStatus.WAITING_EVENT,
-            ProcessStatus.WAITING_TOOL,
-            ProcessStatus.WAITING_HUMAN,
-        }:
-            raise ProcessError(f"cannot resume waiting process: {proc.pid} status={proc.status.value}")
+        self.transitions.require_signal_preserves_condition_wait(proc, sig)
 
     def _create_flow_text_carrier(
         self,
@@ -2190,6 +2190,7 @@ class ProcessManager:
             # Child process memory is held until the parent can merge or discard
             # it, so merge_child_memory remains meaningful after child exit.
             self.memory.release_process_owned(process.pid, preserve_oids=preserve_oids)
+            self._redact_terminal_root_spawn_initial_goal(process)
 
     def _release_terminal_child_memory(self, pid: str, preserve_oids: set[str]) -> None:
         stack = [
@@ -2789,6 +2790,8 @@ class ProcessManager:
         pid: str,
         goal: dict[str, Any] | str | ObjectHandle | None,
         *,
+        image_id: str | None = None,
+        record_initial_goal_recovery: bool = False,
         parent_pid: str | None = None,
         source_oids: Iterable[str] | None = None,
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
@@ -2804,11 +2807,57 @@ class ProcessManager:
                 source_labels=source_labels,
                 source_context=source_context,
             )
-            self._publication_phase(
-                publication_id,
-                "goal_created",
-                goal_oid=handle.oid,
-            )
+            receipt: dict[str, Any] = {"goal_oid": handle.oid}
+            if record_initial_goal_recovery:
+                if image_id is None:
+                    raise ValidationError(
+                        "root spawn initial goal recovery requires an image identity"
+                    )
+                goal_object = self.objects.get_object(handle.oid)
+                if goal_object is None or goal_object.type is not ObjectType.GOAL:
+                    raise ValidationError(
+                        "root spawn initial goal payload is unavailable before publication"
+                    )
+                if goal_object.immutable:
+                    identity = initial_goal_object_identity(
+                        oid=goal_object.oid,
+                        namespace=goal_object.namespace,
+                        name=goal_object.name,
+                        object_type=goal_object.type.value,
+                        schema_version=goal_object.schema_version,
+                        metadata=to_jsonable(goal_object.metadata),
+                        provenance=to_jsonable(goal_object.provenance),
+                        version=goal_object.version,
+                        immutable=goal_object.immutable,
+                        created_by=goal_object.created_by,
+                        owner_kind=goal_object.owner_kind.value,
+                        owner_id=str(goal_object.owner_id or ""),
+                        created_at=goal_object.created_at,
+                    )
+                    try:
+                        launch_process = self._get(pid)
+                        receipt[INITIAL_GOAL_RECOVERY_KEY] = (
+                            build_initial_goal_recovery_envelope(
+                                pid=pid,
+                                process_created_at=launch_process.created_at,
+                                image_id=image_id,
+                                goal_oid=handle.oid,
+                                object_version=goal_object.version,
+                                object_identity_sha256=(
+                                    initial_goal_object_identity_sha256(identity)
+                                ),
+                                payload=goal_object.payload,
+                                persist_full_io=self.config.llm.persist_full_io,
+                                payload_hard_limit_bytes=(
+                                    self.config.tools.memory_payload_hard_limit_bytes
+                                ),
+                            )
+                        )
+                    except ValueError as exc:
+                        raise ValidationError(
+                            f"invalid root spawn initial goal recovery payload: {exc}"
+                        ) from exc
+            self._publication_phase(publication_id, "goal_created", **receipt)
         return handle
 
     def _compile_root_launch_authority(
@@ -2995,6 +3044,160 @@ class ProcessManager:
         for hook in self._before_spawn_hooks:
             hook(image_id)
 
+    def recover_root_spawn_initial_goal_payloads(self) -> tuple[str, ...]:
+        """Rehydrate only exact active root goals before volatile payload sweep."""
+
+        self._require_recovery_lease()
+        recovered: list[str] = []
+        after: ProcessCursor | None = None
+        page_size = self.config.runtime.jit_rehydration_page_size
+        while True:
+            page = self.store.query_processes(after=after, limit=page_size)
+            previous = after
+            for process in page.records:
+                cursor = ProcessCursor(process.created_at, process.pid)
+                if previous is not None and cursor <= previous:
+                    raise ValidationError(
+                        "process repository returned an invalid initial-goal recovery page"
+                    )
+                previous = cursor
+                recovered_oid = self._recover_root_spawn_initial_goal_payload(
+                    process
+                )
+                if recovered_oid is not None:
+                    recovered.append(recovered_oid)
+            if page.next_cursor is None:
+                break
+            if previous is None or page.next_cursor != previous:
+                raise ValidationError(
+                    "process repository returned an invalid initial-goal recovery cursor"
+                )
+            after = page.next_cursor
+        return tuple(recovered)
+
+    def _recover_root_spawn_initial_goal_payload(
+        self,
+        process: AgentProcess,
+    ) -> str | None:
+        if process.parent_pid is not None or not process.goal_oid:
+            return None
+        publication = self.publications.get_committed_root_spawn_publication(
+            process.pid
+        )
+        if publication is None:
+            return None
+        envelope = self._root_spawn_initial_goal_envelope(publication)
+        if envelope is None:
+            return None
+        if process.status in self.TERMINAL_STATUSES:
+            self._redact_root_spawn_initial_goal(publication, envelope=envelope)
+            return None
+        if envelope.recoverable and not self.config.llm.persist_full_io:
+            self._redact_root_spawn_initial_goal(publication, envelope=envelope)
+            return None
+        if not self._root_spawn_goal_envelope_matches_process(envelope, process):
+            return None
+        if self.objects.get_object(process.goal_oid) is not None:
+            return None
+        restored = self.objects.rehydrate_root_spawn_goal_payload(
+            process.goal_oid,
+            envelope.payload,
+            expected_version=envelope.object_version,
+            expected_identity_sha256=envelope.object_identity_sha256,
+            require_recovery_lease=self._require_recovery_lease,
+        )
+        return process.goal_oid if restored else None
+
+    @staticmethod
+    def _root_spawn_goal_envelope_matches_process(
+        envelope: InitialGoalRecoveryEnvelope,
+        process: AgentProcess,
+    ) -> bool:
+        return (
+            envelope.recoverable
+            and envelope.pid == process.pid
+            and envelope.process_created_at == process.created_at
+            and envelope.goal_oid == process.goal_oid
+        )
+
+    def _root_spawn_initial_goal_envelope(
+        self,
+        publication: dict[str, Any],
+    ) -> InitialGoalRecoveryEnvelope | None:
+        receipt = publication.get("receipt")
+        phases = receipt.get("phases") if isinstance(receipt, dict) else None
+        if not isinstance(phases, list):
+            raise ValidationError("root spawn publication phases are invalid")
+        matches = [
+            phase
+            for phase in phases
+            if isinstance(phase, dict)
+            and phase.get("phase") == "goal_created"
+            and INITIAL_GOAL_RECOVERY_KEY in phase
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise ValidationError(
+                "root spawn publication has multiple initial goal envelopes"
+            )
+        phase = matches[0]
+        try:
+            envelope = decode_initial_goal_recovery_envelope(
+                phase[INITIAL_GOAL_RECOVERY_KEY],
+                payload_hard_limit_bytes=(
+                    self.config.tools.memory_payload_hard_limit_bytes
+                ),
+            )
+        except ValueError as exc:
+            raise ValidationError(
+                f"invalid root spawn initial goal recovery envelope: {exc}"
+            ) from exc
+        if phase.get("goal_oid") != envelope.goal_oid:
+            raise ValidationError("root spawn goal phase identity changed")
+        plan = publication.get("plan")
+        if (
+            not isinstance(plan, dict)
+            or plan.get("pid") != envelope.pid
+            or plan.get("image_id") != envelope.image_id
+            or plan.get("launch_kind") != "spawn"
+            or plan.get("parent_pid") is not None
+        ):
+            raise ValidationError("root spawn initial goal publication anchor changed")
+        return envelope
+
+    def _redact_root_spawn_initial_goal(
+        self,
+        publication: dict[str, Any],
+        *,
+        envelope: InitialGoalRecoveryEnvelope | None = None,
+        expected_states: Iterable[str] = ("committed",),
+    ) -> None:
+        selected = envelope or self._root_spawn_initial_goal_envelope(publication)
+        if selected is None:
+            return
+        if not self.publications.redact_root_spawn_initial_goal(
+            publication["publication_id"],
+            pid=selected.pid,
+            goal_oid=selected.goal_oid,
+            expected_payload_sha256=selected.payload_sha256,
+            expected_states=expected_states,
+        ):
+            raise ProcessError(
+                "root spawn initial goal redaction lost its publication CAS: "
+                f"{publication['publication_id']}"
+            )
+
+    def _redact_terminal_root_spawn_initial_goal(self, process: AgentProcess) -> None:
+        if process.parent_pid is not None:
+            return
+        publication = self.publications.get_committed_root_spawn_publication(
+            process.pid
+        )
+        if publication is None:
+            return
+        self._redact_root_spawn_initial_goal(publication)
+
     def _cleanup_failed_launch(self, pid: str) -> None:
         with contextlib.suppress(Exception):
             self.memory.release_process_owned(pid)
@@ -3076,15 +3279,27 @@ class ProcessManager:
     ) -> str | None:
         if publication["state"] == "manual":
             self._fail_closed_manual_launch_publication(publication)
-        claimed = self.publications.claim_runtime_publication_recovery(
-            publication["publication_id"],
-            claimant_instance_id=self.owner_instance_id,
-            expected_owner_instance_id=publication["owner_instance_id"],
-            expected_state=publication["state"],
-            classification="compensate_process_launch",
-            max_attempts=self.config.runtime.publication_recovery_max_attempts,
-            allow_orphaned_claim_takeover=True,
-        )
+        with self.store.transaction():
+            claimed = self.publications.claim_runtime_publication_recovery(
+                publication["publication_id"],
+                claimant_instance_id=self.owner_instance_id,
+                expected_owner_instance_id=publication["owner_instance_id"],
+                expected_state=publication["state"],
+                classification="compensate_process_launch",
+                max_attempts=self.config.runtime.publication_recovery_max_attempts,
+                allow_orphaned_claim_takeover=True,
+            )
+            if claimed is not None:
+                claimed_state = str(claimed["state"])
+                if claimed_state not in {"rollback_pending", "manual"}:
+                    raise ProcessError(
+                        "process launch recovery claim entered an invalid state: "
+                        f"{claimed_state}"
+                    )
+                self._redact_root_spawn_initial_goal(
+                    claimed,
+                    expected_states=(claimed_state,),
+                )
         if claimed is None:
             self._require_launch_publication_resolved(publication["publication_id"])
             return None
@@ -3125,6 +3340,10 @@ class ProcessManager:
                     f"process publication recovery lease changed: {publication_id}"
                 )
             self._cleanup_failed_launch_strict(current)
+            self._redact_root_spawn_initial_goal(
+                current,
+                expected_states=("rollback_pending",),
+            )
             if not self.publications.advance_runtime_publication(
                 publication_id,
                 state="rolled_back",
@@ -3153,6 +3372,15 @@ class ProcessManager:
     ) -> None:
         publication_id = str(claimed["publication_id"])
         with self.store.transaction():
+            current = self.publications.get_runtime_publication(publication_id)
+            if current is None:
+                raise ProcessError(
+                    f"process publication disappeared: {publication_id}"
+                )
+            self._redact_root_spawn_initial_goal(
+                current,
+                expected_states=("rollback_pending",),
+            )
             if not self.publications.advance_runtime_publication(
                 publication_id,
                 state="failed",
@@ -3180,6 +3408,10 @@ class ProcessManager:
         publication: dict[str, Any],
     ) -> None:
         with self.store.transaction():
+            self._redact_root_spawn_initial_goal(
+                publication,
+                expected_states=("manual",),
+            )
             self._reconcile_launch_publication_operation(
                 publication,
                 OperationOutcome.UNKNOWN,
@@ -3415,6 +3647,11 @@ class ProcessManager:
                             "runtime publication repository returned an invalid launch reconciliation page"
                         )
                     with self.store.transaction():
+                        if state in {"rolled_back", "failed", "manual"}:
+                            self._redact_root_spawn_initial_goal(
+                                publication,
+                                expected_states=(state,),
+                            )
                         self._reconcile_launch_publication_operation(
                             publication,
                             outcome,
@@ -3609,16 +3846,29 @@ class ProcessManager:
         """
 
         try:
-            rollback_started = self.publications.advance_runtime_publication(
-                publication_id,
-                state="rollback_pending",
-                phase="compensating",
-                error={
-                    "code": "process_launch_failed",
-                    "error_type": type(exc).__name__,
-                },
-                expected_states={"planning", "applying"},
-            )
+            with self.store.transaction():
+                rollback_started = self.publications.advance_runtime_publication(
+                    publication_id,
+                    state="rollback_pending",
+                    phase="compensating",
+                    error={
+                        "code": "process_launch_failed",
+                        "error_type": type(exc).__name__,
+                    },
+                    expected_states={"planning", "applying"},
+                )
+                if rollback_started:
+                    rollback_publication = (
+                        self.publications.get_runtime_publication(publication_id)
+                    )
+                    if rollback_publication is None:
+                        raise ProcessError(
+                            f"process publication disappeared: {publication_id}"
+                        )
+                    self._redact_root_spawn_initial_goal(
+                        rollback_publication,
+                        expected_states=("rollback_pending",),
+                    )
         except BaseException as transition_error:
             transition_failure = BaseExceptionGroup(
                 "process launch and rollback transition failed",
@@ -3784,6 +4034,15 @@ class ProcessManager:
         error: dict[str, Any] | None = None,
     ) -> None:
         with self.store.transaction():
+            current = self.publications.get_runtime_publication(publication_id)
+            if current is None:
+                raise ProcessError(
+                    f"process publication disappeared: {publication_id}"
+                )
+            self._redact_root_spawn_initial_goal(
+                current,
+                expected_states=("rollback_pending",),
+            )
             if not self.publications.advance_runtime_publication(
                 publication_id,
                 state=state,

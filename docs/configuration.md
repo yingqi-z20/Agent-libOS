@@ -22,24 +22,35 @@ Product entrypoints use this order:
    `AgentLibOSConfig`; without an overlay, the shared frozen baseline is safe
    to reuse through the public configuration API. Unknown fields and unsafe,
    inverted, or non-finite bounds fail before the Runtime opens. Pydantic
-   accepts its normal compatible
-   scalar coercions for ordinary dataclass fields (for example a numeric YAML
-   string may become a number); callers that generate overlays must not treat
-   this loader as a strict JSON-type validator. Fields declared with Pydantic's
-   `StrictInt` or `StrictFloat` remain authoritative exceptions: their non-null
-   values must be actual numbers rather than strings and reject booleans. This
-   includes `runtime.publication_recovery_max_attempts`,
-   `runtime.publication_artifact_lookup_hard_limit`, both the `page_size` and
-   `page_hard_limit` fields for publication reconciliation, resource-usage and
-   capability-use reservation recovery, Object payload and ObjectTask recovery,
-   JIT rehydration, external-effect and operation recovery, and payload
-   retention, plus both payload-retention age fields. It also includes
-   `scheduler.max_workers`, `process.max_tool_calls`, `llm.max_tokens`,
-   `llm.temperature`, `llm.profiles.<profile_id>.max_tokens`, and
-   `llm.profiles.<profile_id>.temperature`. The integer-bound fields require
-   integers; temperature accepts integer or floating-point numbers. Consult the
-   typed declarations for the authoritative set. Post-construction checks then
-   reject non-finite, negative, zero, or inverted values as applicable.
+   accepts normal compatible scalar coercions for ordinary dataclass fields: a
+   numeric YAML string may become a number, and an ordinary `int` or `float`
+   field may coerce YAML booleans to `1` or `0`. Callers that generate overlays
+   must not treat this loader as a strict JSON-type validator and should never
+   use booleans for numeric values. Fields declared with Pydantic's `StrictInt`
+   or `StrictFloat` are the authoritative exceptions: non-null values must be
+   numbers rather than strings, and booleans are rejected. The complete current
+   strict set comprises:
+
+   - `runtime.publication_recovery_max_attempts`,
+     `runtime.publication_artifact_lookup_hard_limit`, both payload-retention
+     ages, and every `page_size`/`page_hard_limit` field for publication,
+     resource-usage, capability-use, Object-payload, ObjectTask, JIT,
+     external-effect, operation, payload-retention, and terminal-process cleanup
+     recovery;
+   - `capability.regex_pattern_max_bytes`, `capability.regex_token_max_bytes`,
+     `capability.regex_match_timeout_s`, `scheduler.max_workers`, and
+     `process.max_tool_calls`;
+   - `llm.max_tokens`, `llm.temperature`, and each profile's corresponding
+     `max_tokens` and `temperature`;
+   - `git.ref_list_limit`, `git.pull_request_list_limit`, all six
+     `memory.query_scan_*`/`memory.metadata_*` bounds, and
+     `skills.max_package_directories`, `skills.max_package_depth`, and
+     `skills.catalog_scan_limit`.
+
+   Strict integer fields require integers; strict floating fields accept numeric
+   integer or floating-point values. Post-construction checks then reject
+   non-finite, negative, zero, or inverted values as applicable. The typed
+   declarations remain authoritative if a later release adds a field.
 
 The config dataclasses are frozen and have no runtime hot reload. In addition,
 security-critical `shell.rules[*].conditions` values are defensively copied and
@@ -77,11 +88,26 @@ The public loader helpers support explicit library composition:
   on a selected immutable base. Relative paths are owned by the caller's current
   working directory.
 - `load_config_from_project_root(filename="config.yaml", base=DEFAULT_CONFIG,
-  root=None)` resolves a relative filename below the detected or explicit
-  project root and returns `base` unchanged when the file is absent.
+  root=None)` joins a relative filename to the detected or explicit project
+  root and returns `base` unchanged when the file is absent. This trusted Host
+  helper is path resolution, not a containment boundary: an absolute filename
+  or a relative name containing `..` may select a file outside that root.
 - `load_config_from_cwd(filename="config.yaml", base=DEFAULT_CONFIG)` is the
   explicit library opt-in to current-working-directory discovery. Product
   entrypoints do not call it.
+
+### Bounded YAML input
+
+Configuration files must be UTF-8 mappings and are read through the shared
+bounded YAML loader. It rejects non-string mapping keys, duplicate keys in a
+source mapping, recursive aliases, invalid scalar construction, and input over
+1,048,576 UTF-8 bytes. Bootstrap-fixed parser ceilings are 60,000 parse events,
+32,768 nodes (including the expanded alias graph), nesting depth 64, 64 aliases,
+4,300 digits in an integer scalar, and 1,048,576 bytes of expanded scalar text.
+These limits intentionally do not depend on the configuration being parsed.
+YAML merge syntax is supported only within the same unique-key and bounded
+alias rules; a document whose root is not a mapping fails before Pydantic
+validation.
 
 Loaders never mutate `base`, so callers may intentionally layer overlays:
 
@@ -97,6 +123,23 @@ checkout selects that persistent store. In an installed package or source tree
 without a project-root config, `DEFAULT_CONFIG.runtime.local_store_target` is
 `local`, an in-memory SQLite store. Scripts and documentation that require state
 across separate CLI invocations should always pass `--db` explicitly.
+That persistence covers process metadata, authority, evidence, and other SQL
+records, not ordinary Object payloads. Current Object rows hold runtime-memory
+markers; if their payload cache is unavailable on reopen they are released
+fail-closed. The sole cross-reopen exception is a committed root spawn's
+initial goal when `llm.persist_full_io` is true: a separate bounded recovery
+envelope retains the exact payload, and startup rehydrates it only after
+validating the same active root process and unchanged goal id, Object identity,
+version, immutable flag, live state, and runtime-memory marker. Only the
+immutable initial GOAL created by `ProcessManager` is eligible; mutable goal
+handles are not. The envelope is independently bound to the initial image
+recorded by the spawn publication; a later exec may change the process image
+without invalidating an otherwise unchanged goal.
+Terminal cleanup redacts the envelope to hash-only; failed launch rollback and
+startup compensation do so before committing a non-committable publication
+state. Child/fork goals, exec replacement goals, ObjectTask owners, and all
+other Object payload producers and consumers must still execute within one
+Runtime lifetime.
 
 Relative paths intentionally have different owners. `--config` and explicit
 `module_manifests=` paths resolve from the caller's current working directory;
@@ -310,7 +353,12 @@ configurable. A runtime release emits only the snapshot version it can decode.
   closed instead of rebuilding or dispatching it. `prompt_mode: image_only`
   cannot use this opt-out: custom Images default to that mode, and it fails
   before provider dispatch unless the lossless native transcript can be written
-  with `persist_full_io=true`.
+  with `persist_full_io=true`. The setting also controls the committed root
+  spawn's initial-goal recovery envelope: true retains its bounded exact payload
+  while the committed root process remains active, while false writes only
+  content-free identity, size, and hash fields and therefore cannot support a
+  later CLI `run` after reopen. Terminal cleanup and failed-launch compensation
+  reduce a reversible envelope to the same hash-only form.
 - Provider-side Responses storage policy remains opt-in through `llm.store`.
   `llm.responses_previous_response_id` permits low-level client chaining policy,
   but the current full-snapshot AgentProcess executor records it as configured
@@ -318,7 +366,8 @@ configurable. A runtime release emits only the snapshot version it can decode.
   can still change the trusted profile identity, and enabling `store` may
   increase provider retention.
 - `runtime.launch_authority_mode: manifest_required` treats image capability
-  requirements as declarations, not grants; this value is fixed in 0.3.
+  requirements as declarations, not grants. It is the only accepted value in
+  the current 1.0.x contract.
 - `runtime.publication_recovery_max_attempts` bounds durable compensation
   retries. Exceeding it persists a `manual` publication disposition and fails
   every startup closed instead of silently repeating an uncertain cleanup

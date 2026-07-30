@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from agent_libos import AgentImage, Runtime
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.llm.client import LLMCompletion
+from agent_libos.llm.client import LLMCompletion, LLMTransientError
 from agent_libos.llm.event_projection import project_prompt_events
 from agent_libos.llm.prompt import (
     build_system_prompt,
@@ -26,12 +26,15 @@ from agent_libos.models import (
     JIT_TOOL_EXPOSURE_DIRECT,
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
     JIT_TOOL_EXPOSURES,
+    LLMCallRecord,
     PROMPT_MODE_IMAGE_ONLY,
     PROMPT_MODE_LIBOS_DEFAULT,
     PROMPT_MODE_MINIMAL_RUNTIME,
     MaterializedContext,
     ObjectMetadata,
     ObjectType,
+    SinkTrustLevel,
+    SinkTrustRule,
 )
 from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
 from agent_libos.tools.base import SyncAgentTool, ToolContext
@@ -598,6 +601,756 @@ class TestLLMPromptModes:
             assert "tool_id" not in replay[3]["content"]
         finally:
             reopened.close()
+
+    def test_image_only_first_transient_error_retries_goal_in_same_runtime(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-transient:v0",
+                    name="transparent-transient",
+                    system_prompt="Exact transient prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptOutcomeClient(
+                [
+                    LLMTransientError("temporary provider failure"),
+                    [_tool_call("transient_exit", "process_exit", {"payload": {"done": True}})],
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-transient:v0",
+                goal="retry the original image-only goal",
+            )
+
+            first = runtime.run_process_once(pid)
+            assert not first["ok"] and first["retryable"] and first["paused"]
+            error_call = runtime.store.list_llm_calls(pid)[0]
+            assert error_call.status == "error"
+            assert error_call.purpose.startswith("image_only_request:")
+            request_purpose = error_call.purpose
+            assert error_call.request_options["image_only_request"][
+                "canonical_message_count"
+            ] == 2
+
+            runtime.process.resume(pid)
+            second = runtime.run_process_once(pid)
+
+            assert second["ok"], second
+            assert client.message_batches[1] == [
+                {"role": "system", "content": "Exact transient prompt."},
+                {"role": "user", "content": "retry the original image-only goal"},
+            ]
+            tombstone = runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose=request_purpose,
+            )
+            assert tombstone is not None and tombstone.status == "ok"
+            assert tombstone.request_options["image_only_request_superseded"][
+                "request_call_id"
+            ] == error_call.call_id
+        finally:
+            runtime.close()
+
+    def test_image_only_first_transient_error_retries_goal_after_reopen(
+        self,
+        tmp_path: Any,
+    ) -> None:
+        database = tmp_path / "transparent-first-error.sqlite"
+        runtime = Runtime.open(database)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-first-error:v0",
+                    name="transparent-first-error",
+                    system_prompt="Exact first-error prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            runtime.llm.client = ScriptedTranscriptOutcomeClient(
+                [LLMTransientError("temporary provider failure")]
+            )
+            parent_pid = runtime.process.spawn(goal="parent process")
+            pid = runtime.process.spawn_child(
+                parent_pid,
+                "recover this goal from the durable request anchor",
+                image="transparent-first-error:v0",
+            )
+            goal_oid = runtime.process.get(pid).goal_oid
+            assert goal_oid is not None
+
+            first = runtime.run_process_once(pid)
+
+            assert not first["ok"] and first["retryable"] and first["paused"]
+            request = runtime.store.list_llm_calls(pid)[0]
+            request_purpose = request.purpose
+            request_labels = request.request_options["image_only_request"]["labels"]
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            assert reopened.store.get_object(goal_oid) is None
+            durable_request = reopened.store.get_latest_llm_call(
+                pid=pid,
+                purpose=request_purpose,
+            )
+            assert durable_request is not None
+            assert durable_request.request_options["image_only_request"]["labels"] == (
+                request_labels
+            )
+            client = ScriptedTranscriptOutcomeClient(
+                [[_tool_call("first_error_exit", "process_exit", {"payload": {"done": True}})]]
+            )
+            reopened.llm.client = client
+            reopened.process.resume(pid)
+
+            completed = reopened.run_process_once(pid)
+
+            assert completed["ok"], completed
+            assert client.message_batches[0] == [
+                {"role": "system", "content": "Exact first-error prompt."},
+                {
+                    "role": "user",
+                    "content": "recover this goal from the durable request anchor",
+                },
+            ]
+        finally:
+            reopened.close()
+
+    def test_image_only_invalid_empty_repair_keeps_request_anchor_fail_closed(
+        self,
+        tmp_path: Any,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, action_repair_attempts=1),
+        )
+        database = tmp_path / "transparent-empty-repair.sqlite"
+        runtime = Runtime.open(database, config=config)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-empty-repair:v0",
+                    name="transparent-empty-repair",
+                    system_prompt="Exact empty-repair prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            runtime.llm.client = ScriptedTranscriptOutcomeClient(
+                [LLMTransientError("temporary provider failure"), []]
+            )
+            parent_pid = runtime.process.spawn(goal="parent process")
+            pid = runtime.process.spawn_child(
+                parent_pid,
+                "retain this non-root goal through exhausted repair",
+                image="transparent-empty-repair:v0",
+            )
+            goal_oid = runtime.process.get(pid).goal_oid
+            assert goal_oid is not None
+
+            first = runtime.run_process_once(pid)
+            assert not first["ok"] and first["retryable"]
+            request = runtime.store.list_llm_calls(pid)[0]
+            runtime.process.resume(pid)
+
+            exhausted = runtime.run_process_once(pid)
+
+            assert not exhausted["ok"]
+            assert runtime.process.get(pid).status.value == "failed"
+            assert runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose=request.purpose,
+            ) == request
+            invalid_head = runtime.store.get_latest_successful_llm_call(
+                pid=pid,
+                purpose="action_selection",
+            )
+            assert invalid_head is not None
+            assert invalid_head.request_options["image_only_transcript"][
+                "tool_calls"
+            ] == []
+            assert runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose=f"image_only_empty_validation:{invalid_head.call_id}",
+            ) is None
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database, config=config)
+        try:
+            assert reopened.store.get_object(goal_oid) is None
+            image = reopened.llm._images["transparent-empty-repair:v0"]
+            process = reopened.process.get(pid)
+            anchor = reopened.llm._image_only_transcript_anchor(image, process)
+            with pytest.raises(
+                ValidationError,
+                match="empty transcript head was not action-validated",
+            ):
+                reopened.llm._latest_image_only_transcript(
+                    pid=pid,
+                    image=image,
+                    anchor=anchor,
+                )
+            assert reopened.store.get_latest_llm_call(
+                pid=pid,
+                purpose=request.purpose,
+            ) == request
+        finally:
+            reopened.close()
+
+    def test_image_only_complete_head_survives_newer_error_and_reopen(
+        self,
+        tmp_path: Any,
+    ) -> None:
+        database = tmp_path / "transparent-error-head.sqlite"
+        runtime = Runtime.open(database)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-error-head:v0",
+                    name="transparent-error-head",
+                    system_prompt="Exact error-head prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["echo", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            runtime.llm.client = ScriptedTranscriptOutcomeClient(
+                [
+                    [_tool_call("before_error", "echo", {"value": "durable"})],
+                    LLMTransientError("temporary provider failure"),
+                ]
+            )
+            pid = runtime.process.spawn(
+                image="transparent-error-head:v0",
+                goal="resume the last complete transcript",
+            )
+
+            completed_head = runtime.run_process_once(pid)
+            transient = runtime.run_process_once(pid)
+
+            assert completed_head["ok"], completed_head
+            assert not transient["ok"] and transient["retryable"] and transient["paused"]
+            calls = runtime.store.list_llm_calls(pid)
+            assert [(call.purpose, call.status) for call in calls] == [
+                ("action_selection", "ok"),
+                ("image_only_error", "error"),
+            ]
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(database)
+        try:
+            client = ScriptedTranscriptOutcomeClient(
+                [[_tool_call("after_error", "process_exit", {"payload": {"done": True}})]]
+            )
+            reopened.llm.client = client
+            reopened.process.resume(pid)
+
+            resumed = reopened.run_process_once(pid)
+
+            assert resumed["ok"], resumed
+            replay = client.message_batches[0]
+            assert [message["role"] for message in replay] == [
+                "system",
+                "user",
+                "assistant",
+                "tool",
+            ]
+            assert replay[2]["tool_calls"][0]["id"] == "before_error"
+            assert replay[3]["tool_call_id"] == "before_error"
+            assert "durable" in replay[3]["content"]
+        finally:
+            reopened.close()
+
+    def test_image_only_complete_head_lookup_is_not_bounded_by_call_list_limit(
+        self,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                call_record_list_limit=2,
+                call_record_hard_limit=2,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-error-volume:v0",
+                    name="transparent-error-volume",
+                    system_prompt="Exact error-volume prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["echo", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptOutcomeClient(
+                [
+                    [_tool_call("volume_echo", "echo", {"value": "head"})],
+                    LLMTransientError("temporary provider failure 1"),
+                    LLMTransientError("temporary provider failure 2"),
+                    LLMTransientError("temporary provider failure 3"),
+                    [_tool_call("volume_exit", "process_exit", {"payload": {"done": True}})],
+                ]
+            )
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="transparent-error-volume:v0",
+                goal="keep the complete head across many errors",
+            )
+
+            assert runtime.run_process_once(pid)["ok"]
+            for ordinal in range(3):
+                runtime.store.insert_llm_call(
+                    LLMCallRecord(
+                        call_id=f"legacy_image_error_{ordinal}",
+                        pid=pid,
+                        image_id="transparent-error-volume:v0",
+                        purpose="action_selection",
+                        status="error",
+                        messages=[],
+                        tools=[],
+                        request_options={},
+                        response_content="",
+                        tool_calls=[],
+                        error="legacy transient provider failure",
+                        created_at=f"9999-01-01T00:00:0{ordinal}+00:00",
+                        completed_at=f"9999-01-01T00:00:0{ordinal}+00:00",
+                    )
+                )
+            for _ in range(3):
+                failed = runtime.run_process_once(pid)
+                assert not failed["ok"] and failed["retryable"]
+                runtime.process.resume(pid)
+
+            completed = runtime.run_process_once(pid)
+
+            assert completed["ok"], completed
+            replay = client.message_batches[-1]
+            assert [message["role"] for message in replay] == [
+                "system",
+                "user",
+                "assistant",
+                "tool",
+            ]
+            assert replay[2]["tool_calls"][0]["id"] == "volume_echo"
+        finally:
+            runtime.close()
+
+    def test_image_only_success_uses_generation_frozen_before_provider_call(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-generation-race:v0",
+                    name="transparent-generation-race",
+                    system_prompt="Exact generation-race prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            pid = runtime.process.spawn(
+                image="transparent-generation-race:v0",
+                goal="bind the response to the request generation",
+            )
+            selected_generation = runtime.store.get_llm_context_generation(pid)
+
+            def change_generation_during_provider() -> list[dict[str, Any]]:
+                runtime.store.set_llm_context_generation(
+                    pid,
+                    "generation-changed-during-provider",
+                )
+                return [
+                    _tool_call(
+                        "generation_exit",
+                        "process_exit",
+                        {"payload": {"done": True}},
+                    )
+                ]
+
+            runtime.llm.client = ScriptedTranscriptOutcomeClient(
+                [change_generation_during_provider]
+            )
+
+            completed = runtime.run_process_once(pid)
+
+            assert completed["ok"], completed
+            call = runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose="action_selection",
+            )
+            assert call is not None
+            assert call.request_options["image_only_transcript"][
+                "llm_context_generation"
+            ] == selected_generation
+            assert (
+                runtime.store.get_llm_context_generation(pid)
+                == "generation-changed-during-provider"
+            )
+        finally:
+            runtime.close()
+
+    def test_image_only_tombstone_failure_preserves_final_output_and_anchor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-anchor-atomicity:v0",
+                    name="transparent-anchor-atomicity",
+                    system_prompt="Exact anchor-atomicity prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            runtime.llm.client = ScriptedTranscriptOutcomeClient(
+                [
+                    LLMTransientError("temporary provider failure"),
+                    [_tool_call("atomic_exit", "process_exit", {"payload": {"done": True}})],
+                ]
+            )
+            pid = runtime.process.spawn(
+                image="transparent-anchor-atomicity:v0",
+                goal="keep the success and tombstone atomic",
+            )
+            failed = runtime.run_process_once(pid)
+            assert not failed["ok"] and failed["retryable"]
+            request = runtime.store.list_llm_calls(pid)[0]
+            original_insert = runtime.store.insert_llm_call
+
+            def fail_tombstone(record: Any) -> None:
+                if str(record.call_id).startswith("llmanchor_"):
+                    raise RuntimeError("injected image-only tombstone failure")
+                original_insert(record)
+
+            monkeypatch.setattr(runtime.store, "insert_llm_call", fail_tombstone)
+            runtime.process.resume(pid)
+
+            result = runtime.run_process_once(pid)
+
+            assert result["ok"], result
+            incomplete_head = runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose="action_selection",
+            )
+            assert incomplete_head is not None and incomplete_head.status == "ok"
+            output_key = incomplete_head.request_options["image_only_transcript"][
+                "output_key"
+            ]
+            output_rows = runtime.store.list_llm_tool_outputs(
+                pid=pid,
+                response_id=output_key,
+            )
+            assert [row["call_id"] for row in output_rows] == ["atomic_exit"]
+            assert runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose=request.purpose,
+            ) == request
+            assert any(
+                record.action
+                == "llm.image_only_request_anchor_supersede_failed"
+                for record in runtime.audit.trace(actor=pid)
+            )
+        finally:
+            runtime.close()
+
+    def test_image_only_output_query_failure_does_not_replay_tool(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-output-query:v0",
+                    name="transparent-output-query",
+                    system_prompt="Exact output-query prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            runtime.llm.client = ScriptedTranscriptOutcomeClient(
+                [
+                    LLMTransientError("temporary provider failure"),
+                    [_tool_call("query_exit", "process_exit", {"payload": {"done": True}})],
+                ]
+            )
+            pid = runtime.process.spawn(
+                image="transparent-output-query:v0",
+                goal="commit the output before retention cleanup",
+            )
+            failed = runtime.run_process_once(pid)
+            assert not failed["ok"] and failed["retryable"]
+            request = runtime.store.list_llm_calls(pid)[0]
+
+            def fail_output_query(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+                raise RuntimeError("injected paired output query failure")
+
+            monkeypatch.setattr(
+                runtime.store,
+                "list_llm_tool_outputs",
+                fail_output_query,
+            )
+            runtime.process.resume(pid)
+
+            result = runtime.run_process_once(pid)
+
+            assert result["ok"], result
+            assert runtime.process.get(pid).status.value == "exited"
+            assert len(
+                [
+                    record
+                    for record in runtime.audit.trace(actor=pid)
+                    if record.action == "tool.call"
+                    and record.decision.get("tool") == "process_exit"
+                ]
+            ) == 1
+            monkeypatch.undo()
+            head = runtime.store.get_latest_successful_llm_call(
+                pid=pid,
+                purpose="action_selection",
+            )
+            assert head is not None
+            output_key = head.request_options["image_only_transcript"]["output_key"]
+            assert [
+                row["call_id"]
+                for row in runtime.store.list_llm_tool_outputs(
+                    pid=pid,
+                    response_id=output_key,
+                )
+            ] == ["query_exit"]
+            assert runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose=request.purpose,
+            ) == request
+            assert any(
+                record.action == "llm.image_only_request_anchor_supersede_failed"
+                and record.decision.get("phase") == "paired_output_query"
+                for record in runtime.audit.trace(actor=pid)
+            )
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("reopen_after_restore", [False, True])
+    def test_image_only_checkpoint_restore_starts_a_new_transcript_anchor(
+        self,
+        tmp_path: Any,
+        reopen_after_restore: bool,
+    ) -> None:
+        database = tmp_path / f"transparent-restore-{reopen_after_restore}.sqlite"
+        runtime = Runtime.open(database)
+        active = runtime
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-restore:v0",
+                    name="transparent-restore",
+                    system_prompt="Exact restore prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["echo", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            runtime.llm.client = ScriptedTranscriptOutcomeClient(
+                [[_tool_call("post_checkpoint_echo", "echo", {"value": "future"})]]
+            )
+            pid = runtime.process.spawn(
+                image="transparent-restore:v0",
+                goal="restart from this checkpoint goal",
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                "before image-only transcript",
+                actor=pid,
+            )
+            checkpoint_generation = runtime.store.get_llm_context_generation(pid)
+
+            assert runtime.run_process_once(pid)["ok"]
+            post_checkpoint_head = runtime.store.get_latest_llm_call(
+                pid=pid,
+                purpose="action_selection",
+            )
+            assert post_checkpoint_head is not None
+            assert post_checkpoint_head.request_options["image_only_transcript"][
+                "llm_context_generation"
+            ] == checkpoint_generation
+
+            runtime.checkpoint.restore(
+                "cli",
+                checkpoint_id,
+                require_capability=False,
+            )
+            restored_generation = runtime.store.get_llm_context_generation(pid)
+            assert restored_generation != checkpoint_generation
+
+            if reopen_after_restore:
+                runtime.close()
+                active = Runtime.open(database)
+            client = ScriptedTranscriptOutcomeClient(
+                [[_tool_call("restored_exit", "process_exit", {"payload": {"done": True}})]]
+            )
+            active.llm.client = client
+
+            completed = active.run_process_once(pid)
+
+            assert completed["ok"], completed
+            assert client.message_batches[0] == [
+                {"role": "system", "content": "Exact restore prompt."},
+                {"role": "user", "content": "restart from this checkpoint goal"},
+            ]
+            restored_head = active.store.get_latest_llm_call(
+                pid=pid,
+                purpose="action_selection",
+            )
+            assert restored_head is not None
+            assert restored_head.request_options["image_only_transcript"][
+                "llm_context_generation"
+            ] == restored_generation
+        finally:
+            active.close()
+
+    def test_image_only_restored_pending_release_rebinds_generation(
+        self,
+        tmp_path: Any,
+    ) -> None:
+        database = tmp_path / "transparent-restored-release.sqlite"
+        runtime = Runtime.open(database)
+        try:
+            runtime.register_image(
+                AgentImage(
+                    image_id="transparent-restored-release:v0",
+                    name="transparent-restored-release",
+                    system_prompt="Exact restored-release prompt.",
+                    prompt_mode=PROMPT_MODE_IMAGE_ONLY,
+                    default_tools=["echo", "process_exit"],
+                    context_policy="recency_first",
+                ),
+                actor="test",
+            )
+            client = ScriptedTranscriptOutcomeClient(
+                [
+                    [_tool_call("restored_release_echo", "echo", {"value": "once"})],
+                    [
+                        _tool_call(
+                            "restored_release_exit",
+                            "process_exit",
+                            {"payload": {"done": True}},
+                        )
+                    ],
+                ]
+            )
+            runtime.llm.client = client
+            runtime.data_flow.register_sink_trust(
+                SinkTrustRule(
+                    pattern="llm:default",
+                    trust_level=SinkTrustLevel.CONDITIONAL,
+                    max_sensitivity="secret",
+                    identity_sha256=runtime.llms.profile_identity_sha256("default"),
+                ),
+                actor="test.host",
+                require_capability=False,
+            )
+            parent_pid = runtime.process.spawn(goal="parent process")
+            pid = runtime.process.spawn_child(
+                parent_pid,
+                "resume the exact approved request in the restored epoch",
+                image="transparent-restored-release:v0",
+                source_labels=ObjectMetadata(sensitivity="secret"),
+            )
+
+            waiting = runtime.run_process_once(pid)
+
+            assert waiting.get("waiting_human"), waiting
+            assert client.message_batches == []
+            pending_before = runtime.store.get_llm_pending_action(pid)
+            assert pending_before is not None
+            approved_messages = list(pending_before["action"]["request_messages"])
+            prepared_generation = pending_before["action"]["request_options"][
+                "llm_context_generation"
+            ]
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                "pending exact image-only LLM release",
+                actor=pid,
+            )
+            runtime.checkpoint.restore(
+                "cli",
+                checkpoint_id,
+                require_capability=False,
+            )
+            restored_generation = runtime.store.get_llm_context_generation(pid)
+            assert restored_generation != prepared_generation
+            runtime.human.drain_terminal_queue(auto_approve=True)
+
+            resumed = runtime.run_process_once(pid)
+
+            assert resumed["ok"], resumed
+            assert resumed["resumed_after_human"]
+            assert client.message_batches[0] == approved_messages
+            head = runtime.store.get_latest_successful_llm_call(
+                pid=pid,
+                purpose="action_selection",
+            )
+            assert head is not None
+            assert head.request_options["image_only_transcript"][
+                "llm_context_generation"
+            ] == restored_generation
+            assert any(
+                record.action == "llm.image_only_release_generation_rebound"
+                and record.decision.get("request_payload_changed") is False
+                for record in runtime.audit.trace(actor=pid)
+            )
+
+            next_wait = runtime.run_process_once(pid)
+            assert next_wait.get("waiting_human"), next_wait
+            runtime.human.drain_terminal_queue(auto_approve=True)
+            completed = runtime.run_process_once(pid)
+
+            assert completed["ok"], completed
+            replay = client.message_batches[1]
+            assert [message["role"] for message in replay] == [
+                "system",
+                "user",
+                "assistant",
+                "tool",
+            ]
+            assert replay[2]["tool_calls"][0]["id"] == "restored_release_echo"
+            assert replay[3]["tool_call_id"] == "restored_release_echo"
+            assert len(
+                [
+                    record
+                    for record in runtime.audit.trace(actor=pid)
+                    if record.action == "tool.call"
+                    and record.decision.get("tool") == "echo"
+                ]
+            ) == 1
+        finally:
+            runtime.close()
 
     def test_image_only_action_repair_is_not_retained_in_transcript(self) -> None:
         runtime = Runtime.open("local")
@@ -1513,7 +2266,10 @@ class TestLLMPromptModes:
             assert "Cumulative completion contract:" not in user_prompt
             assert "identity anchor only; not an Object name or read capability" in user_prompt
             assert "cumulative-review image uses nonterminal process_exit" in user_prompt
-            assert "Retained original goal contract" in user_prompt
+            # Startup rehydrates the integrity-bound root goal before context
+            # materialization.  The older retained-LLM-evidence fallback is
+            # therefore neither needed nor duplicated in this prompt.
+            assert "Retained original goal contract" not in user_prompt
             assert "finish original requirement and final evidence step" in user_prompt
             goal_oid = reopened.process.get(pid).goal_oid
             request_record = [
@@ -1640,6 +2396,35 @@ class ScriptedTranscriptClient:
             raw=SimpleNamespace(id=f"scripted_chat_{ordinal}"),
             api="chat",
             response_id=f"scripted_chat_{ordinal}",
+            model="fake",
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        )
+
+
+class ScriptedTranscriptOutcomeClient:
+    def __init__(self, outcomes: list[Any]) -> None:
+        self._outcomes = list(outcomes)
+        self.message_batches: list[list[dict[str, Any]]] = []
+
+    def complete_action(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> LLMCompletion:
+        del tools
+        self.message_batches.append(json.loads(json.dumps(messages)))
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if callable(outcome):
+            outcome = outcome()
+        ordinal = len(self.message_batches)
+        return LLMCompletion(
+            content="",
+            tool_calls=list(outcome),
+            raw=SimpleNamespace(id=f"scripted_outcome_{ordinal}"),
+            api="chat",
+            response_id=f"scripted_outcome_{ordinal}",
             model="fake",
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         )

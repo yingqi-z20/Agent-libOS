@@ -544,7 +544,10 @@ class ModuleHookContext:
     def _unregister_image(self, image: AgentImage) -> None:
         current = self._services.images.get(image.image_id)
         if current == image:
-            self._services.images.pop(image.image_id, None)
+            self._services.image_registry.stage_image_removal(
+                image.image_id,
+                expected=image,
+            )
         stored = self._services.store.get_image(image.image_id)
         stored_actor = (
             stored[1].get("registered_by")

@@ -608,9 +608,22 @@ legacy full-JSON rows from older development builds; those rows remain durable
 sensitive data and are not rewritten by the marker recovery sweep. See
 [Runtime Storage](storage.md#transaction-model).
 
-If a reopen cannot materialize a live payload cache for a marker row, the
-storage-layer startup recovery sweep releases the object fail-closed instead of
-treating the marker as user payload. This is the recovery-only release path
+The sole current automatic exception is not stored in the Object row: with
+`llm.persist_full_io=true`, the committed launch publication for a live root
+spawn may retain a bounded, integrity-bound copy of its exact immutable initial
+GOAL.
+Startup validates the unchanged root/process creation, goal OID, Object
+identity/version/live marker, and payload digest before rehydrating it. Exec may
+change Image while preserving that original goal; an exec replacement goal,
+child/fork goal, ObjectTask owner, or any other Object remains runtime-local.
+Generic publication reads redact the reversible value, and terminal root
+cleanup changes it to hashes. Failed-launch rollback/compensation cannot commit
+a non-committable publication state ahead of that redaction.
+
+If a reopen cannot materialize a live payload cache for a marker row through
+that exact root-goal exception, the storage-layer startup recovery sweep
+releases the object fail-closed instead of treating the marker as user payload.
+This is the recovery-only release path
 described above, not an invocation of the manager's online release finalizers.
 Low-level payload-cache replacement is conditional on an existing live Object
 row. A missing or released row is rejected before its oid can enter the cache;

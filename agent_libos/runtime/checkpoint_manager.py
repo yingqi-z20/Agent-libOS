@@ -6,7 +6,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Mapping, MutableMapping, NoReturn
+from typing import Any, Iterable, Iterator, Mapping, MutableMapping, NoReturn
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -2792,7 +2792,10 @@ class CheckpointManager:
         restored_image_ids: list[str] | None = None,
         publication_state: MutableMapping[str, Any] | None = None,
     ) -> None:
-        with self._unit_of_work.transaction(include_object_payloads=True):
+        with (
+            self._checkpoint_image_publication_scope(image_snapshot),
+            self._unit_of_work.transaction(include_object_payloads=True),
+        ):
             # Start from the pre-frozen artifact so callbacks cannot mutate the
             # publication inputs. Authority revalidation may only remove or
             # narrow capabilities before the final canonical artifact is set.
@@ -2822,9 +2825,8 @@ class CheckpointManager:
                 publication_state["fork_rows"] = published_rows
                 publication_state["object_payloads"] = published_payloads
             if image_snapshot is not None:
-                # Image/artifact rows and process rows commit together. The
-                # Runtime's in-memory image entries are explicitly discarded
-                # by the caller if this transaction fails.
+                # Image/artifact rows and process rows commit together. Cache
+                # candidates remain staged until this outer transaction commits.
                 existing_image_ids = set(self._images)
                 try:
                     self._restore_images(image_snapshot, overwrite_existing=False)
@@ -2832,8 +2834,9 @@ class CheckpointManager:
                     if restored_image_ids is not None:
                         restored_image_ids.extend(
                             image_id
-                            for image_id in self._images
-                            if image_id not in existing_image_ids and image_id not in restored_image_ids
+                            for image_id in image_snapshot.get("images", {})
+                            if image_id not in existing_image_ids
+                            and image_id not in restored_image_ids
                         )
             if fork_parent_pid is not None and fork_root_pid is not None:
                 self._reserve_fork_parent_child_budget(fork_parent_pid, fork_root_pid, remapped)
@@ -2853,6 +2856,19 @@ class CheckpointManager:
             # interruption lands before this assignment, the caller confirms
             # the unique root from durable storage before deciding cleanup.
             self._acknowledge_fork_main_state_commit(publication_state)
+
+    @contextmanager
+    def _checkpoint_image_publication_scope(
+        self,
+        image_snapshot: Mapping[str, Any] | None,
+    ) -> Iterator[None]:
+        registry = self._image_registry
+        atomic_registrations = getattr(registry, "atomic_image_registrations", None)
+        if image_snapshot is None or not callable(atomic_registrations):
+            yield
+            return
+        with atomic_registrations(image_snapshot.get("images", {})):
+            yield
 
     @staticmethod
     def _acknowledge_fork_main_state_commit(
@@ -3733,7 +3749,15 @@ class CheckpointManager:
                 if not quarantined and to_jsonable(existing) == data:
                     continue
             image = AgentImage(**data)
-            self._images[image_id] = image
+            stage_image = getattr(
+                self._image_registry,
+                "stage_image_publication",
+                None,
+            )
+            if callable(stage_image):
+                stage_image(image)
+            else:
+                self._images[image_id] = image
             self._extensions.upsert_image(
                 image,
                 registered_by="checkpoint.restore",

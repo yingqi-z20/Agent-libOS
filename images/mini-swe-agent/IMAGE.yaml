@@ -8,12 +8,15 @@ context_policy: recency_first
 safety_profile: mini-swe-agent
 jit_tools: tools/jit-tools.json
 default_tools: []
+# Declarations only: missing entries are diagnosed but do not block boot, and
+# these entries never grant the spawned process live authority. The filesystem
+# declaration also does not confine direct I/O by the authorized Bash child.
 required_capabilities:
   - resource: filesystem:workspace:*
     rights: [read, write]
   - resource: shell:*
     rights: [execute]
 metadata:
-  upstream_project: SWE-agent/mini-swe-agent
-  upstream_config: src/minisweagent/config/mini.yaml
-  compatibility_target: tool-call bash command interface
+  inspired_by_project: SWE-agent/mini-swe-agent
+  inspired_by_config_path: src/minisweagent/config/mini.yaml
+  compatibility_scope: inspiration_only_single_bash_tool_shape

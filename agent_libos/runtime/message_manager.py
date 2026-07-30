@@ -288,9 +288,15 @@ class ProcessMessageManager:
             reply_to=reply_to,
             message_ids=message_ids,
         )
+        visible_statuses = (
+            (ProcessMessageStatus.UNREAD, ProcessMessageStatus.ACKED)
+            if include_acked
+            else None
+        )
         messages = self.store.list_process_messages(
             pid,
             status=None if include_acked else ProcessMessageStatus.UNREAD,
+            statuses=visible_statuses,
             kind=ProcessMessageKind(filters.get("kind")) if filters.get("kind") is not None else None,
             sender=filters.get("sender"),
             channel=filters.get("channel"),
@@ -327,10 +333,16 @@ class ProcessMessageManager:
             message_ids=message_ids,
         )
         status = None if include_acked else ProcessMessageStatus.UNREAD
+        statuses = (
+            (ProcessMessageStatus.UNREAD, ProcessMessageStatus.ACKED)
+            if include_acked
+            else None
+        )
         with self.store.transaction():
             messages = self.store.list_process_messages(
                 pid,
                 status=status,
+                statuses=statuses,
                 kind=ProcessMessageKind(filters.get("kind")) if filters.get("kind") is not None else None,
                 sender=filters.get("sender"),
                 channel=filters.get("channel"),
@@ -342,6 +354,7 @@ class ProcessMessageManager:
             matching_count = self.store.count_process_messages(
                 pid,
                 status=status,
+                statuses=statuses,
                 kind=ProcessMessageKind(filters.get("kind")) if filters.get("kind") is not None else None,
                 sender=filters.get("sender"),
                 channel=filters.get("channel"),

@@ -39,6 +39,7 @@ from agent_libos.models.exceptions import (
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.models import (
     EventType,
+    HostResumeProcessWait,
     HumanRequest,
     HumanRequestStatus,
     HumanProcessWait,
@@ -956,6 +957,7 @@ class HumanObjectManager:
             process = self.processes.get_process(pid)
             if process is None:
                 raise NotFound(f"process not found: {pid}")
+            self._transitions.require_signal_preserves_condition_wait(process, sig)
             takeover_scope = contextlib.nullcontext()
             if (
                 process.status == ProcessStatus.RUNNING
@@ -2257,48 +2259,76 @@ class HumanObjectManager:
         *,
         permission_related: bool,
         release_parent: HumanRequest | None,
+        provider_outcome_unknown: bool = False,
     ) -> None:
         if process is None or process.status != ProcessStatus.WAITING_HUMAN:
             return
-        remaining = [
-            pending
-            for pending in self.requests.list(
-                pid=request.pid,
-                status=HumanRequestStatus.PENDING,
-            )
-            if pending.blocking
-        ]
-        if remaining:
-            selected_status = ProcessStatus.WAITING_HUMAN
-            wait_state = HumanProcessWait(
-                request_ids=tuple(pending.request_id for pending in remaining)
-            )
-            status_message = None
-        elif release_parent is not None:
+        if provider_outcome_unknown:
+            # A Human provider phase may have completed even though the caller
+            # observed an exception. Preserve that uncertainty as a Host-only
+            # resume gate; a model parent must not convert manual recovery into
+            # an ordinary resume. A process able to enter WAITING_HUMAN already
+            # has a durable goal Object, and checkpoint restore remaps that
+            # reference, so it is a stable reason OID without creating another
+            # Object inside the Human terminal transaction.
+            reason_oid = str(process.goal_oid or "").strip()
+            if not reason_oid:
+                raise ProcessError(
+                    "ambiguous Human provider outcome cannot be gated without "
+                    f"a durable process goal Object: {process.pid}"
+                )
             selected_status = ProcessStatus.PAUSED
-            wait_state = PausedProcessWait()
-            status_message = (
-                f"data release {status.value} for Human request "
-                f"{release_parent.request_id}"
-            )
+            wait_state = HostResumeProcessWait(reason_oid=reason_oid)
+            if release_parent is not None:
+                status_message = (
+                    "data release provider outcome unknown for Human request "
+                    f"{release_parent.request_id}; manual recovery required"
+                )
+            else:
+                status_message = (
+                    f"human provider outcome unknown for request {request.request_id}; "
+                    "manual recovery required"
+                )
         else:
-            # Permission denials wake the process so it can observe the
-            # structured failed operation. Generic rejections remain paused.
-            selected_status = (
-                ProcessStatus.RUNNABLE
-                if status == HumanRequestStatus.APPROVED or permission_related
-                else ProcessStatus.PAUSED
-            )
-            wait_state = (
-                PausedProcessWait()
-                if selected_status == ProcessStatus.PAUSED
-                else None
-            )
-            status_message = (
-                None
-                if status == HumanRequestStatus.APPROVED
-                else f"human rejected {request.request_id}"
-            )
+            remaining = [
+                pending
+                for pending in self.requests.list(
+                    pid=request.pid,
+                    status=HumanRequestStatus.PENDING,
+                )
+                if pending.blocking
+            ]
+            if remaining:
+                selected_status = ProcessStatus.WAITING_HUMAN
+                wait_state = HumanProcessWait(
+                    request_ids=tuple(pending.request_id for pending in remaining)
+                )
+                status_message = None
+            elif release_parent is not None:
+                selected_status = ProcessStatus.PAUSED
+                wait_state = PausedProcessWait()
+                status_message = (
+                    f"data release {status.value} for Human request "
+                    f"{release_parent.request_id}"
+                )
+            else:
+                # Permission denials wake the process so it can observe the
+                # structured failed operation. Generic rejections remain paused.
+                selected_status = (
+                    ProcessStatus.RUNNABLE
+                    if status == HumanRequestStatus.APPROVED or permission_related
+                    else ProcessStatus.PAUSED
+                )
+                wait_state = (
+                    PausedProcessWait()
+                    if selected_status == ProcessStatus.PAUSED
+                    else None
+                )
+                status_message = (
+                    None
+                    if status == HumanRequestStatus.APPROVED
+                    else f"human rejected {request.request_id}"
+                )
         self._transitions.transition(
             process.pid,
             selected_status,
@@ -3093,6 +3123,7 @@ class HumanObjectManager:
                     HumanRequestStatus.CANCELLED,
                     permission_related=False,
                     release_parent=release_parent,
+                    provider_outcome_unknown=True,
                 )
                 latest = self.requests.get(request_id)
                 if latest is not None and latest.decision is not None:
@@ -3142,45 +3173,14 @@ class HumanObjectManager:
                 )
 
                 process = self.processes.get_process(latest.pid)
-                if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
-                    remaining = [
-                        pending
-                        for pending in self.requests.list(
-                            pid=latest.pid,
-                            status=HumanRequestStatus.PENDING,
-                        )
-                        if pending.blocking
-                    ]
-                    if remaining:
-                        selected_status = ProcessStatus.WAITING_HUMAN
-                        wait_state = HumanProcessWait(
-                            request_ids=tuple(
-                                pending.request_id for pending in remaining
-                            )
-                        )
-                        status_message = None
-                    else:
-                        selected_status = ProcessStatus.PAUSED
-                        wait_state = PausedProcessWait()
-                        if release_parent is not None:
-                            status_message = (
-                                "data release provider outcome unknown for Human request "
-                                f"{release_parent.request_id}; manual recovery required"
-                            )
-                        else:
-                            status_message = (
-                                f"human provider outcome unknown for request {latest.request_id}; "
-                                "manual recovery required"
-                            )
-                    self._transitions.transition(
-                        process.pid,
-                        selected_status,
-                        expected_revision=process.revision,
-                        expected_status=ProcessStatus.WAITING_HUMAN,
-                        expected_state_generation=process.state_generation,
-                        wait_state=wait_state,
-                        status_message=status_message,
-                    )
+                self._transition_after_human_decision(
+                    process,
+                    latest,
+                    HumanRequestStatus.CANCELLED,
+                    permission_related=False,
+                    release_parent=release_parent,
+                    provider_outcome_unknown=True,
+                )
 
                 evidence = {
                     "request_id": latest.request_id,

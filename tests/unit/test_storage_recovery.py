@@ -1389,6 +1389,48 @@ class TestUnsupportedStoreVersion:
 
         assert db_path.read_bytes() == before
 
+    def test_v3_manifest_view_is_rejected_without_mutation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "manifest-view.sqlite"
+        SQLiteStore(db_path).close()
+        lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
+        lease_path.unlink(missing_ok=True)
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("DROP TABLE jsonrpc_endpoints")
+            connection.execute(
+                "CREATE VIEW jsonrpc_endpoints AS "
+                "SELECT NULL AS endpoint_id, NULL AS spec_json, "
+                "NULL AS registered_by, NULL AS created_at, "
+                "NULL AS updated_at WHERE 0"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        db_path.chmod(0o644)
+        before = db_path.read_bytes()
+        before_mode = stat.S_IMODE(db_path.stat().st_mode)
+
+        with pytest.raises(
+            UnsupportedStoreVersion,
+            match=r"manifest relation types.*jsonrpc_endpoints",
+        ):
+            SQLiteStore(db_path)
+
+        assert db_path.read_bytes() == before
+        assert stat.S_IMODE(db_path.stat().st_mode) == before_mode
+        assert not lease_path.exists()
+        connection = sqlite3.connect(db_path)
+        try:
+            row = connection.execute(
+                "SELECT type FROM sqlite_master WHERE name = 'jsonrpc_endpoints'"
+            ).fetchone()
+        finally:
+            connection.close()
+        assert row == ("view",)
+
     def test_nonempty_unversioned_store_is_rejected_without_mutation(self, tmp_path: Path) -> None:
         db_path = tmp_path / "unrelated.sqlite"
         lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")

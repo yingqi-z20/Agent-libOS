@@ -399,6 +399,13 @@ class TestRuntimeModule:
             assert result['error'].startswith('module_load_failed: RuntimeError')
             assert failed['error'] == result['error']
             assert result['correlation_id'] in projected
+            assert failed['module_id'] == 'failed:failed-module.yaml'
+            assert failed['entrypoint'] == ''
+            assert failed['manifest_sha256'] == ''
+            assert failed['source_path'] == ''
+            assert failed['source_sha256'] == ''
+            assert failed['loaded_at'] is None
+            assert not any(failed['registered'].values())
         finally:
             runtime.close()
 
@@ -1662,6 +1669,114 @@ sha256: {package_sha}
                 runtime.image_registry.register_module_image = original_register
                 runtime.close()
 
+    def test_late_module_audit_failure_never_publishes_image_to_concurrent_readers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        manifest, source_sha = _write_module(tmp_path)
+        trust = _module_trust_key('test-module:v0', manifest, source_sha)
+        runtime = Runtime.open()
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+        outcomes: list[BaseException] = []
+        try:
+            real_record = runtime.audit.record
+
+            def fail_late_module_audit(*args, **kwargs):
+                if kwargs.get('action') == 'module.load':
+                    audit_entered.set()
+                    if not release_audit.wait(timeout=5):
+                        raise RuntimeError('timed out waiting to fail module load audit')
+                    raise RuntimeError('injected late module load audit failure')
+                return real_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_late_module_audit)
+
+            def load_module() -> None:
+                try:
+                    runtime.modules.load_module_manifest(
+                        manifest,
+                        trusted_modules=(trust,),
+                    )
+                except BaseException as exc:
+                    outcomes.append(exc)
+
+            thread = threading.Thread(target=load_module, daemon=True)
+            thread.start()
+            assert audit_entered.wait(timeout=5)
+
+            assert 'module-agent:v0' not in runtime.images
+            assert runtime.llm._images.get('module-agent:v0') is None
+            with pytest.raises(NotFound):
+                runtime.launch.require_image('module-agent:v0')
+
+            release_audit.set()
+            thread.join(timeout=10)
+
+            assert not thread.is_alive()
+            assert len(outcomes) == 1
+            assert isinstance(outcomes[0], RuntimeError)
+            assert 'injected late module load audit failure' in str(outcomes[0])
+            assert 'module-agent:v0' not in runtime.images
+            assert runtime.store.get_image('module-agent:v0') is None
+        finally:
+            release_audit.set()
+            runtime.close()
+
+    def test_module_rollback_removes_image_cache_only_after_durable_commit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        manifest, source_sha = _write_module(tmp_path)
+        trust = _module_trust_key('test-module:v0', manifest, source_sha)
+        runtime = Runtime.open()
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+        outcomes: list[BaseException] = []
+        try:
+            runtime.modules.load_module_manifest(
+                manifest,
+                trusted_modules=(trust,),
+            )
+            original = runtime.get_image('module-agent:v0')
+            real_record = runtime.audit.record
+
+            def block_module_rollback_audit(*args, **kwargs):
+                if kwargs.get('action') == 'module.rollback':
+                    audit_entered.set()
+                    if not release_audit.wait(timeout=5):
+                        raise RuntimeError('timed out waiting to commit module rollback')
+                return real_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', block_module_rollback_audit)
+
+            def rollback_module() -> None:
+                try:
+                    runtime.modules._rollback_module('test-module:v0')
+                except BaseException as exc:
+                    outcomes.append(exc)
+
+            thread = threading.Thread(target=rollback_module, daemon=True)
+            thread.start()
+            assert audit_entered.wait(timeout=5)
+
+            assert runtime.get_image('module-agent:v0') == original
+            assert runtime.launch.require_image('module-agent:v0') == original
+            assert runtime.llm._images.get('module-agent:v0') == original
+
+            release_audit.set()
+            thread.join(timeout=10)
+
+            assert not thread.is_alive()
+            assert outcomes == []
+            assert 'module-agent:v0' not in runtime.images
+            assert runtime.store.get_image('module-agent:v0') is None
+        finally:
+            release_audit.set()
+            runtime.close()
+
     def test_invalid_module_image_does_not_leave_partial_tool_registration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1675,13 +1790,32 @@ sha256: {package_sha}
             finally:
                 runtime.close()
 
-    def test_startup_hook_failure_rolls_back_external_module_state(self) -> None:
+    @pytest.mark.parametrize('load_policy', ['fail', 'warn'])
+    def test_startup_hook_failure_rolls_back_external_module_state(
+        self,
+        load_policy: str,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             db = root / 'runtime.sqlite'
             manifest, source_sha = _write_module(root, failing_startup_hook=True)
+            config = replace(
+                DEFAULT_CONFIG,
+                modules=replace(DEFAULT_CONFIG.modules, load_policy=load_policy),
+            )
             with pytest.raises(RuntimeError, match='startup hook failed'):
-                Runtime.open(db, module_manifests=(str(manifest),), trusted_modules=(_module_trust_key('test-module:v0', manifest, source_sha),))
+                Runtime.open(
+                    db,
+                    config=config,
+                    module_manifests=(str(manifest),),
+                    trusted_modules=(
+                        _module_trust_key(
+                            'test-module:v0',
+                            manifest,
+                            source_sha,
+                        ),
+                    ),
+                )
 
             runtime = Runtime.open(db)
             try:
@@ -1696,6 +1830,50 @@ sha256: {package_sha}
                 assert runtime.syscalls.get('module.ping') is None
             finally:
                 runtime.close()
+
+    def test_startup_hook_failure_rolls_back_entire_external_startup_batch(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        successful_root = tmp_path / 'successful'
+        failing_root = tmp_path / 'failing'
+        successful_root.mkdir()
+        failing_root.mkdir()
+        successful_manifest, successful_sha = _write_module(successful_root)
+        failing_manifest, failing_sha = _write_mutating_hook_module(failing_root)
+        database = tmp_path / 'runtime.sqlite'
+
+        with pytest.raises(RuntimeError, match='mutating startup hook failed'):
+            Runtime.open(
+                database,
+                module_manifests=(str(successful_manifest), str(failing_manifest)),
+                trusted_modules=(
+                    _module_trust_key(
+                        'test-module:v0',
+                        successful_manifest,
+                        successful_sha,
+                    ),
+                    _module_trust_key(
+                        'mutating-hook-module:v0',
+                        failing_manifest,
+                        failing_sha,
+                    ),
+                ),
+            )
+
+        runtime = Runtime.open(database)
+        try:
+            assert runtime.modules.inspect_module('test-module:v0')['status'] == 'failed'
+            assert (
+                runtime.modules.inspect_module('mutating-hook-module:v0')['status']
+                == 'failed'
+            )
+            with pytest.raises(NotFound):
+                runtime.tools.resolve('module_echo')
+            assert 'module-agent:v0' not in runtime.images
+            assert runtime.syscalls.get('module.ping') is None
+        finally:
+            runtime.close()
 
     @pytest.mark.parametrize(
         ('startup_hook_exception', 'exception_type', 'error_message'),

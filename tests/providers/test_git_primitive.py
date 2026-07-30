@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import inspect
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -53,6 +54,11 @@ from agent_libos.substrate import (
     LocalShellProvider,
     SubprocessLimitExceeded,
     SubprocessLimits,
+)
+from agent_libos.utils.secure_host_files import (
+    SecureDirectoryGuard,
+    SecureFileDescriptor,
+    StablePathSnapshot,
 )
 
 
@@ -443,6 +449,285 @@ def test_provider_repository_lock_remains_reentrant_in_same_thread(
             assert outer.worktree_id == inner.worktree_id
 
 
+def test_provider_repository_lock_rejects_mocked_reparse_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    lock_directory = root / ".git" / "agent-libos"
+    lock_directory.mkdir()
+    original_open_child = SecureDirectoryGuard.open_child_directory
+
+    def reject_reparse_child(
+        directory: SecureDirectoryGuard,
+        name: str,
+    ) -> SecureDirectoryGuard:
+        if directory.path == root / ".git" and name == "agent-libos":
+            raise OSError("mocked reparse directory")
+        return original_open_child(directory, name)
+
+    monkeypatch.setattr(
+        SecureDirectoryGuard,
+        "open_child_directory",
+        reject_reparse_child,
+    )
+
+    with pytest.raises(GitError) as exc_info:
+        with provider.repository_lock():
+            raise AssertionError("unsafe lock directory must not be entered")
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+    assert not (lock_directory / "repository.lock").exists()
+
+
+def test_provider_repository_lock_rejects_mocked_reparse_file_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    lock_directory = root / ".git" / "agent-libos"
+    lock_directory.mkdir()
+    lock_path = lock_directory / "repository.lock"
+    lock_path.write_bytes(b"")
+    git_provider_module = importlib.import_module("agent_libos.substrate.git")
+    original_open = git_provider_module.open_secure_readwrite_child
+
+    def mocked_reparse_file(*args: Any, **kwargs: Any) -> SecureFileDescriptor:
+        secure_file = original_open(*args, **kwargs)
+        original_snapshot = secure_file.snapshot
+
+        def reparse_snapshot() -> StablePathSnapshot:
+            return replace(original_snapshot(), is_reparse_point=True)
+
+        secure_file.snapshot = reparse_snapshot  # type: ignore[method-assign]
+        return secure_file
+
+    monkeypatch.setattr(
+        git_provider_module,
+        "open_secure_readwrite_child",
+        mocked_reparse_file,
+    )
+
+    with pytest.raises(GitError) as exc_info:
+        with provider.repository_lock():
+            raise AssertionError("unsafe lock file must not be entered")
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+    assert lock_path.read_bytes() == b""
+
+
+def test_provider_repository_lock_rejects_opened_path_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    original_linked_snapshot = SecureFileDescriptor.linked_snapshot
+
+    def mismatched_linked_snapshot(
+        secure_file: SecureFileDescriptor,
+    ) -> StablePathSnapshot:
+        observed = original_linked_snapshot(secure_file)
+        return replace(observed, inode=observed.inode + 1)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            SecureFileDescriptor,
+            "linked_snapshot",
+            mismatched_linked_snapshot,
+        )
+        with pytest.raises(GitError) as exc_info:
+            with provider.repository_lock():
+                raise AssertionError("mismatched lock identity must not be entered")
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+    with provider.repository_lock():
+        pass
+
+
+def test_provider_repository_lock_requires_identity_or_held_replacement_lock(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    unavailable = StablePathSnapshot(
+        device=0,
+        inode=0,
+        mode=stat.S_IFREG,
+        links=1,
+        size=0,
+        modified_ns=0,
+        changed_ns=0,
+    )
+
+    with pytest.raises(OSError, match="stable regular file"):
+        provider._validate_repository_lock_snapshot(unavailable)
+
+    held = replace(unavailable, replacement_locked=True)
+    assert provider._validate_repository_lock_snapshot(held) == held
+    provider._require_same_repository_lock_identity(held, held)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd semantics")
+def test_provider_repository_lock_ancestor_swap_cannot_create_external_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    lock_directory = root / ".git" / "agent-libos"
+    lock_directory.mkdir()
+    moved_directory = root / ".git" / "agent-libos-moved"
+    outside = tmp_path / "outside-lock-directory"
+    outside.mkdir()
+    original_open = os.open
+    swapped = False
+
+    def swap_ancestor_before_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if path == "repository.lock" and dir_fd is not None and not swapped:
+            lock_directory.rename(moved_directory)
+            lock_directory.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swap_ancestor_before_open)
+
+    with pytest.raises(GitError) as exc_info:
+        with provider.repository_lock():
+            raise AssertionError("replaced lock ancestor must not be entered")
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+    assert swapped
+    assert (moved_directory / "repository.lock").is_file()
+    assert not (outside / "repository.lock").exists()
+
+
+def test_provider_repository_lock_rejects_symlink_file_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    lock_directory = root / ".git" / "agent-libos"
+    lock_directory.mkdir()
+    lock_path = lock_directory / "repository.lock"
+    outside = tmp_path / "outside-lock-target"
+    outside.write_bytes(b"outside")
+    try:
+        lock_path.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    with pytest.raises(GitError) as exc_info:
+        with provider.repository_lock():
+            raise AssertionError("symlinked lock file must not be entered")
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+    assert outside.read_bytes() == b"outside"
+
+
+def test_provider_repository_lock_rejects_hard_linked_file(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    lock_directory = root / ".git" / "agent-libos"
+    lock_directory.mkdir()
+    lock_path = lock_directory / "repository.lock"
+    external = tmp_path / "external-lock-target"
+    external.write_bytes(b"")
+    try:
+        os.link(external, lock_path)
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+
+    with pytest.raises(GitError) as exc_info:
+        with provider.repository_lock():
+            raise AssertionError("hard-linked lock file must not be entered")
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+    assert external.read_bytes() == b""
+
+
+def test_prepare_managed_worktree_rejects_mocked_reparse_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    target = Path(provider.managed_worktree_root) / "wt_reparse"
+    target.mkdir(parents=True)
+    original_lstat = Path.lstat
+
+    def mocked_lstat(path: Path) -> Any:
+        observed = original_lstat(path)
+        if path == target:
+            return type(
+                "ReparseTargetMetadata",
+                (),
+                {
+                    "st_mode": observed.st_mode,
+                    "st_file_attributes": 0x400,
+                },
+            )()
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", mocked_lstat)
+
+    with pytest.raises(GitError) as exc_info:
+        provider.prepare_managed_worktree("wt_reparse")
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows junction semantics")
+def test_provider_repository_lock_rejects_windows_junction_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    outside = tmp_path / "outside-lock"
+    _init_repository(root)
+    outside.mkdir()
+    lock_directory = root / ".git" / "agent-libos"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(lock_directory), str(outside)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(
+            "junction creation is unavailable: "
+            + (result.stderr or result.stdout).strip()
+        )
+    metadata = lock_directory.lstat()
+    reparse_attribute = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    assert int(getattr(metadata, "st_file_attributes", 0)) & reparse_attribute
+
+    with pytest.raises(GitError) as exc_info:
+        with LocalGitProvider(root).repository_lock():
+            raise AssertionError("junction lock directory must not be entered")
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+    assert not (outside / "repository.lock").exists()
+
+
 def test_builder_does_not_eagerly_construct_a_fallback_git_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -704,6 +989,278 @@ def test_provider_rejects_symlink_git_entry(tmp_path: Path) -> None:
 
     with pytest.raises(GitError) as exc_info:
         LocalGitProvider(workspace).repository_layout()
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+
+
+def test_provider_detects_windows_reparse_attribute_without_following_it() -> None:
+    git_provider = importlib.import_module("agent_libos.substrate.git")
+    metadata = type(
+        "ReparseMetadata",
+        (),
+        {
+            "st_mode": stat.S_IFDIR,
+            "st_file_attributes": 0x400,
+        },
+    )()
+
+    assert git_provider._is_link_or_reparse(metadata)
+
+
+def test_repository_layout_rejects_unavailable_directory_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    git_directory = root / ".git"
+    original_stat = Path.stat
+
+    def zero_git_directory_identity(
+        path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> os.stat_result:
+        observed = original_stat(path, *args, **kwargs)
+        if path == git_directory:
+            values = list(observed)
+            values[1] = 0
+            return os.stat_result(values)
+        return observed
+
+    monkeypatch.setattr(Path, "stat", zero_git_directory_identity)
+
+    with pytest.raises(GitError) as exc_info:
+        LocalGitProvider(root).repository_layout()
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+
+
+def test_provider_rejects_managed_worktree_selector_symlink(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    managed_root = Path(provider.managed_worktree_root)
+    managed_root.mkdir(parents=True)
+    real_worktree = managed_root / "wt_real"
+    alias_worktree = managed_root / "wt_alias"
+    _git(root, "worktree", "add", "--detach", str(real_worktree), "HEAD")
+    try:
+        alias_worktree.symlink_to(real_worktree, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+
+    with pytest.raises(GitError) as exc_info:
+        provider.repository_layout(worktree=alias_worktree)
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+
+
+def test_provider_rejects_gitfile_metadata_ancestor_symlink(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    managed_root = Path(provider.managed_worktree_root)
+    managed_root.mkdir(parents=True)
+    worktree = managed_root / "wt_linked"
+    _git(root, "worktree", "add", "--detach", str(worktree), "HEAD")
+    gitfile = worktree / ".git"
+    git_dir = Path(gitfile.read_text(encoding="utf-8").removeprefix("gitdir: ").strip())
+    alias = root / ".git" / "worktree-metadata-alias"
+    try:
+        alias.symlink_to(git_dir.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+    gitfile.write_text(f"gitdir: {alias / git_dir.name}\n", encoding="utf-8")
+
+    with pytest.raises(GitError) as exc_info:
+        provider.repository_layout(worktree=worktree)
+
+    assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+
+
+def test_provider_accepts_normal_linked_worktree_backpointer(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    managed_root = Path(provider.managed_worktree_root)
+    managed_root.mkdir(parents=True)
+    worktree = managed_root / "wt_normal"
+    _git(root, "worktree", "add", "--detach", str(worktree), "HEAD")
+
+    layout = provider.repository_layout(worktree=worktree)
+    backpointer = Path(
+        (layout.git_dir / "gitdir").read_text(encoding="utf-8").strip()
+    )
+
+    assert layout.linked_worktree
+    assert layout.git_dir != layout.common_dir
+    assert Path(os.path.abspath(backpointer)) == worktree / ".git"
+
+
+def test_provider_accepts_relative_linked_worktree_metadata_paths(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    managed_root = Path(provider.managed_worktree_root)
+    managed_root.mkdir(parents=True)
+    worktree = managed_root / "wt_relative"
+    _git(root, "worktree", "add", "--detach", str(worktree), "HEAD")
+    gitfile = worktree / ".git"
+    git_dir = Path(
+        gitfile.read_text(encoding="utf-8")
+        .removeprefix("gitdir: ")
+        .strip()
+    )
+    gitfile.write_text(
+        f"gitdir: {os.path.relpath(git_dir, worktree)}\n",
+        encoding="utf-8",
+    )
+    (git_dir / "gitdir").write_text(
+        f"{os.path.relpath(gitfile, git_dir)}\n",
+        encoding="utf-8",
+    )
+
+    layout = provider.repository_layout(worktree=worktree)
+
+    assert layout.linked_worktree
+    assert layout.git_dir == git_dir
+    assert layout.common_dir == root / ".git"
+
+
+def test_provider_rooted_at_linked_worktree_accepts_explicit_trusted_metadata(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    linked = tmp_path / "linked-root"
+    _git(root, "worktree", "add", "--detach", str(linked), "HEAD")
+    config = replace(
+        DEFAULT_CONFIG.git,
+        trusted_metadata_roots=(str(root / ".git"),),
+    )
+
+    layout = LocalGitProvider(linked, config=config).repository_layout()
+
+    assert layout.linked_worktree
+    assert layout.root == linked
+    assert layout.git_dir != layout.common_dir
+    assert layout.common_dir == root / ".git"
+
+
+def test_list_worktrees_rejects_linked_gitfile_reusing_primary_metadata(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    managed_root = Path(provider.managed_worktree_root)
+    managed_root.mkdir(parents=True)
+    worktree = managed_root / "wt_primary_alias"
+    _git(root, "worktree", "add", "--detach", str(worktree), "HEAD")
+    (worktree / ".git").write_text(
+        f"gitdir: {root / '.git'}\n",
+        encoding="utf-8",
+    )
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject primary metadata worktree alias",
+        )
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+        )
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.list_worktrees(pid)
+
+        assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+    finally:
+        runtime.close()
+
+
+def test_list_worktrees_rejects_linked_gitfile_aliasing_another_worktree(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    managed_root = Path(provider.managed_worktree_root)
+    managed_root.mkdir(parents=True)
+    first = managed_root / "wt_first"
+    alias = managed_root / "wt_other_alias"
+    _git(root, "worktree", "add", "--detach", str(first), "HEAD")
+    _git(root, "worktree", "add", "--detach", str(alias), "HEAD")
+    first_git_dir = Path(
+        (first / ".git")
+        .read_text(encoding="utf-8")
+        .removeprefix("gitdir: ")
+        .strip()
+    )
+    (alias / ".git").write_text(
+        f"gitdir: {first_git_dir}\n",
+        encoding="utf-8",
+    )
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject cross-worktree metadata alias",
+        )
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+        )
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.list_worktrees(pid)
+
+        assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
+    finally:
+        runtime.close()
+
+
+def test_provider_rejects_symlinked_linked_worktree_backpointer(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    managed_root = Path(provider.managed_worktree_root)
+    managed_root.mkdir(parents=True)
+    worktree = managed_root / "wt_backpointer_link"
+    _git(root, "worktree", "add", "--detach", str(worktree), "HEAD")
+    git_dir = Path(
+        (worktree / ".git")
+        .read_text(encoding="utf-8")
+        .removeprefix("gitdir: ")
+        .strip()
+    )
+    marker = git_dir / "gitdir"
+    external = tmp_path / "external-gitdir-marker"
+    external.write_bytes(marker.read_bytes())
+    marker.unlink()
+    try:
+        marker.symlink_to(external)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+
+    with pytest.raises(GitError) as exc_info:
+        provider.repository_layout(worktree=worktree)
+
     assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
 
 
@@ -3277,6 +3834,8 @@ def test_managed_worktree_create_failure_does_not_reconcile_absent_target(
 
         managed_root = Path(runtime.git.provider.managed_worktree_root)
         assert not managed_root.exists() or not any(managed_root.iterdir())
+        exclude = (root / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+        assert f"/{DEFAULT_CONFIG.git.worktree_root}/" in exclude
     finally:
         runtime.close()
 
@@ -3345,6 +3904,45 @@ def test_list_worktrees_rejects_managed_root_symlink_drift(tmp_path: Path) -> No
         assert str(external_worktree.resolve()) not in repr(
             runtime.events.list(target="git:workspace")
         )
+    finally:
+        runtime.close()
+
+
+def test_list_worktrees_rejects_managed_gitfile_with_symlinked_ancestor(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    provider = LocalGitProvider(root)
+    managed_root = Path(provider.managed_worktree_root)
+    managed_root.mkdir(parents=True)
+    worktree = managed_root / "wt_untrusted"
+    _git(root, "worktree", "add", "--detach", str(worktree), "HEAD")
+    gitfile = worktree / ".git"
+    git_dir = Path(gitfile.read_text(encoding="utf-8").removeprefix("gitdir: ").strip())
+    alias = root / ".git" / "worktree-list-alias"
+    try:
+        alias.symlink_to(git_dir.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+    gitfile.write_text(f"gitdir: {alias / git_dir.name}\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject structurally unsafe managed worktree",
+        )
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+        )
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.list_worktrees(pid)
+
+        assert exc_info.value.code == GitErrorCode.UNSAFE_REPOSITORY.value
     finally:
         runtime.close()
 
@@ -3438,6 +4036,9 @@ def test_file_remote_push_and_fetch_use_only_configured_remote(tmp_path: Path) -
         remote_info = runtime.git.list_remotes(pid)["remotes"][0]
         assert remote_info.fetch_url.startswith("<redacted:")
         assert str(remote) not in remote_info.fetch_url
+        assert remote_info.fetch_refspecs == [
+            "+refs/heads/*:refs/remotes/origin/*"
+        ]
         with pytest.raises(GitError) as exc_info:
             runtime.git.fetch(pid, remote.as_uri(), fetched.after.token)
         assert exc_info.value.code == GitErrorCode.INVALID_REF.value
@@ -3582,6 +4183,9 @@ def test_multiple_remote_urls_and_escaping_fetch_refspec_are_rejected(
     with pytest.raises(GitError) as refspec_error:
         LocalGitProvider(root).remote_fingerprint("origin")
     assert refspec_error.value.code == GitErrorCode.UNSAFE_CONFIG.value
+    with pytest.raises(GitError) as list_error:
+        LocalGitProvider(root).remote_configuration("origin")
+    assert list_error.value.code == GitErrorCode.UNSAFE_CONFIG.value
 
 
 @pytest.mark.parametrize(
@@ -3838,6 +4442,50 @@ def test_post_dispatch_git_failure_is_retained_as_unknown(
             runtime.git.stage(pid, ["ambiguous.txt"], token)
         assert exc_info.value.code == GitErrorCode.UNKNOWN_EFFECT.value
         assert _git(root, "diff", "--cached", "--name-only").strip() == b"ambiguous.txt"
+        effect = runtime.store.list_external_effects(pid=pid)[-1]
+        assert effect.provider == "git"
+        assert effect.operation == "mutate"
+        assert effect.transaction_state == "unknown"
+    finally:
+        runtime.close()
+
+
+def test_post_dispatch_stale_state_is_retained_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    (root / "stale-after-dispatch.txt").write_text("staged\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reconcile post-dispatch stale Git effect",
+        )
+        _grant_git_authority(runtime, pid)
+        original = runtime.git.provider.run
+
+        def stale_after_dispatch(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            command = args[0] if args else kwargs.get("args")
+            if command and command[0] == "add":
+                raise GitError(
+                    GitErrorCode.STALE_STATE.value,
+                    "repository identity changed after dispatch",
+                    operation="stage",
+                    retryable=True,
+                )
+            return result
+
+        monkeypatch.setattr(runtime.git.provider, "run", stale_after_dispatch)
+        token = runtime.git.status(pid).state.token
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.stage(pid, ["stale-after-dispatch.txt"], token)
+
+        assert exc_info.value.code == GitErrorCode.STALE_STATE.value
+        assert _git(root, "diff", "--cached", "--name-only").strip() == b"stale-after-dispatch.txt"
         effect = runtime.store.list_external_effects(pid=pid)[-1]
         assert effect.provider == "git"
         assert effect.operation == "mutate"

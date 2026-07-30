@@ -618,6 +618,7 @@ class TestMcpPrimitive:
             pytest.param('rollbackable', None, ExternalEffectRollbackStatus.NOT_APPLIED, id='rollbackable-default'),
             pytest.param('no_rollback_required', None, ExternalEffectRollbackStatus.NOT_REQUIRED, id='not-required-default'),
             pytest.param('unknown', None, ExternalEffectRollbackStatus.UNKNOWN, id='unknown-default'),
+            pytest.param('rollbackable', 'null', ExternalEffectRollbackStatus.NOT_APPLIED, id='explicit-null-default'),
             pytest.param('rollbackable', 'unknown', ExternalEffectRollbackStatus.UNKNOWN, id='explicit-override'),
         ],
     )
@@ -796,6 +797,172 @@ class TestMcpPrimitive:
         assert call_started.is_set()
         assert not call_completed.is_set()
         assert elapsed < 0.45
+
+    @pytest.mark.parametrize("next_cursor", ["second-page", ""])
+    def test_sdk_list_tools_rejects_a_paginated_catalog(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        next_cursor: str,
+    ) -> None:
+        provider = SdkMcpProvider()
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="paginated-list",
+            transport="streamable_http",
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=65_536,
+            max_response_bytes=1_048_576,
+            http=McpHttpTransportSpec(url="https://mcp.example.test/tools"),
+        )
+
+        class FakeSession:
+            async def list_tools(self) -> Any:
+                item = SimpleNamespace(
+                    name="demo.echo",
+                    description=None,
+                    inputSchema={},
+                )
+                return SimpleNamespace(tools=[item], nextCursor=next_cursor)
+
+        @contextlib.asynccontextmanager
+        async def fake_session(*_args: Any, **_kwargs: Any):
+            yield FakeSession()
+
+        monkeypatch.setattr(provider, "_session", fake_session)
+
+        with pytest.raises(RuntimeError, match="unsupported continuation cursor"):
+            provider.list_tools(
+                server,
+                timeout_s=server.timeout_s,
+                max_response_bytes=server.max_response_bytes,
+            )
+
+    @pytest.mark.parametrize("next_cursor", ["second-page", ""])
+    def test_sdk_validate_and_call_rejects_a_paginated_live_catalog(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        next_cursor: str,
+    ) -> None:
+        provider = SdkMcpProvider()
+        tool = McpToolSpec(
+            tool_id="echo",
+            mcp_name="demo.echo",
+            right="read",
+            rollback_class="no_rollback_required",
+            state_mutation=False,
+            information_flow=True,
+        )
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="paginated-call",
+            transport="streamable_http",
+            tools=[tool],
+            timeout_s=1,
+            max_request_bytes=65_536,
+            max_response_bytes=1_048_576,
+            http=McpHttpTransportSpec(url="https://mcp.example.test/tools"),
+        )
+        call_started = False
+
+        class FakeSession:
+            async def list_tools(self) -> Any:
+                item = SimpleNamespace(
+                    name="demo.echo",
+                    description=None,
+                    inputSchema={},
+                )
+                return SimpleNamespace(tools=[item], nextCursor=next_cursor)
+
+            async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> Any:
+                nonlocal call_started
+                call_started = True
+                raise AssertionError("call_tool must not run for a partial catalog")
+
+        @contextlib.asynccontextmanager
+        async def fake_session(*_args: Any, **_kwargs: Any):
+            yield FakeSession()
+
+        monkeypatch.setattr(provider, "_session", fake_session)
+
+        result = provider.validate_and_call(
+            server,
+            tool,
+            {},
+            timeout_s=server.timeout_s,
+            max_response_bytes=server.max_response_bytes,
+        )
+
+        assert result.error_type == "LiveToolValidationError"
+        assert result.list_response_bytes == server.max_response_bytes
+        assert not result.call_started
+        assert not call_started
+
+    def test_sdk_accepts_a_complete_single_page_tools_catalog(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = SdkMcpProvider()
+        tool = McpToolSpec(
+            tool_id="echo",
+            mcp_name="demo.echo",
+            right="read",
+            rollback_class="no_rollback_required",
+            state_mutation=False,
+            information_flow=True,
+        )
+        server = McpServerSpec(
+            schema_version=1,
+            server_id="single-page",
+            transport="streamable_http",
+            tools=[tool],
+            timeout_s=1,
+            max_request_bytes=65_536,
+            max_response_bytes=1_048_576,
+            http=McpHttpTransportSpec(url="https://mcp.example.test/tools"),
+        )
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        class FakeSession:
+            async def list_tools(self) -> Any:
+                item = SimpleNamespace(
+                    name="demo.echo",
+                    description="Echo input",
+                    inputSchema={},
+                )
+                return SimpleNamespace(tools=[item], nextCursor=None)
+
+            async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+                calls.append((name, arguments))
+                return SimpleNamespace(
+                    content=[{"type": "text", "text": "ok"}],
+                    structuredContent={"ok": True},
+                    isError=False,
+                )
+
+        @contextlib.asynccontextmanager
+        async def fake_session(*_args: Any, **_kwargs: Any):
+            yield FakeSession()
+
+        monkeypatch.setattr(provider, "_session", fake_session)
+
+        listed = provider.list_tools(
+            server,
+            timeout_s=server.timeout_s,
+            max_response_bytes=server.max_response_bytes,
+        )
+        called = provider.validate_and_call(
+            server,
+            tool,
+            {"text": "hello"},
+            timeout_s=server.timeout_s,
+            max_response_bytes=server.max_response_bytes,
+        )
+
+        assert [item.name for item in listed.tools] == ["demo.echo"]
+        assert called.error is None
+        assert called.call_started
+        assert calls == [("demo.echo", {"text": "hello"})]
 
     def test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env(
         self,

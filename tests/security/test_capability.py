@@ -2427,6 +2427,131 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_delegate_can_add_git_ref_allowlist_as_restrictive_constraint(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            child = runtime.process.spawn(image='base-agent:v0', goal='child')
+            parent_capability = runtime.capability.grant(
+                parent,
+                'git_remote:workspace:origin',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+
+            assert runtime.capability.spec_covers(
+                parent_capability,
+                CapabilitySpec(
+                    resource='git_remote:workspace:origin',
+                    rights={CapabilityRight.READ.value},
+                    constraints={'git_allowed_refs': ['refs/heads/main']},
+                ),
+            )
+
+            delegated = runtime.capability.delegate(
+                parent,
+                child,
+                CapabilitySpec(
+                    resource='git_remote:workspace:origin',
+                    rights={CapabilityRight.READ.value},
+                    constraints={'git_allowed_refs': ['refs/heads/main']},
+                ),
+            )
+
+            assert delegated.constraints == {'git_allowed_refs': ['refs/heads/main']}
+            assert runtime.capability.authorize(
+                child,
+                'git_remote:workspace:origin',
+                CapabilityRight.READ,
+                {'git_remote_ref': 'refs/heads/main'},
+            ).allowed
+            assert not runtime.capability.authorize(
+                child,
+                'git_remote:workspace:origin',
+                CapabilityRight.READ,
+                {'git_remote_ref': 'refs/heads/private'},
+            ).allowed
+        finally:
+            runtime.close()
+
+    def test_delegate_selects_a_valid_parent_when_a_more_specific_parent_is_constrained(
+        self,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            child = runtime.process.spawn(image='base-agent:v0', goal='child')
+            unconstrained = runtime.capability.grant(
+                parent,
+                'filesystem:workspace:*',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+            runtime.capability.grant(
+                parent,
+                'filesystem:workspace:README.md',
+                [CapabilityRight.READ],
+                issued_by='test',
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'parent.readme.allow',
+                            'operation': 'filesystem.read',
+                            'effect': 'allow',
+                            'risk': 'harmless',
+                            'conditions': {'path': 'README.md'},
+                        }
+                    ]
+                },
+                delegable=True,
+            )
+            spec = CapabilitySpec(
+                resource='filesystem:workspace:README.md',
+                rights={CapabilityRight.READ.value},
+            )
+
+            selected_parent = runtime.capability.validate_delegation(parent, spec)
+            delegated = runtime.capability.delegate(parent, child, spec)
+
+            assert selected_parent.cap_id == unconstrained.cap_id
+            assert delegated.parent_cap_id == unconstrained.cap_id
+            assert delegated.constraints == {}
+        finally:
+            runtime.close()
+
+    def test_spec_coverage_rejects_new_authority_shaping_constraints(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = CapabilitySpec(
+                resource='shell:python',
+                rights={CapabilityRight.EXECUTE.value},
+                delegable=True,
+            )
+            requested = CapabilitySpec(
+                resource='shell:python',
+                rights={CapabilityRight.EXECUTE.value},
+                constraints={
+                    'authority_rules': [
+                        {
+                            'rule_id': 'delegated.python.allow',
+                            'operation': 'shell.run',
+                            'effect': 'allow',
+                            'risk': 'harmless',
+                            'conditions': {
+                                'argv': ['python', '--version'],
+                                'match': 'exact',
+                            },
+                        }
+                    ]
+                },
+            )
+
+            assert not runtime.capability.spec_covers(parent, requested)
+        finally:
+            runtime.close()
+
     def test_delegation_cannot_increase_parent_max_depth(self) -> None:
         runtime = Runtime.open('local')
         try:

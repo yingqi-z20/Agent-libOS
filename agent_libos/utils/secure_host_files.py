@@ -9,9 +9,11 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 _GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
 _FILE_SHARE_READ = 0x00000001
 _FILE_SHARE_WRITE = 0x00000002
 _OPEN_EXISTING = 3
+_OPEN_ALWAYS = 4
 _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _FILE_ATTRIBUTE_NORMAL = 0x00000080
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
@@ -88,6 +90,26 @@ def windows_open_contract(
     )
 
 
+def windows_readwrite_create_contract() -> WindowsOpenContract:
+    """Return the Win32 contract for a guarded mutable child file.
+
+    The caller must hold the parent directory through ``SecureDirectoryGuard``.
+    Other Runtime instances may open and lock the same file, but delete sharing
+    stays disabled so the selected directory entry cannot be replaced while the
+    descriptor is live.  ``FILE_FLAG_OPEN_REPARSE_POINT`` makes an existing
+    reparse point observable to the caller instead of following it.
+    """
+
+    return WindowsOpenContract(
+        desired_access=_GENERIC_READ | _GENERIC_WRITE,
+        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        creation_disposition=_OPEN_ALWAYS,
+        flags_and_attributes=(
+            _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT
+        ),
+    )
+
+
 def snapshot_from_stat(value: os.stat_result) -> StablePathSnapshot:
     attributes = int(getattr(value, "st_file_attributes", 0))
     return StablePathSnapshot(
@@ -147,9 +169,11 @@ class SecureFileDescriptor:
 
     def linked_snapshot(self) -> StablePathSnapshot:
         if self._windows_api is not None:
-            # The Win32 handle deliberately omits FILE_SHARE_DELETE and
-            # FILE_SHARE_WRITE, so its final path cannot be replaced and new
-            # writers cannot be admitted until this descriptor is closed.
+            # Every Win32 target handle omits FILE_SHARE_DELETE, so its final
+            # path cannot be replaced until this descriptor is closed.  The
+            # read-only contract also excludes FILE_SHARE_WRITE; the guarded
+            # read-write/create contract intentionally permits peer lock-file
+            # openers while continuing to forbid replacement.
             return self.snapshot()
         if self._parent_guard is not None:
             self._parent_guard.verify_path_guard()
@@ -305,6 +329,19 @@ class SecureDirectoryGuard:
         if self._parent_guard is not None:
             self._parent_guard.verify_path_guard()
         _verify_posix_ancestor_edges(self._posix_ancestor_edges)
+        if self._parent_descriptor is not None:
+            linked = snapshot_from_stat(
+                os.stat(
+                    self._relative_name,
+                    dir_fd=self._parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            opened = self.snapshot()
+            _require_stable_directory_snapshot(linked)
+            _require_stable_directory_snapshot(opened)
+            if not _same_stable_identity(linked, opened):
+                raise OSError("secure POSIX directory changed during access")
 
     def scandir(self) -> Any:
         if self._windows_api is not None:
@@ -451,6 +488,79 @@ def open_secure_file(
         relative_name=relative_name,
         posix_ancestor_descriptors=ancestor_descriptors,
         posix_ancestor_edges=ancestor_edges,
+    )
+
+
+def open_secure_readwrite_child(
+    path: str | Path,
+    *,
+    parent: SecureDirectoryGuard,
+    relative_name: str,
+    platform: str | None = None,
+    windows_api: Any | None = None,
+) -> SecureFileDescriptor:
+    """Open or create one mutable file below a held trusted directory.
+
+    This intentionally has no absolute-path form: creation is safe only while
+    the caller holds the exact parent directory.  POSIX uses ``dir_fd`` plus
+    ``O_NOFOLLOW``; Windows uses ``CreateFileW`` with ``OPEN_ALWAYS`` and
+    ``FILE_FLAG_OPEN_REPARSE_POINT`` while the parent guard prevents directory
+    replacement.
+    """
+
+    selected = Path(path)
+    _validate_child_path(selected, parent=parent, relative_name=relative_name)
+    selected_platform = (
+        "nt"
+        if windows_api is not None
+        else os.name if platform is None else platform
+    )
+    if selected_platform == "nt":
+        api = _WINDOWS_API if windows_api is None else windows_api
+        if api is None:
+            raise OSError("Win32 secure file APIs are unavailable")
+        descriptor, native_handle = api.open_readwrite_file_descriptor(
+            selected,
+            windows_readwrite_create_contract(),
+        )
+        return SecureFileDescriptor(
+            selected,
+            descriptor,
+            parent_guard=parent,
+            relative_name=relative_name,
+            windows_handle=native_handle,
+            windows_api=api,
+        )
+
+    if parent.descriptor is None:
+        raise OSError("secure POSIX parent directory descriptor is unavailable")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | _posix_open_flags(directory=False)
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            relative_name,
+            flags,
+            0o600,
+            dir_fd=parent.descriptor,
+        )
+        parent.verify_path_guard()
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    return SecureFileDescriptor(
+        selected,
+        descriptor,
+        parent_descriptor=parent.descriptor,
+        parent_guard=parent,
+        relative_name=relative_name,
     )
 
 
@@ -869,6 +979,30 @@ if os.name == "nt":
                 raise OSError("Win32 file descriptor conversion returned no descriptor")
             return descriptor, handle
 
+        def open_readwrite_file_descriptor(
+            self,
+            path: Path,
+            contract: WindowsOpenContract,
+        ) -> tuple[int, int]:
+            handle = self._open(path, contract)
+            descriptor: int | None = None
+            try:
+                descriptor = msvcrt.open_osfhandle(
+                    handle,
+                    os.O_RDWR | getattr(os, "O_BINARY", 0),
+                )
+                os.set_inheritable(descriptor, False)
+            except BaseException:
+                if descriptor is not None:
+                    os.close(descriptor)
+                else:
+                    self.close_handle(handle)
+                raise
+            if descriptor is None:
+                self.close_handle(handle)
+                raise OSError("Win32 file descriptor conversion returned no descriptor")
+            return descriptor, handle
+
         def open_directory(
             self,
             path: Path,
@@ -904,9 +1038,10 @@ if os.name == "nt":
                     attributes & _FILE_ATTRIBUTE_REPARSE_POINT
                 ),
                 # A zero legacy file index is possible on some Win32-backed
-                # filesystems. The no-write/no-delete target handle and the
-                # no-delete ancestor chain, rather than a nonzero index alone,
-                # provide the replacement guarantee for this snapshot.
+                # filesystems. The no-delete target handle and ancestor chain,
+                # rather than a nonzero index alone, provide the replacement
+                # guarantee. Read-only targets also block write sharing; the
+                # mutable lock-file contract intentionally permits peer writers.
                 replacement_locked=True,
             )
 

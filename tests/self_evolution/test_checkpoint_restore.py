@@ -40,7 +40,7 @@ from agent_libos.substrate import LocalHumanProvider, LocalResourceProviderSubst
 from agent_libos.storage import SQLiteStore
 from agent_libos.storage.repositories import SnapshotCheckpointRepository
 from agent_libos.tools.builtin.checkpoint import RestoreCheckpointOutput
-from agent_libos.utils.serde import dumps, loads
+from agent_libos.utils.serde import dumps, loads, to_jsonable
 from tests.support.checkpoints import ClassifiedShellProvider
 
 
@@ -1935,6 +1935,124 @@ class TestCheckpointRestore:
         finally:
             runtime.close()
 
+    def test_restore_superseded_message_is_not_visible_or_receivable_with_include_acked(
+        self,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='restore mailbox visibility')
+            runtime.capability.grant(
+                pid,
+                'process:spawn',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            child = runtime.spawn_child_process(pid, 'restore mailbox direct receive')
+            retained = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                channel='history',
+                subject='retained acknowledged message',
+            )
+            runtime.messages.ack(pid, [retained.message_id])
+            retained_unread = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                channel='history',
+                subject='retained unread message',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'before superseded mailbox input',
+                actor=pid,
+            )
+            superseded_history = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                channel='history',
+                subject='must not enter the visible history count',
+            )
+            superseded_late = runtime.messages.post(
+                sender='test',
+                recipient_pid=pid,
+                channel='late',
+                subject='must not cross restore',
+            )
+            child_superseded = runtime.messages.post(
+                sender='test',
+                recipient_pid=child,
+                channel='child-late',
+                subject='must not satisfy a direct blocking receive',
+            )
+
+            runtime.checkpoint.restore('cli', checkpoint_id, require_capability=False)
+
+            for message in (superseded_history, superseded_late, child_superseded):
+                stored = runtime.store.get_process_message(message.message_id)
+                assert stored is not None
+                assert stored.status == ProcessMessageStatus.SUPERSEDED_BY_RESTORE
+
+            read = runtime.tools.call(
+                pid,
+                'read_process_messages',
+                {
+                    'include_acked': True,
+                    'channel': 'history',
+                    'limit': 1,
+                    'ack': False,
+                },
+            )
+            assert read.ok, read.error
+            assert [message['message_id'] for message in read.payload['messages']] == [
+                retained.message_id
+            ]
+            assert read.payload['omitted_count'] == 1
+            assert read.payload['has_more'] is True
+            visible, matching_count = runtime.messages.list_page(
+                pid,
+                include_acked=True,
+                channel='history',
+                limit=10,
+            )
+            assert [message.message_id for message in visible] == [
+                retained.message_id,
+                retained_unread.message_id,
+            ]
+            assert matching_count == 2
+
+            with pytest.raises(ProcessMessageWaitRequired):
+                runtime.tools.call(
+                    pid,
+                    'receive_process_messages',
+                    {
+                        'include_acked': True,
+                        'channel': 'late',
+                        'block': True,
+                        'ack': False,
+                    },
+                )
+            waiting = runtime.process.get(pid)
+            assert waiting.status == ProcessStatus.WAITING_EVENT
+            assert waiting.wait_state is not None
+            assert waiting.wait_state.kind == 'message'
+            assert waiting.wait_state.filters['channel'] == 'late'
+
+            with pytest.raises(ProcessMessageWaitRequired):
+                runtime.messages.receive(
+                    child,
+                    block=True,
+                    include_acked=True,
+                    message_ids=[child_superseded.message_id],
+                )
+            child_waiting = runtime.process.get(child)
+            assert child_waiting.status == ProcessStatus.WAITING_EVENT
+            assert isinstance(child_waiting.wait_state, MessageProcessWait)
+            assert child_waiting.wait_state.filters['message_ids'] == [
+                child_superseded.message_id
+            ]
+        finally:
+            runtime.close()
+
     def test_checkpoint_payload_capture_limit_is_enforced(self) -> None:
         config = AgentLibOSConfig(checkpoint=CheckpointDefaults(payload_capture_limit_bytes=8))
         runtime = Runtime.open('local', config=config)
@@ -3046,6 +3164,71 @@ class TestCheckpointRestore:
         finally:
             if not runtime.lifecycle.closed:
                 runtime.close()
+
+    def test_multi_image_restore_failure_never_publishes_staged_cache_entries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        artifact_phase_entered = threading.Event()
+        release_artifact_phase = threading.Event()
+        outcomes: list[BaseException] = []
+        image_ids = (
+            'checkpoint-staged-first:v0',
+            'checkpoint-staged-second:v0',
+        )
+        snapshot = {
+            'checkpoint_id': 'ckpt_staged_images',
+            'images': {
+                image_id: to_jsonable(
+                    AgentImage(image_id=image_id, name=image_id.split(':', 1)[0])
+                )
+                for image_id in image_ids
+            },
+            'image_artifacts': {},
+        }
+        try:
+            def fail_late_artifact_phase(*_args: object, **_kwargs: object) -> None:
+                artifact_phase_entered.set()
+                if not release_artifact_phase.wait(timeout=5):
+                    raise RuntimeError('timed out waiting to fail image artifact restore')
+                raise RuntimeError('injected late image artifact restore failure')
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_image_artifact_rows',
+                fail_late_artifact_phase,
+            )
+
+            def restore_images() -> None:
+                try:
+                    runtime.checkpoint._restore_images(snapshot)
+                except BaseException as exc:
+                    outcomes.append(exc)
+
+            thread = threading.Thread(target=restore_images, daemon=True)
+            thread.start()
+            assert artifact_phase_entered.wait(timeout=5)
+
+            for image_id in image_ids:
+                assert image_id not in runtime.images
+                assert runtime.llm._images.get(image_id) is None
+                with pytest.raises(NotFound):
+                    runtime.launch.require_image(image_id)
+
+            release_artifact_phase.set()
+            thread.join(timeout=10)
+
+            assert not thread.is_alive()
+            assert len(outcomes) == 1
+            assert isinstance(outcomes[0], RuntimeError)
+            assert str(outcomes[0]) == 'injected late image artifact restore failure'
+            for image_id in image_ids:
+                assert image_id not in runtime.images
+                assert runtime.store.get_image(image_id) is None
+        finally:
+            release_artifact_phase.set()
+            runtime.close()
 
     @pytest.mark.postgres
     def test_postgres_reopen_reconciles_checkpoint_restore_image_phase_once(

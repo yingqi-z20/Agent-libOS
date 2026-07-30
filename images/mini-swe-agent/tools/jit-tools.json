@@ -105,10 +105,21 @@
           }
         ],
         "expected": {"returncode": 0, "output": "clipped", "warning": "Shell capture was truncated before this observation; output is incomplete.", "stdout_truncated": true, "stderr_truncated": false, "output_incomplete": true, "exception_info": ""}
+      },
+      {
+        "args": {"command": "printf blocked >&2; exit 1", "submit": true},
+        "syscalls": [
+          {
+            "name": "shell.run",
+            "args": {"argv": ["bash", "-lc", "exec 2>&1; printf blocked >&2; exit 1"], "timeout_s": 30},
+            "result": {"returncode": 1, "stdout": "blocked", "stderr": ""}
+          }
+        ],
+        "expected": {"returncode": 1, "output": "blocked", "stdout_truncated": false, "stderr_truncated": false, "output_incomplete": false, "exception_info": ""}
       }
     ],
     "metadata": {
-      "compatibility": "mini-swe-agent mini.yaml bash tool",
+      "inspiration": "mini-swe-agent mini.yaml single-bash tool shape",
       "command_max_chars": 32768,
       "final_output_max_chars": 10000,
       "character_unit": "unicode_code_points"

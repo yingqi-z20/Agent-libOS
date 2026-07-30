@@ -436,6 +436,21 @@ class RuntimePublicationRepositoryProtocol(Protocol):
         pid: str | None = None,
     ) -> list[RuntimePublicationRecord]: ...
 
+    def get_committed_root_spawn_publication(
+        self,
+        pid: str,
+    ) -> RuntimePublicationRecord | None: ...
+
+    def redact_root_spawn_initial_goal(
+        self,
+        publication_id: str,
+        *,
+        pid: str,
+        goal_oid: str,
+        expected_payload_sha256: str,
+        expected_states: Iterable[RuntimePublicationState | str] = ("committed",),
+    ) -> bool: ...
+
     def query_runtime_publication_operation_reconciliation(
         self,
         *,
@@ -889,6 +904,16 @@ class ObjectRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
         oid: str,
     ) -> PersistedObjectState | None: ...
 
+    def rehydrate_root_spawn_goal_payload(
+        self,
+        oid: str,
+        payload: Any,
+        *,
+        expected_version: int,
+        expected_identity_sha256: str,
+        require_recovery_lease: Callable[[], None],
+    ) -> bool: ...
+
 
 class ObjectQueryBackendProtocol(TransactionBackendProtocol, Protocol):
     """Payload-free, hard-bounded Object directory query surface."""
@@ -962,6 +987,7 @@ class ProcessBackendProtocol(
         recipient_pid: str | None = None,
         *,
         status: ProcessMessageStatus | str | None = None,
+        statuses: Iterable[ProcessMessageStatus | str] | None = None,
         kind: ProcessMessageKind | str | None = None,
         sender: str | None = None,
         channel: str | None = None,
@@ -1286,6 +1312,21 @@ class RuntimePublicationBackendProtocol(TransactionBackendProtocol, Protocol):
         pid: str | None = None,
     ) -> list[Mapping[str, Any]]: ...
 
+    def get_committed_root_spawn_publication(
+        self,
+        pid: str,
+    ) -> Mapping[str, Any] | None: ...
+
+    def redact_root_spawn_initial_goal(
+        self,
+        publication_id: str,
+        *,
+        pid: str,
+        goal_oid: str,
+        expected_payload_sha256: str,
+        expected_states: Iterable[RuntimePublicationState | str] = ("committed",),
+    ) -> bool: ...
+
     def query_runtime_publication_operation_reconciliation(
         self,
         *,
@@ -1551,6 +1592,7 @@ class SnapshotCheckpointBackendProtocol(
         recipient_pid: str | None = None,
         *,
         status: ProcessMessageStatus | str | None = None,
+        statuses: Iterable[ProcessMessageStatus | str] | None = None,
         kind: ProcessMessageKind | str | None = None,
         sender: str | None = None,
         channel: str | None = None,
@@ -1565,6 +1607,7 @@ class SnapshotCheckpointBackendProtocol(
         recipient_pid: str | None = None,
         *,
         status: ProcessMessageStatus | str | None = None,
+        statuses: Iterable[ProcessMessageStatus | str] | None = None,
         kind: ProcessMessageKind | str | None = None,
         sender: str | None = None,
         channel: str | None = None,

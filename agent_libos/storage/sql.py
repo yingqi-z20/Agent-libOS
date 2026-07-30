@@ -13,11 +13,21 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.evidence.initial_goal_recovery import (
+    INITIAL_GOAL_RECOVERY_KEY,
+    canonical_initial_goal_json_bytes,
+    decode_initial_goal_recovery_envelope,
+    initial_goal_object_identity,
+    initial_goal_object_identity_sha256,
+    redact_initial_goal_recovery_envelope,
+    redact_initial_goal_recovery_receipt_projection,
+)
 from agent_libos.evidence.payload_retention import (
     PayloadRetentionCursor,
     PayloadRetentionPage,
     PayloadRetentionTier,
     external_effect_payload_retention_tier,
+    llm_call_payload_can_be_image_only_transcript_head,
     llm_call_payload_requires_latest_guard,
     llm_call_payload_retention_tier,
     validate_external_effect_payload_retention_update,
@@ -638,6 +648,28 @@ def _canonical_process_message_metadata(value: Any) -> dict[str, Any]:
     return selected
 
 
+def _process_message_status_filter(
+    status: ProcessMessageStatus | str | None,
+    statuses: Iterable[ProcessMessageStatus | str] | None,
+) -> tuple[str | None, tuple[str, ...]]:
+    """Build the mutually exclusive single/set status predicate."""
+
+    if status is not None and statuses is not None:
+        raise ValidationError(
+            "process message query cannot combine status and statuses"
+        )
+    if status is not None:
+        return "status = ?", (ProcessMessageStatus(status).value,)
+    if statuses is None:
+        return None, ()
+    selected = tuple(
+        dict.fromkeys(ProcessMessageStatus(item).value for item in statuses)
+    )
+    if not selected:
+        return None, ()
+    return f"status IN ({', '.join('?' for _ in selected)})", selected
+
+
 _MISSING_OBJECT_PAYLOAD = object()
 _MISSING_PAYLOAD_BEFORE_IMAGE = object()
 _LLM_CONTEXT_LABEL_SCHEMA_VERSION = 1
@@ -1172,7 +1204,7 @@ class SQLRuntimeStore:
         return self.__checkpoint_restore_writer_token
 
     def _require_supported_store_version(self) -> bool:
-        """Reject pre-0.3 stores before initialization can mutate them."""
+        """Reject stores older than schema v3 before initialization can mutate them."""
 
         return self._require_supported_store_version_for(self.conn)
 
@@ -1190,8 +1222,8 @@ class SQLRuntimeStore:
             return False
         if cls._probe_user_schema_objects(conn):
             raise UnsupportedStoreVersion(
-                "unversioned Agent libOS store detected; 0.2 stores are archive-only "
-                "and cannot be opened by 0.3"
+                "unversioned Agent libOS store detected; pre-v3 stores are archive-only "
+                "and cannot be opened by the current runtime"
             )
         return True
 
@@ -1207,7 +1239,7 @@ class SQLRuntimeStore:
             missing["storage_migrations"] = ["obsolete table must be absent"]
         if missing:
             raise UnsupportedStoreVersion(
-                "unsupported or incomplete Agent libOS 0.3 store schema: "
+                "unsupported or incomplete Agent libOS store schema v3: "
                 f"{missing}"
             )
         cls._require_v3_keyset_text_collations(conn)
@@ -1230,7 +1262,7 @@ class SQLRuntimeStore:
                     )
         if incompatible:
             raise UnsupportedStoreVersion(
-                "unsupported Agent libOS 0.3 keyset collation schema: "
+                "unsupported Agent libOS store schema v3 keyset collation: "
                 f"{incompatible}"
             )
 
@@ -2971,7 +3003,7 @@ class SQLRuntimeStore:
             )
 
     def _initialize_v3_schema(self) -> None:
-        """Finish the fresh 0.3 schema without migration or backfill paths."""
+        """Finish a fresh schema-v3 store without migration or backfill paths."""
 
         self._create_v3_data_flow_schema()
         self._create_v3_operation_schema()
@@ -4649,7 +4681,7 @@ class SQLRuntimeStore:
         self._assert_post_exec_tool_result_append(current_process, process)
 
     def _post_exec_completion_receipt(self, mutation: Any) -> dict[str, Any]:
-        publication = self.get_runtime_publication(mutation.publication_id)
+        publication = self._get_runtime_publication_raw(mutation.publication_id)
         self._assert_post_exec_publication_identity(publication, mutation)
         assert publication is not None
         operation = self.get_operation(mutation.operation_id)
@@ -5729,11 +5761,23 @@ class SQLRuntimeStore:
                 now,
             ),
         )
-        publication = self.get_runtime_publication(publication_id)
+        publication = self._get_runtime_publication_raw(publication_id)
         assert publication is not None
         return publication
 
     def get_runtime_publication(self, publication_id: str) -> dict[str, Any] | None:
+        publication = self._get_runtime_publication_raw(publication_id)
+        if publication is None:
+            return None
+        publication["receipt"] = redact_initial_goal_recovery_receipt_projection(
+            publication["receipt"]
+        )
+        return publication
+
+    def _get_runtime_publication_raw(
+        self,
+        publication_id: str,
+    ) -> dict[str, Any] | None:
         rows = self._query(
             "SELECT * FROM runtime_publications WHERE publication_id = ?",
             (publication_id,),
@@ -5766,7 +5810,211 @@ class SQLRuntimeStore:
             f"SELECT * FROM runtime_publications{where} ORDER BY created_at, publication_id",
             params,
         )
-        return [self._runtime_publication_row(row) for row in rows]
+        publications = [self._runtime_publication_row(row) for row in rows]
+        for publication in publications:
+            publication["receipt"] = redact_initial_goal_recovery_receipt_projection(
+                publication["receipt"]
+            )
+        return publications
+
+    def get_committed_root_spawn_publication(
+        self,
+        pid: str,
+    ) -> dict[str, Any] | None:
+        """Resolve the one durable root-spawn launch row without an unbounded scan."""
+
+        if type(pid) is not str or not pid or "\x00" in pid:
+            raise ValidationError("root spawn publication pid must be non-empty text")
+        rows = self._query(
+            "SELECT * FROM runtime_publications "
+            "INDEXED BY idx_runtime_publications_pid_kind "
+            "WHERE pid = ? AND kind = ? AND state = ? "
+            "ORDER BY created_at, publication_id LIMIT 2",
+            (pid, RuntimePublicationKind.PROCESS_LAUNCH.value, "committed"),
+        )
+        if len(rows) > 1:
+            raise ValidationError(
+                f"multiple committed process launch publications exist for {pid}"
+            )
+        if not rows:
+            return None
+        publication = self._runtime_publication_row(rows[0])
+        plan = publication["plan"]
+        if (
+            plan.get("launch_kind") != "spawn"
+            or plan.get("pid") != pid
+            or plan.get("parent_pid") is not None
+        ):
+            raise ValidationError(
+                f"committed root spawn publication identity changed for {pid}"
+            )
+        return publication
+
+    @staticmethod
+    def _validated_root_spawn_goal_redaction_request(
+        publication_id: str,
+        *,
+        pid: str,
+        goal_oid: str,
+        expected_payload_sha256: str,
+        expected_states: Iterable[str],
+    ) -> set[str]:
+        for field_name, value in (
+            ("publication_id", publication_id),
+            ("pid", pid),
+            ("goal_oid", goal_oid),
+        ):
+            if type(value) is not str or not value or "\x00" in value:
+                raise ValidationError(
+                    f"root spawn initial goal {field_name} must be non-empty text"
+                )
+        digest_is_valid = (
+            type(expected_payload_sha256) is str
+            and len(expected_payload_sha256) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in expected_payload_sha256
+            )
+        )
+        if not digest_is_valid:
+            raise ValidationError("root spawn initial goal digest is invalid")
+        try:
+            selected_states = {
+                parse_runtime_publication_state(state) for state in expected_states
+            }
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"root spawn initial goal redaction states are invalid: {exc}"
+            ) from exc
+        if not selected_states:
+            raise ValidationError(
+                "root spawn initial goal redaction requires expected states"
+            )
+        return selected_states
+
+    @staticmethod
+    def _root_spawn_publication_matches_redaction(
+        publication: Mapping[str, Any],
+        *,
+        pid: str,
+        expected_states: set[str],
+    ) -> bool:
+        plan = publication["plan"]
+        return (
+            publication["kind"] is RuntimePublicationKind.PROCESS_LAUNCH
+            and publication["state"] in expected_states
+            and publication["pid"] == pid
+            and plan.get("launch_kind") == "spawn"
+            and plan.get("pid") == pid
+            and plan.get("parent_pid") is None
+        )
+
+    def _root_spawn_goal_redaction_receipt(
+        self,
+        publication: Mapping[str, Any],
+        *,
+        pid: str,
+        goal_oid: str,
+        expected_payload_sha256: str,
+    ) -> tuple[dict[str, Any], bool]:
+        receipt = deepcopy(publication["receipt"])
+        phases = receipt.get("phases")
+        if not isinstance(phases, list):
+            raise ValidationError("root spawn publication phases are invalid")
+        matches = [
+            phase
+            for phase in phases
+            if isinstance(phase, dict)
+            and phase.get("phase") == "goal_created"
+            and INITIAL_GOAL_RECOVERY_KEY in phase
+        ]
+        if len(matches) != 1:
+            raise ValidationError(
+                "root spawn publication must contain one initial goal envelope"
+            )
+        phase = matches[0]
+        try:
+            envelope = decode_initial_goal_recovery_envelope(
+                phase[INITIAL_GOAL_RECOVERY_KEY],
+                payload_hard_limit_bytes=(
+                    self.config.tools.memory_payload_hard_limit_bytes
+                ),
+            )
+        except ValueError as exc:
+            raise ValidationError(
+                f"invalid root spawn initial goal recovery envelope: {exc}"
+            ) from exc
+        anchor_matches = (
+            phase.get("goal_oid") == goal_oid
+            and envelope.pid == pid
+            and envelope.goal_oid == goal_oid
+            and envelope.payload_sha256 == expected_payload_sha256
+        )
+        if not anchor_matches:
+            raise ValidationError("root spawn initial goal redaction anchor changed")
+        if envelope.recoverable:
+            phase[INITIAL_GOAL_RECOVERY_KEY] = (
+                redact_initial_goal_recovery_envelope(
+                    phase[INITIAL_GOAL_RECOVERY_KEY],
+                    payload_hard_limit_bytes=(
+                        self.config.tools.memory_payload_hard_limit_bytes
+                    ),
+                )
+            )
+        return receipt, envelope.recoverable
+
+    def redact_root_spawn_initial_goal(
+        self,
+        publication_id: str,
+        *,
+        pid: str,
+        goal_oid: str,
+        expected_payload_sha256: str,
+        expected_states: Iterable[str] = ("committed",),
+    ) -> bool:
+        """CAS the reversible root launch goal to its hash-only projection."""
+
+        selected_states = self._validated_root_spawn_goal_redaction_request(
+            publication_id,
+            pid=pid,
+            goal_oid=goal_oid,
+            expected_payload_sha256=expected_payload_sha256,
+            expected_states=expected_states,
+        )
+        with self._lock:
+            publication = self._get_runtime_publication_raw(publication_id)
+            if publication is None:
+                return False
+            if not self._root_spawn_publication_matches_redaction(
+                publication,
+                pid=pid,
+                expected_states=selected_states,
+            ):
+                return False
+            receipt, changed = self._root_spawn_goal_redaction_receipt(
+                publication,
+                pid=pid,
+                goal_oid=goal_oid,
+                expected_payload_sha256=expected_payload_sha256,
+            )
+            if not changed:
+                return True
+            current_receipt = dumps(publication["receipt"])
+            updated = self._execute(
+                "UPDATE runtime_publications SET receipt_json = ?, updated_at = ? "
+                "WHERE publication_id = ? AND kind = ? AND pid = ? "
+                "AND state = ? AND receipt_json = ?",
+                (
+                    dumps(receipt),
+                    utc_now(),
+                    publication_id,
+                    RuntimePublicationKind.PROCESS_LAUNCH.value,
+                    pid,
+                    publication["state"],
+                    current_receipt,
+                ),
+            )
+            return updated.rowcount == 1
 
     def query_runtime_publication_operation_reconciliation(
         self,
@@ -5863,9 +6111,14 @@ class SQLRuntimeStore:
             "ORDER BY created_at, publication_id LIMIT ?",
             params,
         )
-        records = tuple(
+        records_list = [
             self._runtime_publication_row(row) for row in rows[:selected_limit]
-        )
+        ]
+        for publication in records_list:
+            publication["receipt"] = redact_initial_goal_recovery_receipt_projection(
+                publication["receipt"]
+            )
+        records = tuple(records_list)
         next_cursor = None
         if len(rows) > selected_limit and records:
             last = records[-1]
@@ -5893,7 +6146,7 @@ class SQLRuntimeStore:
                 "only terminal runtime publications can complete operation reconciliation"
             )
         with self._lock:
-            publication = self.get_runtime_publication(publication_id)
+            publication = self._get_runtime_publication_raw(publication_id)
             if publication is None:
                 return False
             if (
@@ -6370,7 +6623,7 @@ class SQLRuntimeStore:
         publication_id: str,
         target: _PayloadDeliveryTransitionTarget,
     ) -> None:
-        readback = self.get_runtime_publication(publication_id)
+        readback = self._get_runtime_publication_raw(publication_id)
         if readback is None or (
             readback["payload_delivery_state"] != target.state
             or readback["payload_delivery_attempt_id"] != target.attempt_id
@@ -6414,7 +6667,7 @@ class SQLRuntimeStore:
                 raise ValidationError(
                     "checkpoint restore payload delivery requires the internal writer"
                 )
-            publication = self.get_runtime_publication(publication_id)
+            publication = self._get_runtime_publication_raw(publication_id)
             if publication is None:
                 return False
             target = _payload_delivery_transition_target(
@@ -6486,7 +6739,7 @@ class SQLRuntimeStore:
         if claimed_state not in {"reconciliation_pending", "rollback_pending"}:
             return None
         with self._lock:
-            publication = self.get_runtime_publication(publication_id)
+            publication = self._get_runtime_publication_raw(publication_id)
             if publication is None:
                 return None
             if (
@@ -6650,7 +6903,7 @@ class SQLRuntimeStore:
         if state not in allowed_states:
             raise ValidationError(f"invalid runtime publication state: {state}")
         with self._lock:
-            publication = self.get_runtime_publication(publication_id)
+            publication = self._get_runtime_publication_raw(publication_id)
             if publication is None:
                 return False
             if publication["kind"] == "checkpoint_restore":
@@ -7162,7 +7415,7 @@ class SQLRuntimeStore:
         """
 
         with self._lock:
-            publication = self.get_runtime_publication(publication_id)
+            publication = self._get_runtime_publication_raw(publication_id)
             if publication is None:
                 return False
             if (
@@ -7236,7 +7489,7 @@ class SQLRuntimeStore:
             raise ValidationError("runtime publication artifact requires artifact_id")
         selected["artifact_id"] = artifact_id
         with self._lock:
-            publication = self.get_runtime_publication(publication_id)
+            publication = self._get_runtime_publication_raw(publication_id)
             if publication is None:
                 return False
             if (
@@ -8934,6 +9187,161 @@ class SQLRuntimeStore:
                         )
                     ),
                 )
+
+    def _validated_root_spawn_goal_rehydration_payload(
+        self,
+        oid: str,
+        payload: Any,
+        *,
+        expected_version: int,
+        expected_identity_sha256: str,
+    ) -> bytes:
+        if type(oid) is not str or not oid or "\x00" in oid:
+            raise ValidationError("root spawn goal oid must be non-empty text")
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version <= 0
+        ):
+            raise ValidationError("root spawn goal version must be positive")
+        digest_is_valid = (
+            type(expected_identity_sha256) is str
+            and len(expected_identity_sha256) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in expected_identity_sha256
+            )
+        )
+        if not digest_is_valid:
+            raise ValidationError("root spawn goal identity digest is invalid")
+        try:
+            payload_bytes = canonical_initial_goal_json_bytes(payload)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        hard_limit = self.config.tools.memory_payload_hard_limit_bytes
+        if len(payload_bytes) > hard_limit:
+            raise ValidationError(
+                "root spawn goal payload exceeds configured hard limit: "
+                f"{len(payload_bytes)} > {hard_limit}"
+            )
+        return payload_bytes
+
+    def _root_spawn_goal_rehydration_row(self, oid: str) -> Mapping[str, Any]:
+        rows = self._query(
+            "SELECT oid, namespace, name, type, schema_version, payload_json, "
+            "metadata_json, provenance_json, version, immutable, created_by, "
+            "owner_kind, owner_id, lifecycle_state, created_at "
+            "FROM objects WHERE oid = ?",
+            (oid,),
+        )
+        if len(rows) != 1:
+            raise ValidationError("root spawn goal Object is missing")
+        return rows[0]
+
+    @staticmethod
+    def _require_root_spawn_goal_rehydration_state(
+        row: Mapping[str, Any],
+        *,
+        expected_version: int,
+    ) -> None:
+        immutable = row["immutable"]
+        immutable_is_true = (
+            type(immutable) is bool and immutable is True
+        ) or (
+            type(immutable) is int and immutable == 1
+        )
+        state_matches = (
+            row["type"] == ObjectType.GOAL.value
+            and row["lifecycle_state"] == ObjectLifecycleState.LIVE.value
+            and row["version"] == expected_version
+            and row["payload_json"] in _RUNTIME_OBJECT_PRESENT_PAYLOAD_MARKERS
+            and immutable_is_true
+        )
+        if not state_matches:
+            raise ValidationError("root spawn goal Object state changed")
+
+    @staticmethod
+    def _root_spawn_goal_identity_digest(row: Mapping[str, Any]) -> str:
+        try:
+            identity = initial_goal_object_identity(
+                oid=str(row["oid"]),
+                namespace=str(row["namespace"]),
+                name=str(row["name"]),
+                object_type=str(row["type"]),
+                schema_version=str(row["schema_version"]),
+                metadata=loads(row["metadata_json"], {}),
+                provenance=loads(row["provenance_json"], {}),
+                version=int(row["version"]),
+                immutable=bool(row["immutable"]),
+                created_by=str(row["created_by"]),
+                owner_kind=str(row["owner_kind"]),
+                owner_id=str(row["owner_id"]),
+                created_at=str(row["created_at"]),
+            )
+            return initial_goal_object_identity_sha256(identity)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"root spawn goal Object identity is invalid: {exc}"
+            ) from exc
+
+    def _cache_root_spawn_goal_payload(
+        self,
+        oid: str,
+        payload: Any,
+        payload_bytes: bytes,
+    ) -> bool:
+        if oid not in self._object_payloads:
+            self._object_payloads[oid] = deepcopy(payload)
+            return True
+        try:
+            existing = canonical_initial_goal_json_bytes(self._object_payloads[oid])
+        except ValueError as exc:
+            raise ValidationError(
+                f"root spawn goal cache payload is invalid: {exc}"
+            ) from exc
+        if existing != payload_bytes:
+            raise ValidationError("root spawn goal cache payload changed")
+        return False
+
+    def rehydrate_root_spawn_goal_payload(
+        self,
+        oid: str,
+        payload: Any,
+        *,
+        expected_version: int,
+        expected_identity_sha256: str,
+        require_recovery_lease: Callable[[], None],
+    ) -> bool:
+        """Restore one validated root goal into volatile cache without SQL writes."""
+
+        require_recovery_lease()
+        payload_bytes = self._validated_root_spawn_goal_rehydration_payload(
+            oid,
+            payload,
+            expected_version=expected_version,
+            expected_identity_sha256=expected_identity_sha256,
+        )
+        with self._lock:
+            self._ensure_healthy()
+            self._ensure_store_scope_admitted()
+            if self._transaction_depth != 0:
+                raise ValidationError(
+                    "root spawn goal cache rehydration requires an outermost "
+                    "durable transaction boundary"
+                )
+            row = self._root_spawn_goal_rehydration_row(oid)
+            self._require_root_spawn_goal_rehydration_state(
+                row,
+                expected_version=expected_version,
+            )
+            actual_identity_sha256 = self._root_spawn_goal_identity_digest(row)
+            if actual_identity_sha256 != expected_identity_sha256:
+                raise ValidationError("root spawn goal Object identity changed")
+            return self._cache_root_spawn_goal_payload(
+                oid,
+                payload,
+                payload_bytes,
+            )
 
     def is_recovered_object_payload(self, oid: str) -> bool:
         with self.locked():
@@ -11264,7 +11672,10 @@ class SQLRuntimeStore:
             SELECT source.*,
                    CASE
                      WHEN source.pid IS NOT NULL
-                      AND source.status = 'ok'
+                      AND (
+                           source.status = 'ok'
+                           OR substr(source.purpose, 1, 19) = 'image_only_request:'
+                      )
                       AND NOT EXISTS (
                        SELECT 1
                          FROM llm_calls AS newer
@@ -11281,6 +11692,26 @@ class SQLRuntimeStore:
                      ) THEN 1
                      ELSE 0
                    END AS payload_retention_is_latest_llm_call
+                   ,CASE
+                     WHEN source.pid IS NOT NULL
+                      AND source.status = 'ok'
+                      AND NOT EXISTS (
+                       SELECT 1
+                         FROM llm_calls AS newer_success
+                              INDEXED BY idx_llm_calls_provider_chain_head
+                        WHERE newer_success.pid = source.pid
+                          AND newer_success.purpose = source.purpose
+                          AND newer_success.status = 'ok'
+                          AND (
+                            newer_success.created_at COLLATE BINARY,
+                            newer_success.call_id COLLATE BINARY
+                          ) > (
+                            source.created_at COLLATE BINARY,
+                            source.call_id COLLATE BINARY
+                          )
+                     ) THEN 1
+                     ELSE 0
+                   END AS payload_retention_is_latest_successful_llm_call
               FROM llm_calls AS source
               JOIN (
                     SELECT call_id, created_at
@@ -11298,9 +11729,13 @@ class SQLRuntimeStore:
             self._row_to_llm_call(row) for row in rows[:selected_limit]
         )
         latest_llm_call_ids = frozenset(
-            str(row["call_id"])
-            for row in rows[:selected_limit]
+            record.call_id
+            for row, record in zip(rows[:selected_limit], records)
             if bool(row["payload_retention_is_latest_llm_call"])
+            or (
+                bool(row["payload_retention_is_latest_successful_llm_call"])
+                and llm_call_payload_can_be_image_only_transcript_head(record)
+            )
         )
         next_cursor = None
         if len(rows) > selected_limit and records:
@@ -11331,6 +11766,11 @@ class SQLRuntimeStore:
             if len(rows) != 1:
                 return False
             current = self._row_to_llm_call(rows[0])
+            latest_guard_kind = (
+                2
+                if llm_call_payload_can_be_image_only_transcript_head(current)
+                else int(llm_call_payload_requires_latest_guard(current))
+            )
             try:
                 target_tier = validate_llm_call_payload_retention_update(
                     current,
@@ -11371,6 +11811,7 @@ class SQLRuntimeStore:
                                  INDEXED BY idx_llm_calls_provider_chain_head
                            WHERE newer.pid = llm_calls.pid
                              AND newer.purpose = llm_calls.purpose
+                             AND (? != 2 OR newer.status = 'ok')
                              AND (
                                newer.created_at COLLATE BINARY,
                                newer.call_id COLLATE BINARY
@@ -11406,7 +11847,8 @@ class SQLRuntimeStore:
                     dumps(current.observability),
                     current.error,
                     current.error,
-                    int(llm_call_payload_requires_latest_guard(current)),
+                    latest_guard_kind,
+                    latest_guard_kind,
                 ),
             )
             return updated.rowcount == 1
@@ -11414,6 +11856,21 @@ class SQLRuntimeStore:
     def get_latest_llm_call(self, *, pid: str, purpose: str | None = None) -> LLMCallRecord | None:
         params: list[Any] = [pid]
         sql = "SELECT * FROM llm_calls WHERE pid = ?"
+        if purpose is not None:
+            sql += " AND purpose = ?"
+            params.append(purpose)
+        sql += " ORDER BY created_at DESC, call_id DESC LIMIT 1"
+        rows = self._query(sql, params)
+        return self._row_to_llm_call(rows[0]) if rows else None
+
+    def get_latest_successful_llm_call(
+        self,
+        *,
+        pid: str,
+        purpose: str | None = None,
+    ) -> LLMCallRecord | None:
+        params: list[Any] = [pid]
+        sql = "SELECT * FROM llm_calls WHERE pid = ? AND status = 'ok'"
         if purpose is not None:
             sql += " AND purpose = ?"
             params.append(purpose)
@@ -11771,6 +12228,7 @@ class SQLRuntimeStore:
         recipient_pid: str | None = None,
         *,
         status: ProcessMessageStatus | str | None = None,
+        statuses: Iterable[ProcessMessageStatus | str] | None = None,
         kind: ProcessMessageKind | str | None = None,
         sender: str | None = None,
         channel: str | None = None,
@@ -11786,10 +12244,12 @@ class SQLRuntimeStore:
         if recipient_pid is not None:
             clauses.append("recipient_pid = ?")
             params.append(recipient_pid)
-        if status is not None:
-            selected_status = ProcessMessageStatus(status)
-            clauses.append("status = ?")
-            params.append(selected_status.value)
+        status_clause, status_params = _process_message_status_filter(status, statuses)
+        if statuses is not None and not status_params:
+            return []
+        if status_clause is not None:
+            clauses.append(status_clause)
+            params.extend(status_params)
         if kind is not None:
             selected_kind = ProcessMessageKind(kind)
             clauses.append("kind = ?")
@@ -11823,6 +12283,7 @@ class SQLRuntimeStore:
         recipient_pid: str | None = None,
         *,
         status: ProcessMessageStatus | str | None = None,
+        statuses: Iterable[ProcessMessageStatus | str] | None = None,
         kind: ProcessMessageKind | str | None = None,
         sender: str | None = None,
         channel: str | None = None,
@@ -11837,9 +12298,12 @@ class SQLRuntimeStore:
         if recipient_pid is not None:
             clauses.append("recipient_pid = ?")
             params.append(recipient_pid)
-        if status is not None:
-            clauses.append("status = ?")
-            params.append(ProcessMessageStatus(status).value)
+        status_clause, status_params = _process_message_status_filter(status, statuses)
+        if statuses is not None and not status_params:
+            return 0
+        if status_clause is not None:
+            clauses.append(status_clause)
+            params.extend(status_params)
         if kind is not None:
             clauses.append("kind = ?")
             params.append(ProcessMessageKind(kind).value)

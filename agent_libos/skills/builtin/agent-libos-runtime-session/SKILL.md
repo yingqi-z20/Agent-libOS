@@ -151,15 +151,20 @@ those Host-managed runners.
   stop, preserve `result_oid`, do not call `process_exit` again, and leave the
   idempotent `retry_terminal_cleanup` action to the Host.
 - Goal recovery after reopen: cumulative review first reads the live goal Object.
-  If its runtime payload is gone, it can recover the exact initial goal only
-  from retained full-I/O LLM evidence and only up to 32,000 characters. Disabled
+  On persistent reopen, the Host may already have rehydrated the exact initial
+  goal of a committed live root spawn from its integrity-bound full-I/O launch
+  envelope. That exception does not cover child/fork or exec replacement goals.
+  If the live payload is still gone, review can recover the exact initial goal
+  only from retained full-I/O LLM evidence and only up to 32,000 characters. Disabled
   full-I/O, absent evidence, or oversized recovered context fails closed before
   a token is issued. Restore a suitable checkpoint or establish a supported
   bounded successor goal; never invent omitted requirements. A Human follow-up
   does not silently replace an unavailable original goal.
 
 Loaded projection and a pending wait can survive reopen; ordinary Object payloads
-do not. Use checkpoints, files, or approved storage for durable artifacts.
+do not. The narrow committed-root initial-goal envelope above is a startup aid,
+not general Object storage. Use checkpoints, files, or approved storage for
+durable artifacts.
 
 ## Completion evidence
 

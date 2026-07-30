@@ -1,8 +1,8 @@
 {
   "complexity_budgets": {
-    "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch": 60,
+    "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch": 59,
     "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch_object_tasks": 37,
-    "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch_process": 53,
+    "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch_process": 52,
     "agent_libos/human/manager.py::HumanObjectManager._terminal_question": 24,
     "agent_libos/human/manager.py::HumanObjectManager.list_for_presentation_window": 25,
     "agent_libos/human/manager.py::HumanObjectManager.query": 28,

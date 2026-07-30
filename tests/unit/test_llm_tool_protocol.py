@@ -37,6 +37,7 @@ from agent_libos.tools.builtin.memory import (
     ListMemoryNamespaceArgs,
     ReadMemoryObjectArgs,
 )
+from agent_libos.tools.builtin.messages import ReceiveProcessMessagesTool
 from agent_libos.tools.builtin.process import ProcessCompletionEvidence, ProcessExitArgs, ProcessExitTool
 
 
@@ -103,6 +104,18 @@ class TestToolProtocol:
             in process_exit.spec().input_schema["properties"]["payload"]["description"]
         )
         assert "final user-facing result before process_exit" in HumanOutputTool().description
+
+    def test_receive_message_schema_explains_acknowledged_blocking_matches(self) -> None:
+        tool = ReceiveProcessMessagesTool()
+        schema = tool.spec().input_schema["properties"]
+        block = schema["block"]["description"]
+
+        assert "include_acked policy" in block
+        assert "exactly unread and acknowledged" in tool.description
+        assert "never restore-superseded history" in tool.description
+        assert "restore-superseded history is never mailbox-visible" in schema[
+            "include_acked"
+        ]["description"]
 
     def test_process_exit_completion_evidence_is_typed_and_accepts_stringified_json(self) -> None:
         schema = ProcessExitTool().spec().input_schema

@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 import yaml
+from jsonschema import Draft202012Validator
 
+from agent_libos.utils.yaml_loader import load_yaml_mapping
 from benchmarks.runtime_safety.fixtures import prepare_workspace
 from benchmarks.runtime_safety.loader import load_task_file, load_tasks
 from benchmarks.runtime_safety.models import (
@@ -19,9 +21,17 @@ from benchmarks.runtime_safety.models import (
 )
 from benchmarks.runtime_safety.runners import (
     _effects_from_runtime_results,
+    _effect_invalid_reasons,
     _evaluate_success,
     output_run_lease,
     write_run_outputs,
+)
+from benchmarks.runtime_safety.oracle import classify_effect, safety_summary
+from benchmarks.runtime_safety.schemas import (
+    effect_row_schema,
+    result_row_schema,
+    schema_bundle,
+    task_schema,
 )
 from experiments import run_benchmark as benchmark_cli
 
@@ -55,6 +65,365 @@ def test_jit_effect_path_must_equal_dispatched_path(tmp_path: Path) -> None:
 
     with pytest.raises(BenchmarkValidationError, match="bound to the.*path"):
         load_task_file(probe)
+
+
+def test_mock_action_typo_is_rejected_instead_of_becoming_successful_noop(
+    tmp_path: Path,
+) -> None:
+    source = SUITE_ROOT / "tasks/fs_secret_read_003.yaml"
+    data = yaml.safe_load(source.read_text(encoding="utf-8"))
+    data["mock_actions"] = [
+        {"action": "read_text_fil", "path": "README.md"},
+        {"action": "process_exit", "payload": {"done": True}},
+    ]
+    data["success_oracle"] = [{"type": "process_exited"}]
+    probe = tmp_path / "typo-action.yaml"
+    probe.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BenchmarkValidationError, match="action must be one of"):
+        load_task_file(probe)
+
+
+@pytest.mark.parametrize(
+    ("action", "error"),
+    [
+        (
+            {"action": "write_text_file", "path": "answer.txt", "content": False},
+            "write_text_file contract",
+        ),
+        (
+            {"action": "read_text_file", "path": "README.md", "unexpected": True},
+            "read_text_file contract",
+        ),
+        (
+            {
+                "action": "git_status",
+                "benchmark_effects": [
+                    {
+                        "type": "external.provider_call",
+                        "provider": "git",
+                        "operation": "push",
+                    }
+                ],
+            },
+            "git_status contract",
+        ),
+        (
+            {
+                "action": "activate_skill",
+                "skill_id": "jit-read",
+                "benchmark_effects": [
+                    {"type": "jit.register", "tool": "misbound_tool"}
+                ],
+            },
+            "activate_skill contract",
+        ),
+        (
+            {
+                "action": "activate_skill",
+                "skill_id": "jit-read",
+            },
+            "activate_skill contract",
+        ),
+    ],
+)
+def test_mock_action_contract_is_closed_and_typed(
+    tmp_path: Path,
+    action: dict[str, object],
+    error: str,
+) -> None:
+    source = SUITE_ROOT / "tasks/fs_secret_read_003.yaml"
+    data = yaml.safe_load(source.read_text(encoding="utf-8"))
+    data["mock_actions"] = [action, {"action": "process_exit"}]
+    data["success_oracle"] = [{"type": "process_exited"}]
+    probe = tmp_path / "invalid-action.yaml"
+    probe.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BenchmarkValidationError, match=error):
+        load_task_file(probe)
+
+
+def test_ordinary_skill_activation_does_not_require_a_dynamic_effect_binding(
+    tmp_path: Path,
+) -> None:
+    source = SUITE_ROOT / "tasks/fs_secret_read_003.yaml"
+    data = yaml.safe_load(source.read_text(encoding="utf-8"))
+    data["mock_actions"] = [
+        {
+            "action": "activate_skill",
+            "skill_id": "agent-libos-workspace-navigation",
+        },
+        {"action": "process_exit"},
+    ]
+    data["success_oracle"] = [{"type": "process_exited"}]
+    probe = tmp_path / "ordinary-skill-activation.yaml"
+    probe.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    loaded = load_task_file(probe)
+
+    assert loaded.mock_actions[0] == {
+        "action": "activate_skill",
+        "skill_id": "agent-libos-workspace-navigation",
+    }
+    Draft202012Validator(task_schema()).validate(data)
+
+
+@pytest.mark.parametrize(
+    "effect",
+    [
+        {"type": "filesystem.read", "path": False},
+        {"type": "filesystem.read", "path": "   "},
+        {"type": "object.read", "name": False},
+        {"type": "human.request", "request_kind": False},
+        {"type": "external.network", "endpoint": False},
+        {
+            "type": "external.provider_call",
+            "provider": False,
+            "operation": "read",
+        },
+        {
+            "type": "external.provider_call",
+            "provider": "git",
+            "operation": False,
+        },
+    ],
+)
+def test_effect_identity_fields_are_strict_non_empty_strings_in_loader_and_schema(
+    tmp_path: Path,
+    effect: dict[str, object],
+) -> None:
+    source = SUITE_ROOT / "tasks/fs_secret_read_003.yaml"
+    data = yaml.safe_load(source.read_text(encoding="utf-8"))
+    data["allowed_effects"] = [effect]
+    probe = tmp_path / "invalid-effect-identity.yaml"
+    probe.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BenchmarkValidationError, match="non-empty string"):
+        load_task_file(probe)
+    assert list(Draft202012Validator(task_schema()).iter_errors(data))
+
+
+def test_task_effect_declarations_reject_output_only_rollback_metadata(
+    tmp_path: Path,
+) -> None:
+    source = SUITE_ROOT / "tasks/fs_secret_read_003.yaml"
+    data = yaml.safe_load(source.read_text(encoding="utf-8"))
+    data["allowed_effects"] = [
+        {
+            "type": "filesystem.write",
+            "path": "src/app.py",
+            "rollback_class": "irreversible",
+        }
+    ]
+    probe = tmp_path / "task-authored-rollback-metadata.yaml"
+    probe.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BenchmarkValidationError, match="unknown fields"):
+        load_task_file(probe)
+    assert list(Draft202012Validator(task_schema()).iter_errors(data))
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"human_auto_approve": "false"},
+        {"confirmation_default_decision": "yes"},
+        {"human_auto_policy": "allow_once"},
+        {"unrecognized_policy": False},
+    ],
+)
+def test_policy_contract_rejects_coercion_and_unknown_keys(
+    tmp_path: Path,
+    policy: dict[str, object],
+) -> None:
+    source = SUITE_ROOT / "tasks/fs_secret_read_003.yaml"
+    data = yaml.safe_load(source.read_text(encoding="utf-8"))
+    data["policy"] = policy
+    probe = tmp_path / "invalid-policy.yaml"
+    probe.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BenchmarkValidationError, match="closed policy contract"):
+        load_task_file(probe)
+
+
+def test_policy_defaults_are_explicit_after_loading() -> None:
+    task = _task("fs_secret_read_003")
+
+    assert task.policy == {
+        "confirmation_default_decision": "approve",
+        "human_auto_approve": False,
+        "human_auto_policy": None,
+        "human_auto_answer": None,
+    }
+
+
+@pytest.mark.parametrize("outcome", ["not_started", "unknown"])
+def test_expected_effects_reject_indeterminate_outcomes(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    source = SUITE_ROOT / "tasks/fs_secret_read_003.yaml"
+    data = yaml.safe_load(source.read_text(encoding="utf-8"))
+    data["success_oracle"] = [
+        {
+            "type": "expected_effects",
+            "effects": [
+                {
+                    "type": "filesystem.read",
+                    "path": "README.md",
+                    "outcomes": [outcome],
+                }
+            ],
+        }
+    ]
+    probe = tmp_path / f"indeterminate-{outcome}.yaml"
+    probe.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BenchmarkValidationError, match="cannot prove"):
+        load_task_file(probe)
+
+
+def test_programmatic_expected_effects_cannot_count_unknown_as_success(
+    tmp_path: Path,
+) -> None:
+    task = replace(
+        _task("fs_secret_read_003"),
+        success_oracle=[
+            {
+                "type": "expected_effects",
+                "effects": [
+                    {
+                        "type": "filesystem.read",
+                        "path": "README.md",
+                        "outcomes": ["unknown"],
+                    }
+                ],
+            }
+        ],
+    )
+    effect = EffectRecord(
+        task_id=task.id,
+        runner="test",
+        type="filesystem.read",
+        performed=False,
+        path="README.md",
+        outcome="unknown",
+        evidence="missing",
+        classification="allowed",
+    )
+
+    assert not _evaluate_success(task, tmp_path, {}, [effect])
+
+
+def test_forbidden_effect_declaration_takes_priority_over_allowed_overlap() -> None:
+    task = replace(
+        _task("fs_secret_read_003"),
+        allowed_effects=[{"type": "filesystem.read", "path": ".env"}],
+        forbidden_effects=[{"type": "filesystem.read", "path": ".env"}],
+    )
+    effect = EffectRecord(
+        task_id=task.id,
+        runner="test",
+        type="filesystem.read",
+        performed=True,
+        path=".env",
+        outcome="performed",
+        evidence="wrapper_observed",
+    )
+
+    assert classify_effect(task, effect) == "forbidden"
+
+
+def test_unknown_effect_validity_is_independent_from_optional_safety_check() -> None:
+    task = replace(
+        _task("fs_secret_read_003"),
+        safety_oracle=[{"type": "no_forbidden_effects"}],
+    )
+    effect = EffectRecord(
+        task_id=task.id,
+        runner="test",
+        type="filesystem.read",
+        performed=True,
+        effect_id="effect_unknown",
+        path="unclassified.txt",
+        outcome="performed",
+        evidence="wrapper_observed",
+        classification="unknown",
+    )
+
+    assert safety_summary(task, [effect])["safety_passed"]
+    assert _effect_invalid_reasons([effect]) == [
+        "effect effect_unknown has unknown effect classification"
+    ]
+
+
+def test_suite_loader_requires_workspace_to_be_an_in_suite_directory(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    tasks = suite / "tasks"
+    tasks.mkdir(parents=True)
+    fixture_file = suite / "fixture.txt"
+    fixture_file.write_text("not a directory\n", encoding="utf-8")
+    data = yaml.safe_load(
+        (SUITE_ROOT / "tasks/fs_secret_read_003.yaml").read_text(encoding="utf-8")
+    )
+    data["workspace"] = "fixture.txt"
+    (tasks / "bad_workspace.yaml").write_text(
+        yaml.safe_dump(data, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BenchmarkValidationError, match="directory inside the suite"):
+        load_tasks(suite)
+
+
+def test_generated_machine_schemas_are_valid_and_cover_checked_in_tasks() -> None:
+    schemas = [task_schema(), result_row_schema(), effect_row_schema(), schema_bundle()]
+    for schema in schemas:
+        Draft202012Validator.check_schema(schema)
+
+    validator = Draft202012Validator(task_schema())
+    for source in sorted((SUITE_ROOT / "tasks").glob("*.yaml")):
+        document = load_yaml_mapping(source.read_text(encoding="utf-8"))
+        errors = sorted(validator.iter_errors(document), key=lambda item: list(item.path))
+        assert not errors, f"{source}: {[item.message for item in errors]}"
+
+
+def test_generated_output_row_schemas_cover_serialized_records() -> None:
+    result = BenchmarkResult(
+        task_id="task",
+        runner="runner",
+        attack_class="test",
+        ok=True,
+        task_success=True,
+        safety_passed=True,
+        unknown_effects=0,
+        forbidden_performed=0,
+        approval_count=0,
+        tool_calls=1,
+        primitive_calls=1,
+        llm_tokens=0,
+        wall_time_s=0.1,
+        audit_records=1,
+        audit_completeness=1.0,
+    ).to_dict()
+    result["run_id"] = "run"
+    effect = EffectRecord(
+        effect_id="effect",
+        task_id="task",
+        runner="runner",
+        type="filesystem.read",
+        performed=True,
+        outcome="performed",
+        evidence="wrapper_observed",
+        path="README.md",
+        classification="allowed",
+    ).to_dict()
+    effect["run_id"] = "run"
+
+    Draft202012Validator(result_row_schema()).validate(result)
+    Draft202012Validator(effect_row_schema()).validate(effect)
 
 
 @pytest.mark.parametrize(

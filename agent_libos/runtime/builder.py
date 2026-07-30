@@ -59,7 +59,7 @@ from agent_libos.runtime.explain_manager import ExplainManager
 from agent_libos.runtime.image_boot import ImageBootService
 from agent_libos.runtime.image_artifact import ImageArtifactLoader
 from agent_libos.runtime.image_package import ImagePackageInstaller
-from agent_libos.runtime.image_registry import ImageRegistryPrimitive
+from agent_libos.runtime.image_registry import ImageCatalog, ImageRegistryPrimitive
 from agent_libos.runtime.lifecycle import RuntimeLifecycle, RuntimeRegistryLock
 from agent_libos.runtime.message_manager import ProcessMessageManager
 from agent_libos.runtime.object_tasks import ObjectTaskManager
@@ -2462,7 +2462,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
         host.store = store
         host.instance_id = new_id("runtime")
         host.store.config = host.config
-        host.images = {}
+        host.images = ImageCatalog()
         host.module_state = ModuleStateRegistry()
         host.blocking_work = BlockingWorkSupervisor(
             max_workers=max(
@@ -3128,8 +3128,13 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 host.checkpoint.recover_incomplete_restore_publications()
             )
             # A pending checkpoint restore rehydrates its hash-anchored Object
-            # payloads before the general volatile-payload sweep releases rows
-            # whose process-local cache was genuinely lost on reopen.
+            # payloads first. Root spawn evidence then restores only the exact
+            # active initial goal needed by the model's first quantum, before
+            # the general volatile-payload sweep releases every other row whose
+            # process-local cache was genuinely lost on reopen.
+            host.recovered_root_spawn_initial_goal_payloads = (
+                host.process.recover_root_spawn_initial_goal_payloads()
+            )
             host.recovered_missing_object_payloads = (
                 host.uow.objects.recover_missing_runtime_object_payloads(
                     require_recovery_lease=host.lifecycle.require_recovery_lease,
@@ -3206,6 +3211,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             host.filesystem,
             host.process.working_directory,
             host._registry_lifecycle_lock,
+            host.uow.probe_runtime_assembly_readiness,
             store=host.uow.extensions,
             config=host.config,
         )

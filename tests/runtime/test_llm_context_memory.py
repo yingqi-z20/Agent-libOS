@@ -120,6 +120,49 @@ def _new_llm_executor(runtime: Runtime) -> LLMProcessExecutor:
 
 class TestLLMContextMemory:
 
+    def test_first_quantum_allows_explicit_view_to_omit_live_goal(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            goal_sentinel = 'LIVE_GOAL_EXCLUDED_BY_EXPLICIT_VIEW'
+            client = RecordingActionClient([
+                {'action': 'process_exit', 'payload': {'done': True}},
+            ])
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal=goal_sentinel,
+            )
+            visible = runtime.memory.create_object(
+                pid,
+                ObjectType.EVIDENCE,
+                {'visible': 'explicit view source'},
+            )
+            process = runtime.process.get(pid)
+            goal_oid = process.goal_oid
+            assert goal_oid is not None
+            assert runtime.store.get_object(goal_oid) is not None
+            process.memory_view = runtime.memory.create_view(
+                pid,
+                [visible],
+                mode=ViewMode.READ_ONLY,
+            )
+            runtime.store.update_process(process)
+
+            result = runtime.run_process_once(pid)
+
+            assert result['ok'], result
+            assert len(client.user_prompts) == 1
+            assert goal_sentinel not in client.user_prompts[0]
+            request = [
+                record
+                for record in runtime.audit.trace(actor=pid)
+                if record.action == 'llm.request'
+            ][-1]
+            assert visible.oid in request.input_refs
+            assert goal_oid not in request.input_refs
+        finally:
+            runtime.close()
+
     def test_tool_result_prompt_projection_removes_redundant_wire_and_provenance_copies(
         self,
     ) -> None:

@@ -93,6 +93,12 @@ max_request_bytes: 65536
 max_response_bytes: 1048576
 ```
 
+This is a complete manifest-shape example, not a live weather service.
+`api.example.test` is a reserved documentation host and the environment
+variable name is only a Host credential mapping. Save an adapted manifest to
+a real file (the CLI section calls that user-created path `endpoint.yaml`),
+replace the URL and credential mapping, and then register it.
+
 The accepted v1 shape is closed: unknown endpoint, method, or header fields are
 rejected instead of being ignored. `metadata` and JSON Schema contents remain
 application-defined mappings. Mapping fields must actually be YAML/JSON
@@ -108,9 +114,10 @@ silently disable parameter validation.
 
 `right` is one of `read`, `write`, or `execute`. `rollback_class` accepts
 `irreversible`, `rollbackable`, `no_rollback_required`, or `unknown`;
-`rollback_status`, when supplied, accepts `not_supported`, `not_applied`,
-`not_required`, or `unknown`. When `rollback_status` is omitted, the default
-provider maps it as follows:
+non-null `rollback_status`, when supplied, accepts `not_supported`,
+`not_applied`, `not_required`, or `unknown`. An omitted `rollback_status` and
+an explicit YAML/JSON `null` have the same meaning: the default provider maps
+them as follows:
 
 | `rollback_class` | Effective omitted `rollback_status` |
 | --- | --- |
@@ -119,7 +126,7 @@ provider maps it as follows:
 | `no_rollback_required` | `not_required` |
 | `unknown` | `unknown` |
 
-An explicitly supplied `rollback_status` is preserved instead of applying this
+A supplied non-null `rollback_status` is preserved instead of applying this
 default mapping.
 
 A method cannot combine `no_rollback_required` with
@@ -380,6 +387,10 @@ uv run agent-libos --db .agent_libos.sqlite jsonrpc list --text weather --limit 
 uv run agent-libos --db .agent_libos.sqlite jsonrpc inspect demo-weather
 uv run agent-libos --db .agent_libos.sqlite jsonrpc register endpoint.yaml --replace
 ```
+
+`endpoint.yaml` is the user-created, adapted manifest described above; it is
+not shipped at the repository root. The reserved hostname in the example will
+not make these commands a live remote demo.
 
 Grant method authority and call as a process:
 

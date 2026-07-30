@@ -23,6 +23,7 @@ from agent_libos.llm.context_memory import (
 )
 from agent_libos.llm.pending import pending_metadata
 from agent_libos.models import (
+    Capability,
     CapabilityRight,
     ObjectPatch,
     ObjectRight,
@@ -428,6 +429,259 @@ def _storage_pressure_config(threshold_bytes: int = 5_000) -> AgentLibOSConfig:
     )
 
 
+def _replace_context_maintenance_with_finite_authority(
+    runtime: Runtime,
+    pid: str,
+) -> Capability:
+    unlimited = next(
+        capability
+        for capability in runtime.capability.capabilities_for(pid)
+        if capability.resource == LLM_CONTEXT_MAINTENANCE_RESOURCE
+        and capability.active
+    )
+    runtime.capability.revoke(
+        unlimited.cap_id,
+        revoked_by="test",
+        require_authority=False,
+    )
+    return runtime.capability.grant_once(
+        pid,
+        LLM_CONTEXT_MAINTENANCE_RESOURCE,
+        [CapabilityRight.EXECUTE],
+        issued_by="test",
+    )
+
+
+def test_finite_storage_pressure_maintenance_authority_is_consumed_by_first_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="finite-storage-pressure:v0",
+        name="finite-storage-pressure",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime, client, pid = _runtime_with_image(
+        image,
+        config=_storage_pressure_config(),
+    )
+    finite = _replace_context_maintenance_with_finite_authority(runtime, pid)
+    dispatches = 0
+
+    async def dispatch(
+        selected_pid: str,
+        _action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal dispatches
+        dispatches += 1
+        runtime.store.set_llm_context_generation(
+            selected_pid,
+            "finite-storage-pressure-complete",
+        )
+        return {
+            "ok": True,
+            "tool_id": "tool_context",
+            "result_oid": None,
+            "payload": {"compacted": True},
+            "error": None,
+        }
+
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        result = runtime.run_next_process_once()
+
+        assert result["context_compacted"] is True
+        assert result["context_storage_pressure"] is True
+        assert dispatches == 1
+        assert client.user_prompts == []
+        persisted = runtime.store.get_capability(finite.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 0
+    finally:
+        runtime.close()
+
+
+def test_storage_pressure_revocation_before_attempt_wins_without_dispatch_or_failure_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="storage-pressure-revoke-race:v0",
+        name="storage-pressure-revoke-race",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime, client, pid = _runtime_with_image(
+        image,
+        config=_storage_pressure_config(),
+    )
+    finite = _replace_context_maintenance_with_finite_authority(runtime, pid)
+    original_record = runtime.llm._record_storage_context_attempt
+    original_dispatch = runtime.llm.adispatch
+    dispatches = 0
+    raced = False
+
+    def revoke_before_attempt(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            runtime.capability.revoke(
+                finite.cap_id,
+                revoked_by="test",
+                require_authority=False,
+            )
+        return original_record(*args, **kwargs)
+
+    async def dispatch(
+        _selected_pid: str,
+        _action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal dispatches
+        if _action.get("action") != "compact_process_context":
+            return await original_dispatch(
+                _selected_pid,
+                _action,
+                context_metadata=context_metadata,
+            )
+        dispatches += 1
+        raise AssertionError("revoked storage maintenance authority dispatched")
+
+    monkeypatch.setattr(
+        runtime.llm,
+        "_record_storage_context_attempt",
+        revoke_before_attempt,
+    )
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        denied = runtime.run_next_process_once()
+
+        assert denied["ok"] is True
+        assert denied["context_maintenance_not_authorized"] is True
+        assert denied["context_compacted"] is False
+        assert dispatches == 0
+        pressure_actions = [
+            record.action
+            for record in runtime.audit.trace(actor=pid)
+            if record.action.startswith("llm.context_pressure_")
+        ]
+        assert pressure_actions == [
+            "llm.context_pressure_maintenance_not_authorized"
+        ]
+        assert runtime.llm.pending.get(pid) is None
+        persisted = runtime.store.get_capability(finite.cap_id)
+        assert persisted is not None
+        assert persisted.status.value == "revoked"
+        assert persisted.uses_remaining == 1
+
+        resumed = runtime.run_next_process_once()
+
+        assert resumed["action"]["action"] == "process_exit"
+        assert runtime.process.get(pid).status == ProcessStatus.EXITED
+        assert len(client.user_prompts) == 1
+        assert dispatches == 0
+    finally:
+        runtime.close()
+
+
+def test_storage_pressure_marker_failure_rolls_back_finite_authority_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="storage-pressure-marker-failure:v0",
+        name="storage-pressure-marker-failure",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime, client, pid = _runtime_with_image(
+        image,
+        config=_storage_pressure_config(),
+    )
+    finite = _replace_context_maintenance_with_finite_authority(runtime, pid)
+    dispatches = 0
+
+    def fail_marker(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("marker unavailable")
+
+    async def dispatch(
+        _selected_pid: str,
+        _action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal dispatches
+        dispatches += 1
+        raise AssertionError("marker failure dispatched")
+
+    monkeypatch.setattr(
+        runtime.llm,
+        "_persist_completed_context_management_marker",
+        fail_marker,
+    )
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        failed = runtime.run_next_process_once()
+
+        assert failed["ok"] is False
+        assert runtime.process.get(pid).status == ProcessStatus.FAILED
+        assert dispatches == 0
+        assert client.user_prompts == []
+        persisted = runtime.store.get_capability(finite.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 1
+        assert runtime.llm.pending.get(pid) is None
+        failure = next(
+            record
+            for record in runtime.audit.trace(actor=pid)
+            if record.action == "llm.context_pressure_failed"
+        )
+        assert failure.decision["reason"] == "attempt_marker_persistence_failed"
+    finally:
+        runtime.close()
+
+
+def test_storage_pressure_post_dispatch_failure_never_restores_finite_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = AgentImage(
+        image_id="storage-pressure-unknown-outcome:v0",
+        name="storage-pressure-unknown-outcome",
+        default_tools=["compact_process_context", "process_exit"],
+    )
+    runtime, client, pid = _runtime_with_image(
+        image,
+        config=_storage_pressure_config(),
+    )
+    finite = _replace_context_maintenance_with_finite_authority(runtime, pid)
+    dispatches = 0
+
+    async def dispatch(
+        _selected_pid: str,
+        _action: dict[str, Any],
+        *,
+        context_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal dispatches
+        dispatches += 1
+        raise RuntimeError("dispatch outcome unavailable")
+
+    monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
+    try:
+        failed = runtime.run_next_process_once()
+
+        assert failed["ok"] is False
+        assert runtime.process.get(pid).status == ProcessStatus.FAILED
+        assert dispatches == 1
+        assert client.user_prompts == []
+        persisted = runtime.store.get_capability(finite.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 0
+        assert not any(
+            record.action == "capability.restore_reserved_use"
+            for record in runtime.audit.trace(actor=pid)
+        )
+        assert runtime.run_next_process_once() is None
+        assert dispatches == 1
+    finally:
+        runtime.close()
+
+
 def test_storage_pressure_compacts_before_provider_or_object_hard_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -783,7 +1037,7 @@ def test_storage_pressure_resume_failure_fails_closed_without_recursion(
         runtime.close()
 
 
-def test_storage_pressure_builtin_compactor_uses_image_bound_spawn_authority() -> None:
+def test_storage_pressure_builtin_compactor_resumes_without_reconsuming_finite_authority() -> None:
     image = AgentImage(
         image_id="storage-pressure-builtin:v0",
         name="storage-pressure-builtin",
@@ -848,6 +1102,7 @@ def test_storage_pressure_builtin_compactor_uses_image_bound_spawn_authority() -
             ]
         },
     )
+    finite = _replace_context_maintenance_with_finite_authority(runtime, pid)
     try:
         process = runtime.process.get(pid)
         context_handle = runtime.llm.context_memory.ensure(
@@ -901,6 +1156,16 @@ def test_storage_pressure_builtin_compactor_uses_image_bound_spawn_authority() -
             and record.decision["trigger"] == "storage_payload"
             for record in runtime.audit.trace(actor=pid)
         )
+        persisted = runtime.store.get_capability(finite.cap_id)
+        assert persisted is not None and persisted.uses_remaining == 0
+        assert len(
+            [
+                record
+                for record in runtime.audit.trace(actor=pid)
+                if record.action == "capability.reserve_use"
+                and finite.cap_id in record.capability_refs
+            ]
+        ) == 1
     finally:
         runtime.close()
 

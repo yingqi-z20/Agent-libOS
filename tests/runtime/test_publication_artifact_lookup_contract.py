@@ -259,6 +259,84 @@ def test_process_tool_reverse_binding_survives_reopen(
 
 
 @pytest.mark.parametrize("backend", STORE_BACKENDS)
+def test_root_spawn_initial_goal_lookup_and_redaction_cas_contract(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    secret = f"{backend}-root-goal-recovery-secret"
+    with _runtime_for_backend(backend, tmp_path) as runtime:
+        pid = runtime.process.spawn(goal=secret)
+        publication = runtime.store.get_committed_root_spawn_publication(pid)
+        assert publication is not None
+        phases = publication["receipt"]["phases"]
+        goal_phases = [
+            phase
+            for phase in phases
+            if phase.get("phase") == "goal_created"
+            and "initial_goal_recovery" in phase
+        ]
+        assert len(goal_phases) == 1
+        envelope = goal_phases[0]["initial_goal_recovery"]
+        assert envelope["retention"] == "full"
+        assert secret in dumps(publication["receipt"])
+
+        generic = runtime.store.get_runtime_publication(
+            publication["publication_id"]
+        )
+        assert generic is not None
+        assert secret not in dumps(generic["receipt"])
+        generic_list = runtime.store.list_runtime_publications(pid=pid)
+        assert [item["publication_id"] for item in generic_list] == [
+            publication["publication_id"]
+        ]
+        assert secret not in dumps(generic_list[0]["receipt"])
+        assert (
+            goal_phases[0]["goal_oid"] == envelope["goal_oid"]
+        )
+
+        assert not runtime.store.redact_root_spawn_initial_goal(
+            publication["publication_id"],
+            pid=pid,
+            goal_oid=envelope["goal_oid"],
+            expected_payload_sha256=envelope["payload_sha256"],
+            expected_states=("applying",),
+        )
+        unchanged = runtime.store.get_committed_root_spawn_publication(pid)
+        assert unchanged is not None
+        unchanged_envelope = next(
+            phase["initial_goal_recovery"]
+            for phase in unchanged["receipt"]["phases"]
+            if phase.get("phase") == "goal_created"
+        )
+        assert unchanged_envelope["retention"] == "full"
+
+        assert runtime.store.redact_root_spawn_initial_goal(
+            publication["publication_id"],
+            pid=pid,
+            goal_oid=envelope["goal_oid"],
+            expected_payload_sha256=envelope["payload_sha256"],
+            expected_states=("committed",),
+        )
+        redacted = runtime.store.get_committed_root_spawn_publication(pid)
+        assert redacted is not None
+        redacted_envelope = next(
+            phase["initial_goal_recovery"]
+            for phase in redacted["receipt"]["phases"]
+            if phase.get("phase") == "goal_created"
+        )
+        assert redacted_envelope["retention"] == "hash_only"
+        assert "payload" not in redacted_envelope
+        assert secret not in dumps(redacted["receipt"])
+        assert runtime.store.redact_root_spawn_initial_goal(
+            publication["publication_id"],
+            pid=pid,
+            goal_oid=envelope["goal_oid"],
+            expected_payload_sha256=envelope["payload_sha256"],
+            expected_states=("committed",),
+        )
+
+
+@pytest.mark.parametrize("backend", STORE_BACKENDS)
 def test_snapshot_tool_pruning_uses_reverse_index_and_honors_model_aliases(
     backend: str,
     tmp_path: Path,

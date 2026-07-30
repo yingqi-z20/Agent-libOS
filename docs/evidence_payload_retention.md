@@ -84,8 +84,16 @@ LLM calls are eligible only after `status` is `ok` or `error` and
 runtime dependencies until their executable semantics have a separate durable
 projection:
 
-- the unique latest call for a `(pid, purpose)` stream, when it is a complete
-  `image_only` call whose marker supplies the active native transcript head;
+- the unique latest successful call for a `(pid, purpose)` stream, when it is an
+  `image_only` `action_selection` candidate carrying a schema-v2 marker. Runtime
+  replay additionally requires exact paired tool outputs or, for an empty-call
+  response, a separate successful action-validation marker; retention protects
+  an unvalidated candidate conservatively rather than deleting possible
+  recovery evidence;
+- the unique latest error in an exact
+  `image_only_request:<anchor-fingerprint>` stream when its schema-v1 marker
+  carries the two-message system/goal request needed to retry a first provider
+  failure after reopen;
 - the unique latest OpenAI Responses call for a `(pid, purpose)` stream, when
   that call is eligible to supply low-level provider-side continuation state;
   the current AgentProcess executor does not create an eligible provider-chain
@@ -98,17 +106,28 @@ contents cannot be proven safe to discard. This is intentionally conservative:
 retaining an old payload is preferable to breaking a live/pending continuation
 or silently losing recovery state.
 
-The head decision exactly matches runtime lookup ordering: all calls for the
-same `(pid, purpose)` participate, without filtering status first, and the
-greatest `(created_at, call_id)` under the backend's bytewise keyset collation is
-the head. Thus a newer pending or failed attempt prevents an older successful
-Responses or `image_only` call from being treated as the active head, and older
-eligible rows can advance through the configured retention tiers. A row without
-a process id cannot be selected by the runtime lookup and is therefore not a
-continuation/transcript head. The bounded storage query classifies heads with an
-indexed correlated seek; it does not issue one lookup per candidate. The
-retention CAS repeats the "a newer call exists" fence before reducing any
-guarded row classified as non-head.
+The head decision exactly matches each runtime lookup stream. Responses
+continuation and a first-attempt fingerprinted request stream use the greatest
+`(created_at, call_id)` among all rows with the same `(pid, purpose)`, without
+filtering status first; a newer pending or failed Responses call therefore
+supersedes an older successful call. The image-only transcript instead uses the
+greatest successful `action_selection` row, so neither a legacy newer
+same-purpose error nor a current `image_only_error` row shadows its last complete
+head. Image-only provider errors instead use `image_only_error`. All of those
+comparisons use the backend's bytewise keyset collation.
+When a successful action-validated transcript becomes canonical, a content-free
+tombstone is attempted afterward. If it becomes the latest row in that request
+stream, the older full request can advance through the configured retention
+tiers. A tombstone write failure is audited without discarding the canonical
+successful transcript or paired tool outputs, and the old request remains
+protected. The same conservative protection applies if the Host terminalizes
+the process before any success.
+
+A row without a process id cannot be selected by these runtime lookups and is
+therefore not a continuation/transcript/request head. The bounded storage query
+classifies heads with an indexed correlated seek; it does not issue one lookup
+per candidate. The retention CAS repeats the "a newer call exists" fence before
+reducing any guarded row classified as non-head.
 
 ## Explicit maintenance API
 
@@ -204,6 +223,20 @@ It requires a lossless native transcript head and fails before provider dispatch
 when `persist_full_io=false`, so no new action-selection call row is produced by
 that attempted quantum. Runtime-owned prompt modes can use the opt-out normally.
 
+The same setting controls a separate root-spawn startup aid. A committed root
+spawn stores a size-bounded, integrity-bound recovery envelope for its immutable
+initial goal in the internal publication receipt only when
+`persist_full_io=true`; ordinary
+publication reads expose a hash-only projection. `persist_full_io=false` writes
+only hashes. Startup may use a still-full envelope only for the exact matching
+live nonterminal root goal, and terminal root cleanup redacts it. This envelope
+is not an `llm_calls` row and is not scanned or aged by
+`PayloadRetentionMaintenance`; backups and direct database access can still see
+it until that explicit lifecycle redaction occurs. Failed-launch rollback and
+startup recovery claim a non-committable publication state only in the same
+outer transaction that reduces a full envelope to hashes; redaction failure
+rolls the state transition back for a fenced retry.
+
 Opt-out rows written by earlier releases can contain bounded observation
 previews. The retention service recognizes those legacy rows as the summary
 tier and can normalize them to the canonical content-free summary envelope;
@@ -212,9 +245,12 @@ the retention marker described above. It never restores missing content. A
 legacy truncated tool-call preview remains protected when runtime-dependency
 safety cannot be proven.
 
-Retention is therefore an additional maximum-retention policy, not an override
-that can weaken `persist_full_io=false` or reconstruct redacted data. Operators
-should normally run and inspect a dry-run page before applying it.
+Retention is therefore an additional staged minimization policy, not an
+override that can weaken `persist_full_io=false` or reconstruct redacted data.
+It does not promise a maximum deletion deadline for protected runtime
+dependencies such as a first failed image-only retry anchor that never reaches
+a successful transcript. Operators should normally run and inspect a dry-run
+page before applying it.
 
 ## Backend contract
 
@@ -223,8 +259,10 @@ SQLite and PostgreSQL adapters implement the typed
 
 - keyset scans for LLM calls and external effects accept `older_than`, `after`,
   and `limit` and return at most the requested limit;
-- each LLM page identifies every continuation- or transcript-capable candidate
-  that is the actual latest call for its `(pid, purpose)` stream;
+- each LLM page identifies every continuation-, transcript-, or image-only
+  retry-request-capable candidate that is the actual latest row under its
+  runtime rule: latest-any for Responses/request streams and latest-successful
+  for an image-only transcript stream;
 - update methods compare the expected record-level tier and aggregate payload
   hash;
 - the external-effect update also compares `effect_state` and
@@ -246,5 +284,6 @@ this contract by loading all historical rows into Python.
 LLM head classification uses
 `idx_llm_calls_provider_chain_head(pid, purpose, created_at, call_id)` for one
 correlated seek per bounded candidate. The same index backs the atomic update
-fence that rejects reducing a Responses continuation or `image_only` transcript
-head if no newer call exists. The historical index name covers both kinds.
+fence that rejects reducing a Responses continuation, `image_only` transcript
+head, or image-only retry-request anchor if no newer call exists. The historical
+index name covers all three kinds.

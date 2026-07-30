@@ -5,12 +5,13 @@ real LLM paths, and documentation rules for Agent libOS contributors.
 
 ## Setup
 
-Use Python 3.11–3.14 and uv. The full matrix also requires system Git 2.26 or
-newer. The GUI package declares Node `>=22.12.0` with npm 8 or newer. Per-change
-CI exercises Node 24 with the npm version supplied by that toolchain; the lower
-declared Node and npm bounds are compatibility targets, not separately tested
-CI matrix entries. Deno is optional unless validating real TypeScript/JIT
-execution.
+Use Python 3.11–3.14 and uv. CI currently pins uv `0.11.32`; use that exact
+version when reproducing a CI or release receipt. The full matrix also requires
+system Git 2.26 or newer. The GUI package declares Node `>=22.12.0` with npm 8
+or newer. Per-change CI exercises Node 24 with the npm version supplied by that
+toolchain; the lower declared Node and npm bounds are compatibility targets,
+not separately tested CI matrix entries. Deno is optional unless validating
+real TypeScript/JIT execution.
 
 Install dependencies:
 
@@ -26,6 +27,12 @@ artifact and CI-style checks:
 uv sync --frozen --all-groups
 npm --prefix gui ci
 ```
+
+uv dependency groups and package extras are independent. `--all-groups` does
+not install the optional `mcp`, `postgres`, or `pty` extras. Add the relevant
+`--extra` for an integration gate; the complete Windows matrix uses
+`uv sync --frozen --all-groups --extra pty` so native ConPTY tests are
+available.
 
 The release path installs its exact build backend from the frozen `release`
 dependency group and invokes `uv build --no-build-isolation` with that virtual
@@ -66,10 +73,15 @@ AgentDojo has a separate dependency environment so its SDK graph does not enter
 the root lock. Run its deterministic harness tests from the subproject:
 
 ```bash
-cd experiments/agentdojo
-uv sync --frozen
-uv run --frozen pytest -q
+(
+  cd experiments/agentdojo
+  uv sync --frozen
+  uv run --frozen pytest -q
+)
 ```
+
+The subshell returns you to the repository root before the commands in the next
+section.
 
 The subproject's `pyproject.toml` and `uv.lock` cover Python 3.11–3.12. CI runs
 the commands above on both versions, and the release-artifact job waits for that
@@ -88,11 +100,15 @@ uv run python -m pytest -q \
   tests/self_evolution/test_builtin_agent_images_real_llm.py \
   --run-real-llm --fail-on-skip
 uv sync --frozen --all-groups --extra postgres
+export AGENT_LIBOS_POSTGRES_DSN='postgresql://agent_libos:agent_libos@127.0.0.1:5432/agent_libos'
 uv run python -m pytest -m postgres --run-postgres --fail-on-skip
 ```
 
 The real-LLM command may consume paid provider tokens and requires the Host
-environment described below. PostgreSQL requires a configured test service.
+environment described below. PostgreSQL requires a configured disposable test
+service and the `AGENT_LIBOS_POSTGRES_DSN` environment variable shown above;
+without it the marked tests skip, and `--fail-on-skip` correctly makes the gate
+fail. Do not point the suite at a production database.
 `--fail-on-skip` is intentional on these evidence commands: a missing SDK,
 credential, server, or service must not turn an all-skipped provider gate into a
 green release result. Omit it only for exploratory local runs whose skips are
@@ -104,7 +120,8 @@ Use pytest-xdist workers for faster local Python feedback:
 
 ```bash
 uv run python scripts/test_matrix.py --lane all --workers 4
-uv run python scripts/test_matrix.py --lane runtime --workers auto
+uv run python scripts/test_matrix.py --lane runtime --workers auto --dist worksteal
+uv run python scripts/test_matrix.py --lane runtime --shard-count 2 --shard-index 0
 ```
 
 `--workers` applies only to Python lanes. The `runtime`, `security`,
@@ -114,17 +131,23 @@ persistence and runtime-reopen tests. Pass `--workers 1` for serial failure
 diagnosis, or set `AGENT_LIBOS_TEST_WORKERS` / `AGENT_LIBOS_TEST_DIST` to
 override defaults. Pass `--durations 25` to report the slowest tests.
 `--max-lane-seconds` is a hard process-tree timeout for each selected command;
-the Python `all` lane is one command, while the GUI test, typecheck, and build
-commands each receive the full timeout independently. Timeout exits with status
-124 after terminating the process group/tree. Standard lanes deselect
-`postgres` tests because the PostgreSQL CI
-service runs them separately with `pytest -m postgres --run-postgres`. CI gives
-the runtime lane a 480-second process deadline and the other standard lanes a
-360-second deadline, all within a 15-minute outer step deadline. Run the `gui`
-lane separately; it cleans Electron output before production compilation,
-excludes generated `dist-electron` files from Vitest, and never emits test
-files into the production Electron tree. Install GUI dependencies first with
-`npm --prefix gui install`.
+its local default is 600 seconds. `--dist loadfile|loadscope|load|worksteal`
+selects the xdist scheduler when more than one worker is used. Deterministic
+file-weighted `--shard-count N --shard-index I` applies only to one Python lane
+(not `all` or `gui`); indices are zero-based, and every shard must contain at
+least one selected test file. The Python `all` lane is one command, while the
+GUI test, typecheck, and build commands each receive the full timeout
+independently. Timeout exits with status 124 after terminating the process
+group/tree. Standard lanes deselect `postgres` tests because the PostgreSQL CI
+service runs them separately with `pytest -m postgres --run-postgres`. Linux CI
+uses a 480-second process deadline for the runtime lane and 360 seconds for the
+other standard lanes, within a 15-minute step. The Windows matrix uses explicit
+file shards and a 1,400-second process deadline within a 25-minute step; those
+larger limits cover platform and runner variance rather than a different test
+contract. Run the `gui` lane separately; it cleans Electron output before
+production compilation, excludes generated `dist-electron` files from Vitest,
+and never emits test files into the production Electron tree. Install GUI
+dependencies first with `npm --prefix gui install`.
 
 The architecture check covers the core package and repository-level Runtime
 Modules. Its default function-size ceiling is 200 lines; larger existing
@@ -193,9 +216,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.0.0-py3-none-any.whl dist/agent_libos-1.0.0.tar.gz
+  dist/agent_libos-1.0.1-py3-none-any.whl dist/agent_libos-1.0.1.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.0.0-py3-none-any.whl
+  dist/agent_libos-1.0.1-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 ```
 
@@ -272,10 +295,11 @@ uv run --env-file .env python -m pytest -q \
 The same suite covers the coding-image read/write/readback/exit path in an
 isolated temporary workspace. `scripts/run_coding_agent.py` and
 `scripts/llm_write_goal_smoke.py` remain useful for manual coding-image smoke
-runs. The multi-round toolmaker case has a 360-second per-test timeout because
-it includes real provider latency plus Deno validation and registration; the
-other cases retain the ordinary test timeout. These tests spend provider tokens
-and are not part of the deterministic default matrix.
+runs. The coding and multi-round toolmaker cases each have a 360-second
+per-test timeout; the context-compressor case has a 600-second timeout and uses
+a 240-second provider-call timeout. The base and review cases retain the
+ordinary 120-second pytest timeout. These tests spend provider tokens and are
+not part of the deterministic default matrix.
 
 OpenAI-compatible Responses and Chat requests may also be configured with a
 `safety_identifier` and prompt-cache routing fields. These options are sent to
@@ -374,7 +398,18 @@ Run a script smoke:
 
 ```bash
 uv run python scripts/llm_write_goal_smoke.py
+uv run python scripts/run_coding_agent.py --workspace /path/to/repo \
+  --goal "Inspect the requested change" --permission-preset read-only --strict
 ```
+
+The coding launcher runs the configured real LLM immediately unless
+`--no-run` is supplied, with `runtime.launcher_max_quanta` (40 by default) as
+its ceiling. Its default `edit` preset grants workspace-wide read and write;
+the explicit read-only preset above is safer for inspection. By default it
+uses a workspace-keyed persistent database outside the exposed workspace and
+returns JSON even when the process fails; choose `--ephemeral-db` for an
+in-memory store and `--strict` when failure or kill must make the command
+non-zero.
 
 Run a benchmark smoke only with an explicit one-task limit:
 
@@ -388,6 +423,20 @@ envelopes. With the default `llm.persist_full_io: true`, that row also contains
 the full prompt, visible tools, output, tool calls, reasoning metadata, and raw
 responses. Deployments using that default for self-evolution or fine-tuning
 should disclose the retention and use in their user agreement.
+
+The same setting governs the dedicated cross-CLI bootstrap record for a
+committed root spawn. Full-I/O mode stores one bounded, identity- and
+hash-bound copy of that process's initial goal; startup may rehydrate only the
+exact matching active root goal before the ordinary Object-payload sweep.
+Only the immutable initial GOAL created by `ProcessManager` is eligible;
+mutable goal handles are never recovered. Terminal cleanup redacts the copy to
+hash-only; failed launch rollback and startup compensation redact before
+committing a non-committable publication state. Opt-out mode writes no
+reversible goal content, so tests and examples that close after `spawn` and
+execute after reopen must either enable full-I/O persistence or keep goal
+creation and the first quantum in one Runtime lifetime. Do not generalize this
+exception to child/fork goals, exec replacement goals, or arbitrary Object
+payloads.
 
 LLM providers are selected through host-configured named profiles. Processes
 persist only `llm_profile_id`; the Runtime resolves that id for each quantum and
@@ -478,6 +527,7 @@ Library and test code should keep passing explicit config objects when a custom
 runtime is required:
 
 ```python
+from agent_libos import Runtime
 from agent_libos.config import load_config_file
 
 config = load_config_file("config.yaml")
@@ -514,7 +564,13 @@ Current default groups include:
 Resource budgets use integer fields for discrete calls, tokens, bytes, and peak
 memory, while `max_runtime_seconds`, `max_subprocess_wall_seconds`, and
 `max_subprocess_cpu_seconds` accept finite non-negative fractional seconds.
-Booleans are not accepted as numbers.
+The final `ResourceBudget` model and explicit resource tool/manifest inputs
+reject booleans as numbers. Configuration loading is a different boundary:
+ordinary non-strict Pydantic `int`/`float` fields may coerce YAML booleans to
+`0`/`1`, while fields declared `StrictInt` or `StrictFloat` reject them. Do not
+use booleans for numeric config values; see
+[configuration.md](configuration.md#loading-and-precedence) for the
+authoritative strict-field groups.
 
 Event limits are storage-selection bounds, not only renderer truncation. Each
 explicitly enriched LLM context preparation reads at most

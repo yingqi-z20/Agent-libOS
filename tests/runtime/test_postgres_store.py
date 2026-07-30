@@ -24,7 +24,11 @@ from agent_libos.models import (
     JsonRpcMethodSpec,
     LLMCallRecord,
 )
-from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    UnsupportedStoreVersion,
+    ValidationError,
+)
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.skills.schema import SkillPackage
 from agent_libos.storage import StoreCloseClaimOutcome, open_store
@@ -70,6 +74,40 @@ def _dsn_with_search_path(dsn: str, schema: str) -> str:
 
 @pytest.mark.postgres
 class TestPostgresStore:
+    def test_v3_manifest_view_is_rejected_before_initializer(self) -> None:
+        import psycopg
+
+        with _postgres_schema_dsn() as dsn:
+            store = PostgresStore(dsn)
+            store.close()
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                connection.execute("DROP TABLE jsonrpc_endpoints")
+                connection.execute(
+                    "CREATE VIEW jsonrpc_endpoints AS "
+                    "SELECT NULL::text AS endpoint_id, NULL::text AS spec_json, "
+                    "NULL::text AS registered_by, NULL::text AS created_at, "
+                    "NULL::text AS updated_at WHERE false"
+                )
+
+            with pytest.raises(
+                UnsupportedStoreVersion,
+                match=r"manifest relation types.*jsonrpc_endpoints",
+            ):
+                PostgresStore(dsn)
+
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                relation_kind = connection.execute(
+                    """
+                    SELECT relation.relkind
+                      FROM pg_catalog.pg_class AS relation
+                      JOIN pg_catalog.pg_namespace AS namespace
+                        ON namespace.oid = relation.relnamespace
+                     WHERE namespace.nspname = current_schema()
+                       AND relation.relname = 'jsonrpc_endpoints'
+                    """
+                ).fetchone()
+            assert relation_kind == ("v",)
+
     def test_skill_description_search_uses_postgres_supported_json_access(self) -> None:
         with _postgres_schema_dsn() as dsn:
             store = PostgresStore(dsn)

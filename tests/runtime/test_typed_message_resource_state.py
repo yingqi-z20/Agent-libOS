@@ -4,8 +4,10 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.models import (
+    CapabilityRight,
     ChildProcessWait,
     HostResumeProcessWait,
+    HumanRequestStatus,
     HumanProcessWait,
     KilledProcessOutcome,
     MessageProcessWait,
@@ -14,6 +16,7 @@ from agent_libos.models import (
     ToolProcessWait,
 )
 from agent_libos.models.exceptions import (
+    ProcessError,
     ProcessMessageWaitRequired,
     ValidationError,
 )
@@ -180,6 +183,121 @@ class TestTypedMessageAndResourceProcessState:
             assert resumed.outcome is None
             assert resumed.status_message is None
             assert resumed.state_generation == wait_generation + 1
+        finally:
+            runtime.close()
+
+    def test_blocking_human_query_cannot_replace_message_wait(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="message owner must keep its wait",
+            )
+            with pytest.raises(ProcessMessageWaitRequired):
+                runtime.messages.receive(pid, block=True, channel="control")
+            waiting = runtime.process.get(pid)
+
+            with pytest.raises(ProcessError, match="owned by another condition"):
+                runtime.human.query(
+                    pid,
+                    "owner",
+                    {"type": "question", "question": "overwrite message wait?"},
+                    blocking=True,
+                )
+
+            assert runtime.process.get(pid) == waiting
+            assert runtime.human.list(pid) == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("paged", [False, True], ids=("receive", "receive-page"))
+    def test_blocking_message_receive_cannot_replace_human_wait(
+        self,
+        paged: bool,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="Human owner must keep its wait",
+            )
+            request_id = runtime.human.query(
+                pid,
+                "owner",
+                {"type": "question", "question": "hold this wait?"},
+                blocking=True,
+            )
+            waiting = runtime.process.get(pid)
+
+            with pytest.raises(ProcessError, match="owned by another condition"):
+                if paged:
+                    runtime.messages.receive_page(pid, block=True, channel="control")
+                else:
+                    runtime.messages.receive(pid, block=True, channel="control")
+
+            assert runtime.process.get(pid) == waiting
+            assert runtime.human.get(request_id).status == HumanRequestStatus.PENDING
+        finally:
+            runtime.close()
+
+    def test_child_wait_cannot_replace_human_wait(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="Human owner must keep its wait",
+            )
+            runtime.capability.grant(
+                parent,
+                "process:spawn",
+                [CapabilityRight.WRITE],
+                issued_by="test",
+            )
+            child = runtime.process.spawn_child(parent, goal="remain nonterminal")
+            request_id = runtime.human.query(
+                parent,
+                "owner",
+                {"type": "question", "question": "hold this wait?"},
+                blocking=True,
+            )
+            waiting = runtime.process.get(parent)
+
+            with pytest.raises(ProcessError, match="owned by another condition"):
+                runtime.process.wait(parent, child)
+
+            assert runtime.process.get(parent) == waiting
+            assert runtime.human.get(request_id).status == HumanRequestStatus.PENDING
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("paged", [False, True], ids=("receive", "receive-page"))
+    def test_message_receive_cannot_bypass_host_resume_gate(
+        self,
+        paged: bool,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="Host resume gate must remain owned",
+            )
+            runnable = runtime.process.get(pid)
+            gated = runtime.process_transitions.transition(
+                pid,
+                ProcessStatus.PAUSED,
+                expected_revision=runnable.revision,
+                expected_status=runnable.status,
+                expected_state_generation=runnable.state_generation,
+                wait_state=HostResumeProcessWait(reason_oid="obj_manual_recovery"),
+            )
+
+            with pytest.raises(ProcessError, match="owned by another condition"):
+                if paged:
+                    runtime.messages.receive_page(pid, block=True, channel="control")
+                else:
+                    runtime.messages.receive(pid, block=True, channel="control")
+
+            assert runtime.process.get(pid) == gated
         finally:
             runtime.close()
 

@@ -282,6 +282,62 @@ def _required_body_string(body: dict[str, Any], key: str) -> str:
     return value
 
 
+def _optional_body_string(body: dict[str, Any], key: str) -> str | None:
+    if key not in body:
+        return None
+    return _required_body_string(body, key)
+
+
+def _optional_launch_body_strings(
+    body: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    return (
+        _optional_body_string(body, "image"),
+        _optional_body_string(body, "working_directory"),
+    )
+
+
+def _body_object(
+    value: Any,
+    *,
+    error_message: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise GuiServerError(HTTPStatus.BAD_REQUEST, error_message)
+    return value
+
+
+def _body_object_field_or_default(
+    body: dict[str, Any],
+    key: str,
+    *,
+    error_message: str,
+) -> dict[str, Any]:
+    if key not in body:
+        return {}
+    return _body_object(body[key], error_message=error_message)
+
+
+def _nullable_body_string(body: dict[str, Any], key: str) -> str | None:
+    value = body.get(key)
+    if value is not None and not isinstance(value, str):
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} must be a JSON string or null",
+        )
+    return value
+
+
+def _nullable_body_goal(body: dict[str, Any]) -> str | dict[str, Any] | None:
+    value = body.get("goal")
+    if value is not None and not isinstance(value, (str, dict)):
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "goal must be a JSON string, object, or null",
+        )
+    return value
+
+
 def _required_package_sha256(body: dict[str, Any], key: str) -> str:
     value = _required_body_string(body, key)
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
@@ -1222,7 +1278,12 @@ class GuiRuntimeService:
     def require_llm_profile_id(self, value: Any) -> str | None:
         if value is None:
             return None
-        selected = str(value).strip()
+        if not isinstance(value, str):
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "llm_profile must be a JSON string or null",
+            )
+        selected = value.strip()
         if not selected:
             return None
         try:
@@ -1492,13 +1553,14 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
             llm_profile_id = service.require_llm_profile_id(body.get("llm_profile"))
+            image, working_directory = _optional_launch_body_strings(body)
             authority_manifest = body.get("authority_manifest")
             if authority_manifest is not None and not isinstance(authority_manifest, dict):
                 raise GuiServerError(HTTPStatus.BAD_REQUEST, "authority_manifest must be a JSON object")
             pid = service.runtime.process.spawn(
-                image=str(body["image"]) if body.get("image") is not None else None,
+                image=image,
                 goal=body.get("goal", ""),
-                working_directory=body.get("working_directory"),
+                working_directory=working_directory,
                 llm_profile_id=llm_profile_id,
                 authority_manifest=authority_manifest,
             )
@@ -1544,12 +1606,16 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         service = self.server.service
         if method == "POST" and route == ["run"]:
             body = self._read_body()
-            tool = str(body.get("tool") or "").strip()
-            if not tool:
-                raise GuiServerError(HTTPStatus.BAD_REQUEST, "workflow tool is required")
-            raw_args = body.get("args") if "args" in body else {}
-            if not isinstance(raw_args, dict):
-                raise GuiServerError(HTTPStatus.BAD_REQUEST, "workflow args must be a JSON object")
+            tool = _required_body_string(body, "tool").strip()
+            raw_args = (
+                _body_object(
+                    body["args"],
+                    error_message="workflow args must be a JSON object",
+                )
+                if "args" in body
+                else {}
+            )
+            image, working_directory = _optional_launch_body_strings(body)
             authority_manifest = body.get("authority_manifest")
             if authority_manifest is not None and not isinstance(authority_manifest, dict):
                 raise GuiServerError(HTTPStatus.BAD_REQUEST, "authority_manifest must be a JSON object")
@@ -1566,9 +1632,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             result = service.runtime.run_workflow(
                 tool,
                 raw_args,
-                image=str(body["image"]) if body.get("image") is not None else None,
+                image=image,
                 goal=body.get("goal"),
-                working_directory=str(body["working_directory"]) if body.get("working_directory") is not None else None,
+                working_directory=working_directory,
                 authority_manifest=authority_manifest,
             )
             service.publish_runtime_changes("workflow.run")
@@ -1787,6 +1853,13 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
             llm_profile_id = service.require_llm_profile_id(body.get("llm_profile"))
+            image = _required_body_string(body, "image")
+            goal = _nullable_body_goal(body)
+            raw_args = _body_object_field_or_default(
+                body,
+                "args",
+                error_message="process exec args must be a JSON object",
+            )
             self._require_confirmed(
                 "process.exec",
                 body,
@@ -1794,9 +1867,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             )
             process = service.runtime.exec_process(
                 pid,
-                _required_body_string(body, "image"),
-                args=body.get("args") if isinstance(body.get("args"), dict) else {},
-                goal=body.get("goal"),
+                image,
+                args=raw_args,
+                goal=goal,
                 preserve_memory=_json_bool(body, "preserve_memory", True),
                 preserve_capabilities=_json_bool(body, "preserve_capabilities", False),
                 llm_profile_id=llm_profile_id,
@@ -1810,8 +1883,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return service._process_summary_with_scheduler(pid, process)
         if method == "POST" and route == ["exit"]:
             body = self._read_body()
+            message = _nullable_body_string(body, "message")
             self._require_confirmed("process.exit", body, {"pid": pid, "failed": body.get("failed", False)})
-            service.runtime.process.exit(pid, failed=_json_bool(body, "failed", False), message=body.get("message"))
+            service.runtime.process.exit(pid, failed=_json_bool(body, "failed", False), message=message)
             service.publish_runtime_changes("process.exit")
             return service._process_summary(pid, include_messages=True)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown process endpoint")

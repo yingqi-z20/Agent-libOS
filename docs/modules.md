@@ -234,15 +234,22 @@ def register_module(ctx):
 The entrypoint's buffered `ModuleContext` records registrations first. The
 registry verifies that these buffered registrations use only resources declared
 in `provides`, checks name collisions, then applies them before the runtime is
-returned to the caller. Registration,
-module metadata, audit/event rows, and the in-memory tool/image/syscall/hook
-registries commit as one lifecycle transaction. Startup hooks run under the
-same registration-journal discipline: if a hook registers a runtime tool,
-image, syscall, provider hook, module-owned runtime/substrate attribute,
-shutdown finalizer, recovery cleanup, or Object release finalizer and then fails, its journal
-undoes those owned changes in reverse order before the module row is recorded
-as failed. A hook receives an explicit `ModuleHookServices`-backed surface, not
-the concrete Runtime or another manager's private registry. Hook code may still
+returned to the caller. Each module's buffered registration, module metadata,
+audit/event rows, and in-memory tool/image/syscall/hook registries use one
+lifecycle transaction and registration journal.
+
+Hooks use the same journal discipline, but startup and post-startup failure
+scope differ. During `Runtime.open()`, every configured module is applied before
+the combined provider/startup-hook phase begins. If any hook in that phase
+fails, the Runtime rolls back **all external startup modules** from that opening
+attempt, in reverse order, and records their rows as failed; it does not preserve
+the otherwise-successful configured modules from that batch. The internal core
+module is excluded from this rollback. After startup, a trusted Host load runs
+only the newly loaded module's hooks immediately, and a failure rolls back that
+module without removing modules that were already loaded successfully.
+
+A hook receives an explicit `ModuleHookServices`-backed surface, not the
+concrete Runtime or another manager's private registry. Hook code may still
 perform arbitrary external trusted host-side effects that the runtime cannot
 compensate, so hooks should be kept small and idempotent and should not treat a
 registration rollback as an external-effect rollback.
@@ -325,6 +332,22 @@ reconfiguration. If Host code calls
 `runtime.modules.load_module_manifest(...)` after startup has completed, that
 module's provider and startup hooks run immediately; failure rolls back the
 newly loaded module.
+
+`AgentLibOSConfig.modules.load_policy` controls ordinary per-manifest load
+failure handling:
+
+- `fail` (the default) records a bounded failed-module diagnostic and raises the
+  error.
+- `warn` records the same diagnostic and returns a `status: failed` result, so
+  startup manifest iteration can continue. It also changes a post-startup
+  dynamic module/hook failure into that failed result after rolling back the new
+  module.
+
+`load_policy: warn` does **not** make the later combined startup-hook phase
+optional. A provider or startup hook failure while `Runtime.open()` is running
+still rolls back the external startup-module batch and makes `Runtime.open()`
+fail. This preserves the contract that `Runtime.open()` never returns a Runtime
+whose configured startup hooks only partially ran.
 
 ## Registration Surfaces
 
@@ -472,15 +495,19 @@ processes a workspace-scoped `HOME`/`USERPROFILE`.
 
 On POSIX, PTY resource accounting runs in a monitor worker independent of the
 blocking output reader, so a provider read cannot suspend wall/CPU/RSS
-enforcement. Each sample covers the complete process tree. CPU is accumulated
-by `(pid, create_time)` and retains each process's maximum observed total, so an exited
-child cannot make aggregate charged CPU decrease; wall time is charged
-cumulatively and RSS records the session peak. If process-tree discovery or
-CPU/RSS inspection is denied, the adapter closes the session and releases its
-Object handle instead of continuing without accounting. Cleanup signals the
-process group first; if that is denied it explicitly signals the
-discovered descendant tree, and surfaces cleanup failure rather than reporting
-an uncontained session as closed.
+enforcement. Each successful metrics sample covers the complete process tree.
+CPU is accumulated by `(pid, create_time)` and retains each process's maximum
+observed total, so an exited child cannot make aggregate charged CPU decrease;
+wall time is charged cumulatively and RSS records the session peak. If
+process-tree discovery or CPU/RSS inspection is denied, the adapter closes the
+session and releases its Object handle instead of continuing without the
+required accounting. There is one narrower exception: a
+strictly wall-only budget has no CPU or memory value to enforce, so a denied
+process-metrics sample does not stop monotonic wall charging; wall overage still
+kills/closes the session. That mode provides no CPU/RSS accounting claim.
+Cleanup signals the process group first; if that is denied it explicitly
+signals the discovered descendant tree, and surfaces cleanup failure rather
+than reporting an uncontained session as closed.
 
 The current Windows backend is only the `pywinpty`/ConPTY session adapter. It
 does not install a Job Object, process-tree wall/CPU/RSS supervisor, or
@@ -565,14 +592,18 @@ Verify a manifest without loading it:
 uv run agent-libos modules verify modules/pty/module.yaml
 ```
 
-Load a trusted module before a command:
+The checked-in project-root `config.yaml` already lists and trusts the PTY
+module, so list it without repeating the manifest on the command line:
 
 ```bash
-uv run agent-libos \
-  --module-manifest modules/pty/module.yaml \
-  --trusted-module agent-libos-pty:v0:<manifest_sha256>:<source_sha256> \
-  modules list
+uv run agent-libos --db local modules list
 ```
+
+On a Host whose configuration does not already list that manifest, pass
+`--module-manifest modules/pty/module.yaml` together with the exact
+`--trusted-module <trust_key>` returned by `modules verify`. Do not combine a
+config entry and a CLI entry for the same manifest: duplicate module ids are
+rejected during startup.
 
 `modules verify` returns the exact `trust_key` value accepted by
 `--trusted-module`. The weaker
@@ -590,9 +621,13 @@ the process current working directory.
 
 The `runtime_modules` table records loaded and failed modules, source hashes,
 entrypoints, and registration summaries. This is audit and reproducibility
-metadata, not a dynamic loading authority for processes. A `module_id` can be
-loaded only once per `Runtime`; duplicate load attempts are rejected without
-overwriting an already loaded row.
+metadata, not a dynamic loading authority for processes. A failure that occurs
+before the manifest can be verified uses a `failed:<manifest-filename>`
+placeholder id; `entrypoint`, manifest/source hashes, and `source_path` may be
+empty, `registered` may contain only empty collections, and `loaded_at` is
+`null`. Consumers must branch on `status` rather than treating those fields as
+present identity evidence. A `module_id` can be loaded only once per `Runtime`;
+duplicate load attempts are rejected without overwriting an already loaded row.
 
 Checkpoint snapshots record the currently loaded module summaries. Restore and
 fork fail if the current Python runtime has not loaded the same required module

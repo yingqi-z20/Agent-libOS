@@ -3192,6 +3192,51 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
+    def test_pty_wall_only_budget_tolerates_sampler_access_failure_within_budget(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[], session_pid=None)
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="pty wall-only sampler failure",
+                    resource_budget=ResourceBudget(max_subprocess_wall_seconds=10.0),
+                )
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+                assert created.ok, created.error
+                adapter = _pty_adapter(runtime)
+                session_oid = created.payload["session_oid"]
+                session = adapter._sessions[session_oid]
+                session.handle.pid = os.getpid()
+                session.started_monotonic = time.monotonic() - 0.1
+
+                def deny_process_access(process_pid: int) -> Any:
+                    raise psutil.AccessDenied(pid=process_pid)
+
+                monkeypatch.setattr(
+                    "modules.pty.pty_module.psutil.Process",
+                    deny_process_access,
+                )
+
+                adapter._sample_and_charge(session, "shell:git")
+
+                assert session_oid in adapter._sessions
+                assert not provider.sessions[0].closed
+                assert runtime.process.get(pid).status.value != "killed"
+                assert runtime.process.get(pid).resource_usage.subprocess_wall_seconds > 0
+                assert "primitive.pty.resource_monitor_denied" not in [
+                    record.action for record in runtime.audit.trace()
+                ]
+            finally:
+                runtime.close()
+
     def test_pty_resource_monitor_is_independent_from_blocked_output_reader(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = BlockingReadPtyProvider()

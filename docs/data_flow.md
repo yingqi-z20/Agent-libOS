@@ -284,10 +284,19 @@ For egress, the runtime performs this sequence:
 
 An early denial does not call the provider, DNS, filesystem `state()`, Human
 payload delivery, or spawn; does not consume an ordinary finite-use capability;
-and does not create an external-effect intent. It does append a payload-free
-`DataFlowDecision`, event, audit record, and Explain evidence containing the
-Sink, label/source hashes, trusted source refs, trust record/generation, and
-reason.
+and does not create an external-effect intent. Evidence depends on which gate
+denied the request. A request that reaches the data-flow gate and is denied
+there appends a payload-free `DataFlowDecision`, `DATA_FLOW_DECISION` event,
+audit record, and Explain evidence containing the Sink, label/source hashes,
+trusted source refs, trust record/generation, and reason. An earlier tool
+visibility, argument validation, Task Authority, ordinary Capability, provider
+policy, or other authority denial has not yet made a data-flow decision and
+therefore must not be expected to create that row or event. After a call enters
+ToolBroker or an Explain operation scope, a failure may instead be represented
+by the audit, tool-failure, or operation evidence owned by that scope. Python
+signature binding and explicit primitive preflight can reject before any such
+durable evidence scope, however, so those early failures do not guarantee an
+audit, event, or operation row.
 
 Successful effect metadata binds the primary and additional Sink decisions,
 trust ids/hashes, shared registry generation, source Object

@@ -81,11 +81,33 @@ class TestMiniSWEAgentImage:
             "32,768 Unicode code points",
             "10,000-code-point head/tail contract",
             "`submit: true`",
+            "non-zero command never invokes `process.exit`",
+            "the Host must externally terminate",
+            "does not pass through typed libOS primitives",
+            "not an operating-system sandbox",
         ]
 
         for phrase in required_phrases:
             assert phrase in prompt
         assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" not in prompt
+
+    def test_documentation_scopes_inspiration_and_runtime_prerequisites(self) -> None:
+        documentation = Path("docs/mini_swe_agent_image.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = re.sub(r"\s+", " ", documentation)
+
+        assert "does not claim drop-in or versioned compatibility" in normalized
+        assert "`llm.persist_full_io: true`" in normalized
+        assert "Deno itself does not supply Bash" in normalized
+        assert "only normative contract for this image" in normalized
+        assert "not launch gates or grants" in normalized
+        assert "missing entries do not prevent spawn/boot" in normalized
+        assert "only if the process can still execute one authorized" in normalized
+        assert "the Host must externally terminate" in normalized
+        assert "does not re-enter typed filesystem or network Capability checks" in normalized
+        assert "filesystem entry in `required_capabilities` is only" in normalized
+        assert "container, WASM, VM, service-provider" in normalized
 
     def test_package_validates_and_registers_as_image_only_single_bash_tool(self) -> None:
         runtime = Runtime.open("local")
@@ -100,6 +122,9 @@ class TestMiniSWEAgentImage:
             assert image.jit_tool_exposure == JIT_TOOL_EXPOSURE_DIRECT
             assert image.default_tools == []
             assert image.metadata["package_jit_tools"] == ["bash"]
+            assert image.metadata["inspired_by_project"] == "SWE-agent/mini-swe-agent"
+            assert image.metadata["compatibility_scope"] == "inspiration_only_single_bash_tool_shape"
+            assert "upstream_project" not in image.metadata
             assert image.boot["kind"] == "image_package"
         finally:
             runtime.close()
@@ -132,6 +157,23 @@ class TestMiniSWEAgentImage:
             assert not runtime.capability.check(pid, "filesystem:workspace:*", CapabilityRight.READ)
             assert not runtime.capability.check(pid, "filesystem:workspace:*", CapabilityRight.WRITE)
             assert not runtime.capability.check(pid, "shell:*", CapabilityRight.EXECUTE)
+            summary = runtime.authority_manifests.summary_for_process(pid)
+            assert summary is not None
+            assert summary["authorized_capabilities"] == []
+            missing = {
+                (item["resource"], tuple(item["rights"]))
+                for item in summary["missing_required_capabilities"]
+            }
+            declared = {
+                (item["resource"], tuple(item["rights"]))
+                for item in image.required_capabilities
+            }
+            assert missing == declared
+            assert any(
+                record.action == "image.required_capabilities_declared_only"
+                and record.target == f"process:{pid}"
+                for record in runtime.audit.trace(actor="runtime")
+            )
         finally:
             runtime.close()
 
@@ -154,11 +196,16 @@ class TestMiniSWEAgentImage:
             "exception_info",
         ]
         assert spec["output_schema"]["additionalProperties"] is False
-        assert len(spec["tests"]) == 5
+        assert len(spec["tests"]) == 6
         assert spec["tests"][1]["syscalls"][1]["name"] == "process.exit"
         assert spec["tests"][2]["syscalls"][0]["ok"] is False
         assert spec["tests"][3]["syscalls"][1]["ok"] is False
         assert spec["tests"][4]["expected"]["output_incomplete"] is True
+        assert spec["tests"][5]["args"]["submit"] is True
+        assert spec["tests"][5]["expected"]["returncode"] == 1
+        assert [item["name"] for item in spec["tests"][5]["syscalls"]] == [
+            "shell.run"
+        ]
         assert spec["timeout_s"] == 35
 
     def test_package_timeout_reaches_jit_execution_without_raising_global_default(
@@ -381,6 +428,37 @@ class TestMiniSWEAgentImage:
         assert result["elided_chars"] == 2000
         assert result["output_incomplete"] is True
         assert exit_payloads == [{"status": "submitted", **result}]
+
+    @pytest.mark.real_deno
+    def test_nonzero_submit_cannot_invoke_process_exit(self) -> None:
+        source = PACKAGE_ROOT.joinpath("tools/scripts/bash.ts").read_text(
+            encoding="utf-8"
+        )
+        observed: list[str] = []
+
+        async def handler(name: str, args: dict[str, Any]) -> Any:
+            observed.append(name)
+            if name == "shell.run":
+                return {
+                    "returncode": 1,
+                    "stdout": "BLOCKED: shell dependency missing\n",
+                    "stderr": "",
+                }
+            raise AssertionError(
+                f"non-zero command attempted unexpected syscall: {name}"
+            )
+
+        result = asyncio.run(
+            DenoTypescriptSandbox().arun_source(
+                source,
+                {"command": "report blocker", "submit": True},
+                syscall_handler=handler,
+            )
+        )
+
+        assert observed == ["shell.run"]
+        assert result["returncode"] == 1
+        assert result["output"] == "BLOCKED: shell dependency missing\n"
 
     @pytest.mark.real_deno
     def test_bash_propagates_upstream_truncation_without_overstating_elision(

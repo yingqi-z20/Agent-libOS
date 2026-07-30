@@ -736,6 +736,8 @@ def test_exit_review_survives_runtime_reopen(tmp_path: Path) -> None:
         process = runtime.process.get(pid)
         assert process.goal_oid is not None
         goal_oid = process.goal_oid
+        initial_goal = runtime.store.get_object(goal_oid)
+        assert initial_goal is not None
         sibling = runtime.memory.create_object(
             pid,
             ObjectType.ARTIFACT,
@@ -766,18 +768,19 @@ def test_exit_review_survives_runtime_reopen(tmp_path: Path) -> None:
 
         refreshed = reopened.llm.dispatch(pid, {"action": "process_exit"})
         refreshed_review = refreshed["payload"]["completion_review"]
-        assert refreshed_review["goal"]["source"] == "persisted_initial_llm_context"
-        assert refreshed_review["goal"]["reference"]["kind"] == "retained_llm_evidence"
-        assert refreshed_review["goal"]["fallback"] == {
-            "text": "retain the final review across restart"
-        }
+        assert refreshed_review["goal"]["source"] == "object_memory"
+        assert refreshed_review["goal"]["oid"] == initial_goal.oid
+        assert refreshed_review["goal"]["version"] == initial_goal.version
+        assert refreshed_review["goal"]["reference"]["kind"] == "object_memory"
+        assert "payload" not in refreshed_review["goal"]
+        assert "fallback" not in refreshed_review["goal"]
         assert (
             refreshed_review["goal"]["payload_sha256"]
             == review["goal"]["payload_sha256"]
         )
-        assert "UNRELATED_SIBLING_CONTEXT_SENTINEL" not in str(
-            refreshed_review["goal"]["fallback"]
-        )
+        rendered_review = json.dumps(refreshed_review, ensure_ascii=False)
+        assert "retain the final review across restart" not in rendered_review
+        assert "UNRELATED_SIBLING_CONTEXT_SENTINEL" not in rendered_review
         assert refreshed_review["review_token"] == review["review_token"]
 
         completed = reopened.llm.dispatch(
@@ -805,6 +808,11 @@ def test_exit_review_recovers_goal_from_persistent_context_prompt(
             image="coding-agent:v0",
             goal="recover this goal from the persistent context prompt",
         )
+        process = runtime.process.get(pid)
+        assert process.goal_oid is not None
+        goal_oid = process.goal_oid
+        initial_goal = runtime.store.get_object(goal_oid)
+        assert initial_goal is not None
         runtime.capability.grant(
             pid,
             LLM_CONTEXT_ENRICHMENT_RESOURCE,
@@ -822,9 +830,15 @@ def test_exit_review_recovers_goal_from_persistent_context_prompt(
         review_result = reopened.llm.dispatch(pid, {"action": "process_exit"})
         review = review_result["payload"]["completion_review"]
 
-        assert review["goal"]["source"] == "persisted_initial_llm_context"
-        assert "recover this goal from the persistent context prompt" in str(
-            review["goal"]["fallback"]
+        assert review["goal"]["source"] == "object_memory"
+        assert review["goal"]["oid"] == initial_goal.oid
+        assert review["goal"]["version"] == initial_goal.version
+        assert review["goal"]["reference"]["kind"] == "object_memory"
+        assert "payload" not in review["goal"]
+        assert "fallback" not in review["goal"]
+        assert (
+            "recover this goal from the persistent context prompt"
+            not in json.dumps(review, ensure_ascii=False)
         )
     finally:
         reopened.close()

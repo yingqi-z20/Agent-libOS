@@ -399,7 +399,10 @@ class GitPrimitive:
                 GitErrorCode.STALE_STATE.value,
                 "Git repository state changed after the preceding read",
                 retryable=True,
-                details={"actual_state_token": selected.token},
+                details={
+                    "actual_state_token": selected.token,
+                    "effect_started": False,
+                },
             )
         return selected
 
@@ -1842,6 +1845,7 @@ class GitPrimitive:
                         push_url=f"<redacted:{fingerprint['push_url_sha256'][:16]}>",
                         fetch_url_sha256=fingerprint["fetch_url_sha256"],
                         push_url_sha256=fingerprint["push_url_sha256"],
+                        fetch_refspecs=list(fingerprint.get("fetch_refspecs", ())),
                     )
                 )
             after = self.provider.repository_state(worktree=self._worktree_path(worktree_id))
@@ -1868,6 +1872,94 @@ class GitPrimitive:
 
         return self._read(pid, "list_remotes", read, worktree_id=worktree_id)
 
+    @staticmethod
+    def _parse_worktree_record(
+        record: bytes,
+    ) -> tuple[dict[str, bytes], set[str]]:
+        values: dict[str, bytes] = {}
+        flags: set[str] = set()
+        for field in record.strip(b"\0").split(b"\0"):
+            key, separator, value = field.partition(b" ")
+            key_text = key.decode("ascii", errors="strict")
+            if separator:
+                values[key_text] = value
+            else:
+                flags.add(key_text)
+        if "worktree" not in values:
+            raise GitError(
+                GitErrorCode.COMMAND_FAILED.value,
+                "Git worktree output is malformed",
+            )
+        return values, flags
+
+    def _listed_worktree_identity(
+        self,
+        path: Path,
+        *,
+        before: GitRepositoryState,
+        managed_root: Path,
+    ) -> tuple[str, bool] | None:
+        if path == before.layout.root:
+            return "main", False
+        managed = bool(
+            path.parent == managed_root
+            and _WORKTREE_ID_RE.fullmatch(path.name)
+            and path.name != "main"
+        )
+        if not managed:
+            return None
+        layout = self.provider.repository_layout(worktree=path)
+        if (
+            layout.root != path
+            or layout.repository_id != before.layout.repository_id
+            or layout.common_dir != before.layout.common_dir
+            or not layout.linked_worktree
+        ):
+            raise GitError(
+                GitErrorCode.UNSAFE_REPOSITORY.value,
+                "managed Git worktree failed structural validation",
+            )
+        return path.name, True
+
+    def _listed_worktree_info(
+        self,
+        record: bytes,
+        *,
+        before: GitRepositoryState,
+        managed_root: Path,
+    ) -> GitWorktreeInfo | None:
+        values, flags = self._parse_worktree_record(record)
+        path = Path(os.path.abspath(Path(os.fsdecode(values["worktree"]))))
+        identity = self._listed_worktree_identity(
+            path,
+            before=before,
+            managed_root=managed_root,
+        )
+        if identity is None:
+            return None
+        item_id, managed = identity
+        if "bare" in flags:
+            raise GitError(
+                GitErrorCode.UNSAFE_REPOSITORY.value,
+                "Git worktree list contains an unsupported bare entry",
+            )
+        branch_value = values.get("branch")
+        return GitWorktreeInfo(
+            worktree_id=item_id,
+            path=str(path),
+            head_oid=values.get("HEAD", b"").decode("ascii", errors="strict") or None,
+            branch=(
+                branch_value.decode("utf-8", errors="strict")
+                if branch_value
+                else None
+            ),
+            detached="detached" in flags,
+            bare=False,
+            locked="locked" in flags or "locked" in values,
+            prunable="prunable" in flags or "prunable" in values,
+            managed=managed,
+        )
+
     def list_worktrees(self, pid: str) -> dict[str, Any]:
         def read() -> tuple[dict[str, Any], dict[str, Any]]:
             before = self.provider.repository_state()
@@ -1893,45 +1985,14 @@ class GitPrimitive:
                     Path("/__unmanaged__"),
                 )
             )
-            main_root = before.layout.root
             for record in records:
-                values: dict[str, bytes] = {}
-                flags: set[str] = set()
-                for field in record.strip(b"\0").split(b"\0"):
-                    key, separator, value = field.partition(b" ")
-                    key_text = key.decode("ascii", errors="strict")
-                    if separator:
-                        values[key_text] = value
-                    else:
-                        flags.add(key_text)
-                if "worktree" not in values:
-                    raise GitError(GitErrorCode.COMMAND_FAILED.value, "Git worktree output is malformed")
-                path = Path(os.fsdecode(values["worktree"])).resolve(strict=False)
-                managed = bool(
-                    path.parent == managed_root
-                    and _WORKTREE_ID_RE.fullmatch(path.name)
-                    and path.name != "main"
+                item = self._listed_worktree_info(
+                    record,
+                    before=before,
+                    managed_root=managed_root,
                 )
-                if path == main_root:
-                    item_id = "main"
-                elif managed and _WORKTREE_ID_RE.fullmatch(path.name):
-                    item_id = path.name
-                else:
-                    continue
-                branch_value = values.get("branch")
-                worktrees.append(
-                    GitWorktreeInfo(
-                        worktree_id=item_id,
-                        path=str(path),
-                        head_oid=values.get("HEAD", b"").decode("ascii", errors="strict") or None,
-                        branch=branch_value.decode("utf-8", errors="strict") if branch_value else None,
-                        detached="detached" in flags,
-                        bare="bare" in flags,
-                        locked="locked" in flags or "locked" in values,
-                        prunable="prunable" in flags or "prunable" in values,
-                        managed=managed,
-                    )
-                )
+                if item is not None:
+                    worktrees.append(item)
             after = self.provider.repository_state()
             token = self._state_token(before)
             if token.token != self._state_token(after).token:
@@ -3488,6 +3549,15 @@ class GitPrimitive:
                 created_oid, details, changed_raw = callback(before_state)
             except BaseException as operation_error:
                 if not current_state["started"]:
+                    if (
+                        isinstance(operation_error, GitError)
+                        and operation_error.code == GitErrorCode.STALE_STATE.value
+                        and operation_error.retryable
+                    ):
+                        operation_error.details.setdefault(
+                            "effect_started",
+                            False,
+                        )
                     raise
                 self._settle_failed_mutation(
                     pid=pid,
@@ -5287,7 +5357,10 @@ class GitPrimitive:
                 GitErrorCode.STALE_STATE.value,
                 "Git repository state changed after the preceding read",
                 retryable=True,
-                details={"actual_state_token": current.state.token},
+                details={
+                    "actual_state_token": current.state.token,
+                    "effect_started": False,
+                },
             )
         if current.branch is None:
             raise GitError(

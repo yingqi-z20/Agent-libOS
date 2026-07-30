@@ -95,7 +95,7 @@ All PR writes are non-idempotent effects. The model-facing error omits some prov
 - Merge can change `HEAD`, index, or worktree before PR metadata is marked merged. Inspect selected-worktree `HEAD`/branch/status, PR status, `merged_oid`, live branches, snapshots, and commit topology. Because hidden operation state is not directly readable, invoke integration recovery only for a kind known from the attempted strategy/error; otherwise stop. Do not issue a second merge merely because metadata remains open.
 - Close can persist even if acknowledgement is lost. Exact inspection resolves ordinary cases; never retry an already closed PR.
 - Malformed/missing metadata, orphan snapshot refs, snapshot/metadata mismatch, or a merged worktree with stale PR metadata has no typed repair operation in this Skill. Preserve the evidence, report the inconsistent state, and request an authorized administrative recovery path. Raw shell edits to refs/JSON are not an escape hatch.
-- Query-only external-effect recovery reads recorded effect state and does not replay PR writes. It cannot repair partial snapshot/metadata state or infer a changed `HEAD`; `unknown` remains unknown until repository evidence resolves it.
+- Query-only external-effect recovery performs a fresh local repository-state read, including refs, worktree state, and the simulated-PR metadata digest; it does not replay PR writes or compare that evidence into a definitive outcome. It cannot repair partial snapshot/metadata state, and `unknown` remains unknown until a caller reconciles the fresh repository evidence.
 
 ## Completion evidence
 

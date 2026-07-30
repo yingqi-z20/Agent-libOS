@@ -4,6 +4,38 @@ function numberValue(value: unknown, fallback: number, min: number, max: number)
   return Math.max(min, Math.min(max, selected));
 }
 
+function parseMatches(text: string, stdoutTruncated: boolean): {
+  records: Array<{ file: string; rendered: string }>;
+  framingIncomplete: boolean;
+} {
+  const records: Array<{ file: string; rendered: string }> = [];
+  let cursor = 0;
+  let framingIncomplete = false;
+  while (cursor < text.length) {
+    const separator = text.indexOf("\0", cursor);
+    if (separator < 0) {
+      framingIncomplete = true;
+      break;
+    }
+    const file = text.slice(cursor, separator);
+    const lineStart = separator + 1;
+    const newline = text.indexOf("\n", lineStart);
+    if (newline < 0 && stdoutTruncated) {
+      framingIncomplete = true;
+      break;
+    }
+    const end = newline < 0 ? text.length : newline;
+    const match = text.slice(lineStart, end).replace(/\r$/, "");
+    if (file.length === 0 || match.length === 0) {
+      framingIncomplete = true;
+      break;
+    }
+    records.push({ file, rendered: `${file}:${match}` });
+    cursor = newline < 0 ? text.length : newline + 1;
+  }
+  return { records, framingIncomplete };
+}
+
 export async function run(args: Record<string, unknown>, libos: { syscall(name: string, args: unknown): Promise<any> }) {
   const pattern = String(args.pattern ?? "");
   if (!pattern) throw new Error("pattern is required");
@@ -13,7 +45,15 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
   const timeoutSeconds = Number.isFinite(requestedTimeout)
     ? Math.max(Number.EPSILON, Math.min(10, requestedTimeout))
     : 10;
-  const argv = ["rg", "-n", "--hidden", "--glob", "!.git/*"];
+  const argv = [
+    "rg",
+    "-n",
+    "--null",
+    "--with-filename",
+    "--hidden",
+    "--glob",
+    "!.git/*",
+  ];
   if (args.literal !== false) argv.push("-F");
   argv.push("--", pattern, path);
   const result = await libos.syscall("shell.run", {
@@ -24,20 +64,20 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
   const stderr = String(result.stderr ?? "");
   const stdoutTruncated = Boolean(result.stdout_truncated);
   const stderrTruncated = Boolean(result.stderr_truncated);
-  const outputIncomplete = stdoutTruncated || stderrTruncated;
-  const rawMatches = text.split(/\r?\n/).filter((line) => line.length > 0);
-  const matches = rawMatches.slice(0, maxResults);
+  const parsed = parseMatches(text, stdoutTruncated);
+  const matchesIncomplete = stdoutTruncated || parsed.framingIncomplete;
+  const outputIncomplete = matchesIncomplete || stderrTruncated;
+  const selected = parsed.records.slice(0, maxResults);
+  const matches = selected.map((record) => record.rendered);
   const files: string[] = [];
   const seen = new Set<string>();
-  for (const line of matches) {
-    const index = line.indexOf(":");
-    const file = index >= 0 ? line.slice(0, index) : line;
-    if (!seen.has(file)) {
-      seen.add(file);
-      files.push(file);
+  for (const record of selected) {
+    if (!seen.has(record.file)) {
+      seen.add(record.file);
+      files.push(record.file);
     }
   }
-  const observedOmittedMatches = Math.max(rawMatches.length - matches.length, 0);
+  const observedOmittedMatches = Math.max(parsed.records.length - matches.length, 0);
   const emptyMessage =
     result.returncode === 0 &&
       text.length === 0 &&
@@ -50,9 +90,9 @@ export async function run(args: Record<string, unknown>, libos: { syscall(name: 
     returncode: result.returncode,
     files,
     matches,
-    omitted_matches: stdoutTruncated ? null : observedOmittedMatches,
+    omitted_matches: matchesIncomplete ? null : observedOmittedMatches,
     observed_omitted_matches: observedOmittedMatches,
-    matches_incomplete: stdoutTruncated,
+    matches_incomplete: matchesIncomplete,
     stdout_truncated: stdoutTruncated,
     stderr_truncated: stderrTruncated,
     output_incomplete: outputIncomplete,

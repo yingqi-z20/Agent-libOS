@@ -27,6 +27,7 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import (
     CapabilityDenied,
+    NotFound,
     ProcessError,
     ProcessWaitRequired,
     ResourceLimitExceeded,
@@ -1534,6 +1535,79 @@ class TestCheckpointFork:
             assert stored is not None
             assert stored[0].system_prompt == 'snapshot prompt'
         finally:
+            runtime.close()
+
+    def test_fork_outer_failure_never_publishes_restored_image_to_concurrent_readers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        image_id = 'checkpoint-fork-staged-image:v0'
+        row_insert_entered = threading.Event()
+        release_row_insert = threading.Event()
+        outcomes: list[BaseException] = []
+        try:
+            runtime.register_image(
+                AgentImage(image_id=image_id, name='checkpoint-fork-staged-image'),
+                actor='test',
+            )
+            source = runtime.process.spawn(image=image_id, goal='snapshot staged image')
+            checkpoint_id = runtime.checkpoint.create(
+                source,
+                'staged image fork point',
+                actor=source,
+            )
+            actor = runtime.process.spawn(image='base-agent:v0', goal='fork staged image')
+            runtime.capability.grant(
+                actor,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            runtime.image_registry.grant_register(actor, image_id, issued_by='test')
+            runtime.images.pop(image_id)
+            runtime.store.delete_image(image_id)
+            before_pids = {process.pid for process in runtime.process.list()}
+
+            def fail_late_row_insert(*_args: object, **_kwargs: object) -> None:
+                row_insert_entered.set()
+                if not release_row_insert.wait(timeout=5):
+                    raise RuntimeError('timed out waiting to fail checkpoint fork rows')
+                raise RuntimeError('injected late checkpoint fork row failure')
+
+            monkeypatch.setattr(
+                runtime.uow.snapshots,
+                'insert_checkpoint_fork_rows',
+                fail_late_row_insert,
+            )
+
+            def fork() -> None:
+                try:
+                    runtime.checkpoint.fork_from_checkpoint(actor, checkpoint_id)
+                except BaseException as exc:
+                    outcomes.append(exc)
+
+            thread = threading.Thread(target=fork, daemon=True)
+            thread.start()
+            assert row_insert_entered.wait(timeout=5)
+
+            assert image_id not in runtime.images
+            assert runtime.llm._images.get(image_id) is None
+            with pytest.raises(NotFound):
+                runtime.launch.require_image(image_id)
+
+            release_row_insert.set()
+            thread.join(timeout=10)
+
+            assert not thread.is_alive()
+            assert len(outcomes) == 1
+            assert isinstance(outcomes[0], RuntimeError)
+            assert 'injected late checkpoint fork row failure' in str(outcomes[0])
+            assert image_id not in runtime.images
+            assert runtime.store.get_image(image_id) is None
+            assert {process.pid for process in runtime.process.list()} == before_pids
+        finally:
+            release_row_insert.set()
             runtime.close()
 
     def test_fork_revalidates_missing_snapshot_image_write_inside_publish_transaction(

@@ -39,6 +39,13 @@ and process-tree termination. Provider/API credentials, `PYTHONPATH`, and
 startup variables are not inherited. Truncated, limit-killed, incomplete, or
 unparseable oracle output fails closed.
 
+The JSON report contract is `schema_version: 1`. CLI defaults are one
+repetition, six phase-one scheduler quanta, and 48 total scheduler quanta per
+run (`--repetitions 1 --phase-one-quanta 6 --max-quanta 48`). All three values
+must be positive, and total quanta must be greater than phase-one quanta. These
+are evaluation bounds, not guarantees about how many successful model actions
+will occur.
+
 This is environment and resource isolation, not an operating-system sandbox.
 The oracle executes Python from the candidate workspace with the evaluator
 user's filesystem and network access. Run adversarial or otherwise untrusted
@@ -61,6 +68,14 @@ The report path and retained-artifact tree must not equal, contain, or be
 contained by one another; this is rejected before any provider call. Report
 publication uses destination reservation and atomic replacement, with failed
 reruns represented by a non-favorable marker rather than stale success JSON.
+
+`--require-all-successful` is an opt-in exit gate. Without it, the CLI exits 0
+after successfully publishing a schema-v1 report even when a run has
+`passed: false`; with it, any failed durable task-state oracle returns 1 after
+the report is written. Provider/setup exceptions and publication failures
+remain nonzero regardless of the flag. Release or CI invocations must include
+`--require-all-successful` rather than treating artifact creation alone as a
+successful evaluation.
 
 Custom endpoints whose bounded requests can legitimately exceed the default
 provider timeout should set `OPENAI_TIMEOUT` in the Host environment. Keep it

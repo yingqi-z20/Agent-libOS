@@ -14,7 +14,7 @@ import pytest
 
 import agent_libos.storage.postgres as postgres_backend
 import agent_libos.storage.sqlite as sqlite_backend
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import UnsupportedStoreVersion, ValidationError
 from agent_libos.storage.factory import _sqlite_target
 from agent_libos.storage.postgres import _PostgresCursor, _PostgresDialect
 from agent_libos.storage import (
@@ -147,6 +147,10 @@ class TestStorageBackendBoundaries:
             os.umask(previous_umask)
         try:
             assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+            assert (
+                str(store.conn.execute("PRAGMA locking_mode").fetchone()[0]).lower()
+                == "exclusive"
+            )
             lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
             if sqlite_backend.fcntl is not None and hasattr(os, "O_NOFOLLOW"):
                 assert stat.S_IMODE(lease_path.stat().st_mode) == 0o600
@@ -155,10 +159,13 @@ class TestStorageBackendBoundaries:
             store.conn.execute("CREATE TABLE private_mode_probe(value TEXT)")
             store.conn.execute("INSERT INTO private_mode_probe VALUES ('secret')")
             store.conn.commit()
+            # EXCLUSIVE locking does not need a shared-memory sidecar on every
+            # SQLite build. Harden every sidecar SQLite actually materializes.
+            assert Path(f"{db_path}-wal").exists()
             for suffix in ("-wal", "-shm"):
                 sidecar = Path(f"{db_path}{suffix}")
-                assert sidecar.exists()
-                assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+                if sidecar.exists():
+                    assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
         finally:
             store.close()
 
@@ -431,6 +438,42 @@ class TestStorageBackendBoundaries:
         assert "pg_catalog.pg_class" in connection.sql
         assert "current_schema()" in connection.sql
 
+    def test_postgres_v3_manifest_rejects_view_relation_before_column_probe(
+        self,
+    ) -> None:
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.sql = ""
+                self.params: tuple[str, ...] = ()
+
+            def execute(
+                self,
+                sql: str,
+                params: object = (),
+            ) -> list[dict[str, str]]:
+                self.sql = sql
+                self.params = tuple(str(value) for value in params)  # type: ignore[arg-type]
+                return [
+                    {
+                        "name": table,
+                        "relation_kind": "v" if table == "jsonrpc_endpoints" else "r",
+                    }
+                    for table in self.params
+                ]
+
+        connection = FakeConnection()
+
+        with pytest.raises(
+            UnsupportedStoreVersion,
+            match=r"manifest relation types.*jsonrpc_endpoints",
+        ):
+            PostgresStore._require_v3_schema_shape(connection)
+
+        assert "pg_catalog.pg_class" in connection.sql
+        assert "current_schema()" in connection.sql
+        assert "relation.relkind" in connection.sql
+        assert "jsonrpc_endpoints" in connection.params
+
     def test_sqlite_runtime_lease_uses_atomic_lockfile_without_fcntl(
         self,
         tmp_path: Path,
@@ -580,6 +623,107 @@ class TestStorageBackendBoundaries:
         assert not adjacent_lease.exists()
         if identity_directory is not None:
             assert {path.name for path in identity_directory.iterdir()} == identity_before
+
+    def test_sqlite_actual_connection_lease_survives_connect_path_retarget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if sqlite_backend.fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("POSIX secure runtime lease is unavailable")
+        selected_path = tmp_path / "selected.sqlite"
+        alternate_path = tmp_path / "alternate.sqlite"
+        held_selected_path = tmp_path / "held-selected.sqlite"
+
+        for database, sentinel in (
+            (selected_path, "selected-database"),
+            (alternate_path, "alternate-database"),
+        ):
+            seeded = SQLiteStore(database)
+            try:
+                with seeded.transaction() as cursor:
+                    cursor.execute(
+                        "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                        (sentinel, None, "{}", "test", "1", "1"),
+                    )
+            finally:
+                seeded.close()
+
+        real_connect = sqlite_backend.sqlite3.connect
+        swap_triggered = False
+
+        def connect_after_temporary_retarget(
+            target: object,
+            *args: object,
+            **kwargs: object,
+        ) -> sqlite3.Connection:
+            nonlocal swap_triggered
+            target_text = str(target)
+            if (
+                not swap_triggered
+                and target_text.startswith(selected_path.resolve().as_uri())
+                and "mode=rw" in target_text
+            ):
+                selected_path.rename(held_selected_path)
+                alternate_path.rename(selected_path)
+                try:
+                    connection = real_connect(target, *args, **kwargs)
+                finally:
+                    selected_path.rename(alternate_path)
+                    held_selected_path.rename(selected_path)
+                swap_triggered = True
+                return connection
+            return real_connect(target, *args, **kwargs)
+
+        monkeypatch.setattr(
+            sqlite_backend.sqlite3,
+            "connect",
+            connect_after_temporary_retarget,
+        )
+        first = SQLiteStore(selected_path)
+        unexpected: SQLiteStore | None = None
+        try:
+            assert swap_triggered is True
+            assert (
+                str(first.conn.execute("PRAGMA locking_mode").fetchone()[0]).lower()
+                == "exclusive"
+            )
+            namespaces = {
+                str(row["namespace"])
+                for row in first.conn.execute(
+                    "SELECT namespace FROM object_namespaces"
+                )
+            }
+            assert "alternate-database" in namespaces
+            assert "selected-database" not in namespaces
+
+            # The path/inode sidecars describe selected_path, but the SQLite
+            # connection-level lease must still prevent another Runtime from
+            # opening the actual alternate database.
+            with pytest.raises(ValidationError, match="already open"):
+                unexpected = SQLiteStore(alternate_path)
+        finally:
+            if unexpected is not None:
+                unexpected.close()
+            first.close()
+
+        # Releasing the actual database lock restores normal independent open
+        # and reopen behavior for both persistent targets.
+        for database, sentinel in (
+            (selected_path, "selected-database"),
+            (alternate_path, "alternate-database"),
+        ):
+            reopened = SQLiteStore(database)
+            try:
+                namespaces = {
+                    str(row["namespace"])
+                    for row in reopened.conn.execute(
+                        "SELECT namespace FROM object_namespaces"
+                    )
+                }
+                assert sentinel in namespaces
+            finally:
+                reopened.close()
 
     def test_sqlite_identity_lease_is_owner_only_and_released_on_close(
         self,

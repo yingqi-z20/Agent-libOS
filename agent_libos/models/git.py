@@ -169,6 +169,7 @@ class GitRemoteInfo:
     push_url: str
     fetch_url_sha256: str
     push_url_sha256: str
+    fetch_refspecs: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)

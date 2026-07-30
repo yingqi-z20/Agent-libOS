@@ -14,6 +14,7 @@ from pydantic import (
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import GitErrorCode
 from agent_libos.models.exceptions import GitError
+from agent_libos.substrate import ProviderEffectNotStarted
 from agent_libos.tools.base import (
     SyncAgentTool,
     ToolContext,
@@ -372,7 +373,11 @@ _TRANSIENT_CODES = {
 }
 
 
-def _git_tool_error(exc: GitError) -> ToolExecutionError:
+def _git_tool_error(
+    exc: GitError,
+    *,
+    idempotent: bool,
+) -> ToolExecutionError:
     if exc.code in _INVALID_CODES:
         code = ToolErrorCode.VALIDATION_ERROR
     elif exc.code in _UNSUPPORTED_CODES:
@@ -390,12 +395,34 @@ def _git_tool_error(exc: GitError) -> ToolExecutionError:
     return ToolExecutionError(
         str(exc),
         code=code,
-        retryable=exc.retryable or exc.code in _TRANSIENT_CODES,
+        retryable=_git_tool_error_is_retryable(exc, idempotent=idempotent),
         details={
             "git_error_code": exc.code,
             "operation": exc.operation,
         },
     )
+
+
+def _git_tool_error_is_retryable(
+    exc: GitError,
+    *,
+    idempotent: bool,
+) -> bool:
+    """Project Git retry safety without widening provider guarantees."""
+
+    if exc.code == GitErrorCode.UNKNOWN_EFFECT.value:
+        return False
+    if exc.code == GitErrorCode.TIMEOUT.value:
+        return idempotent and exc.retryable
+    if exc.code == GitErrorCode.STALE_STATE.value:
+        if not exc.retryable:
+            return False
+        return (
+            idempotent
+            or isinstance(exc, ProviderEffectNotStarted)
+            or exc.details.get("effect_started") is False
+        )
+    return exc.retryable
 
 
 class _GitTool(SyncAgentTool[_StrictArgs]):
@@ -411,7 +438,10 @@ class _GitTool(SyncAgentTool[_StrictArgs]):
                 **args.model_dump(exclude_none=True, by_alias=True),
             )
         except GitError as exc:
-            raise _git_tool_error(exc) from exc
+            raise _git_tool_error(
+                exc,
+                idempotent=self.policy.idempotent,
+            ) from exc
         return to_jsonable(result)
 
 

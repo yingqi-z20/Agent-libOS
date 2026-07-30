@@ -13,6 +13,49 @@ composition is `LocalResourceProviderSubstrate` from
 provider hooks during startup. Every real provider boundary must use the
 [`ProtectedOperationContract`](protected_operation_sdk.md) lifecycle.
 
+## Python composition boundary
+
+Import the public structural protocols and default composition from
+`agent_libos.substrate`:
+
+```python
+from pathlib import Path
+
+from agent_libos import Runtime
+from agent_libos.substrate import (
+    JsonRpcProvider,
+    LocalResourceProviderSubstrate,
+    McpProvider,
+    ResourceProviderSubstrate,
+)
+
+
+def open_with_remote_providers(
+    target: str | Path,
+    workspace: Path,
+    *,
+    jsonrpc_provider: JsonRpcProvider,
+    mcp_provider: McpProvider,
+) -> Runtime:
+    substrate: ResourceProviderSubstrate = LocalResourceProviderSubstrate(
+        workspace
+    )
+    substrate.jsonrpc = jsonrpc_provider
+    substrate.mcp = mcp_provider
+    return Runtime.open(target, substrate=substrate)
+```
+
+This is an executable composition skeleton, not a complete provider
+implementation. It works only when the supplied objects implement every
+dispatch and external-effect classification method in `JsonRpcProvider` and
+`McpProvider`. Starting from `LocalResourceProviderSubstrate` preserves the
+other required filesystem, Git, clock, Shell, and Human providers. A fully
+custom composition must implement all fields of `ResourceProviderSubstrate`.
+Provider code remains trusted Host code and does not inherit authority,
+data-flow, resource, evidence, or error-sanitization responsibilities from the
+model. See [Python API](python_api.md#provider-protocols-and-injection) for the
+injection and Host-API contract.
+
 ## Current provider inventory
 
 | Provider | Current backend | Authority and policy | Effect/evidence contract | Bounds and containment |

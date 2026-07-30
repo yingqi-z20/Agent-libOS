@@ -5,7 +5,11 @@ allowed-tools: create_memory_namespace list_memory_namespace create_memory_objec
 ---
 # Manage runtime-local Object Memory
 
-Payloads survive prompt/compaction changes only in the live Runtime. Metadata can outlive missing content after reopen; export or explicitly capture required payloads.
+Payloads created through these Object Memory tools survive prompt/compaction
+changes only in the live Runtime. Metadata can outlive missing content after
+reopen; export or explicitly capture required payloads. The Host's narrow
+committed-root initial-GOAL recovery path does not make these ordinary Objects
+durable.
 
 Names are namespace-local lookup, not authority: trimmed, nonempty, not `.`/`..`, with no `/` or `\`. Omitted namespace means process scope.
 
@@ -80,7 +84,9 @@ Needs namespace read and Object read/write; inherits flow labels/provenance and 
 - Append conflict/ambiguity: re-read relevant content/version and retry only if entry is absent. Blind retry duplicates data.
 - Wrong field: preserve the mistaken append and correct the design; do not pretend it did not occur.
 - Permission/label denial: obtain appropriate authority or change the authorized design. Names and Skill activation grant nothing; never route through another namespace/process to evade policy.
-- Runtime reopen with missing payload: recover from an authoritative file or captured checkpoint/image. Do not infer content from surviving metadata, version, or OID.
+- Runtime reopen with missing payload: recover these ordinary Objects from an
+  authoritative file or captured checkpoint/image. Do not infer content from
+  surviving metadata, version, or OID.
 
 There is no wait, rollback, arbitrary update, delete, rename, view-management, or cross-runtime restore operation in this Skill. Stop with an explicit blocker when state cannot be safely reconciled.
 

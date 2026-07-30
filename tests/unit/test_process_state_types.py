@@ -32,8 +32,9 @@ from agent_libos.models import (
     remap_process_outcome,
     upcast_legacy_process_state,
 )
-from agent_libos.models.exceptions import ProcessRevisionConflict, ValidationError
+from agent_libos.models.exceptions import ProcessError, ProcessRevisionConflict, ValidationError
 from agent_libos.process_transition import (
+    ProcessStateToken,
     ProcessTransitionService,
     validate_process_state,
 )
@@ -73,7 +74,6 @@ class _ProcessRepository:
         if pid != self.process.pid:
             return None
         return deepcopy(self.process)
-
     def apply_process_state_transition(
         self,
         pid: str,
@@ -119,6 +119,29 @@ class _ProcessRepository:
         self.process.state_generation += 1
         self.process.revision += 1
         return deepcopy(self.process)
+
+
+class _InterleavingProcessRepository(_ProcessRepository):
+    def __init__(self, process: AgentProcess):
+        super().__init__(process)
+        self.interleave_after_next_read = False
+
+    def get_process(self, pid: str) -> AgentProcess | None:
+        observed = super().get_process(pid)
+        if self.interleave_after_next_read and observed is not None:
+            self.interleave_after_next_read = False
+            replacement = MessageProcessWait(filters={"channel": "racing-owner"})
+            self.process.status = ProcessStatus.WAITING_EVENT
+            self.process.wait_state = replacement
+            self.process.outcome = None
+            self.process.status_message = legacy_status_message(
+                replacement,
+                None,
+                None,
+            )
+            self.process.state_generation += 1
+            self.process.revision += 1
+        return observed
 
 
 def test_process_transition_repository_port_covers_the_service_surface() -> None:
@@ -286,6 +309,318 @@ def test_state_generation_fences_a_repeated_wait_against_aba_wakeup() -> None:
     assert second.state_generation == 3
     with pytest.raises(ProcessRevisionConflict, match="stale process wait token"):
         transitions.wake(stale_token, control=False)
+
+
+@pytest.mark.parametrize(
+    "pause_wait",
+    (
+        PausedProcessWait(reason_oid="obj_pause"),
+        HostResumeProcessWait(reason_oid="obj_host_resume"),
+    ),
+    ids=("paused", "host-resume"),
+)
+def test_pause_wait_cannot_be_turned_into_a_condition_wake_token(
+    pause_wait: ProcessWaitState,
+) -> None:
+    repository = _ProcessRepository(_process())
+    transitions = ProcessTransitionService(repository)
+    paused = transitions.transition(
+        "pid_1",
+        ProcessStatus.PAUSED,
+        expected_revision=0,
+        expected_state_generation=0,
+        wait_state=pause_wait,
+    )
+
+    with pytest.raises(ProcessRevisionConflict, match="no condition-owned wait"):
+        transitions.wait_token(paused)
+    forged = ProcessStateToken(
+        pid=paused.pid,
+        state_generation=paused.state_generation,
+        wait_state=pause_wait,
+    )
+    with pytest.raises(ProcessRevisionConflict, match="not condition-owned"):
+        transitions.wake(forged, control=False)
+
+    assert repository.get_process("pid_1") == paused
+
+
+@pytest.mark.parametrize(
+    ("current_status", "current_wait", "requested_status", "requested_wait"),
+    (
+        (
+            ProcessStatus.WAITING_EVENT,
+            MessageProcessWait(filters={"channel": "control"}),
+            ProcessStatus.WAITING_HUMAN,
+            HumanProcessWait(request_ids=("hreq_new",)),
+        ),
+        (
+            ProcessStatus.WAITING_HUMAN,
+            HumanProcessWait(request_ids=("hreq_current",)),
+            ProcessStatus.WAITING_EVENT,
+            MessageProcessWait(filters={"channel": "control"}),
+        ),
+        (
+            ProcessStatus.WAITING_HUMAN,
+            HumanProcessWait(request_ids=("hreq_current",)),
+            ProcessStatus.WAITING_EVENT,
+            ChildProcessWait(child_pid="pid_child"),
+        ),
+        (
+            ProcessStatus.WAITING_HUMAN,
+            HumanProcessWait(request_ids=("hreq_current",)),
+            ProcessStatus.WAITING_TOOL,
+            ToolProcessWait(operation_id="otask_new"),
+        ),
+        (
+            ProcessStatus.WAITING_TOOL,
+            ToolProcessWait(operation_id="otask_current"),
+            ProcessStatus.WAITING_HUMAN,
+            HumanProcessWait(request_ids=("hreq_new",)),
+        ),
+        (
+            ProcessStatus.PAUSED,
+            PausedProcessWait(reason_oid="obj_pause"),
+            ProcessStatus.WAITING_EVENT,
+            MessageProcessWait(filters={"channel": "control"}),
+        ),
+        (
+            ProcessStatus.PAUSED,
+            HostResumeProcessWait(reason_oid="obj_host"),
+            ProcessStatus.WAITING_EVENT,
+            MessageProcessWait(filters={"channel": "control"}),
+        ),
+    ),
+    ids=(
+        "message-to-human",
+        "human-to-message",
+        "human-to-child",
+        "human-to-tool",
+        "tool-to-human",
+        "pause-to-message",
+        "host-resume-to-message",
+    ),
+)
+def test_condition_wait_registration_cannot_replace_another_owner(
+    current_status: ProcessStatus,
+    current_wait: ProcessWaitState,
+    requested_status: ProcessStatus,
+    requested_wait: ProcessWaitState,
+) -> None:
+    repository = _ProcessRepository(_process())
+    transitions = ProcessTransitionService(repository)
+    waiting = transitions.transition(
+        "pid_1",
+        current_status,
+        expected_revision=0,
+        expected_state_generation=0,
+        wait_state=current_wait,
+    )
+
+    with pytest.raises(ProcessError, match="owned by another condition"):
+        transitions.transition(
+            "pid_1",
+            requested_status,
+            expected_revision=waiting.revision,
+            expected_status=waiting.status,
+            expected_state_generation=waiting.state_generation,
+            wait_state=requested_wait,
+        )
+
+    assert repository.get_process("pid_1") == waiting
+
+
+def test_suspended_process_cannot_register_a_condition_wait() -> None:
+    repository = _ProcessRepository(_process())
+    transitions = ProcessTransitionService(repository)
+    suspended = transitions.transition(
+        "pid_1",
+        ProcessStatus.SUSPENDED,
+        expected_revision=0,
+        expected_state_generation=0,
+    )
+
+    with pytest.raises(ProcessError, match="suspended process"):
+        transitions.transition(
+            "pid_1",
+            ProcessStatus.WAITING_HUMAN,
+            expected_revision=suspended.revision,
+            expected_status=suspended.status,
+            expected_state_generation=suspended.state_generation,
+            wait_state=HumanProcessWait(request_ids=("hreq_new",)),
+        )
+
+    assert repository.get_process("pid_1") == suspended
+
+
+def test_condition_wait_owner_can_update_its_own_generation() -> None:
+    repository = _ProcessRepository(_process())
+    transitions = ProcessTransitionService(repository)
+    first = transitions.transition(
+        "pid_1",
+        ProcessStatus.WAITING_HUMAN,
+        expected_revision=0,
+        expected_state_generation=0,
+        wait_state=HumanProcessWait(request_ids=("hreq_first",)),
+    )
+
+    second = transitions.transition(
+        "pid_1",
+        ProcessStatus.WAITING_HUMAN,
+        expected_revision=first.revision,
+        expected_status=first.status,
+        expected_state_generation=first.state_generation,
+        wait_state=HumanProcessWait(
+            request_ids=("hreq_first", "hreq_second"),
+        ),
+    )
+
+    assert second.wait_state == HumanProcessWait(
+        request_ids=("hreq_first", "hreq_second")
+    )
+    assert second.state_generation == first.state_generation + 1
+    assert second.revision == first.revision + 1
+
+    third = transitions.transition(
+        "pid_1",
+        ProcessStatus.WAITING_HUMAN,
+        expected_revision=second.revision,
+        expected_status=second.status,
+        expected_state_generation=second.state_generation,
+        wait_state=HumanProcessWait(request_ids=("hreq_second",)),
+    )
+    assert third.wait_state == HumanProcessWait(request_ids=("hreq_second",))
+    assert third.state_generation == second.state_generation + 1
+
+
+@pytest.mark.parametrize(
+    ("status", "current_wait", "requested_wait", "error"),
+    (
+        (
+            ProcessStatus.WAITING_EVENT,
+            ChildProcessWait(child_pid="pid_first"),
+            ChildProcessWait(child_pid="pid_second"),
+            "cannot retarget",
+        ),
+        (
+            ProcessStatus.WAITING_EVENT,
+            MessageProcessWait(filters={"channel": "first"}),
+            MessageProcessWait(filters={"channel": "second"}),
+            "cannot retarget",
+        ),
+        (
+            ProcessStatus.WAITING_TOOL,
+            ToolProcessWait(operation_id="otask_first"),
+            ToolProcessWait(operation_id="otask_second"),
+            "cannot retarget",
+        ),
+        (
+            ProcessStatus.WAITING_HUMAN,
+            HumanProcessWait(request_ids=("hreq_first",)),
+            HumanProcessWait(request_ids=("hreq_second",)),
+            "mixed request set",
+        ),
+        (
+            ProcessStatus.WAITING_HUMAN,
+            HumanProcessWait(request_ids=("hreq_first", "hreq_keep")),
+            HumanProcessWait(request_ids=("hreq_keep", "hreq_new")),
+            "mixed request set",
+        ),
+    ),
+    ids=("child", "message", "tool", "human-disjoint", "human-mixed"),
+)
+def test_condition_wait_owner_cannot_retarget_an_active_wait(
+    status: ProcessStatus,
+    current_wait: ProcessWaitState,
+    requested_wait: ProcessWaitState,
+    error: str,
+) -> None:
+    repository = _ProcessRepository(_process())
+    transitions = ProcessTransitionService(repository)
+    waiting = transitions.transition(
+        "pid_1",
+        status,
+        expected_revision=0,
+        expected_state_generation=0,
+        wait_state=current_wait,
+    )
+
+    with pytest.raises(ProcessError, match=error):
+        transitions.transition(
+            "pid_1",
+            status,
+            expected_revision=waiting.revision,
+            expected_status=waiting.status,
+            expected_state_generation=waiting.state_generation,
+            wait_state=requested_wait,
+        )
+
+    assert repository.get_process("pid_1") == waiting
+
+
+def test_wait_registration_reports_a_stale_revision_before_owner_mismatch() -> None:
+    repository = _ProcessRepository(_process())
+    transitions = ProcessTransitionService(repository)
+    human_wait = transitions.transition(
+        "pid_1",
+        ProcessStatus.WAITING_HUMAN,
+        expected_revision=0,
+        expected_state_generation=0,
+        wait_state=HumanProcessWait(request_ids=("hreq_stale",)),
+    )
+    current = repository.process
+    replacement = MessageProcessWait(filters={"channel": "current"})
+    current.status = ProcessStatus.WAITING_EVENT
+    current.wait_state = replacement
+    current.status_message = legacy_status_message(replacement, None, None)
+    current.state_generation += 1
+    current.revision += 1
+
+    with pytest.raises(ProcessRevisionConflict, match="stale process wait registration"):
+        transitions.transition(
+            "pid_1",
+            ProcessStatus.WAITING_HUMAN,
+            expected_revision=human_wait.revision,
+            expected_status=human_wait.status,
+            expected_state_generation=human_wait.state_generation,
+            wait_state=HumanProcessWait(
+                request_ids=("hreq_stale", "hreq_new"),
+            ),
+        )
+
+    assert repository.get_process("pid_1") == current
+
+
+def test_wait_registration_cas_rejects_owner_change_after_guard_read() -> None:
+    repository = _InterleavingProcessRepository(_process())
+    transitions = ProcessTransitionService(repository)
+    human_wait = transitions.transition(
+        "pid_1",
+        ProcessStatus.WAITING_HUMAN,
+        expected_revision=0,
+        expected_state_generation=0,
+        wait_state=HumanProcessWait(request_ids=("hreq_first",)),
+    )
+    repository.interleave_after_next_read = True
+
+    with pytest.raises(ProcessRevisionConflict, match="revision conflict"):
+        transitions.transition(
+            "pid_1",
+            ProcessStatus.WAITING_HUMAN,
+            expected_revision=human_wait.revision,
+            expected_status=human_wait.status,
+            expected_state_generation=human_wait.state_generation,
+            wait_state=HumanProcessWait(
+                request_ids=("hreq_first", "hreq_second"),
+            ),
+        )
+
+    current = repository.get_process("pid_1")
+    assert current is not None
+    assert current.status == ProcessStatus.WAITING_EVENT
+    assert current.wait_state == MessageProcessWait(
+        filters={"channel": "racing-owner"}
+    )
 
 
 def test_forked_terminal_outcome_uses_the_cloned_result_object() -> None:

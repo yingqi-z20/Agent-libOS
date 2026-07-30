@@ -41,6 +41,19 @@ from agent_libos.substrate.base import (
     SubprocessLimits,
     executable_content_sha256,
 )
+from agent_libos.utils.secure_host_files import (
+    SecureFileDescriptor,
+    SecureFileChanged,
+    SecureFileLimitExceeded,
+    SecureFileReadUnavailable,
+    StablePathSnapshot,
+    open_secure_directory,
+    open_secure_file,
+    open_secure_readwrite_child,
+    read_stable_file_limited,
+    snapshot_from_stat,
+    stable_identity_available,
+)
 
 _VERSION_RE = re.compile(rb"(?:git version\s+)?(\d+)\.(\d+)(?:\.(\d+))?")
 _REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -263,6 +276,27 @@ def _is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    reparse_attribute = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        int(getattr(metadata, "st_file_attributes", 0)) & reparse_attribute
+    )
+
+
+def _validate_git_metadata_file_snapshot(
+    snapshot: StablePathSnapshot,
+    _after_read: bool,
+) -> StablePathSnapshot:
+    if (
+        snapshot.is_reparse_point
+        or not stat.S_ISREG(snapshot.mode)
+        or snapshot.links < 1
+        or not stable_identity_available(snapshot)
+    ):
+        raise OSError("Git metadata file is not a stable regular file")
+    return snapshot
+
+
 def _path_identity(path: Path) -> tuple[int, int, int, int, int]:
     value = path.stat()
     return (
@@ -276,9 +310,15 @@ def _path_identity(path: Path) -> tuple[int, int, int, int, int]:
 
 def _directory_identity(path: Path) -> tuple[int, int]:
     value = path.stat()
-    if not stat.S_ISDIR(value.st_mode):
+    snapshot = snapshot_from_stat(value)
+    if (
+        snapshot.is_reparse_point
+        or not stat.S_ISDIR(snapshot.mode)
+        or snapshot.links < 1
+        or not stable_identity_available(snapshot)
+    ):
         raise NotADirectoryError(path)
-    return int(value.st_dev), int(value.st_ino)
+    return snapshot.device, snapshot.inode
 
 
 def _digest_fields(*fields: str) -> str:
@@ -1230,13 +1270,126 @@ class LocalGitProvider:
         selected = Path(worktree)
         if not selected.is_absolute():
             selected = self.workspace_root / selected
-        resolved = selected.resolve(strict=False)
-        if resolved != self.workspace_root and not _is_within(resolved, self.managed_worktree_root):
+        lexical = Path(os.path.abspath(selected))
+        if lexical != self.workspace_root and not _is_within(
+            lexical,
+            self.managed_worktree_root,
+        ):
             raise self._error(
                 GitErrorCode.INVALID_PATH,
                 "worktree is outside the Runtime-managed worktree root",
             )
-        return resolved
+        self._reject_path_indirection(
+            lexical,
+            anchor=self.workspace_root,
+            description="Git worktree path",
+        )
+        resolved = lexical.resolve(strict=False)
+        if resolved != lexical:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "Git worktree path traverses an untrusted link or reparse point",
+            )
+        return lexical
+
+    def _reject_path_indirection(
+        self,
+        path: Path,
+        *,
+        anchor: Path,
+        description: str,
+    ) -> None:
+        """Reject link/reparse components between a trusted anchor and path.
+
+        ``Path.resolve`` cannot be used as the security check because it erases
+        the lexical component that selected the target.  Missing suffixes are
+        allowed here so callers such as worktree creation can validate their
+        existing parents; the operation-specific existence check still owns the
+        final error classification.
+        """
+
+        selected = Path(os.path.abspath(path))
+        trusted = Path(os.path.abspath(anchor))
+        if not _is_within(selected, trusted):
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                f"{description} escaped its trusted root",
+            )
+        paths = [trusted]
+        for component in selected.relative_to(trusted).parts:
+            paths.append(paths[-1] / component)
+        for current in paths:
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise self._error(
+                    GitErrorCode.UNSAFE_REPOSITORY,
+                    f"{description} could not be inspected",
+                ) from exc
+            if _is_link_or_reparse(metadata):
+                raise self._error(
+                    GitErrorCode.UNSAFE_REPOSITORY,
+                    f"{description} traverses an untrusted link or reparse point",
+                )
+            if current != selected and not stat.S_ISDIR(metadata.st_mode):
+                raise self._error(
+                    GitErrorCode.UNSAFE_REPOSITORY,
+                    f"{description} has a non-directory ancestor",
+                )
+
+    def _trusted_metadata_directory(self, candidate: Path) -> Path:
+        lexical = Path(os.path.abspath(candidate))
+        primary_entry = self.workspace_root / ".git"
+        try:
+            primary_state = primary_entry.lstat()
+        except OSError as exc:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "primary Git metadata entry could not be inspected",
+            ) from exc
+        if _is_link_or_reparse(primary_state):
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "primary Git metadata entry is a link or reparse point",
+            )
+        primary = primary_entry.resolve(strict=False)
+        trusted_roots = self._trusted_metadata_roots(primary)
+        matching_roots = tuple(
+            root
+            for root in trusted_roots
+            if _is_within(lexical, root)
+        )
+        if not matching_roots:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "linked worktree metadata is outside trusted metadata roots",
+            )
+        trusted_root = max(matching_roots, key=lambda item: len(item.parts))
+        self._reject_path_indirection(
+            lexical,
+            anchor=trusted_root,
+            description="Git metadata path",
+        )
+        try:
+            resolved = lexical.resolve(strict=True)
+            target_state = lexical.lstat()
+        except OSError as exc:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "Git metadata directory is unavailable",
+            ) from exc
+        if (
+            resolved != lexical
+            or _is_link_or_reparse(target_state)
+            or not stat.S_ISDIR(target_state.st_mode)
+        ):
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "Git metadata path is not a trusted directory",
+            )
+        return lexical
 
     @staticmethod
     def _read_small_file(path: Path, *, limit: int = 65536) -> bytes:
@@ -1245,6 +1398,16 @@ class LocalGitProvider:
         if len(data) > limit:
             raise ValueError(f"metadata file exceeds {limit} bytes")
         return data
+
+    @staticmethod
+    def _read_trusted_metadata_file(path: Path, *, limit: int) -> bytes:
+        secure_file = open_secure_file(path)
+        return read_stable_file_limited(
+            secure_file,
+            max_bytes=limit,
+            chunk_bytes=min(limit + 1, 64 * 1024),
+            validate_snapshot=_validate_git_metadata_file_snapshot,
+        )
 
     def _trusted_metadata_roots(self, primary_git_dir: Path) -> tuple[Path, ...]:
         roots = [primary_git_dir.resolve(strict=False)]
@@ -1264,7 +1427,7 @@ class LocalGitProvider:
                 GitErrorCode.NOT_REPOSITORY,
                 "workspace root is not an existing Git worktree",
             ) from exc
-        if stat.S_ISLNK(entry_state.st_mode):
+        if _is_link_or_reparse(entry_state):
             raise self._error(
                 GitErrorCode.UNSAFE_REPOSITORY,
                 "the worktree .git entry must not be a symlink",
@@ -1287,40 +1450,75 @@ class LocalGitProvider:
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "invalid worktree gitfile")
         raw_path = Path(os.fsdecode(raw[len(prefix) :]))
         candidate = raw_path if raw_path.is_absolute() else entry.parent / raw_path
-        try:
-            git_dir = candidate.resolve(strict=True)
-            target_state = candidate.lstat()
-        except OSError as exc:
-            raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "worktree gitdir is unavailable") from exc
-        if stat.S_ISLNK(target_state.st_mode) or not git_dir.is_dir():
-            raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "worktree gitdir is not trusted")
-        primary = (self.workspace_root / ".git").resolve(strict=False)
-        if not any(_is_within(git_dir, root) for root in self._trusted_metadata_roots(primary)):
+        git_dir = self._trusted_metadata_directory(candidate)
+        self._validate_linked_worktree_backpointer(
+            worktree=worktree,
+            entry=entry,
+            git_dir=git_dir,
+        )
+        return git_dir, True
+
+    def _validate_linked_worktree_backpointer(
+        self,
+        *,
+        worktree: Path,
+        entry: Path,
+        git_dir: Path,
+    ) -> None:
+        primary_git_dir = (self.workspace_root / ".git").resolve(strict=False)
+        if git_dir == primary_git_dir:
             raise self._error(
                 GitErrorCode.UNSAFE_REPOSITORY,
-                "linked worktree metadata is outside trusted metadata roots",
+                "linked worktree cannot reuse primary Git metadata",
             )
-        return git_dir, True
+        marker = git_dir / "gitdir"
+        try:
+            raw = self._read_trusted_metadata_file(marker, limit=8192).strip()
+        except (
+            OSError,
+            SecureFileChanged,
+            SecureFileLimitExceeded,
+            SecureFileReadUnavailable,
+        ) as exc:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "linked worktree backpointer is unavailable or unsafe",
+            ) from exc
+        if not raw or b"\x00" in raw or b"\n" in raw or b"\r" in raw:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "linked worktree backpointer is malformed",
+            )
+        selected = Path(os.fsdecode(raw))
+        candidate = selected if selected.is_absolute() else git_dir / selected
+        backpointer = Path(os.path.abspath(candidate))
+        expected = Path(os.path.abspath(entry))
+        if backpointer != expected or expected != worktree / ".git":
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "linked worktree backpointer does not match its worktree",
+            )
 
     def _common_dir(self, git_dir: Path) -> Path:
         marker = git_dir / "commondir"
-        if not marker.exists():
-            return git_dir
         try:
             marker_state = marker.lstat()
-            if stat.S_ISLNK(marker_state.st_mode) or not stat.S_ISREG(marker_state.st_mode):
+        except FileNotFoundError:
+            return git_dir
+        except OSError as exc:
+            raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "invalid Git common directory") from exc
+        try:
+            if _is_link_or_reparse(marker_state) or not stat.S_ISREG(marker_state.st_mode):
                 raise ValueError("invalid commondir marker")
             raw = self._read_small_file(marker, limit=8192).strip()
             if not raw or b"\x00" in raw or b"\n" in raw or b"\r" in raw:
                 raise ValueError("invalid commondir marker")
             selected = Path(os.fsdecode(raw))
             candidate = selected if selected.is_absolute() else git_dir / selected
-            resolved = candidate.resolve(strict=True)
-            target = candidate.lstat()
-            if stat.S_ISLNK(target.st_mode) or not resolved.is_dir():
-                raise ValueError("invalid common directory")
-            return resolved
-        except (OSError, ValueError) as exc:
+            return self._trusted_metadata_directory(candidate)
+        except (GitError, OSError, ValueError) as exc:
+            if isinstance(exc, GitError):
+                raise
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "invalid Git common directory") from exc
 
     def _repo_prefix(
@@ -1412,7 +1610,7 @@ class LocalGitProvider:
                 continue
             except OSError as exc:
                 raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "Git alternates could not be inspected") from exc
-            if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
+            if _is_link_or_reparse(state) or not stat.S_ISREG(state.st_mode):
                 raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "untrusted Git alternates metadata")
             try:
                 if self._read_small_file(candidate).strip():
@@ -1436,10 +1634,15 @@ class LocalGitProvider:
             selected_state = selected.lstat()
         except FileNotFoundError as exc:
             raise self._error(GitErrorCode.NOT_REPOSITORY, "Git worktree does not exist") from exc
-        if stat.S_ISLNK(selected_state.st_mode) or not stat.S_ISDIR(selected_state.st_mode):
+        if _is_link_or_reparse(selected_state) or not stat.S_ISDIR(selected_state.st_mode):
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "Git worktree root is not a trusted directory")
         git_dir, linked = self._git_dir_from_entry(selected)
         common_dir = self._common_dir(git_dir)
+        if linked and git_dir == common_dir:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "linked worktree must use distinct per-worktree Git metadata",
+            )
         primary_git_dir = (self.workspace_root / ".git").resolve(strict=False)
         if not any(_is_within(common_dir, root) for root in self._trusted_metadata_roots(primary_git_dir)):
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "Git common directory is outside trusted metadata roots")
@@ -1724,7 +1927,7 @@ class LocalGitProvider:
                     GitErrorCode.UNSAFE_CONFIG,
                     "repository Git config could not be inspected",
                 ) from exc
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
                 raise self._error(
                     GitErrorCode.UNSAFE_CONFIG,
                     "repository Git config is not a trusted regular file",
@@ -1997,7 +2200,7 @@ class LocalGitProvider:
                 continue
             except OSError as exc:
                 raise self._error(GitErrorCode.UNSAFE_CONFIG, "Git attributes could not be inspected") from exc
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
                 raise self._error(GitErrorCode.UNSAFE_CONFIG, "Git attributes source is not a regular file")
             try:
                 raw = self._read_small_file(selected, limit=1_048_576)
@@ -2438,6 +2641,24 @@ class LocalGitProvider:
         self._validate_remote_url(push_url)
         return fetch_url, push_url
 
+    def _remote_fetch_refspecs(
+        self,
+        layout: GitRepositoryLayout,
+        remote: str,
+    ) -> tuple[str, ...]:
+        key = f"remote.{remote.casefold()}.fetch"
+        refspecs = tuple(
+            value
+            for scope, _origin, entry_key, value in self._config_entries(layout)
+            if scope != "command" and entry_key == key
+        )
+        if any(not _is_safe_fetch_refspec(value, remote) for value in refspecs):
+            raise self._error(
+                GitErrorCode.UNSAFE_CONFIG,
+                "configured Git fetch refspec escapes the selected remote-tracking namespace",
+            )
+        return refspecs
+
     def _validate_remote_url(self, url: str) -> None:
         if not url or any(char in url for char in "\x00\r\n") or url.startswith("-"):
             raise self._error(GitErrorCode.UNSAFE_CONFIG, "invalid Git remote URL")
@@ -2543,10 +2764,11 @@ class LocalGitProvider:
         layout = self.repository_layout(worktree=worktree)
         config_sha256, _helpers = self._validate_repository_config(
             layout,
-            remote=None,
+            remote=remote,
             operation="list_remotes",
         )
         fetch_url, push_url = self._remote_urls(layout, remote)
+        fetch_refspecs = self._remote_fetch_refspecs(layout, remote)
         after = self.repository_layout(worktree=layout.root)
         if not self._same_layout(layout, after):
             raise self._error(GitErrorCode.STALE_STATE, "Git repository identity changed during remote inspection")
@@ -2554,6 +2776,7 @@ class LocalGitProvider:
             "config_sha256": config_sha256,
             "fetch_url_sha256": hashlib.sha256(fetch_url.encode("utf-8")).hexdigest(),
             "push_url_sha256": hashlib.sha256(push_url.encode("utf-8")).hexdigest(),
+            "fetch_refspecs": fetch_refspecs,
         }
 
     def prepare_managed_worktree(self, worktree_id: str) -> Path:
@@ -2578,12 +2801,121 @@ class LocalGitProvider:
                 metadata = current.lstat()
             except OSError as exc:
                 raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "managed worktree root could not be inspected") from exc
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
                 raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "managed worktree root is not a trusted directory")
         target = self.managed_worktree_root / worktree_id
-        if target.exists() or target.is_symlink():
-            raise self._error(GitErrorCode.ALREADY_EXISTS, "managed worktree target already exists")
-        return target
+        try:
+            target_state = target.lstat()
+        except FileNotFoundError:
+            return target
+        except OSError as exc:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "managed worktree target could not be inspected",
+            ) from exc
+        if _is_link_or_reparse(target_state) or not (
+            stat.S_ISREG(target_state.st_mode)
+            or stat.S_ISDIR(target_state.st_mode)
+        ):
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "managed worktree target is an unsafe existing filesystem entry",
+            )
+        raise self._error(
+            GitErrorCode.ALREADY_EXISTS,
+            "managed worktree target already exists",
+        )
+
+    @staticmethod
+    def _validate_repository_lock_snapshot(
+        snapshot: StablePathSnapshot,
+    ) -> StablePathSnapshot:
+        if (
+            snapshot.is_reparse_point
+            or not stat.S_ISREG(snapshot.mode)
+            or snapshot.links != 1
+            or not stable_identity_available(snapshot)
+        ):
+            raise OSError("repository lock is not a stable regular file")
+        return snapshot
+
+    @staticmethod
+    def _require_same_repository_lock_identity(
+        opened: StablePathSnapshot,
+        linked: StablePathSnapshot,
+    ) -> None:
+        opened_available = stable_identity_available(opened)
+        linked_available = stable_identity_available(linked)
+        if not opened_available or not linked_available:
+            raise OSError("repository lock identity is unavailable")
+        if opened.inode > 0 and linked.inode > 0:
+            if (opened.device, opened.inode) != (linked.device, linked.inode):
+                raise OSError("repository lock path does not match opened file")
+            return
+        # Win32 can report a zero legacy file index.  This branch is safe only
+        # because both snapshots come from the same held no-delete target
+        # handle; ``linked_snapshot`` deliberately reuses that handle.
+        if not (opened.replacement_locked and linked.replacement_locked):
+            raise OSError("repository lock identity requires a held replacement lock")
+
+    def _validate_open_repository_lock_file(
+        self,
+        secure_file: SecureFileDescriptor,
+    ) -> None:
+        opened = self._validate_repository_lock_snapshot(secure_file.snapshot())
+        linked = self._validate_repository_lock_snapshot(
+            secure_file.linked_snapshot()
+        )
+        self._require_same_repository_lock_identity(opened, linked)
+
+    @contextmanager
+    def _open_repository_lock_file(
+        self,
+        common_dir: Path,
+    ) -> Iterator[SecureFileDescriptor]:
+        """Open the lock below held directory guards without path traversal."""
+
+        resources = contextlib.ExitStack()
+        try:
+            common_guard = resources.enter_context(open_secure_directory(common_dir))
+            lock_directory = common_dir / "agent-libos"
+            try:
+                if os.name == "nt":
+                    lock_directory.mkdir(mode=0o700)
+                else:
+                    if common_guard.descriptor is None:
+                        raise OSError("secure common directory descriptor is unavailable")
+                    os.mkdir(
+                        "agent-libos",
+                        mode=0o700,
+                        dir_fd=common_guard.descriptor,
+                    )
+            except FileExistsError:
+                pass
+            common_guard.verify_path_guard()
+            lock_directory_guard = resources.enter_context(
+                common_guard.open_child_directory("agent-libos")
+            )
+            lock_path = lock_directory / "repository.lock"
+            secure_file = open_secure_readwrite_child(
+                lock_path,
+                parent=lock_directory_guard,
+                relative_name=lock_path.name,
+            )
+            resources.callback(secure_file.close)
+            self._validate_open_repository_lock_file(secure_file)
+            lock_directory_guard.linked_snapshot()
+            common_guard.linked_snapshot()
+        except OSError as exc:
+            resources.close()
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "repository lock could not be opened",
+            ) from exc
+        try:
+            yield secure_file
+        finally:
+            resources.close()
 
     def _ensure_managed_worktree_excluded(
         self,
@@ -2616,7 +2948,7 @@ class LocalGitProvider:
                 GitErrorCode.UNSAFE_REPOSITORY,
                 "Git info directory could not be inspected",
             ) from exc
-        if stat.S_ISLNK(info_state.st_mode) or not stat.S_ISDIR(info_state.st_mode):
+        if _is_link_or_reparse(info_state) or not stat.S_ISDIR(info_state.st_mode):
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "Git info directory is not trusted")
 
         exclude = info / "exclude"
@@ -2627,7 +2959,7 @@ class LocalGitProvider:
         except OSError as exc:
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "Git exclude file could not be inspected") from exc
         else:
-            if stat.S_ISLNK(exclude_state.st_mode) or not stat.S_ISREG(exclude_state.st_mode):
+            if _is_link_or_reparse(exclude_state) or not stat.S_ISREG(exclude_state.st_mode):
                 raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "Git exclude file is not trusted")
             try:
                 current = self._read_small_file(exclude, limit=1_048_576)
@@ -2763,7 +3095,7 @@ class LocalGitProvider:
                     metadata = directory.lstat()
                 except OSError as exc:
                     raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata directory could not be inspected") from exc
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
                     raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata directory is not trusted")
         return selected
 
@@ -2781,7 +3113,7 @@ class LocalGitProvider:
             return None
         except OSError as exc:
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata could not be inspected") from exc
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata is not a trusted regular file")
         try:
             data = self._read_small_file(selected, limit=self.config.output_hard_limit_bytes)
@@ -2831,7 +3163,7 @@ class LocalGitProvider:
             return ()
         except OSError as exc:
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata could not be listed") from exc
-        if stat.S_ISLNK(directory_state.st_mode) or not stat.S_ISDIR(directory_state.st_mode):
+        if _is_link_or_reparse(directory_state) or not stat.S_ISDIR(directory_state.st_mode):
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata directory is not trusted")
         rows: list[tuple[str, bytes, str]] = []
         names = self._bounded_pull_request_metadata_paths(directory)[:limit]
@@ -2919,7 +3251,7 @@ class LocalGitProvider:
             return hashlib.sha256(b"no-pull-requests").hexdigest()
         except OSError as exc:
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata could not be inspected") from exc
-        if stat.S_ISLNK(directory_state.st_mode) or not stat.S_ISDIR(directory_state.st_mode):
+        if _is_link_or_reparse(directory_state) or not stat.S_ISDIR(directory_state.st_mode):
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "pull request metadata directory is not trusted")
         digest = hashlib.sha256()
         total = 0
@@ -2927,7 +3259,7 @@ class LocalGitProvider:
         for selected in names:
             try:
                 metadata = selected.lstat()
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
                     raise OSError("unsafe pull request metadata")
                 data = self._read_small_file(selected, limit=self.config.output_hard_limit_bytes)
             except (OSError, ValueError) as exc:
@@ -3012,7 +3344,7 @@ class LocalGitProvider:
             return hashlib.sha256(b"missing-index").hexdigest()
         except OSError as exc:
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "Git index could not be inspected") from exc
-        if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
+        if _is_link_or_reparse(state) or not stat.S_ISREG(state.st_mode):
             raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "Git index is not a trusted regular file")
         digest, _consumed = self._hash_regular_file(
             selected,
@@ -3372,71 +3704,68 @@ class LocalGitProvider:
                     self._repository_lock_depth = depth
                 return
             layout = self.repository_layout(worktree=worktree)
-            lock_directory = layout.common_dir / "agent-libos"
-            try:
-                lock_directory.mkdir(mode=0o700, exist_ok=True)
-                if lock_directory.is_symlink() or not lock_directory.is_dir():
-                    raise OSError("unsafe lock directory")
-                lock_path = lock_directory / "repository.lock"
-                flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-                flags |= getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(lock_path, flags, 0o600)
-            except OSError as exc:
-                raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "repository lock could not be opened") from exc
-            acquired = False
-            try:
-                while not acquired:
-                    if time.monotonic() >= deadline:
-                        raise self._error(
-                            GitErrorCode.REPOSITORY_BUSY,
-                            "Git repository is busy",
-                            retryable=True,
-                        )
-                    try:
-                        if os.name == "nt":
-                            import msvcrt
-
-                            os.lseek(descriptor, 0, os.SEEK_SET)
-                            if os.fstat(descriptor).st_size == 0:
-                                os.write(descriptor, b"\0")
-                            os.lseek(descriptor, 0, os.SEEK_SET)
-                            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-                        else:
-                            import fcntl
-
-                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        acquired = True
-                    except (BlockingIOError, OSError):
+            with self._open_repository_lock_file(layout.common_dir) as lock_file:
+                descriptor = lock_file.descriptor
+                acquired = False
+                try:
+                    while not acquired:
                         if time.monotonic() >= deadline:
                             raise self._error(
                                 GitErrorCode.REPOSITORY_BUSY,
                                 "Git repository is busy",
                                 retryable=True,
                             )
-                        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-                self._repository_lock_owner = owner
-                self._repository_lock_depth = 1
-                current = self.repository_layout(worktree=worktree)
-                if not self._same_layout(layout, current):
-                    raise self._error(GitErrorCode.STALE_STATE, "Git repository identity changed before dispatch")
-                yield current
-            finally:
-                self._repository_lock_depth = 0
-                self._repository_lock_owner = None
-                if acquired:
+                        try:
+                            if os.name == "nt":
+                                import msvcrt
+
+                                os.lseek(descriptor, 0, os.SEEK_SET)
+                                if os.fstat(descriptor).st_size == 0:
+                                    os.write(descriptor, b"\0")
+                                os.lseek(descriptor, 0, os.SEEK_SET)
+                                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                            else:
+                                import fcntl
+
+                                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            acquired = True
+                        except (BlockingIOError, OSError):
+                            if time.monotonic() >= deadline:
+                                raise self._error(
+                                    GitErrorCode.REPOSITORY_BUSY,
+                                    "Git repository is busy",
+                                    retryable=True,
+                                )
+                            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
                     try:
-                        if os.name == "nt":
-                            import msvcrt
+                        self._validate_open_repository_lock_file(lock_file)
+                    except OSError as exc:
+                        raise self._error(
+                            GitErrorCode.UNSAFE_REPOSITORY,
+                            "repository lock identity changed before dispatch",
+                        ) from exc
+                    self._repository_lock_owner = owner
+                    self._repository_lock_depth = 1
+                    current = self.repository_layout(worktree=worktree)
+                    if not self._same_layout(layout, current):
+                        raise self._error(GitErrorCode.STALE_STATE, "Git repository identity changed before dispatch")
+                    yield current
+                finally:
+                    self._repository_lock_depth = 0
+                    self._repository_lock_owner = None
+                    if acquired:
+                        try:
+                            if os.name == "nt":
+                                import msvcrt
 
-                            os.lseek(descriptor, 0, os.SEEK_SET)
-                            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-                        else:
-                            import fcntl
+                                os.lseek(descriptor, 0, os.SEEK_SET)
+                                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                            else:
+                                import fcntl
 
-                            fcntl.flock(descriptor, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
-                os.close(descriptor)
+                                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        except OSError:
+                            pass
         finally:
             self._thread_lock.release()
 

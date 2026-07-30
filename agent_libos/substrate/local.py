@@ -3297,6 +3297,10 @@ class SdkMcpProvider:
                 deadline=deadline,
                 stage="tools/list response",
             )
+        if _mcp_tools_list_has_continuation(result):
+            raise RuntimeError(
+                "MCP tools/list returned an unsupported continuation cursor"
+            )
         tools = [
             McpProviderTool(
                 name=str(getattr(item, "name", "")),
@@ -3416,6 +3420,19 @@ class SdkMcpProvider:
                     correlation_id=new_id("corr"),
                     duration_s=time.monotonic() - started,
                     list_request_bytes=list_request_bytes,
+                    list_response_bytes=max_response_bytes,
+                    call_request_bytes=call_request_bytes,
+                    call_started=False,
+                )
+            if _mcp_tools_list_has_continuation(live_result):
+                return McpProviderCallResult(
+                    error="MCP live tool validation failed",
+                    error_type="LiveToolValidationError",
+                    correlation_id=new_id("corr"),
+                    duration_s=time.monotonic() - started,
+                    list_request_bytes=list_request_bytes,
+                    # The catalog is incomplete, so no exact complete-response
+                    # byte receipt exists. Charge the bounded stage maximum.
                     list_response_bytes=max_response_bytes,
                     call_request_bytes=call_request_bytes,
                     call_started=False,
@@ -5104,6 +5121,16 @@ def _mcp_metadata(item: Any) -> dict[str, Any]:
         for key, value in raw.items()
         if key not in {"name", "description", "inputSchema", "input_schema"}
     }
+
+
+def _mcp_tools_list_has_continuation(result: Any) -> bool:
+    """Return whether an MCP tools/list result is only one page of a catalog."""
+
+    for field in ("nextCursor", "next_cursor"):
+        cursor = getattr(result, field, None)
+        if cursor is not None:
+            return True
+    return False
 
 
 def _bounded_mcp_content(value: Any) -> Any:

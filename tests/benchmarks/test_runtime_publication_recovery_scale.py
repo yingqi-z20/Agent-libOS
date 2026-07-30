@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +20,7 @@ from agent_libos.runtime.checkpoint_reconciliation import (
     CheckpointRestoreReconciler,
 )
 from agent_libos.runtime.operation_manager import OperationManager
+from agent_libos.storage.sql import _V3_REQUIRED_COLUMNS
 
 
 def test_publication_scale_profile_and_workflows_are_stable() -> None:
@@ -201,6 +201,42 @@ def test_publication_scale_reviews_only_the_exact_domain_validation_query() -> N
             sql.replace("LIMIT 1", "LIMIT 2")
         )
         == "unreviewed"
+    )
+
+
+def test_publication_startup_v3_manifest_schema_probe_allowlist_is_exact() -> None:
+    manifest_tables = sorted(_V3_REQUIRED_COLUMNS)
+
+    def manifest_probe(tables: list[str]) -> str:
+        names = ", ".join(f"'{name}'" for name in tables)
+        return (
+            "SELECT name, type FROM sqlite_master "
+            f"WHERE name IN ({names})"
+        )
+
+    exact_probe = manifest_probe(manifest_tables)
+    assert (
+        publication_runner._publication_statement_shape(exact_probe)
+        == "v3_manifest_schema_probe"
+    )
+
+    near_or_arbitrary_probes = (
+        manifest_probe(
+            [name for name in manifest_tables if name != "runtime_publications"]
+        ),
+        manifest_probe(["runtime_publications"]),
+        manifest_probe([*manifest_tables, "not_a_manifest_table"]),
+        manifest_probe(list(reversed(manifest_tables))),
+        manifest_probe([name.upper() for name in manifest_tables]),
+        exact_probe.replace("SELECT name, type", "SELECT name, type, sql"),
+        "SELECT name, type FROM sqlite_master "
+        "WHERE name = 'runtime_publications'",
+        "SELECT * FROM sqlite_master WHERE sql LIKE '%runtime_publications%'",
+        "SELECT * FROM runtime_publications",
+    )
+    assert all(
+        publication_runner._publication_statement_shape(probe) == "unreviewed"
+        for probe in near_or_arbitrary_probes
     )
 
 
@@ -573,12 +609,12 @@ def test_publication_scale_rejects_direct_selects_substituted_for_helper_sql(
         )
 
 
-def test_publication_scale_traces_handler_connections_opened_during_recovery(
+def test_publication_scale_second_handler_connection_is_locked_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if os.name == "nt":
-        pytest.skip("Windows SQLite runtime ownership uses an exclusive connection lease")
+    direct_connect = sqlite3.connect
     original = publication_runner.ProcessManager.reconcile_terminal_publications
+    observed_lock_codes: list[int] = []
 
     def reconcile_with_second_connection(
         manager: publication_runner.ProcessManager,
@@ -588,9 +624,13 @@ def test_publication_scale_traces_handler_connections_opened_during_recovery(
         database_path = str(
             backend.conn.execute("PRAGMA database_list").fetchone()[2]
         )
-        connection = sqlite3.connect(database_path)
+        connection = direct_connect(database_path, timeout=0.0)
         try:
-            connection.execute("SELECT * FROM runtime_publications").fetchone()
+            with pytest.raises(sqlite3.OperationalError) as error:
+                connection.execute("SELECT * FROM runtime_publications").fetchone()
+            error_code = getattr(error.value, "sqlite_errorcode", None)
+            assert error_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            observed_lock_codes.append(error_code)
         finally:
             connection.close()
         return reconciled
@@ -600,15 +640,14 @@ def test_publication_scale_traces_handler_connections_opened_during_recovery(
         "reconcile_terminal_publications",
         reconcile_with_second_connection,
     )
-    with pytest.raises(
-        AssertionError,
-        match="unreviewed publication statement",
-    ):
-        run_publication_scale_benchmark(
-            total_records=40,
-            unreconciled_records=39,
-            page_size=17,
-        )
+    result = run_publication_scale_benchmark(
+        total_records=40,
+        unreconciled_records=39,
+        page_size=17,
+    )
+
+    assert observed_lock_codes
+    assert result.handler_reconciled_records == 39
 
 
 @pytest.mark.parametrize(

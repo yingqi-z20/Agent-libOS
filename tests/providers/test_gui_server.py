@@ -477,7 +477,13 @@ class TestGuiServer:
         status, snapshot = self.request('GET', '/api/snapshot')
         assert status == 200
         schema = json.loads((Path(__file__).resolve().parents[2] / 'docs' / 'gui_api_schema.json').read_text(encoding='utf-8'))
-        Draft202012Validator({**schema, '$ref': '#/$defs/snapshotResponse'}).validate(snapshot)
+        Draft202012Validator(
+            {
+                '$schema': schema['$schema'],
+                '$defs': schema['$defs'],
+                '$ref': '#/$defs/snapshotResponse',
+            }
+        ).validate(snapshot)
         assert len(snapshot['processes']) == 1
         assert snapshot['processes'][0]['llm_profile_id'] == 'gui-spawn'
         assert snapshot['processes'][0]['unread_message_count'] >= 2
@@ -2495,6 +2501,83 @@ class TestGuiServer:
         assert status == 409
         assert deleted['error']['profile_id'] == 'glm-5.2'
 
+    def test_process_spawn_rejects_non_string_llm_profile_before_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        status, _profile = self.request(
+            'POST',
+            '/api/llm-profiles',
+            {'profile_id': '7', 'model': 'numeric-profile', 'api_key_env': 'NUMERIC_PROFILE_API_KEY'},
+        )
+        assert status == 200
+        runtime = self.server.service.runtime
+        original_spawn = runtime.process.spawn
+        calls: list[dict[str, Any]] = []
+
+        def tracked_spawn(*args: Any, **kwargs: Any):
+            calls.append(dict(kwargs))
+            return original_spawn(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.process, 'spawn', tracked_spawn)
+
+        status, body = self.request(
+            'POST',
+            '/api/processes',
+            {'goal': 'must not spawn', 'llm_profile': 7, 'auto_run': False},
+        )
+
+        assert status == 400
+        assert 'llm_profile must be a JSON string or null' in body['error']['message']
+        assert calls == []
+
+    def test_process_exec_rejects_non_string_llm_profile_before_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        status, _profile = self.request(
+            'POST',
+            '/api/llm-profiles',
+            {'profile_id': 'True', 'model': 'boolean-profile', 'api_key_env': 'BOOLEAN_PROFILE_API_KEY'},
+        )
+        assert status == 200
+        _status, spawned = self.request(
+            'POST',
+            '/api/processes',
+            {'goal': 'exec profile target', 'auto_run': False},
+        )
+        pid = spawned['pid']
+        runtime = self.server.service.runtime
+        before = runtime.process.get(pid)
+        original_exec = runtime.exec_process
+        calls: list[dict[str, Any]] = []
+
+        def tracked_exec(*args: Any, **kwargs: Any):
+            calls.append(dict(kwargs))
+            return original_exec(*args, **kwargs)
+
+        monkeypatch.setattr(runtime, 'exec_process', tracked_exec)
+
+        status, body = self.request(
+            'POST',
+            f'/api/processes/{pid}/exec',
+            {
+                'image': 'base-agent:v0',
+                'goal': 'must not exec',
+                'llm_profile': True,
+                'confirmed': True,
+                'auto_run': False,
+            },
+        )
+
+        assert status == 400
+        assert 'llm_profile must be a JSON string or null' in body['error']['message']
+        assert calls == []
+        after = runtime.process.get(pid)
+        assert after.llm_profile_id == before.llm_profile_id
+        assert after.image_id == before.image_id
+        assert after.revision == before.revision
+
     def test_process_spawn_authority_manifest_keeps_workspace_access_request_only(self) -> None:
         runtime = self.server.service.runtime
         subtree = 'agent_outputs/gui_authority'
@@ -3259,6 +3342,222 @@ class TestGuiServer:
         assert 'pid must be a non-empty JSON string' in checkpoint_body['error']['message']
         assert self.server.service.runtime.process.get(pid).image_id == 'base-agent:v0'
 
+    @pytest.mark.parametrize("field", ["image", "working_directory"])
+    @pytest.mark.parametrize("invalid", [None, 7, [], {}, ""])
+    def test_process_spawn_rejects_invalid_optional_string_fields_without_spawning(
+        self,
+        field: str,
+        invalid: Any,
+    ) -> None:
+        runtime = self.server.service.runtime
+        before = {process.pid for process in runtime.process.list()}
+
+        status, body = self.request(
+            "POST",
+            "/api/processes",
+            {"goal": "must not spawn", field: invalid, "auto_run": False},
+        )
+
+        assert status == 400
+        assert f"{field} must be a non-empty JSON string" in body["error"]["message"]
+        assert {process.pid for process in runtime.process.list()} == before
+
+    def test_process_spawn_accepts_valid_optional_string_fields(self) -> None:
+        status, spawned = self.request(
+            "POST",
+            "/api/processes",
+            {
+                "goal": "valid spawn strings",
+                "image": "base-agent:v0",
+                "working_directory": ".",
+                "auto_run": False,
+            },
+        )
+
+        assert status == 200
+        assert spawned["process"]["image_id"] == "base-agent:v0"
+        assert spawned["process"]["working_directory"] == "."
+
+    def test_process_exec_rejects_non_object_args_before_mutation_and_accepts_object(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _status, spawned = self.request(
+            "POST",
+            "/api/processes",
+            {"goal": "exec args target", "auto_run": False},
+        )
+        pid = spawned["pid"]
+        runtime = self.server.service.runtime
+        original_exec = runtime.exec_process
+        calls: list[dict[str, Any]] = []
+
+        def tracked_exec(*args: Any, **kwargs: Any):
+            calls.append(dict(kwargs))
+            return original_exec(*args, **kwargs)
+
+        monkeypatch.setattr(runtime, "exec_process", tracked_exec)
+        for invalid in (None, [], "{}", 7):
+            status, body = self.request(
+                "POST",
+                f"/api/processes/{pid}/exec",
+                {
+                    "image": "base-agent:v0",
+                    "args": invalid,
+                    "confirmed": True,
+                    "auto_run": False,
+                },
+            )
+            assert status == 400
+            assert "process exec args must be a JSON object" in body["error"]["message"]
+        assert calls == []
+
+        status, _body = self.request(
+            "POST",
+            f"/api/processes/{pid}/exec",
+            {
+                "image": "base-agent:v0",
+                "args": {"mode": "review"},
+                "confirmed": True,
+                "auto_run": False,
+            },
+        )
+        assert status == 200
+        assert calls == [{"args": {"mode": "review"}, "goal": None, "preserve_memory": True, "preserve_capabilities": False, "llm_profile_id": None}]
+
+    def test_process_exec_rejects_invalid_goal_before_mutation_and_accepts_object_goal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _status, spawned = self.request(
+            "POST",
+            "/api/processes",
+            {"goal": "exec goal target", "auto_run": False},
+        )
+        pid = spawned["pid"]
+        runtime = self.server.service.runtime
+        original_exec = runtime.exec_process
+        calls: list[dict[str, Any]] = []
+
+        def tracked_exec(*args: Any, **kwargs: Any):
+            calls.append(dict(kwargs))
+            return original_exec(*args, **kwargs)
+
+        monkeypatch.setattr(runtime, "exec_process", tracked_exec)
+        for invalid in ([], 7, False):
+            status, body = self.request(
+                "POST",
+                f"/api/processes/{pid}/exec",
+                {
+                    "image": "base-agent:v0",
+                    "goal": invalid,
+                    "confirmed": True,
+                    "auto_run": False,
+                },
+            )
+            assert status == 400
+            assert "goal must be a JSON string, object, or null" in body["error"]["message"]
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert calls == []
+
+        goal = {"task": "review", "target": "README.md"}
+        status, _body = self.request(
+            "POST",
+            f"/api/processes/{pid}/exec",
+            {
+                "image": "base-agent:v0",
+                "goal": goal,
+                "confirmed": True,
+                "auto_run": False,
+            },
+        )
+        assert status == 200
+        assert calls == [
+            {
+                "args": {},
+                "goal": goal,
+                "preserve_memory": True,
+                "preserve_capabilities": False,
+                "llm_profile_id": None,
+            }
+        ]
+
+    def test_process_exec_rejects_invalid_image_before_confirmation_audit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _status, spawned = self.request(
+            "POST",
+            "/api/processes",
+            {"goal": "invalid exec image target", "auto_run": False},
+        )
+        pid = spawned["pid"]
+        runtime = self.server.service.runtime
+        audit_calls: list[str] = []
+        original_record = runtime.audit.record
+
+        def tracked_record(*args: Any, **kwargs: Any):
+            audit_calls.append(str(kwargs.get("action") or ""))
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.audit, "record", tracked_record)
+        for payload in ({}, {"image": None}, {"image": 7}, {"image": []}, {"image": ""}):
+            status, body = self.request(
+                "POST",
+                f"/api/processes/{pid}/exec",
+                payload,
+            )
+            assert status == 400
+            assert "image must be a non-empty JSON string" in body["error"]["message"]
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert "gui.confirmation_required" not in audit_calls
+
+    def test_process_exit_rejects_non_string_message_before_mutation_and_accepts_nullable_string(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = self.server.service.runtime
+        original_exit = runtime.process.exit
+        calls: list[tuple[str, str | None]] = []
+
+        def tracked_exit(pid: str, *, failed: bool = False, message: str | None = None):
+            calls.append((pid, message))
+            return original_exit(pid, failed=failed, message=message)
+
+        monkeypatch.setattr(runtime.process, "exit", tracked_exit)
+        for invalid in ([], {}, 7, False):
+            _status, spawned = self.request(
+                "POST",
+                "/api/processes",
+                {"goal": "exit message target", "auto_run": False},
+            )
+            pid = spawned["pid"]
+            status, body = self.request(
+                "POST",
+                f"/api/processes/{pid}/exit",
+                {"message": invalid, "confirmed": True},
+            )
+            assert status == 400
+            assert "message must be a JSON string or null" in body["error"]["message"]
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert calls == []
+
+        for message in (None, "completed from GUI"):
+            _status, spawned = self.request(
+                "POST",
+                "/api/processes",
+                {"goal": "valid exit message", "auto_run": False},
+            )
+            pid = spawned["pid"]
+            status, _body = self.request(
+                "POST",
+                f"/api/processes/{pid}/exit",
+                {"message": message, "confirmed": True},
+            )
+            assert status == 200
+            assert runtime.process.get(pid).status == ProcessStatus.EXITED
+        assert [message for _pid, message in calls] == [None, "completed from GUI"]
+
     def test_actor_is_rejected_on_routes_that_do_not_apply_actor_authority(self) -> None:
         service = self.server.service
         runtime = service.runtime
@@ -3893,6 +4192,82 @@ class TestGuiServer:
         assert status == 200
         processes = {process['pid']: process for process in snapshot['processes']}
         assert processes[result['pid']]['status'] == 'exited'
+
+    @pytest.mark.parametrize("field", ["image", "working_directory"])
+    @pytest.mark.parametrize("invalid", [None, 7, [], {}, ""])
+    def test_workflow_rejects_invalid_optional_string_fields_before_launch(
+        self,
+        field: str,
+        invalid: Any,
+    ) -> None:
+        runtime = self.server.service.runtime
+        before = {process.pid for process in runtime.process.list()}
+
+        status, body = self.request(
+            "POST",
+            "/api/workflows/run",
+            {
+                "tool": "get_working_directory",
+                "args": {},
+                field: invalid,
+                "confirmed": True,
+            },
+        )
+
+        assert status == 400
+        assert f"{field} must be a non-empty JSON string" in body["error"]["message"]
+        assert {process.pid for process in runtime.process.list()} == before
+
+    def test_workflow_accepts_valid_optional_string_fields_with_confirmation(self) -> None:
+        status, result = self.request(
+            "POST",
+            "/api/workflows/run",
+            {
+                "tool": "get_working_directory",
+                "args": {},
+                "image": "base-agent:v0",
+                "working_directory": ".",
+                "confirmed": True,
+            },
+        )
+
+        assert status == 200
+        assert result["ok"] is True
+        assert result["status"] == "exited"
+
+    @pytest.mark.parametrize("invalid", [None, 7, False, [], {}, ""])
+    def test_workflow_rejects_non_string_tool_before_confirmation_or_launch(
+        self,
+        invalid: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = self.server.service.runtime
+        audit_calls: list[str] = []
+        workflow_calls: list[str] = []
+        original_record = runtime.audit.record
+        original_run_workflow = runtime.run_workflow
+
+        def tracked_record(*args: Any, **kwargs: Any):
+            audit_calls.append(str(kwargs.get("action") or ""))
+            return original_record(*args, **kwargs)
+
+        def tracked_run_workflow(tool: str, *args: Any, **kwargs: Any):
+            workflow_calls.append(tool)
+            return original_run_workflow(tool, *args, **kwargs)
+
+        monkeypatch.setattr(runtime.audit, "record", tracked_record)
+        monkeypatch.setattr(runtime, "run_workflow", tracked_run_workflow)
+
+        status, body = self.request(
+            "POST",
+            "/api/workflows/run",
+            {"tool": invalid, "args": {}},
+        )
+
+        assert status == 400
+        assert "tool must be a non-empty JSON string" in body["error"]["message"]
+        assert "gui.confirmation_required" not in audit_calls
+        assert workflow_calls == []
 
     def test_side_effect_workflow_requires_confirmation(self) -> None:
         status, denied = self.request('POST', '/api/workflows/run', {'tool': 'ask_human', 'args': {'question': 'Continue?'}})

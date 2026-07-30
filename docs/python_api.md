@@ -153,12 +153,11 @@ methods detect an active event loop and direct the caller to their async
 counterparts. `max_quanta=None` uses the active Runtime configuration; it does
 not mean an unbounded run unless that configuration is itself unbounded.
 
-The complete all-process drain signatures are:
+The complete all-process drain call shapes are:
 
 ```python
 runtime.run_until_idle(
     max_quanta=None,
-    *,
     pids=None,
     process_human_queue=True,
     cancel_inflight_on_budget_exhaustion=True,
@@ -169,7 +168,6 @@ runtime.run_until_idle(
 )
 await runtime.arun_until_idle(
     max_quanta=None,
-    *,
     pids=None,
     process_human_queue=True,
     cancel_inflight_on_budget_exhaustion=True,
@@ -276,6 +274,97 @@ For subsystem-specific signatures and security semantics, see
 [Checkpoints](checkpoints.md), [Skills](skills.md), [Git](git.md), and
 [Tools and JIT](tools_and_jit.md).
 
+## JSON-RPC and MCP Host APIs
+
+The remote-resource managers are Host APIs. Their supported synchronous
+signatures are listed below; `acall(...)`, `alist_tools(...)`, and
+`acall_tool(...)` have the same arguments and return values as their
+synchronous counterparts, but must be awaited.
+
+| JSON-RPC method | Return |
+| --- | --- |
+| `runtime.jsonrpc.register_endpoint(endpoint, *, actor="runtime", replace=False, require_capability=True, source=None)` | inspected endpoint `dict` |
+| `runtime.jsonrpc.register_endpoint_from_yaml_text(text, *, actor, replace=False, require_capability=True, source=None)` | inspected endpoint `dict` |
+| `runtime.jsonrpc.list_endpoints(*, actor=None, require_capability=True, text=None, limit=None)` | bounded `list[dict]` |
+| `runtime.jsonrpc.list_endpoints_window(*, actor=None, require_capability=True, text=None, limit=None)` | `(list[dict], has_more)` |
+| `runtime.jsonrpc.inspect_endpoint(endpoint_id, *, actor=None, require_capability=True, include_sensitive_fields=False)` | endpoint `dict` |
+| `runtime.jsonrpc.unregister_endpoint(endpoint_id, *, actor="runtime", require_capability=True)` | deletion `dict` |
+| `runtime.jsonrpc.call(pid, endpoint_id, method_id, params=None, *, source_oids=None)` / `await runtime.jsonrpc.acall(...)` | `JsonRpcCallResult` |
+| `runtime.jsonrpc.grant_method(pid, endpoint_id, method_id, *, right, issued_by="jsonrpc", delegable=True)` | capability value |
+
+| MCP method | Return |
+| --- | --- |
+| `runtime.mcp.register_server(server, *, actor="runtime", replace=False, require_capability=True, source=None)` | inspected server `dict` |
+| `runtime.mcp.register_server_from_yaml_text(text, *, actor, replace=False, require_capability=True, source=None)` | inspected server `dict` |
+| `runtime.mcp.list_servers(*, actor=None, require_capability=True, text=None, limit=None)` | bounded `list[dict]` |
+| `runtime.mcp.list_servers_window(*, actor=None, require_capability=True, text=None, limit=None)` | `(list[dict], has_more)` |
+| `runtime.mcp.inspect_server(server_id, *, actor=None, require_capability=True, include_sensitive_fields=False)` | server `dict` |
+| `runtime.mcp.list_tools(server_id, *, actor=None, require_capability=True, refresh=False)` / `await runtime.mcp.alist_tools(...)` | tool-list `dict` |
+| `runtime.mcp.unregister_server(server_id, *, actor="runtime", require_capability=True)` | deletion `dict` |
+| `runtime.mcp.call_tool(pid, server_id, tool_id, arguments=None, *, source_oids=None)` / `await runtime.mcp.acall_tool(...)` | `McpCallResult` |
+| `runtime.mcp.grant_tool(pid, server_id, tool_id, *, right, issued_by="mcp", delegable=True)` | capability value |
+
+`actor`, `require_capability`, `include_sensitive_fields`, `source`, and the
+`grant_*` conveniences are trusted Host control-plane inputs. Do not derive
+them from model output or expose these manager methods as model tools.
+`require_capability=False`, an omitted registry-read actor, and
+`include_sensitive_fields=True` are Host bypass/disclosure modes, not ways for
+a process to self-authorize. Calls to remote methods/tools always use the
+target `pid` and still enforce that process's complete Capability, Task
+Authority, Human, data-flow, resource, effect, event, and audit path.
+
+The `*_from_yaml_text` methods parse supplied text; they do not open `source`
+as a path. `source` is evidence metadata only. Trusted Host code must read and
+bound a Host-controlled file itself. If a process supplies a manifest path,
+use the CLI actor mode or the filesystem primitive so its filesystem authority
+is enforced before passing the bounded text to the registry manager.
+
+### Provider protocols and injection
+
+Import provider protocols and the default composition from the public
+`agent_libos.substrate` package, not from implementation modules. The following
+is an executable composition skeleton: it runs when the caller supplies
+concrete provider objects implementing the complete protocols; it is not a
+provider implementation by itself.
+
+```python
+from pathlib import Path
+
+from agent_libos import Runtime
+from agent_libos.substrate import (
+    JsonRpcProvider,
+    LocalResourceProviderSubstrate,
+    McpProvider,
+    ResourceProviderSubstrate,
+)
+
+
+def open_with_remote_providers(
+    target: str | Path,
+    workspace: Path,
+    *,
+    jsonrpc_provider: JsonRpcProvider,
+    mcp_provider: McpProvider,
+) -> Runtime:
+    substrate: ResourceProviderSubstrate = LocalResourceProviderSubstrate(
+        workspace
+    )
+    substrate.jsonrpc = jsonrpc_provider
+    substrate.mcp = mcp_provider
+    return Runtime.open(target, substrate=substrate)
+```
+
+`ResourceProviderSubstrate` is the structural composition protocol;
+`JsonRpcProvider` and `McpProvider` are the primitive-facing transport and
+classification contracts. A replacement must implement every protocol method,
+including conservative external-effect classification. It does not inherit
+authority responsibilities from the primitive and must not perform transport
+work outside the protected operation it is called from. The bundled concrete
+providers are `HttpJsonRpcProvider` and `SdkMcpProvider`; the latter's optional
+subprocess-budget extension is `McpSubprocessLimitsProvider`. See
+[Providers](providers.md), [JSON-RPC](jsonrpc.md), and [MCP](mcp.md) before
+injecting a custom backend.
+
 ## Common exceptions
 
 Manager and primitive APIs raise domain exceptions from
@@ -323,7 +412,7 @@ cannot silently abandon an owned store or partially assembled component graph.
 
 ## Compatibility boundary
 
-- Agent libOS 0.3 is experimental. The top-level `agent_libos.__all__` names
+- Agent libOS 1.0.1 is experimental. The top-level `agent_libos.__all__` names
   and the Runtime entrypoints documented here are the intended application
   import surface for this release. Pin the package version when depending on
   exact signatures or dataclass fields.
@@ -335,15 +424,17 @@ cannot silently abandon an owned store or partially assembled component graph.
   Protected Operation SDK, trusted Runtime Modules, Skills, and tool/syscall
   schemas. An arbitrary importable internal class is not an extension point.
 - Provider protocol evolution is additive through exported, runtime-checkable
-  auxiliary protocols. In particular, the 0.3 Git provider contract retains
-  its original `run(...)` signature; subprocess-aware providers may opt in via
+  auxiliary protocols. In particular, the 1.0 line preserves the legacy Git
+  provider `run(...)` signature introduced before 1.0; subprocess-aware
+  providers may opt in via
   `GitSubprocessScopeProvider` and `GitLimitedRunProvider`. Hosts must test the
   auxiliary protocol and require its `supports_subprocess_limits` flag before
   making a budgeted call. A process with a configured Git subprocess budget
   fails closed when its provider does not implement the scoped supervision
   extension.
-- The 0.3 `McpProvider` contract likewise retains the original
-  `validate_and_call(...)`, `list_tools(...)`, and `call_tool(...)` signatures.
+- The 1.0 line likewise preserves the legacy `McpProvider`
+  `validate_and_call(...)`, `list_tools(...)`, and `call_tool(...)` signatures
+  introduced before 1.0.
   An MCP provider whose three methods also accept `limits=` opts in through
   `McpSubprocessLimitsProvider`. The Runtime never passes that keyword to a
   legacy provider; when a stdio operation has a configured subprocess budget,

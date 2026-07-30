@@ -34,8 +34,11 @@ _LLM_PAYLOAD_FIELDS = (
     "raw_response",
     "error",
 )
+_IMAGE_ONLY_REQUEST_KEY = "image_only_request"
+_IMAGE_ONLY_REQUEST_PURPOSE_PREFIX = "image_only_request:"
+_IMAGE_ONLY_REQUEST_SCHEMA_VERSION = 1
 _IMAGE_ONLY_TRANSCRIPT_KEY = "image_only_transcript"
-_IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION = 1
+_IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION = 2
 
 
 def _validate_retention_age(name: str, value: int | None) -> None:
@@ -1038,6 +1041,12 @@ def llm_call_payload_is_runtime_dependency(
 
     if provider_chain_head is not None and not isinstance(provider_chain_head, bool):
         raise ValueError("provider-chain head classification must be a boolean")
+    if llm_call_payload_can_be_image_only_request_anchor(record):
+        # A failed first image_only request can be the only durable copy of
+        # the original goal after a Runtime reopen. The request-purpose stream
+        # gets a content-free success tombstone once a complete transcript is
+        # durable, so only its actual latest row remains protected.
+        return provider_chain_head is not False
     if llm_call_payload_can_be_image_only_transcript_head(record):
         # Transparent replay is reconstructed from the latest complete call
         # and its paired output rows. Older heads may follow ordinary staged
@@ -1096,10 +1105,45 @@ def llm_call_payload_can_be_image_only_transcript_head(
     )
 
 
+def llm_call_payload_can_be_image_only_request_anchor(
+    record: LLMCallRecord,
+) -> bool:
+    marker = record.request_options.get(_IMAGE_ONLY_REQUEST_KEY)
+    if not (
+        record.status == "error"
+        and record.pid is not None
+        and record.purpose.startswith(_IMAGE_ONLY_REQUEST_PURPOSE_PREFIX)
+        and isinstance(record.messages, list)
+        and isinstance(marker, dict)
+        and marker.get("schema_version") == _IMAGE_ONLY_REQUEST_SCHEMA_VERSION
+        and marker.get("canonical_message_count") == 2
+        and marker.get("purpose") == record.purpose
+    ):
+        return False
+    for key in (
+        "image_id",
+        "goal_oid",
+        "system_prompt_sha256",
+        "llm_context_generation",
+    ):
+        if not isinstance(marker.get(key), str):
+            return False
+    if not isinstance(marker.get("labels"), dict):
+        return False
+    input_oids = marker.get("input_oids")
+    return bool(
+        isinstance(input_oids, list)
+        and all(isinstance(oid, str) and oid for oid in input_oids)
+        and len(record.messages) >= 2
+        and all(isinstance(message, dict) for message in record.messages[:2])
+    )
+
+
 def llm_call_payload_requires_latest_guard(record: LLMCallRecord) -> bool:
     return bool(
         llm_call_payload_can_be_provider_chain_head(record)
         or llm_call_payload_can_be_image_only_transcript_head(record)
+        or llm_call_payload_can_be_image_only_request_anchor(record)
     )
 
 

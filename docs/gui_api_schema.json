@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agent-libos.local/schemas/gui-api/v1.json",
   "title": "Agent libOS local GUI API contract subset v1",
-  "description": "Machine-readable same-build contract for the snapshot's top-level structure, JSON error envelopes, and explicit-confirmation mutation payloads. Snapshot collection item semantics outside process identity/state remain renderer/server implementation details. This is not a complete public REST/OpenAPI specification.",
+  "description": "Machine-readable same-build schema registry for the snapshot's top-level structure, JSON error envelopes, and explicit-confirmation mutation payloads. The document root deliberately rejects instances: validators must select one of the named $defs entry points with a JSON Pointer fragment. Snapshot collection item semantics outside process identity/state remain renderer/server implementation details. This is not a complete public REST/OpenAPI specification.",
   "x-agent-libos-schema-version": 1,
   "x-agent-libos-contract-scope": {
     "snapshot": "GET /api/snapshot",
@@ -28,6 +28,12 @@
       "mcp.call": { "route": "POST /api/mcp/{server_id}/call", "request_def": "mcpCallPayload" }
     }
   },
+  "x-agent-libos-definition-usage": {
+    "root_validation": "The registry root is not an instance schema and always rejects. Select a definition explicitly.",
+    "local_ref_example": "./gui_api_schema.json#/$defs/processExecPayload",
+    "canonical_ref_example": "https://agent-libos.local/schemas/gui-api/v1.json#/$defs/processExecPayload"
+  },
+  "not": {},
   "$defs": {
     "jsonObject": {
       "type": "object",
@@ -165,16 +171,17 @@
     },
     "workflowRunPayload": {
       "allOf": [
-        { "$ref": "#/$defs/confirmedMutation" },
         { "$ref": "#/$defs/noActor" },
         {
+          "type": "object",
           "required": ["tool"],
           "properties": {
             "tool": { "$ref": "#/$defs/nonEmptyString" },
             "args": { "$ref": "#/$defs/jsonObject" },
-            "image": { "type": "string" },
-            "working_directory": { "type": "string" },
-            "authority_manifest": { "$ref": "#/$defs/jsonObject" }
+            "image": { "$ref": "#/$defs/nonEmptyString" },
+            "working_directory": { "$ref": "#/$defs/nonEmptyString" },
+            "authority_manifest": { "$ref": "#/$defs/jsonObject" },
+            "confirmed": { "type": "boolean" }
           }
         }
       ]
@@ -200,7 +207,13 @@
           "required": ["image"],
           "properties": {
             "image": { "$ref": "#/$defs/nonEmptyString" },
-            "goal": { "type": ["string", "null"] },
+            "goal": {
+              "oneOf": [
+                { "type": "string" },
+                { "$ref": "#/$defs/jsonObject" },
+                { "type": "null" }
+              ]
+            },
             "llm_profile": { "type": ["string", "null"] },
             "args": { "$ref": "#/$defs/jsonObject" },
             "preserve_memory": { "type": "boolean" },

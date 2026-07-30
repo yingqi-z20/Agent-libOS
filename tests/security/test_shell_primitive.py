@@ -14,7 +14,7 @@ from typing import Any
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellDefaults
-from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, GitErrorCode, HumanRequestStatus, ObjectMetadata, ObjectType, SinkTrustLevel, SinkTrustRule
+from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, CapabilitySpec, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, GitErrorCode, HumanRequestStatus, ObjectMetadata, ObjectType, SinkTrustLevel, SinkTrustRule
 from agent_libos.models.exceptions import CapabilityDenied, GitError, HumanApprovalRequired, HumanResponseRequired, ResourceLimitExceeded, ValidationError
 from agent_libos.primitives.git_command_policy import harden_read_only_git_argv
 from agent_libos.tools.builtin.shell import RunShellCommandArgs
@@ -1361,6 +1361,111 @@ class TestShellPrimitive:
             runtime.capability.grant(pid, 'shell:*', [CapabilityRight.EXECUTE], issued_by='test')
             with pytest.raises(CapabilityDenied):
                 runtime.shell.run(pid, ['git', 'status'])
+        finally:
+            runtime.close()
+
+    def test_delegation_cannot_add_authority_rules_to_bypass_shell_policy(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            parent = runtime.process.spawn(image='review-agent:v0', goal='restricted delegator')
+            runtime.capability.grant(
+                parent,
+                'process:spawn',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            child = runtime.spawn_child_process(parent, 'restricted delegate')
+            runtime.capability.grant(
+                parent,
+                'shell:python',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                delegable=True,
+            )
+
+            with pytest.raises(CapabilityDenied):
+                runtime.shell.run(parent, ['python', '--version'])
+
+            with pytest.raises(CapabilityDenied, match='authority_rules'):
+                runtime.capability.delegate(
+                    parent,
+                    child,
+                    CapabilitySpec(
+                        resource='shell:python',
+                        rights={CapabilityRight.EXECUTE.value},
+                        constraints={
+                            'authority_rules': [
+                                {
+                                    'rule_id': 'delegated.python.allow',
+                                    'operation': 'shell.run',
+                                    'effect': 'allow',
+                                    'risk': 'harmless',
+                                    'conditions': {
+                                        'argv': ['python', '--version'],
+                                        'match': 'exact',
+                                    },
+                                }
+                            ]
+                        },
+                    ),
+                )
+
+            with pytest.raises(CapabilityDenied):
+                runtime.shell.run(child, ['python', '--version'])
+            assert provider.calls == []
+        finally:
+            runtime.close()
+
+    def test_delegation_preserves_identical_parent_authority_rules(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            parent = runtime.process.spawn(image='review-agent:v0', goal='explicit delegator')
+            runtime.capability.grant(
+                parent,
+                'process:spawn',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            child = runtime.spawn_child_process(parent, 'explicit delegate')
+            constraints = {
+                'authority_rules': [
+                    {
+                        'rule_id': 'delegated.python.allow',
+                        'operation': 'shell.run',
+                        'effect': 'allow',
+                        'risk': 'harmless',
+                        'conditions': {
+                            'argv': ['python', '--version'],
+                            'match': 'exact',
+                        },
+                    }
+                ]
+            }
+            runtime.capability.grant(
+                parent,
+                'shell:python',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+                constraints=constraints,
+                delegable=True,
+            )
+
+            delegated = runtime.capability.delegate(
+                parent,
+                child,
+                CapabilitySpec(
+                    resource='shell:python',
+                    rights={CapabilityRight.EXECUTE.value},
+                    constraints=constraints,
+                ),
+            )
+            result = runtime.shell.run(child, ['python', '--version'])
+
+            assert delegated.constraints == constraints
+            assert result.stdout == 'ok\n'
+            assert provider.calls == [
+                (['python', '--version'], runtime.config.tools.shell_timeout_s)
+            ]
         finally:
             runtime.close()
 

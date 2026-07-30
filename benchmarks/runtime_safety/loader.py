@@ -5,13 +5,21 @@ import re
 from pathlib import Path
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 from benchmarks.runtime_safety.models import (
     BENCHMARK_EFFECT_OBSERVATION_FIELDS,
     BenchmarkTask,
     BenchmarkValidationError,
-    VALID_EFFECT_OUTCOMES,
     VALID_EFFECT_TYPES,
+)
+from benchmarks.runtime_safety.schemas import (
+    EFFECT_IDENTITY_FIELDS,
+    EXPECTED_EFFECT_OUTCOMES,
+    MOCK_ACTION_SCHEMAS,
+    POLICY_DEFAULTS,
+    policy_schema,
 )
 
 REQUIRED_FIELDS = {
@@ -54,10 +62,19 @@ _TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 
 def load_tasks(suite_root: str | Path) -> list[BenchmarkTask]:
     root = Path(suite_root)
+    try:
+        validated_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise BenchmarkValidationError(
+            f"benchmark suite root does not exist: {root}"
+        ) from exc
     tasks_dir = root / "tasks"
     if not tasks_dir.exists():
         raise BenchmarkValidationError(f"benchmark tasks directory does not exist: {tasks_dir}")
-    tasks = [load_task_file(path) for path in sorted(tasks_dir.glob("*.yaml"))]
+    tasks = [
+        load_task_file(path, suite_root=validated_root)
+        for path in sorted(tasks_dir.glob("*.yaml"))
+    ]
     seen: set[str] = set()
     duplicates: list[str] = []
     for task in tasks:
@@ -69,7 +86,11 @@ def load_tasks(suite_root: str | Path) -> list[BenchmarkTask]:
     return tasks
 
 
-def load_task_file(path: str | Path) -> BenchmarkTask:
+def load_task_file(
+    path: str | Path,
+    *,
+    suite_root: str | Path | None = None,
+) -> BenchmarkTask:
     source = Path(path)
     source_bytes = source.read_bytes()
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
@@ -83,7 +104,7 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
         raise BenchmarkValidationError(f"{source}: id must be lowercase snake_case, got {task_id!r}")
     allowed = _validate_effect_list(data.get("allowed_effects"), source, "allowed_effects")
     forbidden = _validate_effect_list(data.get("forbidden_effects"), source, "forbidden_effects")
-    mock_actions = _validate_mapping_list(data.get("mock_actions", []), source, "mock_actions")
+    mock_actions = _validate_mock_actions(data.get("mock_actions", []), source)
     setup = _optional_mapping(data.get("setup", {}), source, "setup")
     success_oracle_items = _validate_mapping_list(
         data.get("success_oracle"), source, "success_oracle"
@@ -95,16 +116,21 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
     success_oracle = _validate_success_oracle(success_oracle_items, source)
     safety_oracle = _validate_safety_oracle(data.get("safety_oracle"), source)
     for index, action in enumerate(mock_actions):
-        if not isinstance(action.get("action"), str) or not action["action"]:
-            raise BenchmarkValidationError(f"{source}: mock_actions[{index}] requires non-empty action")
         _validate_action_paths(action, source, index)
     _validate_success_action_references(success_oracle, mock_actions, source)
     _validate_success_setup_references(setup, success_oracle, source)
+    workspace = _safe_relative_path(
+        _string_field(data, "workspace", source),
+        source,
+        "workspace",
+    )
+    if suite_root is not None:
+        _validate_suite_workspace(workspace, source, Path(suite_root))
     return BenchmarkTask(
         id=task_id,
         title=_string_field(data, "title", source),
         goal=_string_field(data, "goal", source),
-        workspace=_safe_relative_path(_string_field(data, "workspace", source), source, "workspace"),
+        workspace=workspace,
         attack_class=_string_field(data, "attack_class", source),
         allowed_effects=allowed,
         forbidden_effects=forbidden,
@@ -113,7 +139,7 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
         schema_version=1,
         setup=setup,
         capabilities=_optional_mapping(data.get("capabilities", {}), source, "capabilities"),
-        policy=_optional_mapping(data.get("policy", {}), source, "policy"),
+        policy=_validate_policy(data.get("policy", {}), source),
         human_responses=_validate_mapping_list(data.get("human_responses", []), source, "human_responses"),
         expected_audit=_validate_mapping_list(data.get("expected_audit", []), source, "expected_audit"),
         mock_actions=mock_actions,
@@ -121,6 +147,22 @@ def load_task_file(path: str | Path) -> BenchmarkTask:
         source_path=source,
         source_sha256=source_sha256,
     )
+
+
+def validate_task_execution_inputs(task: BenchmarkTask) -> None:
+    """Validate untrusted task fields consumed directly by a runner.
+
+    ``BenchmarkTask`` remains a convenient dataclass for targeted tests and
+    integrations, so callers can construct one without using the YAML loader.
+    Execution must nevertheless enforce the same closed action and policy
+    contracts; otherwise a typo can become a successful wrapper no-op.
+    """
+
+    source = task.source_path or Path(f"<benchmark-task:{task.id}>")
+    actions = _validate_mock_actions(task.mock_actions, source)
+    for index, action in enumerate(actions):
+        _validate_action_paths(action, source, index)
+    _validate_policy(task.policy, source)
 
 
 def _validate_required(data: dict[str, Any], source: Path) -> None:
@@ -172,7 +214,85 @@ def _validate_mapping_list(value: Any, source: Path, field: str) -> list[dict[st
     return result
 
 
-def _validate_effect_list(value: Any, source: Path, field: str) -> list[dict[str, Any]]:
+def _validate_mock_actions(
+    value: Any,
+    source: Path,
+) -> list[dict[str, Any]]:
+    actions = _validate_mapping_list(value, source, "mock_actions")
+    for index, action in enumerate(actions):
+        raw_effects = action.get("benchmark_effects")
+        if isinstance(raw_effects, list):
+            for effect_index, effect in enumerate(raw_effects):
+                if not isinstance(effect, dict):
+                    continue
+                observed = sorted(BENCHMARK_EFFECT_OBSERVATION_FIELDS & set(effect))
+                if observed:
+                    raise BenchmarkValidationError(
+                        f"{source}: mock_actions[{index}].benchmark_effects"
+                        f"[{effect_index}] may not declare runner-observed fields: "
+                        f"{observed}"
+                    )
+        name = action.get("action")
+        if not isinstance(name, str) or not name:
+            raise BenchmarkValidationError(
+                f"{source}: mock_actions[{index}] requires non-empty action"
+            )
+        if name == "skill_syscall_read":
+            if (
+                not isinstance(raw_effects, list)
+                or len(raw_effects) != 1
+                or not isinstance(raw_effects[0], dict)
+                or raw_effects[0].get("type") != "filesystem.read"
+                or raw_effects[0].get("match", "exact") != "exact"
+            ):
+                raise BenchmarkValidationError(
+                    f"{source}: mock_actions[{index}].benchmark_effects must "
+                    "contain exactly one exact filesystem.read bound to the "
+                    "skill_syscall_read path"
+                )
+        schema = MOCK_ACTION_SCHEMAS.get(name)
+        if schema is None:
+            raise BenchmarkValidationError(
+                f"{source}: mock_actions[{index}].action must be one of "
+                f"{sorted(MOCK_ACTION_SCHEMAS)}, got {name!r}"
+            )
+        errors = sorted(
+            Draft202012Validator(schema).iter_errors(action),
+            key=lambda error: tuple(str(item) for item in error.absolute_path),
+        )
+        if errors:
+            error = errors[0]
+            suffix = "".join(f"[{item!r}]" for item in error.absolute_path)
+            raise BenchmarkValidationError(
+                f"{source}: mock_actions[{index}]{suffix} violates the "
+                f"{name} contract: {error.message}"
+            )
+    return actions
+
+
+def _validate_policy(value: Any, source: Path) -> dict[str, Any]:
+    policy = _optional_mapping(value, source, "policy")
+    errors = sorted(
+        Draft202012Validator(policy_schema()).iter_errors(policy),
+        key=lambda error: tuple(str(item) for item in error.absolute_path),
+    )
+    if errors:
+        error = errors[0]
+        suffix = "".join(f"[{item!r}]" for item in error.absolute_path)
+        raise BenchmarkValidationError(
+            f"{source}: policy{suffix} violates the closed policy contract: "
+            f"{error.message}"
+        )
+    return {**POLICY_DEFAULTS, **policy}
+
+
+def _validate_effect_list(
+    value: Any,
+    source: Path,
+    field: str,
+    *,
+    allow_outcomes: bool = False,
+) -> list[dict[str, Any]]:
     effects = _validate_mapping_list(value, source, field)
     for index, effect in enumerate(effects):
         effect_type = effect.get("type")
@@ -180,10 +300,44 @@ def _validate_effect_list(value: Any, source: Path, field: str) -> list[dict[str
             raise BenchmarkValidationError(
                 f"{source}: {field}[{index}].type must be one of {sorted(VALID_EFFECT_TYPES)}, got {effect_type!r}"
             )
+        required_fields, optional_fields = EFFECT_IDENTITY_FIELDS[effect_type]
+        allowed_fields = {
+            "type",
+            *required_fields,
+            *optional_fields,
+            *({"outcomes"} if allow_outcomes else set()),
+        }
+        unknown = sorted(
+            repr(key)
+            for key in effect
+            if not isinstance(key, str) or key not in allowed_fields
+        )
+        if unknown:
+            raise BenchmarkValidationError(
+                f"{source}: {field}[{index}] has unknown fields: {unknown}"
+            )
+        missing = sorted(required_fields - set(effect))
+        if missing:
+            raise BenchmarkValidationError(
+                f"{source}: {field}[{index}] is missing required identity fields: "
+                f"{missing}"
+            )
+        for identity_field in sorted(
+            (required_fields | optional_fields) - {"argv", "match"}
+        ):
+            _validate_non_empty_string(
+                effect,
+                identity_field,
+                source,
+                f"{field}[{index}].{identity_field}",
+                required=identity_field in required_fields,
+            )
         if str(effect_type).startswith("filesystem."):
-            if "path" not in effect:
-                raise BenchmarkValidationError(f"{source}: {field}[{index}] requires path")
-            effect["path"] = _safe_relative_path(str(effect["path"]), source, f"{field}[{index}].path")
+            effect["path"] = _safe_relative_path(
+                effect["path"],
+                source,
+                f"{field}[{index}].path",
+            )
             _validate_match_mode(
                 effect,
                 source,
@@ -205,22 +359,8 @@ def _validate_effect_list(value: Any, source: Path, field: str) -> list[dict[str
             )
         if str(effect_type).startswith("object."):
             namespace = effect.get("namespace")
-            if namespace is not None and (not isinstance(namespace, str) or ".." in namespace.replace("\\", "/").split("/")):
+            if namespace is not None and ".." in namespace.replace("\\", "/").split("/"):
                 raise BenchmarkValidationError(f"{source}: {field}[{index}].namespace is unsafe")
-        if effect_type in {"process.spawn", "process.fork", "process.exec"} and "image" in effect:
-            if not isinstance(effect["image"], str) or not effect["image"]:
-                raise BenchmarkValidationError(f"{source}: {field}[{index}].image must be a string")
-        if effect_type == "skill.activate":
-            _validate_non_empty_string(effect, "skill_id", source, f"{field}[{index}].skill_id")
-        if effect_type == "jit.register":
-            _validate_non_empty_string(effect, "tool", source, f"{field}[{index}].tool")
-        if effect_type in {"image.register", "image.commit"}:
-            _validate_non_empty_string(effect, "image", source, f"{field}[{index}].image")
-        if effect_type in {"checkpoint.create", "checkpoint.fork"}:
-            _validate_non_empty_string(effect, "checkpoint", source, f"{field}[{index}].checkpoint", required=False)
-        if effect_type == "jsonrpc.call":
-            _validate_non_empty_string(effect, "endpoint", source, f"{field}[{index}].endpoint")
-            _validate_non_empty_string(effect, "method", source, f"{field}[{index}].method")
     return effects
 
 
@@ -234,6 +374,35 @@ def _validate_success_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
             raise BenchmarkValidationError(
                 f"{source}: success_oracle[{index}].type must be one of "
                 f"{sorted(SUCCESS_ORACLE_TYPES)}, got {check_type!r}"
+            )
+        allowed_fields = {
+            "process_exited": {"type"},
+            "file_contains": {"type", "path", "text"},
+            "file_exists": {"type", "path"},
+            "python_syntax_valid": {"type", "path"},
+            "object_exists": {"type", "namespace", "name"},
+            "action_succeeded": {"type", "action", "arguments"},
+            "image_requires_capability": {"type", "image", "resource", "rights"},
+            "managed_git_worktree": {"type", "root"},
+            "git_patch_artifact_lineage": {
+                "type",
+                "source_object",
+                "sensitivity",
+                "artifact_origin",
+                "source_origin",
+                "min_bytes",
+                "changed_paths_exact",
+            },
+            "expected_effects": {"type", "effects"},
+        }[check_type]
+        unknown = sorted(
+            repr(key)
+            for key in check
+            if not isinstance(key, str) or key not in allowed_fields
+        )
+        if unknown:
+            raise BenchmarkValidationError(
+                f"{source}: success_oracle[{index}] has unknown fields: {unknown}"
             )
         if check_type in {"file_contains", "file_exists", "python_syntax_valid"}:
             path = _string_field(check, "path", source)
@@ -364,7 +533,12 @@ def _validate_success_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
         if check_type != "expected_effects":
             continue
         field = f"success_oracle[{index}].effects"
-        effects = _validate_effect_list(check.get("effects"), source, field)
+        effects = _validate_effect_list(
+            check.get("effects"),
+            source,
+            field,
+            allow_outcomes=True,
+        )
         if not effects:
             raise BenchmarkValidationError(f"{source}: {field} must be non-empty")
         for effect_index, effect in enumerate(effects):
@@ -377,13 +551,19 @@ def _validate_success_oracle(value: Any, source: Path) -> list[dict[str, Any]]:
                 outcome
                 for outcome in outcomes
                 if not isinstance(outcome, str)
-                or outcome not in VALID_EFFECT_OUTCOMES
+                or outcome not in EXPECTED_EFFECT_OUTCOMES
             ]
             if invalid:
                 raise BenchmarkValidationError(
-                    f"{source}: {field}[{effect_index}].outcomes contains invalid values {invalid!r}"
+                    f"{source}: {field}[{effect_index}].outcomes contains invalid values "
+                    f"that cannot prove an observed effect: {invalid!r}; expected one "
+                    f"of {sorted(EXPECTED_EFFECT_OUTCOMES)}"
                 )
-            effect["outcomes"] = list(dict.fromkeys(outcomes))
+            if len(outcomes) != len(set(outcomes)):
+                raise BenchmarkValidationError(
+                    f"{source}: {field}[{effect_index}].outcomes must be unique"
+                )
+            effect["outcomes"] = list(outcomes)
         check["effects"] = effects
     return checks
 
@@ -493,7 +673,14 @@ def _validate_action_paths(action: dict[str, Any], source: Path, index: int) -> 
         raise BenchmarkValidationError(
             f"{source}: mock_actions[{index}].process_goal must be a non-empty string"
         )
-    if name in {"read_text_file", "write_text_file", "delete_file", "delete_directory", "read_directory", "write_directory", "skill_syscall_read"}:
+    if name in {
+        "read_text_file",
+        "write_text_file",
+        "delete_file",
+        "delete_directory",
+        "skill_syscall_read",
+        "load_image_package",
+    }:
         if "path" not in action:
             raise BenchmarkValidationError(f"{source}: mock_actions[{index}] {name} requires path")
         action["path"] = _safe_relative_path(str(action["path"]), source, f"mock_actions[{index}].path")
@@ -589,6 +776,39 @@ def _safe_relative_path(value: str, source: Path, field: str) -> str:
     if any(part == ".." for part in parts):
         raise BenchmarkValidationError(f"{source}: {field} may not escape workspace: {value!r}")
     return "/".join(parts) if parts else "."
+
+
+def _validate_suite_workspace(
+    workspace: str,
+    source: Path,
+    suite_root: Path,
+) -> None:
+    try:
+        root = suite_root.resolve(strict=True)
+    except OSError as exc:
+        raise BenchmarkValidationError(
+            f"{source}: benchmark suite root does not exist: {suite_root}"
+        ) from exc
+    candidate = root / workspace
+    if candidate.is_symlink():
+        raise BenchmarkValidationError(
+            f"{source}: workspace must be a non-symlink directory relative to "
+            f"the suite root: {workspace!r}"
+        )
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise BenchmarkValidationError(
+            f"{source}: workspace must name an existing directory relative to "
+            f"the suite root: {workspace!r}"
+        ) from exc
+    if not resolved.is_dir() or (
+        resolved != root and root not in resolved.parents
+    ):
+        raise BenchmarkValidationError(
+            f"{source}: workspace must name a directory inside the suite root: "
+            f"{workspace!r}"
+        )
 
 
 def _validate_argv(value: Any, source: Path, field: str) -> None:

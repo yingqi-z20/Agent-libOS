@@ -12,7 +12,7 @@ from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Literal
+from typing import Any, Callable, Iterable, Iterator, Literal, cast
 
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
 from jsonschema.validators import validator_for as jsonschema_validator_for
@@ -48,7 +48,7 @@ from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.image_artifact import ImageArtifactLoader
 from agent_libos.skills.schema import JitToolSpec
-from agent_libos.storage import ExtensionRepository
+from agent_libos.storage import ExtensionRepository, StoreAssemblyReadiness
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.secure_host_files import (
@@ -105,6 +105,8 @@ _CHECKPOINT_BOOT_KIND = "checkpoint_commit"
 _PACKAGE_FILE_READ_CHUNK_BYTES = 64 * 1024
 _INVALID_BOOT_CODE = "image_boot_artifact_invalid"
 _INVALID_BOOT_MESSAGE = "Image boot artifact failed identity validation."
+_DELETE_IMAGE_PUBLICATION = object()
+_CATALOG_MISSING = object()
 
 
 class _InvalidImageBootArtifact(ValidationError):
@@ -117,6 +119,181 @@ class ImageRegistrationResult:
     replaced: bool
     source: str | None = None
     disposition: Literal["created", "replaced", "rehydrated"] = "created"
+
+
+class ImageCatalog(dict[str, AgentImage]):
+    """Shared Image mapping with atomic publication and a thread-local view."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._catalog_lock = threading.RLock()
+        self._publication_state = threading.local()
+
+    def _staged(self) -> dict[str, AgentImage | object] | None:
+        return getattr(self._publication_state, "images", None)
+
+    def begin_publication(self) -> tuple[dict[str, AgentImage | object], bool]:
+        """Open or join this thread's unpublished catalog view."""
+
+        staged = self._staged()
+        outermost = staged is None
+        if outermost:
+            staged = {}
+            self._publication_state.images = staged
+        return staged, outermost
+
+    def finish_publication(self, *, publish: bool) -> None:
+        """Publish the complete staged batch, or discard it, then close the view."""
+
+        staged = self._staged()
+        if staged is None:
+            raise RuntimeError("image catalog publication is not active")
+        try:
+            if publish:
+                updates = {
+                    image_id: candidate
+                    for image_id, candidate in staged.items()
+                    if candidate is not _DELETE_IMAGE_PUBLICATION
+                }
+                removals = tuple(
+                    image_id
+                    for image_id, candidate in staged.items()
+                    if candidate is _DELETE_IMAGE_PUBLICATION
+                )
+                self.publish(updates, removals)
+        finally:
+            del self._publication_state.images
+
+    def stage(self, image_id: str, candidate: AgentImage | object) -> None:
+        staged = self._staged()
+        if staged is None:
+            raise RuntimeError("image catalog publication is not active")
+        staged[image_id] = candidate
+
+    def staged_candidates(self) -> dict[str, AgentImage | object] | None:
+        """Return this thread's mutable staging map for nested rollback only."""
+
+        return self._staged()
+
+    def _snapshot(self) -> dict[str, AgentImage]:
+        with self._catalog_lock:
+            snapshot = dict(super().items())
+        staged = self._staged()
+        if staged is None:
+            return snapshot
+        for image_id, candidate in staged.items():
+            if candidate is _DELETE_IMAGE_PUBLICATION:
+                snapshot.pop(image_id, None)
+            else:
+                snapshot[image_id] = cast(AgentImage, candidate)
+        return snapshot
+
+    def __getitem__(self, key: str) -> AgentImage:
+        staged = self._staged()
+        if staged is not None and key in staged:
+            candidate = staged[key]
+            if candidate is _DELETE_IMAGE_PUBLICATION:
+                raise KeyError(key)
+            return candidate
+        with self._catalog_lock:
+            return super().__getitem__(key)
+
+    def __setitem__(self, key: str, value: AgentImage) -> None:
+        staged = self._staged()
+        if staged is not None:
+            staged[key] = value
+            return
+        with self._catalog_lock:
+            super().__setitem__(key, value)
+
+    def __delitem__(self, key: str) -> None:
+        staged = self._staged()
+        if staged is not None:
+            if key not in self:
+                raise KeyError(key)
+            staged[key] = _DELETE_IMAGE_PUBLICATION
+            return
+        with self._catalog_lock:
+            super().__delitem__(key)
+
+    def __contains__(self, key: object) -> bool:
+        staged = self._staged()
+        if staged is not None and key in staged:
+            return staged[key] is not _DELETE_IMAGE_PUBLICATION
+        with self._catalog_lock:
+            return super().__contains__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(tuple(self._snapshot()))
+
+    def __len__(self) -> int:
+        return len(self._snapshot())
+
+    def get(self, key: str, default: Any = None) -> AgentImage | Any:
+        staged = self._staged()
+        if staged is not None and key in staged:
+            candidate = staged[key]
+            return default if candidate is _DELETE_IMAGE_PUBLICATION else candidate
+        with self._catalog_lock:
+            return super().get(key, default)
+
+    def pop(self, key: str, default: Any = _CATALOG_MISSING) -> AgentImage | Any:
+        staged = self._staged()
+        if staged is not None:
+            current = self.get(key, _CATALOG_MISSING)
+            if current is _CATALOG_MISSING:
+                if default is _CATALOG_MISSING:
+                    raise KeyError(key)
+                return default
+            staged[key] = _DELETE_IMAGE_PUBLICATION
+            return current
+        with self._catalog_lock:
+            if default is _CATALOG_MISSING:
+                return super().pop(key)
+            return super().pop(key, default)
+
+    def clear(self) -> None:
+        staged = self._staged()
+        if staged is not None:
+            for image_id in self._snapshot():
+                staged[image_id] = _DELETE_IMAGE_PUBLICATION
+            return
+        with self._catalog_lock:
+            super().clear()
+
+    def update(self, *args: Any, **kwargs: AgentImage) -> None:
+        staged = self._staged()
+        if staged is not None:
+            updates = dict(*args, **kwargs)
+            staged.update(updates)
+            return
+        with self._catalog_lock:
+            super().update(*args, **kwargs)
+
+    def keys(self) -> Any:
+        return self._snapshot().keys()
+
+    def values(self) -> Any:
+        return self._snapshot().values()
+
+    def items(self) -> Any:
+        return self._snapshot().items()
+
+    def copy(self) -> dict[str, AgentImage]:
+        return self._snapshot()
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, AgentImage]:
+        return deepcopy(self.copy(), memo)
+
+    def publish(
+        self,
+        updates: dict[str, AgentImage],
+        removals: Iterable[str],
+    ) -> None:
+        with self._catalog_lock:
+            for image_id in removals:
+                super().pop(image_id, None)
+            super().update(updates)
 
 
 class ImageRegistryPrimitive:
@@ -154,6 +331,7 @@ class ImageRegistryPrimitive:
         filesystem: ImageFilesystemPort,
         process_working_directory: Callable[[str], Path],
         lifecycle_lock: Any,
+        transaction_readiness: Callable[[], StoreAssemblyReadiness],
         store: ExtensionRepository | None = None,
         config: AgentLibOSConfig | None = None,
     ):
@@ -168,7 +346,10 @@ class ImageRegistryPrimitive:
         self.filesystem = filesystem
         self.process_working_directory = process_working_directory
         self.lifecycle_lock = lifecycle_lock
+        self.transaction_readiness = transaction_readiness
         self._registration_lock = threading.RLock()
+        if not isinstance(self.images, ImageCatalog):
+            raise TypeError("image registry requires an ImageCatalog")
 
     @contextmanager
     def _atomic_image_registration(self, image_id: str) -> Iterator[None]:
@@ -182,23 +363,70 @@ class ImageRegistryPrimitive:
         """Atomically update one or more durable image rows and cache entries."""
 
         transaction_store = self.store or self.audit.store
-        selected_ids = tuple(dict.fromkeys(str(image_id) for image_id in image_ids))
+        # Eagerly consume caller-owned iterables before opening any transaction.
+        _selected_ids = tuple(dict.fromkeys(str(image_id) for image_id in image_ids))
         with self.lifecycle_lock, self._registration_lock:
-            previous = {
-                image_id: self.images[image_id]
-                for image_id in selected_ids
-                if image_id in self.images
-            }
+            outermost = self.images.staged_candidates() is None
+            if (
+                outermost
+                and self.transaction_readiness()
+                is StoreAssemblyReadiness.ACTIVE_TRANSACTION
+            ):
+                raise ValidationError(
+                    "image registry mutation cannot join an existing store transaction"
+                )
+            staged, opened_outermost = self.images.begin_publication()
+            if opened_outermost != outermost:
+                raise RuntimeError("image catalog publication scope changed unexpectedly")
+            staged_before = dict(staged)
             try:
                 with transaction_store.transaction():
                     yield
             except BaseException:
-                for image_id in selected_ids:
-                    if image_id in previous:
-                        self.images[image_id] = previous[image_id]
-                    else:
-                        self.images.pop(image_id, None)
+                # A nested registration may be caught by its outer publisher.
+                # Restore that outer publisher's staging view as well as
+                # relying on the store savepoint rollback.
+                staged.clear()
+                staged.update(staged_before)
                 raise
+            else:
+                if outermost:
+                    # The transaction context has returned, so every durable
+                    # row and required evidence record is committed before an
+                    # unlocked cache reader can observe the candidate.  Failed
+                    # registration/replacement therefore leaves the old shared
+                    # mapping visible throughout the attempt.
+                    self.images.finish_publication(publish=True)
+            finally:
+                if outermost and self.images.staged_candidates() is not None:
+                    self.images.finish_publication(publish=False)
+
+    def _stage_image_publication(self, image: AgentImage) -> None:
+        self.images.stage(image.image_id, image)
+
+    def stage_image_publication(self, image: AgentImage) -> None:
+        """Stage an already validated restore candidate for post-commit visibility."""
+
+        self._stage_image_publication(image)
+
+    def stage_image_removal(
+        self,
+        image_id: str,
+        *,
+        expected: AgentImage | None = None,
+    ) -> bool:
+        """Stage a cache removal while preserving a concurrently replaced entry."""
+
+        staged = self.images.staged_candidates()
+        if staged is None:
+            raise RuntimeError("image cache removal requires an active registration transaction")
+        current = staged.get(image_id, self.images.get(image_id))
+        if current is _DELETE_IMAGE_PUBLICATION:
+            return expected is None
+        if expected is not None and current != expected:
+            return False
+        staged[image_id] = _DELETE_IMAGE_PUBLICATION
+        return True
 
     def register(
         self,
@@ -296,14 +524,14 @@ class ImageRegistryPrimitive:
                     # after durable rows have been loaded. Rehydrate only the
                     # executable cache; do not rewrite registry provenance or
                     # emit a second registration event/audit record.
-                    self.images[candidate.image_id] = candidate
+                    self._stage_image_publication(candidate)
                     return ImageRegistrationResult(
                         image=deepcopy(candidate),
                         replaced=False,
                         source=source,
                         disposition="rehydrated",
                     )
-                self.images[candidate.image_id] = candidate
+                self._stage_image_publication(candidate)
                 now = utc_now()
                 if self.store is not None:
                     self.store.upsert_image(candidate, registered_by=actor, source=source, created_at=now)

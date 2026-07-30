@@ -19,6 +19,7 @@ from agent_libos.models import ExternalEffectRecoveryQuery
 from agent_libos.runtime import RuntimeBuilder
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import sqlite as sqlite_storage
+from agent_libos.storage.sql import _V3_REQUIRED_COLUMNS
 from agent_libos.storage.sqlite import SQLiteStore
 from agent_libos.utils.serde import dumps
 
@@ -125,6 +126,12 @@ _EXTERNAL_EFFECT_SCHEMA_INDEXES = frozenset(
         "idx_external_effects_retention_eligible",
         "idx_external_effects_pid_idempotency",
     }
+)
+_SQLITE_V3_MANIFEST_TABLES = tuple(sorted(_V3_REQUIRED_COLUMNS))
+_SQLITE_V3_MANIFEST_SCHEMA_PROBE_SHAPE = (
+    "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
+    + ", ".join("?" for _ in _SQLITE_V3_MANIFEST_TABLES)
+    + ")"
 )
 _GLOBAL_PATCH_SCOPE_LOCK = threading.RLock()
 
@@ -852,6 +859,13 @@ def _handler_statement_kind(sql: str) -> str | None:
 def _startup_statement_kind(sql: str) -> str | None:
     normalized = " ".join(str(sql).upper().split()).rstrip(";")
     normalized_literals = _SQL_TEXT_LITERAL_RE.sub("?", normalized)
+    if normalized_literals == _SQLITE_V3_MANIFEST_SCHEMA_PROBE_SHAPE:
+        manifest_tables = tuple(
+            literal[1:-1].replace("''", "'")
+            for literal in _SQL_TEXT_LITERAL_RE.findall(str(sql))
+        )
+        if manifest_tables == _SQLITE_V3_MANIFEST_TABLES:
+            return "v3_manifest_schema_probe"
     if re.fullmatch(
         r"SELECT NAME, SQL FROM SQLITE_MASTER WHERE TYPE = \?"
         r" AND NAME IN \(\?(?:, \?)*\)",
@@ -940,6 +954,7 @@ def _assert_startup_statement_contract(actual: Counter[str]) -> None:
         {
             "schema_probe": 2,
             "keyset_collation_schema_probe": 2,
+            "v3_manifest_schema_probe": 2,
             "schema_table": 1,
         }
     )

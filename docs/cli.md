@@ -21,6 +21,16 @@ example with `uv sync --frozen --all-groups --extra postgres`.
 uv run agent-libos --db .agent_libos.sqlite <command>
 ```
 
+Global options (`--config`, `--db`, `--module-manifest`, and the two module
+trust options) must appear before the command name. The startup trust options
+extend the selected Host configuration; they are not process capabilities.
+Management groups that support `--actor-pid` run as the audited Host admin when
+that option is omitted. Supply an actor pid when the operation must be confined
+to that process's authority. Other safety-sensitive opt-ins remain explicit:
+payload retention and Tool-Group migration default to dry runs, exec defaults
+to no scheduler run and to dropping external capabilities, and a bare
+`--max-quanta` omission may use an unbounded-until-idle configured value.
+
 Runtime domain errors are printed as a stable JSON object with
 `schema_version`, `error.type`, and `error.message`, and exit with status 1;
 the installed command does not expose a Python traceback for ordinary user
@@ -34,7 +44,7 @@ working directory. Pass `--config <path>` before the command name to use an
 explicit YAML overlay instead:
 
 ```bash
-uv run agent-libos --config ./agent-config.yaml spawn --goal "Inspect README.md"
+uv run agent-libos --config ./agent-config.yaml --db local processes
 ```
 
 The file is a validated overlay on `agent_libos.config.DEFAULT_CONFIG`. Mapping
@@ -42,8 +52,12 @@ fields are merged recursively, so adding `llm.profiles.coding` keeps the default
 profile. Scalar fields and list/tuple fields replace the default value. Unknown
 fields and unsafe values fail at startup. The Pydantic dataclass loader accepts
 compatible coercions for ordinary scalar fields, so this is not a strict
-JSON-type boundary; security-sensitive numeric bounds still receive explicit
-post-construction validation.
+JSON-type boundary. In particular, an ordinary integer or float config field
+may coerce YAML `true`/`false` to `1`/`0`; do not use booleans as numeric
+configuration values. Fields declared with `StrictInt` or `StrictFloat` reject
+that coercion, and numeric bounds still receive explicit post-construction
+validation. See [Configuration](configuration.md#loading-and-precedence) for
+the authoritative strict-field groups.
 
 ```yaml
 runtime:
@@ -79,17 +93,23 @@ are not committed. SQLite and PostgreSQL implement the same runtime store
 contract. Ordinary Object Memory payloads are runtime-only; SQL object rows
 written by the current runtime store a runtime-memory marker, and marker rows
 whose live payload cache cannot be reconstructed are released fail-closed on
-reopen. Accepted legacy rows from older development builds may still contain
-full JSON payload data; see [Runtime Storage](storage.md#transaction-model).
+reopen. With `llm.persist_full_io: true`, startup may first rehydrate the exact
+active root-spawn initial goal from its separately bounded, identity-bound
+committed launch envelope; this does not apply to other Objects, child/fork
+goals, exec replacement goals, or mutable goal handles. Accepted legacy rows
+from older development builds may still contain full JSON payload data; see
+[Runtime Storage](storage.md#transaction-model).
 Persistent stores also take an active-runtime lease. SQLite derives both the
-connection target and lease from the canonical database path, so a symlink
-alias cannot open a second writer. On the hardened POSIX path, the no-follow
+connection target and path lease from the canonical database path and holds an
+exclusive lock on the database actually opened. On the hardened POSIX path, the no-follow
 path-sidecar `flock` is paired with an owner-only identity lease keyed by the
 validated database `(st_dev, st_ino)`. The database, lease, identity-lease, and
 SQLite sidecars must be regular, current-user-owned, single-link files and are
-tightened to `0600`, rejecting hard links and path/lockfile replacement.
-Otherwise SQLite's kernel-managed exclusive database lock is used without
-claiming those POSIX path/inode guarantees. PostgreSQL uses a session
+tightened to `0600`, rejecting ordinary aliases and replacement races. The
+exclusive lock preserves the single-writer boundary without those POSIX
+guarantees and during a same-UID connect-time retarget, but that actor is within
+the Host trust boundary: keep the parent owner-only and never rename/replace a
+live database path. PostgreSQL uses a session
 advisory key scoped to `current_database()` plus `current_schema()`. A second
 writable Runtime cannot open the same database/schema target while a live owner
 holds the lease. A normal close or process/session termination releases it;
@@ -133,15 +153,21 @@ Each configured shell command rule must contain an executable, its first argv
 token must be non-blank, and no token may contain NUL. Invalid rules fail config
 construction instead of becoming an empty or ambiguous policy match.
 
-Use `--module-manifest` and `--trusted-module` before the command name to load
-trusted Runtime Modules before the runtime is used:
+Use `--module-manifest` and `--trusted-module` before the command name to load a
+trusted Runtime Module that is not already named by the selected config:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite \
-  --module-manifest modules/pty/module.yaml \
-  --trusted-module agent-libos-pty:v0:<manifest_sha256>:<source_sha256> \
+  --module-manifest <path-to-module.yaml> \
+  --trusted-module <module_id>:<manifest_sha256>:<source_sha256> \
   <command>
 ```
+
+The checked-in `config.yaml` already names and trusts
+`modules/pty/module.yaml`. Do not pass that manifest again while using the
+default project config: duplicate startup manifest paths fail closed. Either
+use the configured PTY entry as-is or select a config that omits it before
+supplying the explicit global options.
 
 `modules verify` reports `manifest_sha256`, `source_sha256`, and `trust_key`;
 copy `trust_key` into `--trusted-module`. For multi-file modules,
@@ -192,7 +218,11 @@ contracts; lists labelled “useful options” are intentionally not exhaustive.
 `demo` writes the deterministic preview to
 `agent_outputs/demo_patch_preview.txt` below the Runtime workspace and uses
 overwrite mode. Preserve or move an existing file at that path before running
-the demo if it contains user data.
+the demo if it contains user data. In this source checkout, project-root
+`config.yaml` loads its configured PTY Runtime Module; omitting `--db` also
+opens the persistent `.agent_libos.sqlite` selected by that config. Use
+`agent-libos --db local demo` when the Runtime records should be in-memory. The
+preview file is still written in either mode.
 
 `--actor-pid` is a command-group option for `checkpoint`, `skills`,
 `capabilities`, `images`, `jsonrpc`, and `mcp`. Place it after the group name
@@ -206,18 +236,29 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
-`run` invokes the configured real LLM and may consume provider tokens. For the
-README goal below, first configure the model/API environment and grant the exact
-file capability; image requirement declarations are not grants. `spawn` prints
-the pid to use in the following command. The generic CLI reads inherited
-environment variables and does not implicitly load `.env`; export them first or
-invoke it as `uv run --env-file .env agent-libos ...`. See
-[Real LLM Configuration](../README.md#real-llm-configuration).
+`run`, `llm-once`, and `exec --run` invoke the configured real LLM and may
+consume provider tokens. Process rows and capabilities survive a file-backed
+store reopen, but ordinary Object payloads do not. With the default
+`llm.persist_full_io: true`, a committed root `spawn` is the narrow exception:
+its bounded launch envelope preserves the exact initial goal until terminal
+cleanup, and startup rehydrates it only after matching the active root process,
+unchanged goal id, Object identity/version, live state, and runtime-memory
+marker for the immutable initial GOAL created by `ProcessManager`. Mutable goal
+handles are not eligible. The envelope remains bound to the spawn publication's
+initial image, but recovery does not require the process's current image to
+remain unchanged.
+This permits a later standalone `run`; image requirement declarations are still
+declarations rather than grants.
+The generic CLI reads inherited environment variables and does not implicitly
+load `.env`; export them first or invoke it as
+`uv run --env-file .env agent-libos ...`. See [Real LLM
+Configuration](../README.md#real-llm-configuration).
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite init
 uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Summarize README.md"
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:workspace:README.md --rights read
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> human:owner --rights write
 uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
 uv run agent-libos --db .agent_libos.sqlite processes
 uv run agent-libos --db .agent_libos.sqlite resources <pid>
@@ -225,6 +266,21 @@ uv run agent-libos --db .agent_libos.sqlite audit
 uv run agent-libos --db .agent_libos.sqlite tools
 uv run agent-libos --db .agent_libos.sqlite workflow run get_working_directory
 ```
+
+The initial `spawn` prints the pid to substitute for `<pid>`. The exact
+Host-issued README and Human-output grants from the preceding commands satisfy
+and narrow the coding image's declarations; the declarations themselves issued
+no authority. With `llm.persist_full_io: false`, spawn writes only content-free
+identity, hash, and size metadata and a later CLI invocation cannot recover the
+goal. In that mode, use an embedded `Runtime`, the GUI server, or
+`scripts/run_coding_agent.py` for one Runtime lifetime; for the built-in coding
+image, the bootstrap-plus-`exec --no-preserve-memory --preserve-capabilities
+--run` pattern is also available because exec creates and uses its replacement
+goal before closing. Terminal cleanup changes any reversible root-goal envelope
+to hash-only. Failed launch rollback and startup compensation also redact it
+before committing a non-committable publication state. `human:owner` is the
+checked-in `runtime.default_human: owner`; substitute the configured Human
+resource when that setting changes.
 
 `run` uses the high-level runtime scheduler, so human terminal messages are
 processed as part of runtime execution. Without `--max-quanta`, it uses
@@ -323,24 +379,33 @@ status code 1.
 to an existing Object Memory object, runs one tool bound in the creator's
 complete process tool table through a dedicated runner child process, and
 reports status as JSON. The Host-managed runner does not infer model visibility
-from that binding.
+from that binding. Starting a task requires a live owner Object payload and a
+live creator process in the same Runtime; an object id recorded in a database is
+not sufficient.
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite \
-  object-task start --pid <pid> --owner-oid <oid> get_working_directory --wait
-
-uv run agent-libos --db .agent_libos.sqlite \
-  object-task start --pid <pid> --owner-oid <oid> \
-  --watch-owner --watch-events updated,linked receive_process_messages \
-  --args-json '{"channel":"object-task-owner"}' --wait
-
 uv run agent-libos --db .agent_libos.sqlite object-task list --pid <pid>
+uv run agent-libos --db .agent_libos.sqlite object-task get <task_id> --pid <pid>
 uv run agent-libos --db .agent_libos.sqlite object-task wait <task_id> --pid <pid>
-uv run agent-libos --db .agent_libos.sqlite object-task cancel <task_id> --pid <pid>
-uv run agent-libos --db .agent_libos.sqlite \
-  object-task watch-owner <task_id> --pid <pid> --watch-events updated \
-  --watch-channel object-task-owner
 ```
+
+Those one-shot reads are useful for terminal records. For completeness, the
+parser exposes these lifecycle command shapes:
+
+```text
+object-task start --pid <pid> --owner-oid <live_oid> <tool> --wait
+object-task cancel <task_id> --pid <pid>
+object-task watch-owner <task_id> --pid <pid> --watch-events updated
+```
+
+This is syntax, not a standalone shell recipe: the installed one-shot CLI has
+no command that creates an Object and then starts a task before that Runtime
+closes. On reopen, a marker-only Object without its runtime payload is released
+fail-closed. An embedding host can create the owner and start/supervise the
+ObjectTask in one Runtime lifetime. With the GUI server, keep its Runtime alive
+while a process creates the owner through normal model/tool execution, then call
+`POST /api/object-tasks/start`; the server has no Host endpoint that creates an
+arbitrary owner payload directly.
 
 The task still uses the creator process tool table, ToolBroker, capabilities,
 resource budgets, events, audit, and Object Memory result semantics. A
@@ -351,16 +416,15 @@ event metadata, not object payloads or new capabilities. A
 still active. Owner-watch auto-resume is limited to tools with safe
 message-receive replay semantics, currently `receive_process_messages`.
 Running synchronous side-effect tools are not force-cancelled because Python
-cannot safely stop their worker thread after side effects may have started. A
-one-shot CLI invocation cannot keep detached in-memory tasks alive after the
-CLI Runtime shuts down, so `object-task start` requires `--wait`. For
-file-backed SQLite, the active-runtime lease prevents a separate CLI process
-from opening the same database while a live GUI or embedded host owns it. After
-the live owner has stopped, reopening the store reconciles unfinished
-ObjectTasks as abandoned. Use GUI server APIs or the embedding host for live
-ObjectTask supervision. The one-shot CLI `list|get|wait|cancel|watch-owner`
-commands are intended for the Runtime opened by that CLI invocation or for
-terminal task records after the live owner has stopped.
+cannot safely stop their worker thread after side effects may have started. The
+CLI parser requires `--wait` on `object-task start` because it cannot preserve a
+detached worker after shutdown, but that does not solve the live-owner
+precondition above. For file-backed SQLite, the active-runtime lease also
+prevents a separate CLI process from opening the database while a live GUI or
+embedded host owns it. After that owner stops, reopening reconciles unfinished
+ObjectTasks as abandoned; `list`, `get`, and `wait` may inspect terminal or
+reconciled records, while active `cancel` and `watch-owner` belong on the live
+Host surface.
 
 ## LLM Calls
 
@@ -492,8 +556,12 @@ and human approval do not increase these budgets.
 
 Calls, tokens, syscalls, bytes, child counts, and peak-memory values are
 non-negative integers. Runtime and subprocess wall/CPU seconds are continuous
-finite non-negative values and may be fractional. Boolean values are rejected
-for both shapes instead of being accepted as Python integers.
+finite non-negative values and may be fractional. The final `ResourceBudget`
+model and resource-related tool/manifest inputs reject boolean values instead
+of accepting them as Python integers. This is distinct from loading a config
+overlay: ordinary non-strict Pydantic config fields may first coerce YAML
+booleans to `0`/`1`; strict config fields reject them. Do not use booleans for
+numeric configuration values.
 
 ## Interactive Run
 
@@ -552,15 +620,30 @@ Useful options:
 ## Process Builtins
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite cd <pid> src
-uv run agent-libos --db .agent_libos.sqlite exec review-agent:v0 "Review README.md" --pid <pid> --run
-uv run agent-libos --db .agent_libos.sqlite exit <pid> --payload '{"done":true}'
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> 'filesystem:workspace:agent_libos/*' --rights read
+uv run agent-libos --db .agent_libos.sqlite cd <pid> agent_libos
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> image:review-agent:v0 --rights read
+uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> human:owner --rights write
+uv run agent-libos --db .agent_libos.sqlite exec review-agent:v0 "Review runtime/runtime.py" \
+  --pid <pid> --no-preserve-memory --preserve-capabilities --run --max-quanta 10
 ```
 
 For `exec`, the first positional argument is the target image. It can be an
 already registered image id such as `coding-agent:v0`, or an image package
 directory containing `IMAGE.yaml`. The second positional argument is the
 replacement goal.
+
+`cd` checks `read` on the exact canonical directory resource; the first grant
+above covers the checked-in `agent_libos/` directory. An exec that changes the
+image checks `read` on `image:<target_image_id>`, which is why the example grants
+the review image explicitly. Exec preserves Object Memory by default, drops
+external capabilities by default, and does not run unless `--run` is present.
+Here `--no-preserve-memory` replaces any stale prior view with the live goal,
+while `--preserve-capabilities` keeps the Host-issued directory, image, and
+Human grants needed by the new process. Those grants satisfy and narrow the
+review image's declarations; the declarations themselves issue no authority.
+An `exit <pid> --payload '{"done":true}'` command is valid only while
+the process is still non-terminal.
 
 Useful exec options:
 
@@ -657,8 +740,12 @@ fallback-protocol, or explanatory prompt sections. String goals are preserved
 exactly and structured goals use canonical JSON. Lossless replay requires
 `llm.persist_full_io: true`; otherwise execution fails before the LLM provider.
 An Image using `image_only` cannot select prompt-mode context management.
-Use `minimal_runtime` for factual runtime state sections, or `libos_default`
-only when the image intentionally wants the native Agent libOS planner prompt.
+Use `minimal_runtime` when the image wants the cumulative completion contract,
+factual runtime/state, activated-Skill and recovered-goal sections, plus optional
+Host-enabled fallback JSON guidance, but not the complete native Agent libOS
+base/action-planner envelope. Use `libos_default` when it wants that full
+planner prompt as well. Unactivated Skill metadata remains discoverable through
+`discover_skills`; it is not injected. Only `image_only` is byte-transparent.
 
 `jit_tool_exposure` is optional and defaults to `direct`. Use `multiplexed`
 when the image wants one stable OpenAI tool schema named `run_jit_tool` for all
@@ -704,6 +791,14 @@ uv run agent-libos --db .agent_libos.sqlite images register images/mini-swe-agen
 uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
 ```
 
+| Image subcommand | Arguments and option defaults |
+| --- | --- |
+| `list` | no leaf options |
+| `inspect` | required `image_id` |
+| `validate` | required Host/package `path` |
+| `register` | required `path`; `--replace` is off by default |
+| `commit` | required `checkpoint_id`, `image_id`, and `--name`; `--version` defaults to `v0`, `--metadata-json` to `{}`, and `--replace` is off |
+
 `images` accepts `--actor-pid <pid>` before the subcommand. Process mode uses
 the following authority contract:
 
@@ -743,6 +838,14 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint fork <checkpoint_id> --pa
 uv run agent-libos --db .agent_libos.sqlite checkpoint replay <checkpoint_id> <event_id>
 ```
 
+| Checkpoint subcommand | Arguments and option defaults |
+| --- | --- |
+| `create` | required `pid` and `reason`; `--metadata-json` defaults to `{}` |
+| `list` | optional `--pid`; `--limit` defaults to and cannot exceed `checkpoint.list_limit` (100 by default) |
+| `inspect`, `diff`, `restore` | required `checkpoint_id` |
+| `fork` | required `checkpoint_id`; optional `--parent-pid` |
+| `replay` | required `checkpoint_id` and `event_id` |
+
 `--actor-pid <pid>` makes the CLI enforce that process's operation-specific
 checkpoint capabilities. Restore requires checkpoint `admin`, exact image
 `admin` for every existing image changed by the snapshot, and exact image
@@ -776,12 +879,22 @@ contract. Treat this as reviewed contract drift, not replay equivalence; see
 ```bash
 uv run agent-libos --db .agent_libos.sqlite skills discover
 uv run agent-libos --db .agent_libos.sqlite skills validate skills/swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills inspect swe-agent
 uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
+uv run agent-libos --db .agent_libos.sqlite skills inspect swe-agent
 uv run agent-libos --db .agent_libos.sqlite skills discover --text swe-agent
 uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent --expected-package-sha256 <package_sha256-from-discover>
 uv run agent-libos --db .agent_libos.sqlite skills unload <pid> swe-agent
 ```
+
+| Skill subcommand | Arguments and option defaults |
+| --- | --- |
+| `discover` | optional `--text`; `--limit` defaults to and cannot exceed `skills.discover_limit` (100 by default) |
+| `inspect` | required registered `skill_id` |
+| `validate` | required Host `path`; never accepts `--actor-pid` |
+| `register` | required `path`; `--replace` is off; `--source-type` is `workspace`, `global`, or `runtime`, and omission infers `global` only below a configured global root, otherwise `workspace` |
+| `activate` | required `pid`, `skill_id`, and exact lowercase `--expected-package-sha256` |
+| `unload` | required `pid` and `skill_id` |
+| `trust`, `untrust` | required global Skill `path`; trust is bound to its current package SHA-256 |
 
 `skills activate` compare-and-swaps against the exact lowercase
 `package_sha256` returned by `skills discover`; rediscover instead of retrying
@@ -812,6 +925,23 @@ uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:
 uv run agent-libos --db .agent_libos.sqlite capabilities delegate <parent_pid> <child_pid> 'filesystem:workspace:src/*' --rights read
 uv run agent-libos --db .agent_libos.sqlite capabilities revoke <capability_id> --reason "no longer needed"
 ```
+
+| Capability subcommand | Arguments and option defaults |
+| --- | --- |
+| `list` | `--subject` defaults to the actor in process mode and all subjects in admin mode; `--include-inactive` is off; bounded `--limit` is described below |
+| `inspect` | required `capability_id` |
+| `grant` | required `subject`, `resource`, and one or more `--rights`; spec defaults are `--effect allow`, non-delegable, revocable, no expiry/use ceiling, and `{}` constraints/metadata |
+| `delegate` | required `parent`, `child`, and the same complete spec flags as `grant`; the requested spec must attenuate a covering delegable parent |
+| `revoke` | required `capability_id`; optional `--reason` |
+| `explain` | required `subject`, `resource`, and typed `right`; `--context-json` defaults to `{}` and does not itself grant authority |
+
+For `grant` and `delegate`, `--delegable` opts in, while
+`--revocable`/`--no-revocable` defaults to revocable. `--uses-remaining` and
+`--expires-at` establish finite-use and time leases; `--constraints-json` and
+`--metadata-json` must each decode to a JSON object. An omitted lease field is
+unbounded, not zero. Effects are `allow`, `ask`, or `deny`; because `allow` is
+the default, scripts that intend a restrictive record should always pass the
+effect explicitly.
 
 `capabilities list --limit` defaults to `capability.list_limit` from the active
 Host configuration (100 by default). The same configured value is the maximum
@@ -912,13 +1042,21 @@ raw MCP tool names.
 ## Runtime Module Commands
 
 Runtime Modules are trusted Python startup extensions. They are loaded with
-global arguments before the selected command runs:
+global arguments before the selected command runs. In this checkout the default
+project config already loads and trusts the PTY module, so inspect that
+configured instance without repeating its manifest:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite modules verify modules/pty/module.yaml
-uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module.yaml --trusted-module agent-libos-pty:v0:<manifest_sha256>:<source_sha256> modules list
-uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module.yaml --trusted-module agent-libos-pty:v0:<manifest_sha256>:<source_sha256> modules inspect agent-libos-pty:v0
+uv run agent-libos --db .agent_libos.sqlite modules list
+uv run agent-libos --db .agent_libos.sqlite modules inspect agent-libos-pty:v0
 ```
+
+| Module subcommand | Arguments and option defaults |
+| --- | --- |
+| `list` | `--limit` defaults to and cannot exceed `modules.discover_limit` (100 by default) |
+| `inspect` | required loaded `module_id` |
+| `verify` | required manifest `path`; static verification uses the selected config's bounds/trust plus any repeatable global trust options |
 
 `modules verify` resolves the entrypoint and computes the manifest hash and
 source hash without opening a Runtime, touching the selected database, loading
@@ -932,7 +1070,10 @@ the covered `source_files` list. The returned
 `modules inspect` show persisted module load records for the opened runtime
 database. `--trusted-module-sha256 <manifest_sha256>:<source_sha256>` is
 accepted as a weaker local-development shortcut that trusts the digest pair for
-any module id.
+any module id. When a selected config does not already name a custom module,
+load it with `--module-manifest <path>` and `--trusted-module <trust_key>` before
+the command name. Configured and explicit manifest lists are combined, and a
+duplicate path is rejected rather than silently loaded twice.
 
 ## Benchmark Scripts
 
@@ -976,6 +1117,15 @@ uv run python scripts/human_llm_chat.py --mock --auto-message hello --auto-messa
 `run_coding_agent.py` loads `.env` from the Agent libOS checkout before it
 mounts the target workspace. The target workspace's `.env` is not read
 implicitly; use `--env-file` for an explicit alternate credential file.
+Without `--no-run`, the launcher immediately invokes the configured real LLM
+and allows up to `runtime.launcher_max_quanta` quanta (40 by default). Its
+default `edit` permission preset grants workspace-wide read and write authority,
+and its default Shell policy is `allowlist_auto_else_ask`. It stores state in a
+workspace-keyed persistent database outside the exposed workspace unless
+`--ephemeral-db` is selected. Use `--permission-preset read-only` when writes
+are unnecessary, and use `--strict` when a failed or killed process must make
+the script return non-zero; without `--strict`, inspect `process_status` in the
+printed JSON.
 
 On Windows PowerShell, use backslashes when convenient:
 

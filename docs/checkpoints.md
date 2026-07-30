@@ -519,7 +519,10 @@ Among messages created after the checkpoint, only entries that are still
 **unread** are marked `superseded_by_restore`; acknowledged or
 already-superseded post-checkpoint history is left unchanged. Captured message
 rows are restored to their checkpoint delivery state, so a message that was
-unread at capture may become unread again.
+unread at capture may become unread again. Superseded rows remain durable
+restore history, not mailbox delivery candidates: neither the default selector
+nor `include_acked=true` may return or count them, and they cannot satisfy a
+blocking receive.
 
 ObjectTask rows are durable execution history, but they are not append-only and
 are not themselves checkpoint rows. Restore refuses any active task in the
@@ -561,6 +564,14 @@ The current full-snapshot AgentProcess executor is already stateless and sends
 no `previous_response_id`; the generation fence prevents a future or alternate
 continuation path from chaining to a response made from post-checkpoint local
 state.
+
+A restored full-I/O `image_only` conditional release keeps its exact persisted
+approved messages/tools and Sink/flow/resume binding. Immediately before the
+one claimed dispatch, the executor rebinds only the frozen transcript/request
+anchor to the fresh restored LLM-context generation and audits that the request
+payload did not change. A resulting successful transcript is therefore scoped
+to the restored epoch instead of the checkpoint's older generation; all
+profile, trust, release, and single-claim checks still apply.
 
 When `llm.persist_full_io=false`, a conditional LLM release row contains only
 hash-bound resume metadata. It can resume only while the matching prepared
@@ -604,10 +615,10 @@ process:
   that process (borrowed roots without captured payloads are excluded),
 - process-local namespace state,
 - loaded Skill records and package rows,
-- complete process-bound static tools and process-local JIT tool sources,
-- process cwd and image context settings,
-- model-tool projection mode, the Image default-Skill list, and loaded Skill
-  projection/provenance,
+- process-bound static tool names/bindings and complete process-local JIT tool
+  sources,
+- process cwd and process-local context state,
+- loaded Skill projection/provenance,
 - required startup module summaries.
 
 It does not copy the real filesystem, shell state, remote JSON-RPC/MCP state,
@@ -629,6 +640,29 @@ Loaded startup module summaries are copied into image `required_modules`; the
 committed image fails closed at boot unless those exact module ids and source
 hashes are loaded in the current runtime.
 
+The checkpoint records the source `image_id`, but it does not freeze that
+Image's definition. At commit time, the registry resolves the then-current row
+for that id and copies its system prompt, prompt mode, JIT exposure, planner and
+action schema, context/safety policy, LLM profile, default-Skill list, and model
+tool-projection metadata into the new image/artifact. If the source id was
+replaced after checkpoint creation, the commit inherits that replacement; if
+it is no longer executable/present, those fields use the implementation's
+empty/default fallbacks. The captured process's loaded Skill state and
+static/JIT tool bindings remain separate checkpoint data. Workflows that need
+reproducible commits should use immutable versioned source-image ids and retain
+and verify their registry provenance through commit.
+
+Static tool implementation code is not embedded in a checkpoint-committed
+artifact. Commit verifies that each captured static tool name currently
+resolves, but boot resolves that name again through the current Host
+`ToolBroker`; a same-name built-in or Host registration can therefore drift or
+disappear. Captured JIT tools are different: their bounded source and tool rows
+are embedded and reinstalled. Hash-pinned `required_modules` prevent unnoticed
+drift for tools whose Host implementation is supplied exclusively by one of
+those modules, but they are not a general hash for every static tool. Exact
+replay requires the Host to pin and compare the static-tool implementation
+inventory as well as the image artifact.
+
 Image registry authority is separate from the image's declared external
 requirements. When child spawn selects an image different from the parent's
 current image, or exec switches the process to a different image, the acting
@@ -648,13 +682,29 @@ The registered model-tool wrapper is `commit_checkpoint_to_image`, owned by the
 `agent-libos-agent-images` Skill, and the JIT syscall path is
 `image.commit_checkpoint`. No shipped built-in Image includes the wrapper in its
 static `default_tools`, so it is not model-visible in a fresh built-in process.
-A custom or committed Image must bind the complete immutable Skill tool set and
-activate that Skill before the model can select it. Actor-mode commits require
-`write` on the target `image:<image_id>` and read authority on either the
-checkpoint or the checkpointed process. Replacing an existing target image
-requires `admin` instead of `write`. Both finite decisions settle with artifact/
-manifest/event/audit publication, so a failed commit does not burn either
-one-shot grant.
+After that, visibility follows the Image's ordinary projection policy. Without
+`metadata.tool_projection: skills`, a custom or committed Image that includes
+the wrapper in `default_tools` projects it directly; Skill activation is not
+required. With the `skills` projection, the Image must bind the complete
+immutable `agent-libos-agent-images` tool set in its full table and activate or
+restore that Skill before the wrapper enters the model table. Checkpoint commit
+uses the source Image registry row resolved at commit time for projection policy
+and uses the checkpoint for captured loaded-Skill state; it does not silently
+switch between those routes after the committed image is registered. Either route changes
+visibility only, and every call still enforces the same checkpoint/image
+authority. Actor-mode commits require `write` on the target
+`image:<image_id>` and read authority on either the checkpoint or the
+checkpointed process. Replacing an existing target image requires `admin`
+instead of `write`. Both finite decisions settle with artifact/manifest/event/
+audit publication, so a failed commit does not burn either one-shot grant.
+
+A durable image row whose boot artifact failed validation is quarantined from
+the executable cache but still counts as an existing registry entry. Neither a
+package load nor checkpoint commit may overwrite it with `replace=false` and
+only `write` authority. The Host must inspect the invalid durable row and, if
+replacement is deliberate, use `replace=true` with exact `admin` authority on
+that image id. Quarantine is an execution fence, not a way to downgrade the
+replacement authority requirement.
 
 ## Fork From Checkpoint
 
@@ -798,6 +848,16 @@ not recompute scope from the current live process tree, so a post-checkpoint
 descendant remains in its historical replay scope even if a later restore
 removes that descendant. Detached checkpoint forks are not inferred to be
 children merely because the checkpoint owner initiated them.
+
+The current manager, CLI, and `checkpoint.replay` JIT syscall have no replay
+cursor or limit. The manager first materializes the complete durable event list,
+then returns every selected event through the requested target, including each
+event's complete stored `payload`; it does not apply the inspect/diff preview
+projection or a payload truncation layer. Replay is therefore neither
+storage-query pagination nor a storage/output work bound. Use it only for a
+controlled event interval, treat payloads as untrusted evidence, and use a
+Host-side bounded event export when the history may be large or a consumer
+cannot safely receive complete payloads.
 
 ## Limits
 

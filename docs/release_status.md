@@ -1,11 +1,24 @@
-# Agent libOS 1.0.0 Status
+# Agent libOS 1.0.1 Status
 
-Agent libOS 1.0.0 is a release candidate for the core Python runtime scope
+Agent libOS 1.0.1 is a release candidate for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release-ready status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
 artifact gates. This is not a claim that every platform, desktop package, or
 real external-provider configuration has been release-validated.
+
+This page records the candidate scope and the checked-in validation contract;
+it is not itself a CI receipt. A release-pass claim must be bound to all of the
+following immutable locators:
+
+- the exact source commit locator;
+- the CI workflow run locator and the required job locators for that commit;
+- the canonical wheel, source archive, and checksum-manifest artifact locators
+  produced by that run.
+
+Without that complete binding, wording below such as “requires”, “gates”, or
+“checks” describes the workflow contract only, not an observed pass for a
+checkout or candidate artifact.
 
 ## Closed release blockers and P1 architecture debt
 
@@ -155,13 +168,14 @@ real external-provider configuration has been release-validated.
   `CREATED` detection uses a bounded indexed anti-join rather than full-history
   materialization.
 
-## Validation state
+## Validation contract (CI receipt required)
 
-- Compilation, architecture/blocking-work checks, protected-operation coverage,
-  release-contract checks, whitespace checks, and the invariant manifest pass.
-  The checker resolves every declared invariant against the current pytest
-  collection.
-- The per-lane deterministic matrix passes all selected tests. PostgreSQL
+- The checked-in workflow requires compilation, architecture/blocking-work
+  checks, protected-operation coverage, release-contract checks, whitespace
+  checks, and the invariant manifest to pass. The checker must resolve every
+  declared invariant against the current pytest collection.
+- The workflow requires the per-lane deterministic matrix to pass all selected
+  tests. PostgreSQL
   service coverage and the complete MCP SDK integration file run in dedicated
   gates; real remote MCP deployment and real-LLM coverage remain explicit
   environment gates. Deterministic mocked MCP coverage is part of the normal
@@ -175,33 +189,38 @@ real external-provider configuration has been release-validated.
   3.12, using the subproject's own frozen environment; `release-artifacts`
   waits for both entries. This gate covers deterministic harness behavior only
   and makes no real-model AgentDojo utility or security claim.
-- The GUI lane passes the complete checked-in Vitest suite, TypeScript type
+- The GUI job requires the complete checked-in Vitest suite, TypeScript type
   checking, and the production frontend build. Exact file and test counts are
-  intentionally left to the CI receipt because they change as coverage grows.
-- The runtime-safety release workflow gates all 32 checked-in deterministic
-  tasks with complete audit evidence, no unauthorized effects, and no false
-  denials. Its focused Git tasks cover managed-checkout containment, malicious
-  repository config, remote misuse, and patch-label lineage.
-- The practical-workflow evaluation passes three `native-live` scenarios and 80
-  modeled scenarios while retaining their distinct evidence labels and using no
-  modeled fallback for native scenarios.
-- The 100k and one-million external-effect recovery profiles both use the
-  matching composite index and perform work proportional to pending pages. Their
-  elapsed times are diagnostic measurements, not release SLAs. Store
-  read-only preflight, main initialization, and Runtime handler windows are all
-  trace-observed with exact SELECT/DML ledgers; the benchmark executes the real
-  prepared-effect handler, verifies every surviving seeded identity and final
-  marker, and checks page-bounded Runtime diagnostics.
-- The runtime-publication reconciliation `ci` profile executes the real startup
-  handler over a 10k history with 1,001 incomplete records. Operation repair
-  and the five-stage checkpoint payload handshake stay keyset/page bounded;
+  intentionally left to the bound CI receipt because they change as coverage
+  grows.
+- The runtime-safety release job is configured to gate all 32 checked-in
+  deterministic tasks on complete audit evidence, no unauthorized effects, and
+  no false denials. Its focused Git tasks cover managed-checkout containment,
+  malicious repository config, remote misuse, and patch-label lineage.
+- The practical-workflow gate requires three `native-live` scenarios and 80
+  modeled scenarios to retain their distinct evidence labels, with no modeled
+  fallback for native scenarios.
+- The 100k external-effect recovery profile is the per-change release gate. A
+  separate scheduled/manual workflow runs the one-million profile; the
+  `release-artifacts` job does not depend on that workflow. Both profiles
+  require the matching composite index and work proportional to pending pages.
+  Their elapsed times are diagnostic measurements, not release SLAs. Store
+  read-only preflight, main initialization, and Runtime handler windows must be
+  trace-observed with exact SELECT/DML ledgers; the benchmark must execute the
+  real prepared-effect handler, verify every surviving seeded identity and
+  final marker, and check page-bounded Runtime diagnostics.
+- The runtime-publication reconciliation `ci` gate is configured to execute the
+  real startup handler over a 10k history with 1,001 incomplete records.
+  Operation repair and the five-stage checkpoint payload handshake stay
+  keyset/page bounded;
   page, attempt, ACK guard, control-state, operation-reconciliation, and
   invalid-domain plans use their exact indexes.
-  The profile validates exact publication/operation convergence, attempt
+  The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job builds one canonical 1.0.0 wheel/source pair,
-  rejects extra or non-regular output, and records an exact checksum manifest.
+- The `release-artifacts` CI job is configured to build one canonical 1.0.1
+  wheel/source pair, reject extra or non-regular output, and record an exact
+  checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
   hash-checked dependencies exported from the root lock, and then install the
   artifact without dependency re-resolution. The source build uses the frozen
@@ -219,7 +238,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.0.0 release evidence, and supports no call-count,
+observation, not Agent libOS 1.0.1 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -254,7 +273,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.0.0.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.0.1.
 
 ## Remaining environment gates and non-blocking debt
 

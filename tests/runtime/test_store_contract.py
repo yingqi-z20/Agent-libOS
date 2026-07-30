@@ -4894,6 +4894,107 @@ def test_process_message_ack_is_unread_cas_and_preserves_envelope(
 
 
 @pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_process_message_status_set_queries_filter_before_limit_and_count(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="message status-set query")
+        superseded = runtime.messages.post(
+            sender="test.host",
+            recipient_pid=pid,
+            channel="status-set",
+            subject="excluded restore history",
+        )
+        runtime.store.update_process_message(
+            replace(
+                superseded,
+                status=ProcessMessageStatus.SUPERSEDED_BY_RESTORE,
+                created_at="2000-01-01T00:00:00+00:00",
+                updated_at="2000-01-01T00:00:00+00:00",
+            )
+        )
+        unread = runtime.messages.post(
+            sender="test.host",
+            recipient_pid=pid,
+            channel="status-set",
+            subject="visible unread",
+        )
+        runtime.store.update_process_message(
+            replace(
+                unread,
+                created_at="2001-01-01T00:00:00+00:00",
+                updated_at="2001-01-01T00:00:00+00:00",
+            )
+        )
+        acknowledged = runtime.messages.post(
+            sender="test.host",
+            recipient_pid=pid,
+            channel="status-set",
+            subject="visible acknowledged",
+        )
+        runtime.store.update_process_message(
+            replace(
+                acknowledged,
+                created_at="2002-01-01T00:00:00+00:00",
+                updated_at="2002-01-01T00:00:00+00:00",
+            )
+        )
+        runtime.messages.ack(pid, [acknowledged.message_id])
+
+        all_messages = runtime.store.list_process_messages(
+            pid,
+            status=None,
+            statuses=None,
+            channel="status-set",
+        )
+        assert [message.message_id for message in all_messages] == [
+            superseded.message_id,
+            unread.message_id,
+            acknowledged.message_id,
+        ]
+        assert runtime.store.count_process_messages(
+            pid,
+            status=None,
+            statuses=None,
+            channel="status-set",
+        ) == 3
+
+        visible_statuses = (
+            ProcessMessageStatus.UNREAD,
+            ProcessMessageStatus.ACKED,
+            ProcessMessageStatus.UNREAD,
+        )
+        first_visible = runtime.store.list_process_messages(
+            pid,
+            statuses=visible_statuses,
+            channel="status-set",
+            limit=1,
+        )
+        assert [message.message_id for message in first_visible] == [unread.message_id]
+        assert runtime.store.count_process_messages(
+            pid,
+            statuses=visible_statuses,
+            channel="status-set",
+        ) == 2
+
+        assert runtime.store.list_process_messages(pid, statuses=()) == []
+        assert runtime.store.count_process_messages(pid, statuses=()) == 0
+        with pytest.raises(ValidationError, match="cannot combine status and statuses"):
+            runtime.store.list_process_messages(
+                pid,
+                status=ProcessMessageStatus.UNREAD,
+                statuses=(ProcessMessageStatus.UNREAD,),
+            )
+        with pytest.raises(ValidationError, match="cannot combine status and statuses"):
+            runtime.store.count_process_messages(
+                pid,
+                status=ProcessMessageStatus.UNREAD,
+                statuses=(ProcessMessageStatus.UNREAD,),
+            )
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
 def test_checkpoint_rejects_non_json_native_payload_without_type_loss(
     kind: str,
     tmp_path: Path,

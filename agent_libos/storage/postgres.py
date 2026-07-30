@@ -8,7 +8,11 @@ from typing import Any, Mapping
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import UnsupportedStoreVersion, ValidationError
 from agent_libos.storage.engine import split_sql_script
-from agent_libos.storage.sql import SQLRuntimeStore, _V3_KEYSET_TEXT_COLUMNS
+from agent_libos.storage.sql import (
+    SQLRuntimeStore,
+    _V3_KEYSET_TEXT_COLUMNS,
+    _V3_REQUIRED_COLUMNS,
+)
 
 
 def _postgres_runtime_lock_key(database: str, schema: str) -> int:
@@ -274,6 +278,41 @@ class PostgresStore(SQLRuntimeStore):
             """
         )
         return {str(row["name"]) for row in rows}
+
+    @classmethod
+    def _require_v3_schema_shape(cls, conn: Any) -> None:
+        """Require every manifest relation to be an ordinary PostgreSQL table."""
+
+        required_tables = sorted(_V3_REQUIRED_COLUMNS)
+        placeholders = ", ".join("?" for _ in required_tables)
+        rows = conn.execute(
+            f"""
+            SELECT relation.relname AS name
+                 , relation.relkind AS relation_kind
+              FROM pg_catalog.pg_class AS relation
+              JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = current_schema()
+               AND relation.relname IN ({placeholders})
+            """,
+            required_tables,
+        )
+        relation_kinds = {
+            str(row["name"]): str(row["relation_kind"])
+            for row in rows
+        }
+        invalid_relations = {
+            table: relation_kinds.get(table, "missing")
+            for table in required_tables
+            if relation_kinds.get(table) != "r"
+        }
+        if invalid_relations:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v3 "
+                "manifest relation types: "
+                f"{invalid_relations}; expected PostgreSQL relkind 'r'"
+            )
+        super()._require_v3_schema_shape(conn)
 
     @classmethod
     def _probe_text_column_collations(

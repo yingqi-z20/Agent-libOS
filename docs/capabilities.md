@@ -279,7 +279,11 @@ All authority mutation goes through explicit operations:
   constraints, and delegation depth. Finite-use capabilities are consumed by
   direct use and cannot be delegated. Delegated records keep a parent link, so a
   later parent revocation or expiry stops the child record from authorizing.
-  Child records cannot drop parent constraints such as `shell_policy_level`.
+  Child records cannot drop parent constraints. Authority-shaping constraints
+  such as `shell_policy_level` and `authority_rules` also cannot be introduced
+  unless the parent already carries the identical constraint; ordinary
+  context-matching constraints such as `git_allowed_refs` may be added to
+  narrow the delegated authority.
   Delegation also cannot launder an overlapping parent `deny`/`ask` or malformed
   authority rule by selecting a narrower allow. The child record is not
   observable unless its process attachment, event, and audit evidence all
