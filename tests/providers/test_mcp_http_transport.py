@@ -18,7 +18,8 @@ from agent_libos.substrate.local import (
 )
 
 
-httpx = pytest.importorskip("httpx")
+pytestmark = pytest.mark.mcp
+httpx = pytest.importorskip("httpx2")
 
 
 def _handler(
@@ -97,6 +98,34 @@ def test_http_transport_rejects_content_encoding_before_decode() -> None:
             match="unsupported Content-Encoding=gzip",
         ):
             asyncio.run(_get(url, max_response_bytes=1024))
+
+
+@pytest.mark.parametrize(
+    ("body", "allowed"),
+    [
+        (b"", True),
+        (b'{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"missing"}}', True),
+        (b'{"jsonrpc":"2.0","id":0,"error":{"code":-32022,"message":"modern"}}', False),
+        (b"not-json", False),
+        (b'{"jsonrpc":"2.0","id":0,"result":{}}', False),
+    ],
+)
+def test_http_400_fallback_requires_bounded_unambiguous_legacy_signal(
+    body: bytes,
+    allowed: bool,
+) -> None:
+    transport = _McpPolicyAsyncHTTPTransport(max_response_bytes=1024)
+    exchange = transport.wire_ledger.begin_http("server/discover")
+    exchange.call_started = True
+    exchange.started_at = time.monotonic()
+    exchange.response_body = bytearray(body)
+    exchange.response_declared_bytes = len(body)
+    transport.last_request_method = "server/discover"
+    transport.last_response_status = 400
+
+    transport._finish_http_response(exchange)  # noqa: SLF001 - fallback edge
+
+    assert transport.last_legacy_400_signal is allowed
 
 
 def test_network_backend_bounds_slow_dns_by_absolute_deadline(
@@ -268,3 +297,44 @@ def test_http_response_chunks_cannot_reset_absolute_deadline() -> None:
                 pass
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=1.5))
+
+
+def test_http_response_iteration_and_close_share_one_task() -> None:
+    class OneChunk:
+        def __init__(self) -> None:
+            self.iteration_task: asyncio.Task[Any] | None = None
+            self.close_task: asyncio.Task[Any] | None = None
+            self.sent = False
+
+        def __aiter__(self) -> "OneChunk":
+            return self
+
+        async def __anext__(self) -> bytes:
+            self.iteration_task = asyncio.current_task()
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return b"too large"
+
+        async def aclose(self) -> None:
+            self.close_task = asyncio.current_task()
+
+    async def exercise() -> OneChunk:
+        source = OneChunk()
+        bounded = _bounded_mcp_http_stream(
+            source,
+            max_response_bytes=1,
+            is_sse=False,
+            fail=RuntimeError,
+            deadline=time.monotonic() + 1,
+        )
+        with pytest.raises(RuntimeError, match="MCP HTTP response exceeded"):
+            async for _chunk in bounded:
+                pass
+        await bounded.aclose()
+        return source
+
+    source = asyncio.run(exercise())
+
+    assert source.iteration_task is not None
+    assert source.close_task is source.iteration_task

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { allowedTaskRunActions, assertRuntimeSnapshot, assertTaskRunDetail, runtimeSnapshotFromSseData, taskRunSummaryFromSseData, upsertTaskRunSummary } from "./types";
+import { allowedTaskRunActions, assertMcpDiscoveryResult, assertRuntimeSnapshot, assertTaskRunDetail, runtimeSnapshotFromSseData, taskRunSummaryFromSseData, upsertTaskRunSummary } from "./types";
 
 describe("assertRuntimeSnapshot", () => {
   it("accepts the minimum same-build snapshot shape", () => {
@@ -58,6 +58,46 @@ describe("assertRuntimeSnapshot", () => {
     expect(runtimeSnapshotFromSseData({ snapshot: snapshot() })).toMatchObject({ db: "local" });
     expect(() => runtimeSnapshotFromSseData({ snapshot: { schema_version: 2, db: "local" } })).toThrow(/scheduler/);
     expect(() => runtimeSnapshotFromSseData({})).toThrow(/payload/);
+  });
+
+  it("accepts versioned MCP manifests but rejects persisted negotiation state", () => {
+    const server = mcpServer();
+    expect(() => assertRuntimeSnapshot({ ...snapshot(), mcp_servers: [server] })).not.toThrow();
+    expect(() => assertRuntimeSnapshot({
+      ...snapshot(),
+      mcp_servers: [{ ...server, connection: mcpConnection() }]
+    })).toThrow(/operation-local/);
+    expect(() => assertRuntimeSnapshot({
+      ...snapshot(),
+      mcp_servers: [{ ...server, schema_version: 1, protocol_mode: "auto" }]
+    })).toThrow(/summary/);
+  });
+});
+
+describe("MCP v2 API projection", () => {
+  it("accepts only the locked discovery connection and receipt fields", () => {
+    const result = mcpDiscovery();
+    expect(() => assertMcpDiscoveryResult(result)).not.toThrow();
+    expect(() => assertMcpDiscoveryResult({
+      ...result,
+      connection: {
+        configured_mode: "auto",
+        era: "modern",
+        protocol_revision: "2026-07-28",
+        sessionless: true,
+        fallback_used: false,
+        capabilities: [],
+        unsupported_capabilities: []
+      }
+    })).toThrow(/connection/);
+    expect(() => assertMcpDiscoveryResult({
+      ...result,
+      connection: { ...result.connection, auth_challenge: "secret" }
+    })).toThrow(/connection/);
+    expect(() => assertMcpDiscoveryResult({
+      ...result,
+      receipts: [{ ...result.receipts[0], phase: "subscriptions/listen" }]
+    })).toThrow(/receipt/);
   });
 });
 
@@ -151,5 +191,48 @@ function run(revision = 1) {
     blockers: [],
     retention: "purge_on_terminal" as const,
     payloads_purged: false
+  };
+}
+
+function mcpServer() {
+  return {
+    schema_version: 2,
+    server_id: "modern",
+    protocol_mode: "auto",
+    transport: { type: "streamable_http" },
+    tools: [],
+    timeout_s: 30,
+    max_request_bytes: 65_536,
+    max_response_bytes: 1_048_576,
+    metadata: {}
+  };
+}
+
+function mcpConnection() {
+  return {
+    protocol_mode: "auto",
+    protocol_era: "modern",
+    protocol_revision: "2026-07-28",
+    sessionless: true,
+    fallback_used: false,
+    capabilities: ["tools"],
+    unsupported_capabilities: ["resources"]
+  };
+}
+
+function mcpDiscovery() {
+  return {
+    server_id: "modern",
+    connection: mcpConnection(),
+    request_bytes: 64,
+    response_bytes: 96,
+    duration_s: 0.01,
+    receipts: [{
+      phase: "server/discover",
+      request_bytes: 64,
+      response_bytes: 96,
+      duration_s: 0.01,
+      call_started: true
+    }]
   };
 }

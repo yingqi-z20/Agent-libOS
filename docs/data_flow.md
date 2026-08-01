@@ -174,7 +174,8 @@ and unregister from changing the registry.
 | Human GUI projection | `human:<recipient>:gui` | complete gate-independent serialized public view (including status and decision) plus GUI presentation operation; trust aliases the configured Human terminal identity |
 | JSON-RPC | `jsonrpc:<endpoint-id>:<method-id>` | endpoint plus method manifest hash |
 | MCP | `mcp:<server-id>:<tool-id>` | server, transport, and tool manifest hash; stdio also binds the resolved executable path/content |
-| MCP live discovery | `mcp:<server-id>:list_tools` | server and transport manifest hash; stdio also binds the resolved executable path/content |
+| MCP protocol discovery | `mcp:<server-id>:discover` | Manifest v2 server, configured protocol mode, and transport hash; stdio also binds the resolved executable path/content |
+| MCP live Tool catalog | `mcp:<server-id>:list_tools` | server and transport manifest hash; stdio also binds the resolved executable path/content |
 | File | `filesystem:workspace:<normalized-path>` | canonical workspace path |
 | Git local mutation/fetch | configured `git.repository_resource` (default `git:workspace`) | repository/worktree identity plus expected state token; fetch also binds the existing remote fingerprint |
 | Git push | `git_remote:workspace:<remote>` | fetch/push URL hashes, effective config/helper identities, selected refs, and expected old remote OID |
@@ -200,12 +201,15 @@ caller's context with the session high-water; reads observe that high-water plus
 every returned session. Control serialization prevents a read from returning
 output produced by a labeled write before that write publishes its high-water.
 
-MCP metadata-only cached discovery is public. A process-initiated live refresh
-is a bidirectional provider operation: its current flow context is checked as
-outbound request data, and returned metadata or an after-dispatch provider
-error raises the caller's context with `normal/untrusted` external ingress. A
-provider-certified not-started failure adds no ingress. A Host-internal refresh with
-no process actor uses the runtime's public/verified metadata request context.
+MCP metadata-only cached listing is public. Process-initiated modern discovery
+and live Tool refresh are bidirectional provider operations: the current flow
+context is checked as outbound request data, and returned metadata or an
+after-dispatch provider error raises the caller's context with
+`normal/untrusted` external ingress. A provider-certified not-started failure
+adds no ingress. Host-internal discovery/refresh with no process actor uses the
+runtime's public/verified metadata request context. Negotiated revision and
+server capability metadata are current-operation observations, not authority or
+durable Sink configuration.
 Deno/JIT code receives no direct external authority; its syscalls enter the
 same filesystem, shell, Human, JSON-RPC, MCP, and process boundaries.
 

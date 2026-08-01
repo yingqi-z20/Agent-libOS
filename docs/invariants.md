@@ -318,7 +318,7 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v4-persisted-state-is-strict-and-versioned`: a 1.1.0 store accepts only the
+- `v4-persisted-state-is-strict-and-versioned`: a 1.2.1 store accepts only the
   frozen version-4 physical schema (including Durable Task Run and typed process
   state) and canonical security carriers. Schema-v3, older, incomplete, or
   malformed state is rejected before mutation; no compatibility path is
@@ -1051,6 +1051,29 @@ longer defines.
   deduplicated main, server, process-spawn, and exact stdio authority and persist
   pending evidence before DNS/live-provider boundaries. Local/stdio first-call
   PENS may restore; non-local DNS observation cannot be erased.
+- `mcp-protocol-mode-is-explicit-and-registry-fenced`: Manifest v1 omits
+  protocol mode and retains its exact canonical registry/approval/Sink identity;
+  Manifest v2 requires one of the three release-locked modes. Replacement
+  advances the registry generation and every discovery/list/call phase rejects
+  a changed spec or generation before further dispatch.
+- `mcp-modern-negotiation-never-falls-back-on-ambiguous-failure`: automatic
+  modern negotiation may fall back only on the transport-specific recognized
+  legacy signal and only before Tool dispatch. Authentication/server errors,
+  malformed or oversized replies, modern protocol errors, DNS/TLS failures, and
+  ambiguous timeouts never become legacy evidence or a replay path.
+- `mcp-unsupported-modern-features-never-gain-runtime-authority`: discovered
+  server capabilities, annotations, cache hints, notifications, and unsupported
+  reverse requests are untrusted diagnostics. They cannot register Tools,
+  grant Capability, alter effect policy, invoke Runtime behavior, or persist a
+  negotiated session.
+- `mcp-input-required-is-never-automatically-replayed`: modern
+  `input_required` is a stable, non-retryable terminal result. Continuation
+  state is not persisted or returned; consequential/ambiguous mutation remains
+  unknown and a linked Durable Task Run requires Host attention.
+- `mcp-v1-identity-and-provider-contract-remain-stable`: adding Manifest v2 and
+  the optional modern provider SPI does not add a v1 discovery probe, change v1
+  canonical bytes/digests, or add required parameters to the existing
+  `McpProvider` signatures.
 - `registry-manifests-admit-only-finite-json`: MCP and JSON-RPC mapping and
   YAML registration recursively reject non-finite values in server/endpoint
   metadata, tool/method metadata, and input/parameter schemas before durable
@@ -1143,10 +1166,14 @@ longer defines.
 - PostgreSQL CI uses PostgreSQL 17 on Ubuntu. Other supported server versions
   and deployment TLS/authentication topologies are not release-gated here.
 - JSON-RPC, MCP, and Git remote tests use deterministic loopback or local
-  remotes. The complete MCP SDK integration file runs on Ubuntu from the frozen
-  optional extra; real proxy/TLS/DNS policy, HTTPS/OpenSSH authentication, and
-  remote MCP deployment identity remain environment-gated. GitHub and GitLab
-  API integrations, and MCP Resources/Prompts, are not implemented.
+  remotes. The complete MCP transport, adapter, and SDK integration files plus
+  fixed-upstream applicable Tools-client conformance scenarios without an
+  expected-failure baseline run on Ubuntu Python 3.11 and 3.14 from the frozen
+  optional extra; real proxy/TLS/DNS policy,
+  HTTPS/OpenSSH authentication, and remote MCP deployment identity remain
+  environment-gated. GitHub/GitLab API integrations and MCP MRTR/OAuth/listen,
+  Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OTel product
+  support, and server surfaces are not implemented.
 - Real LLM credentials and token-spending paths are opt-in. The default matrix
   covers mock/action-selection behavior, not a live request for every supported
   profile or provider deployment.

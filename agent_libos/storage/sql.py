@@ -99,11 +99,14 @@ from agent_libos.models import (
     JIT_TOOL_EXPOSURES,
     KilledProcessOutcome,
     LLMCallRecord,
+    McpProtocolMode,
     McpHeaderSpec,
     McpHttpTransportSpec,
     McpServerSpec,
     McpStdioTransportSpec,
     McpToolSpec,
+    canonical_mcp_server_spec_json,
+    mcp_server_spec_to_jsonable,
     MemoryView,
     ObjectFilter,
     ObjectHandle,
@@ -499,6 +502,25 @@ def _persisted_bool(value: Any, label: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{label} must be boolean")
     return value
+
+
+def _persisted_mcp_protocol_mode(
+    data: dict[str, Any],
+) -> tuple[int, McpProtocolMode | None]:
+    schema_version = data.get("schema_version", 1)
+    if type(schema_version) is not int:
+        raise ValueError("manifest schema_version must be the integer 1 or 2")
+    if schema_version == 1:
+        if "protocol_mode" in data:
+            raise ValueError("manifest v1 must omit protocol_mode")
+        return schema_version, None
+    if schema_version == 2:
+        if "protocol_mode" not in data or data["protocol_mode"] is None:
+            raise ValueError("manifest v2 requires an explicit protocol_mode")
+        if type(data["protocol_mode"]) is not str:
+            raise ValueError("manifest v2 protocol_mode must be a string")
+        return schema_version, McpProtocolMode(data["protocol_mode"])
+    raise ValueError("manifest schema_version must be 1 or 2")
 
 
 def _positive_capability_use_count(value: Any, *, label: str = "count") -> int:
@@ -1429,7 +1451,7 @@ class SQLRuntimeStore:
                 if version == 3:
                     raise UnsupportedStoreVersion(
                         "Agent libOS store schema v3 is not writable or readable by "
-                        "1.1.0; expected 4. Use Agent libOS 1.0.1 to view or "
+                        "1.2.1; expected 4. Use Agent libOS 1.0.1 to view or "
                         "archive this store. No migration was attempted."
                     )
                 raise UnsupportedStoreVersion(
@@ -1442,7 +1464,7 @@ class SQLRuntimeStore:
         if cls._probe_user_schema_objects(conn):
             raise UnsupportedStoreVersion(
                 "unversioned Agent libOS store detected; pre-v4 stores are "
-                "archive-only and cannot be opened by 1.1.0; use Agent libOS "
+                "archive-only and cannot be opened by 1.2.1; use Agent libOS "
                 "1.0.1 to view or archive a v3 store"
             )
         return True
@@ -17233,13 +17255,29 @@ class SQLRuntimeStore:
         same complete spec without weakening the registry generation fence.
         """
 
-        payload = loads(value) if isinstance(value, str) else loads(dumps(value))
+        if registry == "mcp" and isinstance(value, McpServerSpec):
+            if value.schema_version == 1 and value.protocol_mode is not None:
+                raise ValidationError(
+                    "MCP manifest v1 must omit protocol_mode"
+                )
+            if value.schema_version == 2 and not isinstance(
+                value.protocol_mode,
+                McpProtocolMode,
+            ):
+                raise ValidationError(
+                    "MCP manifest v2 requires an explicit protocol_mode"
+                )
+            payload = mcp_server_spec_to_jsonable(value)
+        else:
+            payload = loads(value) if isinstance(value, str) else loads(dumps(value))
         if not isinstance(payload, dict):
             raise ValidationError(f"{registry} registry spec must encode an object")
         if registry == "jsonrpc":
             return dumps(self._dict_to_jsonrpc_endpoint(payload))
         if registry == "mcp":
-            return dumps(self._dict_to_mcp_server(payload))
+            return canonical_mcp_server_spec_json(
+                self._dict_to_mcp_server(payload)
+            )
         raise ValidationError(f"unknown provider registry: {registry}")
 
     def upsert_image(
@@ -19013,10 +19051,11 @@ class SQLRuntimeStore:
         with _persisted_model_decode(
             f"MCP server {data.get('server_id', '<unknown>') if isinstance(data, dict) else '<unknown>'}"
         ):
+            schema_version, protocol_mode = _persisted_mcp_protocol_mode(data)
             stdio_data = data.get("stdio")
             http_data = data.get("http")
             return McpServerSpec(
-                schema_version=int(data.get("schema_version", 1)),
+                schema_version=schema_version,
                 server_id=data["server_id"],
                 transport=data["transport"],
                 stdio=(
@@ -19062,6 +19101,7 @@ class SQLRuntimeStore:
                 max_request_bytes=int(data["max_request_bytes"]),
                 max_response_bytes=int(data["max_response_bytes"]),
                 metadata=dict(data.get("metadata") or {}),
+                protocol_mode=protocol_mode,
             )
 
     def _dict_to_skill_package(self, data: dict[str, Any]) -> SkillPackage:

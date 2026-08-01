@@ -89,6 +89,7 @@ from agent_libos.substrate import (
     HttpJsonRpcProvider,
     LocalGitProvider,
     LocalResourceProviderSubstrate,
+    McpProvider,
     ResourceProviderSubstrate,
     SdkMcpProvider,
 )
@@ -2747,6 +2748,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             config=host.config,
             resources=host.resources,
         )
+        mcp_provider = RuntimeBuilder._runtime_mcp_provider(host)
         host.mcp = McpPrimitive(
             host.uow,
             host.capability,
@@ -2754,13 +2756,34 @@ class RuntimeBuilder(Generic[RuntimeT]):
             host.events,
             protected_operations=host.protected_operations,
             human=host.human,
-            provider=getattr(
-                host.substrate,
-                "mcp",
-                SdkMcpProvider(host.workspace_root),
-            ),
+            provider=mcp_provider,
             config=host.config,
             resources=host.resources,
+        )
+
+    @staticmethod
+    def _runtime_mcp_provider(host: Runtime) -> McpProvider:
+        """Select an MCP provider without mutating a caller-owned substrate.
+
+        The local substrate constructs its built-in SDK provider before the
+        Runtime configuration is known.  Reconstruct that exact built-in type
+        for the assembled Runtime so SDK negotiation and pagination use the
+        authoritative ``host.config.mcp`` policy.  A custom provider (including
+        an ``SdkMcpProvider`` subclass) is a caller-owned SPI implementation and
+        must retain both its identity and its own configuration contract.
+        """
+
+        provider = getattr(host.substrate, "mcp", None)
+        if type(provider) is SdkMcpProvider:
+            return SdkMcpProvider(
+                host.workspace_root,
+                mcp_config=host.config.mcp,
+            )
+        if provider is not None:
+            return provider
+        return SdkMcpProvider(
+            host.workspace_root,
+            mcp_config=host.config.mcp,
         )
 
     @staticmethod

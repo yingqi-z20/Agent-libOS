@@ -2872,55 +2872,89 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown JSON-RPC endpoint")
 
     def _dispatch_mcp(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
-        service = self.server.service
-        if method == "GET" and not route:
-            return service.runtime.mcp.list_servers(text=_query_str(query, "text"), require_capability=False)
-        if method == "GET" and len(route) == 1:
-            return service.runtime.mcp.inspect_server(route[0], require_capability=False)
-        if method == "GET" and len(route) == 2 and route[1] == "tools":
-            refresh_value = (_query_str(query, "refresh") or "").lower()
-            return service.runtime.mcp.list_tools(
-                route[0],
-                actor="gui",
-                require_capability=False,
-                refresh=refresh_value in {"1", "true", "yes", "on"},
-            )
+        if method == "GET":
+            return self._dispatch_mcp_get(route, query)
+        if method == "POST" and len(route) == 2 and route[1] == "discover":
+            return self._dispatch_mcp_discover(route[0])
         if method == "POST" and route == ["register"]:
             body = self._read_body()
-            self._require_confirmed("mcp.register", body, {"source": body.get("source")})
-            if "path" in body:
-                raise GuiServerError(
-                    HTTPStatus.BAD_REQUEST,
-                    "GUI MCP registration accepts manifest_text, not host file paths",
-                )
-            text = body.get("manifest_text")
-            if not isinstance(text, str) or not text.strip():
-                raise GuiServerError(HTTPStatus.BAD_REQUEST, "MCP registration requires non-empty manifest_text")
-            result = service.runtime.mcp.register_server_from_yaml_text(
-                text,
-                actor=str(body.get("actor") or "gui"),
-                replace=_json_bool(body, "replace", False),
-                require_capability=body.get("actor") is not None,
-                source=body.get("source"),
+            self._require_confirmed(
+                "mcp.register",
+                body,
+                {"source": body.get("source")},
             )
-            service.publish_runtime_changes("mcp.register")
-            return result
+            return self._dispatch_mcp_register(body)
         if method == "POST" and len(route) == 2 and route[1] == "call":
             body = self._read_body()
             self._require_confirmed(
                 "mcp.call",
                 body,
-                {"pid": body.get("pid"), "server_id": route[0], "tool_id": body.get("tool_id")},
+                {
+                    "pid": body.get("pid"),
+                    "server_id": route[0],
+                    "tool_id": body.get("tool_id"),
+                },
             )
-            result = service.runtime.mcp.call_tool(
-                _required_body_string(body, "pid"),
-                route[0],
-                _required_body_string(body, "tool_id"),
-                arguments=body["arguments"] if "arguments" in body and body["arguments"] is not None else {},
-            )
-            service.publish_runtime_changes("mcp.call")
-            return to_jsonable(result)
+            return self._dispatch_mcp_call(route[0], body)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown MCP endpoint")
+
+    def _dispatch_mcp_get(self, route: list[str], query: dict[str, list[str]]) -> Any:
+        mcp = self.server.service.runtime.mcp
+        if not route:
+            return mcp.list_servers(text=_query_str(query, "text"), require_capability=False)
+        if len(route) == 1:
+            return mcp.inspect_server(route[0], require_capability=False)
+        if len(route) == 2 and route[1] == "tools":
+            refresh_value = (_query_str(query, "refresh") or "").lower()
+            return mcp.list_tools(
+                route[0],
+                actor="gui",
+                require_capability=False,
+                refresh=refresh_value in {"1", "true", "yes", "on"},
+            )
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown MCP endpoint")
+
+    def _dispatch_mcp_discover(self, server_id: str) -> Any:
+        body = self._read_body()
+        service = self.server.service
+        result = service.runtime.mcp.discover(
+            server_id,
+            actor=str(body.get("actor") or "gui"),
+            require_capability=body.get("actor") is not None,
+        )
+        service.publish_runtime_changes("mcp.discover")
+        return to_jsonable(result)
+
+    def _dispatch_mcp_register(self, body: dict[str, Any]) -> Any:
+        if "path" in body:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "GUI MCP registration accepts manifest_text, not host file paths",
+            )
+        text = body.get("manifest_text")
+        if not isinstance(text, str) or not text.strip():
+            raise GuiServerError(HTTPStatus.BAD_REQUEST, "MCP registration requires non-empty manifest_text")
+        service = self.server.service
+        result = service.runtime.mcp.register_server_from_yaml_text(
+            text,
+            actor=str(body.get("actor") or "gui"),
+            replace=_json_bool(body, "replace", False),
+            require_capability=body.get("actor") is not None,
+            source=body.get("source"),
+        )
+        service.publish_runtime_changes("mcp.register")
+        return result
+
+    def _dispatch_mcp_call(self, server_id: str, body: dict[str, Any]) -> Any:
+        service = self.server.service
+        result = service.runtime.mcp.call_tool(
+            _required_body_string(body, "pid"),
+            server_id,
+            _required_body_string(body, "tool_id"),
+            arguments=body["arguments"] if "arguments" in body and body["arguments"] is not None else {},
+        )
+        service.publish_runtime_changes("mcp.call")
+        return to_jsonable(result)
 
     def _dispatch_modules(self, method: str, route: list[str]) -> Any:
         service = self.server.service
@@ -4304,6 +4338,8 @@ def _gui_route_accepts_actor(method: str, route: list[str]) -> bool:
         ("jsonrpc", "register"),
         ("mcp", "register"),
     }:
+        return True
+    if len(route) == 3 and route[0] == "mcp" and route[2] == "discover":
         return True
     if len(route) == 3 and route[0] == "checkpoints" and route[2] in {"restore", "fork"}:
         return True

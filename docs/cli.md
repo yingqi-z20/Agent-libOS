@@ -246,7 +246,7 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
-Agent libOS 1.1.0 opens only store schema v4. A schema-v3 database from 1.0.1
+Agent libOS 1.2.1 opens only store schema v4. A schema-v3 database from 1.0.1
 is rejected before `init`, recovery, audit, or any other write; use 1.0.1 to
 inspect/archive it. There is no v3 migration or read-only compatibility mode.
 
@@ -1115,6 +1115,8 @@ uv sync --frozen --all-groups --extra mcp
 uv run agent-libos --db .agent_libos.sqlite mcp register <path-to-server-manifest.yaml>
 uv run agent-libos --db .agent_libos.sqlite mcp list
 uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
+# Manifest v2 with protocol_mode auto or 2026-07-28 only:
+uv run agent-libos --db .agent_libos.sqlite mcp discover demo-mcp
 uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> <stdio_authority_resource-from-inspect> --rights execute
@@ -1136,6 +1138,7 @@ separate admin-operation audit.
 | `register` | filesystem `read` for the manifest plus exact server `write`; `--replace` requires server `admin`; stdio also requires `process:spawn write` and exact command `execute` |
 | `list` | registry `read` |
 | `inspect` | exact server `read`; sensitive manifest fields remain hidden |
+| `discover` | exact server `read+execute`; stdio additionally requires the local-spawn rights; Manifest v2 `auto`/`2026-07-28` only |
 | `tools` | exact server `read`; `--refresh` also requires server `execute` and the stdio local-spawn rights when applicable |
 | `unregister` | exact server `admin` |
 | `call <pid> ...` | the target `<pid>` supplies the declared tool right and any stdio local-spawn rights; an explicitly supplied `--actor-pid` must equal `<pid>` and does not add authority |
@@ -1153,6 +1156,12 @@ the pid additionally needs `process:spawn write` and `execute` on the exact
 wildcard that digest. Streamable HTTP servers do not need those two local-spawn
 grants. The CLI cannot supply arbitrary transports, commands, URLs, headers, or
 raw MCP tool names.
+
+`mcp list` and `mcp inspect` show the Manifest version and configured protocol
+mode. `mcp discover`, live `mcp tools --refresh`, and `mcp call` project the
+bounded negotiated protocol revision/era and server capability diagnostics for
+that operation. Agent libOS does not cache those connection diagnostics across
+CLI invocations.
 
 ## Runtime Module Commands
 

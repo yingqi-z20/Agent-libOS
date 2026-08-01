@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-libos"
-version = "1.1.0"
+version = "1.2.1"
 description = "A minimal Agent libOS runtime with process, object memory, capability, human approval, JIT tool, checkpoint, and audit primitives."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -39,7 +39,10 @@ postgres = [
     "psycopg[binary]>=3.2,<4",
 ]
 mcp = [
-    "mcp>=1.27,<2",
+    "mcp>=2.0,<3",
+    "httpx2>=2.5,<3",
+    "httpcore2>=2.5,<3",
+    "opentelemetry-api>=1.28,<2",
 ]
 pty = [
     "pywinpty>=2.0.13,<3; sys_platform == 'win32'",

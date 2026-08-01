@@ -556,6 +556,14 @@ requires `mcp:<server>:<tool>` authority at primitive use. The call path also
 checks that derived tool resource before loading server metadata or input
 schemas, so missing authority cannot be used to enumerate provider manifests.
 
+Manifest v1 remains on the initialize-based legacy MCP path. Manifest v2
+explicitly selects `legacy`, `auto`, or `2026-07-28` and requires the optional
+modern provider extension. Protocol discovery is itself a protected external
+read; its server identity, negotiated revision, and advertised capabilities are
+bounded observations rather than Tool registration or authority. Negotiation,
+bounded Tool-catalog pagination, live validation, and call share one deadline,
+cumulative byte budget, registry fence, and external-effect operation.
+
 ## Primitive Boundary
 
 Primitives are the runtime boundary. They are responsible for:

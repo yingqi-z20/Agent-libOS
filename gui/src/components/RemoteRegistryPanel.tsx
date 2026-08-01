@@ -1,7 +1,7 @@
-import { Eye, ListTree, Plug, RadioTower, Send } from "lucide-react";
+import { Compass, Eye, ListTree, Plug, RadioTower, Send } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { LibOSClient } from "../api/client";
-import type { JsonRpcEndpointSummary, McpServerSummary, RuntimeProcess } from "../api/types";
+import type { JsonRpcEndpointSummary, McpConnectionInfo, McpProtocolEra, McpProtocolMode, McpServerSummary, RuntimeProcess } from "../api/types";
 import type { ConfirmationRequest } from "../adminTypes";
 import { useI18n } from "../i18n";
 import { RequestEpoch } from "../requestEpoch";
@@ -32,6 +32,7 @@ export function RemoteRegistryPanel({
   const [argumentsText, setArgumentsText] = useState("{}");
   const [refreshTools, setRefreshTools] = useState(false);
   const [result, setResult] = useState<unknown>(null);
+  const [mcpConnection, setMcpConnection] = useState<McpConnectionInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const inspectionRequests = useRef(new RequestEpoch());
@@ -44,6 +45,12 @@ export function RemoteRegistryPanel({
   const ids = useMemo(() => entries.map((entry) => entryId(kind, entry)).filter(isString), [entries, kind]);
   const selectedEntry = entries.find((entry) => entryId(kind, entry) === selectedId);
   const operationIds = useMemo(() => remoteOperationIds(kind, selectedEntry), [kind, selectedEntry]);
+  const selectedEntryVersion = registryEntryVersion(kind, selectedEntry);
+  const selectedMcpEntry = kind === "mcp" ? selectedEntry as McpServerSummary | undefined : undefined;
+  const canDiscover = selectedMcpEntry?.schema_version === 2
+    && (selectedMcpEntry.protocol_mode === "auto" || selectedMcpEntry.protocol_mode === "2026-07-28");
+  const panelTitleId = `remote-${kind}-panel-title`;
+  const discoverHintId = `remote-${kind}-discover-hint`;
 
   useEffect(() => {
     if (!ids.includes(selectedId)) setSelectedId(ids[0] ?? "");
@@ -56,8 +63,11 @@ export function RemoteRegistryPanel({
   useEffect(() => {
     inspectionRequests.current.invalidate();
     setLoading(false);
+    setResult(null);
+    setMcpConnection(null);
+    setLocalError(null);
     return () => inspectionRequests.current.invalidate();
-  }, [client, kind, selectedId]);
+  }, [client, kind, selectedEntryVersion, selectedId]);
 
   async function inspect() {
     if (!selectedId) return;
@@ -71,7 +81,10 @@ export function RemoteRegistryPanel({
       const response = kind === "jsonrpc"
         ? await client.inspectJsonRpcEndpoint(selectedId)
         : await client.inspectMcpServer(selectedId);
-      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === inspectedKind) setResult(response);
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === inspectedKind) {
+        setResult(response);
+        updateMcpConnection(response, setMcpConnection);
+      }
     } catch (error) {
       if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === inspectedKind) setLocalError(describe(error));
     } finally {
@@ -86,11 +99,45 @@ export function RemoteRegistryPanel({
     const request = inspectionRequests.current.begin();
     setLoading(true);
     setLocalError(null);
+    if (refreshTools) {
+      setResult(null);
+      setMcpConnection(null);
+    }
     try {
       const response = await client.listMcpTools(selectedId, refreshTools);
-      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") setResult(response);
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") {
+        setResult(response);
+        updateMcpConnection(response, setMcpConnection);
+      }
     } catch (error) {
       if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") setLocalError(describe(error));
+    } finally {
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") setLoading(false);
+    }
+  }
+
+  async function discover() {
+    if (kind !== "mcp" || !selectedId || !canDiscover) return;
+    const inspectedId = selectedId;
+    const inspectedClient = client;
+    const request = inspectionRequests.current.begin();
+    setLoading(true);
+    setLocalError(null);
+    setResult(null);
+    setMcpConnection(null);
+    try {
+      const response = await client.discoverMcpServer(selectedId);
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") {
+        const connection = connectionFromResult(response);
+        if (!connection) throw new Error(t("remote.discoveryInvalid"));
+        setMcpConnection(connection);
+        setResult(response);
+      }
+    } catch (error) {
+      if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") {
+        setMcpConnection(null);
+        setLocalError(describe(error));
+      }
     } finally {
       if (inspectionRequests.current.isCurrent(request) && selectedIdRef.current === inspectedId && clientRef.current === inspectedClient && kindRef.current === "mcp") setLoading(false);
     }
@@ -139,20 +186,26 @@ export function RemoteRegistryPanel({
         arguments: args
       },
       action: async () => {
+        const calledId = selectedId;
+        const calledClient = client;
+        const calledKind = kind;
         const response = kind === "jsonrpc"
           ? await client.callJsonRpc(selectedId, pid, selectedOperation, args, true)
           : await client.callMcpTool(selectedId, pid, selectedOperation, args as Record<string, unknown>, true);
-        setResult(response);
+        if (selectedIdRef.current === calledId && clientRef.current === calledClient && kindRef.current === calledKind) {
+          setResult(response);
+          updateMcpConnection(response, setMcpConnection);
+        }
       }
     });
   }
 
   const label = kind === "jsonrpc" ? "JSON-RPC" : "MCP";
   return (
-    <section className="adminPanel remotePanel" aria-busy={loading || undefined}>
+    <section className="adminPanel remotePanel" aria-busy={loading || undefined} aria-labelledby={panelTitleId}>
       <header className="adminPanelHeader">
         <div>
-          <h3>{kind === "jsonrpc" ? <RadioTower size={16} /> : <Plug size={16} />}{label}</h3>
+          <h3 id={panelTitleId}>{kind === "jsonrpc" ? <RadioTower size={16} /> : <Plug size={16} />}{label}</h3>
           <p>{t("remote.description", { kind: label })}</p>
         </div>
       </header>
@@ -168,11 +221,25 @@ export function RemoteRegistryPanel({
         <button disabled={!selectedId || loading} onClick={() => void inspect()}><Eye size={14} />{t("remote.inspect")}</button>
         {kind === "mcp" ? (
           <>
+            <button
+              disabled={!selectedId || loading || !canDiscover}
+              aria-describedby={discoverHintId}
+              onClick={() => void discover()}
+            >
+              <Compass size={14} />{t("remote.discover")}
+            </button>
             <button disabled={!selectedId || loading} onClick={() => void listTools()}><ListTree size={14} />{t("remote.listTools")}</button>
             <label className="toggle"><input type="checkbox" checked={refreshTools} onChange={(event) => setRefreshTools(event.currentTarget.checked)} />{t("remote.refreshTools")}</label>
           </>
         ) : null}
       </div>
+      {kind === "mcp" ? (
+        <p id={discoverHintId} className="remoteDiscoverHint">
+          {canDiscover ? t("remote.discoverHint") : t("remote.discoverUnavailable")}
+        </p>
+      ) : null}
+
+      {kind === "mcp" ? <McpProtocolSummary server={selectedMcpEntry} connection={mcpConnection} /> : null}
 
       <details className="adminDisclosure">
         <summary>{t("remote.register", { kind: label })}</summary>
@@ -215,6 +282,65 @@ export function RemoteRegistryPanel({
   );
 }
 
+function McpProtocolSummary({
+  server,
+  connection
+}: {
+  server: McpServerSummary | undefined;
+  connection: McpConnectionInfo | null;
+}) {
+  const { t } = useI18n();
+  const serverIdentity = connection
+    ? [connection.server_name, connection.server_version].filter(isPresentString).join(" ")
+    : "";
+  return (
+    <section className="mcpProtocolSummary" aria-label={t("remote.protocolSummary")} aria-live="polite">
+      <dl className="mcpProtocolFacts">
+        <ProtocolFact label={t("remote.manifestVersion")} value={server ? `v${server.schema_version}` : t("remote.none")} />
+        <ProtocolFact label={t("remote.protocolMode")} value={server ? protocolModeLabel(server.protocol_mode, t) : t("remote.none")} />
+        {connection ? (
+          <>
+            <ProtocolFact label={t("remote.protocolEra")} value={protocolEraLabel(connection.protocol_era, t)} />
+            <ProtocolFact label={t("remote.protocolRevision")} value={connection.protocol_revision} code />
+            <ProtocolFact label={t("remote.sessionMode")} value={connection.sessionless ? t("remote.sessionless") : t("remote.sessionful")} />
+            <ProtocolFact label={t("remote.fallback")} value={connection.fallback_used ? t("remote.fallbackUsed") : t("remote.fallbackUnused")} />
+            <ProtocolFact label={t("remote.serverIdentity")} value={serverIdentity || t("remote.notReported")} />
+          </>
+        ) : null}
+      </dl>
+      {!connection ? <p className="mcpNegotiationState" role="status">{t("remote.notNegotiated")}</p> : (
+        <div className="mcpCapabilityGroups">
+          <CapabilityList label={t("remote.capabilities")} values={connection.capabilities} empty={t("remote.noneReported")} />
+          <CapabilityList label={t("remote.unsupportedCapabilities")} values={connection.unsupported_capabilities} empty={t("remote.none")} warning />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ProtocolFact({ label, value, code = false }: { label: string; value: string; code?: boolean }) {
+  return <div><dt>{label}</dt><dd>{code ? <code>{value}</code> : value}</dd></div>;
+}
+
+function CapabilityList({
+  label,
+  values,
+  empty,
+  warning = false
+}: {
+  label: string;
+  values: string[];
+  empty: string;
+  warning?: boolean;
+}) {
+  return (
+    <div className={`mcpCapabilityGroup${warning && values.length ? " warning" : ""}`}>
+      <strong>{label}</strong>
+      {values.length ? <ul>{values.map((value) => <li key={value}><code>{value}</code></li>)}</ul> : <span>{empty}</span>}
+    </div>
+  );
+}
+
 export function parseJsonInput(value: string, requireObject: boolean): unknown {
   const selected = value.trim();
   const parsed = selected ? JSON.parse(selected) : {};
@@ -246,6 +372,80 @@ function entryId(kind: RemoteKind, entry: RemoteSummary | undefined): string | n
     ? (entry as JsonRpcEndpointSummary).endpoint_id
     : (entry as McpServerSummary).server_id;
   return typeof id === "string" && id ? id : null;
+}
+
+function registryEntryVersion(kind: RemoteKind, entry: RemoteSummary | undefined): string {
+  if (!entry) return `${kind}:missing`;
+  const value = entry as Record<string, unknown>;
+  return JSON.stringify([
+    kind,
+    entryId(kind, entry),
+    value.schema_version ?? null,
+    value.protocol_mode ?? null,
+    value.transport ?? null,
+    value.tools ?? value.methods ?? null,
+    value.timeout_s ?? null,
+    value.max_request_bytes ?? null,
+    value.max_response_bytes ?? null,
+    value.updated_at ?? null
+  ]);
+}
+
+export function connectionFromResult(value: unknown): McpConnectionInfo | null {
+  if (!isRecord(value) || !isRecord(value.connection)) return null;
+  const connection = value.connection;
+  if (!isProtocolMode(connection.protocol_mode)
+    || !isProtocolEra(connection.protocol_era)
+    || typeof connection.protocol_revision !== "string"
+    || !connection.protocol_revision
+    || typeof connection.sessionless !== "boolean"
+    || typeof connection.fallback_used !== "boolean"
+    || !isOptionalString(connection.server_name)
+    || !isOptionalString(connection.server_version)
+    || !isStringArray(connection.capabilities)
+    || !isStringArray(connection.unsupported_capabilities)) {
+    return null;
+  }
+  return connection as unknown as McpConnectionInfo;
+}
+
+function updateMcpConnection(value: unknown, update: (connection: McpConnectionInfo) => void): void {
+  const connection = connectionFromResult(value);
+  if (connection) update(connection);
+}
+
+function protocolModeLabel(mode: McpProtocolMode, t: ReturnType<typeof useI18n>["t"]): string {
+  if (mode === "auto") return t("remote.protocolModeAuto");
+  if (mode === "legacy") return t("remote.protocolModeLegacy");
+  return mode;
+}
+
+function protocolEraLabel(era: McpProtocolEra, t: ReturnType<typeof useI18n>["t"]): string {
+  return era === "modern" ? t("remote.protocolEraModern") : t("remote.protocolEraLegacy");
+}
+
+function isProtocolMode(value: unknown): value is McpProtocolMode {
+  return value === "legacy" || value === "auto" || value === "2026-07-28";
+}
+
+function isProtocolEra(value: unknown): value is McpProtocolEra {
+  return value === "legacy" || value === "modern";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isOptionalString(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || typeof value === "string";
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isPresentString(value: string | null | undefined): value is string {
+  return typeof value === "string" && value.length > 0;
 }
 
 function isString(value: string | null): value is string {

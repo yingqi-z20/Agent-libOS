@@ -176,6 +176,24 @@ information-flow phase, so an observation or ambiguous failure is recorded and
 does not regain finite authority merely because no application request was
 sent.
 
+Manifest v2 adds a bounded modern MCP discovery/negotiation phase. Its
+configured protocol mode is part of immutable registry/Sink identity; the
+negotiated revision and advertised server capabilities are untrusted
+operation-local observations and cannot grant authority. Automatic fallback is
+limited to protocol-recognized legacy signals, never authentication errors,
+server failures, malformed/oversized replies, or ambiguous transport failure.
+The client does not advertise Sampling, Roots, Elicitation, subscriptions,
+Tasks, or extensions, and rejects reverse requests without invoking Runtime
+behavior. An MRTR input request is non-retryable and preserves unknown mutation
+evidence rather than creating a model-controlled replay path.
+
+MCP protocol/session/content-negotiation, trace, baggage, and reserved `_meta`
+fields are Host-generated. Manifest header matching is case-insensitive and
+cannot override them. Ambient OpenTelemetry context is cleared at this adapter
+boundary; the release installs no exporter and does not claim OTel propagation
+support. Static environment-backed Authorization values remain a Host transport
+choice, not an OAuth implementation or a source of Runtime capability.
+
 These controls reduce SSRF and DNS-rebinding risk; they are not a private
 network firewall or a substitute for TLS and resolver integrity. TLS relies on
 the Host certificate store and server-name validation. MCP HTTP disables

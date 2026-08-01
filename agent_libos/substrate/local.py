@@ -10,6 +10,7 @@ import errno
 import hashlib
 import http.client
 import ipaddress
+import json
 import math
 import os
 import re
@@ -45,13 +46,20 @@ from agent_libos.models import (
     JsonRpcEndpointSpec,
     JsonRpcMethodSpec,
     JsonRpcTransportResult,
+    McpConnectionInfo,
+    McpExchangePhase,
+    McpExchangeReceipt,
+    McpProtocolEra,
+    McpProtocolMode,
     McpProviderCallResult,
+    McpProviderDiscoveryResult,
     McpProviderTool,
     McpServerSpec,
     McpToolListResult,
     McpToolSpec,
 )
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.models.mcp import mcp_runtime_secret_values
 from agent_libos.primitives.git_command_policy import trusted_git_read_operation
 from agent_libos.models.external_effect import default_external_effect_rollback_status
 from agent_libos.ports.blocking_work import run_blocking_once
@@ -75,12 +83,22 @@ from agent_libos.substrate.base import (
 from agent_libos.substrate.git import LocalGitProvider
 from agent_libos.utils.ids import new_id
 from agent_libos.utils.serde import dumps, to_jsonable
+from agent_libos.utils.redaction import redact_sensitive_text
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _SHELL_DEFAULTS = DEFAULT_CONFIG.shell
 _MCP_LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _MCP_FORBIDDEN_HOSTS = {"metadata.google.internal"}
+_MCP_MODERN_PROTOCOL_REVISION = "2026-07-28"
+_MCP_SUPPORTED_MODERN_PROTOCOL_REVISIONS = (_MCP_MODERN_PROTOCOL_REVISION,)
+_MCP_LEGACY_PROTOCOL_REVISION = "2025-11-25"
+_MCP_SUPPORTED_LEGACY_PROTOCOL_REVISIONS = (
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    _MCP_LEGACY_PROTOCOL_REVISION,
+)
 _MCP_STDIO_READ_CHUNK_BYTES = 64 * 1024
 _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER = 4
 _MCP_WINDOWS = os.name == "nt"
@@ -123,6 +141,10 @@ class _McpStdioDispatchNotStarted(ValidationError, ProviderEffectNotStarted):
 
 class _McpStdioDispatchStarted(ValidationError):
     """A stdio child was created but failed post-spawn isolation checks."""
+
+
+class _McpAbsoluteDeadlineExceeded(TimeoutError):
+    """The adapter's own absolute deadline elapsed, not a provider timeout."""
 
 
 class _ProtectedDeleteState:
@@ -2937,15 +2959,1169 @@ class HttpJsonRpcProvider:
         return headers
 
 
+class _McpToolCatalogValidationError(RuntimeError):
+    """A received tools/list catalog cannot safely authorize tools/call."""
+
+
+class _McpIncompleteToolCatalog(_McpToolCatalogValidationError):
+    """Manifest v1 received a partial catalog that cannot be trusted."""
+
+
+class _McpEnteredTransport:
+    """Adapt a stream pair already owned by an outer strict transport scope."""
+
+    def __init__(self, streams: Any) -> None:
+        self.streams = streams
+
+    async def __aenter__(self) -> Any:
+        return self.streams
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        return None
+
+
+class _McpToolsOnlyReadStream:
+    """Drop server notifications after wire accounting, before SDK dispatch."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+
+    async def __aenter__(self) -> "_McpToolsOnlyReadStream":
+        await self.stream.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> Any:
+        return await self.stream.__aexit__(*exc)
+
+    def __aiter__(self) -> "_McpToolsOnlyReadStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return await self.receive()
+        except Exception as exc:
+            if type(exc).__name__ == "EndOfStream":
+                raise StopAsyncIteration from None
+            raise
+
+    async def receive(self) -> Any:
+        while True:
+            item = await self.stream.receive()
+            message = getattr(item, "message", None)
+            if type(message).__name__ == "JSONRPCNotification":
+                continue
+            return item
+
+    @property
+    def last_context(self) -> Any:
+        return getattr(self.stream, "last_context", None)
+
+    async def aclose(self) -> None:
+        await self.stream.aclose()
+
+
+@contextlib.asynccontextmanager
+async def _mcp_tools_only_streamable_http_client(
+    url: str,
+    *,
+    http_client: Any,
+    terminate_on_close: bool = True,
+    legacy_listen: bool = False,
+):
+    """Bounded SDK v2 HTTP transport with era-specific listen behavior.
+
+    Manifest v1 preserves the released SDK-v1 background GET after the
+    initialized notification.  Manifest v2 is Tools-only and suppresses that
+    deprecated listen/subscription surface and its SSE resumption GET.  The
+    Manifest-v1 SDK reconnect loop remains governed by this operation's strict
+    HTTP client and task scope.
+    """
+
+    try:
+        import anyio
+        from mcp.client.streamable_http import StreamableHTTPTransport
+        from mcp.shared._compat import resync_tracer
+        from mcp.shared._context_streams import create_context_streams
+    except (ModuleNotFoundError, ImportError) as exc:  # pragma: no cover
+        raise ValidationError("MCP Python SDK v2 HTTP transport is unavailable") from exc
+
+    transport = StreamableHTTPTransport(url)
+    if not legacy_listen:
+        async def reject_sse_resumption(
+            context: Any,
+            _last_event_id: str,
+            _retry_interval_ms: int | None = None,
+            _attempt: int = 0,
+        ) -> None:
+            message = getattr(context.session_message, "message", None)
+            request_id = getattr(message, "id", None)
+            await transport._resolve_abandoned_request(  # noqa: SLF001
+                context.read_stream_writer,
+                request_id,
+                "MCP SSE resumption is unsupported by the Tools-only client",
+            )
+
+        # SDK v2 otherwise turns an event-id-bearing POST disconnect into an
+        # implicit GET+Last-Event-ID replay.  Manifest v2 forbids that hidden
+        # resume/retry path; Manifest v1 keeps its released behavior.
+        transport._handle_reconnection = reject_sse_resumption  # type: ignore[method-assign]  # noqa: SLF001
+    read_stream_writer, read_stream = create_context_streams(0)
+    write_stream, write_stream_reader = create_context_streams(0)
+    async with (
+        read_stream_writer,
+        read_stream,
+        write_stream,
+        write_stream_reader,
+        anyio.create_task_group() as task_group,
+    ):
+
+        def start_listen_stream() -> None:
+            if legacy_listen:
+                task_group.start_soon(
+                    transport.handle_get_stream,
+                    http_client,
+                    read_stream_writer,
+                )
+
+        task_group.start_soon(
+            transport.post_writer,
+            http_client,
+            write_stream_reader,
+            read_stream_writer,
+            write_stream,
+            start_listen_stream,
+            task_group,
+        )
+        try:
+            yield read_stream, write_stream
+        finally:
+            if transport.session_id and terminate_on_close:
+                await transport.terminate_session(http_client)
+            task_group.cancel_scope.cancel()
+    await resync_tracer()
+
+
+@dataclass
+class _McpWireExchange:
+    """One operation-local protocol exchange measured at the strict wire edge."""
+
+    phase: McpExchangePhase | None
+    method: str | None
+    request_id: object | None = None
+    request_bytes: int = 0
+    response_bytes: int = 0
+    started_at: float | None = None
+    completed_at: float | None = None
+    call_started: bool = False
+    request_body: bytearray | None = None
+    response_body: bytearray | None = None
+    response_declared_bytes: int | None = None
+    merged: bool = False
+
+
+def _mcp_wire_phase(method: str | None) -> McpExchangePhase | None:
+    return {
+        "server/discover": McpExchangePhase.SERVER_DISCOVER,
+        "initialize": McpExchangePhase.INITIALIZE,
+        "notifications/initialized": McpExchangePhase.INITIALIZE,
+        "tools/list": McpExchangePhase.TOOLS_LIST,
+        "tools/call": McpExchangePhase.TOOLS_CALL,
+    }.get(method)
+
+
+def _mcp_wire_request_id_key(value: object) -> tuple[str, object]:
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("number", value)
+    if isinstance(value, str):
+        return ("string", value)
+    return (type(value).__name__, repr(value))
+
+
+class _McpWireLedger:
+    """Bounded operation-local accounting of raw protocol body/frame bytes.
+
+    The strict transports enforce the aggregate limits.  This ledger only
+    attributes bytes already accepted at those transport edges to an MCP
+    phase; it never serializes a second, projected representation.
+    """
+
+    def __init__(self) -> None:
+        self._exchanges: list[_McpWireExchange] = []
+        self._pending_stdio: dict[tuple[str, object], _McpWireExchange] = {}
+
+    def begin_http(self, method: str | None) -> _McpWireExchange:
+        exchange = _McpWireExchange(
+            phase=_mcp_wire_phase(method),
+            method=method,
+            request_body=bytearray(),
+        )
+        self._exchanges.append(exchange)
+        return exchange
+
+    def record_http_request(self, exchange: _McpWireExchange, chunk: bytes) -> None:
+        if not exchange.call_started:
+            exchange.call_started = True
+            exchange.started_at = time.monotonic()
+        exchange.request_bytes += len(chunk)
+        if exchange.request_body is not None:
+            exchange.request_body.extend(chunk)
+
+    def finish_http_request(self, exchange: _McpWireExchange) -> None:
+        self._bind_request_body(exchange)
+
+    def record_http_response(self, exchange: _McpWireExchange, size: int) -> None:
+        exchange.response_bytes += size
+
+    def record_http_response_body(
+        self,
+        exchange: _McpWireExchange,
+        chunk: bytes,
+    ) -> None:
+        self.record_http_response(exchange, len(chunk))
+        if exchange.response_body is not None:
+            exchange.response_body.extend(chunk)
+
+    def finish_http_response(self, exchange: _McpWireExchange) -> None:
+        self._bind_request_body(exchange)
+        if exchange.completed_at is None:
+            exchange.completed_at = time.monotonic()
+
+    def record_stdio_request(self, encoded: bytes) -> None:
+        payload = self._parse_payload(encoded)
+        method = payload.get("method") if isinstance(payload, dict) else None
+        if not isinstance(method, str):
+            target = self._latest_active_exchange()
+            if target is not None:
+                target.request_bytes += len(encoded)
+            return
+        phase = _mcp_wire_phase(method)
+        if method == "notifications/initialized":
+            target = self._latest_phase(McpExchangePhase.INITIALIZE)
+            if target is not None:
+                target.request_bytes += len(encoded)
+            return
+        if phase is None:
+            target = self._latest_active_exchange()
+            if target is not None:
+                target.request_bytes += len(encoded)
+            return
+        exchange = _McpWireExchange(
+            phase=phase,
+            method=method,
+            request_id=payload.get("id"),
+            request_bytes=len(encoded),
+            started_at=time.monotonic(),
+            call_started=True,
+        )
+        self._exchanges.append(exchange)
+        if "id" in payload:
+            self._pending_stdio[_mcp_wire_request_id_key(payload["id"])] = exchange
+
+    def record_stdio_response(self, encoded: bytes, message: Any) -> None:
+        if isinstance(getattr(message, "method", None), str):
+            target = self._latest_active_exchange()
+            if target is not None:
+                target.response_bytes += len(encoded)
+            return
+        response_id = getattr(message, "id", None)
+        if response_id is None:
+            payload = self._parse_payload(encoded)
+            response_id = payload.get("id") if isinstance(payload, dict) else None
+        if response_id is None:
+            return
+        exchange = self._pending_stdio.pop(
+            _mcp_wire_request_id_key(response_id),
+            None,
+        )
+        if exchange is None:
+            # An unmatched response is still accepted protocol input and must
+            # count against the active exchange's bounded response budget.  It
+            # must not complete that exchange: JSON-RPC string and number ids
+            # are distinct identities (for example, "1" is not 1).
+            target = self._latest_active_exchange()
+            if target is not None:
+                target.response_bytes += len(encoded)
+            return
+        exchange.response_bytes += len(encoded)
+        exchange.completed_at = time.monotonic()
+
+    def record_stdio_partial_response(self, encoded: bytes) -> None:
+        target = self._latest_active_exchange()
+        if target is not None:
+            target.response_bytes += len(encoded)
+
+    def receipts(self) -> tuple[McpExchangeReceipt, ...]:
+        now = time.monotonic()
+        receipts: list[McpExchangeReceipt] = []
+        for exchange in self._exchanges:
+            if exchange.merged or exchange.phase is None or not exchange.call_started:
+                continue
+            started_at = exchange.started_at or now
+            completed_at = exchange.completed_at or now
+            receipts.append(
+                McpExchangeReceipt(
+                    phase=exchange.phase,
+                    request_bytes=exchange.request_bytes,
+                    response_bytes=exchange.response_bytes,
+                    duration_s=max(0.0, completed_at - started_at),
+                    call_started=True,
+                )
+            )
+        return tuple(receipts)
+
+    def attach(self, error: BaseException) -> None:
+        with contextlib.suppress(Exception):
+            setattr(error, "_agent_libos_mcp_receipts", self.receipts())
+
+    def _bind_request_body(self, exchange: _McpWireExchange) -> None:
+        if exchange.request_body is None:
+            return
+        payload = self._parse_payload(bytes(exchange.request_body))
+        exchange.request_body = None
+        if not isinstance(payload, dict):
+            return
+        method = payload.get("method")
+        if not isinstance(method, str):
+            target = self._latest_active_exchange(before=exchange)
+            if target is not None:
+                target.request_bytes += exchange.request_bytes
+                exchange.merged = True
+            return
+        exchange.method = method
+        exchange.phase = _mcp_wire_phase(method)
+        exchange.request_id = payload.get("id")
+        if method != "notifications/initialized":
+            return
+        target = self._latest_phase(McpExchangePhase.INITIALIZE, before=exchange)
+        if target is not None:
+            target.request_bytes += exchange.request_bytes
+            exchange.merged = True
+
+    def _latest_phase(
+        self,
+        phase: McpExchangePhase,
+        *,
+        before: _McpWireExchange | None = None,
+    ) -> _McpWireExchange | None:
+        for candidate in reversed(self._exchanges):
+            if candidate is before:
+                continue
+            if not candidate.merged and candidate.phase is phase:
+                return candidate
+        return None
+
+    def _latest_active_exchange(
+        self,
+        *,
+        before: _McpWireExchange | None = None,
+    ) -> _McpWireExchange | None:
+        for candidate in reversed(self._exchanges):
+            if candidate is before or candidate.merged or candidate.phase is None:
+                continue
+            if candidate.call_started and candidate.completed_at is None:
+                return candidate
+        return None
+
+    @staticmethod
+    def _parse_payload(encoded: bytes) -> Any:
+        try:
+            return json.loads(encoded.decode("utf-8").strip())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+
+def _mcp_wire_receipts(value: Any) -> tuple[McpExchangeReceipt, ...] | None:
+    ledger = getattr(value, "_agent_libos_wire_ledger", None)
+    if isinstance(ledger, _McpWireLedger):
+        return ledger.receipts()
+    return None
+
+
+def _mcp_attach_wire_evidence(
+    error: BaseException,
+    *,
+    wire_ledger: _McpWireLedger | None,
+    connection: McpConnectionInfo | None,
+) -> None:
+    """Bind exact operation-local phase evidence to a propagated failure."""
+
+    if wire_ledger is None:
+        return
+    with contextlib.suppress(Exception):
+        setattr(error, "_agent_libos_mcp_wire_evidence", True)
+    wire_ledger.attach(error)
+    if connection is not None:
+        with contextlib.suppress(Exception):
+            setattr(error, "_agent_libos_mcp_connection", connection)
+
+
+def _mcp_legacy_wire_bytes(encoded: bytes, *, newline: bool) -> bytes:
+    """Reproduce SDK-v1 framing without reserializing JSON value tokens.
+
+    SDK v1 used a different top-level member order and omitted an empty
+    request ``params._meta``.  Rebuilding the entire value through
+    ``json.dumps`` is not byte-compatible: it changes valid number spellings
+    such as ``1e-7`` and can rewrite Unicode escapes.  Parse only member
+    boundaries, then splice the original key/value tokens.
+    """
+
+    try:
+        source = encoded.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return encoded
+    members = _mcp_raw_json_object_members(source)
+    if members is None:
+        return encoded
+    if len({name for name, _key, _value in members}) != len(members):
+        return encoded
+
+    rewritten: list[tuple[str, str, str]] = []
+    for name, raw_key, raw_value in members:
+        if name != "params":
+            rewritten.append((name, raw_key, raw_value))
+            continue
+        params = _mcp_raw_json_object_members(raw_value)
+        if params is None:
+            rewritten.append((name, raw_key, raw_value))
+            continue
+        retained = [
+            item
+            for item in params
+            if not (
+                item[0] == "_meta"
+                and _mcp_raw_json_object_members(item[2]) == []
+            )
+        ]
+        if retained:
+            rewritten.append(
+                (name, raw_key, _mcp_rebuild_raw_json_object(retained))
+            )
+
+    by_name = {name: item for name, *item in rewritten}
+    ordered: list[tuple[str, str, str]] = []
+    for name in ("method", "params", "jsonrpc", "id", "result", "error"):
+        selected = by_name.pop(name, None)
+        if selected is not None:
+            ordered.append((name, selected[0], selected[1]))
+    ordered.extend(
+        item for item in rewritten if item[0] in by_name
+    )
+    suffix = "\n" if newline else ""
+    return (_mcp_rebuild_raw_json_object(ordered) + suffix).encode("utf-8")
+
+
+def _mcp_raw_json_object_members(
+    source: str,
+) -> list[tuple[str, str, str]] | None:
+    """Return decoded names plus untouched JSON member tokens for one object."""
+
+    decoder = json.JSONDecoder()
+    length = len(source)
+
+    def skip_space(index: int) -> int:
+        while index < length and source[index] in " \t\r\n":
+            index += 1
+        return index
+
+    index = skip_space(0)
+    if index >= length or source[index] != "{":
+        return None
+    index = skip_space(index + 1)
+    if index < length and source[index] == "}":
+        return [] if skip_space(index + 1) == length else None
+
+    members: list[tuple[str, str, str]] = []
+    while index < length:
+        key_start = index
+        try:
+            key, key_end = decoder.raw_decode(source, index)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(key, str):
+            return None
+        raw_key = source[key_start:key_end]
+        index = skip_space(key_end)
+        if index >= length or source[index] != ":":
+            return None
+        index = skip_space(index + 1)
+        value_start = index
+        try:
+            _value, value_end = decoder.raw_decode(source, index)
+        except json.JSONDecodeError:
+            return None
+        members.append((key, raw_key, source[value_start:value_end]))
+        index = skip_space(value_end)
+        if index >= length:
+            return None
+        if source[index] == "}":
+            return members if skip_space(index + 1) == length else None
+        if source[index] != ",":
+            return None
+        index = skip_space(index + 1)
+    return None
+
+
+def _mcp_rebuild_raw_json_object(
+    members: list[tuple[str, str, str]],
+) -> str:
+    return "{" + ",".join(
+        f"{raw_key}:{raw_value}"
+        for _name, raw_key, raw_value in members
+    ) + "}"
+
+
+def _mcp_protocol_mode(server: McpServerSpec) -> McpProtocolMode:
+    if server.schema_version == 1:
+        return McpProtocolMode.LEGACY
+    if server.schema_version != 2 or server.protocol_mode is None:
+        raise ValidationError(
+            "Manifest v2 requires protocol_mode legacy, auto, or 2026-07-28"
+        )
+    try:
+        return McpProtocolMode(server.protocol_mode)
+    except ValueError as exc:  # defensive for hand-built public model values
+        raise ValidationError(f"unsupported MCP protocol mode: {server.protocol_mode}") from exc
+
+
+@contextlib.contextmanager
+def _mcp_sanitized_otel_context() -> Iterator[None]:
+    """Prevent ambient trace or baggage values from entering MCP wire metadata."""
+
+    token: object | None = None
+    detach: Callable[[object], object] | None = None
+    try:
+        from opentelemetry.context import Context, attach
+        from opentelemetry.context import detach as otel_detach
+
+        token = attach(Context())
+        detach = otel_detach
+    except ModuleNotFoundError:
+        pass
+    try:
+        yield
+    finally:
+        if token is not None and detach is not None:
+            detach(token)
+
+
+@contextlib.asynccontextmanager
+async def _mcp_sdk_v2_client(
+    client_session_type: Any,
+    transport: Any,
+    *,
+    server: McpServerSpec,
+    mode: McpProtocolMode,
+    sdk_mode: str,
+    deadline: float,
+    max_response_bytes: int,
+    http_policy_transport: Any = None,
+    wire_ledger: _McpWireLedger | None = None,
+    mcp_config: Any = None,
+    sensitive_values: tuple[str, ...] = (),
+):
+    """Enter one SDK v2 client session with fail-closed era negotiation."""
+
+    try:
+        import mcp.types as mcp_types
+    except ModuleNotFoundError as exc:  # pragma: no cover - imported above
+        raise ValidationError("MCP Python SDK v2 is unavailable") from exc
+
+    del sdk_mode
+    client_info = mcp_types.Implementation(
+        name=("mcp" if server.schema_version == 1 else "agent-libos"),
+        version=("0.1.0" if server.schema_version == 1 else "1.2.1"),
+    )
+    negotiation_started = time.monotonic()
+    session: Any = None
+    entered_session = False
+    entered_transport = False
+    connection_evidence: McpConnectionInfo | None = None
+    with _mcp_sanitized_otel_context():
+        try:
+            streams = await transport.__aenter__()
+            entered_transport = True
+            read, write = streams[:2]
+            read = _McpToolsOnlyReadStream(read)
+            session = client_session_type(
+                read,
+                write,
+                sampling_callback=None,
+                elicitation_callback=None,
+                list_roots_callback=None,
+                logging_callback=None,
+                client_info=client_info,
+                log_level=None,
+                extensions=None,
+            )
+            if server.schema_version == 1:
+                dispatcher = getattr(session, "_dispatcher", None)
+                if hasattr(dispatcher, "_next_id"):
+                    # SDK v1 minted request id 0 first; SDK v2 starts at 1.
+                    # Preserve Manifest-v1 raw-wire identity exactly.
+                    dispatcher._next_id = -1
+            await session.__aenter__()
+            entered_session = True
+            await _mcp_negotiate_sdk_v2_session(
+                session,
+                server=server,
+                mode=mode,
+                deadline=deadline,
+                negotiation_started=negotiation_started,
+                http_policy_transport=http_policy_transport,
+                mcp_types=mcp_types,
+                protocol_probe_timeout_s=(
+                    DEFAULT_CONFIG.mcp.protocol_probe_timeout_s
+                    if mcp_config is None
+                    else mcp_config.protocol_probe_timeout_s
+                ),
+            )
+
+            protocol_revision = str(session.protocol_version)
+            if protocol_revision in _MCP_SUPPORTED_MODERN_PROTOCOL_REVISIONS:
+                protocol_era = McpProtocolEra.MODERN
+            elif protocol_revision in _MCP_SUPPORTED_LEGACY_PROTOCOL_REVISIONS:
+                protocol_era = McpProtocolEra.LEGACY
+            else:
+                # ClientSession.adopt() follows the installed SDK's supported
+                # revision set.  A future SDK minor must not silently widen the
+                # product's release-locked protocol surface.
+                raise ValidationError(
+                    "MCP negotiation selected a protocol revision outside the "
+                    "release-locked supported set"
+                )
+            if (
+                mode is McpProtocolMode.REVISION_2026_07_28
+                and protocol_revision != _MCP_MODERN_PROTOCOL_REVISION
+            ):
+                raise ValidationError(
+                    "MCP server does not support required protocol revision 2026-07-28"
+                )
+            connected = _McpSdkV2ClientAdapter(session)
+            connection = _mcp_connection_info(
+                connected,
+                mode=mode,
+                protocol_era=protocol_era,
+                protocol_revision=protocol_revision,
+                sensitive_values=sensitive_values,
+            )
+            connection_evidence = connection
+            receipts = (
+                wire_ledger.receipts()
+                if wire_ledger is not None
+                else (() if server.schema_version == 1 else _mcp_negotiation_receipts(
+                    connection,
+                    duration_s=max(0.0, time.monotonic() - negotiation_started),
+                ))
+            )
+            setattr(connected, "_agent_libos_sdk_v2", True)
+            setattr(connected, "_agent_libos_connection", connection)
+            setattr(connected, "_agent_libos_receipts", list(receipts))
+            setattr(connected, "_agent_libos_manifest_version", server.schema_version)
+            setattr(
+                connected,
+                "_agent_libos_mcp_config",
+                DEFAULT_CONFIG.mcp if mcp_config is None else mcp_config,
+            )
+            if wire_ledger is not None:
+                setattr(connected, "_agent_libos_wire_ledger", wire_ledger)
+            _mcp_check_receipt_budget(
+                receipts,
+                server=server,
+                max_response_bytes=max_response_bytes,
+            )
+            yield connected
+        except BaseException as error:
+            _mcp_attach_wire_evidence(
+                error,
+                wire_ledger=wire_ledger,
+                connection=connection_evidence,
+            )
+            raise
+        finally:
+            await _mcp_close_sdk_v2_client(
+                session=session,
+                entered_session=entered_session,
+                transport=transport,
+                entered_transport=entered_transport,
+                wire_ledger=wire_ledger,
+                connection=connection_evidence,
+            )
+
+
+async def _mcp_close_sdk_v2_client(
+    *,
+    session: Any,
+    entered_session: bool,
+    transport: Any,
+    entered_transport: bool,
+    wire_ledger: _McpWireLedger | None,
+    connection: McpConnectionInfo | None,
+) -> None:
+    """Close both SDK scopes while binding cleanup failures to wire evidence."""
+
+    try:
+        if entered_session and session is not None:
+            try:
+                await session.__aexit__(None, None, None)
+            except BaseException as error:
+                _mcp_attach_wire_evidence(
+                    error,
+                    wire_ledger=wire_ledger,
+                    connection=connection,
+                )
+                raise
+    finally:
+        if entered_transport:
+            try:
+                await transport.__aexit__(None, None, None)
+            except BaseException as error:
+                _mcp_attach_wire_evidence(
+                    error,
+                    wire_ledger=wire_ledger,
+                    connection=connection,
+                )
+                raise
+
+
+async def _mcp_negotiate_sdk_v2_session(
+    session: Any,
+    *,
+    server: McpServerSpec,
+    mode: McpProtocolMode,
+    deadline: float,
+    negotiation_started: float,
+    http_policy_transport: Any,
+    mcp_types: Any,
+    protocol_probe_timeout_s: float,
+) -> None:
+    """Negotiate exactly one SDK v2 session without widening fallback policy."""
+
+    if mode is McpProtocolMode.LEGACY:
+        await _mcp_await_with_deadline(
+            _mcp_initialize_locked(session, mcp_types),
+            deadline=deadline,
+            stage="initialize",
+        )
+        return
+
+    fallback = False
+    probe_deadline = min(
+        deadline,
+        negotiation_started + protocol_probe_timeout_s,
+    )
+    try:
+        raw_discover = await _mcp_await_with_deadline(
+            session.send_discover(_MCP_MODERN_PROTOCOL_REVISION),
+            deadline=probe_deadline,
+            stage="server/discover probe",
+        )
+        discover = mcp_types.DiscoverResult.model_validate(raw_discover)
+        supported = tuple(discover.supported_versions)
+        if _MCP_MODERN_PROTOCOL_REVISION in supported:
+            session.adopt(discover)
+        elif _mcp_stdio_legacy_versions(supported, mode=mode, server=server):
+            fallback = True
+        else:
+            raise ValidationError(
+                "MCP server/discover returned no supported modern protocol revision"
+            )
+    except _McpAbsoluteDeadlineExceeded:
+        if mode is McpProtocolMode.AUTO and server.transport == "stdio":
+            fallback = True
+        else:
+            raise
+    except Exception as exc:
+        retry_version = _mcp_mutual_modern_retry_version(exc)
+        if retry_version is not None:
+            raw_discover = await _mcp_await_with_deadline(
+                session.send_discover(retry_version),
+                deadline=probe_deadline,
+                stage="server/discover version retry",
+            )
+            discover = mcp_types.DiscoverResult.model_validate(raw_discover)
+            if retry_version not in discover.supported_versions:
+                raise ValidationError(
+                    "MCP server/discover retry did not confirm the requested revision"
+                )
+            session.adopt(discover)
+        elif _mcp_stdio_legacy_error_fallback(exc, mode=mode, server=server):
+            fallback = True
+        elif _mcp_auto_fallback_allowed(
+            exc,
+            mode=mode,
+            transport=server.transport,
+            http_policy_transport=http_policy_transport,
+        ):
+            fallback = True
+        else:
+            raise
+    if fallback:
+        await _mcp_await_with_deadline(
+            _mcp_initialize_locked(session, mcp_types),
+            deadline=deadline,
+            stage="initialize fallback",
+        )
+
+
+async def _mcp_initialize_locked(session: Any, mcp_types: Any) -> Any:
+    """Perform a legacy handshake without trusting an SDK minor's latest."""
+
+    result = await session.send_request(
+        mcp_types.InitializeRequest(
+            params=mcp_types.InitializeRequestParams(
+                protocol_version=_MCP_LEGACY_PROTOCOL_REVISION,
+                capabilities=session._build_capabilities(  # noqa: SLF001
+                    _MCP_LEGACY_PROTOCOL_REVISION
+                ),
+                client_info=session._client_info,  # noqa: SLF001
+            )
+        ),
+        mcp_types.InitializeResult,
+    )
+    if result.protocol_version not in _MCP_SUPPORTED_LEGACY_PROTOCOL_REVISIONS:
+        raise ValidationError(
+            "MCP initialize returned a protocol revision outside the "
+            "release-locked legacy set"
+        )
+    session.adopt(result)
+    await session.send_notification(mcp_types.InitializedNotification())
+    return result
+
+
+class _McpSdkV2ClientAdapter:
+    """Minimal Tools-only view over the official SDK v2 ClientSession."""
+
+    def __init__(self, session: Any) -> None:
+        self.session = session
+
+    @property
+    def protocol_version(self) -> Any:
+        return self.session.protocol_version
+
+    @property
+    def server_info(self) -> Any:
+        return self.session.server_info
+
+    @property
+    def server_capabilities(self) -> Any:
+        return self.session.server_capabilities
+
+    async def list_tools(
+        self,
+        *,
+        cursor: str | None = None,
+        cache_mode: str | None = None,
+    ) -> Any:
+        del cache_mode
+        params = None
+        if cursor is not None:
+            try:
+                import mcp.types as mcp_types
+            except ModuleNotFoundError as exc:  # pragma: no cover
+                raise ValidationError("MCP Python SDK v2 is unavailable") from exc
+            params = mcp_types.PaginatedRequestParams(cursor=cursor)
+        return await self.session.list_tools(params=params)
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Issue tools/call without SDK outputSchema enforcement.
+
+        Server-provided outputSchema is diagnostic-only in Agent libOS.  Use
+        the SDK dispatcher and typed response parsing, but intentionally skip
+        ClientSession.call_tool(), whose post-response validation would turn a
+        diagnostic schema into an execution gate.
+        """
+
+        try:
+            import mcp.types as mcp_types
+            from pydantic import TypeAdapter
+        except ModuleNotFoundError as exc:  # pragma: no cover
+            raise ValidationError("MCP Python SDK v2 is unavailable") from exc
+        return await self.session.send_request(
+            mcp_types.CallToolRequest(
+                params=mcp_types.CallToolRequestParams(
+                    name=name,
+                    arguments=arguments,
+                )
+            ),
+            TypeAdapter(mcp_types.CallToolResult | mcp_types.InputRequiredResult),
+        )
+
+
+def _mcp_auto_fallback_allowed(
+    error: Exception,
+    *,
+    mode: McpProtocolMode,
+    transport: str,
+    http_policy_transport: Any,
+) -> bool:
+    """Return only positive, transport-specific evidence of a legacy peer."""
+
+    if mode is not McpProtocolMode.AUTO:
+        return False
+    code = getattr(error, "code", None)
+    if code is None:
+        nested = getattr(error, "error", None)
+        code = getattr(nested, "code", None)
+    if code in {-32020, -32021, -32022}:
+        return False
+    if transport == "stdio":
+        return code == -32601
+    if transport == "streamable_http":
+        return bool(
+            http_policy_transport is not None
+            and getattr(http_policy_transport, "last_response_status", None) == 400
+            and getattr(http_policy_transport, "last_request_method", None)
+            == "server/discover"
+            and getattr(
+                http_policy_transport,
+                "last_legacy_400_signal",
+                # Test doubles predating raw-body classification keep their
+                # established behavior; production policy transports always
+                # expose the fail-closed flag.
+                True,
+            )
+        )
+    return False
+
+
+def _mcp_error_supported_versions(error: Exception) -> tuple[str, ...] | None:
+    code = getattr(error, "code", None)
+    nested = getattr(error, "error", None)
+    if code is None:
+        code = getattr(nested, "code", None)
+    if code != -32022:
+        return None
+    data = getattr(nested, "data", None)
+    if data is None:
+        data = getattr(error, "data", None)
+    supported = data.get("supported") if isinstance(data, dict) else getattr(data, "supported", None)
+    if (
+        not isinstance(supported, list)
+        or not supported
+        or any(not isinstance(item, str) or not item for item in supported)
+    ):
+        return None
+    return tuple(supported)
+
+
+def _mcp_stdio_legacy_versions(
+    supported: tuple[str, ...],
+    *,
+    mode: McpProtocolMode,
+    server: McpServerSpec,
+) -> bool:
+    return bool(
+        mode is McpProtocolMode.AUTO
+        and server.transport == "stdio"
+        and supported
+        and all(
+            item in _MCP_SUPPORTED_LEGACY_PROTOCOL_REVISIONS
+            for item in supported
+        )
+    )
+
+
+def _mcp_stdio_legacy_error_fallback(
+    error: Exception,
+    *,
+    mode: McpProtocolMode,
+    server: McpServerSpec,
+) -> bool:
+    supported = _mcp_error_supported_versions(error)
+    return bool(
+        supported is not None
+        and _mcp_stdio_legacy_versions(supported, mode=mode, server=server)
+    )
+
+
+def _mcp_mutual_modern_retry_version(error: Exception) -> str | None:
+    """Return the one pinned modern revision named by a -32022 response."""
+
+    supported = _mcp_error_supported_versions(error)
+    if supported is not None and _MCP_MODERN_PROTOCOL_REVISION in supported:
+        return _MCP_MODERN_PROTOCOL_REVISION
+    return None
+
+
+def _mcp_connection_info(
+    client: Any,
+    *,
+    mode: McpProtocolMode,
+    protocol_era: McpProtocolEra,
+    protocol_revision: str,
+    sensitive_values: tuple[str, ...] = (),
+) -> McpConnectionInfo:
+    server_info = getattr(client, "server_info", None)
+    capabilities_value = _jsonable_mcp_value(
+        getattr(client, "server_capabilities", None)
+    )
+    advertised: list[str] = []
+    if isinstance(capabilities_value, dict):
+        advertised = sorted(
+            str(name)
+            for name, value in capabilities_value.items()
+            if value not in (None, False, {}, [])
+        )
+    sanitized_capabilities = tuple(
+        dict.fromkeys(
+            redact_sensitive_text(
+                name,
+                sensitive_values=sensitive_values,
+            )
+            for name in advertised
+        )
+    )
+    unsupported = tuple(
+        dict.fromkeys(
+            redact_sensitive_text(
+                name,
+                sensitive_values=sensitive_values,
+            )
+            for name in advertised
+            if name != "tools"
+        )
+    )
+    raw_server_name = str(getattr(server_info, "name", "")) or None
+    raw_server_version = str(getattr(server_info, "version", "")) or None
+    return McpConnectionInfo(
+        protocol_mode=mode,
+        protocol_era=protocol_era,
+        protocol_revision=protocol_revision,
+        sessionless=protocol_era is McpProtocolEra.MODERN,
+        fallback_used=(mode is McpProtocolMode.AUTO and protocol_era is McpProtocolEra.LEGACY),
+        server_name=(
+            redact_sensitive_text(
+                raw_server_name,
+                sensitive_values=sensitive_values,
+            )
+            if raw_server_name is not None
+            else None
+        ),
+        server_version=(
+            redact_sensitive_text(
+                raw_server_version,
+                sensitive_values=sensitive_values,
+            )
+            if raw_server_version is not None
+            else None
+        ),
+        capabilities=sanitized_capabilities,
+        unsupported_capabilities=unsupported,
+    )
+
+
+def _mcp_negotiation_receipts(
+    connection: McpConnectionInfo,
+    *,
+    duration_s: float,
+) -> tuple[McpExchangeReceipt, ...]:
+    connection_payload = dumps(to_jsonable(connection)).encode("utf-8")
+    if connection.protocol_mode is McpProtocolMode.LEGACY:
+        return (
+            McpExchangeReceipt(
+                phase=McpExchangePhase.INITIALIZE,
+                request_bytes=len(dumps({"method": "initialize"}).encode("utf-8")),
+                response_bytes=len(connection_payload),
+                duration_s=duration_s,
+                call_started=True,
+            ),
+        )
+    discover = McpExchangeReceipt(
+        phase=McpExchangePhase.SERVER_DISCOVER,
+        request_bytes=len(dumps({"method": "server/discover"}).encode("utf-8")),
+        response_bytes=(0 if connection.fallback_used else len(connection_payload)),
+        duration_s=duration_s,
+        call_started=True,
+    )
+    if not connection.fallback_used:
+        return (discover,)
+    return (
+        discover,
+        McpExchangeReceipt(
+            phase=McpExchangePhase.INITIALIZE,
+            request_bytes=len(dumps({"method": "initialize"}).encode("utf-8")),
+            response_bytes=len(connection_payload),
+            duration_s=0.0,
+            call_started=True,
+        ),
+    )
+
+
 class SdkMcpProvider:
     """MCP client provider backed by the optional official Python SDK."""
 
     supports_executable_snapshots = True
     supports_runtime_environment_snapshots = True
     supports_subprocess_limits = True
+    supports_mcp_modern_protocol = True
 
-    def __init__(self, workspace_root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace_root: str | Path | None = None,
+        *,
+        mcp_config: Any = None,
+    ) -> None:
         self.workspace_root = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
+        self.mcp_config = DEFAULT_CONFIG.mcp if mcp_config is None else mcp_config
+
+    def discover(
+        self,
+        server: McpServerSpec,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
+    ) -> McpProviderDiscoveryResult:
+        """Negotiate one Manifest v2 connection without caching its result."""
+
+        mode = _mcp_protocol_mode(server)
+        if server.schema_version != 2 or mode is McpProtocolMode.LEGACY:
+            raise ValidationError(
+                "MCP discovery requires a Manifest v2 server in auto or 2026-07-28 mode"
+            )
+        deadline = time.monotonic() + timeout_s
+        started = time.monotonic()
+        with self._stdio_dispatch_snapshot(
+            server,
+            executable_snapshot,
+            runtime_environment=runtime_environment,
+        ) as selected_snapshot:
+            async def run() -> McpProviderDiscoveryResult:
+                async with self._session(
+                    server,
+                    deadline=deadline,
+                    max_response_bytes=max_response_bytes,
+                    executable_snapshot=selected_snapshot,
+                    runtime_environment=runtime_environment,
+                    limits=limits,
+                ) as client:
+                    connection = _mcp_session_connection(client)
+                    if connection is None:  # pragma: no cover - real SDK invariant
+                        raise RuntimeError("MCP SDK v2 did not expose negotiated connection metadata")
+                    receipts = _mcp_session_receipts(client)
+                    return McpProviderDiscoveryResult(
+                        connection=connection,
+                        request_bytes=sum(item.request_bytes for item in receipts),
+                        response_bytes=sum(item.response_bytes for item in receipts),
+                        duration_s=max(0.0, time.monotonic() - started),
+                        receipts=receipts,
+                    )
+
+            try:
+                return _run_mcp_async(
+                    _mcp_await_with_deadline(
+                        run(),
+                        deadline=deadline,
+                        stage="server/discover",
+                    )
+                )
+            except BaseExceptionGroup as exc:
+                self._raise_mcp_transport_limit_error(exc)
+                raise
 
     def list_tools(
         self,
@@ -3059,8 +4235,16 @@ class SdkMcpProvider:
                     )
                 )
             except BaseExceptionGroup as exc:
+                pre_call = self._mcp_v2_pre_call_exception_result(
+                    server,
+                    error=exc,
+                    started_at=deadline - timeout_s,
+                )
+                if pre_call is not None:
+                    return pre_call
                 message = self._mcp_transport_limit_message(exc)
                 if message is not None:
+                    _, receipts, connection = self._mcp_wire_failure_evidence(exc)
                     return self._mcp_transport_failure_result(
                         server,
                         tool,
@@ -3068,12 +4252,22 @@ class SdkMcpProvider:
                         message=message,
                         started_at=deadline - timeout_s,
                         max_response_bytes=max_response_bytes,
+                        receipts=receipts,
+                        connection=connection,
                     )
                 raise
             except RuntimeError as exc:
+                pre_call = self._mcp_v2_pre_call_exception_result(
+                    server,
+                    error=exc,
+                    started_at=deadline - timeout_s,
+                )
+                if pre_call is not None:
+                    return pre_call
                 message = self._mcp_transport_limit_message(exc)
                 if message is None:
                     raise
+                _, receipts, connection = self._mcp_wire_failure_evidence(exc)
                 return self._mcp_transport_failure_result(
                     server,
                     tool,
@@ -3081,7 +4275,18 @@ class SdkMcpProvider:
                     message=message,
                     started_at=deadline - timeout_s,
                     max_response_bytes=max_response_bytes,
+                    receipts=receipts,
+                    connection=connection,
                 )
+            except Exception as exc:
+                pre_call = self._mcp_v2_pre_call_exception_result(
+                    server,
+                    error=exc,
+                    started_at=deadline - timeout_s,
+                )
+                if pre_call is not None:
+                    return pre_call
+                raise
 
     def resolve_stdio_executable(
         self,
@@ -3216,6 +4421,8 @@ class SdkMcpProvider:
                     "MCP stdio request frame exceeded max_request_bytes=",
                     "MCP stdio stdin exceeded max_output_bytes=",
                     "MCP HTTP response exceeded max_response_bytes=",
+                    "MCP HTTP operation exceeded max_response_bytes=",
+                    "MCP HTTP request exceeded max_request_bytes=",
                     "MCP HTTP SSE frame exceeded max_response_bytes=",
                     "MCP HTTP response uses unsupported Content-Encoding=",
                 )
@@ -3230,6 +4437,138 @@ class SdkMcpProvider:
         return None
 
     @staticmethod
+    def _mcp_transport_receipts(
+        error: BaseException,
+    ) -> tuple[McpExchangeReceipt, ...]:
+        pending: list[BaseException] = [error]
+        seen: set[int] = set()
+        selected: tuple[McpExchangeReceipt, ...] = ()
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            candidate = getattr(current, "_agent_libos_mcp_receipts", ())
+            if (
+                isinstance(candidate, tuple)
+                and all(isinstance(item, McpExchangeReceipt) for item in candidate)
+                and len(candidate) > len(selected)
+            ):
+                selected = candidate
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend(current.exceptions)
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
+        return selected
+
+    @staticmethod
+    def _mcp_wire_failure_evidence(
+        error: BaseException,
+    ) -> tuple[
+        bool,
+        tuple[McpExchangeReceipt, ...],
+        McpConnectionInfo | None,
+    ]:
+        pending: list[BaseException] = [error]
+        seen: set[int] = set()
+        certified = False
+        selected: tuple[McpExchangeReceipt, ...] = ()
+        connection: McpConnectionInfo | None = None
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if getattr(current, "_agent_libos_mcp_wire_evidence", False) is True:
+                certified = True
+                candidate = getattr(current, "_agent_libos_mcp_receipts", ())
+                if (
+                    isinstance(candidate, tuple)
+                    and all(
+                        isinstance(item, McpExchangeReceipt)
+                        for item in candidate
+                    )
+                    and len(candidate) >= len(selected)
+                ):
+                    selected = candidate
+                candidate_connection = getattr(
+                    current,
+                    "_agent_libos_mcp_connection",
+                    None,
+                )
+                if isinstance(candidate_connection, McpConnectionInfo):
+                    connection = candidate_connection
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend(current.exceptions)
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
+        return certified, selected, connection
+
+    @staticmethod
+    def _mcp_v2_pre_call_exception_result(
+        server: McpServerSpec,
+        *,
+        error: BaseException,
+        started_at: float,
+    ) -> McpProviderCallResult | None:
+        if server.schema_version != 2:
+            return None
+        certified, receipts, connection = SdkMcpProvider._mcp_wire_failure_evidence(
+            error
+        )
+        if not certified or any(
+            item.phase is McpExchangePhase.TOOLS_CALL
+            for item in receipts
+        ):
+            return None
+        list_receipts = tuple(
+            item
+            for item in receipts
+            if item.phase is McpExchangePhase.TOOLS_LIST
+        )
+        return McpProviderCallResult(
+            error="MCP operation failed before tools/call dispatch",
+            error_type="McpPreCallFailure",
+            correlation_id=new_id("corr"),
+            duration_s=max(0.0, time.monotonic() - started_at),
+            list_request_bytes=sum(item.request_bytes for item in list_receipts),
+            list_response_bytes=sum(item.response_bytes for item in list_receipts),
+            call_request_bytes=0,
+            call_response_bytes=0,
+            call_started=False,
+            connection=connection,
+            receipts=receipts,
+        )
+
+    @staticmethod
+    def _mcp_transport_error_type(message: str) -> str:
+        prefixes = (
+            ("MCP stdio frame exceeded", "McpStdioFrameTooLarge"),
+            ("MCP stdio stdout exceeded", "McpStdioStdoutTooLarge"),
+            ("MCP stdio stderr exceeded", "McpStdioStderrTooLarge"),
+            ("MCP HTTP SSE frame exceeded", "McpHttpSseFrameTooLarge"),
+            ("MCP HTTP response exceeded", "McpHttpResponseTooLarge"),
+            ("MCP HTTP operation exceeded", "McpHttpOperationTooLarge"),
+            ("MCP HTTP request exceeded", "McpHttpRequestTooLarge"),
+            (
+                "MCP HTTP response uses unsupported Content-Encoding=",
+                "McpHttpContentEncodingDenied",
+            ),
+        )
+        return next(
+            (
+                error_type
+                for prefix, error_type in prefixes
+                if message.startswith(prefix)
+            ),
+            "McpTransportLimitError",
+        )
+
+    @staticmethod
     def _mcp_transport_failure_result(
         server: McpServerSpec,
         tool: McpToolSpec,
@@ -3238,39 +4577,51 @@ class SdkMcpProvider:
         message: str,
         started_at: float,
         max_response_bytes: int,
+        receipts: tuple[McpExchangeReceipt, ...] = (),
+        connection: McpConnectionInfo | None = None,
     ) -> McpProviderCallResult:
-        list_request_bytes = len(
-            dumps({"method": "tools/list", "server_id": server.server_id}).encode(
-                "utf-8"
+        legacy = server.schema_version == 1
+        if legacy:
+            receipts = ()
+            connection = None
+        list_receipts = tuple(
+            item for item in receipts if item.phase is McpExchangePhase.TOOLS_LIST
+        )
+        call_receipts = tuple(
+            item for item in receipts if item.phase is McpExchangePhase.TOOLS_CALL
+        )
+        list_request_bytes = sum(item.request_bytes for item in list_receipts)
+        list_response_bytes = sum(item.response_bytes for item in list_receipts)
+        call_request_bytes = sum(item.request_bytes for item in call_receipts)
+        call_response_bytes = sum(item.response_bytes for item in call_receipts)
+        if legacy:
+            list_request_bytes = len(
+                dumps({"method": "tools/list", "server_id": server.server_id}).encode(
+                    "utf-8"
+                )
             )
-        )
-        call_request_bytes = len(
-            dumps({"name": tool.mcp_name, "arguments": arguments}).encode("utf-8")
-        )
-        error_type = "McpTransportLimitError"
-        if message.startswith("MCP stdio frame exceeded"):
-            error_type = "McpStdioFrameTooLarge"
-        elif message.startswith("MCP stdio stdout exceeded"):
-            error_type = "McpStdioStdoutTooLarge"
-        elif message.startswith("MCP stdio stderr exceeded"):
-            error_type = "McpStdioStderrTooLarge"
-        elif message.startswith("MCP HTTP SSE frame exceeded"):
-            error_type = "McpHttpSseFrameTooLarge"
-        elif message.startswith("MCP HTTP response exceeded"):
-            error_type = "McpHttpResponseTooLarge"
-        elif message.startswith("MCP HTTP response uses unsupported Content-Encoding="):
-            error_type = "McpHttpContentEncodingDenied"
+            call_request_bytes = len(
+                dumps({"name": tool.mcp_name, "arguments": arguments}).encode("utf-8")
+            )
+            call_response_bytes = max_response_bytes
+        error_type = SdkMcpProvider._mcp_transport_error_type(message)
         return McpProviderCallResult(
             error="bounded MCP transport failure",
             error_type=error_type,
             correlation_id=new_id("corr"),
-            response_bytes=max_response_bytes,
+            response_bytes=call_response_bytes,
             duration_s=max(0.0, time.monotonic() - started_at),
             list_request_bytes=list_request_bytes,
-            list_response_bytes=0,
+            list_response_bytes=list_response_bytes,
             call_request_bytes=call_request_bytes,
-            call_response_bytes=max_response_bytes,
-            call_started=True,
+            call_response_bytes=call_response_bytes,
+            call_started=(
+                True
+                if legacy
+                else any(item.call_started for item in call_receipts)
+            ),
+            connection=connection,
+            receipts=receipts,
         )
 
     async def _alist_tools(
@@ -3292,32 +4643,22 @@ class SdkMcpProvider:
             runtime_environment=runtime_environment,
             limits=limits,
         ) as session:
-            result = await _mcp_await_with_deadline(
-                session.list_tools(),
+            tools, response_bytes = await _mcp_collect_tools(
+                session,
+                server,
                 deadline=deadline,
+                max_response_bytes=max_response_bytes,
                 stage="tools/list response",
             )
-        if _mcp_tools_list_has_continuation(result):
-            raise RuntimeError(
-                "MCP tools/list returned an unsupported continuation cursor"
-            )
-        tools = [
-            McpProviderTool(
-                name=str(getattr(item, "name", "")),
-                description=getattr(item, "description", None),
-                input_schema=dict(getattr(item, "inputSchema", None) or getattr(item, "input_schema", None) or {}),
-                metadata=_mcp_metadata(item),
-            )
-            for item in list(getattr(result, "tools", []) or [])
-        ]
-        encoded = dumps([to_jsonable(tool) for tool in tools]).encode("utf-8")
-        if len(encoded) > max_response_bytes:
-            raise RuntimeError(f"MCP tools/list response exceeded max_response_bytes={max_response_bytes}")
+            connection = _mcp_session_connection(session)
+            receipts = _mcp_session_receipts(session)
         return McpToolListResult(
             server_id=server.server_id,
             tools=tools,
-            response_bytes=len(encoded),
+            response_bytes=response_bytes,
             duration_s=time.monotonic() - started,
+            connection=connection,
+            receipts=receipts,
         )
 
     async def _acall_tool(
@@ -3341,11 +4682,42 @@ class SdkMcpProvider:
             runtime_environment=runtime_environment,
             limits=limits,
         ) as session:
+            receipt_count = len(_mcp_session_receipts(session))
+            call_started = time.monotonic()
             result = await _mcp_await_with_deadline(
-                session.call_tool(tool.mcp_name, arguments),
+                _mcp_session_call_tool(session, tool.mcp_name, arguments),
                 deadline=deadline,
                 stage=f"tools/call response {tool.mcp_name}",
             )
+            connection = _mcp_session_connection(session)
+            if _mcp_is_input_required_result(result):
+                call_response_bytes = _mcp_result_size(result)
+                _mcp_append_receipt(
+                    session,
+                    McpExchangeReceipt(
+                        phase=McpExchangePhase.TOOLS_CALL,
+                        request_bytes=_mcp_call_request_size(tool.mcp_name, arguments),
+                        response_bytes=min(call_response_bytes, max_response_bytes),
+                        duration_s=max(0.0, time.monotonic() - call_started),
+                        call_started=True,
+                    ),
+                    server=server,
+                    max_response_bytes=max_response_bytes,
+                )
+                call_request_bytes, call_response_bytes = _mcp_phase_wire_sizes(
+                    session,
+                    phase=McpExchangePhase.TOOLS_CALL,
+                    after=receipt_count,
+                    request_bytes=_mcp_call_request_size(tool.mcp_name, arguments),
+                    response_bytes=min(call_response_bytes, max_response_bytes),
+                )
+                return _mcp_input_required_failure(
+                    started=started,
+                    connection=connection,
+                    receipts=_mcp_session_receipts(session),
+                    call_request_bytes=call_request_bytes,
+                    call_response_bytes=call_response_bytes,
+                )
         content = _jsonable_mcp_value(getattr(result, "content", None))
         structured = _jsonable_mcp_value(_mcp_structured_content(result))
         raw_payload = {"content": content, "structured_content": structured}
@@ -3358,13 +4730,38 @@ class SdkMcpProvider:
                 "content": _bounded_mcp_content(content),
                 "structured_content": _bounded_mcp_content(structured),
             }
+        call_response_bytes = min(len(encoded), max_response_bytes)
+        _mcp_append_receipt(
+            session,
+            McpExchangeReceipt(
+                phase=McpExchangePhase.TOOLS_CALL,
+                request_bytes=_mcp_call_request_size(tool.mcp_name, arguments),
+                response_bytes=call_response_bytes,
+                duration_s=max(0.0, time.monotonic() - call_started),
+                call_started=True,
+            ),
+            server=server,
+            max_response_bytes=max_response_bytes,
+        )
+        call_request_bytes, call_response_bytes = _mcp_phase_wire_sizes(
+            session,
+            phase=McpExchangePhase.TOOLS_CALL,
+            after=receipt_count,
+            request_bytes=_mcp_call_request_size(tool.mcp_name, arguments),
+            response_bytes=call_response_bytes,
+        )
         return McpProviderCallResult(
             content=payload["content"],
             structured_content=payload["structured_content"],
             is_error=bool(getattr(result, "isError", False) or getattr(result, "is_error", False)),
-            response_bytes=min(len(encoded), max_response_bytes),
+            response_bytes=call_response_bytes,
             duration_s=time.monotonic() - started,
             too_large=too_large,
+            call_request_bytes=call_request_bytes,
+            call_response_bytes=call_response_bytes,
+            call_started=True,
+            connection=connection,
+            receipts=_mcp_session_receipts(session),
         )
 
     async def _avalidate_and_call(
@@ -3383,9 +4780,6 @@ class SdkMcpProvider:
         list_request_bytes = len(
             dumps({"method": "tools/list", "server_id": server.server_id}).encode("utf-8")
         )
-        call_request_bytes = len(
-            dumps({"name": tool.mcp_name, "arguments": arguments}).encode("utf-8")
-        )
         async with self._session(
             server,
             deadline=deadline,
@@ -3394,68 +4788,123 @@ class SdkMcpProvider:
             runtime_environment=runtime_environment,
             limits=limits,
         ) as session:
-            live_result = await _mcp_await_with_deadline(
-                session.list_tools(),
-                deadline=deadline,
-                stage="validated tools/list response",
-            )
-            live_tools = [
-                McpProviderTool(
-                    name=str(getattr(item, "name", "")),
-                    description=getattr(item, "description", None),
-                    input_schema=dict(
-                        getattr(item, "inputSchema", None)
-                        or getattr(item, "input_schema", None)
-                        or {}
-                    ),
-                    metadata=_mcp_metadata(item),
+            list_receipt_start = len(_mcp_session_receipts(session))
+            try:
+                live_tools, list_response_bytes = await _mcp_collect_tools(
+                    session,
+                    server,
+                    deadline=deadline,
+                    max_response_bytes=max_response_bytes,
+                    stage="validated tools/list response",
                 )
-                for item in list(getattr(live_result, "tools", []) or [])
-            ]
+            except _McpToolCatalogValidationError:
+                if server.schema_version == 2:
+                    return _mcp_pre_call_validation_failure(
+                        session,
+                        started=started,
+                        list_receipt_start=list_receipt_start,
+                    )
+                # Preserve the Manifest-v1 provider projection byte-for-byte.
+                return _mcp_v1_pre_call_validation_failure(
+                    session,
+                    tool=tool,
+                    arguments=arguments,
+                    started=started,
+                    list_request_bytes=list_request_bytes,
+                    list_response_bytes=max_response_bytes,
+                )
+            list_receipts = tuple(
+                item
+                for item in _mcp_session_receipts(session)[list_receipt_start:]
+                if item.phase is McpExchangePhase.TOOLS_LIST
+            )
+            if list_receipts:
+                list_request_bytes = sum(item.request_bytes for item in list_receipts)
+                list_response_bytes = sum(item.response_bytes for item in list_receipts)
             list_encoded = dumps([to_jsonable(item) for item in live_tools]).encode("utf-8")
-            if len(list_encoded) > max_response_bytes:
-                return McpProviderCallResult(
+            if list_response_bytes > max_response_bytes:
+                if server.schema_version == 2:
+                    return _mcp_pre_call_validation_failure(
+                        session,
+                        started=started,
+                        list_receipt_start=list_receipt_start,
+                        error="MCP tools/list response exceeded limit",
+                        error_type="ResponseTooLarge",
+                    )
+                return _mcp_v1_pre_call_validation_failure(
+                    session,
+                    tool=tool,
+                    arguments=arguments,
+                    started=started,
                     error="MCP tools/list response exceeded limit",
                     error_type="ResponseTooLarge",
-                    correlation_id=new_id("corr"),
-                    duration_s=time.monotonic() - started,
                     list_request_bytes=list_request_bytes,
                     list_response_bytes=max_response_bytes,
-                    call_request_bytes=call_request_bytes,
-                    call_started=False,
-                )
-            if _mcp_tools_list_has_continuation(live_result):
-                return McpProviderCallResult(
-                    error="MCP live tool validation failed",
-                    error_type="LiveToolValidationError",
-                    correlation_id=new_id("corr"),
-                    duration_s=time.monotonic() - started,
-                    list_request_bytes=list_request_bytes,
-                    # The catalog is incomplete, so no exact complete-response
-                    # byte receipt exists. Charge the bounded stage maximum.
-                    list_response_bytes=max_response_bytes,
-                    call_request_bytes=call_request_bytes,
-                    call_started=False,
                 )
             live = next((item for item in live_tools if item.name == tool.mcp_name), None)
             if live is None or (
-                tool.input_schema and live.input_schema != tool.input_schema
+                tool.input_schema
+                and not _mcp_canonical_json_equal(
+                    live.input_schema,
+                    tool.input_schema,
+                )
             ):
-                return McpProviderCallResult(
-                    error="MCP live tool validation failed",
-                    error_type="LiveToolValidationError",
-                    correlation_id=new_id("corr"),
-                    duration_s=time.monotonic() - started,
+                if server.schema_version == 2:
+                    return _mcp_pre_call_validation_failure(
+                        session,
+                        started=started,
+                        list_receipt_start=list_receipt_start,
+                    )
+                return _mcp_v1_pre_call_validation_failure(
+                    session,
+                    tool=tool,
+                    arguments=arguments,
+                    started=started,
                     list_request_bytes=list_request_bytes,
                     list_response_bytes=len(list_encoded),
-                    call_request_bytes=call_request_bytes,
-                    call_started=False,
                 )
+            call_request_bytes = _mcp_call_request_size(
+                tool.mcp_name,
+                arguments,
+            )
+            call_receipt_start = len(_mcp_session_receipts(session))
+            call_started_at = time.monotonic()
             result = await _mcp_await_with_deadline(
-                session.call_tool(tool.mcp_name, arguments),
+                _mcp_session_call_tool(session, tool.mcp_name, arguments),
                 deadline=deadline,
                 stage=f"validated tools/call response {tool.mcp_name}",
             )
+            connection = _mcp_session_connection(session)
+            if _mcp_is_input_required_result(result):
+                call_response_bytes = min(_mcp_result_size(result), max_response_bytes)
+                _mcp_append_receipt(
+                    session,
+                    McpExchangeReceipt(
+                        phase=McpExchangePhase.TOOLS_CALL,
+                        request_bytes=call_request_bytes,
+                        response_bytes=call_response_bytes,
+                        duration_s=max(0.0, time.monotonic() - call_started_at),
+                        call_started=True,
+                    ),
+                    server=server,
+                    max_response_bytes=max_response_bytes,
+                )
+                call_request_bytes, call_response_bytes = _mcp_phase_wire_sizes(
+                    session,
+                    phase=McpExchangePhase.TOOLS_CALL,
+                    after=call_receipt_start,
+                    request_bytes=call_request_bytes,
+                    response_bytes=call_response_bytes,
+                )
+                return _mcp_input_required_failure(
+                    started=started,
+                    connection=connection,
+                    receipts=_mcp_session_receipts(session),
+                    list_request_bytes=list_request_bytes,
+                    list_response_bytes=list_response_bytes,
+                    call_request_bytes=call_request_bytes,
+                    call_response_bytes=call_response_bytes,
+                )
         content = _jsonable_mcp_value(getattr(result, "content", None))
         structured = _jsonable_mcp_value(_mcp_structured_content(result))
         raw_payload = {"content": content, "structured_content": structured}
@@ -3469,6 +4918,25 @@ class SdkMcpProvider:
                 "structured_content": _bounded_mcp_content(structured),
             }
         call_response_bytes = min(len(encoded), max_response_bytes)
+        _mcp_append_receipt(
+            session,
+            McpExchangeReceipt(
+                phase=McpExchangePhase.TOOLS_CALL,
+                request_bytes=call_request_bytes,
+                response_bytes=call_response_bytes,
+                duration_s=max(0.0, time.monotonic() - call_started_at),
+                call_started=True,
+            ),
+            server=server,
+            max_response_bytes=max_response_bytes,
+        )
+        call_request_bytes, call_response_bytes = _mcp_phase_wire_sizes(
+            session,
+            phase=McpExchangePhase.TOOLS_CALL,
+            after=call_receipt_start,
+            request_bytes=call_request_bytes,
+            response_bytes=call_response_bytes,
+        )
         return McpProviderCallResult(
             content=payload["content"],
             structured_content=payload["structured_content"],
@@ -3477,10 +4945,12 @@ class SdkMcpProvider:
             duration_s=time.monotonic() - started,
             too_large=too_large,
             list_request_bytes=list_request_bytes,
-            list_response_bytes=len(list_encoded),
+            list_response_bytes=list_response_bytes,
             call_request_bytes=call_request_bytes,
             call_response_bytes=call_response_bytes,
             call_started=True,
+            connection=connection,
+            receipts=_mcp_session_receipts(session),
         )
 
     @contextlib.asynccontextmanager
@@ -3500,13 +4970,30 @@ class SdkMcpProvider:
                 server.timeout_s if timeout_s is None else timeout_s
             )
         try:
-            from mcp import ClientSession
+            from mcp.client import ClientSession
             from mcp.client.stdio import StdioServerParameters
-            from mcp.client.streamable_http import streamable_http_client
         except ModuleNotFoundError as exc:
             raise ValidationError(
                 "MCP provider requires the optional dependency; install with `uv sync --extra mcp --all-groups`"
             ) from exc
+        except ImportError:
+            # Compatibility seam for tests and environments still carrying the
+            # pre-v2 SDK. The released MCP extra requires SDK v2, but keeping
+            # this path avoids changing the established Manifest v1 Provider
+            # SPI and makes the upgrade failure explicit at the package edge.
+            async with self._legacy_sdk_session(
+                server,
+                deadline=deadline,
+                max_response_bytes=max_response_bytes,
+                executable_snapshot=executable_snapshot,
+                runtime_environment=runtime_environment,
+                limits=limits,
+            ) as session:
+                yield session
+            return
+
+        mode = _mcp_protocol_mode(server)
+        sdk_mode = "legacy" if mode is McpProtocolMode.LEGACY else "auto"
         if server.transport == "stdio":
             if server.stdio is None:
                 raise RuntimeError("MCP stdio transport is missing stdio configuration")
@@ -3538,6 +5025,141 @@ class SdkMcpProvider:
                 # Python can discover its pyvenv.cfg. The resolved target above
                 # remains the identity that was validated by the primitive.
                 command = str(command_candidate)
+            with self._stdio_dispatch_cwd(server) as (dispatch_cwd, cwd_fd):
+                wire_ledger = (
+                    _McpWireLedger() if server.schema_version == 2 else None
+                )
+                stdio_environment = self._stdio_dispatch_env(
+                    server,
+                    executable_snapshot,
+                    runtime_environment=runtime_environment,
+                )
+                params = StdioServerParameters(
+                    command=command,
+                    args=list(server.stdio.args),
+                    env=stdio_environment,
+                    cwd=dispatch_cwd,
+                )
+                transport = _strict_stdio_client(
+                    params,
+                    max_frame_bytes=max_response_bytes,
+                    max_request_bytes=server.max_request_bytes,
+                    cwd_fd=cwd_fd,
+                    deadline=deadline,
+                    limits=limits,
+                    stdout_limit_bytes=(
+                        max_response_bytes if server.schema_version == 2 else None
+                    ),
+                    stdin_limit_bytes=(
+                        server.max_request_bytes if server.schema_version == 2 else None
+                    ),
+                    wire_ledger=wire_ledger,
+                    legacy_wire_compat=server.schema_version == 1,
+                )
+                async with _mcp_sdk_v2_client(
+                    ClientSession,
+                    transport,
+                    server=server,
+                    mode=mode,
+                    sdk_mode=sdk_mode,
+                    deadline=deadline,
+                    max_response_bytes=max_response_bytes,
+                    wire_ledger=wire_ledger,
+                    mcp_config=self.mcp_config,
+                    sensitive_values=mcp_runtime_secret_values(
+                        server,
+                        stdio_environment,
+                    ),
+                ) as client:
+                    yield client
+            return
+        if server.transport == "streamable_http":
+            if server.http is None:
+                raise RuntimeError("MCP streamable_http transport is missing HTTP configuration")
+            async with self._http_client(
+                server,
+                timeout_s=_mcp_remaining_timeout(deadline, stage="HTTP client setup"),
+                max_response_bytes=max_response_bytes,
+                runtime_environment=runtime_environment,
+                deadline=deadline,
+            ) as http_client:
+                async with _mcp_tools_only_streamable_http_client(
+                    server.http.url,
+                    http_client=http_client,
+                    terminate_on_close=True,
+                    legacy_listen=server.schema_version == 1,
+                ) as transport:
+                    # ``streamable_http_client`` has already been entered here,
+                    # while Client expects the context manager itself. Wrap the
+                    # live stream pair in a no-op transport context so Client
+                    # owns only its dispatcher/session and this scope continues
+                    # to own the strict HTTP transport.
+                    async with _mcp_sdk_v2_client(
+                        ClientSession,
+                        _McpEnteredTransport(transport),
+                        server=server,
+                        mode=mode,
+                        sdk_mode=sdk_mode,
+                        deadline=deadline,
+                        max_response_bytes=max_response_bytes,
+                        http_policy_transport=getattr(
+                            http_client,
+                            "_agent_libos_policy_transport",
+                            None,
+                        ),
+                        wire_ledger=(
+                            getattr(
+                                getattr(
+                                    http_client,
+                                    "_agent_libos_policy_transport",
+                                    None,
+                                ),
+                                "wire_ledger",
+                                None,
+                            )
+                            if server.schema_version == 2
+                            else None
+                        ),
+                        mcp_config=self.mcp_config,
+                        sensitive_values=getattr(
+                            http_client,
+                            "_agent_libos_sensitive_values",
+                            (),
+                        ),
+                    ) as client:
+                        yield client
+            return
+        raise RuntimeError(f"unsupported MCP transport: {server.transport}")
+
+    @contextlib.asynccontextmanager
+    async def _legacy_sdk_session(
+        self,
+        server: McpServerSpec,
+        *,
+        deadline: float,
+        max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None,
+        runtime_environment: Mapping[str, str] | None,
+        limits: SubprocessLimits | None,
+    ):
+        if server.schema_version != 1 or _mcp_protocol_mode(server) is not McpProtocolMode.LEGACY:
+            raise ValidationError("Manifest v2 requires MCP Python SDK v2")
+        from mcp import ClientSession
+        from mcp.client.stdio import StdioServerParameters
+
+        if server.transport == "stdio":
+            if server.stdio is None:
+                raise RuntimeError("MCP stdio transport is missing stdio configuration")
+            command = (
+                str(executable_snapshot.executable_path)
+                if executable_snapshot is not None
+                else str(
+                    self._stdio_command_candidate(
+                        server,
+                        runtime_environment=runtime_environment,
+                    )
+                )
+            )
             with self._stdio_dispatch_cwd(server) as (dispatch_cwd, cwd_fd):
                 params = StdioServerParameters(
                     command=command,
@@ -3575,10 +5197,11 @@ class SdkMcpProvider:
                 runtime_environment=runtime_environment,
                 deadline=deadline,
             ) as http_client:
-                async with streamable_http_client(
+                async with _mcp_tools_only_streamable_http_client(
                     server.http.url,
                     http_client=http_client,
-                ) as (read, write, _):
+                ) as streams:
+                    read, write = streams[:2]
                     async with ClientSession(read, write) as session:
                         await _mcp_await_with_deadline(
                             session.initialize(),
@@ -3600,10 +5223,10 @@ class SdkMcpProvider:
         deadline: float | None = None,
     ):
         try:
-            import httpx
+            import httpx2 as httpx
         except ModuleNotFoundError as exc:
             raise ValidationError(
-                "MCP provider requires httpx from the optional MCP dependency; "
+                "MCP provider requires httpx2 from the optional MCP dependency; "
                 "install with `uv sync --extra mcp --all-groups`"
             ) from exc
         selected_deadline = (
@@ -3619,10 +5242,13 @@ class SdkMcpProvider:
             server,
             runtime_environment=runtime_environment,
         )
+        sensitive_values = mcp_runtime_secret_values(server, headers)
         headers["Accept-Encoding"] = "identity"
         transport = _McpPolicyAsyncHTTPTransport(
             max_response_bytes=max_response_bytes,
+            max_request_bytes=server.max_request_bytes,
             deadline=selected_deadline,
+            legacy_wire_compat=server.schema_version == 1,
         )
         try:
             async with httpx.AsyncClient(
@@ -3632,6 +5258,12 @@ class SdkMcpProvider:
                 transport=transport,
                 trust_env=False,
             ) as client:
+                setattr(client, "_agent_libos_policy_transport", transport)
+                setattr(
+                    client,
+                    "_agent_libos_sensitive_values",
+                    sensitive_values,
+                )
                 yield client
                 if transport.limit_error is not None:
                     raise transport.limit_error
@@ -3803,7 +5435,7 @@ class SdkMcpProvider:
         context: dict[str, Any],
         result: Any,
     ) -> ExternalEffectClassification:
-        if operation == "list_tools":
+        if operation in {"discover", "list_tools"}:
             return ExternalEffectClassification(
                 rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
                 rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
@@ -3844,7 +5476,9 @@ def _mcp_remaining_timeout(
 ) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise TimeoutError(f"MCP absolute deadline exhausted during {stage}")
+        raise _McpAbsoluteDeadlineExceeded(
+            f"MCP absolute deadline exhausted during {stage}"
+        )
     if requested is None:
         return remaining
     return min(remaining, max(0.0, requested))
@@ -3862,12 +5496,404 @@ async def _mcp_await_with_deadline(
         if asyncio.iscoroutine(awaitable):
             awaitable.close()
         raise
+    task = asyncio.ensure_future(awaitable)
     try:
-        return await asyncio.wait_for(awaitable, timeout=timeout)
-    except TimeoutError as exc:
-        raise TimeoutError(
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+    except BaseException as error:
+        # A task-group/transport failure can cancel this parent while the SDK
+        # request task is still pending.  Always retrieve the child outcome so
+        # it cannot later surface as an unhandled MCPError, while preserving
+        # the original parent exception.
+        child_error = await _mcp_cancel_and_retrieve(task)
+        _mcp_copy_wire_evidence(child_error, error)
+        raise
+    if task in done:
+        return task.result()
+    child_error = await _mcp_cancel_and_retrieve(task)
+    timeout_error = _McpAbsoluteDeadlineExceeded(
+        f"MCP absolute deadline exhausted during {stage}"
+    )
+    _mcp_copy_wire_evidence(child_error, timeout_error)
+    raise timeout_error
+
+
+async def _mcp_anext_with_deadline(
+    iterator: Any,
+    *,
+    deadline: float,
+    stage: str,
+) -> Any:
+    """Advance and later close an HTTP response stream in the same task."""
+
+    timeout = _mcp_remaining_timeout(deadline, stage=stage)
+    timeout_scope = asyncio.timeout(timeout)
+    try:
+        async with timeout_scope:
+            return await anext(iterator)
+    except TimeoutError as error:
+        if not timeout_scope.expired():
+            raise
+        raise _McpAbsoluteDeadlineExceeded(
             f"MCP absolute deadline exhausted during {stage}"
-        ) from exc
+        ) from error
+
+
+async def _mcp_cancel_and_retrieve(
+    task: asyncio.Future[Any],
+) -> BaseException | None:
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except BaseException as error:
+        return error
+    return None
+
+
+def _mcp_copy_wire_evidence(
+    source: BaseException | None,
+    target: BaseException,
+) -> None:
+    if source is None:
+        return
+    for name in (
+        "_agent_libos_mcp_wire_evidence",
+        "_agent_libos_mcp_receipts",
+        "_agent_libos_mcp_connection",
+    ):
+        with contextlib.suppress(Exception):
+            if hasattr(source, name):
+                setattr(target, name, getattr(source, name))
+
+
+def _mcp_session_connection(session: Any) -> McpConnectionInfo | None:
+    value = getattr(session, "_agent_libos_connection", None)
+    return value if isinstance(value, McpConnectionInfo) else None
+
+
+def _mcp_session_receipts(session: Any) -> tuple[McpExchangeReceipt, ...]:
+    wire_receipts = _mcp_wire_receipts(session)
+    if wire_receipts is not None:
+        return wire_receipts
+    value = getattr(session, "_agent_libos_receipts", ())
+    return tuple(item for item in value if isinstance(item, McpExchangeReceipt))
+
+
+def _mcp_check_receipt_budget(
+    receipts: tuple[McpExchangeReceipt, ...] | list[McpExchangeReceipt],
+    *,
+    server: McpServerSpec,
+    max_response_bytes: int,
+) -> None:
+    request_bytes = sum(item.request_bytes for item in receipts)
+    response_bytes = sum(item.response_bytes for item in receipts)
+    if request_bytes > server.max_request_bytes:
+        raise RuntimeError(
+            f"MCP operation exceeded max_request_bytes={server.max_request_bytes}"
+        )
+    if response_bytes > max_response_bytes:
+        raise RuntimeError(
+            f"MCP operation exceeded max_response_bytes={max_response_bytes}"
+        )
+
+
+def _mcp_append_receipt(
+    session: Any,
+    receipt: McpExchangeReceipt,
+    *,
+    server: McpServerSpec,
+    max_response_bytes: int,
+) -> None:
+    if getattr(session, "_agent_libos_manifest_version", None) == 1:
+        return
+    wire_receipts = _mcp_wire_receipts(session)
+    if wire_receipts is not None:
+        _mcp_check_receipt_budget(
+            wire_receipts,
+            server=server,
+            max_response_bytes=max_response_bytes,
+        )
+        setattr(session, "_agent_libos_receipts", list(wire_receipts))
+        return
+    receipts = list(_mcp_session_receipts(session))
+    receipts.append(receipt)
+    _mcp_check_receipt_budget(
+        receipts,
+        server=server,
+        max_response_bytes=max_response_bytes,
+    )
+    if getattr(session, "_agent_libos_sdk_v2", False):
+        setattr(session, "_agent_libos_receipts", receipts)
+
+
+def _mcp_phase_wire_sizes(
+    session: Any,
+    *,
+    phase: McpExchangePhase,
+    after: int,
+    request_bytes: int,
+    response_bytes: int,
+) -> tuple[int, int]:
+    recorded = _mcp_session_receipts(session)
+    for receipt in reversed(recorded[after:]):
+        if receipt.phase is phase:
+            return receipt.request_bytes, receipt.response_bytes
+    return request_bytes, response_bytes
+
+
+async def _mcp_session_list_tools(session: Any, cursor: str | None) -> Any:
+    if getattr(session, "_agent_libos_sdk_v2", False):
+        return await session.list_tools(cursor=cursor, cache_mode="bypass")
+    if cursor is None:
+        return await session.list_tools()
+    return await session.list_tools(cursor=cursor)
+
+
+async def _mcp_session_call_tool(
+    session: Any,
+    name: str,
+    arguments: dict[str, Any],
+) -> Any:
+    if getattr(session, "_agent_libos_sdk_v2", False):
+        return await session.call_tool(name, arguments)
+    return await session.call_tool(name, arguments)
+
+
+def _mcp_provider_tool(item: Any) -> McpProviderTool:
+    return McpProviderTool(
+        name=str(getattr(item, "name", "")),
+        description=getattr(item, "description", None),
+        input_schema=dict(
+            getattr(item, "inputSchema", None)
+            or getattr(item, "input_schema", None)
+            or {}
+        ),
+        metadata=_mcp_metadata(item),
+    )
+
+
+def _mcp_tools_list_cursor(result: Any) -> tuple[bool, str | None]:
+    for field in ("nextCursor", "next_cursor"):
+        if hasattr(result, field):
+            value = getattr(result, field)
+            if value is not None:
+                return True, value if isinstance(value, str) else None
+    return False, None
+
+
+async def _mcp_collect_tools(
+    session: Any,
+    server: McpServerSpec,
+    *,
+    deadline: float,
+    max_response_bytes: int,
+    stage: str,
+) -> tuple[list[McpProviderTool], int]:
+    """Collect one legacy page or a bounded Manifest v2 catalog."""
+
+    is_v2 = server.schema_version == 2
+    mcp_config = getattr(session, "_agent_libos_mcp_config", DEFAULT_CONFIG.mcp)
+    max_pages = mcp_config.list_max_pages if is_v2 else 1
+    max_items = mcp_config.list_limit
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    seen_names: set[str] = set()
+    tools: list[McpProviderTool] = []
+    total_response_bytes = 0
+
+    for page_index in range(max_pages):
+        receipt_count = len(_mcp_session_receipts(session))
+        request_payload: dict[str, Any] = {"method": "tools/list"}
+        if cursor is not None:
+            request_payload["params"] = {"cursor": cursor}
+        request_bytes = len(dumps(request_payload).encode("utf-8"))
+        prospective = (*_mcp_session_receipts(session), McpExchangeReceipt(
+            phase=McpExchangePhase.TOOLS_LIST,
+            request_bytes=request_bytes,
+        ))
+        _mcp_check_receipt_budget(
+            prospective,
+            server=server,
+            max_response_bytes=max_response_bytes,
+        )
+        page_started = time.monotonic()
+        result = await _mcp_await_with_deadline(
+            _mcp_session_list_tools(session, cursor),
+            deadline=deadline,
+            stage=f"{stage} page {page_index + 1}",
+        )
+        try:
+            page_tools = [
+                _mcp_provider_tool(item)
+                for item in list(getattr(result, "tools", []) or [])
+            ]
+        except (TypeError, ValueError) as exc:
+            raise _McpToolCatalogValidationError(
+                "MCP tools/list returned a malformed tool catalog"
+            ) from exc
+        page_encoded = dumps([to_jsonable(item) for item in page_tools]).encode("utf-8")
+        page_response_bytes = len(page_encoded)
+        receipt = McpExchangeReceipt(
+            phase=McpExchangePhase.TOOLS_LIST,
+            request_bytes=request_bytes,
+            response_bytes=page_response_bytes,
+            duration_s=max(0.0, time.monotonic() - page_started),
+            call_started=True,
+        )
+        _mcp_append_receipt(
+            session,
+            receipt,
+            server=server,
+            max_response_bytes=max_response_bytes,
+        )
+        recorded = _mcp_session_receipts(session)
+        if len(recorded) > receipt_count:
+            wire_receipt = recorded[-1]
+            if wire_receipt.phase is McpExchangePhase.TOOLS_LIST:
+                request_bytes = wire_receipt.request_bytes
+                page_response_bytes = wire_receipt.response_bytes
+        total_response_bytes += page_response_bytes
+
+        for item in page_tools:
+            if is_v2 and item.name in seen_names:
+                raise _McpToolCatalogValidationError(
+                    f"MCP tools/list returned duplicate tool name: {item.name}"
+                )
+            seen_names.add(item.name)
+            tools.append(item)
+            if is_v2 and len(tools) > max_items:
+                raise _McpToolCatalogValidationError(
+                    f"MCP tools/list exceeded maximum tool count={max_items}"
+                )
+
+        has_cursor, next_cursor = _mcp_tools_list_cursor(result)
+        if not has_cursor:
+            return tools, total_response_bytes
+        if not is_v2:
+            raise _McpIncompleteToolCatalog(
+                "MCP tools/list returned an unsupported continuation cursor"
+            )
+        if not next_cursor:
+            raise _McpToolCatalogValidationError(
+                "MCP tools/list returned a malformed continuation cursor"
+            )
+        if next_cursor in seen_cursors:
+            raise _McpToolCatalogValidationError(
+                "MCP tools/list returned a repeated continuation cursor"
+            )
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    raise _McpToolCatalogValidationError(
+        f"MCP tools/list exceeded maximum page count={max_pages}"
+    )
+
+
+def _mcp_v1_pre_call_validation_failure(
+    session: Any,
+    *,
+    tool: McpToolSpec,
+    arguments: dict[str, Any],
+    started: float,
+    list_request_bytes: int,
+    list_response_bytes: int,
+    error: str = "MCP live tool validation failed",
+    error_type: str = "LiveToolValidationError",
+) -> McpProviderCallResult:
+    return McpProviderCallResult(
+        error=error,
+        error_type=error_type,
+        correlation_id=new_id("corr"),
+        duration_s=max(0.0, time.monotonic() - started),
+        list_request_bytes=list_request_bytes,
+        list_response_bytes=list_response_bytes,
+        call_request_bytes=_mcp_call_request_size(tool.mcp_name, arguments),
+        call_started=False,
+        connection=_mcp_session_connection(session),
+        receipts=_mcp_session_receipts(session),
+    )
+
+
+def _mcp_pre_call_validation_failure(
+    session: Any,
+    *,
+    started: float,
+    list_receipt_start: int,
+    error: str = "MCP live tool validation failed",
+    error_type: str = "LiveToolValidationError",
+) -> McpProviderCallResult:
+    """Project a v2 live-validation denial without implying tools/call dispatch."""
+
+    receipts = _mcp_session_receipts(session)
+    list_receipts = tuple(
+        receipt
+        for receipt in receipts[list_receipt_start:]
+        if receipt.phase is McpExchangePhase.TOOLS_LIST
+    )
+    return McpProviderCallResult(
+        error=error,
+        error_type=error_type,
+        correlation_id=new_id("corr"),
+        duration_s=max(0.0, time.monotonic() - started),
+        list_request_bytes=sum(item.request_bytes for item in list_receipts),
+        list_response_bytes=sum(item.response_bytes for item in list_receipts),
+        call_request_bytes=0,
+        call_response_bytes=0,
+        call_started=False,
+        connection=_mcp_session_connection(session),
+        receipts=receipts,
+    )
+
+
+def _mcp_canonical_json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values without Python's bool/int equality coercion."""
+
+    try:
+        return dumps(left).encode("utf-8") == dumps(right).encode("utf-8")
+    except (TypeError, ValueError, RecursionError, UnicodeEncodeError):
+        return False
+
+
+def _mcp_call_request_size(name: str, arguments: dict[str, Any]) -> int:
+    return len(dumps({"name": name, "arguments": arguments}).encode("utf-8"))
+
+
+def _mcp_result_size(result: Any) -> int:
+    return len(dumps(_jsonable_mcp_value(result)).encode("utf-8"))
+
+
+def _mcp_is_input_required_result(result: Any) -> bool:
+    if type(result).__name__ == "InputRequiredResult":
+        return True
+    value = getattr(result, "result_type", None)
+    return value in {"input_required", "inputRequired"}
+
+
+def _mcp_input_required_failure(
+    *,
+    started: float,
+    connection: McpConnectionInfo | None,
+    receipts: tuple[McpExchangeReceipt, ...],
+    list_request_bytes: int = 0,
+    list_response_bytes: int = 0,
+    call_request_bytes: int,
+    call_response_bytes: int,
+) -> McpProviderCallResult:
+    return McpProviderCallResult(
+        is_error=True,
+        error="MCP server requested unsupported multi-round input",
+        error_type="mcp_input_required_unsupported",
+        correlation_id=new_id("corr"),
+        response_bytes=call_response_bytes,
+        duration_s=max(0.0, time.monotonic() - started),
+        list_request_bytes=list_request_bytes,
+        list_response_bytes=list_response_bytes,
+        call_request_bytes=call_request_bytes,
+        call_response_bytes=call_response_bytes,
+        call_started=True,
+        connection=connection,
+        receipts=receipts,
+    )
 
 
 class _McpPolicyAsyncHTTPTransport:
@@ -3877,21 +5903,38 @@ class _McpPolicyAsyncHTTPTransport:
         self,
         *,
         max_response_bytes: int,
+        max_request_bytes: int | None = None,
         deadline: float | None = None,
+        wire_ledger: _McpWireLedger | None = None,
+        legacy_wire_compat: bool = False,
     ) -> None:
         try:
-            import httpcore
-            import httpx  # noqa: F401
+            import httpcore2 as httpcore
+            import httpx2 as httpx  # noqa: F401
         except ModuleNotFoundError as exc:
             raise ValidationError(
-                "MCP HTTP transport requires httpx/httpcore from the optional MCP dependency; "
+                "MCP HTTP transport requires httpx2/httpcore2 from the optional MCP dependency; "
                 "install with `uv sync --extra mcp --all-groups`"
             ) from exc
         if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
             raise ValidationError("MCP HTTP max_response_bytes must be a positive integer")
+        selected_request_bytes = (
+            max_response_bytes if max_request_bytes is None else max_request_bytes
+        )
+        if isinstance(selected_request_bytes, bool) or selected_request_bytes < 1:
+            raise ValidationError("MCP HTTP max_request_bytes must be a positive integer")
         self.max_response_bytes = max_response_bytes
+        self.max_request_bytes = selected_request_bytes
+        self.request_bytes = 0
+        self.response_bytes = 0
+        self.last_request_method: str | None = None
+        self.last_response_status: int | None = None
+        self.last_legacy_400_signal = False
         self.deadline = float("inf") if deadline is None else deadline
         self.limit_error: RuntimeError | None = None
+        self.wire_ledger = wire_ledger or _McpWireLedger()
+        self._agent_libos_wire_ledger = self.wire_ledger
+        self.legacy_wire_compat = legacy_wire_compat
         self._pool = httpcore.AsyncConnectionPool(
             ssl_context=ssl.create_default_context(),
             max_connections=8,
@@ -3913,10 +5956,13 @@ class _McpPolicyAsyncHTTPTransport:
             await self._pool.__aexit__(exc_type, exc_value, traceback)
 
     async def handle_async_request(self, request: Any) -> Any:
-        import httpcore
-        import httpx
+        import httpcore2 as httpcore
+        import httpx2 as httpx
 
         request.headers["Accept-Encoding"] = "identity"
+        self.last_request_method = request.headers.get("Mcp-Method")
+        self.last_legacy_400_signal = False
+        exchange = self.wire_ledger.begin_http(self.last_request_method)
         extensions = dict(request.extensions)
         timeout_extension = dict(extensions.get("timeout", {}))
         for timeout_kind in ("connect", "pool", "read", "write"):
@@ -3927,6 +5973,24 @@ class _McpPolicyAsyncHTTPTransport:
                 stage=f"HTTP {timeout_kind}",
             )
         extensions["timeout"] = timeout_extension
+        request_stream = request.stream
+        request_headers = request.headers
+        if self.legacy_wire_compat:
+            buffered = bytearray()
+            async for chunk in request.stream:
+                buffered.extend(chunk)
+                if len(buffered) > self.max_request_bytes + 1024:
+                    raise self._limit_failure(
+                        f"MCP HTTP request exceeded max_request_bytes={self.max_request_bytes}"
+                    )
+            encoded = _mcp_legacy_wire_bytes(bytes(buffered), newline=False)
+            if len(encoded) > self.max_request_bytes:
+                raise self._limit_failure(
+                    f"MCP HTTP request exceeded max_request_bytes={self.max_request_bytes}"
+                )
+            request_stream = _mcp_one_chunk_stream(encoded)
+            request_headers = httpx.Headers(request.headers)
+            request_headers["Content-Length"] = str(len(encoded))
         core_request = httpcore.Request(
             method=request.method,
             url=httpcore.URL(
@@ -3935,13 +5999,25 @@ class _McpPolicyAsyncHTTPTransport:
                 port=request.url.port,
                 target=request.url.raw_path,
             ),
-            headers=request.headers.raw,
-            content=request.stream,
+            headers=request_headers.raw,
+            content=self._bounded_request_stream(request_stream, exchange),
             extensions=extensions,
         )
-        with _map_mcp_httpcore_exceptions():
-            core_response = await self._pool.handle_async_request(core_request)
+        try:
+            with _map_mcp_httpcore_exceptions():
+                core_response = await self._pool.handle_async_request(core_request)
+        except BaseException as exc:
+            self.wire_ledger.finish_http_request(exchange)
+            self.wire_ledger.finish_http_response(exchange)
+            self.wire_ledger.attach(exc)
+            raise
+        self.last_response_status = int(core_response.status)
+        if self.last_response_status == 400:
+            exchange.response_body = bytearray()
         headers = httpx.Headers(core_response.headers)
+        content_length = headers.get("content-length")
+        if content_length is not None and content_length.isdigit():
+            exchange.response_declared_bytes = int(content_length)
         content_encoding = headers.get("content-encoding", "").strip().lower()
         if content_encoding and content_encoding != "identity":
             error = self._limit_failure(
@@ -3960,14 +6036,99 @@ class _McpPolicyAsyncHTTPTransport:
                 is_sse=content_type == "text/event-stream",
                 fail=self._limit_failure,
                 deadline=self.deadline,
+                count_response_bytes=lambda size: self._count_response_bytes(
+                    size,
+                    exchange=exchange,
+                ),
+                observe_response_chunk=lambda chunk: self._observe_response_chunk(
+                    exchange,
+                    chunk,
+                ),
+                response_complete=lambda: self._finish_http_response(exchange),
             ),
             extensions=core_response.extensions,
         )
 
     def _limit_failure(self, message: str) -> RuntimeError:
         error = RuntimeError(message)
+        self.wire_ledger.attach(error)
         self.limit_error = error
         return error
+
+    async def _bounded_request_stream(
+        self,
+        stream: Any,
+        exchange: _McpWireExchange,
+    ):
+        async for chunk in stream:
+            prospective = (
+                exchange.request_bytes + len(chunk)
+                if self.legacy_wire_compat
+                else self.request_bytes + len(chunk)
+            )
+            if prospective > self.max_request_bytes:
+                raise self._limit_failure(
+                    f"MCP HTTP request exceeded max_request_bytes={self.max_request_bytes}"
+                )
+            self.request_bytes += len(chunk)
+            self.wire_ledger.record_http_request(exchange, chunk)
+            yield chunk
+        self.wire_ledger.finish_http_request(exchange)
+
+    def _count_response_bytes(
+        self,
+        size: int,
+        *,
+        exchange: _McpWireExchange,
+    ) -> None:
+        current_response_bytes = (
+            exchange.response_bytes
+            if self.legacy_wire_compat
+            else self.response_bytes
+        )
+        if current_response_bytes + size > self.max_response_bytes:
+            raise self._limit_failure(
+                (
+                    f"MCP HTTP response exceeded max_response_bytes={self.max_response_bytes}"
+                    if self.legacy_wire_compat
+                    else f"MCP HTTP operation exceeded max_response_bytes={self.max_response_bytes}"
+                )
+            )
+        if size:
+            self.wire_ledger.record_http_response(exchange, size)
+            self.response_bytes += size
+
+    def _observe_response_chunk(
+        self,
+        exchange: _McpWireExchange,
+        chunk: bytes,
+    ) -> None:
+        if exchange.response_body is not None:
+            exchange.response_body.extend(chunk)
+
+    def _finish_http_response(self, exchange: _McpWireExchange) -> None:
+        self.wire_ledger.finish_http_response(exchange)
+        if (
+            self.last_response_status != 400
+            or exchange.method != "server/discover"
+            or exchange.response_body is None
+            or self.limit_error is not None
+        ):
+            return
+        body = bytes(exchange.response_body)
+        if not body:
+            self.last_legacy_400_signal = exchange.response_declared_bytes == 0
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+            return
+        code = payload["error"].get("code")
+        self.last_legacy_400_signal = bool(
+            isinstance(code, int) and code not in {-32020, -32021, -32022}
+        )
 
     async def aclose(self) -> None:
         with _map_mcp_httpcore_exceptions():
@@ -3981,8 +6142,8 @@ def _map_mcp_httpcore_exceptions() -> Iterator[None]:
     try:
         yield
     except Exception as exc:
-        import httpcore
-        import httpx
+        import httpcore2 as httpcore
+        import httpx2 as httpx
 
         exception_names = (
             "TimeoutException",
@@ -4062,6 +6223,10 @@ class _McpHttpResponseLimiter:
         return None
 
 
+async def _mcp_one_chunk_stream(content: bytes):
+    yield content
+
+
 def _bounded_mcp_http_stream(
     stream: Any,
     *,
@@ -4069,8 +6234,11 @@ def _bounded_mcp_http_stream(
     is_sse: bool,
     fail: Callable[[str], RuntimeError],
     deadline: float = float("inf"),
+    count_response_bytes: Callable[[int], None] | None = None,
+    observe_response_chunk: Callable[[bytes], None] | None = None,
+    response_complete: Callable[[], None] | None = None,
 ) -> Any:
-    import httpx
+    import httpx2 as httpx
 
     limiter = _McpHttpResponseLimiter(max_response_bytes=max_response_bytes, is_sse=is_sse)
 
@@ -4080,22 +6248,32 @@ def _bounded_mcp_http_stream(
             while True:
                 try:
                     with _map_mcp_httpcore_exceptions():
-                        chunk = await _mcp_await_with_deadline(
-                            anext(iterator),
+                        chunk = await _mcp_anext_with_deadline(
+                            iterator,
                             deadline=deadline,
                             stage="HTTP response body",
                         )
                 except StopAsyncIteration:
+                    if response_complete is not None:
+                        response_complete()
                     return
                 else:
                     message = limiter.feed(chunk)
                     if message is not None:
                         raise fail(message)
+                    if count_response_bytes is not None:
+                        count_response_bytes(len(chunk))
+                    if observe_response_chunk is not None:
+                        observe_response_chunk(chunk)
                     yield chunk
 
         async def aclose(self) -> None:
-            with _map_mcp_httpcore_exceptions():
-                await stream.aclose()
+            try:
+                with _map_mcp_httpcore_exceptions():
+                    await stream.aclose()
+            finally:
+                if response_complete is not None:
+                    response_complete()
 
     return BoundedMcpHttpStream()
 
@@ -4105,10 +6283,10 @@ class _McpPolicyNetworkBackend:
 
     def __init__(self, *, deadline: float | None = None) -> None:
         try:
-            import httpcore
+            import httpcore2 as httpcore
         except ModuleNotFoundError as exc:
             raise ValidationError(
-                "MCP HTTP transport requires httpcore from the optional MCP dependency; "
+                "MCP HTTP transport requires httpcore2 from the optional MCP dependency; "
                 "install with `uv sync --extra mcp --all-groups`"
             ) from exc
         self._backend = httpcore.AnyIOBackend()
@@ -4404,6 +6582,7 @@ def _find_windows_mcp_command(
 class _McpStdioConfig:
     max_frame_bytes: int
     request_limit_bytes: int
+    stdin_limit_bytes: int
     stdout_limit_bytes: int
     stderr_limit_bytes: int
     deadline: float
@@ -4428,6 +6607,7 @@ def _validated_mcp_stdio_config(
     *,
     max_frame_bytes: int,
     max_request_bytes: int | None,
+    stdin_limit_bytes: int | None,
     deadline: float | None,
     limits: SubprocessLimits | None,
     stdout_limit_bytes: int | None,
@@ -4435,6 +6615,11 @@ def _validated_mcp_stdio_config(
 ) -> _McpStdioConfig:
     selected_request_limit = (
         max_frame_bytes if max_request_bytes is None else max_request_bytes
+    )
+    selected_stdin_limit = (
+        selected_request_limit * _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER
+        if stdin_limit_bytes is None
+        else stdin_limit_bytes
     )
     selected_stdout_limit = (
         max_frame_bytes * _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER
@@ -4447,6 +6632,7 @@ def _validated_mcp_stdio_config(
     for field_name, value in (
         ("max_frame_bytes", max_frame_bytes),
         ("max_request_bytes", selected_request_limit),
+        ("stdin_limit_bytes", selected_stdin_limit),
         ("stdout limit", selected_stdout_limit),
         ("stderr limit", selected_stderr_limit),
     ):
@@ -4457,6 +6643,7 @@ def _validated_mcp_stdio_config(
     return _McpStdioConfig(
         max_frame_bytes=max_frame_bytes,
         request_limit_bytes=selected_request_limit,
+        stdin_limit_bytes=selected_stdin_limit,
         stdout_limit_bytes=selected_stdout_limit,
         stderr_limit_bytes=selected_stderr_limit,
         deadline=(
@@ -4627,6 +6814,8 @@ class _StrictMcpStdioTransport:
         read_stream: Any,
         write_stream: Any,
         write_stream_reader: Any,
+        wire_ledger: _McpWireLedger | None,
+        legacy_wire_compat: bool,
     ) -> None:
         self.anyio = anyio
         self.mcp_types = mcp_types
@@ -4642,6 +6831,8 @@ class _StrictMcpStdioTransport:
         self.read_stream = read_stream
         self.write_stream = write_stream
         self.write_stream_reader = write_stream_reader
+        self.wire_ledger = wire_ledger
+        self.legacy_wire_compat = legacy_wire_compat
         self.transport_errors: list[BaseException] = []
         self.failure_event = anyio.Event()
         self.termination_lock = anyio.Lock()
@@ -4654,6 +6845,8 @@ class _StrictMcpStdioTransport:
         self.stdin_bytes = 0
 
     def record_failure(self, error: BaseException) -> None:
+        if self.wire_ledger is not None:
+            self.wire_ledger.attach(error)
         if not self.transport_errors:
             self.transport_errors.append(error)
         self.failure_event.set()
@@ -4699,19 +6892,35 @@ class _StrictMcpStdioTransport:
             newline = buffer.find(b"\n")
             if newline < 0:
                 if len(buffer) > self.config.max_frame_bytes:
+                    if self.wire_ledger is not None:
+                        self.wire_ledger.record_stdio_partial_response(bytes(buffer))
                     await self._send_stdout_failure(self._frame_limit_error())
                     return False
                 return True
             if newline > self.config.max_frame_bytes:
+                if self.wire_ledger is not None:
+                    self.wire_ledger.record_stdio_partial_response(
+                        bytes(buffer[: newline + 1])
+                    )
                 await self._send_stdout_failure(self._frame_limit_error())
                 return False
             line = bytes(buffer[:newline])
             del buffer[: newline + 1]
             try:
-                message = self.mcp_types.JSONRPCMessage.model_validate_json(line)
+                adapter = getattr(
+                    self.mcp_types,
+                    "jsonrpc_message_adapter",
+                    None,
+                )
+                if adapter is not None:
+                    message = adapter.validate_json(line, by_name=False)
+                else:
+                    message = self.mcp_types.JSONRPCMessage.model_validate_json(line)
             except Exception as exc:
                 await self.read_stream_writer.send(exc)
                 continue
+            if self.wire_ledger is not None:
+                self.wire_ledger.record_stdio_response(line + b"\n", message)
             await self.read_stream_writer.send(self.session_message_type(message))
 
     def _frame_limit_error(self) -> RuntimeError:
@@ -4763,8 +6972,7 @@ class _StrictMcpStdioTransport:
                         return
                     self.stdin_bytes += len(encoded)
                     aggregate_limit = (
-                        self.config.request_limit_bytes
-                        * _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER
+                        self.config.stdin_limit_bytes
                     )
                     if self.stdin_bytes > aggregate_limit:
                         self.record_failure(
@@ -4774,16 +6982,24 @@ class _StrictMcpStdioTransport:
                             )
                         )
                         return
+                    if self.wire_ledger is not None:
+                        # Mark immediately before the transport send.  A send
+                        # interrupted after this point may still have delivered
+                        # the complete stdio frame.
+                        self.wire_ledger.record_stdio_request(encoded)
                     await self.process.stdin.send(encoded)
         except self.anyio.ClosedResourceError:
             await self.anyio.lowlevel.checkpoint()
 
     def _encode_request(self, session_message: Any) -> bytes:
         raw = session_message.message.model_dump_json(by_alias=True, exclude_none=True)
-        return (raw + "\n").encode(
+        encoded = (raw + "\n").encode(
             encoding=self.server.encoding,
             errors=self.server.encoding_error_handler,
         )
+        if self.legacy_wire_compat:
+            return _mcp_legacy_wire_bytes(encoded, newline=True)
+        return encoded
 
     def _selected_limit_kind(self, wall_seconds: float) -> tuple[bool, str | None]:
         timed_out = time.monotonic() >= self.config.deadline
@@ -4926,16 +7142,20 @@ async def _strict_stdio_client(
     *,
     max_frame_bytes: int,
     max_request_bytes: int | None = None,
+    stdin_limit_bytes: int | None = None,
     cwd_fd: int | None = None,
     deadline: float | None = None,
     limits: SubprocessLimits | None = None,
     stdout_limit_bytes: int | None = None,
     stderr_limit_bytes: int | None = None,
+    wire_ledger: _McpWireLedger | None = None,
+    legacy_wire_compat: bool = False,
 ):
     anyio, mcp_types, session_message_type = _mcp_stdio_dependencies()
     config = _validated_mcp_stdio_config(
         max_frame_bytes=max_frame_bytes,
         max_request_bytes=max_request_bytes,
+        stdin_limit_bytes=stdin_limit_bytes,
         deadline=deadline,
         limits=limits,
         stdout_limit_bytes=stdout_limit_bytes,
@@ -4991,6 +7211,8 @@ async def _strict_stdio_client(
         read_stream=read_stream,
         write_stream=write_stream,
         write_stream_reader=write_stream_reader,
+        wire_ledger=wire_ledger,
+        legacy_wire_compat=legacy_wire_compat,
     )
     async with transport.run() as client_streams:
         yield client_streams

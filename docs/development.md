@@ -94,8 +94,12 @@ Optional provider gates are excluded unless selected explicitly:
 
 ```bash
 uv sync --frozen --all-groups --extra mcp
-uv run python -m pytest -q tests/providers/test_mcp_sdk_integration.py \
+uv run python -m pytest -q \
+  tests/providers/test_mcp_http_transport.py \
+  tests/providers/test_mcp_v2_adapter.py \
+  tests/providers/test_mcp_sdk_integration.py \
   --run-mcp --fail-on-skip
+uv run python scripts/run_mcp_conformance.py
 uv run python -m pytest -q \
   tests/self_evolution/test_builtin_agent_images_real_llm.py \
   --run-real-llm --fail-on-skip
@@ -103,6 +107,22 @@ uv sync --frozen --all-groups --extra postgres
 export AGENT_LIBOS_POSTGRES_DSN='postgresql://agent_libos:agent_libos@127.0.0.1:5432/agent_libos'
 uv run python -m pytest -m postgres --run-postgres --fail-on-skip
 ```
+
+The MCP integration job runs all three complete transport, adapter, and SDK
+integration files, without selection or ignored tests, on Ubuntu Python 3.11
+and 3.14. The `mcp` extra is the SDK v2 environment:
+`mcp>=2.0,<3` plus directly declared `httpx2`, `httpcore2`, and
+`opentelemetry-api` bounds. Legacy wire compatibility is tested through SDK v2
+and raw protocol fixtures; CI does not install SDK v1 beside it.
+The conformance runner checks out one reviewed upstream revision in a temporary
+directory and runs only the applicable strict Tools-client scenarios. It uses
+no expected-failure baseline; its generated results remain under ignored
+`.benchmark_runs/` and are not release artifacts. Git checkout, `npm ci`, the
+explicit build target, the Node runner, and its Python client start from a
+minimal environment allowlist. Their HOME, temporary directories, XDG state,
+and npm cache/user configuration are isolated for the run; ambient credentials,
+DSNs, proxy configuration, Python import paths, telemetry context, and tokens
+are not forwarded.
 
 The real-LLM command may consume paid provider tokens and requires the Host
 environment described below. PostgreSQL requires a configured disposable test
@@ -216,9 +236,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.1.0-py3-none-any.whl dist/agent_libos-1.1.0.tar.gz
+  dist/agent_libos-1.2.1-py3-none-any.whl dist/agent_libos-1.2.1.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.1.0-py3-none-any.whl
+  dist/agent_libos-1.2.1-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 ```
 
@@ -624,9 +644,10 @@ Current behavior must not claim:
 
 - Python JIT compatibility,
 - direct external framework adapters as trusted boundaries,
-- MCP Resources/Prompts or real hosted GitHub/GitLab provider integrations that
-  are not implemented (the typed local Git provider and simulated PRs are
-  current),
+- MCP MRTR/OAuth/listen, Resources, Prompts, Tasks, Apps, Roots, Sampling,
+  Logging, OpenTelemetry product support, an MCP server surface, or real hosted
+  GitHub/GitLab provider integrations that are not implemented (the MCP
+  Tools-only client and typed local Git provider/simulated PRs are current),
 - provider-level compensation for rollbackable external side effects,
 - Skill activation as a capability grant.
 

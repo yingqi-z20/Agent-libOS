@@ -8,8 +8,24 @@ configuration at call time. They pass only:
 - `tool_id`
 - `arguments`, as a JSON object; `null` is normalized to `{}` by the primitive
 
-v1 covers MCP Tools only. MCP Resources and Prompts are not exposed as runtime
-primitives yet.
+Agent libOS 1.2.1 uses the Python MCP SDK v2. “SDK v2” is not a wire-protocol
+version: MCP protocol revisions are date strings. This release pins its modern
+wire contract to `2026-07-28` and also supports legacy initialize-based
+revisions. Manifest schema, SDK major, protocol revision, Agent libOS product
+version, and RuntimeStore schema are independent identifiers; the Store remains
+schema v4.
+
+The supported product surface is deliberately narrower than the upstream SDK:
+Tools list/call and modern `server/discover` only. Resources, Prompts, Tasks,
+Roots, Sampling, Logging, Elicitation/MRTR continuation,
+`subscriptions/listen`, MCP Apps, OAuth client login, and an MCP server product
+surface are not implemented. Static Host environment-backed Authorization
+headers remain supported transport inputs, but that is not OAuth conformance.
+
+Normative upstream references for this release are the MCP
+[`2026-07-28` versioning rules](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
+the [revision changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog),
+and the [Python SDK v2.0.0 release](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.0.0).
 
 ## Server Manifest V1
 
@@ -121,6 +137,75 @@ text is capped at 262,144 bytes. Server/tool ids are capped at 96 characters,
 `mcp_name` at 256, header names at 128, and resolved header values at 8,192;
 deployments may customize these values through `AgentLibOSConfig.mcp`.
 
+Manifest v1 is a compatibility contract. It must omit `protocol_mode`, always
+uses the legacy initialize handshake, does not send a modern discovery probe,
+does not follow `nextCursor`, and preserves its existing canonical identity,
+approval binding, and Sink digest.
+
+## Server Manifest V2
+
+Manifest v2 has the same closed transport and tool allowlist shape, but requires
+an explicit protocol mode:
+
+```yaml
+schema_version: 2
+protocol_mode: auto
+server_id: demo-mcp-modern
+transport: streamable_http
+http:
+  url: https://api.example.test/mcp
+  headers:
+    Authorization:
+      env: AGENT_LIBOS_MCP_DEMO_TOKEN
+      prefix: "Bearer "
+tools:
+  - tool_id: forecast
+    mcp_name: weather.forecast
+    right: read
+    rollback_class: no_rollback_required
+    state_mutation: false
+    information_flow: true
+    input_schema:
+      type: object
+      additionalProperties: true
+timeout_s: 10
+max_request_bytes: 65536
+max_response_bytes: 1048576
+```
+
+`protocol_mode` has exactly three values:
+
+| Mode | Wire behavior |
+| --- | --- |
+| `legacy` | Uses the initialize-based legacy path only. |
+| `auto` | Attempts modern discovery, then performs only the transport-specific safe fallback described below. |
+| `2026-07-28` | Requires modern discovery to advertise that exact revision and never falls back. |
+
+The release-supported protocol set is an Agent libOS constant, not whatever a
+later compatible SDK package happens to add. A future SDK minor therefore
+cannot silently expand the negotiated protocol set.
+
+`auto` gives a probe at most five seconds and always truncates it to the
+operation's shorter remaining absolute deadline. Stdio may fall back only for a
+specification-recognized non-modern response or probe timeout. Streamable HTTP
+may fall back only for the recognized legacy `400` response. Authentication
+failures, `5xx`, DNS/TLS/HTTP timeouts, malformed or oversized responses, and
+recognized modern errors never trigger fallback. Fallback is forbidden after a
+Tool call has been dispatched.
+
+Manifest v2 follows `tools/list.nextCursor` on the same connection and within
+the same deadline. The catalog is capped at 16 pages and 100 tools; malformed
+or repeated cursors, duplicate tool names, and either cap being exceeded fail
+closed. A call completes this bounded live catalog validation before
+dispatching `tools/call`. Manifest v1 retains its single-page contract.
+
+The v2 `input_schema` is a bounded JSON Schema 2020-12 subset. Its root remains
+an object; local acyclic `$ref`/`$defs`, composition, and conditionals are
+accepted, while external, dynamic, or recursive references are rejected.
+Validation caps schema depth at 64, nodes at 10,000, reference hops at 128, and
+composition expansion at 1,024. Server `outputSchema`, annotations, and cache
+hints are diagnostic metadata only and never expand authority.
+
 ## Authority
 
 Registry metadata authority:
@@ -150,6 +235,12 @@ calls also require `process:spawn` `write` plus `execute` on the exact
 `mcp_stdio:<sha256>` launch resource. Registration authorizes persisting that
 executable launch surface; live refresh and calls are the operations that
 actually start the local child process.
+
+`discover`/`adiscover` is a protected external read available only for
+Manifest v2 `auto` and `2026-07-28` servers. It requires the same exact server
+`read+execute` authority and, for stdio, the same local-spawn authorities as a
+live refresh. Discovery never registers a live Tool, grants a capability, or
+changes a manifest Tool's effect classification.
 `inspect_mcp_server` returns that value as `stdio_authority_resource`; its hash
 covers the canonical command, args, environment mapping, and cwd. HTTP servers
 return `null` for this field. `call_mcp_tool` requires the right declared by the
@@ -293,11 +384,17 @@ post-boundary failures do not restore the use.
 For `call_tool`, target-only stdio executable identity selection precedes
 protected preparation. One absolute deadline then begins after preparation and
 covers complete environment snapshotting, primitive DNS, final executable
-snapshotting, live `tools/list`, validation, and `call_tool`; each subsequent
-stage receives only the remaining time. For live refresh, environment
+snapshotting, protocol discovery/initialization, all live `tools/list` pages,
+validation, and `call_tool`; each subsequent stage receives only the remaining
+time. For live refresh, environment
 snapshotting and initial executable identity selection precede its deadline;
-that deadline then covers primitive DNS, final executable snapshotting, and
-`tools/list`. An exhausted deadline cannot start the next provider phase.
+that deadline then covers primitive DNS, final executable snapshotting,
+protocol negotiation, and all `tools/list` pages. An exhausted deadline cannot
+start the next provider phase.
+Manifest v2 also applies `max_request_bytes` and `max_response_bytes`
+cumulatively across discovery/initialization, every list page, and the call.
+Bounded `McpExchangeReceipt` entries identify each phase, while
+`call_started` records whether the consequential Tool phase was entered.
 Legacy two-call providers reserve the complete request/response envelope before
 dispatch, but settlement follows observed stage progress: completed response
 bytes are charged exactly, an ordinary exception with unknown response size
@@ -317,6 +414,13 @@ uses the platform TLS trust store, forces HTTP/1.1 with no keepalive, and sets
 httpcore retries to zero. Its network backend may try another validated address
 only while establishing a TCP connection; the custom HTTP transport adds no
 retry for an already-issued request after a write/read failure.
+
+The forbidden-header check is case-insensitive and includes protocol version,
+method/name/parameter, session/resume, content-negotiation, trace, and baggage
+headers. In particular, a manifest cannot override `MCP-Protocol-Version`,
+`Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`, session ids, `Last-Event-ID`,
+`traceparent`, `tracestate`, or `baggage`. Required protocol headers and reserved
+request `_meta` values are generated by the Host adapter.
 
 For non-local HTTP, the primitive first resolves every address and rejects the
 operation if any result is non-public. The SDK connection backend resolves and
@@ -359,6 +463,13 @@ blank-line frame boundary. Requests force `Accept-Encoding: identity`, and a
 response carrying any other `Content-Encoding` is rejected before decoding to
 avoid an encoded response expanding past the raw limit.
 
+The client advertises none of the unsupported callback capabilities. A server
+request for Sampling, Roots, Elicitation, subscriptions, or an extension is
+rejected without invoking Runtime behavior. A modern `InputRequiredResult` is
+returned as stable `mcp_input_required_unsupported` with
+`automatic_retry_disabled: true`; Agent libOS never registers an elicitation
+callback, persists its continuation state, or automatically retries it.
+
 ### Provider Result Bounds
 
 Objects returned by an MCP provider remain untrusted even when the provider is
@@ -372,8 +483,9 @@ tree and applies all of these bounds:
   `max_response_bytes`;
 - a live `tools/list` response contains at most `config.mcp.list_limit` tools
   (100 with `DEFAULT_CONFIG`), with unique non-empty names;
-- a non-empty MCP `nextCursor` is rejected as an incomplete catalog; v1 does
-  not return or follow continuation cursors;
+- For Manifest v1, a non-empty MCP `nextCursor` is rejected as an incomplete catalog;
+  Manifest v2 follows at most 16 pages and rejects malformed or repeated
+  cursors;
 - the canonical JSON encoding of the complete returned tool list, or of a call's
   `content` plus `structured_content`, cannot exceed `max_response_bytes`; and
 - provider byte receipts cannot exceed `max_response_bytes` or under-report
@@ -432,6 +544,12 @@ normal-sensitivity data, but the Sink remains unidentified and elevated
 clearance fails closed. The bundled `SdkMcpProvider` implements all three
 support contracts.
 
+Modern support is an optional `McpModernProtocolProvider` extension rather than
+a breaking change to those legacy signatures. A Manifest v2 operation requires
+that extension before dispatch. SDK-native response objects are detached into
+Agent libOS-owned result types at the Host boundary; they are never exposed as
+the public provider contract.
+
 ## External Effects
 
 A refreshed `list_tools` call first validates runtime environment values, then
@@ -470,7 +588,7 @@ mutation flag. Manifest classification cannot erase an earlier phase
 already observed by the composite operation.
 
 Checkpoint reports and benchmark evidence include both finalized and still
-pending MCP effects. v1 does not compensate remote MCP state.
+pending MCP effects. Neither manifest version compensates remote MCP state.
 
 Call-effect metadata includes the data-flow decision, trust generation/hash,
 label/source hashes, and exact Object source refs without persisting the raw
@@ -480,7 +598,8 @@ arguments as data-flow evidence.
 
 `call_mcp_tool`, `mcp.call`, the Python primitive, and `mcp call` expose the
 same `McpCallResult` fields: `server_id`, `tool_id`, `mcp_name`, `status`,
-`ok`, `result`, `error`, `response_bytes`, and `duration_s`.
+`ok`, `result`, `error`, `response_bytes`, `duration_s`, optional negotiated
+`connection`, and bounded phase receipts.
 
 | `status` | Meaning |
 | --- | --- |
@@ -489,6 +608,7 @@ same `McpCallResult` fields: `server_id`, `tool_id`, `mcp_name`, `status`,
 | `transport_error` | The provider or transport failed. This includes raw stdio frame/stdout and HTTP body/SSE-frame limit failures, because no safe materialized call-result receipt exists. An atomic provider also uses this status with `error_type: "LiveToolValidationError"` when combined live validation blocks dispatch. `error` is sanitized rather than exposing raw exception or credential text. |
 | `invalid_response` | The legacy two-call path records this status when mandatory live tool metadata is missing, malformed, or does not match a pinned manifest schema, then raises the validation/provider exception to the caller. |
 | `response_too_large` | A provider materialized a valid call result and returned a bounded, primitive-validated `too_large` receipt for canonical result content over the registered limit. Raw transport-limit failures are instead `transport_error`. |
+| `input_required_unsupported` | The server requested MRTR input, which this release cannot continue. The result is non-retryable; consequential or ambiguously mutating effects remain unknown and a linked Durable Task Run enters `needs_attention`. |
 
 Local argument/schema validation, capability, Human approval, data-flow,
 environment, and pre-provider resource failures are raised instead of encoded
@@ -506,6 +626,12 @@ refresh has `refreshed: true` and augments declared tool entries with matched
 live metadata; refresh failures are raised with a sanitized provider error
 instead of returning a partial tool list.
 
+`discover` returns configured mode, protocol era and exact revision,
+sessionless/fallback flags, bounded server name/version, and standard versus
+unsupported capability names. The same optional connection projection appears
+on successful live Tool listing and call results. It is current-operation
+diagnostic state: it is not written into the Store or reused across operations.
+
 ## CLI
 
 ```bash
@@ -513,6 +639,8 @@ uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
 uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml --replace
 uv run agent-libos --db .agent_libos.sqlite mcp list --text demo --limit 20
 uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
+# Manifest v2 with protocol_mode auto or 2026-07-28 only:
+uv run agent-libos --db .agent_libos.sqlite mcp discover demo-mcp
 uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp
 uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp --refresh
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
@@ -527,9 +655,10 @@ shipped at the repository root. The placeholder server/module and reserved
 HTTP hostname in the manifest examples will not make these commands a live
 remote demo.
 
-`mcp list` accepts `--text` and `--limit`; `mcp tools --refresh` performs the
-live provider operation described above. Registering with `--replace` requires
-`admin` rather than `write` on the exact server resource.
+`mcp list` accepts `--text` and `--limit`; `mcp discover` and
+`mcp tools --refresh` perform the protected live provider operations described
+above. Registering with `--replace` requires `admin` rather than `write` on the
+exact server resource.
 
 Registry commands accept the group-level `--actor-pid <pid>` before the
 subcommand to enforce that process's
@@ -579,6 +708,14 @@ The optional SDK-backed provider requires:
 uv sync --extra mcp --all-groups
 ```
 
+The extra installs Python MCP SDK `>=2.0,<3` plus the directly used bounded
+`httpx2`, `httpcore2`, and OpenTelemetry API dependencies. Agent libOS clears
+ambient trace and baggage context at the MCP adapter boundary, installs no
+exporter, and does not advertise an OpenTelemetry product capability. Reserved
+MCP negotiation/session/content headers, `Mcp-Param-*`, trace headers, and
+reserved protocol `_meta` keys are Host-generated and cannot be supplied by a
+manifest.
+
 ## Tools And Syscalls
 
 LLM tool interfaces, when bound in the complete process table and projected into
@@ -603,9 +740,14 @@ or raw MCP tool names.
 ## Persistence And Checkpoints
 
 MCP server specs are runtime store registry rows. Resolved secret values and
-their per-operation immutable snapshots are not persisted.
+their per-operation immutable snapshots are not persisted. Negotiated revision,
+server identity/capabilities, session handles, cursors, and protocol phase state
+are also operation-local and are not persisted as resumable MCP state.
 
 Checkpoint snapshots preserve process capabilities that reference MCP
 resources, but they do not copy or restore MCP server registry rows. Restore
 and fork can still load capability records, but later inspect/call operations
 fail closed if the current runtime does not have a matching registered server.
+They also never restore or reuse a prior MCP discovery/session; a later live
+operation performs a fresh governed negotiation against the current registry
+binding.

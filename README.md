@@ -137,9 +137,13 @@ The implementation currently includes:
   Per-item registry authority is checked before metadata lookup; registry row,
   stale-grant invalidation, event, and audit changes commit atomically.
 - Client-only MCP Tools through registered stdio or Streamable HTTP servers,
-  tool capabilities, provider-classified external effects, audit, and resource
-  accounting, with the same authority-before-lookup and transactional registry
-  semantics.
+  using Python MCP SDK v2 with explicit legacy/automatic/`2026-07-28`
+  negotiation. Tool capabilities, provider-classified external effects, audit,
+  and resource accounting retain the same authority-before-lookup and
+  transactional registry semantics.
+  The 1.2.1 surface remains client-only and Tools-only: MRTR/OAuth/listen,
+  Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OpenTelemetry
+  product support, and an MCP server surface are intentionally excluded.
 - A deterministic runtime-safety benchmark harness with 32 checked-in schema-v1
   tasks, including a self-evolution subset, baselines, evidence-backed
   side-effect oracle, fail-closed output validity, and explicit metric
@@ -191,8 +195,9 @@ Start here, then read the deeper references as needed:
   manifests, trust model, registration surfaces, CLI, and checkpoint behavior.
 - [docs/jsonrpc.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/jsonrpc.md): client-only JSON-RPC endpoint registry,
   capability resources, tools, syscalls, and checkpoint behavior.
-- [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md): client-only MCP server registry, tools-only v1
-  scope, capability resources, tools, syscalls, and checkpoint behavior.
+- [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md): client-only MCP server registry, Tools-only
+  Manifest v1/v2 scope, protocol negotiation, capability resources, and
+  checkpoint behavior.
 - [docs/skills.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/skills.md): standard `SKILL.md` packages,
   workspace/global sources, trust, activate/unload semantics, bundled JIT
   tools, and `swe-agent`.
@@ -299,9 +304,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.1.0-py3-none-any.whl dist/agent_libos-1.1.0.tar.gz
+  dist/agent_libos-1.2.1-py3-none-any.whl dist/agent_libos-1.2.1.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.1.0-py3-none-any.whl
+  dist/agent_libos-1.2.1-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -315,7 +320,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.1.0-py3-none-any.whl
+  --no-deps dist/agent_libos-1.2.1-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -328,7 +333,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.1.0.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.2.1.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -516,10 +521,10 @@ uv sync --frozen --all-groups --extra postgres
 uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
 ```
 
-Agent libOS 1.1.0 creates and opens only RuntimeStore schema v4. It rejects a
+Agent libOS 1.2.1 creates and opens only RuntimeStore schema v4. It rejects a
 schema-v3 store before initialization or any write; use Agent libOS 1.0.1 only
 to view or archive that store. There is no v3 migration, read-only bridge, or
-dual-schema mode in 1.1.0.
+dual-schema mode in 1.2.1.
 
 Both backends implement the same runtime store contract. Process metadata,
 capabilities, audit/events, messages, human requests, LLM call records,
@@ -761,6 +766,8 @@ Register and call a preconfigured MCP tool:
 uv sync --frozen --all-groups --extra mcp
 uv run agent-libos --db .agent_libos.sqlite mcp register <path-to-server-manifest.yaml>
 uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
+# Manifest v2 with protocol_mode auto or 2026-07-28 only:
+uv run agent-libos --db .agent_libos.sqlite mcp discover demo-mcp
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> <stdio_authority_resource-from-inspect> --rights execute
 uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mcp:forecast --rights read
@@ -769,6 +776,9 @@ uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --a
 
 Create the manifest from [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md); the angle-bracket path is
 user supplied. The `mcp` extra is not installed by the core Quick Start command.
+Manifest v1 remains a legacy-wire compatibility contract. Manifest v2 requires
+an explicit `protocol_mode` of `legacy`, `auto`, or `2026-07-28`; discovery and
+negotiated connection diagnostics are available only for the modern modes.
 
 The `process:spawn` and exact `mcp_stdio:<sha256>` grants are required only for
 stdio servers. Copy `stdio_authority_resource` from `mcp inspect`; do not derive

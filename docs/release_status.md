@@ -1,6 +1,6 @@
-# Agent libOS 1.1.0 Status
+# Agent libOS 1.2.1 Status
 
-Agent libOS 1.1.0 is a release candidate for the core Python runtime scope
+Agent libOS 1.2.1 is a release candidate for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release-ready status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -26,7 +26,7 @@ checkout or candidate artifact.
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;
   they do not introduce a generic workflow DSL or distributed scheduler.
-- RuntimeStore schema v4 is the only store format accepted by 1.1.0. A schema
+- RuntimeStore schema v4 is the only store format accepted by 1.2.1. A schema
   v3 store is rejected before initialization or any write and remains
   archive-only under 1.0.1; this release has no migration, read-only bridge, or
   dual-schema mode.
@@ -95,6 +95,17 @@ checkout or candidate artifact.
   unknown exchange costs conservatively, and expose only stable public error
   envelopes across primitive, JIT, Deno, ToolResult, and durable-result
   boundaries.
+- MCP uses Python SDK v2 while preserving Manifest v1 as a legacy-wire
+  compatibility contract. Manifest v2 explicitly selects `legacy`, `auto`, or
+  modern `2026-07-28`; discovery, pagination, live validation, and Tool call
+  phases share one absolute deadline, cumulative byte reservation, registry
+  fence, and bounded receipts. Ambiguous failures never masquerade as legacy
+  fallback, unsupported server capabilities never grant authority, and an
+  MRTR input request is non-retryable.
+- The MCP product surface remains client-only and Tools-only. This release does
+  not implement MRTR continuation, OAuth/keyring login,
+  `subscriptions/listen`, Resources, Prompts, Tasks, Apps, Roots, Sampling,
+  Logging, OpenTelemetry product support, or an MCP server surface.
 - A process exec operation covers the complete snapshot, publication, process,
   tool, boot, Skill, evidence, and compensation orchestration. Its terminal
   status is written only with the matching publication result. Host and worker
@@ -201,9 +212,11 @@ checkout or candidate artifact.
   checks, and the invariant manifest to pass. The checker must resolve every
   declared invariant against the current pytest collection.
 - The workflow requires the per-lane deterministic matrix to pass all selected
-  tests. PostgreSQL
-  service coverage and the complete MCP SDK integration file run in dedicated
-  gates; real remote MCP deployment and real-LLM coverage remain explicit
+  tests. PostgreSQL service coverage, the complete MCP transport, adapter, and
+  SDK integration files, and the applicable fixed-upstream Tools-client
+  conformance scenarios without
+  an expected-failure baseline run on Python 3.11 and 3.14 in dedicated gates;
+  real remote MCP deployment and real-LLM coverage remain explicit
   environment gates. Deterministic mocked MCP coverage is part of the normal
   matrix. Platform-specific skips stay documented and real Deno runs by default
   when installed.
@@ -291,7 +304,7 @@ checkout or candidate artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.1.0
+- The `release-artifacts` CI job is configured to build one canonical 1.2.1
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
@@ -311,7 +324,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.1.0 release evidence, and supports no call-count,
+observation, not Agent libOS 1.2.1 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -348,7 +361,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.1.0.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.2.1.
 
 ## Remaining environment gates and non-blocking debt
 
@@ -365,7 +378,8 @@ its reproducible report outside this status summary.
   GUI server are covered. Installer packaging, signing, and notarization are
   not configured.
 - Remote MCP server identity, real LLM, network proxy and TLS topology, and
-  provider credentials remain explicit opt-in gates. The Ubuntu MCP SDK gate
+  provider credentials remain explicit opt-in gates. The Ubuntu Python
+  3.11/3.14 MCP SDK gates
   and deterministic loopback evidence are not presented as deployment-specific
   real-provider evidence.
 - Real Git HTTPS/OpenSSH authentication and Host credential-manager variations

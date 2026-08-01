@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from functools import partial
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
@@ -23,6 +24,7 @@ from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.human.manager import HumanObjectManager
 from agent_libos.models import (
+    canonical_mcp_server_spec_json,
     CapabilityEffect,
     CapabilityRight,
     DataFlowContext,
@@ -34,14 +36,22 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
     McpCallResult,
     McpCallStatus,
+    McpConnectionInfo,
+    McpDiscoveryResult,
+    McpExchangePhase,
+    McpExchangeReceipt,
     McpHeaderSpec,
     McpHttpTransportSpec,
+    McpProtocolEra,
+    McpProtocolMode,
     McpProviderCallResult,
+    McpProviderDiscoveryResult,
     McpProviderTool,
     McpServerSpec,
     McpStdioTransportSpec,
     McpToolListResult,
     McpToolSpec,
+    mcp_server_spec_to_jsonable,
     ResourceUsage,
 )
 from agent_libos.models.exceptions import (
@@ -53,11 +63,13 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.models.external_effect import default_external_effect_rollback_status
+from agent_libos.models.mcp import mcp_runtime_secret_values
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.storage import UnitOfWork
 from agent_libos.substrate import (
     ExecutableSnapshot,
     executable_content_sha256,
+    McpModernProtocolProvider,
     McpProvider,
     McpSubprocessLimitsProvider,
     ProviderEffectNotStarted,
@@ -67,6 +79,7 @@ from agent_libos.substrate import (
 from agent_libos.substrate.local import (
     _allowed_mcp_connect_addresses,
     _bounded_mcp_content,
+    SdkMcpProvider,
 )
 from agent_libos.sdk import (
     ProviderEffectNotStartedResult,
@@ -80,13 +93,37 @@ from agent_libos.sdk import (
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.public_errors import provider_error_envelope_from_mapping
+from agent_libos.utils.redaction import redact_sensitive_text
 from agent_libos.utils.serde import bounded_json_loads, dumps, to_jsonable
 from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]*$")
 _ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _HEADER_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
-_FORBIDDEN_HEADERS = {"connection", "content-length", "host", "transfer-encoding", "upgrade"}
+_LEGACY_FORBIDDEN_HEADERS = {
+    "connection",
+    "content-length",
+    "host",
+    "transfer-encoding",
+    "upgrade",
+}
+_MODERN_FORBIDDEN_HEADERS = _LEGACY_FORBIDDEN_HEADERS | {
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "baggage",
+    "content-encoding",
+    "content-language",
+    "content-type",
+    "last-event-id",
+    "mcp-method",
+    "mcp-name",
+    "mcp-protocol-version",
+    "mcp-session-id",
+    "traceparent",
+    "tracestate",
+}
 _FORBIDDEN_MCP_HOSTS = {"metadata.google.internal"}
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _CALL_RIGHTS = {CapabilityRight.READ.value, CapabilityRight.WRITE.value, CapabilityRight.EXECUTE.value}
@@ -102,6 +139,19 @@ _INVALID_MCP_TEXT_JSON = object()
 _MCP_PROVIDER_JSON_MAX_DEPTH = 128
 _MCP_PROVIDER_JSON_MAX_NODES = 100_000
 _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER = 4
+_MCP_V2_DYNAMIC_REFERENCE_KEYS = {
+    "$dynamicAnchor",
+    "$dynamicRef",
+    "$recursiveAnchor",
+    "$recursiveRef",
+}
+_MCP_RELEASE_PROTOCOL_REVISIONS = {
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "2026-07-28",
+}
 _SERVER_FIELDS = {
     "schema_version",
     "server_id",
@@ -113,6 +163,7 @@ _SERVER_FIELDS = {
     "max_request_bytes",
     "max_response_bytes",
     "metadata",
+    "protocol_mode",
 }
 _STDIO_FIELDS = {"command", "args", "env", "cwd"}
 _HTTP_FIELDS = {"url", "headers"}
@@ -154,6 +205,46 @@ def _provider_result_was_returned(error: BaseException) -> bool:
     except Exception:
         return False
     return attributes.get(_PROVIDER_RESULT_RETURNED_ATTR) is True
+
+
+def _wire_failure_evidence(
+    error: BaseException,
+) -> tuple[bool, tuple[McpExchangeReceipt, ...], McpConnectionInfo | None]:
+    """Read inert, operation-local wire evidence from an exception chain."""
+
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    certified = False
+    receipts: tuple[McpExchangeReceipt, ...] = ()
+    connection: McpConnectionInfo | None = None
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        try:
+            attributes = object.__getattribute__(current, "__dict__")
+        except Exception:
+            attributes = {}
+        if attributes.get("_agent_libos_mcp_wire_evidence") is True:
+            certified = True
+            candidate = attributes.get("_agent_libos_mcp_receipts", ())
+            if (
+                type(candidate) is tuple
+                and all(isinstance(item, McpExchangeReceipt) for item in candidate)
+                and len(candidate) >= len(receipts)
+            ):
+                receipts = candidate
+            candidate_connection = attributes.get("_agent_libos_mcp_connection")
+            if isinstance(candidate_connection, McpConnectionInfo):
+                connection = candidate_connection
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return certified, receipts, connection
 
 
 class _McpLiveToolValidationError(ValidationError):
@@ -367,8 +458,8 @@ def _decode_mcp_text_json(value: str) -> Any:
 
 def _json_values_equivalent(left: Any, right: Any) -> bool:
     try:
-        return dumps(left) == dumps(right)
-    except (TypeError, ValueError, RecursionError):
+        return dumps(left).encode("utf-8") == dumps(right).encode("utf-8")
+    except (TypeError, ValueError, RecursionError, UnicodeEncodeError):
         return False
 
 
@@ -586,6 +677,287 @@ class McpPrimitive:
         spec, metadata = self._load_server(server_id)
         return self._server_to_json(spec, metadata, include_sensitive_fields=include_sensitive_fields)
 
+    def discover(
+        self,
+        server_id: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+    ) -> McpDiscoveryResult:
+        """Perform one governed, operation-local MCP modern discovery."""
+
+        try:
+            return self._discover(
+                server_id,
+                actor=actor,
+                require_capability=require_capability,
+            )
+        except ProviderEffectNotStarted as error:
+            raise self._safe_not_started_error(error) from None
+
+    def _discover(
+        self,
+        server_id: str,
+        *,
+        actor: str | None,
+        require_capability: bool,
+    ) -> McpDiscoveryResult:
+        authority_decisions: list[Any] = []
+        if require_capability and actor is not None:
+            authority_decisions.append(
+                self.capabilities.require(
+                    actor,
+                    self.server_resource(server_id),
+                    CapabilityRight.READ,
+                    consume=False,
+                )
+            )
+        spec, _metadata = self._load_server(server_id)
+        mode = self._effective_protocol_mode(spec)
+        if spec.schema_version != 2 or mode is McpProtocolMode.LEGACY:
+            raise ValidationError(
+                "MCP discover requires Manifest v2 protocol_mode auto or 2026-07-28"
+            )
+        self._require_modern_protocol_provider(spec)
+        if require_capability and actor is not None:
+            authority_decisions.append(
+                self.capabilities.require(
+                    actor,
+                    self.server_resource(server_id),
+                    CapabilityRight.EXECUTE,
+                    consume=False,
+                )
+            )
+            authority_decisions.extend(
+                self._require_stdio_process_spawn(actor, spec, consume=False)
+            )
+        effect_actor = actor or "runtime"
+        usage_pid = self._resource_usage_pid(actor)
+        request_bytes = len(
+            dumps(
+                {"method": "server/discover", "server_id": spec.server_id}
+            ).encode("utf-8")
+        )
+        if request_bytes > spec.max_request_bytes:
+            raise ValidationError(
+                "MCP discover request exceeds "
+                f"max_request_bytes={spec.max_request_bytes}"
+            )
+        effect_context = self._discover_effect_context(
+            spec,
+            request_bytes=request_bytes,
+        )
+        request_flow = (
+            self._data_flow().current_context()
+            if actor is not None
+            else DataFlowContext(
+                labels=DataLabels(
+                    sensitivity="public",
+                    trust_level="verified",
+                    integrity="verified",
+                    origin="runtime:mcp-discover-metadata",
+                )
+            )
+        )
+        runtime_environment = self._require_runtime_environment(spec)
+        stdio_identity = self._stdio_executable_identity(
+            spec,
+            runtime_environment=runtime_environment,
+        )
+        sink = DataSink(
+            f"mcp:{server_id}:discover",
+            self._discover_identity_sha256(
+                spec,
+                stdio_executable=stdio_identity,
+            ),
+        )
+        contract_name = (
+            "primitive.mcp.discover"
+            if authority_decisions
+            else "primitive.mcp.discover.internal"
+        )
+        registry_binding = self._registry_binding_for_server_spec(spec)
+        invocation = self._discover_invocation(
+            server_id=server_id,
+            spec=spec,
+            effect_actor=effect_actor,
+            authority_decisions=authority_decisions,
+            usage_pid=usage_pid,
+            request_bytes=request_bytes,
+            effect_context=effect_context,
+            request_flow=request_flow,
+            runtime_environment=runtime_environment,
+            sink=sink,
+            registry_binding=registry_binding,
+        )
+        with self._protected().start(
+            contract_name,
+            invocation,
+            provider=self.provider,
+        ) as protected:
+            deadline = time.monotonic() + spec.timeout_s
+            if spec.transport == "streamable_http":
+                observes_host = self._runtime_resolution_observes_host(spec)
+                protected.call(
+                    ProviderPhase(
+                        "dns_resolution",
+                        information_flow=observes_host,
+                        commits_authority=observes_host,
+                    ),
+                    self._validate_runtime_resolution,
+                    spec,
+                    deadline=deadline,
+                )
+            executable_snapshot = self._stdio_snapshot_for_dispatch(
+                pid=effect_actor,
+                spec=spec,
+                expected_identity=stdio_identity,
+                sink=sink,
+                context=request_flow,
+                payload={"method": "server/discover", "server_id": server_id},
+                runtime_environment=runtime_environment,
+            )
+            try:
+                provider_result = protected.call(
+                    ProviderPhase(
+                        "provider_not_started_after_dns",
+                        information_flow=True,
+                    ),
+                    self._invoke_discover_provider,
+                    spec,
+                    deadline=deadline,
+                    pid=effect_actor,
+                    executable_snapshot=executable_snapshot,
+                    runtime_environment=runtime_environment,
+                )
+            finally:
+                if executable_snapshot is not None:
+                    executable_snapshot.close()
+            if self._registry_binding_context(server_id) != registry_binding:
+                raise CapabilityDenied(
+                    "MCP server registry changed during protocol discovery"
+                )
+            result = McpDiscoveryResult(
+                server_id=spec.server_id,
+                connection=provider_result.connection,
+                request_bytes=provider_result.request_bytes,
+                response_bytes=provider_result.response_bytes,
+                duration_s=provider_result.duration_s,
+                receipts=provider_result.receipts,
+            )
+            result_payload = {
+                "ok": True,
+                "status": "ok",
+                "request_bytes": result.request_bytes,
+                "response_bytes": result.response_bytes,
+                "duration_s": result.duration_s,
+                "connection": to_jsonable(result.connection),
+                "receipts": to_jsonable(result.receipts),
+            }
+            return protected.complete(
+                result,
+                self._protected_discover_evidence(
+                    effect_actor,
+                    spec,
+                    effect_context,
+                    result_payload,
+                ),
+                classification_context=effect_context,
+                classification_result=result_payload,
+                resource=(
+                    ResourceSettlement(
+                        usage=ResourceUsage(
+                            mcp_request_bytes=result.request_bytes,
+                            mcp_response_bytes=result.response_bytes,
+                        ),
+                        source="primitive.mcp.discover",
+                        context={
+                            "server_id": server_id,
+                            "request_bytes": result.request_bytes,
+                            "response_bytes": result.response_bytes,
+                            "protocol_revision": result.connection.protocol_revision,
+                        },
+                    )
+                    if usage_pid is not None
+                    else None
+                ),
+            )
+
+    def _discover_invocation(
+        self,
+        *,
+        server_id: str,
+        spec: McpServerSpec,
+        effect_actor: str,
+        authority_decisions: list[Any],
+        usage_pid: str | None,
+        request_bytes: int,
+        effect_context: dict[str, Any],
+        request_flow: DataFlowContext,
+        runtime_environment: Mapping[str, str],
+        sink: DataSink,
+        registry_binding: ProviderRegistryBinding,
+    ) -> ProtectedOperationInvocation:
+        return ProtectedOperationInvocation(
+            pid=effect_actor,
+            actor=effect_actor,
+            target=self.server_resource(server_id),
+            decisions=tuple(authority_decisions),
+            canonical_args=effect_context,
+            observation=effect_context,
+            reservation_usage=(
+                ResourceUsage(
+                    mcp_request_bytes=spec.max_request_bytes,
+                    mcp_response_bytes=spec.max_response_bytes,
+                )
+                if usage_pid is not None
+                else None
+            ),
+            resource_source="primitive.mcp.discover",
+            resource_context={
+                "server_id": server_id,
+                "request_bytes": request_bytes,
+            },
+            **self._protected_registry_guard(
+                registry_binding,
+                server_id,
+            ),
+            data_sink=sink,
+            data_sink_revalidator=lambda: self._discover_data_sink(
+                server_id,
+                spec,
+                runtime_environment,
+            ),
+            data_flow_context=request_flow,
+            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                request_flow,
+                origin="external:mcp",
+            ),
+            data_flow_payload={"method": "server/discover", "server_id": server_id},
+            data_flow_operation="mcp.discover",
+            failure_evidence=lambda error, phase: self._protected_discover_failure_evidence(
+                effect_actor,
+                spec,
+                effect_context,
+                error,
+                phase,
+            ),
+        )
+
+    async def adiscover(
+        self,
+        server_id: str,
+        *,
+        actor: str | None = None,
+        require_capability: bool = True,
+    ) -> McpDiscoveryResult:
+        return await self._data_flow().run_sync_in_worker(
+            self.discover,
+            server_id,
+            actor=actor,
+            require_capability=require_capability,
+        )
+
     def list_tools(
         self,
         server_id: str,
@@ -623,153 +995,315 @@ class McpPrimitive:
             if refresh:
                 authority_decisions.append(read_decision)
         spec, _metadata = self._load_server(server_id)
+        if refresh:
+            # Manifest v2 is an explicit provider-contract boundary, including
+            # its legacy mode. Fence an unmarked provider before the refresh
+            # path can resolve DNS, snapshot/spawn stdio, or dispatch I/O.
+            self._require_modern_protocol_provider(spec)
         live_by_name: dict[str, McpProviderTool] = {}
         live_response_bytes = 0
+        live_connection: McpConnectionInfo | None = None
+        live_receipts: tuple[McpExchangeReceipt, ...] = ()
         if refresh:
-            effect_actor = actor or "runtime"
-            usage_pid = self._resource_usage_pid(actor)
-            if require_capability and actor is not None:
-                authority_decisions.append(
-                    self.capabilities.require(
-                        actor,
-                        self.server_resource(server_id),
-                        CapabilityRight.EXECUTE,
-                        consume=False,
-                    )
-                )
-                authority_decisions.extend(self._require_stdio_process_spawn(actor, spec, consume=False))
-            runtime_environment = self._require_runtime_environment(spec)
-            request_bytes = len(dumps({"method": "tools/list", "server_id": spec.server_id}).encode("utf-8"))
-            if request_bytes > spec.max_request_bytes:
-                raise ValidationError(f"MCP list_tools request exceeds max_request_bytes={spec.max_request_bytes}")
-            effect_context = self._list_tools_effect_context(spec, request_bytes=request_bytes)
-            contract_name = (
-                "primitive.mcp.list_tools"
-                if authority_decisions
-                else "primitive.mcp.list_tools.internal"
+            result = self._refresh_list_tools(
+                server_id,
+                actor=actor,
+                require_capability=require_capability,
+                spec=spec,
+                authority_decisions=authority_decisions,
             )
-            resource_context = {"server_id": server_id, "request_bytes": request_bytes}
-            request_flow = (
-                self._data_flow().current_context()
-                if actor is not None
-                else DataFlowContext(
-                    labels=DataLabels(
-                        sensitivity="public",
-                        trust_level="verified",
-                        integrity="verified",
-                        origin="runtime:mcp-list-tools-metadata",
-                    )
-                )
-            )
-            stdio_executable_identity = self._stdio_executable_identity(
-                spec,
-                runtime_environment=runtime_environment,
-            )
-            list_sink = DataSink(
-                f"mcp:{server_id}:list_tools",
-                self._list_tools_identity_sha256(
-                    spec,
-                    stdio_executable=stdio_executable_identity,
-                ),
-            )
-            invocation = ProtectedOperationInvocation(
-                pid=effect_actor,
-                actor=effect_actor,
-                target=self.server_resource(spec.server_id),
-                decisions=tuple(authority_decisions),
-                canonical_args=effect_context,
-                observation=effect_context,
-                reservation_usage=(
-                    ResourceUsage(
-                        mcp_request_bytes=request_bytes,
-                        mcp_response_bytes=spec.max_response_bytes,
-                    )
-                    if usage_pid is not None
-                    else None
-                ),
-                resource_source="primitive.mcp.list_tools",
-                resource_context=resource_context,
-                **self._protected_registry_guard(self._registry_binding_for_server_spec(spec), server_id),
-                data_sink=list_sink,
-                data_sink_revalidator=lambda: self._list_tools_data_sink(
-                    server_id, spec, runtime_environment
-                ),
-                data_flow_context=request_flow,
-                data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
-                    request_flow,
-                    origin="external:mcp",
-                ),
-                data_flow_payload={"method": "tools/list", "server_id": server_id},
-                data_flow_operation="mcp.list_tools",
-                failure_evidence=lambda error, phase: self._protected_list_failure_evidence(effect_actor, spec, effect_context, error, phase),
-            )
-            with self._protected().start(contract_name, invocation, provider=self.provider) as protected:
-                started = time.monotonic()
-                deadline = started + spec.timeout_s
-                result, provider_error = self._dispatch_list_tools(
-                    protected,
-                    spec,
-                    deadline=deadline,
-                    pid=effect_actor,
-                    expected_identity=stdio_executable_identity,
-                    sink=list_sink,
-                    context=request_flow,
-                    payload={"method": "tools/list", "server_id": server_id},
-                    runtime_environment=runtime_environment,
-                )
-                if provider_error is not None:
-                    result_payload = self._list_tools_failure_payload(
-                        provider_error,
-                        duration_s=time.monotonic() - started,
-                    )
-                    protected.complete(
-                        result_payload,
-                        self._protected_list_evidence(effect_actor, spec, effect_context, result_payload),
-                        classification_context=effect_context,
-                        classification_result=result_payload,
-                        resource=(
-                            ResourceSettlement(
-                                usage=ResourceUsage(mcp_request_bytes=request_bytes),
-                                source="primitive.mcp.list_tools",
-                                context={**resource_context, "response_bytes": 0, "status": result_payload["status"]},
-                                charge_reserved_maximum=True,
-                            )
-                            if usage_pid is not None
-                            else None
-                        ),
-                    )
-                    raise provider_error
-                live_response_bytes = result.response_bytes
-                live_by_name = {tool.name: tool for tool in result.tools}
-                result_payload = self._list_tools_success_payload(result)
-                protected.complete(
-                    result,
-                    self._protected_list_evidence(effect_actor, spec, effect_context, result_payload),
-                    classification_context=effect_context,
-                    classification_result=result_payload,
-                    resource=(
-                        ResourceSettlement(
-                            usage=ResourceUsage(
-                                mcp_request_bytes=request_bytes,
-                                mcp_response_bytes=live_response_bytes,
-                            ),
-                            source="primitive.mcp.list_tools",
-                            context={**resource_context, "response_bytes": live_response_bytes},
-                        )
-                        if usage_pid is not None
-                        else None
-                    ),
-                )
+            live_response_bytes = result.response_bytes
+            live_connection = result.connection
+            live_receipts = result.receipts
+            live_by_name = {tool.name: tool for tool in result.tools}
         return {
             "server_id": spec.server_id,
+            "schema_version": spec.schema_version,
             "transport": spec.transport,
+            "protocol_mode": self._effective_protocol_mode(spec).value,
             "tools": [
                 self._tool_to_json(spec.server_id, tool, live=live_by_name.get(tool.mcp_name) if refresh else None)
                 for tool in spec.tools
             ],
             "refreshed": refresh,
             "response_bytes": live_response_bytes,
+            **(
+                {
+                    "connection": to_jsonable(live_connection),
+                    "receipts": to_jsonable(live_receipts),
+                }
+                if live_connection is not None
+                else {}
+            ),
         }
+
+    def _refresh_list_tools(
+        self,
+        server_id: str,
+        *,
+        actor: str | None,
+        require_capability: bool,
+        spec: McpServerSpec,
+        authority_decisions: list[Any],
+    ) -> McpToolListResult:
+        effect_actor = actor or "runtime"
+        usage_pid = self._resource_usage_pid(actor)
+        if require_capability and actor is not None:
+            authority_decisions.append(
+                self.capabilities.require(
+                    actor,
+                    self.server_resource(server_id),
+                    CapabilityRight.EXECUTE,
+                    consume=False,
+                )
+            )
+            authority_decisions.extend(
+                self._require_stdio_process_spawn(actor, spec, consume=False)
+            )
+        runtime_environment = self._require_runtime_environment(spec)
+        request_payload = {"method": "tools/list", "server_id": spec.server_id}
+        request_bytes = len(dumps(request_payload).encode("utf-8"))
+        if request_bytes > spec.max_request_bytes:
+            raise ValidationError(
+                f"MCP list_tools request exceeds max_request_bytes={spec.max_request_bytes}"
+            )
+        effect_context = self._list_tools_effect_context(
+            spec,
+            request_bytes=request_bytes,
+        )
+        resource_context = {"server_id": server_id, "request_bytes": request_bytes}
+        request_flow = self._list_tools_request_flow(actor)
+        stdio_executable_identity = self._stdio_executable_identity(
+            spec,
+            runtime_environment=runtime_environment,
+        )
+        list_sink = DataSink(
+            f"mcp:{server_id}:list_tools",
+            self._list_tools_identity_sha256(
+                spec,
+                stdio_executable=stdio_executable_identity,
+            ),
+        )
+        invocation = self._list_tools_invocation(
+            server_id=server_id,
+            effect_actor=effect_actor,
+            spec=spec,
+            authority_decisions=authority_decisions,
+            effect_context=effect_context,
+            request_bytes=request_bytes,
+            resource_context=resource_context,
+            usage_pid=usage_pid,
+            runtime_environment=runtime_environment,
+            request_flow=request_flow,
+            list_sink=list_sink,
+            request_payload=request_payload,
+        )
+        contract_name = (
+            "primitive.mcp.list_tools"
+            if authority_decisions
+            else "primitive.mcp.list_tools.internal"
+        )
+        with self._protected().start(
+            contract_name,
+            invocation,
+            provider=self.provider,
+        ) as protected:
+            started = time.monotonic()
+            result, provider_error = self._dispatch_list_tools(
+                protected,
+                spec,
+                deadline=started + spec.timeout_s,
+                pid=effect_actor,
+                expected_identity=stdio_executable_identity,
+                sink=list_sink,
+                context=request_flow,
+                payload=request_payload,
+                runtime_environment=runtime_environment,
+            )
+            if provider_error is not None:
+                self._complete_list_tools_failure(
+                    protected,
+                    provider_error,
+                    effect_actor=effect_actor,
+                    spec=spec,
+                    effect_context=effect_context,
+                    resource_context=resource_context,
+                    request_bytes=request_bytes,
+                    usage_pid=usage_pid,
+                    started=started,
+                )
+                raise provider_error
+            self._complete_list_tools_success(
+                protected,
+                result,
+                effect_actor=effect_actor,
+                spec=spec,
+                effect_context=effect_context,
+                resource_context=resource_context,
+                request_bytes=request_bytes,
+                usage_pid=usage_pid,
+            )
+            return result
+
+    def _list_tools_request_flow(self, actor: str | None) -> DataFlowContext:
+        if actor is not None:
+            return self._data_flow().current_context()
+        return DataFlowContext(
+            labels=DataLabels(
+                sensitivity="public",
+                trust_level="verified",
+                integrity="verified",
+                origin="runtime:mcp-list-tools-metadata",
+            )
+        )
+
+    def _list_tools_invocation(
+        self,
+        *,
+        server_id: str,
+        effect_actor: str,
+        spec: McpServerSpec,
+        authority_decisions: list[Any],
+        effect_context: dict[str, Any],
+        request_bytes: int,
+        resource_context: dict[str, Any],
+        usage_pid: str | None,
+        runtime_environment: Mapping[str, str],
+        request_flow: DataFlowContext,
+        list_sink: DataSink,
+        request_payload: dict[str, str],
+    ) -> ProtectedOperationInvocation:
+        reservation_usage = None
+        if usage_pid is not None:
+            reservation_usage = ResourceUsage(
+                mcp_request_bytes=(
+                    spec.max_request_bytes
+                    if spec.schema_version == 2
+                    else request_bytes
+                ),
+                mcp_response_bytes=spec.max_response_bytes,
+            )
+        return ProtectedOperationInvocation(
+            pid=effect_actor,
+            actor=effect_actor,
+            target=self.server_resource(spec.server_id),
+            decisions=tuple(authority_decisions),
+            canonical_args=effect_context,
+            observation=effect_context,
+            reservation_usage=reservation_usage,
+            resource_source="primitive.mcp.list_tools",
+            resource_context=resource_context,
+            **self._protected_registry_guard(
+                self._registry_binding_for_server_spec(spec),
+                server_id,
+            ),
+            data_sink=list_sink,
+            data_sink_revalidator=lambda: self._list_tools_data_sink(
+                server_id,
+                spec,
+                runtime_environment,
+            ),
+            data_flow_context=request_flow,
+            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                request_flow,
+                origin="external:mcp",
+            ),
+            data_flow_payload=request_payload,
+            data_flow_operation="mcp.list_tools",
+            failure_evidence=lambda error, phase: self._protected_list_failure_evidence(
+                effect_actor,
+                spec,
+                effect_context,
+                error,
+                phase,
+            ),
+        )
+
+    def _complete_list_tools_failure(
+        self,
+        protected: Any,
+        provider_error: Exception,
+        *,
+        effect_actor: str,
+        spec: McpServerSpec,
+        effect_context: dict[str, Any],
+        resource_context: dict[str, Any],
+        request_bytes: int,
+        usage_pid: str | None,
+        started: float,
+    ) -> None:
+        result_payload = self._list_tools_failure_payload(
+            provider_error,
+            duration_s=time.monotonic() - started,
+        )
+        settlement = None
+        if usage_pid is not None:
+            settlement = ResourceSettlement(
+                usage=ResourceUsage(mcp_request_bytes=request_bytes),
+                source="primitive.mcp.list_tools",
+                context={
+                    **resource_context,
+                    "response_bytes": 0,
+                    "status": result_payload["status"],
+                },
+                charge_reserved_maximum=True,
+            )
+        protected.complete(
+            result_payload,
+            self._protected_list_evidence(
+                effect_actor,
+                spec,
+                effect_context,
+                result_payload,
+            ),
+            classification_context=effect_context,
+            classification_result=result_payload,
+            resource=settlement,
+        )
+
+    def _complete_list_tools_success(
+        self,
+        protected: Any,
+        result: McpToolListResult,
+        *,
+        effect_actor: str,
+        spec: McpServerSpec,
+        effect_context: dict[str, Any],
+        resource_context: dict[str, Any],
+        request_bytes: int,
+        usage_pid: str | None,
+    ) -> None:
+        result_payload = self._list_tools_success_payload(result)
+        settlement = None
+        if usage_pid is not None:
+            settled_request_bytes = request_bytes
+            settled_response_bytes = result.response_bytes
+            if spec.schema_version == 2 and result.receipts:
+                settled_request_bytes = sum(item.request_bytes for item in result.receipts)
+                settled_response_bytes = sum(item.response_bytes for item in result.receipts)
+            settlement = ResourceSettlement(
+                usage=ResourceUsage(
+                    mcp_request_bytes=settled_request_bytes,
+                    mcp_response_bytes=settled_response_bytes,
+                ),
+                source="primitive.mcp.list_tools",
+                context={
+                    **resource_context,
+                    "response_bytes": result.response_bytes,
+                },
+            )
+        protected.complete(
+            result,
+            self._protected_list_evidence(
+                effect_actor,
+                spec,
+                effect_context,
+                result_payload,
+            ),
+            classification_context=effect_context,
+            classification_result=result_payload,
+            resource=settlement,
+        )
 
     async def alist_tools(
         self,
@@ -857,51 +1391,25 @@ class McpPrimitive:
         *,
         source_oids: list[str] | tuple[str, ...] | None = None,
     ) -> McpCallResult:
-        resource, selected_args, spec, tool, registry_binding = (
-            self._resolve_tool_call_target(
-                pid,
-                server_id,
-                tool_id,
-                arguments,
-                source_oids=source_oids,
-            )
-        )
-        operation_context = self._operation_context(
-            pid,
+        (
+            resource,
+            selected_args,
             spec,
             tool,
-            selected_args,
-            registry_binding=registry_binding,
-        )
-        flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
-        (
+            registry_binding,
+            operation_context,
+            flow_context,
             sink,
             decision,
             auxiliary_decisions,
             stdio_identity,
             stdio_target_environment,
-        ) = self._authorize_and_resolve_call_sink(
-            pid=pid,
-            server_id=server_id,
-            resource=resource,
-            spec=spec,
-            tool=tool,
-            arguments=selected_args,
-            operation_context=operation_context,
-            flow_context=flow_context,
-            source_oids=source_oids,
-        )
-        profile = self.capabilities.profiles.mcp(
-            resource=resource,
-            effect=decision.effect or CapabilityEffect.DENY,
+        ) = self._prepare_tool_call(
+            pid,
             server_id=server_id,
             tool_id=tool_id,
-        )
-        self._attach_call_authority_context(
-            operation_context,
-            decision=decision,
-            auxiliary_decisions=auxiliary_decisions,
-            profile=profile,
+            arguments=arguments,
+            source_oids=source_oids,
         )
         request_bytes = len(dumps({"name": tool.mcp_name, "arguments": selected_args}).encode("utf-8"))
         if request_bytes > spec.max_request_bytes:
@@ -935,8 +1443,16 @@ class McpPrimitive:
             canonical_args=operation_context,
             observation=effect_context,
             reservation_usage=ResourceUsage(
-                mcp_request_bytes=list_request_bytes + request_bytes,
-                mcp_response_bytes=spec.max_response_bytes * 2,
+                mcp_request_bytes=(
+                    spec.max_request_bytes
+                    if spec.schema_version == 2
+                    else list_request_bytes + request_bytes
+                ),
+                mcp_response_bytes=(
+                    spec.max_response_bytes
+                    if spec.schema_version == 2
+                    else spec.max_response_bytes * 2
+                ),
             ),
             resource_source="primitive.mcp.call",
             resource_context=resource_context,
@@ -987,54 +1503,25 @@ class McpPrimitive:
                     runtime_environment=runtime_environment,
                 )
 
-                def invoke_validated_tool() -> Any:
-                    try:
-                        provider_kwargs = self._provider_dispatch_kwargs(
-                            spec,
-                            deadline=deadline,
-                            pid=pid,
-                            runtime_environment=runtime_environment,
-                            executable_snapshot=executable_snapshot,
-                        )
-                        raw_result = validate_and_call(
-                            spec,
-                            tool,
-                            selected_args,
-                            **provider_kwargs,
-                        )
-                        return self._validated_provider_call_result(spec, raw_result)
-                    except ProviderEffectNotStarted as error:
-                        return ProviderEffectNotStartedResult(
-                            error=error,
-                            outcome="validate_and_call_not_started",
-                            result=McpProviderCallResult(
-                                error="provider call did not start",
-                                error_type=type(error).__name__,
-                                correlation_id=new_id("corr"),
-                                duration_s=time.monotonic() - started,
-                                call_started=False,
-                            ),
-                        )
-                    except ProviderHostError:
-                        raise
-                    except Exception as error:
-                        raise ProviderHostError(
-                            code="mcp_provider_error",
-                            error_type=type(error).__name__,
-                            correlation_id=new_id("corr"),
-                        ) from None
-
-                try:
-                    provider_outcome = protected.call(
-                        ProviderPhase(
-                            "provider_validate_and_call",
-                            state_mutation=tool.state_mutation, information_flow=True,
-                        ),
-                        invoke_validated_tool,
-                    )
-                finally:
-                    if executable_snapshot is not None:
-                        executable_snapshot.close()
+                invoke_validated_tool = partial(
+                    self._invoke_validated_provider_tool,
+                    validate_and_call,
+                    spec,
+                    tool,
+                    selected_args,
+                    deadline=deadline,
+                    pid=pid,
+                    runtime_environment=runtime_environment,
+                    executable_snapshot=executable_snapshot,
+                    started=started,
+                )
+                provider_outcome, wire_bound_combined_provider = self._dispatch_validated_provider_call(
+                    protected,
+                    invoke_validated_tool,
+                    server=spec,
+                    tool=tool,
+                    executable_snapshot=executable_snapshot,
+                )
                 if isinstance(provider_outcome, ProviderEffectNotStartedResult):
                     return self._call_result_from_provider(
                         spec,
@@ -1043,18 +1530,24 @@ class McpPrimitive:
                     )
                 provider_result = provider_outcome
                 result = self._call_result_from_provider(spec, tool, provider_result)
-                classification_override = None
-                if not provider_result.call_started:
-                    classification_override = ExternalEffectClassification(
-                        rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
-                        rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
-                        state_mutation=False,
-                        information_flow=True,
-                        metadata={
-                            "outcome": "live_validation_failed_before_call",
-                            "phase": "live_validation",
-                        },
-                    )
+                classification_override = self._pre_call_failure_classification_override(
+                    spec,
+                    tool,
+                    provider_result,
+                    wire_bound_combined_provider=wire_bound_combined_provider,
+                )
+                post_call_override = self._post_call_failure_classification_override(
+                    tool,
+                    provider_result,
+                )
+                if post_call_override is not None:
+                    classification_override = post_call_override
+                input_required_override = self._input_required_classification_override(
+                    tool,
+                    provider_result,
+                )
+                if input_required_override is not None:
+                    classification_override = input_required_override
                 return protected.complete(
                     result,
                     self._protected_call_evidence(pid, resource, result, tool, operation_context),
@@ -1143,7 +1636,14 @@ class McpPrimitive:
                         selected_args,
                         **provider_kwargs,
                     )
-                    return self._validated_provider_call_result(spec, raw_result), None
+                    return (
+                        self._validated_provider_call_result(
+                            spec,
+                            raw_result,
+                            runtime_environment=runtime_environment,
+                        ),
+                        None,
+                    )
                 except ProviderEffectNotStarted as error:
                     return ProviderEffectNotStartedResult(
                         error=error,
@@ -1204,6 +1704,12 @@ class McpPrimitive:
                 return result
             provider_result, classification_override = provider_outcome
             result = self._call_result_from_provider(spec, tool, provider_result)
+            input_required_override = self._input_required_classification_override(
+                tool,
+                provider_result,
+            )
+            if input_required_override is not None:
+                classification_override = input_required_override
             completed = protected.complete(
                 result,
                 self._protected_call_evidence(pid, resource, result, tool, operation_context),
@@ -1223,6 +1729,89 @@ class McpPrimitive:
                 ),
             )
             return completed
+
+    def _prepare_tool_call(
+        self,
+        pid: str,
+        *,
+        server_id: str,
+        tool_id: str,
+        arguments: Any,
+        source_oids: list[str] | tuple[str, ...] | None,
+    ) -> tuple[
+        str,
+        dict[str, Any],
+        McpServerSpec,
+        McpToolSpec,
+        dict[str, Any],
+        dict[str, Any],
+        DataFlowContext,
+        DataSink,
+        Any,
+        list[Any],
+        dict[str, str] | None,
+        Mapping[str, str],
+    ]:
+        resource, selected_args, spec, tool, registry_binding = (
+            self._resolve_tool_call_target(
+                pid,
+                server_id,
+                tool_id,
+                arguments,
+                source_oids=source_oids,
+            )
+        )
+        operation_context = self._operation_context(
+            pid,
+            spec,
+            tool,
+            selected_args,
+            registry_binding=registry_binding,
+        )
+        flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
+        (
+            sink,
+            decision,
+            auxiliary_decisions,
+            stdio_identity,
+            stdio_target_environment,
+        ) = self._authorize_and_resolve_call_sink(
+            pid=pid,
+            server_id=server_id,
+            resource=resource,
+            spec=spec,
+            tool=tool,
+            arguments=selected_args,
+            operation_context=operation_context,
+            flow_context=flow_context,
+            source_oids=source_oids,
+        )
+        profile = self.capabilities.profiles.mcp(
+            resource=resource,
+            effect=decision.effect or CapabilityEffect.DENY,
+            server_id=server_id,
+            tool_id=tool_id,
+        )
+        self._attach_call_authority_context(
+            operation_context,
+            decision=decision,
+            auxiliary_decisions=auxiliary_decisions,
+            profile=profile,
+        )
+        return (
+            resource,
+            selected_args,
+            spec,
+            tool,
+            registry_binding,
+            operation_context,
+            flow_context,
+            sink,
+            decision,
+            auxiliary_decisions,
+            stdio_identity,
+            stdio_target_environment,
+        )
 
     def _attach_call_authority_context(
         self,
@@ -1281,6 +1870,10 @@ class McpPrimitive:
             source_oids=source_oids,
         )
         spec, _metadata = self._load_server(server_id)
+        # All Manifest v2 modes require the modern provider SPI, even when the
+        # configured wire mode is ``legacy``. Keep this check ahead of sink
+        # resolution and every DNS, stdio, or provider dispatch path.
+        self._require_modern_protocol_provider(spec)
         tool = spec.tool_by_id(tool_id)
         if tool is None:
             raise NotFound(f"MCP tool not found: {server_id}/{tool_id}")
@@ -1411,7 +2004,7 @@ class McpPrimitive:
             spec,
             consume=False,
         )
-        self._validate_arguments_against_schema(tool, arguments)
+        self._validate_arguments_against_schema(spec, tool, arguments)
         stdio_environment = self._stdio_executable_resolution_environment(spec)
         stdio_identity = self._stdio_executable_identity(
             spec,
@@ -1546,7 +2139,11 @@ class McpPrimitive:
                 server,
                 **provider_kwargs,
             )
-            result = self._validated_tool_list_result(server, raw_result)
+            result = self._validated_tool_list_result(
+                server,
+                raw_result,
+                runtime_environment=runtime_environment,
+            )
             live = next(
                 (item for item in result.tools if item.name == tool.mcp_name),
                 None,
@@ -1556,7 +2153,10 @@ class McpPrimitive:
                     f"MCP server {server.server_id} no longer exposes tool {tool.mcp_name}",
                     result,
                 )
-            if tool.input_schema and live.input_schema != tool.input_schema:
+            if tool.input_schema and not _json_values_equivalent(
+                live.input_schema,
+                tool.input_schema,
+            ):
                 raise _McpLiveToolValidationError(
                     f"MCP tool schema changed for {server.server_id}/{tool.tool_id}",
                     result,
@@ -1574,6 +2174,126 @@ class McpPrimitive:
                 correlation_id=new_id("corr"),
             ) from None
         return result
+
+    def _invoke_discover_provider(
+        self,
+        server: McpServerSpec,
+        *,
+        deadline: float,
+        pid: str,
+        executable_snapshot: ExecutableSnapshot | None,
+        runtime_environment: Mapping[str, str],
+    ) -> McpProviderDiscoveryResult:
+        self._require_modern_protocol_provider(server)
+        provider_kwargs = self._provider_dispatch_kwargs(
+            server,
+            deadline=deadline,
+            pid=pid,
+            runtime_environment=runtime_environment,
+            executable_snapshot=executable_snapshot,
+        )
+        try:
+            raw_result = self.provider.discover(server, **provider_kwargs)  # type: ignore[attr-defined]
+            return self._validated_discovery_result(
+                server,
+                raw_result,
+                runtime_environment=runtime_environment,
+            )
+        except ProviderEffectNotStarted:
+            raise
+        except ProviderHostError:
+            raise
+        except Exception as error:
+            raise ProviderHostError(
+                code="mcp_provider_error",
+                error_type=type(error).__name__,
+                correlation_id=new_id("corr"),
+            ) from None
+
+    def _validated_discovery_result(
+        self,
+        server: McpServerSpec,
+        result: Any,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
+    ) -> McpProviderDiscoveryResult:
+        try:
+            if not isinstance(result, McpProviderDiscoveryResult):
+                raise TypeError("MCP provider returned an invalid discovery result")
+            self._validate_discovery_result_header(server, result)
+            connection = self._validated_connection_info(
+                server,
+                result.connection,
+                runtime_environment=runtime_environment,
+            )
+            if connection is None:  # pragma: no cover - schema v2 invariant
+                raise TypeError("MCP discovery connection metadata is missing")
+            receipts = self._validated_exchange_receipts(server, result.receipts)
+            self._validate_discovery_receipts(
+                server,
+                result,
+                connection,
+                receipts,
+            )
+            return McpProviderDiscoveryResult(
+                connection=connection,
+                request_bytes=result.request_bytes,
+                response_bytes=result.response_bytes,
+                duration_s=float(result.duration_s),
+                receipts=receipts,
+            )
+        except ProviderHostError as error:
+            _mark_provider_result_returned(error)
+            raise
+        except Exception as error:
+            raise _mark_provider_result_returned(
+                ProviderHostError(
+                    code="mcp_provider_error",
+                    error_type=type(error).__name__,
+                    correlation_id=new_id("corr"),
+                )
+            ) from None
+
+    @staticmethod
+    def _validate_discovery_result_header(
+        server: McpServerSpec,
+        result: McpProviderDiscoveryResult,
+    ) -> None:
+        if type(result.request_bytes) is not int or result.request_bytes < 0:
+            raise TypeError("MCP discovery request_bytes is invalid")
+        if type(result.response_bytes) is not int or result.response_bytes < 0:
+            raise TypeError("MCP discovery response_bytes is invalid")
+        if result.request_bytes > server.max_request_bytes:
+            raise TypeError("MCP discovery exceeds cumulative request budget")
+        if result.response_bytes > server.max_response_bytes:
+            raise TypeError("MCP discovery exceeds cumulative response budget")
+        if (
+            type(result.duration_s) not in {int, float}
+            or not math.isfinite(result.duration_s)
+            or result.duration_s < 0
+        ):
+            raise TypeError("MCP discovery duration_s is invalid")
+
+    def _validate_discovery_receipts(
+        self,
+        server: McpServerSpec,
+        result: McpProviderDiscoveryResult,
+        connection: McpConnectionInfo,
+        receipts: tuple[McpExchangeReceipt, ...],
+    ) -> None:
+        negotiation_end = self._validated_v2_negotiation_prefix(
+            server,
+            connection,
+            receipts,
+        )
+        if negotiation_end != len(receipts):
+            raise TypeError("MCP discovery returned a non-negotiation phase receipt")
+        request_total = sum(item.request_bytes for item in receipts)
+        response_total = sum(item.response_bytes for item in receipts)
+        if result.request_bytes != request_total:
+            raise TypeError("MCP discovery request bytes do not match phase receipts")
+        if result.response_bytes != response_total:
+            raise TypeError("MCP discovery response bytes do not match phase receipts")
 
     def _invoke_list_tools_provider(
         self,
@@ -1593,7 +2313,14 @@ class McpPrimitive:
                 executable_snapshot=executable_snapshot,
             )
             raw_result = self.provider.list_tools(server, **provider_kwargs)
-            return self._validated_tool_list_result(server, raw_result), None
+            return (
+                self._validated_tool_list_result(
+                    server,
+                    raw_result,
+                    runtime_environment=runtime_environment,
+                ),
+                None,
+            )
         except ProviderEffectNotStarted:
             raise
         except ProviderHostError as error:
@@ -1660,6 +2387,8 @@ class McpPrimitive:
         self,
         server: McpServerSpec,
         result: Any,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpToolListResult:
         """Decode every provider-owned tools/list field before it escapes."""
 
@@ -1689,13 +2418,55 @@ class McpPrimitive:
             )
             if canonical_response_bytes > server.max_response_bytes:
                 raise TypeError("MCP tools/list canonical response exceeds max_response_bytes")
-            if response_bytes < canonical_response_bytes:
+            if (
+                server.schema_version == 1
+                and response_bytes < canonical_response_bytes
+            ):
                 raise TypeError("MCP tools/list response_bytes underreports canonical response")
+            connection = self._validated_connection_info(
+                server,
+                result.connection,
+                runtime_environment=runtime_environment,
+            )
+            receipts = self._validated_exchange_receipts(
+                server,
+                result.receipts,
+            )
+            if server.schema_version == 2:
+                if connection is None:  # pragma: no cover - required above
+                    raise TypeError("MCP Manifest v2 tools/list connection is missing")
+                self._validate_v2_list_receipts(
+                    server,
+                    connection,
+                    receipts,
+                    response_bytes=response_bytes,
+                )
+            else:
+                if any(
+                    receipt.phase
+                    not in {
+                        McpExchangePhase.SERVER_DISCOVER,
+                        McpExchangePhase.INITIALIZE,
+                        McpExchangePhase.TOOLS_LIST,
+                    }
+                    for receipt in receipts
+                ):
+                    raise TypeError("MCP tools/list returned an unrelated phase receipt")
+                if sum(
+                    receipt.phase is McpExchangePhase.TOOLS_LIST
+                    for receipt in receipts
+                ) > getattr(self, "config", DEFAULT_CONFIG).mcp.list_max_pages:
+                    raise TypeError(
+                        "MCP tools/list exceeds maximum page receipts="
+                        f"{getattr(self, 'config', DEFAULT_CONFIG).mcp.list_max_pages}"
+                    )
             return McpToolListResult(
                 server_id=server_id,
                 tools=selected_tools,
                 response_bytes=response_bytes,
                 duration_s=float(duration_s),
+                connection=connection,
+                receipts=receipts,
             )
         except ProviderHostError as error:
             _mark_provider_result_returned(error)
@@ -1734,6 +2505,390 @@ class McpPrimitive:
             or duration_s < 0
         ):
             raise TypeError("MCP tools/list duration_s is invalid")
+
+    def _validated_connection_info(
+        self,
+        server: McpServerSpec,
+        connection: Any,
+        *,
+        required: bool | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
+    ) -> McpConnectionInfo | None:
+        if connection is None:
+            if required is None:
+                required = server.schema_version == 2
+            if required:
+                raise TypeError(
+                    "MCP Manifest v2 provider result is missing connection metadata"
+                )
+            return None
+        if not isinstance(connection, McpConnectionInfo):
+            raise TypeError("MCP provider connection metadata is invalid")
+        mode, era, revision = self._validated_connection_protocol(server, connection)
+        self._validate_connection_server_identity(connection)
+        sensitive_values = mcp_runtime_secret_values(server, runtime_environment)
+        server_name = (
+            redact_sensitive_text(
+                connection.server_name,
+                sensitive_values=sensitive_values,
+            )
+            if connection.server_name is not None
+            else None
+        )
+        server_version = (
+            redact_sensitive_text(
+                connection.server_version,
+                sensitive_values=sensitive_values,
+            )
+            if connection.server_version is not None
+            else None
+        )
+        capabilities = self._validated_connection_names(
+            connection.capabilities,
+            field="capabilities",
+            sensitive_values=sensitive_values,
+        )
+        unsupported = self._validated_connection_names(
+            connection.unsupported_capabilities,
+            field="unsupported_capabilities",
+            sensitive_values=sensitive_values,
+        )
+        return McpConnectionInfo(
+            protocol_mode=mode,
+            protocol_era=era,
+            protocol_revision=revision,
+            sessionless=connection.sessionless,
+            fallback_used=connection.fallback_used,
+            server_name=server_name,
+            server_version=server_version,
+            capabilities=capabilities,
+            unsupported_capabilities=unsupported,
+        )
+
+    def _validated_connection_protocol(
+        self,
+        server: McpServerSpec,
+        connection: McpConnectionInfo,
+    ) -> tuple[McpProtocolMode, McpProtocolEra, str]:
+        mode = connection.protocol_mode
+        era = connection.protocol_era
+        revision = connection.protocol_revision
+        if type(mode) is not McpProtocolMode or mode != self._effective_protocol_mode(server):
+            raise TypeError("MCP provider protocol mode is invalid")
+        if type(era) is not McpProtocolEra:
+            raise TypeError("MCP provider protocol era is invalid")
+        if type(revision) is not str or revision not in _MCP_RELEASE_PROTOCOL_REVISIONS:
+            raise TypeError("MCP provider protocol revision is invalid")
+        if (
+            type(connection.sessionless) is not bool
+            or type(connection.fallback_used) is not bool
+        ):
+            raise TypeError("MCP provider connection flags are invalid")
+        self._validate_connection_protocol_semantics(
+            mode,
+            era,
+            revision,
+            sessionless=connection.sessionless,
+            fallback_used=connection.fallback_used,
+        )
+        return mode, era, revision
+
+    def _validate_connection_protocol_semantics(
+        self,
+        mode: McpProtocolMode,
+        era: McpProtocolEra,
+        revision: str,
+        *,
+        sessionless: bool,
+        fallback_used: bool,
+    ) -> None:
+        if era is McpProtocolEra.MODERN:
+            self._validate_modern_connection_flags(
+                revision,
+                sessionless=sessionless,
+                fallback_used=fallback_used,
+            )
+        else:
+            self._validate_legacy_connection_flags(
+                mode,
+                revision,
+                sessionless=sessionless,
+                fallback_used=fallback_used,
+            )
+        if mode is McpProtocolMode.LEGACY and era is not McpProtocolEra.LEGACY:
+            raise TypeError("MCP forced legacy mode negotiated modern")
+
+    @staticmethod
+    def _validate_modern_connection_flags(
+        revision: str,
+        *,
+        sessionless: bool,
+        fallback_used: bool,
+    ) -> None:
+        if revision != McpProtocolMode.REVISION_2026_07_28.value:
+            raise TypeError("MCP modern connection revision is invalid")
+        if not sessionless or fallback_used:
+            raise TypeError("MCP modern connection flags are invalid")
+
+    @staticmethod
+    def _validate_legacy_connection_flags(
+        mode: McpProtocolMode,
+        revision: str,
+        *,
+        sessionless: bool,
+        fallback_used: bool,
+    ) -> None:
+        if revision == McpProtocolMode.REVISION_2026_07_28.value:
+            raise TypeError("MCP legacy connection revision is invalid")
+        if sessionless:
+            raise TypeError("MCP legacy connection cannot be sessionless")
+        if mode is McpProtocolMode.REVISION_2026_07_28:
+            raise TypeError("MCP pinned modern mode cannot negotiate legacy")
+        if mode is McpProtocolMode.AUTO and not fallback_used:
+            raise TypeError("MCP auto legacy connection must report fallback")
+        if mode is McpProtocolMode.LEGACY and fallback_used:
+            raise TypeError("MCP forced legacy connection cannot report fallback")
+
+    def _validate_connection_server_identity(
+        self,
+        connection: McpConnectionInfo,
+    ) -> None:
+        mcp_config = getattr(self, "config", DEFAULT_CONFIG).mcp
+        for field_name, value in (
+            ("server_name", connection.server_name),
+            ("server_version", connection.server_version),
+        ):
+            if value is not None and (
+                type(value) is not str
+                or len(value) > mcp_config.header_value_max_chars
+            ):
+                raise TypeError(f"MCP provider {field_name} is invalid")
+
+    def _validated_connection_names(
+        self,
+        names: Any,
+        *,
+        field: str,
+        sensitive_values: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        mcp_config = getattr(self, "config", DEFAULT_CONFIG).mcp
+        if type(names) is not tuple or len(names) > mcp_config.list_limit:
+            raise TypeError(f"MCP provider {field} is invalid")
+        selected: list[str] = []
+        raw_names: list[str] = []
+        for name in names:
+            if (
+                type(name) is not str
+                or not name
+                or len(name) > mcp_config.mcp_name_max_chars
+            ):
+                raise TypeError(f"MCP provider {field} is invalid")
+            raw_names.append(name)
+            sanitized = redact_sensitive_text(
+                name,
+                sensitive_values=sensitive_values,
+            )
+            if sanitized not in selected:
+                selected.append(sanitized)
+        if len(set(raw_names)) != len(raw_names):
+            raise TypeError(f"MCP provider {field} contains duplicates")
+        return tuple(selected)
+
+    def _validated_exchange_receipts(
+        self,
+        server: McpServerSpec,
+        receipts: Any,
+    ) -> tuple[McpExchangeReceipt, ...]:
+        if type(receipts) is not tuple:
+            raise TypeError("MCP provider receipts must be a tuple")
+        mcp_config = getattr(self, "config", DEFAULT_CONFIG).mcp
+        if len(receipts) > mcp_config.list_max_pages + 3:
+            raise TypeError("MCP provider returned too many exchange receipts")
+        selected: list[McpExchangeReceipt] = []
+        request_total = 0
+        response_total = 0
+        for receipt in receipts:
+            if not isinstance(receipt, McpExchangeReceipt):
+                raise TypeError("MCP provider exchange receipt is invalid")
+            if type(receipt.phase) is not McpExchangePhase:
+                raise TypeError("MCP provider receipt phase is invalid")
+            if type(receipt.request_bytes) is not int or receipt.request_bytes < 0:
+                raise TypeError("MCP provider receipt request_bytes is invalid")
+            if type(receipt.response_bytes) is not int or receipt.response_bytes < 0:
+                raise TypeError("MCP provider receipt response_bytes is invalid")
+            if (
+                type(receipt.duration_s) not in {int, float}
+                or not math.isfinite(receipt.duration_s)
+                or receipt.duration_s < 0
+            ):
+                raise TypeError("MCP provider receipt duration_s is invalid")
+            if type(receipt.call_started) is not bool:
+                raise TypeError("MCP provider receipt call_started is invalid")
+            selected.append(
+                McpExchangeReceipt(
+                    phase=receipt.phase,
+                    request_bytes=receipt.request_bytes,
+                    response_bytes=receipt.response_bytes,
+                    duration_s=float(receipt.duration_s),
+                    call_started=receipt.call_started,
+                )
+            )
+            request_total += receipt.request_bytes
+            response_total += receipt.response_bytes
+        if server.schema_version == 2:
+            if request_total > server.max_request_bytes:
+                raise TypeError("MCP provider receipts exceed cumulative request budget")
+            if response_total > server.max_response_bytes:
+                raise TypeError("MCP provider receipts exceed cumulative response budget")
+        return tuple(selected)
+
+    def _validated_v2_negotiation_prefix(
+        self,
+        server: McpServerSpec,
+        connection: McpConnectionInfo,
+        receipts: tuple[McpExchangeReceipt, ...],
+    ) -> int:
+        """Return the first post-negotiation receipt index for Manifest v2.
+
+        Negotiation evidence is deliberately a small grammar rather than an
+        unordered bag.  This prevents a provider from hiding automatic
+        retries, reporting fallback without an initialize exchange, or
+        attributing a later tools exchange to negotiation.
+        """
+
+        if server.schema_version != 2:  # pragma: no cover - caller invariant
+            raise TypeError("MCP v2 negotiation receipts require Manifest v2")
+        if not receipts:
+            raise TypeError("MCP Manifest v2 provider result is missing receipts")
+
+        mode = self._effective_protocol_mode(server)
+        if mode is McpProtocolMode.LEGACY:
+            receipt = receipts[0]
+            if (
+                receipt.phase is not McpExchangePhase.INITIALIZE
+                or not receipt.call_started
+            ):
+                raise TypeError("MCP legacy negotiation must begin with initialize")
+            return 1
+
+        discover_count = 0
+        while (
+            discover_count < len(receipts)
+            and receipts[discover_count].phase is McpExchangePhase.SERVER_DISCOVER
+        ):
+            if not receipts[discover_count].call_started:
+                raise TypeError("MCP server/discover receipt must prove dispatch")
+            discover_count += 1
+        if discover_count == 0:
+            raise TypeError("MCP modern negotiation must begin with server/discover")
+        if discover_count > 2:
+            raise TypeError("MCP provider exceeded the bounded server/discover retry")
+
+        if connection.fallback_used:
+            # A version-negotiation retry can only converge on the pinned
+            # modern revision.  Legacy fallback therefore follows exactly one
+            # probe and one initialize exchange.
+            if discover_count != 1:
+                raise TypeError("MCP legacy fallback cannot follow a discover retry")
+            if (
+                discover_count >= len(receipts)
+                or receipts[discover_count].phase is not McpExchangePhase.INITIALIZE
+                or not receipts[discover_count].call_started
+            ):
+                raise TypeError("MCP legacy fallback must include initialize")
+            return discover_count + 1
+
+        if (
+            discover_count < len(receipts)
+            and receipts[discover_count].phase is McpExchangePhase.INITIALIZE
+        ):
+            raise TypeError("MCP modern negotiation cannot include initialize")
+        return discover_count
+
+    def _validate_v2_list_receipts(
+        self,
+        server: McpServerSpec,
+        connection: McpConnectionInfo,
+        receipts: tuple[McpExchangeReceipt, ...],
+        *,
+        response_bytes: int,
+    ) -> None:
+        negotiation_end = self._validated_v2_negotiation_prefix(
+            server,
+            connection,
+            receipts,
+        )
+        list_receipts = receipts[negotiation_end:]
+        max_pages = getattr(self, "config", DEFAULT_CONFIG).mcp.list_max_pages
+        if not 1 <= len(list_receipts) <= max_pages:
+            raise TypeError(
+                f"MCP tools/list requires 1..{max_pages} page receipts"
+            )
+        if any(
+            receipt.phase is not McpExchangePhase.TOOLS_LIST
+            or not receipt.call_started
+            for receipt in list_receipts
+        ):
+            raise TypeError("MCP tools/list page receipts must be contiguous and dispatched")
+        if sum(item.response_bytes for item in list_receipts) != response_bytes:
+            raise TypeError("MCP tools/list response bytes do not match page receipts")
+
+    def _validate_v2_call_receipts(
+        self,
+        server: McpServerSpec,
+        result: McpProviderCallResult,
+        connection: McpConnectionInfo,
+        receipts: tuple[McpExchangeReceipt, ...],
+    ) -> None:
+        negotiation_end = self._validated_v2_negotiation_prefix(
+            server,
+            connection,
+            receipts,
+        )
+        remaining = receipts[negotiation_end:]
+        list_count = 0
+        while (
+            list_count < len(remaining)
+            and remaining[list_count].phase is McpExchangePhase.TOOLS_LIST
+        ):
+            if not remaining[list_count].call_started:
+                raise TypeError("MCP tools/list receipt must prove dispatch")
+            list_count += 1
+        max_pages = getattr(self, "config", DEFAULT_CONFIG).mcp.list_max_pages
+        if not 1 <= list_count <= max_pages:
+            raise TypeError(
+                f"MCP tool call requires 1..{max_pages} live tools/list page receipts"
+            )
+
+        call_receipts = remaining[list_count:]
+        if len(call_receipts) > 1 or any(
+            receipt.phase is not McpExchangePhase.TOOLS_CALL
+            for receipt in call_receipts
+        ):
+            raise TypeError("MCP tools/call receipt must be unique and terminal")
+        if result.call_started:
+            if len(call_receipts) != 1 or not call_receipts[0].call_started:
+                raise TypeError("MCP dispatched tools/call is missing its terminal receipt")
+        elif any(receipt.call_started for receipt in call_receipts):
+            raise TypeError("MCP provider claims tools/call did not start after dispatch")
+
+        list_receipts = remaining[:list_count]
+        list_request_bytes = sum(item.request_bytes for item in list_receipts)
+        list_response_bytes = sum(item.response_bytes for item in list_receipts)
+        call_request_bytes = sum(item.request_bytes for item in call_receipts)
+        call_response_bytes = sum(item.response_bytes for item in call_receipts)
+        expected_fields = (
+            ("list_request_bytes", result.list_request_bytes, list_request_bytes),
+            ("list_response_bytes", result.list_response_bytes, list_response_bytes),
+            ("call_request_bytes", result.call_request_bytes, call_request_bytes),
+            ("call_response_bytes", result.call_response_bytes, call_response_bytes),
+            ("response_bytes", result.response_bytes, call_response_bytes),
+        )
+        for field_name, actual, expected in expected_fields:
+            if actual != expected:
+                raise TypeError(
+                    f"MCP provider {field_name} does not match phase receipts"
+                )
 
     @staticmethod
     def _validated_provider_tools(
@@ -1839,6 +2994,11 @@ class McpPrimitive:
         ):
             if selected is not None and type(selected) is not str:
                 raise TypeError(f"MCP provider {field_name} is invalid")
+        if (
+            result.error_type == "mcp_input_required_unsupported"
+            and not result.call_started
+        ):
+            raise TypeError("MCP input_required must follow a dispatched tools/call")
 
     @staticmethod
     def _validated_provider_call_payloads(
@@ -1891,13 +3051,19 @@ class McpPrimitive:
             )
             if canonical_response_bytes > server.max_response_bytes:
                 raise TypeError("MCP tool canonical response exceeds max_response_bytes")
-        if result.too_large:
-            McpPrimitive._validate_oversized_provider_call_bytes(server, result)
-        elif has_response_payload:
-            McpPrimitive._validate_canonical_provider_call_bytes(
-                result,
-                canonical_response_bytes=canonical_response_bytes,
-            )
+        # Manifest v1 byte fields predate phase receipts and retain their
+        # released canonical-projection lower-bound contract. Manifest v2
+        # fields are exact raw-wire measurements and are checked against the
+        # phase receipts below; a decoded/canonical JSON projection can be
+        # larger than its wire representation without implying undercounting.
+        if server.schema_version == 1:
+            if result.too_large:
+                McpPrimitive._validate_oversized_provider_call_bytes(server, result)
+            elif has_response_payload:
+                McpPrimitive._validate_canonical_provider_call_bytes(
+                    result,
+                    canonical_response_bytes=canonical_response_bytes,
+                )
 
     @staticmethod
     def _validate_oversized_provider_call_bytes(
@@ -1934,10 +3100,12 @@ class McpPrimitive:
                 "MCP provider call_response_bytes underreports canonical response"
             )
 
-    @staticmethod
     def _validated_provider_call_result(
+        self,
         server: McpServerSpec,
         result: Any,
+        *,
+        runtime_environment: Mapping[str, str] | None = None,
     ) -> McpProviderCallResult:
         """Decode every provider-owned call field into an inert value object."""
 
@@ -1954,6 +3122,55 @@ class McpPrimitive:
                 selected_content=selected_content,
                 selected_structured_content=selected_structured_content,
             )
+            receipts = self._validated_exchange_receipts(server, result.receipts)
+            incomplete_negotiation_failure = (
+                server.schema_version == 2
+                and result.connection is None
+                and self._validate_v2_incomplete_negotiation_failure(
+                    server,
+                    result,
+                    receipts,
+                )
+            )
+            connection = self._validated_connection_info(
+                server,
+                result.connection,
+                required=(
+                    server.schema_version == 2
+                    and not incomplete_negotiation_failure
+                ),
+                runtime_environment=runtime_environment,
+            )
+            if server.schema_version == 2:
+                if connection is not None:
+                    self._validate_v2_call_receipts(
+                        server,
+                        result,
+                        connection,
+                        receipts,
+                    )
+            else:
+                if any(
+                    receipt.phase
+                    not in {
+                        McpExchangePhase.SERVER_DISCOVER,
+                        McpExchangePhase.INITIALIZE,
+                        McpExchangePhase.TOOLS_LIST,
+                        McpExchangePhase.TOOLS_CALL,
+                    }
+                    for receipt in receipts
+                ):
+                    raise TypeError("MCP tool call returned an unrelated phase receipt")
+                if sum(
+                    receipt.phase is McpExchangePhase.TOOLS_LIST
+                    for receipt in receipts
+                ) > getattr(self, "config", DEFAULT_CONFIG).mcp.list_max_pages:
+                    raise TypeError("MCP tool call exceeds maximum tools/list pages")
+                if sum(
+                    receipt.phase is McpExchangePhase.TOOLS_CALL
+                    for receipt in receipts
+                ) > 1:
+                    raise TypeError("MCP provider automatically retried tools/call")
             return McpProviderCallResult(
                 content=selected_content,
                 structured_content=selected_structured_content,
@@ -1969,6 +3186,8 @@ class McpPrimitive:
                 call_request_bytes=result.call_request_bytes,
                 call_response_bytes=result.call_response_bytes,
                 call_started=result.call_started,
+                connection=connection,
+                receipts=receipts,
             )
         except ProviderHostError as error:
             _mark_provider_result_returned(error)
@@ -1981,6 +3200,69 @@ class McpPrimitive:
                     correlation_id=new_id("corr"),
                 )
             ) from None
+
+    def _validate_v2_incomplete_negotiation_failure(
+        self,
+        server: McpServerSpec,
+        result: McpProviderCallResult,
+        receipts: tuple[McpExchangeReceipt, ...],
+    ) -> bool:
+        """Accept only built-in wire proof that negotiation failed pre-call."""
+
+        if type(self.provider) is not SdkMcpProvider:
+            raise TypeError("MCP Manifest v2 tool-call connection is missing")
+        if (
+            not result.error
+            or result.content is not None
+            or result.structured_content is not None
+            or result.is_error
+            or result.too_large
+            or result.call_started
+            or any(
+                value != 0
+                for value in (
+                    result.response_bytes,
+                    result.list_request_bytes,
+                    result.list_response_bytes,
+                    result.call_request_bytes,
+                    result.call_response_bytes,
+                )
+            )
+            or any(not receipt.call_started for receipt in receipts)
+        ):
+            raise TypeError("MCP incomplete negotiation failure is invalid")
+
+        phases = tuple(receipt.phase for receipt in receipts)
+        mode = self._effective_protocol_mode(server)
+        if mode is McpProtocolMode.LEGACY:
+            valid_phases = phases in {(), (McpExchangePhase.INITIALIZE,)}
+        elif mode is McpProtocolMode.REVISION_2026_07_28:
+            valid_phases = phases in {
+                (),
+                (McpExchangePhase.SERVER_DISCOVER,),
+                (
+                    McpExchangePhase.SERVER_DISCOVER,
+                    McpExchangePhase.SERVER_DISCOVER,
+                ),
+            }
+        else:
+            valid_phases = phases in {
+                (),
+                (McpExchangePhase.SERVER_DISCOVER,),
+                (
+                    McpExchangePhase.SERVER_DISCOVER,
+                    McpExchangePhase.SERVER_DISCOVER,
+                ),
+                (
+                    McpExchangePhase.SERVER_DISCOVER,
+                    McpExchangePhase.INITIALIZE,
+                ),
+            }
+        if not valid_phases:
+            raise TypeError(
+                "MCP incomplete negotiation receipts are not a legal prefix"
+            )
+        return True
 
     def _validate_live_tool_for_call(
         self,
@@ -2190,6 +3472,30 @@ class McpPrimitive:
         provider_result: McpProviderCallResult,
     ) -> McpCallResult:
         provider_result = self._validated_provider_call_result(server, provider_result)
+        if provider_result.error_type == "mcp_input_required_unsupported":
+            return McpCallResult(
+                server_id=server.server_id,
+                tool_id=tool.tool_id,
+                mcp_name=tool.mcp_name,
+                status=McpCallStatus.INPUT_REQUIRED_UNSUPPORTED,
+                ok=False,
+                error={
+                    "code": "mcp_input_required_unsupported",
+                    "error_type": "mcp_input_required_unsupported",
+                    "correlation_id": provider_result.correlation_id or new_id("corr"),
+                    "message": (
+                        "MCP server requested multi-round input, which is not "
+                        "supported by this release"
+                    ),
+                    "retryable": False,
+                    "automatic_retry_disabled": True,
+                    "continuation_present": True,
+                },
+                response_bytes=provider_result.response_bytes,
+                duration_s=provider_result.duration_s,
+                connection=provider_result.connection,
+                receipts=provider_result.receipts,
+            )
         if provider_result.error:
             safe_message = self._safe_transport_error_message(
                 server,
@@ -2213,6 +3519,8 @@ class McpPrimitive:
                 },
                 response_bytes=provider_result.response_bytes,
                 duration_s=provider_result.duration_s,
+                connection=provider_result.connection,
+                receipts=provider_result.receipts,
             )
         if provider_result.too_large:
             return self._failure(
@@ -2254,6 +3562,290 @@ class McpPrimitive:
             result=to_jsonable(projected),
             response_bytes=provider_result.response_bytes,
             duration_s=provider_result.duration_s,
+            connection=provider_result.connection,
+            receipts=provider_result.receipts,
+        )
+
+    def _invoke_validated_provider_tool(
+        self,
+        validate_and_call: Any,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+        *,
+        deadline: float,
+        pid: str,
+        runtime_environment: Mapping[str, str] | None,
+        executable_snapshot: ExecutableSnapshot | None,
+        started: float,
+    ) -> McpProviderCallResult | ProviderEffectNotStartedResult:
+        try:
+            provider_kwargs = self._provider_dispatch_kwargs(
+                server,
+                deadline=deadline,
+                pid=pid,
+                runtime_environment=runtime_environment,
+                executable_snapshot=executable_snapshot,
+            )
+            raw_result = validate_and_call(
+                server,
+                tool,
+                arguments,
+                **provider_kwargs,
+            )
+            return self._validated_provider_call_result(
+                server,
+                raw_result,
+                runtime_environment=runtime_environment,
+            )
+        except ProviderEffectNotStarted as error:
+            return ProviderEffectNotStartedResult(
+                error=error,
+                outcome="validate_and_call_not_started",
+                result=McpProviderCallResult(
+                    error="provider call did not start",
+                    error_type=type(error).__name__,
+                    correlation_id=new_id("corr"),
+                    duration_s=time.monotonic() - started,
+                    call_started=False,
+                ),
+            )
+        except Exception as error:
+            post_call_failure = self._wire_bound_post_call_failure_result(
+                server,
+                error,
+                started=started,
+                runtime_environment=runtime_environment,
+            )
+            if post_call_failure is not None:
+                return post_call_failure
+            if isinstance(error, ProviderHostError):
+                raise
+            raise ProviderHostError(
+                code="mcp_provider_error",
+                error_type=type(error).__name__,
+                correlation_id=new_id("corr"),
+            ) from None
+
+    def _wire_bound_post_call_failure_result(
+        self,
+        server: McpServerSpec,
+        error: BaseException,
+        *,
+        started: float,
+        runtime_environment: Mapping[str, str] | None,
+    ) -> McpProviderCallResult | None:
+        if server.schema_version != 2 or type(self.provider) is not SdkMcpProvider:
+            return None
+        certified, receipts, connection = _wire_failure_evidence(error)
+        call_receipts = tuple(
+            receipt
+            for receipt in receipts
+            if receipt.phase is McpExchangePhase.TOOLS_CALL
+        )
+        if (
+            not certified
+            or connection is None
+            or len(call_receipts) != 1
+            or not call_receipts[0].call_started
+        ):
+            return None
+        list_receipts = tuple(
+            receipt
+            for receipt in receipts
+            if receipt.phase is McpExchangePhase.TOOLS_LIST
+        )
+        result = McpProviderCallResult(
+            error="MCP tools/call dispatch outcome is unknown",
+            error_type="McpPostCallFailure",
+            correlation_id=new_id("corr"),
+            response_bytes=call_receipts[0].response_bytes,
+            duration_s=max(0.0, time.monotonic() - started),
+            list_request_bytes=sum(item.request_bytes for item in list_receipts),
+            list_response_bytes=sum(item.response_bytes for item in list_receipts),
+            call_request_bytes=call_receipts[0].request_bytes,
+            call_response_bytes=call_receipts[0].response_bytes,
+            call_started=True,
+            connection=connection,
+            receipts=receipts,
+        )
+        return self._validated_provider_call_result(
+            server,
+            result,
+            runtime_environment=runtime_environment,
+        )
+
+    def _pre_call_failure_classification_override(
+        self,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        provider_result: McpProviderCallResult,
+        *,
+        wire_bound_combined_provider: bool,
+    ) -> ExternalEffectClassification | None:
+        if provider_result.call_started:
+            return None
+
+        # Manifest v1 retains its released Provider SPI: call_started=False is
+        # the provider's pre-dispatch certificate.  Manifest v2 has exact phase
+        # receipts, so require the stronger wire-bound certificate before a
+        # mutating tool can be narrowed to an external-read failure.
+        certified_pre_call = server.schema_version == 1 or (
+            wire_bound_combined_provider
+            and provider_result.call_request_bytes == 0
+            and provider_result.call_response_bytes == 0
+            and provider_result.response_bytes == 0
+            and all(
+                receipt.phase is not McpExchangePhase.TOOLS_CALL
+                for receipt in provider_result.receipts
+            )
+        )
+        if certified_pre_call:
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={
+                    "outcome": "failed",
+                    "failure_kind": "live_validation_failed_before_call",
+                    "phase": "live_validation",
+                    "call_started": False,
+                    "tools_call_receipt_present": False,
+                },
+            )
+
+        # A v2 result which claims no call but carries call bytes or a
+        # tools/call receipt is not a pre-dispatch certificate.  Preserve an
+        # unknown mutation for mutating/rollback-unclear tools so an ambiguous
+        # provider result can never enable replay.
+        rollback_class = ExternalEffectRollbackClass(tool.rollback_class)
+        if (
+            tool.state_mutation
+            or rollback_class is not ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+        ):
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+                rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+                state_mutation=tool.state_mutation,
+                information_flow=True,
+                metadata={
+                    "outcome": "unknown_pre_call_dispatch_state",
+                    "phase": "tools/call",
+                    "call_started": False,
+                    "tools_call_receipt_present": any(
+                        receipt.phase is McpExchangePhase.TOOLS_CALL
+                        for receipt in provider_result.receipts
+                    ),
+                },
+            )
+        return None
+
+    @staticmethod
+    def _post_call_failure_classification_override(
+        tool: McpToolSpec,
+        provider_result: McpProviderCallResult,
+    ) -> ExternalEffectClassification | None:
+        # Any provider failure after tools/call dispatch leaves a mutating
+        # tool's external state ambiguous, including bounded transport errors.
+        if provider_result.error is None or not provider_result.call_started:
+            return None
+        rollback_class = ExternalEffectRollbackClass(tool.rollback_class)
+        if (
+            not tool.state_mutation
+            and rollback_class is ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+        ):
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={
+                    "outcome": "failed",
+                    "failure_kind": "mcp_post_call_read_failure",
+                    "phase": "tools/call",
+                    "call_started": True,
+                    "automatic_retry_disabled": True,
+                },
+            )
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+            rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+            state_mutation=tool.state_mutation,
+            information_flow=True,
+            metadata={
+                "outcome": "unknown_mcp_post_call_failure",
+                "failure_kind": "mcp_post_call_failure",
+                "phase": "tools/call",
+                "call_started": True,
+                "automatic_retry_disabled": True,
+            },
+        )
+
+    def _dispatch_validated_provider_call(
+        self,
+        protected: Any,
+        invoke_validated_tool: Any,
+        *,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        executable_snapshot: ExecutableSnapshot | None,
+    ) -> tuple[Any, bool]:
+        # Manifest v2 combines negotiation, live catalog validation and the
+        # eventual tools/call in one provider entry point. Only the exact
+        # built-in SDK provider has wire evidence strong enough to narrow a
+        # normal pre-call result; custom providers retain the mutation floor.
+        wire_bound = (
+            server.schema_version == 2
+            and type(self.provider) is SdkMcpProvider
+        )
+        phase = ProviderPhase(
+            "provider_validate_and_call",
+            state_mutation=tool.state_mutation and not wire_bound,
+            information_flow=True,
+        )
+        try:
+            return protected.call(phase, invoke_validated_tool), wire_bound
+        finally:
+            if executable_snapshot is not None:
+                executable_snapshot.close()
+
+    @staticmethod
+    def _input_required_classification_override(
+        tool: McpToolSpec,
+        provider_result: McpProviderCallResult,
+    ) -> ExternalEffectClassification | None:
+        if provider_result.error_type != "mcp_input_required_unsupported":
+            return None
+        rollback_class = ExternalEffectRollbackClass(tool.rollback_class)
+        if (
+            not tool.state_mutation
+            and rollback_class is ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+        ):
+            return ExternalEffectClassification(
+                rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+                rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+                state_mutation=False,
+                information_flow=True,
+                metadata={
+                    "outcome": "failed",
+                    "failure_kind": "mcp_input_required_unsupported",
+                    "phase": "tools/call",
+                    "automatic_retry_disabled": True,
+                    "continuation_present": True,
+                },
+            )
+        return ExternalEffectClassification(
+            rollback_class=ExternalEffectRollbackClass.UNKNOWN,
+            rollback_status=ExternalEffectRollbackStatus.UNKNOWN,
+            state_mutation=tool.state_mutation,
+            information_flow=True,
+            metadata={
+                "outcome": "unknown_mcp_input_required_unsupported",
+                "phase": "tools/call",
+                "automatic_retry_disabled": True,
+                "continuation_present": True,
+            },
         )
 
     @staticmethod
@@ -2267,9 +3859,12 @@ class McpPrimitive:
                 f"max_response_bytes={server.max_response_bytes}"
             )
         if error_type == "McpStdioStdoutTooLarge":
+            max_output_bytes = server.max_response_bytes
+            if server.schema_version == 1:
+                max_output_bytes *= _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER
             return (
                 "MCP stdio stdout exceeded max_output_bytes="
-                f"{server.max_response_bytes * _MCP_STDIO_PROTOCOL_OUTPUT_MULTIPLIER}"
+                f"{max_output_bytes}"
             )
         if error_type == "McpStdioStderrTooLarge":
             return (
@@ -2284,6 +3879,11 @@ class McpPrimitive:
         if error_type == "McpHttpResponseTooLarge":
             return (
                 "MCP HTTP response exceeded "
+                f"max_response_bytes={server.max_response_bytes}"
+            )
+        if error_type == "McpHttpOperationTooLarge":
+            return (
+                "MCP HTTP operation exceeded "
                 f"max_response_bytes={server.max_response_bytes}"
             )
         if error_type == "McpHttpContentEncodingDenied":
@@ -2321,10 +3921,28 @@ class McpPrimitive:
             },
             response_bytes=provider_result.response_bytes,
             duration_s=provider_result.duration_s,
+            connection=provider_result.connection,
+            receipts=provider_result.receipts,
         )
 
     def _protected(self) -> Any:
         return self.protected_operations
+
+    @staticmethod
+    def _effective_protocol_mode(server: McpServerSpec) -> McpProtocolMode:
+        return server.protocol_mode or McpProtocolMode.LEGACY
+
+    def _require_modern_protocol_provider(self, server: McpServerSpec) -> None:
+        if server.schema_version != 2:
+            return
+        if (
+            not isinstance(self.provider, McpModernProtocolProvider)
+            or self.provider.supports_mcp_modern_protocol is not True
+        ):
+            raise ValidationError(
+                "MCP Manifest v2 requires a provider that explicitly supports "
+                "modern protocol negotiation"
+            )
 
     def _data_flow(self) -> Any:
         manager = getattr(self, "data_flow", None) or getattr(
@@ -2356,8 +3974,8 @@ class McpPrimitive:
             dumps(
                 to_jsonable(
                     {
-                        "schema_version": 1,
-                        "server": spec,
+                        "schema_version": spec.schema_version,
+                        "server": mcp_server_spec_to_jsonable(spec),
                         "tool": tool,
                         "stdio_executable": stdio_executable,
                     }
@@ -2381,9 +3999,34 @@ class McpPrimitive:
             dumps(
                 to_jsonable(
                     {
-                        "schema_version": 1,
-                        "server": spec,
+                        "schema_version": spec.schema_version,
+                        "server": mcp_server_spec_to_jsonable(spec),
                         "operation": "tools/list",
+                        "stdio_executable": stdio_executable,
+                    }
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _discover_identity_sha256(
+        self,
+        spec: McpServerSpec,
+        *,
+        stdio_executable: dict[str, str] | None | object = (
+            _STDIO_EXECUTABLE_IDENTITY_UNSET
+        ),
+    ) -> str | None:
+        if stdio_executable is _STDIO_EXECUTABLE_IDENTITY_UNSET:
+            stdio_executable = self._stdio_executable_identity(spec)
+        if spec.transport == "stdio" and stdio_executable is None:
+            return None
+        return hashlib.sha256(
+            dumps(
+                to_jsonable(
+                    {
+                        "schema_version": 2,
+                        "server": mcp_server_spec_to_jsonable(spec),
+                        "operation": "server/discover",
                         "stdio_executable": stdio_executable,
                     }
                 )
@@ -2551,6 +4194,24 @@ class McpPrimitive:
             ),
         )
 
+    def _discover_data_sink(
+        self,
+        server_id: str,
+        spec: McpServerSpec,
+        runtime_environment: Mapping[str, str] | None,
+    ) -> DataSink:
+        stdio_identity = self._stdio_executable_identity(
+            spec,
+            runtime_environment=runtime_environment,
+        )
+        return DataSink(
+            f"mcp:{server_id}:discover",
+            self._discover_identity_sha256(
+                spec,
+                stdio_executable=stdio_identity,
+            ),
+        )
+
     def _stdio_snapshot_for_dispatch(
         self,
         *,
@@ -2669,6 +4330,71 @@ class McpPrimitive:
             },
         )
 
+    def _protected_discover_evidence(
+        self,
+        pid: str,
+        spec: McpServerSpec,
+        context: dict[str, Any],
+        result_payload: dict[str, Any],
+    ) -> ProtectedOperationEvidence:
+        event_payload = {
+            "adapter": "mcp",
+            "operation": "discover",
+            "server_id": spec.server_id,
+            "transport": spec.transport,
+            **result_payload,
+        }
+        return ProtectedOperationEvidence(
+            event_type=EventType.EXTERNAL_READ,
+            event_source=pid,
+            event_target=self.server_resource(spec.server_id),
+            event_payload=event_payload,
+            audit_action="primitive.mcp.discover",
+            audit_actor=pid,
+            audit_target=self.server_resource(spec.server_id),
+            audit_decision={
+                "server_id": spec.server_id,
+                "transport": spec.transport,
+                "protocol_mode": self._effective_protocol_mode(spec).value,
+                "request_bytes": context["request_bytes"],
+                **result_payload,
+            },
+            effect_metadata=result_payload,
+            provider_receipt={
+                "request_bytes": int(result_payload.get("request_bytes", 0) or 0),
+                "response_bytes": int(result_payload.get("response_bytes", 0) or 0),
+                "duration_s": float(result_payload.get("duration_s", 0.0) or 0.0),
+                "protocol_revision": (
+                    result_payload.get("connection", {}).get("protocol_revision")
+                    if isinstance(result_payload.get("connection"), dict)
+                    else None
+                ),
+            },
+        )
+
+    def _protected_discover_failure_evidence(
+        self,
+        pid: str,
+        spec: McpServerSpec,
+        context: dict[str, Any],
+        error: BaseException,
+        phase: str,
+    ) -> ProtectedOperationEvidence:
+        return self._protected_discover_evidence(
+            pid,
+            spec,
+            context,
+            {
+                "ok": False,
+                "status": "transport_error",
+                "request_bytes": 0,
+                "response_bytes": 0,
+                "duration_s": 0.0,
+                "error_type": type(error).__name__,
+                "phase": phase,
+            },
+        )
+
     def _protected_list_failure_evidence(
         self,
         pid: str,
@@ -2701,6 +4427,17 @@ class McpPrimitive:
         operation_context: dict[str, Any],
     ) -> ProtectedOperationEvidence:
         result_payload = self._call_effect_result(result)
+        receipt_request_bytes = sum(
+            receipt.request_bytes for receipt in result.receipts
+        )
+        receipt_response_bytes = sum(
+            receipt.response_bytes for receipt in result.receipts
+        )
+        connection_payload = (
+            to_jsonable(result.connection)
+            if result.connection is not None
+            else None
+        )
         return ProtectedOperationEvidence(
             event_type=(
                 EventType.EXTERNAL_WRITE
@@ -2733,8 +4470,25 @@ class McpPrimitive:
             capability_refs=tuple(operation_context.get("capability_ids") or ()),
             effect_metadata=result_payload,
             provider_receipt={
+                "request_bytes": receipt_request_bytes,
                 "response_bytes": result.response_bytes,
+                "operation_response_bytes": receipt_response_bytes,
                 "duration_s": result.duration_s,
+                **(
+                    {"receipts": to_jsonable(result.receipts)}
+                    if result.receipts
+                    else {}
+                ),
+                **(
+                    {
+                        "protocol_revision": result.connection.protocol_revision,
+                        "protocol_era": result.connection.protocol_era.value,
+                        "fallback_used": result.connection.fallback_used,
+                        "connection": connection_payload,
+                    }
+                    if result.connection is not None
+                    else {}
+                ),
             },
         )
 
@@ -2765,6 +4519,15 @@ class McpPrimitive:
             "response_bytes": result.response_bytes,
             "duration_s": result.duration_s,
         }
+        if result.receipts:
+            payload["receipts"] = to_jsonable(result.receipts)
+        if result.connection is not None:
+            payload.update(
+                {
+                    "protocol_revision": result.connection.protocol_revision,
+                    "connection": to_jsonable(result.connection),
+                }
+            )
         public_error = provider_error_envelope_from_mapping(result.error or {})
         if public_error is not None:
             payload["error"] = {
@@ -2814,7 +4577,32 @@ class McpPrimitive:
         resource_progress: dict[str, int],
     ) -> ResourceSettlement | None:
         list_response_bytes = resource_progress["list_response_bytes"]
-        if phase == "provider_call" and _provider_result_was_returned(error):
+        provider_result_failure = _provider_result_was_returned(error)
+        if (
+            provider_result_failure
+            and phase == "provider_validate_and_call"
+            and spec.schema_version == 2
+        ):
+            # A combined v2 provider owns negotiation, live validation and
+            # dispatch.  Once it has returned a malformed result, no trusted
+            # per-phase receipt remains; settle the same cumulative envelope
+            # reserved for that phase instead of the legacy two-response shape.
+            return ResourceSettlement(
+                usage=ResourceUsage(
+                    mcp_request_bytes=spec.max_request_bytes,
+                    mcp_response_bytes=spec.max_response_bytes,
+                ),
+                source="primitive.mcp.call",
+                context={
+                    **resource_context,
+                    "failure_phase": phase,
+                    "unknown_request_bytes": spec.max_request_bytes,
+                    "unknown_response_bytes": spec.max_response_bytes,
+                    "call_started": True,
+                    "provider_result_returned": True,
+                },
+            )
+        if phase == "provider_call" and provider_result_failure:
             return ResourceSettlement(
                 usage=ResourceUsage(
                     mcp_request_bytes=list_request_bytes + request_bytes,
@@ -2926,6 +4714,15 @@ class McpPrimitive:
         list_request_bytes: int,
         live_list_result: McpToolListResult | None,
     ) -> ResourceSettlement:
+        if provider_result.receipts:
+            return cls._mcp_exchange_settlement(
+                provider_result,
+                fallback_list_request_bytes=list_request_bytes,
+                fallback_call_request_bytes=request_bytes,
+                server_id=server_id,
+                tool_id=tool_id,
+                status=result.status.value,
+            )
         list_response_bytes = (
             live_list_result.response_bytes if live_list_result is not None else 0
         )
@@ -2955,6 +4752,25 @@ class McpPrimitive:
         tool_id: str,
         status: str,
     ) -> ResourceSettlement:
+        if result.receipts:
+            request_bytes = sum(item.request_bytes for item in result.receipts)
+            response_bytes = sum(item.response_bytes for item in result.receipts)
+            return ResourceSettlement(
+                usage=ResourceUsage(
+                    mcp_request_bytes=request_bytes,
+                    mcp_response_bytes=response_bytes,
+                ),
+                source="primitive.mcp.call",
+                context={
+                    "server_id": server_id,
+                    "tool_id": tool_id,
+                    "request_bytes": request_bytes,
+                    "response_bytes": response_bytes,
+                    "call_started": result.call_started,
+                    "status": status,
+                    "receipts": to_jsonable(result.receipts),
+                },
+            )
         list_request_bytes = result.list_request_bytes or fallback_list_request_bytes
         call_request_bytes = (
             result.call_request_bytes or fallback_call_request_bytes
@@ -3045,13 +4861,17 @@ class McpPrimitive:
         )
 
     def _list_tools_success_payload(self, result: McpToolListResult) -> dict[str, Any]:
-        return {
+        payload = {
             "ok": True,
             "status": "ok",
             "response_bytes": result.response_bytes,
             "duration_s": result.duration_s,
             "tool_count": len(result.tools),
         }
+        if result.connection is not None:
+            payload["connection"] = to_jsonable(result.connection)
+            payload["receipts"] = to_jsonable(result.receipts)
+        return payload
 
     def _list_tools_failure_payload(self, exc: Exception, *, duration_s: float) -> dict[str, Any]:
         safe_error = (
@@ -3089,6 +4909,23 @@ class McpPrimitive:
             "request_bytes": request_bytes,
         }
 
+    def _discover_effect_context(
+        self,
+        server: McpServerSpec,
+        *,
+        request_bytes: int,
+    ) -> dict[str, Any]:
+        return {
+            "server_id": server.server_id,
+            "transport": server.transport,
+            "protocol_mode": self._effective_protocol_mode(server).value,
+            "rollback_class": ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED.value,
+            "rollback_status": ExternalEffectRollbackStatus.NOT_REQUIRED.value,
+            "state_mutation": False,
+            "information_flow": True,
+            "request_bytes": request_bytes,
+        }
+
     def _operation_context(
         self,
         pid: str,
@@ -3110,6 +4947,11 @@ class McpPrimitive:
             "authority_operation": "mcp.call",
             "server_id": server.server_id,
             "transport": server.transport,
+            **(
+                {"protocol_mode": self._effective_protocol_mode(server).value}
+                if server.schema_version == 2
+                else {}
+            ),
             "tool_id": tool.tool_id,
             "mcp_name": tool.mcp_name,
             "right": tool.right,
@@ -3153,7 +4995,9 @@ class McpPrimitive:
 
     @staticmethod
     def _server_spec_sha256(server: McpServerSpec) -> str:
-        return hashlib.sha256(dumps(server).encode("utf-8")).hexdigest()
+        return hashlib.sha256(
+            canonical_mcp_server_spec_json(server).encode("utf-8")
+        ).hexdigest()
 
     def _registry_binding_context(self, server_id: str) -> dict[str, Any]:
         binding = self.extensions.get_mcp_registry_binding(server_id)
@@ -3211,6 +5055,11 @@ class McpPrimitive:
         return {
             "server_id": server.server_id,
             "transport": server.transport,
+            **(
+                {"protocol_mode": self._effective_protocol_mode(server).value}
+                if server.schema_version == 2
+                else {}
+            ),
             "tool_id": tool.tool_id,
             "mcp_name": tool.mcp_name,
             "right": tool.right,
@@ -3224,7 +5073,8 @@ class McpPrimitive:
         }
 
     def _coerce_server(self, value: McpServerSpec | dict[str, Any]) -> McpServerSpec:
-        if isinstance(value, McpServerSpec):
+        typed_input = isinstance(value, McpServerSpec)
+        if typed_input:
             # Normalize typed and mapping/YAML inputs identically.  Runtime
             # dataclass annotations do not coerce ``timeout_s=1`` to ``1.0``;
             # leaving the typed value untouched would make the durable raw
@@ -3232,6 +5082,29 @@ class McpPrimitive:
             value = to_jsonable(value)
         if isinstance(value, dict):
             _reject_unknown_fields(value, _SERVER_FIELDS, context="MCP server")
+            schema_version = self._coerce_positive_int(
+                value.get("schema_version", 1),
+                "schema_version",
+            )
+            if (
+                not typed_input
+                and schema_version == 1
+                and "protocol_mode" in value
+            ):
+                raise ValidationError(
+                    "MCP server schema_version 1 must omit protocol_mode"
+                )
+            raw_protocol_mode = value.get("protocol_mode")
+            protocol_mode: McpProtocolMode | None = None
+            if raw_protocol_mode is not None:
+                if type(raw_protocol_mode) is not str:
+                    raise ValidationError("MCP protocol_mode must be a string")
+                try:
+                    protocol_mode = McpProtocolMode(raw_protocol_mode)
+                except ValueError as exc:
+                    raise ValidationError(
+                        "MCP protocol_mode must be legacy, auto, or 2026-07-28"
+                    ) from exc
             transport = self._required_string(
                 value,
                 "transport",
@@ -3243,10 +5116,7 @@ class McpPrimitive:
                 "MCP server",
             )
             spec = McpServerSpec(
-                schema_version=self._coerce_positive_int(
-                    value.get("schema_version", 1),
-                    "schema_version",
-                ),
+                schema_version=schema_version,
                 server_id=server_id,
                 transport=transport,
                 # Preserve every supplied transport block through canonical
@@ -3277,6 +5147,7 @@ class McpPrimitive:
                     "max_response_bytes",
                 ),
                 metadata=self._mapping_field(value, "metadata", "MCP server"),
+                protocol_mode=protocol_mode,
             )
         else:
             raise ValidationError("MCP server must be an object")
@@ -3347,9 +5218,29 @@ class McpPrimitive:
         )
 
     def _validate_server(self, server: McpServerSpec) -> None:
-        if server.schema_version != 1:
-            raise ValidationError("MCP server schema_version must be 1")
+        self._validate_server_protocol(server)
         self._validate_identifier(server.server_id, "server_id", self.config.mcp.server_id_max_chars)
+        self._validate_server_transport(server)
+        self._validate_server_limits(server)
+        self._validate_server_tools(server)
+        self._validate_json_value(server.metadata, "metadata")
+        if server.schema_version == 2:
+            self._validate_no_reserved_mcp_meta(server.metadata, "metadata")
+
+    @staticmethod
+    def _validate_server_protocol(server: McpServerSpec) -> None:
+        if server.schema_version not in {1, 2}:
+            raise ValidationError("MCP server schema_version must be 1 or 2")
+        if server.schema_version == 1 and server.protocol_mode is not None:
+            raise ValidationError(
+                "MCP server schema_version 1 must omit protocol_mode"
+            )
+        if server.schema_version == 2 and server.protocol_mode is None:
+            raise ValidationError(
+                "MCP server schema_version 2 requires protocol_mode"
+            )
+
+    def _validate_server_transport(self, server: McpServerSpec) -> None:
         if server.transport not in _TRANSPORTS:
             raise ValidationError("MCP transport must be stdio or streamable_http")
         if server.transport == "stdio":
@@ -3357,28 +5248,42 @@ class McpPrimitive:
             if server.http is not None:
                 raise ValidationError("MCP stdio server cannot include http configuration")
         if server.transport == "streamable_http":
-            self._validate_http(server.http)
+            self._validate_http(
+                server.http,
+                schema_version=server.schema_version,
+            )
             if server.stdio is not None:
                 raise ValidationError("MCP streamable_http server cannot include stdio configuration")
+
+    def _validate_server_limits(self, server: McpServerSpec) -> None:
         if not server.tools:
             raise ValidationError("MCP server must declare at least one allowed tool")
+        if (
+            server.schema_version == 2
+            and len(server.tools) > self.config.mcp.list_limit
+        ):
+            raise ValidationError(
+                "MCP schema_version 2 tool allowlist exceeds "
+                f"list_limit={self.config.mcp.list_limit}"
+            )
         if server.timeout_s > self.config.mcp.timeout_hard_limit_s:
             raise ValidationError("MCP timeout_s exceeds configured hard limit")
         if server.max_request_bytes > self.config.mcp.max_request_hard_limit_bytes:
             raise ValidationError("MCP max_request_bytes exceeds configured hard limit")
         if server.max_response_bytes > self.config.mcp.max_response_hard_limit_bytes:
             raise ValidationError("MCP max_response_bytes exceeds configured hard limit")
+
+    def _validate_server_tools(self, server: McpServerSpec) -> None:
         seen_tool_ids: set[str] = set()
         seen_mcp_names: set[str] = set()
         for tool in server.tools:
-            self._validate_tool(tool)
+            self._validate_tool(tool, schema_version=server.schema_version)
             if tool.tool_id in seen_tool_ids:
                 raise ValidationError(f"duplicate MCP tool_id: {tool.tool_id}")
             if tool.mcp_name in seen_mcp_names:
                 raise ValidationError(f"duplicate MCP mcp_name: {tool.mcp_name}")
             seen_tool_ids.add(tool.tool_id)
             seen_mcp_names.add(tool.mcp_name)
-        self._validate_json_value(server.metadata, "metadata")
 
     def _validate_stdio(self, stdio: McpStdioTransportSpec | None) -> None:
         if stdio is None:
@@ -3453,12 +5358,17 @@ class McpPrimitive:
                     continue
                 parts.append(part)
 
-    def _validate_http(self, http: McpHttpTransportSpec | None) -> None:
+    def _validate_http(
+        self,
+        http: McpHttpTransportSpec | None,
+        *,
+        schema_version: int,
+    ) -> None:
         if http is None:
             raise ValidationError("MCP streamable_http transport requires http configuration")
         self._validate_url(http.url)
         for name, header in http.headers.items():
-            self._validate_header_name(name)
+            self._validate_header_name(name, schema_version=schema_version)
             self._validate_env_name(header.env, f"header {name} env")
             if not self._env_allowed(header.env, self.config.mcp.header_env_allowlist):
                 raise ValidationError(f"MCP header env is not allowlisted: {header.env}")
@@ -3467,7 +5377,7 @@ class McpPrimitive:
             if header.suffix not in _ALLOWED_HEADER_SUFFIXES:
                 raise ValidationError(f"MCP header {name} suffix is not allowed")
 
-    def _validate_tool(self, tool: McpToolSpec) -> None:
+    def _validate_tool(self, tool: McpToolSpec, *, schema_version: int) -> None:
         self._validate_identifier(tool.tool_id, "tool_id", self.config.mcp.tool_id_max_chars)
         if not tool.mcp_name or len(tool.mcp_name) > self.config.mcp.mcp_name_max_chars:
             raise ValidationError("MCP mcp_name must be non-empty and within configured length")
@@ -3486,8 +5396,14 @@ class McpPrimitive:
             pass
         if rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED and tool.state_mutation:
             raise ValidationError("MCP tool with state_mutation=true cannot use no_rollback_required")
-        self._validate_json_schema(tool.input_schema, "input_schema")
+        self._validate_json_schema(
+            tool.input_schema,
+            "input_schema",
+            modern=schema_version == 2,
+        )
         self._validate_json_value(tool.metadata, "tool metadata")
+        if schema_version == 2:
+            self._validate_no_reserved_mcp_meta(tool.metadata, "tool metadata")
 
     def _header_specs(self, value: Any) -> dict[str, McpHeaderSpec]:
         if not isinstance(value, dict):
@@ -3558,11 +5474,18 @@ class McpPrimitive:
             raise ValidationError(f"{context} {key} must be an array")
         return list(selected)
 
-    def _validate_header_name(self, name: str) -> None:
+    def _validate_header_name(self, name: str, *, schema_version: int) -> None:
         lowered = name.lower()
         if len(name) > self.config.mcp.header_name_max_chars or not _HEADER_PATTERN.match(name):
             raise ValidationError(f"invalid MCP header name: {name!r}")
-        if lowered in _FORBIDDEN_HEADERS:
+        forbidden_headers = (
+            _MODERN_FORBIDDEN_HEADERS
+            if schema_version == 2
+            else _LEGACY_FORBIDDEN_HEADERS
+        )
+        if lowered in forbidden_headers or (
+            schema_version == 2 and lowered.startswith("mcp-param-")
+        ):
             raise ValidationError(f"MCP header is forbidden: {name}")
 
     def _env_allowed(self, name: str, patterns: tuple[str, ...]) -> bool:
@@ -3784,18 +5707,52 @@ class McpPrimitive:
         except (TypeError, ValueError, RecursionError) as exc:
             raise ValidationError(f"MCP {field} must be JSON-serializable") from exc
 
-    def _validate_json_schema(self, schema: dict[str, Any], field: str) -> None:
+    def _validate_no_reserved_mcp_meta(self, value: Any, field: str) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ValidationError(
+                        f"MCP {field} object keys must be strings"
+                    )
+                if key == "_meta" or key.startswith("io.modelcontextprotocol/"):
+                    raise ValidationError(
+                        f"MCP {field} must not define protocol-reserved _meta"
+                    )
+                self._validate_no_reserved_mcp_meta(item, field)
+        elif isinstance(value, list):
+            for item in value:
+                self._validate_no_reserved_mcp_meta(item, field)
+
+    def _validate_json_schema(
+        self,
+        schema: dict[str, Any],
+        field: str,
+        *,
+        modern: bool = False,
+    ) -> None:
         if not schema:
             return
         self._validate_json_value(schema, field)
+        if modern:
+            self._validate_v2_json_schema_safety(schema, field)
         try:
             jsonschema_validator_for(schema).check_schema(schema)
         except JsonSchemaSchemaError as exc:
             raise ValidationError(f"MCP {field} is not a valid JSON Schema") from exc
 
-    def _validate_arguments_against_schema(self, tool: McpToolSpec, arguments: dict[str, Any]) -> None:
+    def _validate_arguments_against_schema(
+        self,
+        server: McpServerSpec,
+        tool: McpToolSpec,
+        arguments: dict[str, Any],
+    ) -> None:
         if not tool.input_schema:
             return
+        if server.schema_version == 2:
+            self._validate_v2_json_schema_safety(
+                tool.input_schema,
+                "input_schema",
+            )
         try:
             validator = jsonschema_validator_for(tool.input_schema)
             validator.check_schema(tool.input_schema)
@@ -3804,6 +5761,216 @@ class McpPrimitive:
             raise ValidationError(f"MCP tool arguments failed schema validation: {exc.message}") from exc
         except JsonSchemaSchemaError as exc:
             raise ValidationError("MCP tool input_schema is invalid") from exc
+
+    def _validate_v2_json_schema_safety(
+        self,
+        schema: dict[str, Any],
+        field: str,
+    ) -> None:
+        """Validate the bounded JSON Schema 2020-12 subset used by Manifest v2."""
+
+        if schema.get("type") != "object":
+            raise ValidationError(
+                f"MCP {field} schema_version 2 root type must be object"
+            )
+        node_count = 0
+        combinator_expansion = 1
+        local_refs: list[tuple[dict[str, Any], str]] = []
+
+        def walk(value: Any, *, depth: int, path: str) -> None:
+            nonlocal node_count, combinator_expansion
+            if depth > self.config.mcp.schema_max_depth:
+                raise ValidationError(
+                    f"MCP {field} exceeds schema depth={self.config.mcp.schema_max_depth}"
+                )
+            node_count += 1
+            if node_count > self.config.mcp.schema_max_nodes:
+                raise ValidationError(
+                    f"MCP {field} exceeds schema nodes={self.config.mcp.schema_max_nodes}"
+                )
+            if isinstance(value, dict):
+                if "if" in value and ("then" in value or "else" in value):
+                    combinator_expansion *= 2
+                    if (
+                        combinator_expansion
+                        > self.config.mcp.schema_max_composition_expansions
+                    ):
+                        raise ValidationError(
+                            "MCP "
+                            f"{field} exceeds combinator expansion="
+                            f"{self.config.mcp.schema_max_composition_expansions}"
+                        )
+                for key, item in value.items():
+                    if key in _MCP_V2_DYNAMIC_REFERENCE_KEYS:
+                        raise ValidationError(
+                            f"MCP {field} does not allow dynamic or recursive references"
+                        )
+                    if key == "$ref":
+                        if not isinstance(item, str) or not item.startswith("#"):
+                            raise ValidationError(
+                                f"MCP {field} external $ref is not allowed"
+                            )
+                        local_refs.append((value, item))
+                    if key in {"allOf", "anyOf", "oneOf"}:
+                        if not isinstance(item, list):
+                            raise ValidationError(
+                                f"MCP {field} {key} must be an array"
+                            )
+                        combinator_expansion *= max(1, len(item))
+                        if (
+                            combinator_expansion
+                            > self.config.mcp.schema_max_composition_expansions
+                        ):
+                            raise ValidationError(
+                                "MCP "
+                                f"{field} exceeds combinator expansion="
+                                f"{self.config.mcp.schema_max_composition_expansions}"
+                            )
+                    walk(item, depth=depth + 1, path=f"{path}/{key}")
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    walk(item, depth=depth + 1, path=f"{path}/{index}")
+
+        walk(schema, depth=0, path="#")
+        for _source, reference in local_refs:
+            self._resolve_local_schema_ref(schema, reference, field)
+        self._reject_cyclic_schema_refs(schema, local_refs, field)
+
+    @staticmethod
+    def _resolve_local_schema_ref(
+        schema: dict[str, Any],
+        reference: str,
+        field: str,
+    ) -> Any:
+        if reference == "#":
+            return schema
+        if not reference.startswith("#/"):
+            raise ValidationError(
+                f"MCP {field} local $ref must use a JSON Pointer fragment"
+            )
+        selected: Any = schema
+        for raw_part in reference[2:].split("/"):
+            part = raw_part.replace("~1", "/").replace("~0", "~")
+            if isinstance(selected, dict) and part in selected:
+                selected = selected[part]
+                continue
+            if isinstance(selected, list) and part.isdigit():
+                index = int(part)
+                if index < len(selected):
+                    selected = selected[index]
+                    continue
+            raise ValidationError(f"MCP {field} contains an unresolved local $ref")
+        return selected
+
+    def _reject_cyclic_schema_refs(
+        self,
+        schema: dict[str, Any],
+        references: list[tuple[dict[str, Any], str]],
+        field: str,
+    ) -> None:
+        # Build one bounded graph for both containment and reference edges.
+        # The former implementation recursively scanned a reference target for
+        # every `$ref`, turning a valid schema with many references to one large
+        # shared definition into quadratic work.
+        nodes, edges = self._schema_containment_graph(schema)
+        self._add_schema_reference_edges(
+            schema,
+            references,
+            field,
+            nodes=nodes,
+            edges=edges,
+        )
+        self._validate_schema_reference_graph(nodes, edges, field)
+
+    @staticmethod
+    def _schema_containment_graph(
+        schema: dict[str, Any],
+    ) -> tuple[
+        dict[int, dict[str, Any] | list[Any]],
+        dict[int, list[tuple[int, int]]],
+    ]:
+        nodes: dict[int, dict[str, Any] | list[Any]] = {}
+        edges: dict[int, list[tuple[int, int]]] = {}
+        pending: list[dict[str, Any] | list[Any]] = [schema]
+        while pending:
+            value = pending.pop()
+            identity = id(value)
+            if identity in nodes:
+                continue
+            nodes[identity] = value
+            edges[identity] = []
+            children = (
+                (item for key, item in value.items() if key != "$ref")
+                if isinstance(value, dict)
+                else iter(value)
+            )
+            for child in children:
+                if not isinstance(child, (dict, list)):
+                    continue
+                child_identity = id(child)
+                edges[identity].append((child_identity, 0))
+                pending.append(child)
+        return nodes, edges
+
+    def _add_schema_reference_edges(
+        self,
+        schema: dict[str, Any],
+        references: list[tuple[dict[str, Any], str]],
+        field: str,
+        *,
+        nodes: dict[int, dict[str, Any] | list[Any]],
+        edges: dict[int, list[tuple[int, int]]],
+    ) -> None:
+        for source, reference in references:
+            target = self._resolve_local_schema_ref(schema, reference, field)
+            if not isinstance(target, (dict, list)):
+                continue
+            source_identity = id(source)
+            target_identity = id(target)
+            nodes.setdefault(source_identity, source)
+            nodes.setdefault(target_identity, target)
+            edges.setdefault(source_identity, []).append((target_identity, 1))
+            edges.setdefault(target_identity, [])
+
+    def _validate_schema_reference_graph(
+        self,
+        nodes: dict[int, dict[str, Any] | list[Any]],
+        edges: dict[int, list[tuple[int, int]]],
+        field: str,
+    ) -> None:
+        indegree = {identity: 0 for identity in nodes}
+        for outgoing in edges.values():
+            for target_identity, _ref_edge in outgoing:
+                indegree[target_identity] += 1
+        ready = deque(
+            identity for identity, degree in indegree.items() if degree == 0
+        )
+        ref_hops = {identity: 0 for identity in nodes}
+        processed = 0
+        while ready:
+            identity = ready.popleft()
+            processed += 1
+            for target_identity, ref_edge in edges[identity]:
+                candidate_hops = ref_hops[identity] + ref_edge
+                if candidate_hops > ref_hops[target_identity]:
+                    ref_hops[target_identity] = candidate_hops
+                if (
+                    ref_hops[target_identity]
+                    > self.config.mcp.schema_max_ref_hops
+                ):
+                    raise ValidationError(
+                        "MCP "
+                        f"{field} exceeds local $ref hops="
+                        f"{self.config.mcp.schema_max_ref_hops}"
+                    )
+                indegree[target_identity] -= 1
+                if indegree[target_identity] == 0:
+                    ready.append(target_identity)
+
+        if processed != len(nodes):
+            raise ValidationError(
+                f"MCP {field} recursive local $ref is not allowed"
+            )
 
     def _bounded_list_limit(self, limit: int | None) -> int:
         selected = self.config.mcp.list_limit if limit is None else limit
@@ -3858,6 +6025,7 @@ class McpPrimitive:
         return {
             "schema_version": server.schema_version,
             "server_id": server.server_id,
+            "protocol_mode": self._effective_protocol_mode(server).value,
             "transport": transport,
             "stdio_authority_resource": self.stdio_resource_for_server(server),
             "tools": [self._tool_to_json(server.server_id, tool) for tool in server.tools],
@@ -3892,7 +6060,11 @@ class McpPrimitive:
                 "name": live.name,
                 "description": live.description,
                 "input_schema": live.input_schema,
-                "schema_matches_manifest": not tool.input_schema or live.input_schema == tool.input_schema,
+                "schema_matches_manifest": not tool.input_schema
+                or _json_values_equivalent(
+                    live.input_schema,
+                    tool.input_schema,
+                ),
             }
         return payload
 

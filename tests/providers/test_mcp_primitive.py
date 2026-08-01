@@ -968,7 +968,7 @@ class TestMcpPrimitive:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import httpx
+        import httpx2
         provider = SdkMcpProvider()
         server = McpServerSpec(
             schema_version=1,
@@ -1007,7 +1007,7 @@ class TestMcpPrimitive:
             'AGENT_LIBOS_MCP_TEST_TOKEN',
             'attacker-token\r\nX-Injected: yes',
         )
-        monkeypatch.setattr(httpx, 'AsyncClient', FakeAsyncClient)
+        monkeypatch.setattr(httpx2, 'AsyncClient', FakeAsyncClient)
 
         async def exercise() -> None:
             async with provider._http_client(
@@ -1145,9 +1145,11 @@ class TestMcpPrimitive:
             url: str,
             *,
             http_client: Any,
+            terminate_on_close: bool = True,
         ):
             assert url == server.http.url
             assert http_client is selected_http_client
+            assert terminate_on_close
             yield object(), object(), None
 
         class FakeClientSession:
@@ -1180,6 +1182,10 @@ class TestMcpPrimitive:
             sys.modules,
             'mcp.client.streamable_http',
             mcp_http_module,
+        )
+        monkeypatch.setattr(
+            'agent_libos.substrate.local._mcp_tools_only_streamable_http_client',
+            fake_streamable_http_client,
         )
         monkeypatch.setattr(provider, '_http_client', fake_http_client)
 
@@ -3040,6 +3046,7 @@ class TestMcpPrimitive:
             **to_jsonable(typed),
             'server_id': 'conflicting-mapping-transport',
         }
+        mapping.pop('protocol_mode')
         try:
             for value in (typed, mapping):
                 server_id = (
@@ -4883,6 +4890,52 @@ class TestMcpPrimitive:
                     )
                 ]
             )
+        finally:
+            runtime.close()
+
+    def test_legacy_custom_provider_schema_drift_distinguishes_true_from_one(
+        self,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider(
+            live_schema={
+                "type": "object",
+                "properties": {"text": {"const": 1}},
+                "additionalProperties": False,
+            }
+        )
+        runtime.mcp.provider = provider
+        manifest = _stdio_manifest("typed-schema-drift").replace(
+            "          type: string",
+            "          const: true",
+        )
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="distinguish JSON boolean from number",
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                manifest,
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp:typed-schema-drift:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            with pytest.raises(ValidationError, match="schema changed"):
+                runtime.mcp.call_tool(
+                    pid,
+                    "typed-schema-drift",
+                    "echo",
+                    {"text": True},
+                )
+
+            assert provider.call_args == []
         finally:
             runtime.close()
 

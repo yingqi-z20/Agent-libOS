@@ -19,7 +19,9 @@ from agent_libos import Runtime
 from agent_libos.models import (
     CapabilityRight,
     McpCallStatus,
+    McpExchangePhase,
     McpHttpTransportSpec,
+    McpProtocolEra,
     McpServerSpec,
     McpToolSpec,
 )
@@ -83,6 +85,44 @@ class TestMcpSdkIntegration:
 
             assert result.ok
             assert "hello" in json.dumps(result.result, sort_keys=True)
+        finally:
+            runtime.close()
+
+    def test_stdio_modern_discovery_call_and_phase_receipts(self, tmp_path: Path) -> None:
+        server_path = _write_fastmcp_stdio_server(tmp_path)
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="mcp modern stdio")
+            args = [str(server_path)]
+            spec = _server_spec("stdio-modern-it", sys.executable, args)
+            spec["schema_version"] = 2
+            spec["protocol_mode"] = "2026-07-28"
+            runtime.mcp.register_server(spec, actor="cli", require_capability=False)
+            runtime.capability.grant(
+                pid,
+                "mcp:stdio-modern-it:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid, sys.executable, args)
+
+            result = runtime.mcp.call_tool(
+                pid,
+                "stdio-modern-it",
+                "echo",
+                {"text": "modern"},
+            )
+
+            assert result.ok
+            assert result.connection is not None
+            assert result.connection.protocol_era is McpProtocolEra.MODERN
+            assert result.connection.protocol_revision == "2026-07-28"
+            assert not result.connection.fallback_used
+            assert [item.phase for item in result.receipts] == [
+                McpExchangePhase.SERVER_DISCOVER,
+                McpExchangePhase.TOOLS_LIST,
+                McpExchangePhase.TOOLS_CALL,
+            ]
         finally:
             runtime.close()
 
@@ -450,9 +490,9 @@ def _write_fastmcp_stdio_server(root: Path) -> Path:
     path = root / "stdio_server.py"
     path.write_text(
         """
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("stdio-it")
+mcp = MCPServer("stdio-it")
 
 @mcp.tool(name="demo.echo")
 def echo(text: str) -> dict[str, str]:
@@ -474,9 +514,9 @@ from __future__ import annotations
 
 import os
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("stdio-env-it")
+mcp = MCPServer("stdio-env-it")
 
 @mcp.tool(name="demo.envcwd")
 def envcwd() -> dict[str, str | None]:
@@ -498,9 +538,9 @@ def _write_fastmcp_large_stdio_server(root: Path) -> Path:
     path = root / 'large_stdio_server.py'
     path.write_text(
         """
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("stdio-frame-limit")
+mcp = MCPServer("stdio-frame-limit")
 
 @mcp.tool(name="demo.large")
 def large() -> dict[str, str]:
@@ -522,9 +562,9 @@ from __future__ import annotations
 
 import sys
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("http-it", host="127.0.0.1", port=int(sys.argv[1]), streamable_http_path="/mcp", stateless_http=True)
+mcp = MCPServer("http-it")
 
 @mcp.tool(name="demo.echo")
 def echo(text: str) -> dict[str, str]:
@@ -535,7 +575,13 @@ def large() -> dict[str, str]:
     return {"blob": "x" * 16384}
 
 if __name__ == "__main__":
-    mcp.run("streamable-http")
+    mcp.run(
+        "streamable-http",
+        host="127.0.0.1",
+        port=int(sys.argv[1]),
+        streamable_http_path="/mcp",
+        stateless_http=True,
+    )
 """.strip(),
         encoding="utf-8",
     )

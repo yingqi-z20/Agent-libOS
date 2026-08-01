@@ -275,7 +275,17 @@ function snapshot(): RuntimeSnapshot {
     images: [],
     skills: [],
     jsonrpc_endpoints: [],
-    mcp_servers: [{ server_id: "demo-mcp" }],
+    mcp_servers: [{
+      schema_version: 1,
+      server_id: "demo-mcp",
+      protocol_mode: "legacy",
+      transport: { type: "stdio" },
+      tools: [],
+      timeout_s: 30,
+      max_request_bytes: 65_536,
+      max_response_bytes: 1_048_576,
+      metadata: {}
+    }],
     modules: []
   };
 }

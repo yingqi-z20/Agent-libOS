@@ -766,6 +766,15 @@ diff/restore and the runtime-safety benchmark consume that row conservatively,
 so a process crash cannot turn an uncertain external effect into “no effect
 recorded.”
 
+Manifest v2 MCP keeps protocol discovery/initialization, every bounded
+`tools/list` page, and `tools/call` inside one protected composite operation.
+One absolute deadline and cumulative request/response byte reservation span all
+phases; each completed phase contributes a bounded exchange receipt. Safe
+legacy fallback can occur only before Tool dispatch. An unsupported modern
+`input_required` response is never retried: a consequential or ambiguously
+mutating call remains `unknown`, and Durable Task Run reconciliation blocks in
+`needs_attention` rather than treating it as a normal resumable wait.
+
 Terminal human reads and automatic prompt/decision writes follow the same
 protocol. Their effect and audit context contains request id, purpose,
 byte/character counts, and hashes only; provider exception text is not

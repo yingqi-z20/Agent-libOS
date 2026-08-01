@@ -6,34 +6,10 @@ from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import ValidationError
+from agent_libos.utils.redaction import redact_sensitive_text as _redact_sensitive_text
 from agent_libos.utils.serde import dumps, to_jsonable
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
-_SCALAR_SECRET_PATTERNS = (
-    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
-    re.compile(
-        r"(?i)['\"]?\b(api[_-]?key|authorization|auth[_-]?token|password|passwd|secret|session[_-]?token|token)\b['\"]?"
-        r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;\"'}]+)"
-    ),
-    re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9_=-]+"),
-    re.compile(r"\bSECRET_[A-Za-z0-9_]+\b"),
-    re.compile(r"(?i)\b(?:secret|token)[_-][A-Za-z0-9._-]+\b"),
-)
-
-# Userinfo is the credential-bearing component before ``@`` in an absolute
-# URI.  Keep the scheme and destination visible for diagnostics while removing
-# both the username and password.  This intentionally also covers DSN schemes
-# such as postgresql(+driver), mysql, redis, and mongodb.
-_URI_USERINFO_PATTERN = re.compile(
-    r"(?i)(?P<scheme>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^\s/@]+)@"
-)
-
-# Cookie values commonly arrive inside provider exception text rather than a
-# structured ``headers`` mapping.  Limit the match to one HTTP header line so
-# surrounding diagnostic text remains useful.
-_HTTP_COOKIE_HEADER_PATTERN = re.compile(
-    r"(?im)(?P<header>\b(?:set-cookie|cookie)\s*:)\s*[^\r\n]*"
-)
 
 SENSITIVE_OBSERVABILITY_KEYS = frozenset(
     {
@@ -150,6 +126,23 @@ def sanitize_for_observability(
     return envelope
 
 
+def redact_sensitive_text(
+    value: str,
+    *,
+    sensitive_values: tuple[str, ...] | list[str] = (),
+) -> str:
+    """Return a stable, public-safe projection of provider-controlled text.
+
+    Pattern redaction protects common credential formats. ``sensitive_values``
+    additionally binds redaction to the exact Host-resolved secret snapshot
+    used for an operation, covering opaque provider keys that have no
+    recognizable prefix. Longest-first replacement prevents a prefix value
+    from exposing the remainder of a longer credential.
+    """
+
+    return _redact_sensitive_text(value, sensitive_values=sensitive_values)
+
+
 def _redact_value(value: Any, *, sensitive_keys: frozenset[str]) -> Any:
     jsonable = to_jsonable(value)
     if isinstance(jsonable, dict):
@@ -169,17 +162,7 @@ def _redact_value(value: Any, *, sensitive_keys: frozenset[str]) -> Any:
 
 
 def _redact_scalar_string(value: str) -> str:
-    redacted = _URI_USERINFO_PATTERN.sub(
-        lambda match: f'{match.group("scheme")}[redacted]@',
-        value,
-    )
-    redacted = _HTTP_COOKIE_HEADER_PATTERN.sub(
-        lambda match: f'{match.group("header")} [redacted]',
-        redacted,
-    )
-    for pattern in _SCALAR_SECRET_PATTERNS:
-        redacted = pattern.sub("[redacted]", redacted)
-    return redacted
+    return _redact_sensitive_text(value)
 
 
 def _is_sensitive_observability_key(key: str, *, sensitive_keys: frozenset[str]) -> bool:

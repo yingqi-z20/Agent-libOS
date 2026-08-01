@@ -234,7 +234,7 @@ same change.
 | `shell` | `policy_capability_key`, `policy_resource`, `default_policy_level`, `timeout_hard_limit_s`, `max_stdout_chars`, `max_stderr_chars`, `stdout_hard_limit_chars`, `stderr_hard_limit_chars`, `rules`, `whitelist`, `blacklist` |
 | `git` | `enabled`, `executable`, `minimum_version`, `repository_resource`, `worktree_root`, `trusted_metadata_roots`, `local_timeout_s`, `remote_timeout_s`, `timeout_hard_limit_s`, `lock_timeout_s`, `status_entry_limit`, `status_entry_hard_limit`, `log_entry_limit`, `log_entry_hard_limit`, `output_max_bytes`, `output_hard_limit_bytes`, `patch_max_bytes`, `patch_hard_limit_bytes`, `state_content_hard_limit_bytes`, `allowed_remote_schemes`, `allow_scp_style_ssh`, `allow_file_remotes`, `inherit_credential_helpers`, `inherit_ssh_agent`, `protect_git_metadata`, `ref_list_limit`, `pull_request_list_limit` |
 | `jsonrpc` | `registry_resource`, `endpoint_id_max_chars`, `method_id_max_chars`, `rpc_method_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist` |
-| `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
+| `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `protocol_probe_timeout_s`, `list_max_pages`, `schema_max_depth`, `schema_max_nodes`, `schema_max_ref_hops`, `schema_max_composition_expansions`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
 | `image` | `registry_resource`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `manifest_hard_limit_bytes`, `structured_field_hard_limit_bytes`, `max_default_tools`, `max_required_capabilities`, `max_required_modules`, `package_manifest_name`, `package_workspace_dir`, `package_tools_dir`, `package_resources_dir`, `materialized_workspace_root`, `package_manifest_max_bytes`, `package_manifest_hard_limit_bytes`, `package_file_max_bytes`, `package_max_bytes`, `package_max_files`, `prompt_max_chars`, `max_package_jit_tools`, `max_workspace_grants` |
 | `image_commit` | `artifact_version`, `artifact_hard_limit_bytes`, `payload_capture_limit_bytes`, `max_required_capabilities`, `max_committed_tools`, `max_committed_jit_sources`, `metadata_preview_chars` |
 | `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix`, `query_scan_page_size`, `query_scan_ceiling`, `metadata_text_max_chars`, `metadata_collection_max_items`, `metadata_collection_item_max_chars`, `metadata_max_bytes` |
@@ -305,19 +305,38 @@ configurable. A runtime release emits only the snapshot version it can decode.
   wildcard meaning anywhere except the final character. Manifests reference
   those names; resolved secret values must not be persisted in registry rows,
   audit metadata, benchmark provenance, or GUI responses.
+  MCP Manifest v2 additionally requires `protocol_mode` in the manifest itself;
+  it is not a mutable global configuration fallback. Manifest v1 omits that
+  field and is permanently legacy-wire. Header names are checked
+  case-insensitively and cannot override protocol/session/content-negotiation,
+  `Mcp-Param-*`, trace, baggage, or other Host-generated MCP fields.
 - `mcp.timeout_s` defaults to `10.0` seconds (with a `60.0` second hard limit)
   and is one absolute exchange deadline, not a fresh timeout for each I/O
   stage. DNS queueing and resolution, every resolved-address connect attempt,
   TLS, request writes, response headers/body chunks, stdio spawn, and stdio
-  protocol work all consume that same deadline. `mcp.max_request_bytes`
+  protocol work all consume that same deadline. For Manifest v2 that includes
+  discovery/initialization, at most 16 `tools/list` pages, and Tool dispatch;
+  the automatic modern probe receives at most five seconds and never outlives
+  the remaining deadline. `mcp.max_request_bytes`
   defaults to `65536` and `mcp.max_response_bytes` to `1048576`; provider byte
-  counters must cover the canonical JSON payload and may not under-report it.
+  counters are cumulative across those phases, must cover the canonical JSON
+  payload, and may not under-report it. The complete live Tool catalog cannot
+  exceed `mcp.list_limit` (100 by default).
   Stdio additionally caps each response frame at `max_response_bytes`, total
   stdout at four times that value, stderr at that value, each request frame at
   `max_request_bytes`, and total stdin at four times that value. Stdio children
   also inherit the process's remaining subprocess wall/CPU/memory budgets;
   unavailable metrics fail closed when a configured CPU or memory limit cannot
   be enforced.
+- `mcp.protocol_probe_timeout_s` defaults to `5.0`; it must be positive and
+  cannot exceed the release-locked `5.0` second maximum. The probe is further
+  truncated by the operation's shorter remaining absolute deadline rather
+  than silently extending either limit. `mcp.list_max_pages` defaults to 16.
+  Manifest v2 schema safety
+  uses `mcp.schema_max_depth: 64`, `mcp.schema_max_nodes: 10000`,
+  `mcp.schema_max_ref_hops: 128`, and
+  `mcp.schema_max_composition_expansions: 1024`. These are Host policy caps;
+  a server or model cannot raise them at dispatch time.
 - `tools.shell_timeout_s` defaults to `30.0` seconds and
   `shell.timeout_hard_limit_s` to `300.0`. Provider timeout and subprocess-limit
   failures are recognized through their causal wrapper chain, charged once to

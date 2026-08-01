@@ -707,7 +707,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.1.0 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.2.1 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.
@@ -809,7 +809,8 @@ Important endpoints:
   `POST /api/jsonrpc/register`, and
   `POST /api/jsonrpc/{endpoint_id}/call`
 - `GET /api/mcp`, `GET /api/mcp/{server_id}`,
-  `GET /api/mcp/{server_id}/tools`, `POST /api/mcp/register`, and
+  `GET /api/mcp/{server_id}/tools`, `POST /api/mcp/register`,
+  `POST /api/mcp/{server_id}/discover`, and
   `POST /api/mcp/{server_id}/call`
 - `GET /api/modules`, `GET /api/modules/{module_id}`
 
@@ -826,6 +827,16 @@ is not treated as omission. Process exec defaults an omitted `args` to `{}` but
 rejects any supplied non-object value. Process exit accepts `message` only as a
 JSON string or `null`. These type failures also return `400` before the runtime
 mutation or workflow launch.
+
+The MCP panel exposes an explicit Discover action for Manifest v2 `auto` and
+`2026-07-28` servers. It displays Manifest version/configured mode plus the
+current operation's revision/era, legacy/sessionless/fallback state, bounded
+server identity, standard capabilities, and unsupported capabilities. A page
+reload returns to “not negotiated”; discovery/session state is neither placed
+in the GUI snapshot schema nor persisted by the Runtime. Discovery is a
+protected external read, not a high-risk mutation confirmation. The panel does
+not expose OAuth login, MRTR continuation, subscriptions, Resources, Prompts,
+Tasks, or other excluded MCP surfaces.
 
 The process detail pane includes an Explain tab. It renders an outcome and
 evidence-completeness summary, an explicit causal tree, and a filterable

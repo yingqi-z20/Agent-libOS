@@ -218,10 +218,94 @@ export type JsonRpcEndpointSummary = Record<string, unknown> & {
   description?: string;
 };
 
+export type McpProtocolMode = "legacy" | "auto" | "2026-07-28";
+
+export type McpProtocolEra = "legacy" | "modern";
+
+export type McpConnectionInfo = {
+  protocol_mode: McpProtocolMode;
+  protocol_era: McpProtocolEra;
+  protocol_revision: string;
+  sessionless: boolean;
+  fallback_used: boolean;
+  server_name?: string | null;
+  server_version?: string | null;
+  capabilities: string[];
+  unsupported_capabilities: string[];
+};
+
+export type McpExchangeReceipt = {
+  phase: "server/discover" | "initialize" | "tools/list" | "tools/call";
+  request_bytes: number;
+  response_bytes: number;
+  duration_s: number;
+  call_started: boolean;
+};
+
+export type McpToolSummary = Record<string, unknown> & {
+  tool_id: string;
+  mcp_name: string;
+  right: string;
+  resource: string;
+  rollback_class: string;
+  rollback_status: string;
+  state_mutation: boolean;
+  information_flow: boolean;
+  input_schema: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  live?: {
+    name: string;
+    description?: string | null;
+    input_schema: Record<string, unknown>;
+    schema_matches_manifest: boolean;
+  };
+};
+
 export type McpServerSummary = Record<string, unknown> & {
+  schema_version: 1 | 2;
   server_id: string;
-  name?: string;
-  description?: string;
+  protocol_mode: McpProtocolMode;
+  transport: Record<string, unknown> & { type: string };
+  tools: McpToolSummary[];
+  timeout_s: number;
+  max_request_bytes: number;
+  max_response_bytes: number;
+  metadata: Record<string, unknown>;
+};
+
+export type McpToolListResult = {
+  server_id: string;
+  schema_version: 1 | 2;
+  transport: string;
+  protocol_mode: McpProtocolMode;
+  tools: McpToolSummary[];
+  refreshed: boolean;
+  response_bytes: number;
+  connection?: McpConnectionInfo | null;
+  receipts?: McpExchangeReceipt[];
+};
+
+export type McpDiscoveryResult = {
+  server_id: string;
+  connection: McpConnectionInfo;
+  request_bytes: number;
+  response_bytes: number;
+  duration_s: number;
+  receipts: McpExchangeReceipt[];
+};
+
+export type McpCallResult = {
+  server_id: string;
+  tool_id: string;
+  mcp_name: string;
+  status: "ok" | "mcp_error" | "transport_error" | "invalid_response" | "response_too_large" | "input_required_unsupported";
+  ok: boolean;
+  result?: unknown;
+  error?: Record<string, unknown> | null;
+  response_bytes: number;
+  duration_s: number;
+  connection?: McpConnectionInfo | null;
+  receipts?: McpExchangeReceipt[];
 };
 
 export type ModuleSummary = Record<string, unknown> & {
@@ -848,6 +932,195 @@ export function assertRuntimeSnapshot(value: unknown): asserts value is RuntimeS
     }
   }
   for (const run of value.task_runs as unknown[]) assertTaskRunSummary(run);
+  for (const server of value.mcp_servers as unknown[]) assertMcpServerSummary(server);
+}
+
+const mcpProtocolModes = ["legacy", "auto", "2026-07-28"] as const;
+const mcpProtocolEras = ["legacy", "modern"] as const;
+const mcpExchangePhases = ["server/discover", "initialize", "tools/list", "tools/call"] as const;
+const mcpCallStatuses = ["ok", "mcp_error", "transport_error", "invalid_response", "response_too_large", "input_required_unsupported"] as const;
+const mcpConnectionKeys = new Set([
+  "protocol_mode",
+  "protocol_era",
+  "protocol_revision",
+  "sessionless",
+  "fallback_used",
+  "server_name",
+  "server_version",
+  "capabilities",
+  "unsupported_capabilities"
+]);
+const mcpReceiptKeys = new Set(["phase", "request_bytes", "response_bytes", "duration_s", "call_started"]);
+const mcpDiscoveryKeys = new Set(["server_id", "connection", "request_bytes", "response_bytes", "duration_s", "receipts"]);
+
+export function assertMcpServerSummary(value: unknown): asserts value is McpServerSummary {
+  if (!isRecord(value)
+      || (value.schema_version !== 1 && value.schema_version !== 2)
+      || typeof value.server_id !== "string"
+      || !value.server_id
+      || !isMcpProtocolMode(value.protocol_mode)
+      || (value.schema_version === 1 && value.protocol_mode !== "legacy")
+      || !isRecord(value.transport)
+      || typeof value.transport.type !== "string"
+      || !value.transport.type
+      || !Array.isArray(value.tools)
+      || typeof value.timeout_s !== "number"
+      || !Number.isFinite(value.timeout_s)
+      || value.timeout_s <= 0
+      || !isNonNegativeSafeInteger(value.max_request_bytes)
+      || !isNonNegativeSafeInteger(value.max_response_bytes)
+      || !isRecord(value.metadata)) {
+    throw new Error("GUI MCP server summary is malformed.");
+  }
+  if (["connection", "receipts", "protocol_era", "protocol_revision", "fallback_used"].some((key) => key in value)) {
+    throw new Error("GUI MCP server summary contains operation-local protocol state.");
+  }
+  for (const tool of value.tools) assertMcpToolSummary(tool);
+}
+
+export function assertMcpConnectionInfo(value: unknown): asserts value is McpConnectionInfo {
+  if (!isRecord(value)
+      || Object.keys(value).some((key) => !mcpConnectionKeys.has(key))
+      || !isMcpProtocolMode(value.protocol_mode)
+      || !isMcpProtocolEra(value.protocol_era)
+      || typeof value.protocol_revision !== "string"
+      || !/^\d{4}-\d{2}-\d{2}$/.test(value.protocol_revision)
+      || typeof value.sessionless !== "boolean"
+      || typeof value.fallback_used !== "boolean"
+      || !isOptionalNullableString(value.server_name)
+      || !isOptionalNullableString(value.server_version)
+      || !isUniqueStringArray(value.capabilities)
+      || !isUniqueStringArray(value.unsupported_capabilities)) {
+    throw new Error("GUI MCP connection metadata is malformed.");
+  }
+}
+
+export function assertMcpDiscoveryResult(value: unknown): asserts value is McpDiscoveryResult {
+  if (!isRecord(value)
+      || Object.keys(value).some((key) => !mcpDiscoveryKeys.has(key))
+      || typeof value.server_id !== "string"
+      || !value.server_id
+      || !isNonNegativeSafeInteger(value.request_bytes)
+      || !isNonNegativeSafeInteger(value.response_bytes)
+      || !isNonNegativeFiniteNumber(value.duration_s)
+      || !Array.isArray(value.receipts)) {
+    throw new Error("GUI MCP discovery result is malformed.");
+  }
+  assertMcpConnectionInfo(value.connection);
+  for (const receipt of value.receipts) assertMcpExchangeReceipt(receipt);
+}
+
+export function assertMcpToolListResult(value: unknown): asserts value is McpToolListResult {
+  if (!isRecord(value)
+      || typeof value.server_id !== "string"
+      || !value.server_id
+      || (value.schema_version !== 1 && value.schema_version !== 2)
+      || typeof value.transport !== "string"
+      || !value.transport
+      || !isMcpProtocolMode(value.protocol_mode)
+      || (value.schema_version === 1 && value.protocol_mode !== "legacy")
+      || !Array.isArray(value.tools)
+      || typeof value.refreshed !== "boolean"
+      || !isNonNegativeSafeInteger(value.response_bytes)) {
+    throw new Error("GUI MCP tool list result is malformed.");
+  }
+  for (const tool of value.tools) assertMcpToolSummary(tool);
+  assertOptionalMcpOperationMetadata(value);
+}
+
+export function assertMcpCallResult(value: unknown): asserts value is McpCallResult {
+  if (!isRecord(value)
+      || typeof value.server_id !== "string"
+      || !value.server_id
+      || typeof value.tool_id !== "string"
+      || !value.tool_id
+      || typeof value.mcp_name !== "string"
+      || !value.mcp_name
+      || typeof value.status !== "string"
+      || !(mcpCallStatuses as readonly string[]).includes(value.status)
+      || typeof value.ok !== "boolean"
+      || !(value.error === undefined || value.error === null || isRecord(value.error))
+      || !isNonNegativeSafeInteger(value.response_bytes)
+      || !isNonNegativeFiniteNumber(value.duration_s)) {
+    throw new Error("GUI MCP call result is malformed.");
+  }
+  assertOptionalMcpOperationMetadata(value);
+}
+
+function assertMcpToolSummary(value: unknown): asserts value is McpToolSummary {
+  if (!isRecord(value)
+      || !["tool_id", "mcp_name", "right", "resource", "rollback_class", "rollback_status"].every(
+        (key) => typeof value[key] === "string" && Boolean(value[key])
+      )
+      || typeof value.state_mutation !== "boolean"
+      || typeof value.information_flow !== "boolean"
+      || !isRecord(value.input_schema)
+      || !isRecord(value.metadata)) {
+    throw new Error("GUI MCP tool summary is malformed.");
+  }
+  if (value.live !== undefined && (
+    !isRecord(value.live)
+    || typeof value.live.name !== "string"
+    || !value.live.name
+    || !isOptionalNullableString(value.live.description)
+    || !isRecord(value.live.input_schema)
+    || typeof value.live.schema_matches_manifest !== "boolean"
+  )) {
+    throw new Error("GUI MCP live tool summary is malformed.");
+  }
+}
+
+function assertMcpExchangeReceipt(value: unknown): asserts value is McpExchangeReceipt {
+  if (!isRecord(value)
+      || Object.keys(value).some((key) => !mcpReceiptKeys.has(key))
+      || typeof value.phase !== "string"
+      || !(mcpExchangePhases as readonly string[]).includes(value.phase)
+      || !isNonNegativeSafeInteger(value.request_bytes)
+      || !isNonNegativeSafeInteger(value.response_bytes)
+      || !isNonNegativeFiniteNumber(value.duration_s)
+      || typeof value.call_started !== "boolean") {
+    throw new Error("GUI MCP exchange receipt is malformed.");
+  }
+}
+
+function assertOptionalMcpOperationMetadata(value: Record<string, unknown>): void {
+  const hasConnection = value.connection !== undefined && value.connection !== null;
+  const hasReceipts = value.receipts !== undefined;
+  if (hasConnection) assertMcpConnectionInfo(value.connection);
+  if (hasReceipts) {
+    if (!Array.isArray(value.receipts)) throw new Error("GUI MCP exchange receipts are malformed.");
+    for (const receipt of value.receipts) assertMcpExchangeReceipt(receipt);
+  }
+  if ((hasConnection && !hasReceipts)
+      || (!hasConnection && Array.isArray(value.receipts) && value.receipts.length > 0)) {
+    throw new Error("GUI MCP operation metadata is incomplete.");
+  }
+}
+
+function isMcpProtocolMode(value: unknown): value is McpProtocolMode {
+  return typeof value === "string" && (mcpProtocolModes as readonly string[]).includes(value);
+}
+
+function isMcpProtocolEra(value: unknown): value is McpProtocolEra {
+  return typeof value === "string" && (mcpProtocolEras as readonly string[]).includes(value);
+}
+
+function isOptionalNullableString(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || typeof value === "string";
+}
+
+function isUniqueStringArray(value: unknown): value is string[] {
+  return Array.isArray(value)
+    && value.every((item) => typeof item === "string" && Boolean(item))
+    && new Set(value).size === value.length;
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isNonNegativeFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 /** Validate snapshots delivered inside an SSE event before replacing visible state. */

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import field
 import math
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 from urllib.parse import SplitResult, unquote_plus, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -24,6 +24,10 @@ _TIMEZONE_KEY_PATTERN = re.compile(
     r"[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*\Z"
 )
 _FIXED_TIMEZONE_FALLBACK_KEYS = frozenset({"Asia/Shanghai"})
+
+# MCP 1.2.1 release contract: automatic modern discovery may consume no more
+# than five seconds, even when the enclosing operation has a longer deadline.
+MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S: Final[float] = 5.0
 
 ShellPolicyLevel = Literal[
     "always_deny",
@@ -769,6 +773,12 @@ class McpDefaults:
     max_request_hard_limit_bytes: int = 1_048_576
     max_response_hard_limit_bytes: int = 8_388_608
     list_limit: int = 100
+    protocol_probe_timeout_s: float = MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S
+    list_max_pages: int = 16
+    schema_max_depth: int = 64
+    schema_max_nodes: int = 10_000
+    schema_max_ref_hops: int = 128
+    schema_max_composition_expansions: int = 1_024
     audit_preview_chars: int = 512
     header_env_allowlist: tuple[str, ...] = ("AGENT_LIBOS_MCP_*",)
     stdio_env_allowlist: tuple[str, ...] = ("AGENT_LIBOS_MCP_*",)
@@ -1281,6 +1291,43 @@ def _validate_data_flow_config(data_flow: DataFlowDefaults) -> None:
         priorities[priority] = rule.pattern
 
 
+def _validate_mcp_config(mcp: McpDefaults) -> None:
+    for name in (
+        "registry_resource",
+        "server_id_max_chars",
+        "tool_id_max_chars",
+        "mcp_name_max_chars",
+        "header_name_max_chars",
+        "header_value_max_chars",
+        "manifest_max_bytes",
+        "timeout_s",
+        "timeout_hard_limit_s",
+        "max_request_bytes",
+        "max_response_bytes",
+        "max_request_hard_limit_bytes",
+        "max_response_hard_limit_bytes",
+        "list_limit",
+        "protocol_probe_timeout_s",
+        "list_max_pages",
+        "schema_max_depth",
+        "schema_max_nodes",
+        "schema_max_ref_hops",
+        "schema_max_composition_expansions",
+        "audit_preview_chars",
+    ):
+        _positive_or_non_empty(f"mcp.{name}", getattr(mcp, name))
+    _require_at_least("mcp.timeout_hard_limit_s", mcp.timeout_hard_limit_s, "mcp.timeout_s", mcp.timeout_s)
+    _require_at_least("mcp.max_request_hard_limit_bytes", mcp.max_request_hard_limit_bytes, "mcp.max_request_bytes", mcp.max_request_bytes)
+    _require_at_least("mcp.max_response_hard_limit_bytes", mcp.max_response_hard_limit_bytes, "mcp.max_response_bytes", mcp.max_response_bytes)
+    if mcp.protocol_probe_timeout_s > MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S:
+        raise ValueError(
+            "mcp.protocol_probe_timeout_s must be <= release maximum "
+            f"{MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S}"
+        )
+    _require_non_empty_items("mcp.header_env_allowlist", mcp.header_env_allowlist)
+    _require_non_empty_items("mcp.stdio_env_allowlist", mcp.stdio_env_allowlist)
+
+
 def _validate_config(config: AgentLibOSConfig) -> None:
     _validate_runtime_config(config.runtime)
     _validate_data_flow_config(config.data_flow)
@@ -1452,30 +1499,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _require_at_least("jsonrpc.max_response_hard_limit_bytes", jsonrpc.max_response_hard_limit_bytes, "jsonrpc.max_response_bytes", jsonrpc.max_response_bytes)
     _require_non_empty_items("jsonrpc.header_env_allowlist", jsonrpc.header_env_allowlist)
 
-    mcp = config.mcp
-    for name in (
-        "registry_resource",
-        "server_id_max_chars",
-        "tool_id_max_chars",
-        "mcp_name_max_chars",
-        "header_name_max_chars",
-        "header_value_max_chars",
-        "manifest_max_bytes",
-        "timeout_s",
-        "timeout_hard_limit_s",
-        "max_request_bytes",
-        "max_response_bytes",
-        "max_request_hard_limit_bytes",
-        "max_response_hard_limit_bytes",
-        "list_limit",
-        "audit_preview_chars",
-    ):
-        _positive_or_non_empty(f"mcp.{name}", getattr(mcp, name))
-    _require_at_least("mcp.timeout_hard_limit_s", mcp.timeout_hard_limit_s, "mcp.timeout_s", mcp.timeout_s)
-    _require_at_least("mcp.max_request_hard_limit_bytes", mcp.max_request_hard_limit_bytes, "mcp.max_request_bytes", mcp.max_request_bytes)
-    _require_at_least("mcp.max_response_hard_limit_bytes", mcp.max_response_hard_limit_bytes, "mcp.max_response_bytes", mcp.max_response_bytes)
-    _require_non_empty_items("mcp.header_env_allowlist", mcp.header_env_allowlist)
-    _require_non_empty_items("mcp.stdio_env_allowlist", mcp.stdio_env_allowlist)
+    _validate_mcp_config(config.mcp)
 
     image = config.image
     for name in (

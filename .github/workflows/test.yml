@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 env:
-  RELEASE_WHEEL: dist/agent_libos-1.1.0-py3-none-any.whl
-  RELEASE_SDIST: dist/agent_libos-1.1.0.tar.gz
+  RELEASE_WHEEL: dist/agent_libos-1.2.1-py3-none-any.whl
+  RELEASE_SDIST: dist/agent_libos-1.2.1.tar.gz
   RELEASE_CHECKSUMS: dist/SHA256SUMS
 
 jobs:
@@ -355,7 +355,13 @@ jobs:
   mcp-sdk:
     needs: static
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+
+    name: mcp sdk (${{ matrix.python-version }})
 
     steps:
       - name: Check out repository
@@ -366,7 +372,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -377,11 +388,16 @@ jobs:
       - name: Install frozen MCP SDK dependencies
         run: uv sync --frozen --all-groups --extra mcp
 
-      - name: Run complete MCP SDK integration file
+      - name: Run complete MCP SDK integration suite
         run: >-
           uv run python -m pytest
+          tests/providers/test_mcp_http_transport.py
+          tests/providers/test_mcp_v2_adapter.py
           tests/providers/test_mcp_sdk_integration.py
           --run-mcp --fail-on-skip
+
+      - name: Run applicable MCP client conformance scenarios
+        run: uv run python scripts/run_mcp_conformance.py
 
   windows:
     needs: static

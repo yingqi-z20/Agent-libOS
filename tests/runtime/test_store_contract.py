@@ -50,6 +50,7 @@ from agent_libos.models import (
     KilledProcessOutcome,
     LLMCallRecord,
     McpHttpTransportSpec,
+    McpProtocolMode,
     McpProviderCallResult,
     McpProviderTool,
     McpServerSpec,
@@ -77,6 +78,7 @@ from agent_libos.models import (
     TaskRunStatus,
     ToolProcessWait,
     ToolCandidateStatus,
+    canonical_mcp_server_spec_json,
 )
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.runtime.checkpoint_reconciliation import (
@@ -316,6 +318,18 @@ def _registry_contract_http_mcp_server(
         max_request_bytes=1024,
         max_response_bytes=2048,
     )
+
+
+_MCP_V1_1_1_0_CANONICAL_JSON = (
+    '{"http": null, "max_request_bytes": 1024, "max_response_bytes": 2048, '
+    '"metadata": {}, "schema_version": 1, "server_id": "canonical-v1-mcp", '
+    '"stdio": {"args": ["-m", "demo_mcp"], "command": "python3", '
+    '"cwd": null, "env": {}}, "timeout_s": 1.0, "tools": '
+    '[{"information_flow": true, "input_schema": {}, "mcp_name": "demo.echo", '
+    '"metadata": {}, "right": "read", "rollback_class": '
+    '"no_rollback_required", "rollback_status": null, '
+    '"state_mutation": false, "tool_id": "echo"}], "transport": "stdio"}'
+)
 
 
 class _RegistryDispatchBarrierProvider:
@@ -728,6 +742,194 @@ def test_checkpoint_repository_restore_rolls_back_rows_and_payloads(
 
 
 @pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_mcp_manifest_v1_store_bytes_and_digest_remain_1_1_0_canonical(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    server = _registry_contract_mcp_server("canonical-v1-mcp")
+    assert server.protocol_mode is None
+    assert canonical_mcp_server_spec_json(server) == _MCP_V1_1_1_0_CANONICAL_JSON
+
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        runtime.store.upsert_mcp_server(
+            server,
+            registered_by="test",
+            created_at=utc_now(),
+        )
+
+        rows = runtime.store._query(
+            "SELECT spec_json FROM mcp_servers WHERE server_id = ?",
+            (server.server_id,),
+        )
+        assert [row["spec_json"] for row in rows] == [
+            _MCP_V1_1_1_0_CANONICAL_JSON
+        ]
+        assert runtime.store.get_mcp_registry_binding(server.server_id) == {
+            "registry_generation": 1,
+            "registry_spec_sha256": hashlib.sha256(
+                _MCP_V1_1_1_0_CANONICAL_JSON.encode("utf-8")
+            ).hexdigest(),
+        }
+        loaded = runtime.store.get_mcp_server(server.server_id)
+        assert loaded is not None
+        assert loaded[0] == server
+
+
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+@pytest.mark.parametrize(
+    ("schema_version", "protocol_mode"),
+    [
+        pytest.param(1, None, id="manifest-v1-legacy"),
+        pytest.param(2, McpProtocolMode.LEGACY, id="manifest-v2-legacy"),
+        pytest.param(2, McpProtocolMode.AUTO, id="manifest-v2-auto"),
+        pytest.param(
+            2,
+            McpProtocolMode.REVISION_2026_07_28,
+            id="manifest-v2-modern",
+        ),
+    ],
+)
+def test_mcp_manifest_v1_and_v2_reopen_with_stable_canonical_binding(
+    kind: str,
+    schema_version: int,
+    protocol_mode: McpProtocolMode | None,
+    tmp_path: Path,
+) -> None:
+    server = replace(
+        _registry_contract_mcp_server(f"reopen-mcp-v{schema_version}-{protocol_mode}"),
+        schema_version=schema_version,
+        protocol_mode=protocol_mode,
+    )
+    expected_json = canonical_mcp_server_spec_json(server)
+    expected_binding: dict[str, object]
+
+    with _persistent_target(kind, tmp_path) as (target, config):
+        runtime = Runtime.open(target, config=config)
+        try:
+            runtime.store.upsert_mcp_server(
+                server,
+                registered_by="test",
+                created_at=utc_now(),
+            )
+            rows = runtime.store._query(
+                "SELECT spec_json FROM mcp_servers WHERE server_id = ?",
+                (server.server_id,),
+            )
+            assert [row["spec_json"] for row in rows] == [expected_json]
+            persisted = json.loads(expected_json)
+            if schema_version == 1:
+                assert "protocol_mode" not in persisted
+            else:
+                assert protocol_mode is not None
+                assert persisted["protocol_mode"] == protocol_mode.value
+            expected_binding = runtime.store.get_mcp_registry_binding(
+                server.server_id
+            )
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(target, config=config)
+        try:
+            loaded = reopened.store.get_mcp_server(server.server_id)
+            assert loaded is not None
+            assert loaded[0] == server
+            assert reopened.store.get_mcp_registry_binding(
+                server.server_id
+            ) == expected_binding
+        finally:
+            reopened.close()
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+@pytest.mark.parametrize(
+    ("schema_version", "protocol_mode", "message"),
+    [
+        pytest.param(
+            1,
+            McpProtocolMode.LEGACY,
+            "manifest v1 must omit protocol_mode",
+            id="v1-present",
+        ),
+        pytest.param(
+            2,
+            None,
+            "manifest v2 requires an explicit protocol_mode",
+            id="v2-missing",
+        ),
+    ],
+)
+def test_mcp_manifest_store_rejects_noncanonical_protocol_mode_shape_without_write(
+    kind: str,
+    schema_version: int,
+    protocol_mode: McpProtocolMode | None,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    server = replace(
+        _registry_contract_mcp_server("noncanonical-mcp-protocol-mode"),
+        schema_version=schema_version,
+        protocol_mode=protocol_mode,
+    )
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        before = runtime.store.get_mcp_registry_binding(server.server_id)
+        with pytest.raises(ValidationError, match=message):
+            runtime.store.upsert_mcp_server(
+                server,
+                registered_by="test",
+                created_at=utc_now(),
+            )
+        assert runtime.store.list_mcp_servers() == []
+        assert runtime.store.get_mcp_registry_binding(server.server_id) == before
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+@pytest.mark.parametrize(
+    "corrupt_schema_version",
+    [
+        pytest.param(True, id="boolean"),
+        pytest.param("2", id="string"),
+        pytest.param(2.9, id="fractional"),
+    ],
+)
+def test_mcp_manifest_store_rejects_noninteger_persisted_schema_versions(
+    kind: str,
+    corrupt_schema_version: object,
+    tmp_path: Path,
+) -> None:
+    server = replace(
+        _registry_contract_mcp_server("corrupt-mcp-schema-version"),
+        schema_version=2,
+        protocol_mode=McpProtocolMode.AUTO,
+    )
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        runtime.store.upsert_mcp_server(
+            server,
+            registered_by="test",
+            created_at=utc_now(),
+        )
+        corrupt = json.loads(canonical_mcp_server_spec_json(server))
+        corrupt["schema_version"] = corrupt_schema_version
+        corrupt_json = json.dumps(
+            corrupt,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        runtime.store._execute(
+            "UPDATE mcp_servers SET spec_json = ? WHERE server_id = ?",
+            (corrupt_json, server.server_id),
+        )
+
+        with pytest.raises(ValidationError, match="integer 1 or 2"):
+            runtime.store.get_mcp_server(server.server_id)
+        with pytest.raises(ValidationError, match="integer 1 or 2"):
+            runtime.store.get_mcp_registry_binding(server.server_id)
+        assert runtime.store._query(
+            "SELECT spec_json FROM mcp_servers WHERE server_id = ?",
+            (server.server_id,),
+        )[0]["spec_json"] == corrupt_json
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
 def test_provider_registry_bindings_are_versioned_and_independent(
     kind: str,
     tmp_path: Path,
@@ -780,7 +982,7 @@ def test_provider_registry_bindings_are_versioned_and_independent(
         assert current_mcp == {
             "registry_generation": 1,
             "registry_spec_sha256": hashlib.sha256(
-                dumps(server).encode("utf-8")
+                canonical_mcp_server_spec_json(server).encode("utf-8")
             ).hexdigest(),
         }
 

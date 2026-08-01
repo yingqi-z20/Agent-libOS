@@ -27,7 +27,7 @@ Legend:
 | PTY Runtime Module | POSIX PTY plus optional Windows `pywinpty`/ConPTY session I/O; source checkout/source distribution only, not the core wheel | POSIX paths on Ubuntu; Windows 3.11 installs the `pty` extra before running the complete deterministic matrix | Current Windows backend has no Job Object, parent-death containment, or wall/CPU/RSS supervision; budgeted `SubprocessLimits` spawns fail closed. Native CI coverage does not expand those implementation guarantees |
 | Typed Git provider | System Git 2.26+, fixed non-bare workspace repository; local operations, managed worktrees, patch Objects, existing remotes, and repository-local simulated PRs | Deterministic provider/security/runtime tests use temporary SHA-1/SHA-256 repositories and local bare remotes on Ubuntu, with the complete deterministic matrix also running on Windows 3.11; Shell/PTY/provenance hardening is parameterized | Credential-manager integrations and real HTTPS/OpenSSH authentication require environment-gated runs; GitHub/GitLab APIs are not implemented |
 | JSON-RPC client | Registered HTTP endpoints only | Deterministic loopback/provider tests | Real network proxy/TLS/DNS policy is deployment-specific |
-| MCP client | Tools-only v1 over Streamable HTTP or stdio | Deterministic primitive/provider tests plus the complete MCP SDK integration file on Ubuntu from the frozen `mcp` extra | Real remote-server identity, proxy, and TLS topology remain deployment gates; Resources/Prompts are not implemented |
+| MCP client | Tools-only Manifest v1/v2 over Streamable HTTP or stdio, using Python MCP SDK v2; v1 is legacy-wire only and v2 explicitly selects `legacy`, `auto`, or modern `2026-07-28` | Deterministic primitive/provider/security tests, complete frozen-extra SDK integration, and the fixed-upstream applicable client conformance scenarios without an expected-failure baseline, on Ubuntu Python 3.11 and 3.14 | Real remote identity/proxy/TLS topology remains a deployment gate. MRTR/OAuth/`subscriptions/listen`, Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OTel product support, and an MCP server surface are not implemented |
 | Real LLM | OpenAI Responses and OpenAI-compatible Chat profiles | Mock/action-selection paths only | Credentials and token-spending smoke are opt-in with `--run-real-llm`; run one scoped task/profile per release target |
 | Data-label egress enforcement | Host Sink registry and a unified gate cover LLM, Human, JSON-RPC, MCP, typed Git, filesystem writes, Shell/PTY, and internal process handoff | Deterministic unit/runtime/security/provider/benchmark tests, including pre-provider denial and exact conditional release | The guarantee covers runtime-mediated payloads; trusted modules/providers, native child I/O, Sink re-forwarding, and direct store administration remain operator trust boundaries |
 
@@ -60,7 +60,8 @@ invariant/collection checks; per-lane deterministic matrix on every CI Python
 version, including Windows Python 3.11 with Deno and the PTY extra; GUI lane;
 isolated AgentDojo Python 3.11/3.12 harness; PostgreSQL job;
 runtime-safety release smoke; 100k external-effect recovery gate;
-10k runtime-publication recovery gate; Ubuntu MCP SDK integration; and the
+10k runtime-publication recovery gate; Ubuntu MCP SDK integration on Python
+3.11 and 3.14; and the
 single release-artifact build plus clean-install smoke on Python 3.11–3.14 are
 all necessary but not sufficient for a cross-platform release. The
 `release-artifacts` build waits for the pre-build jobs listed in its `needs` and

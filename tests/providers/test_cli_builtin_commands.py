@@ -17,8 +17,10 @@ from agent_libos.api.cli import cli as cli_entrypoint
 from agent_libos.api.cli import _handle_interactive_human_response
 from agent_libos.api.cli import main as cli_main
 from agent_libos.api.cli import _print_interactive_help
+from agent_libos.api.cli import _parse_cli_args
 from agent_libos.api.cli import _run_capabilities_command
 from agent_libos.api.cli import _run_interactive_command
+from agent_libos.api.cli import _run_mcp_command
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
@@ -26,6 +28,12 @@ from agent_libos.models import (
     ObjectMetadata,
     ObjectType,
     HumanRequestStatus,
+    McpConnectionInfo,
+    McpDiscoveryResult,
+    McpExchangePhase,
+    McpExchangeReceipt,
+    McpProtocolEra,
+    McpProtocolMode,
     ProcessMessageKind,
     ProcessStatus,
     process_outcome_to_mapping,
@@ -619,7 +627,7 @@ class TestCLIBuiltinCommand:
         self,
     ) -> None:
         message = (
-            "Agent libOS store schema v3 is not writable or readable by 1.1.0; "
+            "Agent libOS store schema v3 is not writable or readable by 1.2.1; "
             "expected 4. Use Agent libOS 1.0.1 to view or archive this store. "
             "No migration was attempted."
         )
@@ -646,7 +654,7 @@ class TestCLIBuiltinCommand:
 
     def test_python_module_entrypoint_uses_structured_error_boundary(self) -> None:
         message = (
-            "Agent libOS store schema v3 is not writable or readable by 1.1.0; "
+            "Agent libOS store schema v3 is not writable or readable by 1.2.1; "
             "expected 4. Use Agent libOS 1.0.1 to view or archive this store. "
             "No migration was attempted."
         )
@@ -1256,6 +1264,101 @@ class TestCLIBuiltinCommand:
             assert inspected['transport']['type'] == 'stdio'
             assert tools['tools'][0]['tool_id'] == 'echo'
             assert tools['tools'][0]['resource'] == 'mcp:cli-mcp:echo'
+
+    def test_cli_mcp_discover_forwards_process_actor_and_projects_connection(self) -> None:
+        _parser, args = _parse_cli_args(
+            [
+                'mcp',
+                '--actor-pid',
+                'pid-modern-reader',
+                'discover',
+                'modern-server',
+            ]
+        )
+        calls: list[dict[str, object]] = []
+        discovery = McpDiscoveryResult(
+            server_id='modern-server',
+            connection=McpConnectionInfo(
+                protocol_mode=McpProtocolMode.AUTO,
+                protocol_era=McpProtocolEra.MODERN,
+                protocol_revision='2026-07-28',
+                sessionless=True,
+                fallback_used=False,
+                server_name='fixture',
+                server_version='2.0.0',
+                capabilities=('tools',),
+            ),
+            request_bytes=41,
+            response_bytes=97,
+            duration_s=0.01,
+            receipts=(
+                McpExchangeReceipt(
+                    phase=McpExchangePhase.SERVER_DISCOVER,
+                    request_bytes=41,
+                    response_bytes=97,
+                    duration_s=0.01,
+                    call_started=True,
+                ),
+            ),
+        )
+        expected = {
+            'server_id': 'modern-server',
+            'connection': {
+                'protocol_mode': 'auto',
+                'protocol_era': 'modern',
+                'protocol_revision': '2026-07-28',
+                'sessionless': True,
+                'fallback_used': False,
+                'server_name': 'fixture',
+                'server_version': '2.0.0',
+                'capabilities': ['tools'],
+                'unsupported_capabilities': [],
+            },
+            'request_bytes': 41,
+            'response_bytes': 97,
+            'duration_s': 0.01,
+            'receipts': [
+                {
+                    'phase': 'server/discover',
+                    'request_bytes': 41,
+                    'response_bytes': 97,
+                    'duration_s': 0.01,
+                    'call_started': True,
+                }
+            ],
+        }
+
+        class RecordingMcp:
+            @staticmethod
+            def discover(
+                server_id: str,
+                *,
+                actor: str,
+                require_capability: bool,
+            ) -> McpDiscoveryResult:
+                calls.append(
+                    {
+                        'server_id': server_id,
+                        'actor': actor,
+                        'require_capability': require_capability,
+                    }
+                )
+                return discovery
+
+        result = _run_mcp_command(
+            SimpleNamespace(mcp=RecordingMcp()),
+            args,
+        )
+
+        assert result == expected
+        assert result['connection']['protocol_revision'] == '2026-07-28'
+        assert calls == [
+            {
+                'server_id': 'modern-server',
+                'actor': 'pid-modern-reader',
+                'require_capability': True,
+            }
+        ]
 
 @contextlib.contextmanager
 def _temporary_cwd(path: Path):

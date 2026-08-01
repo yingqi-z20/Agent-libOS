@@ -71,6 +71,7 @@ PRIMITIVE_BOUNDARIES = (
     boundary("git", "merge_pull_request", "primitive", "runtime.git.merge_pull_request", "pid", "pid"),
     boundary("git", "close_pull_request", "primitive", "runtime.git.close_pull_request", "pid", "pid"),
     boundary("jsonrpc", "call", "primitive", "primitive.jsonrpc.call", "pid", "pid"),
+    boundary("mcp", "discover", "primitive", "primitive.mcp.discover", "actor", "actor"),
     boundary("mcp", "list_tools", "primitive", "primitive.mcp.list_tools", "actor", "actor"),
     boundary("mcp", "call_tool", "primitive", "primitive.mcp.call", "pid", "pid"),
     boundary("clock", "now", "primitive", "primitive.clock.now", "pid", "pid"),

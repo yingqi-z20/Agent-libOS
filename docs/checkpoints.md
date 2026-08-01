@@ -625,7 +625,10 @@ the provider.
 JSON-RPC endpoint and MCP server registry rows are host provider configuration
 and are not captured or restored. Restored capabilities that reference a
 missing endpoint or server fail closed until a host operator registers that
-provider configuration explicitly.
+provider configuration explicitly. MCP negotiated revisions, discovery
+metadata, sessions, cursors, and phase state are operation-local and likewise
+are not checkpointed; a later live Tool operation negotiates afresh under the
+current registry binding.
 
 ## Commit To Image
 

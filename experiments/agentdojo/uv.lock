@@ -4,7 +4,7 @@ requires-python = ">=3.11, <3.13"
 
 [[package]]
 name = "agent-libos"
-version = "1.1.0"
+version = "1.2.1"
 source = { editable = "../../" }
 dependencies = [
     { name = "jsonschema" },
@@ -17,9 +17,12 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpcore2", marker = "extra == 'mcp'", specifier = ">=2.5,<3" },
+    { name = "httpx2", marker = "extra == 'mcp'", specifier = ">=2.5,<3" },
     { name = "jsonschema", specifier = ">=4.25.0,<5" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.27,<2" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.0,<3" },
     { name = "openai", specifier = ">=2.43.0,<3" },
+    { name = "opentelemetry-api", marker = "extra == 'mcp'", specifier = ">=1.28,<2" },
     { name = "psutil", specifier = ">=7.0.0,<8" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2,<4" },
     { name = "pydantic", specifier = ">=2.13.4,<3" },

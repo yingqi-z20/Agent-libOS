@@ -84,10 +84,14 @@ def record_external_effect(
     # Rollback support and provider outcome are separate axes. A provider may
     # confirm that an effect committed while being unable to classify how it
     # could be rolled back. Only an explicitly unknown outcome makes the
-    # transaction outcome unknown.
+    # transaction outcome unknown, while an explicit failed outcome records a
+    # terminal dispatch failure rather than manufacturing a commit.
+    provider_outcome = str(provider_metadata.get("outcome") or "")
     transaction_state = (
         "unknown"
-        if str(provider_metadata.get("outcome") or "").startswith("unknown")
+        if provider_outcome.startswith("unknown")
+        else "failed"
+        if provider_outcome == "failed"
         else "committed"
     )
     receipt = provider_metadata.get("provider_receipt")

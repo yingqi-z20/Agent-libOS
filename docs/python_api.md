@@ -24,6 +24,7 @@ surface. They are grouped below by purpose.
 | Object Memory | `AgentObject`, `MaterializedContext`, `MemoryView`, `ObjectHandle`, `ObjectMetadata`, `ObjectNamespace`, `ObjectQuery`, `ObjectRight`, `ObjectType`, `RelationType`, `ViewMode` |
 | Object tasks | `ObjectTask`, `ObjectTaskNotification`, `ObjectTaskNotificationStatus`, `ObjectTaskOwnerWatch`, `ObjectTaskStatus` |
 | Durable Task Runs | `TaskRunSpecV1`, `TaskRunStatus`, `TaskRunAction`, `TaskRunRetention`, `TaskRunSummary`, `TaskRunLedgerItem` |
+| MCP client | `McpProtocolMode`, `McpProtocolEra`, `McpConnectionInfo`, `McpDiscoveryResult`, `McpToolListResult`, `McpProviderCallResult`, `McpCallResult` |
 | Operations and evidence | `ContextMaterializationManifest`, `OperationEvidenceLink`, `OperationEvidenceRole`, `OperationKind`, `OperationOutcome`, `OperationRecord`, `OperationState` |
 | Human, events, tools, and workflows | `HumanRequest`, `Event`, `EventType`, `ToolCallResult`, `ToolCandidate`, `ToolHandle`, `ToolSpec`, `ValidationResult`, `WorkflowRunResult` |
 
@@ -304,8 +305,8 @@ opt-in, retention, recovery, and external-effect semantics.
 ## JSON-RPC and MCP Host APIs
 
 The remote-resource managers are Host APIs. Their supported synchronous
-signatures are listed below; `acall(...)`, `alist_tools(...)`, and
-`acall_tool(...)` have the same arguments and return values as their
+signatures are listed below; `acall(...)`, `adiscover(...)`,
+`alist_tools(...)`, and `acall_tool(...)` have the same arguments and return values as their
 synchronous counterparts, but must be awaited.
 
 | JSON-RPC method | Return |
@@ -326,6 +327,7 @@ synchronous counterparts, but must be awaited.
 | `runtime.mcp.list_servers(*, actor=None, require_capability=True, text=None, limit=None)` | bounded `list[dict]` |
 | `runtime.mcp.list_servers_window(*, actor=None, require_capability=True, text=None, limit=None)` | `(list[dict], has_more)` |
 | `runtime.mcp.inspect_server(server_id, *, actor=None, require_capability=True, include_sensitive_fields=False)` | server `dict` |
+| `runtime.mcp.discover(server_id, *, actor=None, require_capability=True)` / `await runtime.mcp.adiscover(...)` | `McpDiscoveryResult` for Manifest v2 modern-capable modes |
 | `runtime.mcp.list_tools(server_id, *, actor=None, require_capability=True, refresh=False)` / `await runtime.mcp.alist_tools(...)` | tool-list `dict` |
 | `runtime.mcp.unregister_server(server_id, *, actor="runtime", require_capability=True)` | deletion `dict` |
 | `runtime.mcp.call_tool(pid, server_id, tool_id, arguments=None, *, source_oids=None)` / `await runtime.mcp.acall_tool(...)` | `McpCallResult` |
@@ -345,6 +347,14 @@ as a path. `source` is evidence metadata only. Trusted Host code must read and
 bound a Host-controlled file itself. If a process supplies a manifest path,
 use the CLI actor mode or the filesystem primitive so its filesystem authority
 is enforced before passing the bounded text to the registry manager.
+
+MCP public result models distinguish configured `McpProtocolMode` from
+negotiated `McpProtocolEra`. `McpConnectionInfo` reports only bounded,
+non-secret operation-local diagnostics; it is neither a capability nor a
+persisted session. The existing `McpProvider` signatures remain compatible for
+Manifest v1. Manifest v2 requires the separately feature-detected
+`McpModernProtocolProvider` extension, so an older custom provider fails before
+dispatch instead of receiving an unexpected call shape.
 
 ### Provider protocols and injection
 
@@ -439,7 +449,7 @@ cannot silently abandon an owned store or partially assembled component graph.
 
 ## Compatibility boundary
 
-- Agent libOS 1.1.0 is experimental. The top-level `agent_libos.__all__` names
+- Agent libOS 1.2.1 is experimental. The top-level `agent_libos.__all__` names
   and the Runtime entrypoints documented here are the intended application
   import surface for this release. Pin the package version when depending on
   exact signatures or dataclass fields.
@@ -466,6 +476,9 @@ cannot silently abandon an owned store or partially assembled component graph.
   `McpSubprocessLimitsProvider`. The Runtime never passes that keyword to a
   legacy provider; when a stdio operation has a configured subprocess budget,
   a provider without the extension is rejected before provider dispatch.
+  Agent libOS 1.2.1 adds modern discovery/negotiation through the optional
+  `McpModernProtocolProvider`; it does not add required parameters to those
+  three methods.
 - Persisted Runtime state has a strict schema generation. Opening an older,
   newer, incomplete, or hand-built schema may raise `UnsupportedStoreVersion`;
   no general automatic migration guarantee is implied by Python API

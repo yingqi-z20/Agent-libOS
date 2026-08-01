@@ -43,6 +43,10 @@ from agent_libos.models import (
     ObjectPatch,
     ObjectType,
     McpProviderTool,
+    McpConnectionInfo,
+    McpDiscoveryResult,
+    McpProtocolEra,
+    McpProtocolMode,
     McpToolListResult,
     ProcessSignal,
     ProcessStatus,
@@ -4939,6 +4943,134 @@ class TestGuiServer:
         assert registered['server_id'] == 'gui-actor-mcp'
         assert tools['tools'][0]['tool_id'] == 'echo'
         assert tools['tools'][0]['resource'] == 'mcp:gui-actor-mcp:echo'
+
+    def test_mcp_discover_is_an_unconfirmed_external_read_projects_connection_and_publishes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        observed: list[dict[str, object]] = []
+        discovery = McpDiscoveryResult(
+            server_id='gui-modern-mcp',
+            connection=McpConnectionInfo(
+                protocol_mode=McpProtocolMode.AUTO,
+                protocol_era=McpProtocolEra.MODERN,
+                protocol_revision='2026-07-28',
+                sessionless=True,
+                fallback_used=False,
+                server_name='gui-fixture',
+                server_version='2.0.0',
+                capabilities=('tools',),
+                unsupported_capabilities=('resources',),
+            ),
+            request_bytes=43,
+            response_bytes=101,
+            duration_s=0.02,
+        )
+        expected = {
+            'server_id': 'gui-modern-mcp',
+            'connection': {
+                'protocol_mode': 'auto',
+                'protocol_era': 'modern',
+                'protocol_revision': '2026-07-28',
+                'sessionless': True,
+                'fallback_used': False,
+                'server_name': 'gui-fixture',
+                'server_version': '2.0.0',
+                'capabilities': ['tools'],
+                'unsupported_capabilities': ['resources'],
+            },
+            'request_bytes': 43,
+            'response_bytes': 101,
+            'duration_s': 0.02,
+            'receipts': [],
+        }
+
+        def record_discover(
+            server_id: str,
+            *,
+            actor: str,
+            require_capability: bool,
+        ) -> McpDiscoveryResult:
+            observed.append(
+                {
+                    'server_id': server_id,
+                    'actor': actor,
+                    'require_capability': require_capability,
+                }
+            )
+            return discovery
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            'discover',
+            record_discover,
+            raising=False,
+        )
+        cursor = self.server.service.broadcaster.replay_after(0)[-1].seq
+
+        host_status, host_result = self.request(
+            'POST',
+            '/api/mcp/gui-modern-mcp/discover',
+            {},
+        )
+        actor_status, actor_result = self.request(
+            'POST',
+            '/api/mcp/gui-modern-mcp/discover',
+            {'actor': 'pid-modern-reader'},
+        )
+        published_reasons = [
+            event.data['reason']
+            for event in self.server.service.broadcaster.replay_after(cursor)
+            if event.event == 'snapshot'
+        ]
+
+        assert host_status == 200
+        assert actor_status == 200
+        assert host_result == expected
+        assert actor_result['connection']['protocol_revision'] == '2026-07-28'
+        assert observed == [
+            {
+                'server_id': 'gui-modern-mcp',
+                'actor': 'gui',
+                'require_capability': False,
+            },
+            {
+                'server_id': 'gui-modern-mcp',
+                'actor': 'pid-modern-reader',
+                'require_capability': True,
+            },
+        ]
+        assert published_reasons == ['mcp.discover', 'mcp.discover']
+
+    def test_mcp_discover_does_not_publish_failed_operation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def fail_discover(*_args: object, **_kwargs: object) -> McpDiscoveryResult:
+            raise ValidationError('injected MCP discovery failure')
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            'discover',
+            fail_discover,
+            raising=False,
+        )
+        cursor = self.server.service.broadcaster.replay_after(0)[-1].seq
+
+        status, body = self.request(
+            'POST',
+            '/api/mcp/gui-modern-mcp/discover',
+            {},
+        )
+        published_reasons = [
+            event.data['reason']
+            for event in self.server.service.broadcaster.replay_after(cursor)
+            if event.event == 'snapshot'
+        ]
+
+        assert status == 400
+        assert body['error']['message'] == 'injected MCP discovery failure'
+        assert published_reasons == []
 
     def test_mcp_call_preserves_invalid_arguments_for_primitive_validation(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'mcp invalid args', 'auto_run': False})

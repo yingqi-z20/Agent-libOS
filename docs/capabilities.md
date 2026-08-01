@@ -608,10 +608,14 @@ discovery, not tool invocation. Granting `mcp:demo-tools:echo read` allows only
 that manifest-declared tool, subject to argument schema validation, live tool
 schema checks, runtime DNS/secret policy for HTTP transports, provider
 classification, audit, and external-effect recording. MCP Resources and
-Prompts are not exposed in v1.
+Prompts are not exposed. Manifest v2 protocol discovery is a separate protected
+external read: a process needs both `read` and `execute` on the exact
+`mcp_server:<server-id>` resource. Discovery metadata cannot grant Tool rights
+or turn an unsupported server capability into a Runtime capability.
 
-For `stdio` MCP transports, actor-mode server registration, live tool refresh,
-and tool calls additionally require both `process:spawn` `write` and `execute`
+For `stdio` MCP transports, actor-mode server registration, protocol discovery,
+live tool refresh, and tool calls additionally require both `process:spawn`
+`write` and `execute`
 on the exact `mcp_stdio:<sha256>` launch resource. The hash covers the canonical
 command, argv, environment mapping, and cwd, so a grant for one launch surface
 cannot authorize another. Registration authorizes persisting that surface;

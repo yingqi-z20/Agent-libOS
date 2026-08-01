@@ -22,6 +22,7 @@ from agent_libos.models import (
     JsonRpcEndpointSpec,
     JsonRpcMethodSpec,
     JsonRpcTransportResult,
+    McpProviderDiscoveryResult,
     McpProviderCallResult,
     McpServerSpec,
     McpToolListResult,
@@ -1196,6 +1197,29 @@ class McpProvider(Protocol):
         context: dict[str, Any],
         result: Any,
     ) -> ExternalEffectClassification: ...
+
+
+@runtime_checkable
+class McpModernProtocolProvider(Protocol):
+    """Opt-in SPI for MCP providers supporting modern protocol discovery.
+
+    The marker keeps existing :class:`McpProvider` implementations source and
+    runtime compatible. Runtime code must verify the exact marker before using
+    this optional interface for a Manifest v2 server.
+    """
+
+    supports_mcp_modern_protocol: Literal[True]
+
+    def discover(
+        self,
+        server: McpServerSpec,
+        *,
+        timeout_s: float,
+        max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
+    ) -> McpProviderDiscoveryResult: ...
 
 
 @runtime_checkable

@@ -1,5 +1,5 @@
-import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LLMProfileInput, LLMProfileSummary, McpServerSummary, ModuleSummary, ObjectTask, OperationListResponse, RuntimeHealth, RuntimeSnapshot, SchedulerStatus, SkillSummary, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunPage, TaskRunSpecV1, TaskRunStatus, TaskRunSummary, WorkflowRunResult } from "./types";
-import { assertRuntimeSnapshot, assertSchedulerStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
+import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeHealth, RuntimeSnapshot, SchedulerStatus, SkillSummary, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunPage, TaskRunSpecV1, TaskRunStatus, TaskRunSummary, WorkflowRunResult } from "./types";
+import { assertMcpCallResult, assertMcpDiscoveryResult, assertMcpServerSummary, assertMcpToolListResult, assertRuntimeSnapshot, assertSchedulerStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -446,32 +446,54 @@ export class LibOSClient {
   }
 
   async inspectMcpServer(serverId: string): Promise<McpServerSummary> {
-    return this.request("GET", `/api/mcp/${encodeURIComponent(serverId)}`);
+    const value = await this.request<unknown>("GET", `/api/mcp/${encodeURIComponent(serverId)}`);
+    assertMcpServerSummary(value);
+    if (value.server_id !== serverId) throw new Error("GUI MCP server identity does not match the requested server id.");
+    return value;
   }
 
-  async listMcpTools(serverId: string, refresh = false): Promise<Record<string, unknown>> {
-    return this.request(
+  async listMcpTools(serverId: string, refresh = false): Promise<McpToolListResult> {
+    const value = await this.request<unknown>(
       "GET",
       `/api/mcp/${encodeURIComponent(serverId)}/tools${refresh ? "?refresh=true" : ""}`
     );
+    assertMcpToolListResult(value);
+    if (value.server_id !== serverId) throw new Error("GUI MCP tool list identity does not match the requested server id.");
+    return value;
   }
 
-  async registerMcpServer(manifestText: string, confirmed: boolean, replace = false, actor?: string) {
-    return this.request<McpServerSummary>("POST", "/api/mcp/register", {
+  async discoverMcpServer(serverId: string, actor?: string): Promise<McpDiscoveryResult> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/discover`, {
+      ...(actor ? { actor } : {})
+    });
+    assertMcpDiscoveryResult(value);
+    if (value.server_id !== serverId) throw new Error("GUI MCP discovery identity does not match the requested server id.");
+    return value;
+  }
+
+  async registerMcpServer(manifestText: string, confirmed: boolean, replace = false, actor?: string): Promise<McpServerSummary> {
+    const value = await this.request<unknown>("POST", "/api/mcp/register", {
       manifest_text: manifestText,
       confirmed,
       replace,
       ...(actor ? { actor } : {})
     });
+    assertMcpServerSummary(value);
+    return value;
   }
 
-  async callMcpTool(serverId: string, pid: string, toolId: string, args: Record<string, unknown>, confirmed: boolean) {
-    return this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/call`, {
+  async callMcpTool(serverId: string, pid: string, toolId: string, args: Record<string, unknown>, confirmed: boolean): Promise<McpCallResult> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/call`, {
       pid,
       tool_id: toolId,
       arguments: args,
       confirmed
     });
+    assertMcpCallResult(value);
+    if (value.server_id !== serverId || value.tool_id !== toolId) {
+      throw new Error("GUI MCP call identity does not match the requested tool.");
+    }
+    return value;
   }
 
   async inspectModule(moduleId: string): Promise<ModuleSummary> {

@@ -1816,6 +1816,111 @@ textarea {
   gap: 7px;
 }
 
+.remotePanel,
+.remotePanel > *,
+.mcpProtocolSummary,
+.mcpProtocolSummary > * {
+  min-width: 0;
+}
+
+.remotePanel {
+  overflow-wrap: anywhere;
+}
+
+.remoteDiscoverHint,
+.mcpNegotiationState {
+  margin: 0;
+  color: #627d98;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.mcpProtocolSummary {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid #d9e2ec;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.mcpProtocolFacts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 8rem), 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.mcpProtocolFacts > div {
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid #e4ebf1;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.mcpProtocolFacts dt,
+.mcpProtocolFacts dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.mcpProtocolFacts dt,
+.mcpCapabilityGroup strong {
+  color: #627d98;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.mcpProtocolFacts dd {
+  margin-top: 3px;
+  color: #243b53;
+  font-size: 12px;
+}
+
+.mcpCapabilityGroups {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.mcpCapabilityGroup {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.mcpCapabilityGroup > span {
+  color: #627d98;
+  font-size: 11px;
+}
+
+.mcpCapabilityGroup ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mcpCapabilityGroup li {
+  max-width: 100%;
+  padding: 3px 6px;
+  border: 1px solid #bcccdc;
+  border-radius: 999px;
+  background: #fff;
+  overflow-wrap: anywhere;
+}
+
+.mcpCapabilityGroup.warning li {
+  border-color: #f5c2a3;
+  background: #fff7ed;
+  color: #9a3412;
+}
+
 .adminFormGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5221,8 +5326,14 @@ button.timelineExplain:hover:not(:disabled) {
 @container inspector (max-width: 420px) {
   .rightPane .resourceGrid,
   .adminFormGrid,
-  .factGrid {
+  .factGrid,
+  .mcpProtocolFacts {
     grid-template-columns: 1fr;
+  }
+
+  .remotePanel .adminActions > button {
+    flex: 1 1 100%;
+    justify-content: center;
   }
 
   .imageRow {

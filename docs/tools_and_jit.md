@@ -47,7 +47,8 @@ The current built-in tool surface includes tools for:
   simulated pull requests through `Runtime.git`; no arbitrary Git argv or URL.
 - JSON-RPC: list/inspect registered endpoints and call registered methods.
 - MCP: list/inspect registered servers, list manifest-allowed tools, and call
-  registered MCP tools.
+  registered MCP tools. Modern `server/discover` is intentionally a Host
+  SDK/CLI/GUI operation rather than another model tool or syscall.
 - Image registry: load workspace image packages and commit checkpoints into
   checkpoint-derived images.
 - Checkpoint: create, list, inspect, diff, restore, and fork.

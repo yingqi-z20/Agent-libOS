@@ -31,9 +31,9 @@
     "agent_libos/utils/serde.py::to_jsonable": 23
   },
   "function_line_budgets": {
-    "agent_libos/config/defaults.py::_validate_config": 340,
+    "agent_libos/config/defaults.py::_validate_config": 317,
     "agent_libos/primitives/filesystem.py::FilesystemAdapter._delete_directory_serialized": 243,
-    "agent_libos/primitives/mcp.py::McpPrimitive._call_tool": 375,
+    "agent_libos/primitives/mcp.py::McpPrimitive._call_tool": 347,
     "agent_libos/primitives/shell.py::ShellAdapter.run": 257,
     "agent_libos/storage/sql.py::SQLRuntimeStore.initialize": 402
   },

@@ -1,11 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import type { McpServerSummary } from "../api/types";
 import { I18nProvider } from "../i18n";
 import { AppNotices, LoadingScreen } from "./AppNotices";
 import { checkpointLabel } from "./CheckpointPanel";
 import { capabilityIdentity } from "./CapabilityPanel";
 import { buildObjectTaskStartRequest, isObjectTaskTerminal, parseObjectInput } from "./ObjectTasksPanel";
-import { parseJsonInput, reconcileRemoteOperationId, remoteOperationIds } from "./RemoteRegistryPanel";
+import { connectionFromResult, parseJsonInput, reconcileRemoteOperationId, remoteOperationIds } from "./RemoteRegistryPanel";
 
 describe("GUI administration helpers", () => {
   it("validates structured arguments locally before remote or task calls", () => {
@@ -37,7 +38,32 @@ describe("GUI administration helpers", () => {
     expect(remoteOperationIds("mcp", {
       server_id: "tools",
       tools: [{ tool_id: "search" }, { not_a_tool: true }]
-    })).toEqual(["search"]);
+    } as unknown as McpServerSummary)).toEqual(["search"]);
+  });
+
+  it("accepts only the locked MCP connection projection", () => {
+    expect(connectionFromResult({
+      connection: {
+        protocol_mode: "auto",
+        protocol_era: "modern",
+        protocol_revision: "2026-07-28",
+        sessionless: true,
+        fallback_used: false,
+        capabilities: ["tools"],
+        unsupported_capabilities: ["resources"]
+      }
+    })).toMatchObject({ protocol_era: "modern", protocol_revision: "2026-07-28" });
+    expect(connectionFromResult({
+      connection: {
+        configured_mode: "auto",
+        era: "modern",
+        protocol_revision: "2026-07-28",
+        sessionless: true,
+        fallback_used: false,
+        capabilities: [],
+        unsupported_capabilities: []
+      }
+    })).toBeNull();
   });
 
   it("uses the backend Object Task terminal statuses", () => {

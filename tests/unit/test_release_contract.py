@@ -4,6 +4,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 import re
+import subprocess
 import tarfile
 import tomllib
 import zipfile
@@ -150,7 +151,7 @@ def _write_test_sdist(
     return target
 
 
-def _write_release_pair(target: Path, *, version: str = "1.1.0") -> tuple[Path, Path]:
+def _write_release_pair(target: Path, *, version: str = "1.2.1") -> tuple[Path, Path]:
     wheel = _write_test_wheel(
         target / f"agent_libos-{version}-py3-none-any.whl",
         version=version,
@@ -163,7 +164,7 @@ def _write_release_pair(target: Path, *, version: str = "1.1.0") -> tuple[Path, 
 
 
 def test_release_version_identifiers_are_aligned() -> None:
-    assert validate_version_alignment(ROOT) == "1.1.0"
+    assert validate_version_alignment(ROOT) == "1.2.1"
 
 
 def test_agentdojo_lock_tracks_current_editable_agent_libos_version() -> None:
@@ -173,8 +174,58 @@ def test_agentdojo_lock_tracks_current_editable_agent_libos_version() -> None:
         )
     )
     package = next(item for item in lock["package"] if item["name"] == "agent-libos")
-    assert package["version"] == "1.1.0"
+    assert package["version"] == "1.2.1"
     assert package["source"] == {"editable": "../../"}
+
+
+def test_root_lock_resolves_the_reviewed_mcp_sdk_v2_graph() -> None:
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    packages = {item["name"]: item for item in lock["package"]}
+
+    assert packages["agent-libos"]["version"] == "1.2.1"
+    assert packages["mcp"]["version"] == "2.0.0"
+    assert packages["mcp-types"]["version"] == "2.0.0"
+    assert {
+        item["name"]
+        for item in packages["agent-libos"]["optional-dependencies"]["mcp"]
+    } == {"mcp", "httpx2", "httpcore2", "opentelemetry-api"}
+
+
+def test_gui_lockfile_uses_only_the_public_npm_registry() -> None:
+    lock = json.loads((ROOT / "gui" / "package-lock.json").read_text(encoding="utf-8"))
+    resolved_urls = sorted(
+        package["resolved"]
+        for package in lock["packages"].values()
+        if isinstance(package, dict) and isinstance(package.get("resolved"), str)
+    )
+
+    assert resolved_urls
+    assert [
+        url
+        for url in resolved_urls
+        if not url.startswith("https://registry.npmjs.org/")
+    ] == []
+
+
+def test_tracked_project_files_contain_no_private_vendor_markers() -> None:
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split("\0")
+    forbidden = (b"bn" + b"pm", b"by" + b"ted", b"byte" + b"dance")
+    offenders: list[str] = []
+
+    for relative in tracked:
+        if not relative:
+            continue
+        payload = (ROOT / relative).read_bytes().lower()
+        if any(marker in payload for marker in forbidden):
+            offenders.append(relative)
+
+    assert offenders == []
 
 
 def test_build_backend_runtime_dependencies_and_project_urls_are_bounded() -> None:
@@ -194,7 +245,12 @@ def test_build_backend_runtime_dependencies_and_project_urls_are_bounded() -> No
     }
     assert pyproject["project"]["optional-dependencies"] == {
         "postgres": ["psycopg[binary]>=3.2,<4"],
-        "mcp": ["mcp>=1.27,<2"],
+        "mcp": [
+            "mcp>=2.0,<3",
+            "httpx2>=2.5,<3",
+            "httpcore2>=2.5,<3",
+            "opentelemetry-api>=1.28,<2",
+        ],
         "pty": ["pywinpty>=2.0.13,<3; sys_platform == 'win32'"],
     }
     assert pyproject["dependency-groups"]["release"] == [
@@ -389,7 +445,7 @@ def test_release_checksum_manifest_records_and_verifies_exact_artifacts(
 
 def test_release_status_contains_current_version_state_only() -> None:
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
-    assert text.startswith("# Agent libOS 1.1.0 Status\n")
+    assert text.startswith("# Agent libOS 1.2.1 Status\n")
     forbidden = {
         "dirty state": r"\bdirty\b",
         "worktree state": r"\bwork(?:ing)?[ -]?tree\b",
@@ -397,10 +453,12 @@ def test_release_status_contains_current_version_state_only() -> None:
         "benchmark artifact path": r"\.benchmark_runs/",
         "absolute user path": r"(?:/Users/|/home/|/private/|/tmp/|[A-Za-z]:\\Users\\)",
         "bare hexadecimal identifier": r"\b[0-9a-f]{7,40}\b",
-        "calendar date": r"\b20\d{2}-\d{2}-\d{2}\b",
     }
     offenders = [label for label, pattern in forbidden.items() if re.search(pattern, text, re.IGNORECASE)]
     assert offenders == []
+    assert set(re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", text)) <= {
+        "2026-07-28"
+    }
 
 
 def test_release_status_requires_an_immutable_ci_receipt_binding() -> None:
@@ -444,7 +502,7 @@ def test_release_status_bounds_unarchived_evidence_and_volatile_counts() -> None
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
 
     assert "## Unarchived real-LLM observation" in text
-    assert "not Agent libOS 1.1.0 release evidence" in text
+    assert "not Agent libOS 1.2.1 release evidence" in text
     assert "AgentDojo harness is a required CI matrix" in text
     assert "collected pytest nodes" not in text
     assert not re.search(r"selects [\d,]+ tests", text)
@@ -476,10 +534,64 @@ def test_documented_no_skip_provider_gates_invoke_pytest_directly() -> None:
     text = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")
     normalized = " ".join(text.split())
 
-    assert "tests/providers/test_mcp_sdk_integration.py" in text
+    for path in (
+        "tests/providers/test_mcp_http_transport.py",
+        "tests/providers/test_mcp_v2_adapter.py",
+        "tests/providers/test_mcp_sdk_integration.py",
+    ):
+        assert path in text
     assert "tests/self_evolution/test_builtin_agent_images_real_llm.py" in text
     assert not re.search(r"scripts/test_matrix\.py[^\n]*--fail-on-skip", text)
     assert "`--fail-on-skip` is a pytest option" in normalized
+
+
+def test_mcp_sdk_optional_test_files_are_explicitly_marked() -> None:
+    for relative in (
+        "tests/providers/test_mcp_http_transport.py",
+        "tests/providers/test_mcp_v2_adapter.py",
+        "tests/providers/test_mcp_sdk_integration.py",
+    ):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        assert "pytestmark = pytest.mark.mcp" in text
+
+
+def test_mcp_v2_release_contract_is_precise_and_strict_core_only() -> None:
+    mcp = " ".join((ROOT / "docs" / "mcp.md").read_text(encoding="utf-8").split())
+    support = " ".join(
+        (ROOT / "docs" / "support_matrix.md").read_text(encoding="utf-8").split()
+    )
+    release = " ".join(
+        (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8").split()
+    )
+
+    for required in (
+        "Python MCP SDK v2",
+        "protocol revisions are date strings",
+        "`2026-07-28`",
+        "Manifest v1 is a compatibility contract",
+        "Manifest v2",
+        "`legacy`",
+        "`auto`",
+        "Tools list/call and modern `server/discover` only",
+        "that is not OAuth conformance",
+        "the Store remains schema v4",
+    ):
+        assert required in mcp
+    for excluded in (
+        "MRTR",
+        "OAuth",
+        "subscriptions/listen",
+        "Resources",
+        "Prompts",
+        "Tasks",
+        "Apps",
+        "Roots",
+        "Sampling",
+        "Logging",
+    ):
+        assert excluded in support
+        assert excluded in release
+    assert "Ubuntu Python 3.11 and 3.14" in support
 
 
 def test_public_overview_records_corrected_security_and_release_boundaries() -> None:
@@ -574,11 +686,11 @@ def test_release_builtin_skill_validation_rejects_missing_or_unparseable_package
 def test_readme_clean_install_smoke_covers_wheel_and_source_distribution() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "dist/agent_libos-1.1.0-py3-none-any.whl" in readme
-    assert "dist/agent_libos-1.1.0.tar.gz" in readme
+    assert "dist/agent_libos-1.2.1-py3-none-any.whl" in readme
+    assert "dist/agent_libos-1.2.1.tar.gz" in readme
     assert readme.count("--require-hashes") >= 3
-    assert "--no-deps dist/agent_libos-1.1.0-py3-none-any.whl" in readme
-    assert "--no-deps --no-build-isolation dist/agent_libos-1.1.0.tar.gz" in readme
+    assert "--no-deps dist/agent_libos-1.2.1-py3-none-any.whl" in readme
+    assert "--no-deps --no-build-isolation dist/agent_libos-1.2.1.tar.gz" in readme
     for entrypoint in EXPECTED_CONSOLE_SCRIPTS:
         assert readme.count(f"/{entrypoint} --help") >= 2
     assert readme.count("uv pip check --python /tmp/agent-libos-") >= 2
@@ -1118,11 +1230,18 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         ),
         (
             "mcp-sdk",
-            "Run complete MCP SDK integration file",
+            "Run complete MCP SDK integration suite",
             (
+                "tests/providers/test_mcp_http_transport.py",
+                "tests/providers/test_mcp_v2_adapter.py",
                 "tests/providers/test_mcp_sdk_integration.py",
                 "--run-mcp --fail-on-skip",
             ),
+        ),
+        (
+            "mcp-sdk",
+            "Run applicable MCP client conformance scenarios",
+            "scripts/run_mcp_conformance.py",
         ),
         (
             "gui",
@@ -1193,6 +1312,23 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     )
     assert "--fail-on-skip" in str(postgres_step["run"])
     mcp_job = parsed["jobs"]["mcp-sdk"]
+    assert mcp_job["strategy"] == {
+        "fail-fast": False,
+        "matrix": {"python-version": ["3.11", "3.14"]},
+    }
+    assert mcp_job["name"] == "mcp sdk (${{ matrix.python-version }})"
+    mcp_python = next(
+        item
+        for item in mcp_job["steps"]
+        if item.get("name") == "Set up Python"
+    )
+    assert mcp_python["with"]["python-version"] == "${{ matrix.python-version }}"
+    mcp_node = next(
+        item
+        for item in mcp_job["steps"]
+        if item.get("name") == "Set up Node"
+    )
+    assert mcp_node["with"]["node-version"] == "24"
     mcp_install = next(
         item
         for item in mcp_job["steps"]
@@ -1202,11 +1338,27 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     mcp_test = next(
         item
         for item in mcp_job["steps"]
-        if item.get("name") == "Run complete MCP SDK integration file"
+        if item.get("name") == "Run complete MCP SDK integration suite"
     )
     mcp_command = str(mcp_test["run"])
+    for path in (
+        "tests/providers/test_mcp_http_transport.py",
+        "tests/providers/test_mcp_v2_adapter.py",
+        "tests/providers/test_mcp_sdk_integration.py",
+    ):
+        assert path in mcp_command
+    assert "--run-mcp --fail-on-skip" in mcp_command
     assert "-k " not in mcp_command
     assert "--ignore" not in mcp_command
+    mcp_conformance = next(
+        item
+        for item in mcp_job["steps"]
+        if item.get("name") == "Run applicable MCP client conformance scenarios"
+    )
+    assert mcp_conformance["run"] == "uv run python scripts/run_mcp_conformance.py"
+    assert "expected-failures" not in str(mcp_conformance["run"])
+    assert "if" not in mcp_conformance
+    assert "continue-on-error" not in mcp_conformance
     compile_step = next(
         item
         for item in parsed["jobs"]["static"]["steps"]
@@ -1220,8 +1372,8 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         "cancel-in-progress": True,
     }
     assert parsed["env"] == {
-        "RELEASE_WHEEL": "dist/agent_libos-1.1.0-py3-none-any.whl",
-        "RELEASE_SDIST": "dist/agent_libos-1.1.0.tar.gz",
+        "RELEASE_WHEEL": "dist/agent_libos-1.2.1-py3-none-any.whl",
+        "RELEASE_SDIST": "dist/agent_libos-1.2.1.tar.gz",
         "RELEASE_CHECKSUMS": "dist/SHA256SUMS",
     }
     release_steps = release_job["steps"]

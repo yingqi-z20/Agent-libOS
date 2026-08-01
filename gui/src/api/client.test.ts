@@ -227,7 +227,19 @@ describe("LibOSClient", () => {
   });
 
   it("preserves explicit confirmations and authority mode for administration routes", async () => {
-    const fetchMock = mockFetch({});
+    const fetchMock = mockFetch({
+      server_id: "server/1",
+      tool_id: "search",
+      mcp_name: "search",
+      status: "ok",
+      ok: true,
+      result: null,
+      error: null,
+      response_bytes: 0,
+      duration_s: 0,
+      connection: null,
+      receipts: []
+    });
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
 
     await client.restoreCheckpoint("cp/1", true, "pid_1");
@@ -261,6 +273,44 @@ describe("LibOSClient", () => {
       "http://127.0.0.1:1/api/mcp/server%2F1/call",
       expect.objectContaining({ body: JSON.stringify({ pid: "pid_1", tool_id: "search", arguments: { q: "x" }, confirmed: true }) })
     );
+  });
+
+  it("discovers MCP protocol state through the encoded Host route without confirmation", async () => {
+    const payload = {
+      server_id: "server/1",
+      connection: {
+        protocol_mode: "auto",
+        protocol_era: "modern",
+        protocol_revision: "2026-07-28",
+        sessionless: true,
+        fallback_used: false,
+        capabilities: ["tools"],
+        unsupported_capabilities: []
+      },
+      request_bytes: 64,
+      response_bytes: 96,
+      duration_s: 0.01,
+      receipts: [{
+        phase: "server/discover",
+        request_bytes: 64,
+        response_bytes: 96,
+        duration_s: 0.01,
+        call_started: true
+      }]
+    };
+    const fetchMock = mockFetch(payload);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.discoverMcpServer("server/1")).resolves.toEqual(payload);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/mcp/server%2F1/discover",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({})
+      })
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).not.toHaveProperty("confirmed");
   });
 
   it("passes the discovered package hash through skill activation", async () => {

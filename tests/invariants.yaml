@@ -4515,6 +4515,68 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "mcp-protocol-mode-is-explicit-and-registry-fenced",
+      "title": "MCP protocol mode is explicit in Manifest v2 identity and every modern provider phase is fenced by the immutable registry binding.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/providers/test_mcp_v2_contract.py::test_discover_requires_read_and_execute_before_provider_dispatch",
+        "tests/providers/test_mcp_v2_contract.py::test_protocol_mode_replacement_changes_registry_binding",
+        "tests/providers/test_mcp_v2_contract.py::test_discovery_result_is_fenced_if_registry_changes_during_dispatch"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "mcp-modern-negotiation-never-falls-back-on-ambiguous-failure",
+      "title": "MCP modern negotiation falls back only on the recognized legacy signal, never authentication, server, pinned-modern, or ambiguous failure.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/providers/test_mcp_v2_contract.py::test_auto_fallback_policy_rejects_ambiguous_failures_without_sdk",
+        "tests/providers/test_mcp_v2_adapter.py::test_auto_http_does_not_fallback_on_auth_or_server_error[401]",
+        "tests/providers/test_mcp_v2_adapter.py::test_auto_http_does_not_fallback_on_auth_or_server_error[403]",
+        "tests/providers/test_mcp_v2_adapter.py::test_auto_http_does_not_fallback_on_auth_or_server_error[500]",
+        "tests/providers/test_mcp_v2_adapter.py::test_auto_http_falls_back_only_on_legacy_400_signal",
+        "tests/providers/test_mcp_v2_adapter.py::test_modern_pin_rejects_legacy_method_not_found_without_fallback"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "mcp-unsupported-modern-features-never-gain-runtime-authority",
+      "title": "Unsupported MCP modern capabilities and provider metadata remain bounded diagnostics and never grant Runtime authority or durable session state.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/providers/test_mcp_v2_contract.py::test_discovered_server_capabilities_never_grant_runtime_authority",
+        "tests/providers/test_mcp_v2_contract.py::test_discovery_metadata_is_operation_local_not_persisted",
+        "tests/providers/test_mcp_v2_contract.py::test_manifest_v2_rejects_reserved_protocol_meta[server]",
+        "tests/providers/test_mcp_v2_contract.py::test_manifest_v2_rejects_reserved_protocol_meta[tool]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "mcp-input-required-is-never-automatically-replayed",
+      "title": "Unsupported MCP input-required results are terminal and non-retryable, with consequential mutation retained as unknown.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/providers/test_mcp_v2_contract.py::test_input_required_is_terminal_never_retried_and_mutation_is_unknown[False]",
+        "tests/providers/test_mcp_v2_contract.py::test_input_required_is_terminal_never_retried_and_mutation_is_unknown[True]",
+        "tests/providers/test_mcp_v2_contract.py::test_task_run_input_required_fences_unknown_mutation_without_replay[read-False-no_rollback_required-False]",
+        "tests/providers/test_mcp_v2_contract.py::test_task_run_input_required_fences_unknown_mutation_without_replay[write-True-rollbackable-True]",
+        "tests/providers/test_mcp_v2_contract.py::test_task_run_input_required_fences_unknown_mutation_without_replay[rollback-unclear-False-unknown-True]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "mcp-v1-identity-and-provider-contract-remain-stable",
+      "title": "Manifest v1 canonical identity and the existing MCP provider signatures remain stable while modern support is an optional extension.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/providers/test_mcp_v2_contract.py::test_manifest_v1_canonical_registry_and_sink_hashes_are_stable",
+        "tests/unit/test_mcp_v2_models.py::test_mcp_v1_model_construction_remains_compatible",
+        "tests/providers/test_mcp_provider_compatibility.py::test_mcp_provider_keeps_legacy_method_signatures",
+        "tests/providers/test_mcp_provider_compatibility.py::test_unbudgeted_stdio_runtime_accepts_exact_legacy_provider"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "rating-mutations-are-audit-atomic",
       "title": "Rating updates and their required audit records commit or roll back in one transaction.",
       "lane": "runtime",

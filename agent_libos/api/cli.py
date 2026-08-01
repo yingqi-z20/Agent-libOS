@@ -358,7 +358,7 @@ def _parse_cli_args(
     _add_jsonrpc_parser_args(jsonrpc_parser)
     mcp_parser = sub.add_parser(
         "mcp",
-        help="Register, list, inspect, enumerate tools, call, or unregister MCP servers",
+        help="Register, list, inspect, discover, enumerate tools, call, or unregister MCP servers",
     )
     _add_mcp_parser_args(mcp_parser)
     modules_parser = sub.add_parser("modules", help="List, inspect, or verify startup runtime modules")
@@ -2161,6 +2161,11 @@ def _add_mcp_parser_args(parser: argparse.ArgumentParser) -> None:
     list_parser.add_argument("--limit", type=int)
     inspect = sub.add_parser("inspect", help="Inspect one registered MCP server")
     inspect.add_argument("server_id")
+    discover = sub.add_parser(
+        "discover",
+        help="Negotiate and inspect one registered modern MCP server",
+    )
+    discover.add_argument("server_id")
     tools = sub.add_parser("tools", help="List allowed tools for one registered MCP server")
     tools.add_argument("server_id")
     tools.add_argument("--refresh", action="store_true", help="Query the live MCP server for current tool metadata.")
@@ -2219,6 +2224,14 @@ def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, An
             actor=actor if require_capability else None,
             require_capability=require_capability,
             include_sensitive_fields=not require_capability,
+        )
+    if command == "discover":
+        return to_jsonable(
+            runtime.mcp.discover(
+                args.server_id,
+                actor=actor,
+                require_capability=require_capability,
+            )
         )
     if command == "tools":
         return runtime.mcp.list_tools(
